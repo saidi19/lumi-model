@@ -20,6 +20,7 @@ def tiny_config() -> LumiConfig:
         pad_token_id=0,
         bos_token_id=1,
         eos_token_id=2,
+        doc_token_id=3,
         tie_word_embeddings=True,
         use_cache=False,
     )

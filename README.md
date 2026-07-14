@@ -10,14 +10,14 @@ training data, secrets, or model checkpoints.
 
 ## Current phase
 
-Phase 1 validates the architecture and software path before any expensive GPU
-run:
+Phase 1 architecture correctness is complete. Phase 2 validates checkpoint,
+tokenizer, and deployment portability before any expensive GPU run:
 
-1. exact analytical parameter counting;
-2. causal-attention, loss-shift, and weight-tying tests;
-3. save/load round trips;
-4. tiny synthetic smoke training;
-5. later: vLLM, MLX, and GGUF conversion gates.
+1. self-contained Hugging Face export and isolated-process loading;
+2. vLLM Transformers-backend compatibility;
+3. one tokenizer contract shared by the 150M pilot and 4B candidate;
+4. later in Phase 2: trained tokenizer, MLX, and GGUF conversion gates;
+5. only then: a small real-corpus pilot and measured GPU throughput.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
@@ -34,6 +34,7 @@ python -m pip install -e '.[dev]'
 pytest
 python scripts/count_parameters.py configs/lumi-4b.json
 python scripts/smoke_train.py --steps 20
+python scripts/check_isolated_hf.py
 ```
 
 ## Repository policy
@@ -45,5 +46,8 @@ python scripts/smoke_train.py --steps 20
 - A measured single-GPU throughput pilot is required before approving the 4B
   run.
 
-See [`docs/architecture-v0.1.md`](docs/architecture-v0.1.md) for the current
-technical decision record.
+See [`docs/architecture-v0.1.md`](docs/architecture-v0.1.md),
+[`docs/portability-v0.1.md`](docs/portability-v0.1.md), and
+[`docs/tokenizer-v0.1.md`](docs/tokenizer-v0.1.md) for the current decision
+records. The candidate source mix and acquisition gates are in
+[`docs/data-plan-v0.1.md`](docs/data-plan-v0.1.md).

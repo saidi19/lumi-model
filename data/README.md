@@ -14,3 +14,10 @@ Future data work must track, at minimum:
 
 Actual shards will live in private object storage. This directory is ignored
 except for this policy file.
+
+The first data artifact is not the 80B-100B-token corpus. It is a small,
+representative tokenizer sample with source-level provenance. It must cover the
+intended English-first mix (web, books/reference, code, mathematics/science,
+and structured text) plus a multilingual slice. Tokenizer samples and resulting
+vocabularies must be scanned for secrets, benchmark leakage, junk, and
+source-specific artifacts before they are used.

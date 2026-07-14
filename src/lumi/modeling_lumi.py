@@ -8,7 +8,9 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import GenerationMixin, PreTrainedModel
+from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import BaseModelOutput, CausalLMOutput
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .configuration_lumi import LumiConfig
 
@@ -67,29 +69,66 @@ def _apply_rotary(
     )
 
 
+def _repeat_key_value(hidden_states: torch.Tensor, repeats: int) -> torch.Tensor:
+    if repeats == 1:
+        return hidden_states
+    batch, key_value_heads, sequence, head_dim = hidden_states.shape
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, key_value_heads, repeats, sequence, head_dim
+    )
+    return hidden_states.reshape(batch, key_value_heads * repeats, sequence, head_dim)
+
+
+def _lumi_eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **_: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference attention used when no optimized backend is selected."""
+
+    key = _repeat_key_value(key, module.num_key_value_groups)
+    value = _repeat_key_value(value, module.num_key_value_groups)
+    weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    if attention_mask is None:
+        query_length, key_length = query.shape[-2], key.shape[-2]
+        causal = torch.ones((query_length, key_length), device=query.device, dtype=torch.bool).tril(
+            diagonal=key_length - query_length
+        )
+        weights = weights.masked_fill(~causal, torch.finfo(weights.dtype).min)
+    elif attention_mask.dtype == torch.bool:
+        weights = weights.masked_fill(~attention_mask, torch.finfo(weights.dtype).min)
+    else:
+        weights = weights + attention_mask
+
+    weights = F.softmax(weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    weights = F.dropout(weights, p=dropout, training=module.training)
+    output = torch.matmul(weights, value).transpose(1, 2).contiguous()
+    return output, weights
+
+
 class LumiAttention(nn.Module):
-    def __init__(self, config: LumiConfig) -> None:
+    def __init__(self, config: LumiConfig, layer_idx: int) -> None:
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.head_dim = config.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.is_causal = True
         self.query_size = config.query_projection_size
         self.key_value_size = config.key_value_projection_size
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, self.query_size, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, self.key_value_size, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, self.key_value_size, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            self.query_size, config.hidden_size, bias=config.attention_bias
-        )
+        self.q_proj = nn.Linear(config.hidden_size, self.query_size, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, self.key_value_size, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, self.key_value_size, bias=config.attention_bias)
+        self.o_proj = nn.Linear(self.query_size, config.hidden_size, bias=config.attention_bias)
         self.rotary = LumiRotaryEmbedding(config)
 
     def _shape(self, states: torch.Tensor, heads: int) -> torch.Tensor:
@@ -101,6 +140,7 @@ class LumiAttention(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
         position_ids: torch.LongTensor,
+        **kwargs: Any,
     ) -> torch.Tensor:
         batch, sequence, _ = hidden_states.shape
         query = self._shape(self.q_proj(hidden_states), self.num_heads)
@@ -110,38 +150,20 @@ class LumiAttention(nn.Module):
         cosine, sine = self.rotary(value, position_ids)
         query, key = _apply_rotary(query, key, cosine, sine)
 
-        if self.num_key_value_groups > 1:
-            key = key.repeat_interleave(self.num_key_value_groups, dim=1)
-            value = value.repeat_interleave(self.num_key_value_groups, dim=1)
-
-        if attention_mask is None:
-            output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                dropout_p=0.0,
-                is_causal=True,
-            )
-        else:
-            if attention_mask.shape != (batch, sequence):
-                raise ValueError(
-                    "attention_mask must have shape "
-                    f"{(batch, sequence)}, got {tuple(attention_mask.shape)}"
-                )
-            causal = torch.ones(
-                (sequence, sequence), device=hidden_states.device, dtype=torch.bool
-            ).tril()
-            allowed = causal[None, None, :, :] & attention_mask[:, None, None, :].bool()
-            output = F.scaled_dot_product_attention(
-                query,
-                key,
-                value,
-                attn_mask=allowed,
-                dropout_p=0.0,
-                is_causal=False,
-            )
-
-        output = output.transpose(1, 2).contiguous().view(batch, sequence, self.query_size)
+        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, _lumi_eager_attention_forward
+        )
+        output, _ = attention_interface(
+            self,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=0.0,
+            scaling=self.scaling,
+            **kwargs,
+        )
+        output = output.reshape(batch, sequence, self.query_size).contiguous()
         return self.o_proj(output)
 
 
@@ -157,13 +179,11 @@ class LumiMLP(nn.Module):
 
 
 class LumiDecoderLayer(nn.Module):
-    def __init__(self, config: LumiConfig) -> None:
+    def __init__(self, config: LumiConfig, layer_idx: int) -> None:
         super().__init__()
         self.input_layernorm = LumiRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.self_attn = LumiAttention(config)
-        self.post_attention_layernorm = LumiRMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
+        self.self_attn = LumiAttention(config, layer_idx)
+        self.post_attention_layernorm = LumiRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.mlp = LumiMLP(config)
 
     def forward(
@@ -171,11 +191,15 @@ class LumiDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
         position_ids: torch.LongTensor,
+        **kwargs: Any,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = residual + self.self_attn(
-            hidden_states, attention_mask=attention_mask, position_ids=position_ids
+            hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            **kwargs,
         )
 
         residual = hidden_states
@@ -188,6 +212,7 @@ class LumiPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = False
     _supports_sdpa = True
+    _supports_attention_backend = True
     _supports_cache_class = False
     _no_split_modules = ["LumiDecoderLayer"]
 
@@ -209,7 +234,7 @@ class LumiModel(LumiPreTrainedModel):
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
         )
         self.layers = nn.ModuleList(
-            [LumiDecoderLayer(config) for _ in range(config.num_hidden_layers)]
+            [LumiDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LumiRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_init()
@@ -227,7 +252,7 @@ class LumiModel(LumiPreTrainedModel):
         position_ids: torch.LongTensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
         return_dict: bool | None = None,
-        **_: Any,
+        **kwargs: Any,
     ) -> BaseModelOutput | tuple[torch.Tensor]:
         return_dict = self.config.return_dict if return_dict is None else return_dict
         if (input_ids is None) == (inputs_embeds is None):
@@ -244,11 +269,26 @@ class LumiModel(LumiPreTrainedModel):
             position_ids = torch.arange(sequence, device=hidden_states.device).unsqueeze(0)
             position_ids = position_ids.expand(batch, -1)
 
+        if attention_mask is not None and attention_mask.ndim == 2:
+            if attention_mask.shape != (batch, sequence):
+                raise ValueError(
+                    "attention_mask must have shape "
+                    f"{(batch, sequence)}, got {tuple(attention_mask.shape)}"
+                )
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=hidden_states,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            position_ids=position_ids,
+        )
+
         for layer in self.layers:
             hidden_states = layer(
                 hidden_states,
-                attention_mask=attention_mask,
+                attention_mask=causal_mask,
                 position_ids=position_ids,
+                **kwargs,
             )
         hidden_states = self.norm(hidden_states)
 
@@ -315,8 +355,7 @@ class LumiForCausalLM(LumiPreTrainedModel, GenerationMixin):
         if labels is not None:
             if labels.shape != logits.shape[:2]:
                 raise ValueError(
-                    f"labels must have shape {tuple(logits.shape[:2])}, "
-                    f"got {tuple(labels.shape)}"
+                    f"labels must have shape {tuple(logits.shape[:2])}, got {tuple(labels.shape)}"
                 )
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous().to(shift_logits.device)

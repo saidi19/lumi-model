@@ -21,9 +21,25 @@ def test_lumi_4b_candidate_parameter_count() -> None:
     assert parameter_breakdown(config).total == 4_002_376_704
 
 
+def test_lumi_pilot_candidate_parameter_count() -> None:
+    path = Path(__file__).parents[1] / "configs" / "lumi-150m.json"
+    with path.open(encoding="utf-8") as handle:
+        config = LumiConfig(**json.load(handle))
+    assert parameter_breakdown(config).total == 150_625_536
+
+
 def test_special_token_ids_must_be_distinct() -> None:
     with pytest.raises(ValueError, match="must be distinct"):
-        LumiConfig(pad_token_id=2, bos_token_id=1, eos_token_id=2)
+        LumiConfig(pad_token_id=0, bos_token_id=1, eos_token_id=2, doc_token_id=2)
+
+
+def test_export_auto_map_contains_base_and_causal_models() -> None:
+    config = LumiConfig()
+    assert config.auto_map == {
+        "AutoConfig": "configuration_lumi.LumiConfig",
+        "AutoModel": "modeling_lumi.LumiModel",
+        "AutoModelForCausalLM": "modeling_lumi.LumiForCausalLM",
+    }
 
 
 def test_gqa_head_counts_must_divide() -> None:

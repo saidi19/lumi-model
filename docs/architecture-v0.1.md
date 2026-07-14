@@ -65,7 +65,8 @@ critical.
 
 ### Portability
 
-- Hugging Face `save_pretrained`/`from_pretrained` works.
+- Hugging Face self-contained export loads in an isolated process without the
+  local `lumi` package (passed for a tiny checkpoint).
 - vLLM serves the model through a Transformers-compatible backend.
 - MLX conversion and generation work on M5/16GB.
 - GGUF conversion and `llama.cpp` generation work.
@@ -79,7 +80,10 @@ not branding, decide the frozen architecture.
 - Synthetic smoke model trains without NaNs.
 - A 50M-150M pilot learns from a real clean corpus.
 - A larger pilot establishes loss trend, memory use, MFU/throughput, checkpoint
-  reliability, and cost per billion tokens.
+reliability, and cost per billion tokens.
+
+See [`portability-v0.1.md`](portability-v0.1.md) for per-backend status and
+[`tokenizer-v0.1.md`](tokenizer-v0.1.md) for the tokenizer freeze gates.
 
 ## Explicit non-goals for v0.1
 

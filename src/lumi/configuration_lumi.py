@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from transformers import PretrainedConfig
 
+LUMI_AUTO_MAP = {
+    "AutoConfig": "configuration_lumi.LumiConfig",
+    "AutoModel": "modeling_lumi.LumiModel",
+    "AutoModelForCausalLM": "modeling_lumi.LumiForCausalLM",
+}
+
 
 class LumiConfig(PretrainedConfig):
     """Configuration container for the Lumi architecture.
@@ -33,6 +39,7 @@ class LumiConfig(PretrainedConfig):
         pad_token_id: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
+        doc_token_id: int = 3,
         tie_word_embeddings: bool = True,
         **kwargs,
     ) -> None:
@@ -49,6 +56,12 @@ class LumiConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.attention_bias = attention_bias
         self.use_cache = use_cache
+        self.doc_token_id = doc_token_id
+
+        # These mappings make an exported checkpoint self-contained. AutoModel is
+        # also required by vLLM's Transformers modeling backend, while
+        # AutoModelForCausalLM is the normal text-generation entry point.
+        kwargs.setdefault("auto_map", dict(LUMI_AUTO_MAP))
 
         super().__init__(
             pad_token_id=pad_token_id,
@@ -92,10 +105,17 @@ class LumiConfig(PretrainedConfig):
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be positive")
 
-        special_ids = [self.pad_token_id, self.bos_token_id, self.eos_token_id]
-        if any(token_id is None for token_id in special_ids):
-            raise ValueError("PAD, BOS, and EOS token IDs must all be configured")
-        if len(set(special_ids)) != len(special_ids):
-            raise ValueError("PAD, BOS, and EOS token IDs must be distinct")
-        if not all(0 <= token_id < self.vocab_size for token_id in special_ids):
+        special_ids = {
+            "PAD": self.pad_token_id,
+            "BOS": self.bos_token_id,
+            "EOS": self.eos_token_id,
+            "DOC": self.doc_token_id,
+        }
+        if any(token_id is None for token_id in special_ids.values()):
+            raise ValueError("PAD, BOS, EOS, and DOC token IDs must all be configured")
+        if not all(isinstance(token_id, int) for token_id in special_ids.values()):
+            raise ValueError("special token IDs must be integers")
+        if len(set(special_ids.values())) != len(special_ids):
+            raise ValueError("PAD, BOS, EOS, and DOC token IDs must be distinct")
+        if not all(0 <= token_id < self.vocab_size for token_id in special_ids.values()):
             raise ValueError("special token IDs must be inside the vocabulary")
