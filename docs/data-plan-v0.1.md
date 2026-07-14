@@ -1,17 +1,27 @@
 # Lumi data plan v0.1
 
-Status: **candidate; no training corpus has been downloaded or approved**
+Status: **candidate; 25MB tokenizer and 10MB provenance canaries passed, but no training is approved**
 
 ## Default source direction
 
-Use the filtered
+Use the Common Pile v0.1 filtered source family as the primary pool. The 521GB
 [`common-pile/comma_v0.1_training_dataset`](https://huggingface.co/datasets/common-pile/comma_v0.1_training_dataset)
-as the primary source pool. It is a 521GB consolidated version of Common Pile
-v0.1 and exposes the mix used for the Comma models. Common Pile was built from
-public-domain and openly licensed text, with source-level collection code and
-provenance. Its source pool is much larger than Lumi's 80B-100B-token target, so
-Lumi can select a quality-focused subset instead of downloading arbitrary web
-text.
+is the pinned mix reference and was sufficient for the first streaming canary.
+It must not be the source of the development or final corpus because its
+consolidated rows contain only `text` and discard the original Dolma IDs,
+URLs, and license metadata.
+
+Starting with the 1GB-2GB development sample, materialize from the individual
+`common-pile/*_filtered` component repositories. Their rows retain `id`,
+`source`, and metadata such as provenance, URL, and usually document license.
+All 23 candidate component schemas and revisions are pinned in
+[`configs/component-sources-v0.1.json`](../configs/component-sources-v0.1.json).
+The overall dataset has no single unified license; license values or an approved
+source-level public-domain basis must therefore be retained per document.
+A bounded first-shard audit found IDs, provenance, and a non-null license or
+documented source-level basis in all 44,061 inspected rows; the machine-readable
+counts and limitations are in
+[`reports/component-provenance-audit-v0.1.json`](../reports/component-provenance-audit-v0.1.json).
 
 This is a safer and more reproducible default than treating FineWeb-Edu or a
 random Common Crawl dump as the entire corpus. FineWeb-Edu remains an optional
@@ -22,6 +32,10 @@ rights.
 Personal use does not remove the need for provenance. It matters for deletion
 requests, accidental secrets/PII, later model sharing, and any future change in
 Lumi's use.
+
+The consolidated canary source is pinned to commit
+`5afc546db324e7f39f297ba757c9a60547151e7c`; a floating `main` revision is not
+accepted by the sampler.
 
 ## Candidate 80B mix
 
@@ -44,6 +58,19 @@ candidate is [`configs/data-mix-v0.1.json`](../configs/data-mix-v0.1.json).
 
 ### 1. Tokenizer sample — no GPU
 
+- Completed first gate: a 25MB seven-domain canary, documented in
+  [`data-canary-v0.1.md`](data-canary-v0.1.md).
+- Completed provenance correction: a 10MB component-repository canary retained
+  required IDs, licenses/basis, URLs, and collection provenance in every
+  accepted record; see
+  [`provenance-canary-v0.2.md`](provenance-canary-v0.2.md).
+- Next, build a 1GB-2GB development sample across more source components and
+  add a small, explicitly licensed Bangla/multilingual tokenizer slice.
+- Use the metadata-preserving component repositories, audit null/malformed
+  license rates, and treat CCCC as a documented source-level-license exception:
+  its card describes whole-domain license review, but 0 of 10,000 audited raw
+  and filtered rows contained the per-document license field claimed by the
+  card.
 - Stream a stratified 6GB-12GB uncompressed sample across every domain.
 - Keep document IDs, source component, revision, license metadata, and hashes.
 - Train both 32K and 65K tokenizers from exactly the same sample.
