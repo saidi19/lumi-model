@@ -11,13 +11,15 @@ training data, secrets, or model checkpoints.
 ## Current phase
 
 Phase 1 architecture correctness is complete. Phase 2 validates checkpoint,
-tokenizer, and deployment portability before any expensive GPU run:
+tokenizer, data, and deployment portability before any expensive GPU run:
 
 1. self-contained Hugging Face export and isolated-process loading;
 2. vLLM Transformers-backend compatibility;
 3. one tokenizer contract shared by the 150M pilot and 4B candidate;
-4. later in Phase 2: trained tokenizer, MLX, and GGUF conversion gates;
-5. only then: a small real-corpus pilot and measured GPU throughput.
+4. a pinned 25MB tokenizer canary, a metadata-preserving 10MB provenance
+   canary, and 32K/65K tokenizer prototypes now pass their local gates;
+5. later in Phase 2: representative tokenizer data, MLX, and GGUF conversion;
+6. only then: a small real-corpus pilot and measured GPU throughput.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
@@ -50,4 +52,7 @@ See [`docs/architecture-v0.1.md`](docs/architecture-v0.1.md),
 [`docs/portability-v0.1.md`](docs/portability-v0.1.md), and
 [`docs/tokenizer-v0.1.md`](docs/tokenizer-v0.1.md) for the current decision
 records. The candidate source mix and acquisition gates are in
-[`docs/data-plan-v0.1.md`](docs/data-plan-v0.1.md).
+[`docs/data-plan-v0.1.md`](docs/data-plan-v0.1.md), with the first measured run
+in [`docs/data-canary-v0.1.md`](docs/data-canary-v0.1.md).
+The metadata-preserving follow-up is in
+[`docs/provenance-canary-v0.2.md`](docs/provenance-canary-v0.2.md).
