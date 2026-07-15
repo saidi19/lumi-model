@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 from lumi.data_quality import DataQualityGate, validate_quality_config
 
@@ -419,17 +419,39 @@ def validate_sample_config(config: Mapping[str, Any]) -> None:
             component = source.get("component")
             source_file = source.get("file")
             blob_sha1 = source.get("blob_sha1")
+            blob_sha256 = source.get("blob_sha256")
+            source_format = source.get("format", "jsonl_gzip")
             if not isinstance(component, str) or not component:
                 raise ValueError(f"category {category} has a source without a component")
+            if source_format not in {"jsonl_gzip", "parquet"}:
+                raise ValueError(
+                    f"source {source_file} has an unsupported format: {source_format}"
+                )
+            valid_suffix = (
+                source_file.endswith((".json.gz", ".jsonl.gz"))
+                if isinstance(source_file, str) and source_format == "jsonl_gzip"
+                else isinstance(source_file, str) and source_file.endswith(".parquet")
+            )
             if (
                 not isinstance(source_file, str)
                 or source_file.startswith("/")
                 or ".." in Path(source_file).parts
-                or not source_file.endswith(".gz")
+                or not valid_suffix
             ):
                 raise ValueError(f"category {category} has an unsafe or unsupported source file")
-            if not isinstance(blob_sha1, str) or SHA1_PATTERN.fullmatch(blob_sha1) is None:
-                raise ValueError(f"source {source_file} must pin a 40-character blob SHA")
+            if (blob_sha1 is None) == (blob_sha256 is None):
+                raise ValueError(
+                    f"source {source_file} must pin exactly one blob_sha1 or blob_sha256"
+                )
+            if blob_sha1 is not None and (
+                not isinstance(blob_sha1, str) or SHA1_PATTERN.fullmatch(blob_sha1) is None
+            ):
+                raise ValueError(f"source {source_file} must pin a 40-character blob SHA-1")
+            if blob_sha256 is not None and (
+                not isinstance(blob_sha256, str)
+                or SHA256_PATTERN.fullmatch(blob_sha256) is None
+            ):
+                raise ValueError(f"source {source_file} must pin a 64-character blob SHA-256")
             compressed_bytes = source.get("compressed_bytes")
             if (
                 not isinstance(compressed_bytes, int)
@@ -574,6 +596,169 @@ def _iter_source_lines(
         with gzip.GzipFile(fileobj=response) as compressed:
             with io.TextIOWrapper(compressed, encoding="utf-8") as text_stream:
                 yield from enumerate(text_stream, start=1)
+
+
+class _HTTPRangeReader:
+    """Minimal seekable reader for bounded Parquet HTTP range requests."""
+
+    def __init__(self, url: str, size: int, timeout_seconds: float) -> None:
+        self.name = url
+        self.mode = "rb"
+        self._url = url
+        self._size = size
+        self._timeout_seconds = timeout_seconds
+        self._position = 0
+        self._closed = False
+        self.bytes_fetched = 0
+        self.requests = 0
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        self._closed = True
+
+    def readable(self) -> bool:
+        return not self._closed
+
+    def seekable(self) -> bool:
+        return not self._closed
+
+    def writable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        if self._closed:
+            raise ValueError("I/O operation on closed HTTP range reader")
+        return self._position
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        if self._closed:
+            raise ValueError("I/O operation on closed HTTP range reader")
+        if whence == io.SEEK_SET:
+            position = offset
+        elif whence == io.SEEK_CUR:
+            position = self._position + offset
+        elif whence == io.SEEK_END:
+            position = self._size + offset
+        else:
+            raise ValueError(f"unsupported seek mode: {whence}")
+        if not 0 <= position <= self._size:
+            raise ValueError("HTTP range seek is outside the pinned source")
+        self._position = position
+        return position
+
+    def read(self, size: int = -1) -> bytes:
+        if self._closed:
+            raise ValueError("I/O operation on closed HTTP range reader")
+        remaining = self._size - self._position
+        if size is None or size < 0:
+            size = remaining
+        size = min(size, remaining)
+        if size == 0:
+            return b""
+        start = self._position
+        end = start + size - 1
+        request = urllib.request.Request(
+            self._url,
+            headers={
+                "Range": f"bytes={start}-{end}",
+                "User-Agent": "lumi-data-canary/0.1",
+            },
+        )
+        with urllib.request.urlopen(  # noqa: S310
+            request, timeout=self._timeout_seconds
+        ) as response:
+            status = response.getcode()
+            if status == 200 and (start != 0 or size != self._size):
+                raise OSError("source server ignored a bounded HTTP range request")
+            if status not in {200, 206}:
+                raise OSError(f"source server returned HTTP {status} for a range request")
+            content_range = response.headers.get("Content-Range")
+            if content_range is not None:
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range)
+                if match is None or tuple(map(int, match.groups())) != (
+                    start,
+                    end,
+                    self._size,
+                ):
+                    raise OSError("source server returned an unexpected Content-Range")
+            data = response.read()
+        if len(data) != size:
+            raise EOFError(
+                f"short HTTP range read for pinned source: expected {size}, got {len(data)}"
+            )
+        self._position += len(data)
+        self.bytes_fetched += len(data)
+        self.requests += 1
+        return data
+
+
+def _parquet_columns(source: Mapping[str, Any]) -> list[str]:
+    columns = {"text"}
+    columns.update(
+        str(path).split(".", maxsplit=1)[0]
+        for path in source.get("retain_provenance", {}).values()
+    )
+    return sorted(columns)
+
+
+def _iter_parquet_records(
+    dataset: Mapping[str, Any], source: Mapping[str, Any], timeout_seconds: float
+) -> Iterator[tuple[int, Mapping[str, Any]]]:
+    try:
+        import pyarrow.parquet as parquet
+    except ImportError as error:
+        raise RuntimeError(
+            "Parquet data sources require `pip install -e '.[data]'`"
+        ) from error
+
+    source_url = _source_url(dataset, source)
+    parsed = urlparse(source_url)
+    range_reader: _HTTPRangeReader | None = None
+    if parsed.scheme == "file":
+        parquet_input: Any = Path(unquote(parsed.path))
+    else:
+        range_reader = _HTTPRangeReader(
+            source_url,
+            int(source["compressed_bytes"]),
+            timeout_seconds,
+        )
+        parquet_input = range_reader
+    try:
+        parquet_file = parquet.ParquetFile(parquet_input)
+        source_row = 0
+        for batch in parquet_file.iter_batches(
+            batch_size=128,
+            columns=_parquet_columns(source),
+            use_threads=False,
+        ):
+            for record in batch.to_pylist():
+                source_row += 1
+                yield source_row, record
+    finally:
+        if range_reader is not None:
+            range_reader.close()
+
+
+def _iter_source_records(
+    dataset: Mapping[str, Any], source: Mapping[str, Any], timeout_seconds: float
+) -> Iterator[tuple[int, Mapping[str, Any] | None]]:
+    source_format = source.get("format", "jsonl_gzip")
+    if source_format == "jsonl_gzip":
+        for source_line, line in _iter_source_lines(dataset, source, timeout_seconds):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                yield source_line, None
+                continue
+            yield source_line, record if isinstance(record, Mapping) else None
+        return
+    if source_format == "parquet":
+        yield from _iter_parquet_records(dataset, source, timeout_seconds)
+        return
+    raise ValueError(f"unsupported source format: {source_format}")
 
 
 def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
@@ -867,27 +1052,29 @@ def _manifest_from_run(
             source_key = _source_key(
                 config["dataset"], source, mixture_entry["category"]
             )
-            source_files.append(
-                {
-                    "blob_sha1": source["blob_sha1"],
-                    "category": mixture_entry["category"],
-                    "component": source["component"],
-                    "compressed_bytes": source["compressed_bytes"],
-                    "dataset_id": _source_dataset(config["dataset"], source)["id"],
-                    "file": source["file"],
-                    "required_non_null_provenance": source.get(
-                        "required_non_null_provenance", []
-                    ),
-                    "revision": _source_dataset(config["dataset"], source)["revision"],
-                    "statistics": {
-                        "documents": int(stats["source_documents"].get(source_key, 0)),
-                        "target_text_utf8_bytes": source_targets.get(source_key),
-                        "text_utf8_bytes": int(stats["source_bytes"].get(source_key, 0)),
-                    },
-                    "used": source_key in stats["source_bytes"],
-                    "weight_within_category": source.get("weight_within_category"),
-                }
-            )
+            source_manifest = {
+                "category": mixture_entry["category"],
+                "component": source["component"],
+                "compressed_bytes": source["compressed_bytes"],
+                "dataset_id": _source_dataset(config["dataset"], source)["id"],
+                "file": source["file"],
+                "format": source.get("format", "jsonl_gzip"),
+                "required_non_null_provenance": source.get(
+                    "required_non_null_provenance", []
+                ),
+                "revision": _source_dataset(config["dataset"], source)["revision"],
+                "statistics": {
+                    "documents": int(stats["source_documents"].get(source_key, 0)),
+                    "target_text_utf8_bytes": source_targets.get(source_key),
+                    "text_utf8_bytes": int(stats["source_bytes"].get(source_key, 0)),
+                },
+                "used": source_key in stats["source_bytes"],
+                "weight_within_category": source.get("weight_within_category"),
+            }
+            for digest_key in ("blob_sha1", "blob_sha256"):
+                if digest_key in source:
+                    source_manifest[digest_key] = source[digest_key]
+            source_files.append(source_manifest)
     quality_enabled = "quality" in config
     limitations = [
         "Development sample only: this does not approve a pilot or full-model training run.",
@@ -1066,8 +1253,10 @@ def build_sample(
                 attempt = 0
                 while True:
                     try:
-                        source_lines = _iter_source_lines(dataset, source, timeout_seconds)
-                        for source_line, line in source_lines:
+                        source_records = _iter_source_records(
+                            dataset, source, timeout_seconds
+                        )
+                        for source_line, upstream_record in source_records:
                             if source_target is None:
                                 target_reached = (
                                     stats["category_bytes"].get(category, 0) >= target
@@ -1079,9 +1268,7 @@ def build_sample(
                                 )
                             if target_reached:
                                 break
-                            try:
-                                upstream_record = json.loads(line)
-                            except json.JSONDecodeError:
+                            if upstream_record is None:
                                 rejections["invalid_json"] += 1
                                 continue
                             raw_text = upstream_record.get("text")
@@ -1147,7 +1334,6 @@ def build_sample(
                                         "dataset_revision": source_dataset["revision"],
                                         "raw_text_sha256": filtered.raw_sha256,
                                         "segment_index": segment_index,
-                                        "source_blob_sha1": source["blob_sha1"],
                                         "source_file": source["file"],
                                         "source_line": source_line,
                                     },
@@ -1159,6 +1345,11 @@ def build_sample(
                                         ),
                                     },
                                 }
+                                for digest_key in ("blob_sha1", "blob_sha256"):
+                                    if digest_key in source:
+                                        record["provenance"][
+                                            f"source_{digest_key}"
+                                        ] = source[digest_key]
                                 if quality_evaluation is not None:
                                     record["quality"] = quality_evaluation.metadata
                                 if retained_provenance:
@@ -1387,7 +1578,8 @@ def validate_sample(
             source.get("dataset_id", default_dataset["id"]),
             source.get("revision", default_dataset["revision"]),
             source["file"],
-            source["blob_sha1"],
+            source.get("blob_sha1"),
+            source.get("blob_sha256"),
             source["category"],
         )
         for source in manifest["source_files"]
@@ -1474,7 +1666,8 @@ def validate_sample(
                     provenance["dataset_id"],
                     provenance["dataset_revision"],
                     provenance["source_file"],
-                    provenance["source_blob_sha1"],
+                    provenance.get("source_blob_sha1"),
+                    provenance.get("source_blob_sha256"),
                     provenance["category"],
                 )
                 if source_key not in allowed_sources:

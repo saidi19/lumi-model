@@ -101,6 +101,24 @@ def validate_quality_config(config: Mapping[str, Any]) -> None:
         raise ValueError("quality.language.allowed_languages must be a non-empty list")
     if not all(isinstance(code, str) and re.fullmatch(r"[a-z]{2}", code) for code in allowed):
         raise ValueError("allowed language labels must be lowercase ISO 639-1 codes")
+    allowed_by_category = language.get("allowed_languages_by_category", {})
+    if not isinstance(allowed_by_category, Mapping):
+        raise ValueError("quality.language.allowed_languages_by_category must be an object")
+    for category, category_allowed in allowed_by_category.items():
+        if not isinstance(category, str) or not category:
+            raise ValueError("category-specific language rules need non-empty category names")
+        if not isinstance(category_allowed, list) or not category_allowed:
+            raise ValueError(
+                f"category-specific allowed languages for {category} must be a non-empty list"
+            )
+        if not all(
+            isinstance(code, str) and re.fullmatch(r"[a-z]{2}", code)
+            for code in category_allowed
+        ):
+            raise ValueError(
+                f"category-specific language labels for {category} must be "
+                "lowercase ISO 639-1 codes"
+            )
     confidence = language.get("minimum_confidence")
     if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
         raise ValueError("quality.language.minimum_confidence must be numeric")
@@ -176,6 +194,10 @@ class LinguaLanguageIdentifier:
 
         self.detector = LanguageDetectorBuilder.from_all_spoken_languages().build()
         self.allowed = set(config["allowed_languages"])
+        self.allowed_by_category = {
+            str(category): set(codes)
+            for category, codes in config.get("allowed_languages_by_category", {}).items()
+        }
         self.minimum_confidence = float(config["minimum_confidence"])
         self.max_characters = int(config["max_characters"])
         self.bypass_categories = set(config.get("bypass_categories", []))
@@ -207,7 +229,8 @@ class LinguaLanguageIdentifier:
         )
         if confidence < self.minimum_confidence:
             return LanguageResult(label, confidence, "low_confidence")
-        if label not in self.allowed:
+        allowed = self.allowed_by_category.get(category, self.allowed)
+        if label not in allowed:
             return LanguageResult(label, confidence, "disallowed")
         return LanguageResult(label, confidence, "accepted")
 

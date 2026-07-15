@@ -1,19 +1,21 @@
 # Lumi representative tokenizer sample v0.1
 
-Status: **25MB scale canary passed; full 6GB build awaits the multilingual slice**
+Status: **23-source and Bengali source canaries passed separately; combined 24-source canary pending**
 
 ## Purpose
 
 This stage produces the provenance-preserving, quality-gated text used to train
 the 32K and 65K tokenizer candidates. It is not model-pretraining data and it
 does not approve an H100 run. The default plan targets 6,000,000,000 accepted
-UTF-8 text bytes across the same 23 pinned components as the audited 1GB
-development artifact.
+UTF-8 text bytes: 99% from the same 23 pinned components as the audited 1GB
+development artifact and 1% from a pinned Bengali Wikipedia source. The
+Bengali allocation is therefore 60MB; it changes the tokenizer sample only and
+does not modify the candidate 80B pretraining mixture.
 
-The English-first component mix is ready. A small explicitly licensed
-Bangla/multilingual slice must be added and audited before either tokenizer is
-frozen; the slice protects future Unicode token efficiency without changing
-Lumi v1 into a Bangla-focused model.
+The source-level license basis, file digest, dataset revision, article ID,
+title, and page URL are retained. This protects future Unicode token efficiency
+without changing Lumi v1 into a Bangla-focused model. See
+`docs/multilingual-source-v0.1.md` for the source decision and limitations.
 
 ## Disconnect-safe implementation
 
@@ -28,6 +30,8 @@ Lumi v1 into a Bangla-focused model.
   Codex session.
 - Generated SQLite files are caches outside Git. The JSONL and manifest remain
   the authoritative corpus artifacts.
+- The Bengali Parquet source is read through bounded HTTP range requests. The
+  full 192MB shard is not downloaded merely to read its footer or first rows.
 
 Progress can be inspected without modifying the job:
 
@@ -53,6 +57,33 @@ Completed on 2026-07-15:
 
 The generated canary remains outside Git at
 `/private/tmp/lumi-tokenizer-sqlite-canary`.
+
+The Bengali source-only canary completed on 2026-07-15:
+
+| Check | Result |
+|---|---:|
+| Accepted UTF-8 text | 1,076,043 bytes |
+| Documents | 20 |
+| Language labels | `bn`: 20 |
+| Source revision | `3e1f92c331f318af862b87e2319ed5dc26d80f5d` |
+| Parquet SHA-256 | `98a8189cf1d0e4b41d647b3d88bd6201e571e002344b5648496c6bfda402841b` |
+| Fresh validation | Pass, from line 0 |
+| Cached validation | Pass, resumed at line 20 |
+| Sample SHA-256 | `a3ce570bfa96c25e033977f2abeb8b765431fcf80a6e183693310c252b11c2c8` |
+
+It remains outside Git at `/private/tmp/lumi-bn-parquet-canary`. Reproduce the
+bounded category-only gate with:
+
+```bash
+python scripts/build_representative_tokenizer_sample.py \
+  --output /path/to/lumi-bn-parquet-canary \
+  --target-bytes 1000000 \
+  --canary-category multilingual_reference \
+  --retries 0
+```
+
+The category-only flag requires a target no larger than 100MB, preventing an
+accidental full-size single-category build.
 
 Run a bounded all-component build before the full target:
 
@@ -81,9 +112,10 @@ also pass `--config` only when using a fully composed machine-readable config.
 
 Do not start the default 6GB build until:
 
-1. the 25MB SQLite/restart canary remains reproducible (passed once);
-2. the licensed multilingual slice is configured and audited;
-3. projected free disk space covers JSONL, both SQLite indexes, tokenizer
+1. the 25MB 23-source SQLite/restart canary remains reproducible (passed once);
+2. the Bengali source-only range/quality canary remains reproducible (passed once);
+3. one combined 24-source canary passes every source quota;
+4. projected free disk space covers JSONL, both SQLite indexes, tokenizer
    outputs, and temporary files;
-4. the job is launched with `--resume --retry-forever` and local logs;
-5. 32K and 65K tokenizers are trained from the exact same finalized sample.
+5. the job is launched with `--resume --retry-forever` and local logs;
+6. 32K and 65K tokenizers are trained from the exact same finalized sample.

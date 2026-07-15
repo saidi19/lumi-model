@@ -293,6 +293,87 @@ def test_build_validate_and_resume_local_sample(tmp_path: Path) -> None:
         build_sample(config, output)
 
 
+def test_builds_pinned_parquet_source_with_sha256_provenance(tmp_path: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    parquet_path = tmp_path / "bangla.parquet"
+    rows = []
+    for index in range(12):
+        rows.append(
+            {
+                "id": f"bn-{index}",
+                "text": (
+                    f"বাংলা নিবন্ধ {index} একটি নির্ভরযোগ্য বহুভাষিক টোকেনাইজার নমুনা তৈরির "
+                    "জন্য স্বাভাবিক বাক্য, ইতিহাস, বিজ্ঞান এবং সংস্কৃতি নিয়ে বিস্তারিত আলোচনা "
+                    "করে। প্রতিটি নথিতে আলাদা বিষয় ও শব্দভাণ্ডার রাখা হয়েছে।"
+                ),
+                "title": f"বাংলা শিরোনাম {index}",
+                "url": f"https://bn.wikipedia.org/wiki/Fixture_{index}",
+            }
+        )
+    pq.write_table(pa.Table.from_pylist(rows), parquet_path)
+    config = {
+        "dataset": {
+            "id": "test/corpus",
+            "revision": "a" * 40,
+            "upstream_card": "https://example.invalid/test/corpus",
+        },
+        "filters": _policy(),
+        "mixture": [
+            {
+                "category": "multilingual_reference",
+                "sources": [
+                    {
+                        "blob_sha256": sha256_file(parquet_path),
+                        "component": "wikimedia_wikipedia_bn",
+                        "compressed_bytes": parquet_path.stat().st_size,
+                        "dataset_id": "wikimedia/wikipedia",
+                        "file": "20231101.bn/fixture.parquet",
+                        "format": "parquet",
+                        "required_non_null_provenance": [
+                            "upstream_id",
+                            "upstream_url",
+                            "title",
+                            "language",
+                            "license_basis",
+                        ],
+                        "retain_provenance": {
+                            "title": "title",
+                            "upstream_id": "id",
+                            "upstream_url": "url",
+                        },
+                        "revision": "d" * 40,
+                        "static_provenance": {
+                            "language": "bn",
+                            "license_basis": "fixture CC-BY-SA source-level basis",
+                        },
+                        "url": parquet_path.as_uri(),
+                    }
+                ],
+                "weight": 1.0,
+            }
+        ],
+        "purpose": "test Parquet source",
+        "target_uncompressed_text_bytes": 900,
+        "version": "0.1",
+    }
+    output = tmp_path / "parquet-sample"
+
+    manifest = build_sample(config, output)
+    validation = validate_sample(output, expected_config=config)
+    record = json.loads((output / "sample.jsonl").read_text().splitlines()[0])
+
+    assert validation["text_utf8_bytes"] >= 900
+    assert manifest["source_files"][0]["format"] == "parquet"
+    assert manifest["source_files"][0]["blob_sha256"] == sha256_file(parquet_path)
+    assert record["provenance"]["source_blob_sha256"] == sha256_file(parquet_path)
+    assert record["retained_provenance"]["language"] == "bn"
+    assert record["retained_provenance"]["upstream_url"].startswith(
+        "https://bn.wikipedia.org/wiki/"
+    )
+
+
 def test_resume_rejects_changed_target(tmp_path: Path) -> None:
     first_source = tmp_path / "education.jsonl.gz"
     second_source = tmp_path / "code.jsonl.gz"

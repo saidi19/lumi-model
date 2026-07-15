@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -80,10 +81,24 @@ def compose_development_config(
             "quality_config",
         )
     }
+    supplemental_path_value = plan.get("supplemental_mixture")
+    if supplemental_path_value is not None:
+        if not isinstance(supplemental_path_value, str):
+            raise ValueError("supplemental_mixture must be a repository-relative path")
+        input_paths["supplemental_mixture"] = _repository_path(
+            repository_root, supplemental_path_value
+        )
     anchors = _load_json(input_paths["component_anchor_files"])
     inventory = _load_json(input_paths["component_inventory"])
     mixture_plan = _load_json(input_paths["mixture_plan"])
     quality = _load_json(input_paths["quality_config"])
+    supplemental = {"mixture": [], "version": "0.1"}
+    if "supplemental_mixture" in input_paths:
+        supplemental = _load_json(input_paths["supplemental_mixture"])
+        if supplemental.get("version") != "0.1":
+            raise ValueError("supplemental mixture version must be 0.1")
+        if not isinstance(supplemental.get("mixture"), list):
+            raise ValueError("supplemental mixture must contain a mixture list")
 
     inventory_by_component = {
         source["component"]: source for source in inventory["sources"]
@@ -102,6 +117,19 @@ def compose_development_config(
     configured_weights = plan.get("source_weights")
     if not isinstance(configured_weights, Mapping):
         raise ValueError("development plan source_weights must be an object")
+    supplemental_weight = sum(
+        float(entry.get("weight", 0.0)) for entry in supplemental["mixture"]
+    )
+    if not 0.0 <= supplemental_weight < 1.0:
+        raise ValueError("supplemental mixture weight must be in [0, 1)")
+    base_weight_scale = 1.0 - supplemental_weight
+    base_categories = {entry["category"] for entry in mixture_plan["mixture"]}
+    supplemental_categories = [entry.get("category") for entry in supplemental["mixture"]]
+    if len(set(supplemental_categories)) != len(supplemental_categories):
+        raise ValueError("supplemental mixture repeats a category")
+    if base_categories & set(supplemental_categories):
+        raise ValueError("supplemental mixture category collides with the base plan")
+
     mixture = []
     for mixture_entry in mixture_plan["mixture"]:
         category = mixture_entry["category"]
@@ -139,9 +167,10 @@ def compose_development_config(
             {
                 "category": category,
                 "sources": sources,
-                "weight": mixture_entry["weight"],
+                "weight": float(mixture_entry["weight"]) * base_weight_scale,
             }
         )
+    mixture.extend(deepcopy(supplemental["mixture"]))
 
     config = {
         "composition": {

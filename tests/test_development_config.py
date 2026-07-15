@@ -49,8 +49,19 @@ def test_representative_tokenizer_plan_uses_minimum_six_gigabyte_target() -> Non
         repository_root=root,
     )
     assert config["target_uncompressed_text_bytes"] == 6_000_000_000
-    assert "multilingual slice is required" in config["purpose"]
-    assert sum(len(entry["sources"]) for entry in config["mixture"]) == 23
+    assert "1% Bengali reference slice" in config["purpose"]
+    assert sum(len(entry["sources"]) for entry in config["mixture"]) == 24
+    multilingual = next(
+        entry for entry in config["mixture"] if entry["category"] == "multilingual_reference"
+    )
+    assert multilingual["weight"] == 0.01
+    assert multilingual["sources"][0]["format"] == "parquet"
+    assert re.fullmatch(r"[0-9a-f]{64}", multilingual["sources"][0]["blob_sha256"])
+    assert "supplemental_mixture" in config["composition"]
+    assert math.isclose(
+        sum(entry["weight"] for entry in config["mixture"]),
+        1.0,
+    )
 
 
 def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> None:

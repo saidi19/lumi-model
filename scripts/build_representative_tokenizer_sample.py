@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from lumi.data_pipeline import build_sample
@@ -19,6 +20,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", type=Path, default=DEFAULT_PLAN)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-bytes", type=int)
+    parser.add_argument(
+        "--canary-category",
+        help="build one category only; requires --target-bytes <= 100000000",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
     parser.add_argument("--retries", type=int, default=3)
@@ -33,6 +38,21 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     config = compose_development_config(args.plan, repository_root=REPOSITORY_ROOT)
+    if args.canary_category is not None:
+        if args.target_bytes is None or not 0 < args.target_bytes <= 100_000_000:
+            raise ValueError(
+                "--canary-category requires --target-bytes between 1 and 100000000"
+            )
+        matches = [
+            entry for entry in config["mixture"]
+            if entry["category"] == args.canary_category
+        ]
+        if len(matches) != 1:
+            raise ValueError(f"unknown canary category: {args.canary_category}")
+        selected = deepcopy(matches[0])
+        selected["weight"] = 1.0
+        config["mixture"] = [selected]
+        config["purpose"] += f"; category-only canary: {args.canary_category}"
     manifest = build_sample(
         config,
         args.output,

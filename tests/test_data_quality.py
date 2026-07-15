@@ -96,6 +96,25 @@ def test_lingua_labels_english_and_rejects_bengali() -> None:
     assert identifier.identify("def f(x): return x + 1", "code").label == "zxx"
 
 
+def test_lingua_allows_bengali_only_in_the_multilingual_category() -> None:
+    identifier = LinguaLanguageIdentifier(
+        {
+            "allowed_languages": ["en"],
+            "allowed_languages_by_category": {"multilingual_reference": ["bn"]},
+            "bypass_categories": ["code"],
+            "max_characters": 4096,
+            "minimum_confidence": 0.6,
+            "package_version": "2.2.0",
+        }
+    )
+    text = (
+        "বাংলা ভাষায় লেখা এই অনুচ্ছেদটি বহুভাষিক টোকেনাইজার নমুনার জন্য তৈরি করা হয়েছে। "
+        "এখানে যথেষ্ট স্বাভাবিক বাক্য রয়েছে যাতে ভাষা শনাক্তকরণ নির্ভরযোগ্য হয়।"
+    )
+    assert identifier.identify(text, "multilingual_reference").decision == "accepted"
+    assert identifier.identify(text, "reference").decision == "disallowed"
+
+
 def test_benchmark_registry_matches_exact_and_embedded_text(tmp_path: Path) -> None:
     benchmark_text = (
         "Which careful procedure prevents evaluation examples from entering the training corpus "
