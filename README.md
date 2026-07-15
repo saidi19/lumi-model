@@ -25,10 +25,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
    coverage and a real 25MB, 23-source disconnect/resume canary;
 7. a SHA-256-pinned Bengali Wikipedia Parquet source, category-scoped language
    policy, and 1MB real-network canary pass with retained article URLs;
-8. the first 6GB attempt exposed three capacity-limited sources without spending
-   GPU credit; a pinned v0.2 capacity report, safe-margin allocations, preflight
-   guard, and corrected 24-source canary now pass; next: the fresh 6GB sample and
-   a measured 32K/65K tokenizer comparison;
+8. the v0.2 full-size attempt exposed a single-anchor assumption in a multi-file
+   component without spending GPU credit; v0.3 now has generic component-level
+   continuation, per-file provenance, resumable exhaustion state, and mandatory
+   full-quota capacity gates; Stack passes, while WikiTeam and CCCC audits still
+   block the 6GB resume;
 9. only then: MLX/GGUF conversion, a small real-corpus pilot, and measured GPU
    throughput.
 
@@ -72,6 +73,6 @@ The metadata-preserving follow-up is in
 The current audited all-component result is in
 [`docs/development-sample-v0.4.md`](docs/development-sample-v0.4.md).
 The current scale-up gates are in
-[`docs/tokenizer-sample-v0.2.md`](docs/tokenizer-sample-v0.2.md), and the pinned
+[`docs/tokenizer-sample-v0.3.md`](docs/tokenizer-sample-v0.3.md), and the pinned
 Bengali source decision is in
 [`docs/multilingual-source-v0.1.md`](docs/multilingual-source-v0.1.md).
