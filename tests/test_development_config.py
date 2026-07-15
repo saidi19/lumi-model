@@ -45,10 +45,11 @@ def test_development_config_composes_all_23_weighted_components() -> None:
 def test_representative_tokenizer_plan_uses_minimum_six_gigabyte_target() -> None:
     root = Path(__file__).parents[1]
     config = compose_development_config(
-        root / "configs" / "tokenizer-sample-v0.1.json",
+        root / "configs" / "tokenizer-sample-v0.2.json",
         repository_root=root,
     )
     assert config["target_uncompressed_text_bytes"] == 6_000_000_000
+    assert config["version"] == "0.2"
     assert "1% Bengali reference slice" in config["purpose"]
     assert sum(len(entry["sources"]) for entry in config["mixture"]) == 24
     multilingual = next(
@@ -58,10 +59,38 @@ def test_representative_tokenizer_plan_uses_minimum_six_gigabyte_target() -> Non
     assert multilingual["sources"][0]["format"] == "parquet"
     assert re.fullmatch(r"[0-9a-f]{64}", multilingual["sources"][0]["blob_sha256"])
     assert "supplemental_mixture" in config["composition"]
+    assert "source_capacity_report" in config["composition"]
     assert math.isclose(
         sum(entry["weight"] for entry in config["mixture"]),
         1.0,
     )
+    capacities = {
+        source["component"]: source["verified_capacity_text_utf8_bytes"]
+        for entry in config["mixture"]
+        for source in entry["sources"]
+        if "verified_capacity_text_utf8_bytes" in source
+    }
+    assert capacities == {
+        "oercommons": 50_199_017,
+        "public_domain_review": 7_021_638,
+        "python_enhancement_proposals": 11_244_664,
+    }
+
+    target = config["target_uncompressed_text_bytes"]
+    planned_targets = {}
+    for entry in config["mixture"]:
+        category_target = int(target * entry["weight"])
+        for source in entry["sources"]:
+            if source["component"] in capacities:
+                planned_targets[source["component"]] = int(
+                    category_target * source["weight_within_category"]
+                )
+    assert planned_targets == {
+        "oercommons": 35_640_000,
+        "public_domain_review": 4_455_000,
+        "python_enhancement_proposals": 7_128_000,
+    }
+    assert all(planned_targets[name] < capacities[name] for name in capacities)
 
 
 def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> None:

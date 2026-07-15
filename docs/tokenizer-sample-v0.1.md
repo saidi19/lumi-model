@@ -1,6 +1,12 @@
 # Lumi representative tokenizer sample v0.1
 
-Status: **all required 25MB and source-only canaries passed; 6GB build ready**
+Status: **superseded by v0.2 after the first 6GB run exposed an impossible OER Commons source quota**
+
+The v0.1 full build stopped safely at 1,653,568,270 accepted text bytes because
+the complete pinned OER Commons source supplied 50,199,017 bytes against a
+178,200,000-byte target. No GPU was used. The retained failed artifact and its
+exact source-capacity evidence led to the corrected, preflighted plan in
+[`tokenizer-sample-v0.2.md`](tokenizer-sample-v0.2.md).
 
 ## Purpose
 

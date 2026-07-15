@@ -459,6 +459,15 @@ def validate_sample_config(config: Mapping[str, Any]) -> None:
                 or compressed_bytes <= 0
             ):
                 raise ValueError(f"source {source_file} must record its compressed size")
+            verified_capacity = source.get("verified_capacity_text_utf8_bytes")
+            if verified_capacity is not None and (
+                not isinstance(verified_capacity, int)
+                or isinstance(verified_capacity, bool)
+                or verified_capacity <= 0
+            ):
+                raise ValueError(
+                    f"source {source_file} has an invalid verified text capacity"
+                )
             source_dataset_id = source.get("dataset_id")
             source_revision = source.get("revision")
             if (source_dataset_id is None) != (source_revision is None):
@@ -1074,6 +1083,10 @@ def _manifest_from_run(
             for digest_key in ("blob_sha1", "blob_sha256"):
                 if digest_key in source:
                     source_manifest[digest_key] = source[digest_key]
+            if "verified_capacity_text_utf8_bytes" in source:
+                source_manifest["verified_capacity_text_utf8_bytes"] = source[
+                    "verified_capacity_text_utf8_bytes"
+                ]
             source_files.append(source_manifest)
     quality_enabled = "quality" in config
     limitations = [
@@ -1130,7 +1143,7 @@ def _manifest_from_run(
     return manifest
 
 
-def build_sample(
+def _build_sample_impl(
     config: Mapping[str, Any],
     output_directory: Path,
     *,
@@ -1152,6 +1165,20 @@ def build_sample(
         raise ValueError("target_bytes must be positive")
     targets = _category_targets(config, effective_target)
     source_targets = _source_targets(config, targets)
+    for mixture_entry in config["mixture"]:
+        category = mixture_entry["category"]
+        for source in mixture_entry["sources"]:
+            verified_capacity = source.get("verified_capacity_text_utf8_bytes")
+            source_target = source_targets.get(_source_key(config["dataset"], source, category))
+            if (
+                verified_capacity is not None
+                and source_target is not None
+                and source_target > verified_capacity
+            ):
+                raise ValueError(
+                    f"source target for {source['file']} is {source_target} bytes, exceeding "
+                    f"verified capacity {verified_capacity}"
+                )
     config_sha256 = _sha256_bytes(_canonical_json_bytes(config))
     run_fingerprint = _sha256_bytes(
         _canonical_json_bytes(
@@ -1203,6 +1230,11 @@ def build_sample(
             "target_uncompressed_text_bytes": effective_target,
         }
         _atomic_json_write(state_path, state)
+
+    state["status"] = "building"
+    state.pop("failure", None)
+    state["updated_at"] = _utc_now()
+    _atomic_json_write(state_path, state)
 
     stats = _scan_records(sample_path)
     rejections = Counter(state.get("rejections", {}))
@@ -1465,6 +1497,46 @@ def build_sample(
     state["updated_at"] = _utc_now()
     _atomic_json_write(state_path, state)
     return manifest
+
+
+def build_sample(
+    config: Mapping[str, Any],
+    output_directory: Path,
+    *,
+    target_bytes: int | None = None,
+    resume: bool = False,
+    timeout_seconds: float = 60.0,
+    retries: int = 2,
+    retry_forever: bool = False,
+) -> dict[str, Any]:
+    """Build a sample and persist a machine-readable failure state on interruption."""
+
+    try:
+        return _build_sample_impl(
+            config,
+            output_directory,
+            target_bytes=target_bytes,
+            resume=resume,
+            timeout_seconds=timeout_seconds,
+            retries=retries,
+            retry_forever=retry_forever,
+        )
+    except BaseException as error:
+        state_path = output_directory / "run-state.json"
+        if state_path.is_file():
+            try:
+                with state_path.open(encoding="utf-8") as handle:
+                    state = json.load(handle)
+                state["failure"] = {
+                    "message": str(error),
+                    "type": type(error).__name__,
+                }
+                state["status"] = "failed"
+                state["updated_at"] = _utc_now()
+                _atomic_json_write(state_path, state)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        raise
 
 
 def validate_sample(

@@ -69,8 +69,8 @@ def compose_development_config(
 ) -> dict[str, Any]:
     repository_root = repository_root or Path(__file__).resolve().parents[2]
     plan = _load_json(plan_path)
-    if plan.get("version") != "0.1":
-        raise ValueError("development sample plan version must be 0.1")
+    if plan.get("version") not in {"0.1", "0.2"}:
+        raise ValueError("development sample plan version must be 0.1 or 0.2")
 
     input_paths = {
         name: _repository_path(repository_root, plan[name])
@@ -88,10 +88,30 @@ def compose_development_config(
         input_paths["supplemental_mixture"] = _repository_path(
             repository_root, supplemental_path_value
         )
+    capacity_path_value = plan.get("source_capacity_report")
+    if capacity_path_value is not None:
+        if not isinstance(capacity_path_value, str):
+            raise ValueError("source_capacity_report must be a repository-relative path")
+        input_paths["source_capacity_report"] = _repository_path(
+            repository_root, capacity_path_value
+        )
     anchors = _load_json(input_paths["component_anchor_files"])
     inventory = _load_json(input_paths["component_inventory"])
     mixture_plan = _load_json(input_paths["mixture_plan"])
     quality = _load_json(input_paths["quality_config"])
+    capacity_report = None
+    if "source_capacity_report" in input_paths:
+        capacity_report = _load_json(input_paths["source_capacity_report"])
+        if capacity_report.get("version") != "0.1":
+            raise ValueError("source capacity report version must be 0.1")
+        if capacity_report.get("status") != "complete":
+            raise ValueError("source capacity report must be complete")
+        if capacity_report.get("filters") != plan.get("filters"):
+            raise ValueError("source capacity report filters do not match the plan")
+        if capacity_report.get("quality_config_sha256") != _sha256_file(
+            input_paths["quality_config"]
+        ):
+            raise ValueError("source capacity report quality config does not match")
     supplemental = {"mixture": [], "version": "0.1"}
     if "supplemental_mixture" in input_paths:
         supplemental = _load_json(input_paths["supplemental_mixture"])
@@ -113,6 +133,28 @@ def compose_development_config(
         raise ValueError("component inventory does not exactly cover the mixture plan")
     if set(anchor_by_component) != expected_components:
         raise ValueError("component anchor files do not exactly cover the mixture plan")
+
+    capacities_by_component: dict[str, Mapping[str, Any]] = {}
+    if capacity_report is not None:
+        capacity_sources = capacity_report.get("sources")
+        if not isinstance(capacity_sources, list) or not capacity_sources:
+            raise ValueError("source capacity report must contain a non-empty sources list")
+        for capacity in capacity_sources:
+            if not isinstance(capacity, Mapping):
+                raise ValueError("source capacity report entries must be objects")
+            component_name = capacity.get("component")
+            if component_name not in expected_components:
+                raise ValueError(f"capacity report contains unknown component {component_name}")
+            if component_name in capacities_by_component:
+                raise ValueError(f"capacity report repeats component {component_name}")
+            accepted_bytes = capacity.get("accepted_text_utf8_bytes")
+            if (
+                not isinstance(accepted_bytes, int)
+                or isinstance(accepted_bytes, bool)
+                or accepted_bytes <= 0
+            ):
+                raise ValueError(f"capacity report has invalid bytes for {component_name}")
+            capacities_by_component[str(component_name)] = capacity
 
     configured_weights = plan.get("source_weights")
     if not isinstance(configured_weights, Mapping):
@@ -148,6 +190,19 @@ def compose_development_config(
             anchor = anchor_by_component[component_name]
             if anchor["file"] != component["schema_anchor"]:
                 raise ValueError(f"anchor mismatch for component {component_name}")
+            capacity = capacities_by_component.get(component_name)
+            if capacity is not None:
+                expected_capacity_pins = {
+                    "blob_sha1": anchor["blob_sha1"],
+                    "dataset_id": component["dataset_id"],
+                    "file": anchor["file"],
+                    "revision": component["revision"],
+                }
+                for name, expected_value in expected_capacity_pins.items():
+                    if capacity.get(name) != expected_value:
+                        raise ValueError(
+                            f"capacity report {name} mismatch for component {component_name}"
+                        )
             retained, static, required = _source_provenance(component)
             source = {
                 "blob_sha1": anchor["blob_sha1"],
@@ -160,6 +215,10 @@ def compose_development_config(
                 "revision": component["revision"],
                 "weight_within_category": weights[component_name],
             }
+            if capacity is not None:
+                source["verified_capacity_text_utf8_bytes"] = capacity[
+                    "accepted_text_utf8_bytes"
+                ]
             if static:
                 source["static_provenance"] = static
             sources.append(source)
