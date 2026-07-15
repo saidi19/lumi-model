@@ -26,13 +26,14 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 7. a SHA-256-pinned Bengali Wikipedia Parquet source, category-scoped language
    policy, and 1MB real-network canary pass with retained article URLs;
 8. the v0.2 full-size attempt exposed a single-anchor assumption in a multi-file
-   component without spending GPU credit; v0.3 now has generic component-level
+   component without spending GPU credit; v0.3 adds generic component-level
    continuation, per-file provenance, resumable exhaustion state, and mandatory
-   full-quota capacity gates; Stack, WikiTeam, and CCCC audits plus the 6GB
-   no-download preflight and v0.3 all-source canary pass; next: migrate and
-   resume the verified 2.883GB artifact;
-9. only then: MLX/GGUF conversion, a small real-corpus pilot, and measured GPU
-   throughput.
+   full-quota capacity gates;
+9. the resulting 6GB accepted-text sample is sealed at 1,128,089 documents and
+   SHA-256 `80bea9f9634a8daca542b2ffd0aad1c8c994a7cbeef909a5e529b6272671102a`;
+   resumed full validation and the cached validation check pass;
+10. next: compare 32K/65K tokenizers, then run MLX/GGUF conversion, a small
+    real-corpus pilot, and measured GPU throughput.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
