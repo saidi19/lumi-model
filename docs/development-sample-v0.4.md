@@ -25,7 +25,11 @@ does not redact a private-looking numeric quad without configuration context.
 Phone-like values require an international `+` prefix or a tight telephone,
 fax, hotline, call, contact, or field-label relationship. Scientific/version
 contexts are excluded. The same predicates run during filtering and validation,
-and `contextual-v4` is included in both the run fingerprint and manifest.
+and `contextual-v4` is included in both the run fingerprint and manifest. A
+subsequent validation run found that replacing one contextual value could
+expose another value to the detector's bounded context window. Contextual v5
+therefore repeats the same conservative redaction predicates to a fixed point
+and fails closed if they do not converge.
 
 | Artifact | IPv4 redactions | Phone redactions | Disposition |
 |---|---:|---:|---|
@@ -47,7 +51,8 @@ or explicitly labelled phone values.
 - Pinned component files: [`configs/component-anchor-files-v0.1.json`](../configs/component-anchor-files-v0.1.json)
 - Quality policy: [`configs/data-quality-v0.1.json`](../configs/data-quality-v0.1.json)
 - Hashed held-out benchmark registry: `data/benchmark-signatures-v0.1.jsonl.gz`
-- PII implementation: `contextual-v4`
+- PII implementation at the original v0.4 seal: `contextual-v4`; tokenizer
+  sample v0.3 repair and later builds use `contextual-v5`
 - Accepted documents: 166,757
 - Accepted text: 1,000,895,350 UTF-8 bytes
 - Materialized JSONL size: 1,253,922,152 bytes

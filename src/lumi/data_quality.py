@@ -392,6 +392,18 @@ class MinHashNearDuplicateIndex:
         self.index.insert(document_id, signature)
         self.signatures[document_id] = signature
 
+    def replace(self, document_id: str, signature: Any) -> None:
+        """Atomically replace one accepted document's MinHash signature."""
+
+        existing = self.signatures.get(document_id)
+        if existing is None:
+            raise KeyError(f"near-duplicate signature does not exist for {document_id}")
+        if self.fingerprint(existing) == self.fingerprint(signature):
+            return
+        self.index.remove(document_id)
+        self.index.insert(document_id, signature)
+        self.signatures[document_id] = signature
+
     def count(self) -> int:
         return len(self.signatures)
 
@@ -594,6 +606,34 @@ class SQLiteMinHashNearDuplicateIndex(MinHashNearDuplicateIndex):
             ),
         )
 
+    def replace(self, document_id: str, signature: Any) -> None:
+        """Replace one durable signature and all of its LSH buckets."""
+
+        signature_bytes = self._signature_bytes(signature)
+        existing = self.connection.execute(
+            f"SELECT signature FROM {self._signatures_table} WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if existing is None:
+            raise KeyError(f"near-duplicate signature does not exist for {document_id}")
+        if bytes(existing[0]) == signature_bytes:
+            return
+        self.connection.execute(
+            f"DELETE FROM {self._buckets_table} WHERE document_id = ?", (document_id,)
+        )
+        self.connection.execute(
+            f"UPDATE {self._signatures_table} SET signature = ? WHERE document_id = ?",
+            (signature_bytes, document_id),
+        )
+        self.connection.executemany(
+            f"INSERT INTO {self._buckets_table} (band, bucket, document_id) "
+            "VALUES (?, ?, ?)",
+            (
+                (band, self._bucket_bytes(signature, start, end), document_id)
+                for band, (start, end) in enumerate(self.hashranges)
+            ),
+        )
+
     def count(self) -> int:
         row = self.connection.execute(
             f"SELECT COUNT(*) FROM {self._signatures_table}"
@@ -710,6 +750,13 @@ class DataQualityGate:
         if evaluation.rejection_reason is not None or evaluation.near_duplicate_signature is None:
             raise ValueError("cannot accept a rejected or incomplete quality evaluation")
         self.near_duplicate.add(document_id, evaluation.near_duplicate_signature)
+
+    def replace(self, document_id: str, evaluation: QualityEvaluation) -> None:
+        """Replace metadata-backed index state after a deterministic text repair."""
+
+        if evaluation.rejection_reason is not None or evaluation.near_duplicate_signature is None:
+            raise ValueError("cannot replace with a rejected or incomplete quality evaluation")
+        self.near_duplicate.replace(document_id, evaluation.near_duplicate_signature)
 
     def verify_and_accept_record(self, record: Mapping[str, Any], line_number: int) -> None:
         document_id = str(record["id"])
