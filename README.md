@@ -25,7 +25,8 @@ tokenizer, data, and deployment portability before any expensive GPU run:
    coverage and a real 25MB, 23-source disconnect/resume canary;
 7. a SHA-256-pinned Bengali Wikipedia Parquet source, category-scoped language
    policy, and 1MB real-network canary pass with retained article URLs;
-8. next: a combined 24-source tokenizer canary, the 6GB representative sample,
+8. the combined 24-source tokenizer canary passes every source quota plus fresh,
+   cached, and completed-resume validation; next: the 6GB representative sample
    and a measured 32K/65K tokenizer comparison;
 9. only then: MLX/GGUF conversion, a small real-corpus pilot, and measured GPU
    throughput.

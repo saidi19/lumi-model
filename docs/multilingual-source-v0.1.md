@@ -1,6 +1,6 @@
 # Lumi multilingual tokenizer source v0.1
 
-Status: **source selected, pinned, and source-only canary passed**
+Status: **source selected, pinned, and source-only plus combined canaries passed**
 
 ## Decision
 
@@ -63,8 +63,17 @@ Parquet footer inspection used 272,391 range-read bytes. The file contains
 row-group boundary explains why the 1MB accepted-text canary used roughly
 8.5MB of payload rather than downloading the full 192MB shard.
 
+## Combined canary
+
+The 2026-07-15 combined 24-source run accepted 25,637,516 UTF-8 text bytes in
+5,014 documents. Every source met its quota. The Bengali category contributed
+256,799 bytes in five `bn` documents against a 250,000-byte target. Fresh
+validation passed from line 0, cached validation resumed at line 5,014, and a
+completed same-config `--resume` required no further source read. The sample
+SHA-256 is
+`6b28052c9479844f93cf9d7d310a36db5b0931eab02f6ce0c1142878f6d09888`.
+
 ## Next gate
 
-Run one combined 24-source canary on normal Wi-Fi. Do not start the full 6GB
-sample until that canary verifies all source quotas and both fresh and cached
-validation.
+Build and fully validate the resumable 6GB representative tokenizer sample,
+then use that one finalized artifact for the 32K-versus-65K tokenizer bakeoff.

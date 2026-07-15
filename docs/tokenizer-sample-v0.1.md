@@ -1,6 +1,6 @@
 # Lumi representative tokenizer sample v0.1
 
-Status: **23-source and Bengali source canaries passed separately; combined 24-source canary pending**
+Status: **all required 25MB and source-only canaries passed; 6GB build ready**
 
 ## Purpose
 
@@ -85,7 +85,30 @@ python scripts/build_representative_tokenizer_sample.py \
 The category-only flag requires a target no larger than 100MB, preventing an
 accidental full-size single-category build.
 
-Run a bounded all-component build before the full target:
+The combined 24-source canary completed on 2026-07-15:
+
+| Check | Result |
+|---|---:|
+| Accepted UTF-8 text | 25,637,516 bytes |
+| Documents | 5,014 |
+| Pinned sources meeting quota | 24 / 24 |
+| Bengali allocation | 256,799 bytes in 5 `bn` documents |
+| Language labels | `en`: 3,659; `zxx`: 1,350; `bn`: 5 |
+| Network retries | 0 |
+| Build MinHash SQLite cache | ~20MB |
+| Validation SQLite cache | ~22MB |
+| Fresh validation | Pass, from line 0 |
+| Cached validation | Pass, resumed at line 5,014 |
+| Completed `--resume` check | Pass, no source read required |
+| Sample SHA-256 | `6b28052c9479844f93cf9d7d310a36db5b0931eab02f6ce0c1142878f6d09888` |
+
+The sample remains outside Git at
+`/private/tmp/lumi-tokenizer-24-source-canary`. Its JSONL is 33,182,493 bytes;
+the build directory is approximately 74MB including both resumable SQLite
+indexes. The accepted Bengali share is 1.002% of accepted text, preserving the
+planned English-first 99%/1% composition within document-boundary rounding.
+
+Reproduce the bounded all-component build with:
 
 ```bash
 python scripts/build_representative_tokenizer_sample.py \
@@ -114,8 +137,9 @@ Do not start the default 6GB build until:
 
 1. the 25MB 23-source SQLite/restart canary remains reproducible (passed once);
 2. the Bengali source-only range/quality canary remains reproducible (passed once);
-3. one combined 24-source canary passes every source quota;
+3. one combined 24-source canary passes every source quota (passed once);
 4. projected free disk space covers JSONL, both SQLite indexes, tokenizer
-   outputs, and temporary files;
-5. the job is launched with `--resume --retry-forever` and local logs;
-6. 32K and 65K tokenizers are trained from the exact same finalized sample.
+   outputs, and temporary files (705GB free before launch);
+5. launch the job with `--resume --retry-forever` and local logs;
+6. after the sample passes validation, train 32K and 65K tokenizers from the
+   exact same finalized sample.
