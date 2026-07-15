@@ -644,7 +644,9 @@ def test_failed_build_records_failure_and_resume_clears_stale_error(
     assert resumed_state["failure"]["type"] == "RuntimeError"
 
 
-def test_pipeline_applies_and_revalidates_composed_quality_gates(tmp_path: Path) -> None:
+def test_pipeline_applies_and_revalidates_composed_quality_gates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     first_source = tmp_path / "education.jsonl.gz"
     second_source = tmp_path / "code.jsonl.gz"
     _write_source(first_source, "education")
@@ -691,3 +693,51 @@ def test_pipeline_applies_and_revalidates_composed_quality_gates(tmp_path: Path)
     assert indexed == result["documents"]
     records = [json.loads(line) for line in (output / "sample.jsonl").read_text().splitlines()]
     assert all(record["quality"]["benchmark_registry_sha256"] for record in records)
+
+    # Simulate a crash after the sample line was flushed but before its quality
+    # index entry was committed, plus loss of the final manifest. A resume must
+    # evaluate only that missing tail entry.
+    missing_document_id = records[-1]["id"]
+    with sqlite3.connect(output / "build-quality-state.sqlite3") as connection:
+        connection.execute(
+            "DELETE FROM near_duplicate_buckets WHERE document_id = ?",
+            (missing_document_id,),
+        )
+        connection.execute(
+            "DELETE FROM near_duplicate_signatures WHERE document_id = ?",
+            (missing_document_id,),
+        )
+    (output / "manifest.json").unlink()
+    original_verify = data_pipeline.DataQualityGate.verify_and_accept_record
+    build_replay_lines: list[int] = []
+
+    def track_build_replay(
+        gate: data_pipeline.DataQualityGate, record: dict, line_number: int
+    ) -> None:
+        if gate.near_duplicate.table_prefix == "near_duplicate":
+            build_replay_lines.append(line_number)
+        original_verify(gate, record, line_number)
+
+    monkeypatch.setattr(
+        data_pipeline.DataQualityGate,
+        "verify_and_accept_record",
+        track_build_replay,
+    )
+    resumed = build_sample(config, output, resume=True)
+    resumed_state = json.loads((output / "run-state.json").read_text())
+    assert resumed["output"]["sha256"] == manifest["output"]["sha256"]
+    assert build_replay_lines == [2]
+    assert resumed_state["quality_resume"] == {
+        "indexed_documents": 2,
+        "rebuilt_documents": 1,
+        "reused_documents": 1,
+        "sample_documents": 2,
+        "status": "complete",
+    }
+
+    # A subsequent resume with a complete durable index performs no quality
+    # inference for existing build records.
+    (output / "manifest.json").unlink()
+    build_replay_lines.clear()
+    build_sample(config, output, resume=True)
+    assert build_replay_lines == []
