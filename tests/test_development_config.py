@@ -42,6 +42,17 @@ def test_development_config_composes_all_23_weighted_components() -> None:
     )
 
 
+def test_representative_tokenizer_plan_uses_minimum_six_gigabyte_target() -> None:
+    root = Path(__file__).parents[1]
+    config = compose_development_config(
+        root / "configs" / "tokenizer-sample-v0.1.json",
+        repository_root=root,
+    )
+    assert config["target_uncompressed_text_bytes"] == 6_000_000_000
+    assert "multilingual slice is required" in config["purpose"]
+    assert sum(len(entry["sources"]) for entry in config["mixture"]) == 23
+
+
 def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> None:
     root = Path(__file__).parents[1]
     quality = json.loads((root / "configs" / "data-quality-v0.1.json").read_text())

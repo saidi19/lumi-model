@@ -104,8 +104,11 @@ The full post-write validator recomputed every file/content hash, deterministic
 ID, source and required provenance field, category/source quota, language label,
 benchmark signature, and MinHash decision before sealing the manifest.
 
-Next, add a small explicitly licensed Bangla and multilingual tokenizer slice.
-Build a representative tokenizer-only corpus, train the 32K and 65K candidates
+Disk-backed MinHash state and resumable validation checkpoints now remove the
+MinHash-dominated 1GB memory boundary. A real 25MB SQLite network canary passed
+all 23 source quotas, fresh validation, and cached validation. Next, add a small
+explicitly licensed Bangla and multilingual tokenizer slice. Build a
+representative tokenizer-only corpus, train the 32K and 65K candidates
 from identical bytes, and compare domain and multilingual efficiency before
 freezing one tokenizer. Only then run the 50M-token 150M plumbing pilot and a
 measured one-H100 throughput calibration.

@@ -13,6 +13,7 @@ import hashlib
 import importlib.metadata
 import json
 import re
+import sqlite3
 import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Mapping
@@ -349,15 +350,253 @@ class MinHashNearDuplicateIndex:
         values = b"".join(int(value).to_bytes(width, "big") for value in signature.hashvalues)
         return sha256_bytes(values)
 
-    def duplicate_of(self, signature: Any) -> str | None:
+    def duplicate_of(
+        self, signature: Any, *, exclude_document_id: str | None = None
+    ) -> str | None:
         for candidate in sorted(self.index.query(signature)):
+            if candidate == exclude_document_id:
+                continue
             if signature.jaccard(self.signatures[candidate]) >= self.threshold:
                 return candidate
         return None
 
     def add(self, document_id: str, signature: Any) -> None:
+        existing = self.signatures.get(document_id)
+        if existing is not None:
+            if self.fingerprint(existing) != self.fingerprint(signature):
+                raise ValueError(f"near-duplicate signature changed for {document_id}")
+            return
         self.index.insert(document_id, signature)
         self.signatures[document_id] = signature
+
+    def count(self) -> int:
+        return len(self.signatures)
+
+    def document_ids(self) -> set[str]:
+        return set(self.signatures)
+
+    def clear(self) -> None:
+        from datasketch import MinHashLSH
+
+        self.index = MinHashLSH(threshold=self.threshold, num_perm=self.num_perm)
+        self.signatures.clear()
+
+    def flush(self) -> None:
+        """Match the durable index interface; the in-memory backend has nothing to flush."""
+
+    def close(self) -> None:
+        """Match the durable index interface; the in-memory backend has nothing to close."""
+
+
+class SQLiteMinHashNearDuplicateIndex(MinHashNearDuplicateIndex):
+    """Disk-backed MinHash-LSH index for multi-gigabyte corpus construction.
+
+    Only compact MinHash signatures and band buckets are stored. Raw document
+    text never enters the database. The band layout is obtained from the pinned
+    ``datasketch`` implementation, and candidates are rechecked using the full
+    MinHash signature before a duplicate decision is returned.
+    """
+
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        *,
+        path: Path | None = None,
+        connection: sqlite3.Connection | None = None,
+        table_prefix: str = "near_duplicate",
+    ) -> None:
+        if (path is None) == (connection is None):
+            raise ValueError("provide exactly one SQLite path or connection")
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,31}", table_prefix) is None:
+            raise ValueError("invalid SQLite table prefix")
+
+        expected_version = str(config["package_version"])
+        try:
+            actual_version = importlib.metadata.version("datasketch")
+        except importlib.metadata.PackageNotFoundError as error:
+            raise RuntimeError("near-dedup requires `pip install -e '.[data]'`") from error
+        if actual_version != expected_version:
+            raise RuntimeError(
+                "datasketch version mismatch: "
+                f"quality config pins {expected_version}, installed {actual_version}"
+            )
+
+        from datasketch import MinHashLSH
+
+        self.threshold = float(config["threshold"])
+        self.num_perm = int(config["num_perm"])
+        self.shingle_tokens = int(config["shingle_tokens"])
+        self.seed = int(config["seed"])
+        self.scheme = str(config["scheme"])
+        layout = MinHashLSH(threshold=self.threshold, num_perm=self.num_perm)
+        self.hashranges = tuple(tuple(item) for item in layout.hashranges)
+        self.signature_width = 4 if self.scheme == "affine32" else 8
+        self.table_prefix = table_prefix
+        self._owns_connection = connection is None
+        if connection is None:
+            assert path is not None
+            path.parent.mkdir(parents=True, exist_ok=True)
+            connection = sqlite3.connect(path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=NORMAL")
+            connection.execute("PRAGMA temp_store=MEMORY")
+        self.connection = connection
+        self._create_schema(config)
+
+    @property
+    def _metadata_table(self) -> str:
+        return f"{self.table_prefix}_metadata"
+
+    @property
+    def _signatures_table(self) -> str:
+        return f"{self.table_prefix}_signatures"
+
+    @property
+    def _buckets_table(self) -> str:
+        return f"{self.table_prefix}_buckets"
+
+    def _create_schema(self, config: Mapping[str, Any]) -> None:
+        self.connection.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._metadata_table} "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        self.connection.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._signatures_table} "
+            "(document_id TEXT PRIMARY KEY, signature BLOB NOT NULL)"
+        )
+        self.connection.execute(
+            f"CREATE TABLE IF NOT EXISTS {self._buckets_table} "
+            "(band INTEGER NOT NULL, bucket BLOB NOT NULL, document_id TEXT NOT NULL, "
+            "PRIMARY KEY (band, bucket, document_id))"
+        )
+        self.connection.execute(
+            f"CREATE INDEX IF NOT EXISTS {self.table_prefix}_bucket_lookup "
+            f"ON {self._buckets_table} (band, bucket)"
+        )
+        fingerprint = sha256_bytes(
+            json.dumps(
+                {
+                    "hashranges": self.hashranges,
+                    "num_perm": self.num_perm,
+                    "package_version": config["package_version"],
+                    "scheme": self.scheme,
+                    "seed": self.seed,
+                    "shingle_tokens": self.shingle_tokens,
+                    "threshold": self.threshold,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        existing = self.connection.execute(
+            f"SELECT value FROM {self._metadata_table} WHERE key = 'fingerprint'"
+        ).fetchone()
+        if existing is not None and existing[0] != fingerprint and self.count() > 0:
+            raise ValueError("SQLite near-duplicate index configuration changed")
+        self.connection.execute(
+            f"INSERT OR REPLACE INTO {self._metadata_table} (key, value) VALUES (?, ?)",
+            ("fingerprint", fingerprint),
+        )
+        self.connection.execute(
+            f"INSERT OR REPLACE INTO {self._metadata_table} (key, value) VALUES (?, ?)",
+            ("schema_version", "1"),
+        )
+
+    def _signature_bytes(self, signature: Any) -> bytes:
+        if len(signature.hashvalues) != self.num_perm:
+            raise ValueError("MinHash signature length does not match the configured num_perm")
+        return bytes(signature.hashvalues.byteswap().data)
+
+    def _bucket_bytes(self, signature: Any, start: int, end: int) -> bytes:
+        return bytes(signature.hashvalues[start:end].byteswap().data)
+
+    def _estimated_jaccard(self, left: bytes, right: bytes) -> float:
+        if len(left) != len(right) or len(left) != self.num_perm * self.signature_width:
+            raise ValueError("stored MinHash signature has an invalid size")
+        matches = sum(
+            left[offset : offset + self.signature_width]
+            == right[offset : offset + self.signature_width]
+            for offset in range(0, len(left), self.signature_width)
+        )
+        return matches / self.num_perm
+
+    def duplicate_of(
+        self, signature: Any, *, exclude_document_id: str | None = None
+    ) -> str | None:
+        candidates: set[str] = set()
+        for band, (start, end) in enumerate(self.hashranges):
+            bucket = self._bucket_bytes(signature, start, end)
+            candidates.update(
+                row[0]
+                for row in self.connection.execute(
+                    f"SELECT document_id FROM {self._buckets_table} "
+                    "WHERE band = ? AND bucket = ?",
+                    (band, bucket),
+                )
+            )
+        query_bytes = self._signature_bytes(signature)
+        for candidate in sorted(candidates):
+            if candidate == exclude_document_id:
+                continue
+            row = self.connection.execute(
+                f"SELECT signature FROM {self._signatures_table} WHERE document_id = ?",
+                (candidate,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"missing stored MinHash signature for {candidate}")
+            if self._estimated_jaccard(query_bytes, bytes(row[0])) >= self.threshold:
+                return candidate
+        return None
+
+    def add(self, document_id: str, signature: Any) -> None:
+        signature_bytes = self._signature_bytes(signature)
+        existing = self.connection.execute(
+            f"SELECT signature FROM {self._signatures_table} WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if existing is not None:
+            if bytes(existing[0]) != signature_bytes:
+                raise ValueError(f"near-duplicate signature changed for {document_id}")
+            return
+        self.connection.execute(
+            f"INSERT INTO {self._signatures_table} (document_id, signature) VALUES (?, ?)",
+            (document_id, signature_bytes),
+        )
+        self.connection.executemany(
+            f"INSERT INTO {self._buckets_table} (band, bucket, document_id) "
+            "VALUES (?, ?, ?)",
+            (
+                (band, self._bucket_bytes(signature, start, end), document_id)
+                for band, (start, end) in enumerate(self.hashranges)
+            ),
+        )
+
+    def count(self) -> int:
+        row = self.connection.execute(
+            f"SELECT COUNT(*) FROM {self._signatures_table}"
+        ).fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def document_ids(self) -> set[str]:
+        return {
+            str(row[0])
+            for row in self.connection.execute(
+                f"SELECT document_id FROM {self._signatures_table}"
+            )
+        }
+
+    def clear(self) -> None:
+        self.connection.execute(f"DELETE FROM {self._buckets_table}")
+        self.connection.execute(f"DELETE FROM {self._signatures_table}")
+
+    def flush(self) -> None:
+        self.connection.commit()
+
+    def close(self) -> None:
+        if self._owns_connection:
+            self.connection.commit()
+            self.connection.close()
 
 
 @dataclass(frozen=True)
@@ -370,16 +609,38 @@ class QualityEvaluation:
 class DataQualityGate:
     """Compose language, contamination, and near-duplicate gates."""
 
-    def __init__(self, config: Mapping[str, Any], repository_root: Path) -> None:
+    def __init__(
+        self,
+        config: Mapping[str, Any],
+        repository_root: Path,
+        *,
+        near_duplicate_path: Path | None = None,
+        near_duplicate_connection: sqlite3.Connection | None = None,
+        near_duplicate_table_prefix: str = "near_duplicate",
+    ) -> None:
         validate_quality_config(config)
         self.config = config
         self.language = LinguaLanguageIdentifier(config["language"])
         self.benchmark = BenchmarkRegistry(
             config["benchmark_decontamination"], repository_root
         )
-        self.near_duplicate = MinHashNearDuplicateIndex(config["near_duplicate"])
+        if near_duplicate_path is not None or near_duplicate_connection is not None:
+            self.near_duplicate = SQLiteMinHashNearDuplicateIndex(
+                config["near_duplicate"],
+                path=near_duplicate_path,
+                connection=near_duplicate_connection,
+                table_prefix=near_duplicate_table_prefix,
+            )
+        else:
+            self.near_duplicate = MinHashNearDuplicateIndex(config["near_duplicate"])
 
-    def evaluate(self, text: str, category: str) -> QualityEvaluation:
+    def evaluate(
+        self,
+        text: str,
+        category: str,
+        *,
+        exclude_document_id: str | None = None,
+    ) -> QualityEvaluation:
         benchmark_match = self.benchmark.match(text)
         if benchmark_match is not None:
             return QualityEvaluation(
@@ -395,7 +656,9 @@ class DataQualityGate:
             return QualityEvaluation(f"language:disallowed:{language.label}", None, None)
 
         signature = self.near_duplicate.signature(text)
-        duplicate_of = self.near_duplicate.duplicate_of(signature)
+        duplicate_of = self.near_duplicate.duplicate_of(
+            signature, exclude_document_id=exclude_document_id
+        )
         if duplicate_of is not None:
             return QualityEvaluation("near_duplicate", None, None)
 
@@ -426,11 +689,22 @@ class DataQualityGate:
         self.near_duplicate.add(document_id, evaluation.near_duplicate_signature)
 
     def verify_and_accept_record(self, record: Mapping[str, Any], line_number: int) -> None:
-        evaluation = self.evaluate(record["text"], record["provenance"]["category"])
+        document_id = str(record["id"])
+        evaluation = self.evaluate(
+            record["text"],
+            record["provenance"]["category"],
+            exclude_document_id=document_id,
+        )
         if evaluation.rejection_reason is not None:
             raise ValueError(
                 f"quality gate {evaluation.rejection_reason} failed at line {line_number}"
             )
         if record.get("quality") != evaluation.metadata:
             raise ValueError(f"quality metadata mismatch at line {line_number}")
-        self.accept(str(record["id"]), evaluation)
+        self.accept(document_id, evaluation)
+
+    def flush(self) -> None:
+        self.near_duplicate.flush()
+
+    def close(self) -> None:
+        self.near_duplicate.close()

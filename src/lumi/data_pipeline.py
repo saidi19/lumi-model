@@ -14,6 +14,7 @@ import ipaddress
 import json
 import math
 import re
+import sqlite3
 import time
 import unicodedata
 import urllib.error
@@ -584,6 +585,161 @@ def _atomic_json_write(path: Path, value: Mapping[str, Any]) -> None:
     temporary.replace(path)
 
 
+VALIDATION_STATE_SCHEMA_VERSION = 1
+VALIDATION_STATE_FILE = "validation-state.sqlite3"
+
+
+def _validation_fingerprint(manifest: Mapping[str, Any]) -> str:
+    return _sha256_bytes(
+        _canonical_json_bytes(
+            {
+                "config_sha256": manifest["config_sha256"],
+                "output_file_bytes": manifest["output"]["file_bytes"],
+                "output_sha256": manifest["output"]["sha256"],
+                "pii_detector": manifest.get("implementation", {}).get("pii_detector"),
+                "schema_version": VALIDATION_STATE_SCHEMA_VERSION,
+            }
+        )
+    )
+
+
+def _empty_validation_statistics() -> dict[str, Any]:
+    return {
+        "category_bytes": Counter(),
+        "category_documents": Counter(),
+        "language_labels": Counter(),
+        "source_bytes": Counter(),
+        "source_documents": Counter(),
+        "total_text_bytes": 0,
+    }
+
+
+def _serialize_validation_statistics(statistics: Mapping[str, Any]) -> str:
+    return json.dumps(
+        {
+            "category_bytes": dict(sorted(statistics["category_bytes"].items())),
+            "category_documents": dict(
+                sorted(statistics["category_documents"].items())
+            ),
+            "language_labels": dict(sorted(statistics["language_labels"].items())),
+            "source_bytes": [
+                [*key, int(value)]
+                for key, value in sorted(statistics["source_bytes"].items())
+            ],
+            "source_documents": [
+                [*key, int(value)]
+                for key, value in sorted(statistics["source_documents"].items())
+            ],
+            "total_text_bytes": int(statistics["total_text_bytes"]),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _deserialize_validation_statistics(value: str) -> dict[str, Any]:
+    serialized = json.loads(value)
+    statistics = _empty_validation_statistics()
+    statistics["category_bytes"].update(serialized["category_bytes"])
+    statistics["category_documents"].update(serialized["category_documents"])
+    statistics["language_labels"].update(serialized["language_labels"])
+    statistics["source_bytes"].update(
+        {tuple(item[:-1]): int(item[-1]) for item in serialized["source_bytes"]}
+    )
+    statistics["source_documents"].update(
+        {tuple(item[:-1]): int(item[-1]) for item in serialized["source_documents"]}
+    )
+    statistics["total_text_bytes"] = int(serialized["total_text_bytes"])
+    return statistics
+
+
+def _remove_sqlite_state(path: Path) -> None:
+    for candidate in (
+        path,
+        path.with_name(path.name + "-shm"),
+        path.with_name(path.name + "-wal"),
+    ):
+        candidate.unlink(missing_ok=True)
+
+
+def _open_validation_state(
+    path: Path,
+    *,
+    fingerprint: str,
+    resume: bool,
+) -> tuple[sqlite3.Connection, int, int, dict[str, Any], str]:
+    if path.exists() and not resume:
+        _remove_sqlite_state(path)
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA temp_store=MEMORY")
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS validation_progress ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1), "
+        "fingerprint TEXT NOT NULL, status TEXT NOT NULL, next_offset INTEGER NOT NULL, "
+        "line_number INTEGER NOT NULL, statistics TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS validation_document_ids "
+        "(document_id TEXT PRIMARY KEY)"
+    )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS validation_content_hashes "
+        "(content_hash TEXT PRIMARY KEY)"
+    )
+    row = connection.execute(
+        "SELECT fingerprint, status, next_offset, line_number, statistics "
+        "FROM validation_progress WHERE id = 1"
+    ).fetchone()
+    if row is not None and row[0] != fingerprint:
+        connection.close()
+        _remove_sqlite_state(path)
+        return _open_validation_state(path, fingerprint=fingerprint, resume=True)
+    if row is None:
+        statistics = _empty_validation_statistics()
+        connection.execute(
+            "INSERT INTO validation_progress "
+            "(id, fingerprint, status, next_offset, line_number, statistics, updated_at) "
+            "VALUES (1, ?, 'validating', 0, 0, ?, ?)",
+            (fingerprint, _serialize_validation_statistics(statistics), _utc_now()),
+        )
+        connection.commit()
+        return connection, 0, 0, statistics, "validating"
+    return (
+        connection,
+        int(row[2]),
+        int(row[3]),
+        _deserialize_validation_statistics(str(row[4])),
+        str(row[1]),
+    )
+
+
+def _checkpoint_validation(
+    connection: sqlite3.Connection,
+    *,
+    fingerprint: str,
+    status: str,
+    next_offset: int,
+    line_number: int,
+    statistics: Mapping[str, Any],
+) -> None:
+    connection.execute(
+        "UPDATE validation_progress SET fingerprint = ?, status = ?, next_offset = ?, "
+        "line_number = ?, statistics = ?, updated_at = ? WHERE id = 1",
+        (
+            fingerprint,
+            status,
+            next_offset,
+            line_number,
+            _serialize_validation_statistics(statistics),
+            _utc_now(),
+        ),
+    )
+    connection.commit()
+
+
 def _record_id(dataset: Mapping[str, Any], source_file: str, line: int, segment: int) -> str:
     location = f"{dataset['id']}@{dataset['revision']}:{source_file}:{line}:{segment}"
     return f"lumi-{_sha256_bytes(location.encode('utf-8'))}"
@@ -795,6 +951,7 @@ def build_sample(
     resume: bool = False,
     timeout_seconds: float = 60.0,
     retries: int = 2,
+    retry_forever: bool = False,
 ) -> dict[str, Any]:
     """Stream a deterministic canary sample into ``output_directory``."""
 
@@ -869,12 +1026,19 @@ def build_sample(
     quality_gate = None
     if "quality" in config:
         quality_gate = DataQualityGate(
-            config["quality"], Path(__file__).resolve().parents[2]
+            config["quality"],
+            Path(__file__).resolve().parents[2],
+            near_duplicate_path=output_directory / "build-quality-state.sqlite3",
         )
+        indexed_document_ids = quality_gate.near_duplicate.document_ids()
+        if not indexed_document_ids.issubset(stats["document_ids"]):
+            quality_gate.near_duplicate.clear()
+            quality_gate.flush()
         if sample_path.exists():
             with sample_path.open(encoding="utf-8") as existing_sample:
                 for line_number, line in enumerate(existing_sample, start=1):
                     quality_gate.verify_and_accept_record(json.loads(line), line_number)
+            quality_gate.flush()
     writes_since_state = 0
 
     with sample_path.open("a", encoding="utf-8") as output:
@@ -899,7 +1063,8 @@ def build_sample(
                     continue
                 last_error: Exception | None = None
                 source_dataset = _source_dataset(dataset, source)
-                for attempt in range(retries + 1):
+                attempt = 0
+                while True:
                     try:
                         source_lines = _iter_source_lines(dataset, source, timeout_seconds)
                         for source_line, line in source_lines:
@@ -1028,6 +1193,8 @@ def build_sample(
                                 writes_since_state += 1
                                 if writes_since_state >= 100:
                                     output.flush()
+                                    if quality_gate is not None:
+                                        quality_gate.flush()
                                     state["rejections"] = dict(rejections)
                                     state["pii_redactions"] = dict(pii_redactions)
                                     state["language_labels"] = dict(language_labels)
@@ -1048,12 +1215,13 @@ def build_sample(
                         break
                     except (EOFError, OSError, TimeoutError, urllib.error.URLError) as error:
                         last_error = error
-                        if attempt >= retries:
+                        if not retry_forever and attempt >= retries:
                             break
                         state["network_retries"] = int(state.get("network_retries", 0)) + 1
                         state["updated_at"] = _utc_now()
                         _atomic_json_write(state_path, state)
-                        time.sleep(min(2**attempt, 4))
+                        time.sleep(min(2 ** min(attempt, 6), 60))
+                        attempt += 1
                 if last_error is not None:
                     raise RuntimeError(
                         f"failed streaming pinned source {source['file']}"
@@ -1073,6 +1241,8 @@ def build_sample(
                     f"{stats['category_bytes'].get(category, 0)} of {target} target bytes"
                 )
             output.flush()
+            if quality_gate is not None:
+                quality_gate.flush()
             state["rejections"] = dict(rejections)
             state["pii_redactions"] = dict(pii_redactions)
             state["language_labels"] = dict(language_labels)
@@ -1084,6 +1254,9 @@ def build_sample(
             state["updated_at"] = _utc_now()
             _atomic_json_write(state_path, state)
 
+    if quality_gate is not None:
+        quality_gate.flush()
+        quality_gate.close()
     stats = _scan_records(sample_path)
     manifest = _manifest_from_run(
         config=config,
@@ -1104,8 +1277,16 @@ def build_sample(
 
 
 def validate_sample(
-    output_directory: Path, *, expected_config: Mapping[str, Any] | None = None
+    output_directory: Path,
+    *,
+    expected_config: Mapping[str, Any] | None = None,
+    resume_validation: bool = True,
+    checkpoint_interval: int = 1000,
 ) -> dict[str, Any]:
+    """Validate a corpus with disk-backed uniqueness and resumable checkpoints."""
+
+    if checkpoint_interval < 1:
+        raise ValueError("checkpoint_interval must be positive")
     manifest_path = output_directory / "manifest.json"
     if not manifest_path.is_file():
         raise FileNotFoundError(f"sample manifest does not exist: {manifest_path}")
@@ -1130,12 +1311,76 @@ def validate_sample(
     if _sha256_file(sample_path) != expected_output["sha256"]:
         raise ValueError("sample output SHA-256 does not match manifest")
 
+    validation_fingerprint = _validation_fingerprint(manifest)
+    validation_path = output_directory / VALIDATION_STATE_FILE
+    (
+        validation_connection,
+        next_offset,
+        line_number,
+        validation_statistics,
+        validation_status,
+    ) = _open_validation_state(
+        validation_path,
+        fingerprint=validation_fingerprint,
+        resume=resume_validation,
+    )
+    if next_offset > sample_path.stat().st_size:
+        validation_connection.close()
+        raise ValueError("validation checkpoint offset exceeds the sample size")
+    document_count = int(
+        validation_connection.execute(
+            "SELECT COUNT(*) FROM validation_document_ids"
+        ).fetchone()[0]
+    )
+    content_count = int(
+        validation_connection.execute(
+            "SELECT COUNT(*) FROM validation_content_hashes"
+        ).fetchone()[0]
+    )
+    if document_count != line_number or content_count != line_number:
+        validation_connection.close()
+        raise ValueError("validation checkpoint tables do not match its line number")
+    if validation_status == "complete":
+        if (
+            line_number != manifest["statistics"]["documents"]
+            or int(validation_statistics["total_text_bytes"])
+            != expected_output["text_utf8_bytes"]
+        ):
+            validation_connection.close()
+            raise ValueError("completed validation checkpoint does not match the manifest")
+        if "quality" in manifest:
+            quality_row = validation_connection.execute(
+                "SELECT COUNT(*) FROM validation_near_duplicate_signatures"
+            ).fetchone()
+            if quality_row is None or int(quality_row[0]) != line_number:
+                validation_connection.close()
+                raise ValueError(
+                    "completed validation MinHash index does not match the manifest"
+                )
+        validation_connection.close()
+        return {
+            "documents": line_number,
+            "sha256": expected_output["sha256"],
+            "text_utf8_bytes": int(validation_statistics["total_text_bytes"]),
+            "validation_resumed_from_line": line_number,
+        }
+    if validation_status != "validating":
+        validation_connection.close()
+        raise ValueError(f"unsupported validation checkpoint status: {validation_status}")
+
     filters = manifest["filters"]
     quality_gate = None
     if "quality" in manifest:
         quality_gate = DataQualityGate(
-            manifest["quality"], Path(__file__).resolve().parents[2]
+            manifest["quality"],
+            Path(__file__).resolve().parents[2],
+            near_duplicate_connection=validation_connection,
+            near_duplicate_table_prefix="validation_near_duplicate",
         )
+        if quality_gate.near_duplicate.count() != line_number:
+            quality_gate.close()
+            validation_connection.close()
+            raise ValueError("validation MinHash index does not match its line number")
     default_dataset = manifest["dataset"]
     allowed_sources = {
         (
@@ -1155,126 +1400,211 @@ def validate_sample(
         ): source.get("required_non_null_provenance", [])
         for source in manifest["source_files"]
     }
-    content_hashes: set[str] = set()
-    document_ids: set[str] = set()
-    category_bytes: Counter[str] = Counter()
-    category_documents: Counter[str] = Counter()
-    language_labels: Counter[str] = Counter()
-    source_bytes: Counter[tuple[str, str, str, str]] = Counter()
-    source_documents: Counter[tuple[str, str, str, str]] = Counter()
-    total_text_bytes = 0
-    with sample_path.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            try:
-                record = json.loads(line)
-                text = record["text"]
-                provenance = record["provenance"]
-                content_hash = record["content_sha256"]
-                document_id = record["id"]
-            except (json.JSONDecodeError, KeyError, TypeError) as error:
-                raise ValueError(f"invalid sample record at line {line_number}: {error}") from error
-            if not isinstance(text, str) or not text:
-                raise ValueError(f"empty or non-text sample record at line {line_number}")
-            if unicodedata.normalize("NFC", text) != text:
-                raise ValueError(f"sample text is not NFC-normalized at line {line_number}")
-            secret_kind = detect_secret(text)
-            if secret_kind is not None:
-                raise ValueError(f"secret pattern {secret_kind} remains at line {line_number}")
-            pii_kind = detect_pii(text)
-            if pii_kind is not None:
-                raise ValueError(f"PII pattern {pii_kind} remains at line {line_number}")
-            text_bytes = text.encode("utf-8")
-            if len(text_bytes) > int(filters["max_segment_utf8_bytes"]):
-                raise ValueError(
-                    f"sample segment exceeds configured byte cap at line {line_number}"
-                )
-            actual_hash = _sha256_bytes(text_bytes)
-            if content_hash != actual_hash or SHA256_PATTERN.fullmatch(content_hash) is None:
-                raise ValueError(f"content hash mismatch at line {line_number}")
-            if content_hash in content_hashes:
-                raise ValueError(f"duplicate content at line {line_number}")
-            if document_id in document_ids:
-                raise ValueError(f"duplicate document ID at line {line_number}")
-            expected_id = _record_id(
-                {"id": provenance["dataset_id"], "revision": provenance["dataset_revision"]},
-                provenance["source_file"],
-                provenance["source_line"],
-                provenance["segment_index"],
-            )
-            if document_id != expected_id:
-                raise ValueError(f"provenance-derived ID mismatch at line {line_number}")
-            source_key = (
-                provenance["dataset_id"],
-                provenance["dataset_revision"],
-                provenance["source_file"],
-                provenance["source_blob_sha1"],
-                provenance["category"],
-            )
-            if source_key not in allowed_sources:
-                raise ValueError(f"unlisted source provenance at line {line_number}")
-            requirement_key = (
-                provenance["dataset_id"],
-                provenance["dataset_revision"],
-                provenance["source_file"],
-            )
-            retained = record.get("retained_provenance", {})
-            for name in required_provenance[requirement_key]:
-                retained_value = retained.get(name)
-                if retained_value is None or retained_value == "" or retained_value == []:
+    category_bytes = validation_statistics["category_bytes"]
+    category_documents = validation_statistics["category_documents"]
+    language_labels = validation_statistics["language_labels"]
+    source_bytes = validation_statistics["source_bytes"]
+    source_documents = validation_statistics["source_documents"]
+    total_text_bytes = int(validation_statistics["total_text_bytes"])
+    resumed_from_line = line_number
+    processed_since_checkpoint = 0
+    try:
+        with sample_path.open("rb") as handle:
+            handle.seek(next_offset)
+            while True:
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                line_number += 1
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as error:
                     raise ValueError(
-                        f"required retained provenance {name!r} is missing at line {line_number}"
+                        f"invalid UTF-8 sample record at line {line_number}: {error}"
+                    ) from error
+                try:
+                    record = json.loads(line)
+                    text = record["text"]
+                    provenance = record["provenance"]
+                    content_hash = record["content_sha256"]
+                    document_id = record["id"]
+                except (json.JSONDecodeError, KeyError, TypeError) as error:
+                    raise ValueError(
+                        f"invalid sample record at line {line_number}: {error}"
+                    ) from error
+                if not isinstance(text, str) or not text:
+                    raise ValueError(f"empty or non-text sample record at line {line_number}")
+                if unicodedata.normalize("NFC", text) != text:
+                    raise ValueError(
+                        f"sample text is not NFC-normalized at line {line_number}"
                     )
-            if quality_gate is not None:
-                quality_gate.verify_and_accept_record(record, line_number)
-                language_labels[record["quality"]["language"]["label"]] += 1
-            content_hashes.add(content_hash)
-            document_ids.add(document_id)
-            total_text_bytes += len(text_bytes)
-            category_bytes[provenance["category"]] += len(text_bytes)
-            category_documents[provenance["category"]] += 1
-            validation_source_key = (
-                provenance["dataset_id"],
-                provenance["dataset_revision"],
-                provenance["source_file"],
-                provenance["category"],
-            )
-            source_bytes[validation_source_key] += len(text_bytes)
-            source_documents[validation_source_key] += 1
+                secret_kind = detect_secret(text)
+                if secret_kind is not None:
+                    raise ValueError(
+                        f"secret pattern {secret_kind} remains at line {line_number}"
+                    )
+                pii_kind = detect_pii(text)
+                if pii_kind is not None:
+                    raise ValueError(f"PII pattern {pii_kind} remains at line {line_number}")
+                text_bytes = text.encode("utf-8")
+                if len(text_bytes) > int(filters["max_segment_utf8_bytes"]):
+                    raise ValueError(
+                        f"sample segment exceeds configured byte cap at line {line_number}"
+                    )
+                actual_hash = _sha256_bytes(text_bytes)
+                if (
+                    content_hash != actual_hash
+                    or SHA256_PATTERN.fullmatch(content_hash) is None
+                ):
+                    raise ValueError(f"content hash mismatch at line {line_number}")
+                expected_id = _record_id(
+                    {
+                        "id": provenance["dataset_id"],
+                        "revision": provenance["dataset_revision"],
+                    },
+                    provenance["source_file"],
+                    provenance["source_line"],
+                    provenance["segment_index"],
+                )
+                if document_id != expected_id:
+                    raise ValueError(
+                        f"provenance-derived ID mismatch at line {line_number}"
+                    )
+                source_key = (
+                    provenance["dataset_id"],
+                    provenance["dataset_revision"],
+                    provenance["source_file"],
+                    provenance["source_blob_sha1"],
+                    provenance["category"],
+                )
+                if source_key not in allowed_sources:
+                    raise ValueError(f"unlisted source provenance at line {line_number}")
+                requirement_key = (
+                    provenance["dataset_id"],
+                    provenance["dataset_revision"],
+                    provenance["source_file"],
+                )
+                retained = record.get("retained_provenance", {})
+                for name in required_provenance[requirement_key]:
+                    retained_value = retained.get(name)
+                    if (
+                        retained_value is None
+                        or retained_value == ""
+                        or retained_value == []
+                    ):
+                        raise ValueError(
+                            f"required retained provenance {name!r} is missing "
+                            f"at line {line_number}"
+                        )
+                if quality_gate is not None:
+                    quality_gate.verify_and_accept_record(record, line_number)
+                    language_labels[record["quality"]["language"]["label"]] += 1
+                try:
+                    validation_connection.execute(
+                        "INSERT INTO validation_content_hashes (content_hash) VALUES (?)",
+                        (content_hash,),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise ValueError(f"duplicate content at line {line_number}") from error
+                try:
+                    validation_connection.execute(
+                        "INSERT INTO validation_document_ids (document_id) VALUES (?)",
+                        (document_id,),
+                    )
+                except sqlite3.IntegrityError as error:
+                    raise ValueError(
+                        f"duplicate document ID at line {line_number}"
+                    ) from error
+                total_text_bytes += len(text_bytes)
+                category_bytes[provenance["category"]] += len(text_bytes)
+                category_documents[provenance["category"]] += 1
+                validation_source_key = (
+                    provenance["dataset_id"],
+                    provenance["dataset_revision"],
+                    provenance["source_file"],
+                    provenance["category"],
+                )
+                source_bytes[validation_source_key] += len(text_bytes)
+                source_documents[validation_source_key] += 1
+                processed_since_checkpoint += 1
+                if processed_since_checkpoint >= checkpoint_interval:
+                    validation_statistics["total_text_bytes"] = total_text_bytes
+                    _checkpoint_validation(
+                        validation_connection,
+                        fingerprint=validation_fingerprint,
+                        status="validating",
+                        next_offset=handle.tell(),
+                        line_number=line_number,
+                        statistics=validation_statistics,
+                    )
+                    processed_since_checkpoint = 0
 
-    if total_text_bytes != expected_output["text_utf8_bytes"]:
-        raise ValueError("sample text byte count does not match manifest")
-    if len(document_ids) != manifest["statistics"]["documents"]:
-        raise ValueError("sample document count does not match manifest")
-    for category, expected in manifest["statistics"]["categories"].items():
-        if category_bytes[category] != expected["text_utf8_bytes"]:
-            raise ValueError(f"category byte count mismatch for {category}")
-        if category_documents[category] != expected["documents"]:
-            raise ValueError(f"category document count mismatch for {category}")
-        if category_bytes[category] < expected["target_text_utf8_bytes"]:
-            raise ValueError(f"category target was not reached for {category}")
-    if quality_gate is not None:
-        expected_labels = manifest["statistics"]["quality"]["language_labels"]
-        if dict(sorted(language_labels.items())) != expected_labels:
-            raise ValueError("quality language-label counts do not match manifest")
-    for source in manifest["source_files"]:
-        expected_source = source.get("statistics")
-        if not isinstance(expected_source, Mapping):
-            continue
-        validation_source_key = (
-            source.get("dataset_id", default_dataset["id"]),
-            source.get("revision", default_dataset["revision"]),
-            source["file"],
-            source["category"],
+            next_offset = handle.tell()
+
+        validation_statistics["total_text_bytes"] = total_text_bytes
+        _checkpoint_validation(
+            validation_connection,
+            fingerprint=validation_fingerprint,
+            status="validating",
+            next_offset=next_offset,
+            line_number=line_number,
+            statistics=validation_statistics,
         )
-        if source_bytes[validation_source_key] != expected_source["text_utf8_bytes"]:
-            raise ValueError(f"source byte count mismatch for {source['file']}")
-        if source_documents[validation_source_key] != expected_source["documents"]:
-            raise ValueError(f"source document count mismatch for {source['file']}")
-        source_target = expected_source.get("target_text_utf8_bytes")
-        if source_target is not None and source_bytes[validation_source_key] < source_target:
-            raise ValueError(f"source target was not reached for {source['file']}")
-    return {
-        "documents": len(document_ids),
-        "sha256": expected_output["sha256"],
-        "text_utf8_bytes": total_text_bytes,
-    }
+
+        if total_text_bytes != expected_output["text_utf8_bytes"]:
+            raise ValueError("sample text byte count does not match manifest")
+        if line_number != manifest["statistics"]["documents"]:
+            raise ValueError("sample document count does not match manifest")
+        for category, expected in manifest["statistics"]["categories"].items():
+            if category_bytes[category] != expected["text_utf8_bytes"]:
+                raise ValueError(f"category byte count mismatch for {category}")
+            if category_documents[category] != expected["documents"]:
+                raise ValueError(f"category document count mismatch for {category}")
+            if category_bytes[category] < expected["target_text_utf8_bytes"]:
+                raise ValueError(f"category target was not reached for {category}")
+        if quality_gate is not None:
+            expected_labels = manifest["statistics"]["quality"]["language_labels"]
+            if dict(sorted(language_labels.items())) != expected_labels:
+                raise ValueError("quality language-label counts do not match manifest")
+        for source in manifest["source_files"]:
+            expected_source = source.get("statistics")
+            if not isinstance(expected_source, Mapping):
+                continue
+            validation_source_key = (
+                source.get("dataset_id", default_dataset["id"]),
+                source.get("revision", default_dataset["revision"]),
+                source["file"],
+                source["category"],
+            )
+            if source_bytes[validation_source_key] != expected_source["text_utf8_bytes"]:
+                raise ValueError(f"source byte count mismatch for {source['file']}")
+            if source_documents[validation_source_key] != expected_source["documents"]:
+                raise ValueError(f"source document count mismatch for {source['file']}")
+            source_target = expected_source.get("target_text_utf8_bytes")
+            if (
+                source_target is not None
+                and source_bytes[validation_source_key] < source_target
+            ):
+                raise ValueError(f"source target was not reached for {source['file']}")
+
+        _checkpoint_validation(
+            validation_connection,
+            fingerprint=validation_fingerprint,
+            status="complete",
+            next_offset=next_offset,
+            line_number=line_number,
+            statistics=validation_statistics,
+        )
+        return {
+            "documents": line_number,
+            "sha256": expected_output["sha256"],
+            "text_utf8_bytes": total_text_bytes,
+            "validation_resumed_from_line": resumed_from_line,
+        }
+    except Exception:
+        validation_connection.rollback()
+        raise
+    finally:
+        if quality_gate is not None:
+            quality_gate.close()
+        validation_connection.close()

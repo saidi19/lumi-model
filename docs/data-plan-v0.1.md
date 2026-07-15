@@ -76,9 +76,10 @@ candidate is [`configs/data-mix-v0.1.json`](../configs/data-mix-v0.1.json).
   its card describes whole-domain license review, but 0 of 10,000 audited raw
   and filtered rows contained the per-document license field claimed by the
   card.
-- Before scaling beyond this 1GB development artifact, shard or externalize the
-  MinHash index and add validation progress checkpoints; the correctness-first
-  in-memory validator is intentionally bounded and too slow for a 6GB-12GB run.
+- Disk-backed SQLite MinHash state, exact-ID/content indexes, and byte-offset
+  validation checkpoints are now implemented with network retry-forever mode.
+  A 25MB all-component network canary passed with 5,055 documents, all 23
+  sources, a recorded network retry, and both fresh and cached validation.
 - Then stream a stratified 6GB-12GB uncompressed tokenizer-only sample across
   every domain.
 - Keep document IDs, source component, revision, license metadata, and hashes.

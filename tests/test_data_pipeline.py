@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import sqlite3
 from copy import deepcopy
 from pathlib import Path
 
@@ -334,6 +335,72 @@ def test_network_retry_is_persisted(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     assert state["network_retries"] == 1
 
 
+def test_retry_forever_waits_through_multiple_network_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    output = tmp_path / "persistent-retry-sample"
+    original_iter = data_pipeline._iter_source_lines
+    attempts = 0
+
+    def repeatedly_flaky_iter(dataset: dict, source: dict, timeout_seconds: float):
+        nonlocal attempts
+        if attempts < 3:
+            attempts += 1
+            raise OSError("temporary network failure")
+        yield from original_iter(dataset, source, timeout_seconds)
+
+    monkeypatch.setattr(data_pipeline, "_iter_source_lines", repeatedly_flaky_iter)
+    monkeypatch.setattr(data_pipeline.time, "sleep", lambda _: None)
+    manifest = build_sample(config, output, retries=0, retry_forever=True)
+    assert manifest["statistics"]["network_retries"] == 3
+
+
+def test_validation_resumes_from_committed_sqlite_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    config["target_uncompressed_text_bytes"] = 12000
+    output = tmp_path / "checkpointed-validation"
+    manifest = build_sample(config, output)
+    original_detect_secret = data_pipeline.detect_secret
+    calls = 0
+
+    def interrupt_after_three_records(text: str) -> str | None:
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise RuntimeError("simulated validator interruption")
+        return original_detect_secret(text)
+
+    monkeypatch.setattr(data_pipeline, "detect_secret", interrupt_after_three_records)
+    with pytest.raises(RuntimeError, match="simulated validator interruption"):
+        validate_sample(
+            output,
+            resume_validation=False,
+            checkpoint_interval=1,
+        )
+    with sqlite3.connect(output / "validation-state.sqlite3") as connection:
+        status, line_number = connection.execute(
+            "SELECT status, line_number FROM validation_progress WHERE id = 1"
+        ).fetchone()
+    assert status == "validating"
+    assert line_number == 3
+
+    monkeypatch.setattr(data_pipeline, "detect_secret", original_detect_secret)
+    resumed = validate_sample(output, checkpoint_interval=1)
+    assert resumed["validation_resumed_from_line"] == 3
+    assert resumed["documents"] == manifest["statistics"]["documents"]
+
+
 def test_weighted_source_quotas_force_every_source_into_sample(tmp_path: Path) -> None:
     first_source = tmp_path / "education.jsonl.gz"
     second_source = tmp_path / "code.jsonl.gz"
@@ -408,5 +475,10 @@ def test_pipeline_applies_and_revalidates_composed_quality_gates(tmp_path: Path)
     assert manifest["implementation"]["pii_detector"] == "contextual-v4"
     assert manifest["statistics"]["quality"]["language_labels"] == {"en": 1, "zxx": 1}
     assert result["documents"] == 2
+    with sqlite3.connect(output / "build-quality-state.sqlite3") as connection:
+        indexed = connection.execute(
+            "SELECT COUNT(*) FROM near_duplicate_signatures"
+        ).fetchone()[0]
+    assert indexed == result["documents"]
     records = [json.loads(line) for line in (output / "sample.jsonl").read_text().splitlines()]
     assert all(record["quality"]["benchmark_registry_sha256"] for record in records)

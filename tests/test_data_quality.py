@@ -10,6 +10,7 @@ from lumi.data_quality import (
     DataQualityGate,
     LinguaLanguageIdentifier,
     MinHashNearDuplicateIndex,
+    SQLiteMinHashNearDuplicateIndex,
     benchmark_signature_entry,
     sha256_file,
 )
@@ -142,6 +143,50 @@ def test_minhash_index_rejects_near_copy_but_keeps_unrelated_text() -> None:
         "Saturn has a complex ring system composed of ice particles dust and rocky material."
     )
     assert index.duplicate_of(unrelated) is None
+
+
+def test_sqlite_minhash_matches_memory_and_survives_reopen(tmp_path: Path) -> None:
+    config = {
+        "num_perm": 128,
+        "package_version": "2.0.0",
+        "scheme": "affine32",
+        "seed": 1,
+        "shingle_tokens": 4,
+        "threshold": 0.75,
+    }
+    memory = MinHashNearDuplicateIndex(config)
+    database_path = tmp_path / "near-duplicates.sqlite3"
+    disk = SQLiteMinHashNearDuplicateIndex(config, path=database_path)
+    original = (
+        "Reproducible corpus construction records source identity license revision content hash "
+        "and every deterministic transformation before language model training begins."
+    )
+    near_copy = original.replace("begins", "starts")
+    unrelated = (
+        "Saturn has a complex ring system composed of ice particles dust and rocky material."
+    )
+
+    first = memory.signature(original)
+    memory.add("first", first)
+    disk.add("first", disk.signature(original))
+    disk.flush()
+    assert disk.count() == 1
+    assert disk.duplicate_of(disk.signature(near_copy)) == memory.duplicate_of(
+        memory.signature(near_copy)
+    )
+    assert disk.duplicate_of(disk.signature(unrelated)) is None
+    assert disk.duplicate_of(
+        disk.signature(original), exclude_document_id="first"
+    ) is None
+    disk.close()
+
+    reopened = SQLiteMinHashNearDuplicateIndex(config, path=database_path)
+    assert reopened.count() == 1
+    assert reopened.duplicate_of(reopened.signature(near_copy)) == "first"
+    reopened.add("first", reopened.signature(original))
+    with pytest.raises(ValueError, match="signature changed"):
+        reopened.add("first", reopened.signature(unrelated))
+    reopened.close()
 
 
 def test_composed_gate_records_metadata_and_blocks_all_three_classes(tmp_path: Path) -> None:

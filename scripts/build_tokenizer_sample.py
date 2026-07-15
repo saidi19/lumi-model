@@ -22,6 +22,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument(
+        "--retry-forever",
+        action="store_true",
+        help="wait through network outages and resume without Codex supervision",
+    )
     return parser.parse_args()
 
 
@@ -34,6 +39,7 @@ def main() -> None:
         resume=args.resume,
         timeout_seconds=args.timeout_seconds,
         retries=args.retries,
+        retry_forever=args.retry_forever,
     )
     summary = {
         "documents": manifest["statistics"]["documents"],

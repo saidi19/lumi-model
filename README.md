@@ -21,9 +21,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 5. a contextual-PII-v4 1GB development sample passes all 23 component quotas,
    language/secret/provenance gates, near-deduplication, benchmark
    decontamination, full post-write validation, and manual PII snippet review;
-6. next: an explicitly licensed Bangla/multilingual tokenizer slice,
+6. disk-backed MinHash and byte-offset validation checkpoints pass regression
+   coverage and a real 25MB, 23-source disconnect/resume canary;
+7. next: an explicitly licensed Bangla/multilingual tokenizer slice,
    representative tokenizer data, then MLX and GGUF conversion;
-7. only then: a small real-corpus pilot and measured GPU throughput.
+8. only then: a small real-corpus pilot and measured GPU throughput.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
@@ -64,3 +66,5 @@ The metadata-preserving follow-up is in
 [`docs/provenance-canary-v0.2.md`](docs/provenance-canary-v0.2.md).
 The current audited all-component result is in
 [`docs/development-sample-v0.4.md`](docs/development-sample-v0.4.md).
+The scale-up gates are in
+[`docs/tokenizer-sample-v0.1.md`](docs/tokenizer-sample-v0.1.md).
