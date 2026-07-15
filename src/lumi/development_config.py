@@ -69,8 +69,8 @@ def compose_development_config(
 ) -> dict[str, Any]:
     repository_root = repository_root or Path(__file__).resolve().parents[2]
     plan = _load_json(plan_path)
-    if plan.get("version") not in {"0.1", "0.2"}:
-        raise ValueError("development sample plan version must be 0.1 or 0.2")
+    if plan.get("version") not in {"0.1", "0.2", "0.3"}:
+        raise ValueError("development sample plan version must be 0.1, 0.2, or 0.3")
 
     input_paths = {
         name: _repository_path(repository_root, plan[name])
@@ -88,6 +88,13 @@ def compose_development_config(
         input_paths["supplemental_mixture"] = _repository_path(
             repository_root, supplemental_path_value
         )
+    continuation_path_value = plan.get("component_continuation_files")
+    if continuation_path_value is not None:
+        if not isinstance(continuation_path_value, str):
+            raise ValueError("component_continuation_files must be a repository-relative path")
+        input_paths["component_continuation_files"] = _repository_path(
+            repository_root, continuation_path_value
+        )
     capacity_path_value = plan.get("source_capacity_report")
     if capacity_path_value is not None:
         if not isinstance(capacity_path_value, str):
@@ -102,8 +109,8 @@ def compose_development_config(
     capacity_report = None
     if "source_capacity_report" in input_paths:
         capacity_report = _load_json(input_paths["source_capacity_report"])
-        if capacity_report.get("version") != "0.1":
-            raise ValueError("source capacity report version must be 0.1")
+        if capacity_report.get("version") not in {"0.1", "0.2"}:
+            raise ValueError("source capacity report version must be 0.1 or 0.2")
         if capacity_report.get("status") != "complete":
             raise ValueError("source capacity report must be complete")
         if capacity_report.get("filters") != plan.get("filters"):
@@ -120,21 +127,67 @@ def compose_development_config(
         if not isinstance(supplemental.get("mixture"), list):
             raise ValueError("supplemental mixture must contain a mixture list")
 
-    inventory_by_component = {
-        source["component"]: source for source in inventory["sources"]
-    }
+    inventory_by_component = {source["component"]: source for source in inventory["sources"]}
     anchor_by_component = {source["component"]: source for source in anchors["sources"]}
     expected_components = {
-        component
-        for entry in mixture_plan["mixture"]
-        for component in entry["source_components"]
+        component for entry in mixture_plan["mixture"] for component in entry["source_components"]
     }
     if set(inventory_by_component) != expected_components:
         raise ValueError("component inventory does not exactly cover the mixture plan")
     if set(anchor_by_component) != expected_components:
         raise ValueError("component anchor files do not exactly cover the mixture plan")
 
-    capacities_by_component: dict[str, Mapping[str, Any]] = {}
+    continuations_by_component: dict[str, list[dict[str, Any]]] = {}
+    if "component_continuation_files" in input_paths:
+        continuation_config = _load_json(input_paths["component_continuation_files"])
+        if continuation_config.get("version") != "0.1":
+            raise ValueError("component continuation file version must be 0.1")
+        continuation_sources = continuation_config.get("sources")
+        if not isinstance(continuation_sources, list):
+            raise ValueError("component continuation config must contain a sources list")
+        for continuation_source in continuation_sources:
+            if not isinstance(continuation_source, Mapping):
+                raise ValueError("component continuation entries must be objects")
+            component_name = continuation_source.get("component")
+            if component_name not in expected_components:
+                raise ValueError(f"continuation config contains unknown component {component_name}")
+            if component_name in continuations_by_component:
+                raise ValueError(f"continuation config repeats component {component_name}")
+            component = inventory_by_component[str(component_name)]
+            if continuation_source.get("dataset_id") != component["dataset_id"]:
+                raise ValueError(f"continuation dataset mismatch for component {component_name}")
+            if continuation_source.get("revision") != component["revision"]:
+                raise ValueError(f"continuation revision mismatch for component {component_name}")
+            files = continuation_source.get("files")
+            if not isinstance(files, list) or not files:
+                raise ValueError(f"continuation component {component_name} must contain files")
+            normalized_files = []
+            seen_files = {anchor_by_component[str(component_name)]["file"]}
+            for source_file in files:
+                if not isinstance(source_file, Mapping):
+                    raise ValueError(f"continuation files for {component_name} must be objects")
+                file_name = source_file.get("file")
+                if not isinstance(file_name, str) or file_name in seen_files:
+                    raise ValueError(
+                        f"continuation config repeats an invalid file for {component_name}"
+                    )
+                seen_files.add(file_name)
+                normalized = {
+                    key: source_file[key]
+                    for key in (
+                        "blob_sha1",
+                        "blob_sha256",
+                        "compressed_bytes",
+                        "file",
+                        "format",
+                        "url",
+                    )
+                    if key in source_file
+                }
+                normalized_files.append(normalized)
+            continuations_by_component[str(component_name)] = normalized_files
+
+    capacities_by_source: dict[tuple[str, str], Mapping[str, Any]] = {}
     if capacity_report is not None:
         capacity_sources = capacity_report.get("sources")
         if not isinstance(capacity_sources, list) or not capacity_sources:
@@ -145,8 +198,12 @@ def compose_development_config(
             component_name = capacity.get("component")
             if component_name not in expected_components:
                 raise ValueError(f"capacity report contains unknown component {component_name}")
-            if component_name in capacities_by_component:
-                raise ValueError(f"capacity report repeats component {component_name}")
+            source_file = capacity.get("file")
+            if not isinstance(source_file, str) or not source_file:
+                raise ValueError(f"capacity report has invalid file for {component_name}")
+            capacity_key = (str(component_name), source_file)
+            if capacity_key in capacities_by_source:
+                raise ValueError(f"capacity report repeats {component_name} file {source_file}")
             accepted_bytes = capacity.get("accepted_text_utf8_bytes")
             if (
                 not isinstance(accepted_bytes, int)
@@ -154,14 +211,30 @@ def compose_development_config(
                 or accepted_bytes <= 0
             ):
                 raise ValueError(f"capacity report has invalid bytes for {component_name}")
-            capacities_by_component[str(component_name)] = capacity
+            capacity_kind = capacity.get("capacity_kind", "exhaustive")
+            if capacity_kind not in {"exhaustive", "lower_bound"}:
+                raise ValueError(f"capacity report has invalid capacity kind for {component_name}")
+            capacities_by_source[capacity_key] = capacity
+        known_capacity_sources = {
+            (component_name, anchor["file"])
+            for component_name, anchor in anchor_by_component.items()
+        }
+        known_capacity_sources.update(
+            (component_name, source_file["file"])
+            for component_name, source_files in continuations_by_component.items()
+            for source_file in source_files
+        )
+        unknown_capacity_sources = set(capacities_by_source) - known_capacity_sources
+        if unknown_capacity_sources:
+            raise ValueError(
+                "capacity report contains unpinned physical files: "
+                f"{sorted(unknown_capacity_sources)}"
+            )
 
     configured_weights = plan.get("source_weights")
     if not isinstance(configured_weights, Mapping):
         raise ValueError("development plan source_weights must be an object")
-    supplemental_weight = sum(
-        float(entry.get("weight", 0.0)) for entry in supplemental["mixture"]
-    )
+    supplemental_weight = sum(float(entry.get("weight", 0.0)) for entry in supplemental["mixture"])
     if not 0.0 <= supplemental_weight < 1.0:
         raise ValueError("supplemental mixture weight must be in [0, 1)")
     base_weight_scale = 1.0 - supplemental_weight
@@ -190,8 +263,15 @@ def compose_development_config(
             anchor = anchor_by_component[component_name]
             if anchor["file"] != component["schema_anchor"]:
                 raise ValueError(f"anchor mismatch for component {component_name}")
-            capacity = capacities_by_component.get(component_name)
+            capacity = capacities_by_source.get((component_name, anchor["file"]))
             if capacity is not None:
+                capacity_digest_names = {
+                    name for name in ("blob_sha1", "blob_sha256") if name in capacity
+                }
+                if capacity_digest_names != {"blob_sha1"}:
+                    raise ValueError(
+                        f"capacity report digest mismatch for component {component_name}"
+                    )
                 expected_capacity_pins = {
                     "blob_sha1": anchor["blob_sha1"],
                     "dataset_id": component["dataset_id"],
@@ -216,11 +296,57 @@ def compose_development_config(
                 "weight_within_category": weights[component_name],
             }
             if capacity is not None:
-                source["verified_capacity_text_utf8_bytes"] = capacity[
-                    "accepted_text_utf8_bytes"
-                ]
+                source["verified_capacity_text_utf8_bytes"] = capacity["accepted_text_utf8_bytes"]
+                if "capacity_kind" in capacity:
+                    source["verified_capacity_is_exhaustive"] = (
+                        capacity["capacity_kind"] == "exhaustive"
+                    )
             if static:
                 source["static_provenance"] = static
+            continuation_files = []
+            for continuation in continuations_by_component.get(component_name, []):
+                continuation = dict(continuation)
+                continuation_capacity = capacities_by_source.get(
+                    (component_name, continuation["file"])
+                )
+                if continuation_capacity is not None:
+                    continuation_digest_names = {
+                        name for name in ("blob_sha1", "blob_sha256") if name in continuation
+                    }
+                    capacity_digest_names = {
+                        name
+                        for name in ("blob_sha1", "blob_sha256")
+                        if name in continuation_capacity
+                    }
+                    if capacity_digest_names != continuation_digest_names:
+                        raise ValueError(
+                            f"capacity report digest mismatch for component "
+                            f"{component_name} file {continuation['file']}"
+                        )
+                    expected_capacity_pins = {
+                        "dataset_id": component["dataset_id"],
+                        "file": continuation["file"],
+                        "revision": component["revision"],
+                    }
+                    for digest_name in ("blob_sha1", "blob_sha256"):
+                        if digest_name in continuation:
+                            expected_capacity_pins[digest_name] = continuation[digest_name]
+                    for name, expected_value in expected_capacity_pins.items():
+                        if continuation_capacity.get(name) != expected_value:
+                            raise ValueError(
+                                f"capacity report {name} mismatch for component "
+                                f"{component_name} file {continuation['file']}"
+                            )
+                    continuation["verified_capacity_text_utf8_bytes"] = continuation_capacity[
+                        "accepted_text_utf8_bytes"
+                    ]
+                    if "capacity_kind" in continuation_capacity:
+                        continuation["verified_capacity_is_exhaustive"] = (
+                            continuation_capacity["capacity_kind"] == "exhaustive"
+                        )
+                continuation_files.append(continuation)
+            if continuation_files:
+                source["continuation_files"] = continuation_files
             sources.append(source)
         mixture.append(
             {
@@ -244,8 +370,7 @@ def compose_development_config(
             "id": mixture_plan["primary_dataset"]["id"],
             "revision": mixture_plan["primary_dataset"]["revision"],
             "upstream_card": (
-                "https://huggingface.co/datasets/"
-                + mixture_plan["primary_dataset"]["id"]
+                "https://huggingface.co/datasets/" + mixture_plan["primary_dataset"]["id"]
             ),
         },
         "filters": plan["filters"],
@@ -255,5 +380,9 @@ def compose_development_config(
         "target_uncompressed_text_bytes": plan["target_uncompressed_text_bytes"],
         "version": plan["version"],
     }
+    if "required_capacity_preflight_components" in plan:
+        config["required_capacity_preflight_components"] = deepcopy(
+            plan["required_capacity_preflight_components"]
+        )
     validate_sample_config(config)
     return config

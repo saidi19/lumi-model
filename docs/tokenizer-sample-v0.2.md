@@ -1,6 +1,7 @@
 # Lumi representative tokenizer sample v0.2
 
-Status: **capacity-corrected 24-source canary passed; fresh 6GB build approved**
+Status: **superseded after the full-size run exposed a multi-file capacity bug;
+see `tokenizer-sample-v0.3.md`**
 
 ## Why v0.2 exists
 
@@ -56,14 +57,26 @@ Completed on 2026-07-15:
 The canary remains outside Git at
 `/private/tmp/lumi-tokenizer-24-source-canary-v02`.
 
-## Full build
+## Full build outcome
 
-The default script now composes `configs/tokenizer-sample-v0.2.json`. Launch on
-the Mac with a sleep inhibitor, persistent retry, and a new output directory:
+The v0.2 full-size run was launched and stopped safely at the first file of the
+`stackv2_edu` component. That component required 1,180,872,000 accepted bytes,
+while `stack-edu-0000.json.gz` exhausted at 1,101,302,254 bytes. The v0.2
+sampler had no component-level continuation behavior, so it failed even though
+the pinned dataset contains additional files.
+
+The artifact is retained and verified as migration-compatible; do not relaunch
+it with the v0.2 plan. The correction and remaining gates are documented in
+`tokenizer-sample-v0.3.md`.
+
+## Historical launch command
+
+This command is retained only as a record of the v0.2 attempt:
 
 ```bash
 caffeinate -dimsu /usr/bin/env PYTHONPATH=src python \
   scripts/build_representative_tokenizer_sample.py \
+  --plan configs/tokenizer-sample-v0.2.json \
   --output /Users/afnan/Documents/lumi-data/tokenizer-sample-v0.2 \
   --resume \
   --retry-forever \

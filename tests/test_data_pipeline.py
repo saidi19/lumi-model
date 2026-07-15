@@ -14,6 +14,7 @@ from lumi.data_pipeline import (
     detect_pii,
     detect_secret,
     filter_document,
+    preflight_sample_config,
     validate_sample,
 )
 from lumi.data_quality import benchmark_signature_entry, sha256_file
@@ -39,8 +40,7 @@ def _write_source(path: Path, label: str) -> None:
                 f"{label}-{index}. Contact person{index}@example.org from server IP "
                 f"192.0.2.{index % 10}. "
                 + "A varied tokenizer sample needs complete sentences and "
-                "code-like_name tokens. "
-                * 3
+                "code-like_name tokens. " * 3
             )
             record = {
                 "id": f"{label}-{index}",
@@ -103,9 +103,7 @@ def _config(first_source: Path, second_source: Path) -> dict:
                         "file": "code/part.jsonl.gz",
                         "required_non_null_provenance": ["upstream_id", "license_basis"],
                         "retain_provenance": {"upstream_id": "id"},
-                        "static_provenance": {
-                            "license_basis": "fixture source-level open license"
-                        },
+                        "static_provenance": {"license_basis": "fixture source-level open license"},
                         "url": second_source.as_uri(),
                     }
                 ],
@@ -514,6 +512,95 @@ def test_weighted_source_quotas_force_every_source_into_sample(tmp_path: Path) -
         build_sample(invalid, tmp_path / "invalid-weighted")
 
 
+def test_component_quota_spills_into_pinned_continuation_with_exact_provenance(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary.jsonl.gz"
+    continuation = tmp_path / "continuation.jsonl.gz"
+    unused = tmp_path / "unused.jsonl.gz"
+    _write_source(primary, "primary")
+    _write_source(continuation, "continuation")
+    _write_source(unused, "unused")
+    config = _config(primary, unused)
+    source = config["mixture"][0]["sources"][0]
+    source["weight_within_category"] = 1.0
+    source["verified_capacity_text_utf8_bytes"] = 10_480
+    source["verified_capacity_is_exhaustive"] = True
+    source["continuation_files"] = [
+        {
+            "blob_sha1": "e" * 40,
+            "compressed_bytes": continuation.stat().st_size,
+            "file": "education/part-0001.jsonl.gz",
+            "url": continuation.as_uri(),
+            "verified_capacity_text_utf8_bytes": 5_000,
+            "verified_capacity_is_exhaustive": False,
+        }
+    ]
+    config["mixture"] = [config["mixture"][0]]
+    config["mixture"][0]["weight"] = 1.0
+    config["target_uncompressed_text_bytes"] = 15_000
+    config["required_capacity_preflight_components"] = ["education"]
+
+    preflight = preflight_sample_config(config)
+    assert preflight["sources"][0]["status"] == "verified"
+    output = tmp_path / "multi-shard"
+    manifest = build_sample(config, output)
+    validation = validate_sample(output, expected_config=config)
+
+    group = manifest["source_files"][0]
+    assert group["statistics"]["text_utf8_bytes"] >= 15_000
+    assert [item["file"] for item in group["physical_files"]] == [
+        "education/part.jsonl.gz",
+        "education/part-0001.jsonl.gz",
+    ]
+    assert group["physical_files"][0]["statistics"]["text_utf8_bytes"] == 10_480
+    assert group["physical_files"][1]["statistics"]["text_utf8_bytes"] > 0
+    records = [json.loads(line) for line in (output / "sample.jsonl").read_text().splitlines()]
+    continuation_records = [
+        record
+        for record in records
+        if record["provenance"]["source_file"] == "education/part-0001.jsonl.gz"
+    ]
+    assert continuation_records
+    assert all(
+        record["provenance"]["source_blob_sha1"] == "e" * 40 for record in continuation_records
+    )
+    assert validation["text_utf8_bytes"] == group["statistics"]["text_utf8_bytes"]
+
+
+def test_capacity_preflight_rejects_unverified_required_continuation(
+    tmp_path: Path,
+) -> None:
+    primary = tmp_path / "primary.jsonl.gz"
+    continuation = tmp_path / "continuation.jsonl.gz"
+    unused = tmp_path / "unused.jsonl.gz"
+    _write_source(primary, "primary")
+    _write_source(continuation, "continuation")
+    _write_source(unused, "unused")
+    config = _config(primary, unused)
+    source = config["mixture"][0]["sources"][0]
+    source["weight_within_category"] = 1.0
+    source["verified_capacity_text_utf8_bytes"] = 10_480
+    source["verified_capacity_is_exhaustive"] = True
+    source["continuation_files"] = [
+        {
+            "blob_sha1": "e" * 40,
+            "compressed_bytes": continuation.stat().st_size,
+            "file": "education/part-0001.jsonl.gz",
+            "url": continuation.as_uri(),
+        }
+    ]
+    config["mixture"] = [config["mixture"][0]]
+    config["mixture"][0]["weight"] = 1.0
+    config["target_uncompressed_text_bytes"] = 15_000
+    config["required_capacity_preflight_components"] = ["education"]
+    output = tmp_path / "unverified"
+
+    with pytest.raises(ValueError, match="required capacity preflight"):
+        build_sample(config, output)
+    assert not output.exists()
+
+
 def test_verified_source_capacity_rejects_an_impossible_plan_before_writing(
     tmp_path: Path,
 ) -> None:
@@ -524,9 +611,7 @@ def test_verified_source_capacity_rejects_an_impossible_plan_before_writing(
     config = _config(first_source, second_source)
     for entry in config["mixture"]:
         entry["sources"][0]["weight_within_category"] = 1.0
-    config["mixture"][0]["sources"][0][
-        "verified_capacity_text_utf8_bytes"
-    ] = 2_999
+    config["mixture"][0]["sources"][0]["verified_capacity_text_utf8_bytes"] = 2_999
     output = tmp_path / "impossible-capacity"
 
     with pytest.raises(ValueError, match="exceeding verified capacity 2999"):
@@ -602,9 +687,7 @@ def test_pipeline_applies_and_revalidates_composed_quality_gates(tmp_path: Path)
     assert manifest["statistics"]["quality"]["language_labels"] == {"en": 1, "zxx": 1}
     assert result["documents"] == 2
     with sqlite3.connect(output / "build-quality-state.sqlite3") as connection:
-        indexed = connection.execute(
-            "SELECT COUNT(*) FROM near_duplicate_signatures"
-        ).fetchone()[0]
+        indexed = connection.execute("SELECT COUNT(*) FROM near_duplicate_signatures").fetchone()[0]
     assert indexed == result["documents"]
     records = [json.loads(line) for line in (output / "sample.jsonl").read_text().splitlines()]
     assert all(record["quality"]["benchmark_registry_sha256"] for record in records)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import math
 import re
 from pathlib import Path
 
+from lumi.data_pipeline import preflight_sample_config
 from lumi.data_quality import sha256_file
 from lumi.development_config import compose_development_config
 
@@ -37,8 +39,7 @@ def test_development_config_composes_all_23_weighted_components() -> None:
     assert "license_basis" in cccc["static_provenance"]
     assert "license_basis" in cccc["required_non_null_provenance"]
     assert all(
-        re.fullmatch(r"[0-9a-f]{64}", item["sha256"])
-        for item in config["composition"].values()
+        re.fullmatch(r"[0-9a-f]{64}", item["sha256"]) for item in config["composition"].values()
     )
 
 
@@ -92,14 +93,63 @@ def test_representative_tokenizer_plan_uses_minimum_six_gigabyte_target() -> Non
     }
     assert all(planned_targets[name] < capacities[name] for name in capacities)
 
+    canonical = json.dumps(
+        config, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    assert hashlib.sha256(canonical).hexdigest() == (
+        "0d49f873ef1846f079c5e6e87974e5f8445734696921dfcfeeb2821a09463c98"
+    )
+
+
+def test_v03_composes_component_level_continuation_files() -> None:
+    root = Path(__file__).parents[1]
+    config = compose_development_config(
+        root / "configs" / "tokenizer-sample-v0.3.json",
+        repository_root=root,
+    )
+    sources = {
+        source["component"]: source for entry in config["mixture"] for source in entry["sources"]
+    }
+
+    assert config["version"] == "0.3"
+    assert len(sources) == 24
+    assert sum(1 + len(source.get("continuation_files", [])) for source in sources.values()) == 27
+    assert "component_continuation_files" in config["composition"]
+    assert set(config["required_capacity_preflight_components"]) == {
+        "cccc",
+        "oercommons",
+        "public_domain_review",
+        "python_enhancement_proposals",
+        "stackv2_edu",
+        "wikiteam",
+    }
+    stack = sources["stackv2_edu"]
+    assert [stack["file"]] + [
+        continuation["file"] for continuation in stack["continuation_files"]
+    ] == ["stack-edu-0000.json.gz", "stack-edu-0002.json.gz"]
+    assert all(
+        continuation["file"] != "stack-edu-0001.json.gz"
+        for continuation in stack["continuation_files"]
+    )
+    assert stack["verified_capacity_text_utf8_bytes"] == 1_101_302_254
+    assert stack["continuation_files"][0]["verified_capacity_text_utf8_bytes"] == 100_003_598
+    preflight = preflight_sample_config(config)
+    required = {
+        source["component"]: source
+        for source in preflight["sources"]
+        if source["component"] in config["required_capacity_preflight_components"]
+    }
+    assert preflight["status"] == "pass"
+    assert all(source["status"] == "verified" for source in required.values())
+    assert required["wikiteam"]["verified_capacity_lower_bound_text_utf8_bytes"] == 250_000_118
+    assert required["cccc"]["verified_capacity_lower_bound_text_utf8_bytes"] == 650_000_832
+
 
 def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> None:
     root = Path(__file__).parents[1]
     quality = json.loads((root / "configs" / "data-quality-v0.1.json").read_text())
     registry_path = root / quality["benchmark_decontamination"]["registry"]
-    assert sha256_file(registry_path) == quality["benchmark_decontamination"][
-        "registry_sha256"
-    ]
+    assert sha256_file(registry_path) == quality["benchmark_decontamination"]["registry_sha256"]
     with gzip.open(registry_path, "rt", encoding="utf-8") as handle:
         metadata = json.loads(next(handle))["_meta"]
         assert metadata["entries"] == 46_999
@@ -111,10 +161,7 @@ def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> No
             assert "text" not in entry
             assert "prompt" not in entry
             assert re.fullmatch(r"[0-9a-f]{64}", entry["exact_sha256"])
-            assert all(
-                re.fullmatch(r"[0-9a-f]{64}", value)
-                for value in entry["anchor_sha256"]
-            )
+            assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in entry["anchor_sha256"])
             benchmarks.add(entry["benchmark"])
             entries += 1
     assert entries == metadata["entries"]
@@ -133,9 +180,7 @@ def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> No
 
 def test_benchmark_source_files_pin_revisions_sizes_and_hashes() -> None:
     root = Path(__file__).parents[1]
-    sources = json.loads(
-        (root / "configs" / "benchmark-sources-v0.1.json").read_text()
-    )["sources"]
+    sources = json.loads((root / "configs" / "benchmark-sources-v0.1.json").read_text())["sources"]
     assert len(sources) == 8
     assert {source["benchmark"] for source in sources} == {
         "arc",
