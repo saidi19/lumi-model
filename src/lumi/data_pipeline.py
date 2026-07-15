@@ -1351,6 +1351,74 @@ def _manifest_from_run(
     return manifest
 
 
+def _restore_build_quality_index(
+    *,
+    quality_gate: DataQualityGate,
+    sample_path: Path,
+    sample_document_ids: set[str],
+    state: dict[str, Any],
+    state_path: Path,
+    checkpoint_interval: int = 100,
+) -> None:
+    """Restore only quality-index entries missing from an existing sample.
+
+    Accepted entries in the durable SQLite index were already evaluated under
+    the run's matching quality configuration.  Re-evaluating every indexed
+    document makes multi-gigabyte resumes spend tens of minutes in Lingua and
+    MinHash before useful work can continue.  The sample is scanned separately
+    before this function, so duplicate IDs and source/statistics mismatches are
+    still rejected.  Any sample tail written after the last SQLite commit is
+    verified and inserted here.
+    """
+
+    indexed_document_ids = quality_gate.near_duplicate.document_ids()
+    if not indexed_document_ids.issubset(sample_document_ids):
+        quality_gate.near_duplicate.clear()
+        quality_gate.flush()
+        indexed_document_ids = set()
+
+    reused_documents = len(indexed_document_ids)
+    rebuilt_documents = 0
+    state["quality_resume"] = {
+        "indexed_documents": reused_documents,
+        "rebuilt_documents": rebuilt_documents,
+        "sample_documents": len(sample_document_ids),
+        "status": "restoring",
+    }
+    state["updated_at"] = _utc_now()
+    _atomic_json_write(state_path, state)
+
+    if sample_path.exists():
+        with sample_path.open(encoding="utf-8") as existing_sample:
+            for line_number, line in enumerate(existing_sample, start=1):
+                record = json.loads(line)
+                document_id = str(record["id"])
+                if document_id in indexed_document_ids:
+                    continue
+                quality_gate.verify_and_accept_record(record, line_number)
+                indexed_document_ids.add(document_id)
+                rebuilt_documents += 1
+                if rebuilt_documents % checkpoint_interval == 0:
+                    quality_gate.flush()
+                    state["quality_resume"]["indexed_documents"] = len(indexed_document_ids)
+                    state["quality_resume"]["rebuilt_documents"] = rebuilt_documents
+                    state["updated_at"] = _utc_now()
+                    _atomic_json_write(state_path, state)
+
+    quality_gate.flush()
+    if indexed_document_ids != sample_document_ids:
+        raise ValueError("quality index document IDs do not match the existing sample")
+    state["quality_resume"] = {
+        "indexed_documents": len(indexed_document_ids),
+        "rebuilt_documents": rebuilt_documents,
+        "reused_documents": reused_documents,
+        "sample_documents": len(sample_document_ids),
+        "status": "complete",
+    }
+    state["updated_at"] = _utc_now()
+    _atomic_json_write(state_path, state)
+
+
 def _build_sample_impl(
     config: Mapping[str, Any],
     output_directory: Path,
@@ -1444,15 +1512,13 @@ def _build_sample_impl(
             Path(__file__).resolve().parents[2],
             near_duplicate_path=output_directory / "build-quality-state.sqlite3",
         )
-        indexed_document_ids = quality_gate.near_duplicate.document_ids()
-        if not indexed_document_ids.issubset(stats["document_ids"]):
-            quality_gate.near_duplicate.clear()
-            quality_gate.flush()
-        if sample_path.exists():
-            with sample_path.open(encoding="utf-8") as existing_sample:
-                for line_number, line in enumerate(existing_sample, start=1):
-                    quality_gate.verify_and_accept_record(json.loads(line), line_number)
-            quality_gate.flush()
+        _restore_build_quality_index(
+            quality_gate=quality_gate,
+            sample_path=sample_path,
+            sample_document_ids=stats["document_ids"],
+            state=state,
+            state_path=state_path,
+        )
     writes_since_state = 0
     exhausted_source_files = {
         tuple(item)
