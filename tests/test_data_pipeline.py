@@ -7,7 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from lumi.data_pipeline import build_sample, filter_document, validate_sample
+import lumi.data_pipeline as data_pipeline
+from lumi.data_pipeline import (
+    build_sample,
+    detect_pii,
+    detect_secret,
+    filter_document,
+    validate_sample,
+)
+from lumi.data_quality import benchmark_signature_entry, sha256_file
 
 
 def _policy() -> dict:
@@ -27,7 +35,8 @@ def _write_source(path: Path, label: str) -> None:
         for index in range(30):
             text = (
                 f"{label} document {index} contains useful educational prose and unique marker "
-                f"{label}-{index}. Contact person{index}@example.org from 192.0.2.{index % 10}. "
+                f"{label}-{index}. Contact person{index}@example.org from server IP "
+                f"192.0.2.{index % 10}. "
                 + "A varied tokenizer sample needs complete sentences and "
                 "code-like_name tokens. "
                 * 3
@@ -108,6 +117,34 @@ def _config(first_source: Path, second_source: Path) -> dict:
     }
 
 
+def _write_benchmark_registry(path: Path) -> None:
+    benchmark_text = (
+        "This private evaluation fixture contains a deliberately distinctive sequence of words "
+        "that must not appear inside any model training sample."
+    )
+    entry = benchmark_signature_entry(
+        benchmark="pipeline_fixture",
+        example_id="1",
+        split="test",
+        text=benchmark_text,
+        anchor_ngram_tokens=7,
+        max_anchors=4,
+        minimum_anchor_matches=2,
+    )
+    metadata = {
+        "_meta": {
+            "anchor_ngram_tokens": 7,
+            "entries": 1,
+            "normalization": "nfkc_casefold_whitespace_v1",
+            "schema_version": 1,
+        }
+    }
+    path.write_text(
+        json.dumps(metadata, sort_keys=True) + "\n" + json.dumps(entry, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def test_filter_redacts_pii_and_rejects_credentials() -> None:
     text = (
         "Please email afnan@example.com or connect to 192.0.2.42 for this sufficiently long "
@@ -129,6 +166,101 @@ def test_filter_redacts_pii_and_rejects_credentials() -> None:
     )
     assert secret.text is None
     assert secret.rejection_reason == "secret:assigned_credential"
+
+
+def test_filter_redacts_contextual_phone_numbers() -> None:
+    text = (
+        "For account support, call our phone number +1 (212) 555-0123 during normal business "
+        "hours and never include private contact details in training data."
+    )
+    result = filter_document(text, _policy())
+    assert result.rejection_reason is None
+    assert result.text is not None
+    assert "+1 (212) 555-0123" not in result.text
+    assert "[PHONE_NUMBER]" in result.text
+    assert result.redactions == {"phone": 1}
+
+
+def test_filter_redacts_labelled_ip_ranges_and_phone_fields() -> None:
+    text = (
+        "The two nodes use fixed IP addresses (192.0.2.10 - 192.0.2.11), while the support "
+        'record stores Phone = "612-555-0123" for this intentionally realistic safety test.'
+    )
+    result = filter_document(text, _policy())
+    assert result.rejection_reason is None
+    assert result.text is not None
+    assert result.text.count("[IP_ADDRESS]") == 2
+    assert result.text.count("[PHONE_NUMBER]") == 1
+    assert result.redactions == {"ipv4": 2, "phone": 1}
+
+
+def test_filter_redacts_private_ips_only_with_config_context() -> None:
+    text = (
+        "The export configuration grants /u/usr 192.168.1.2 (rw, sync) and gives the remote "
+        "machine 192.168.1.3 access for this realistic network-safety fixture."
+    )
+    result = filter_document(text, _policy())
+    assert result.rejection_reason is None
+    assert result.text is not None
+    assert result.text.count("[IP_ADDRESS]") == 2
+    assert result.redactions == {"ipv4": 2}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "software version 1.2.3.4",
+        "source-code revision 1.2.3.4",
+        "enzyme EC 3.2.1.3",
+        "ORCID 0000-0002-1825-0097",
+        "DOI 10.1000/1825-0097",
+        "JCPDS card 00-047-1049",
+        "publication years 2019-2020",
+        "Sections 2.3.2.4 and 4.1.1.12",
+        "TCP/IP documentation section §2.5.4.1",
+        "private-range-looking heading 10.1.1.1 Elimination of attributes",
+        "TCP/IP index entry §10.1.1.1",
+        "server IP 999.999.999.999",
+    ],
+)
+def test_filter_preserves_scientific_identifiers_and_versions(value: str) -> None:
+    text = (
+        f"This sufficiently long research record contains {value} as ordinary scholarly "
+        "metadata that must remain intact after corpus filtering."
+    )
+    result = filter_document(text, _policy())
+    assert result.rejection_reason is None
+    assert result.text is not None
+    assert value in result.text
+    assert result.redactions == {}
+    assert detect_pii(result.text) is None
+
+
+def test_filter_preserves_wavenumbers_near_scientific_cell_text() -> None:
+    text = (
+        "The liquid cell spectrum reports wavenumbers 3400 3200 2800 2600 2400 cm-1, and "
+        "these numeric axis labels are measurements rather than telephone numbers."
+    )
+    result = filter_document(text, _policy())
+    assert result.rejection_reason is None
+    assert result.text == text
+    assert result.redactions == {}
+    assert detect_pii(result.text) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        ("sk-ant-" + "a" * 40, "anthropic_api_key"),
+        ("sk-proj-" + "A" * 40, "openai_api_key"),
+        ("hf_" + "a" * 40, "huggingface_token"),
+        ("glpat-" + "a" * 32, "gitlab_token"),
+        ("npm_" + "a" * 36, "npm_token"),
+        ("postgresql://lumi:supersecretpassword@db.example.invalid/model", "credentialed_uri"),
+    ],
+)
+def test_stronger_secret_scanner(value: str, kind: str) -> None:
+    assert detect_secret(f"Never retain this credential: {value}") == kind
 
 
 def test_build_validate_and_resume_local_sample(tmp_path: Path) -> None:
@@ -175,3 +307,106 @@ def test_resume_rejects_changed_target(tmp_path: Path) -> None:
         build_sample(changed, output, resume=True)
     with pytest.raises(ValueError, match="does not match the expected config"):
         validate_sample(output, expected_config=changed)
+
+
+def test_network_retry_is_persisted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    output = tmp_path / "retry-sample"
+    original_iter = data_pipeline._iter_source_lines
+    attempts = 0
+
+    def flaky_iter(dataset: dict, source: dict, timeout_seconds: float):
+        nonlocal attempts
+        if attempts == 0:
+            attempts += 1
+            raise OSError("temporary network failure")
+        yield from original_iter(dataset, source, timeout_seconds)
+
+    monkeypatch.setattr(data_pipeline, "_iter_source_lines", flaky_iter)
+    monkeypatch.setattr(data_pipeline.time, "sleep", lambda _: None)
+    manifest = build_sample(config, output, retries=1)
+    state = json.loads((output / "run-state.json").read_text())
+    assert manifest["statistics"]["network_retries"] == 1
+    assert state["network_retries"] == 1
+
+
+def test_weighted_source_quotas_force_every_source_into_sample(tmp_path: Path) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    first = config["mixture"][0]["sources"][0]
+    second = config["mixture"][1]["sources"][0]
+    first["weight_within_category"] = 0.5
+    second["weight_within_category"] = 0.5
+    config["mixture"] = [
+        {
+            "category": "mixed",
+            "sources": [first, second],
+            "weight": 1.0,
+        }
+    ]
+    config["target_uncompressed_text_bytes"] = 1000
+    output = tmp_path / "weighted-sample"
+    manifest = build_sample(config, output)
+    validate_sample(output, expected_config=config)
+    source_stats = [source["statistics"] for source in manifest["source_files"]]
+    assert all(source["used"] for source in manifest["source_files"])
+    assert [source["target_text_utf8_bytes"] for source in source_stats] == [500, 500]
+    assert all(source["text_utf8_bytes"] >= 500 for source in source_stats)
+
+    invalid = deepcopy(config)
+    del invalid["mixture"][0]["sources"][1]["weight_within_category"]
+    with pytest.raises(ValueError, match="weight either every source or no sources"):
+        build_sample(invalid, tmp_path / "invalid-weighted")
+
+
+def test_pipeline_applies_and_revalidates_composed_quality_gates(tmp_path: Path) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    registry = tmp_path / "benchmarks.jsonl"
+    _write_benchmark_registry(registry)
+    config = _config(first_source, second_source)
+    config["target_uncompressed_text_bytes"] = 500
+    config["quality"] = {
+        "benchmark_decontamination": {
+            "anchor_ngram_tokens": 7,
+            "minimum_anchor_matches": 2,
+            "registry": str(registry),
+            "registry_sha256": sha256_file(registry),
+        },
+        "language": {
+            "allowed_languages": ["en"],
+            "backend": "lingua",
+            "bypass_categories": ["code"],
+            "max_characters": 4096,
+            "minimum_confidence": 0.6,
+            "package_version": "2.2.0",
+        },
+        "near_duplicate": {
+            "algorithm": "minhash_lsh",
+            "num_perm": 64,
+            "package_version": "2.0.0",
+            "scheme": "affine32",
+            "seed": 1,
+            "shingle_tokens": 5,
+            "threshold": 0.8,
+        },
+        "schema_version": 1,
+    }
+    output = tmp_path / "quality-sample"
+    manifest = build_sample(config, output)
+    result = validate_sample(output, expected_config=config)
+    assert manifest["schema_version"] == 2
+    assert manifest["implementation"]["pii_detector"] == "contextual-v4"
+    assert manifest["statistics"]["quality"]["language_labels"] == {"en": 1, "zxx": 1}
+    assert result["documents"] == 2
+    records = [json.loads(line) for line in (output / "sample.jsonl").read_text().splitlines()]
+    assert all(record["quality"]["benchmark_registry_sha256"] for record in records)

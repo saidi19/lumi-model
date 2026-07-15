@@ -17,22 +17,28 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 2. vLLM Transformers-backend compatibility;
 3. one tokenizer contract shared by the 150M pilot and 4B candidate;
 4. a pinned 25MB tokenizer canary, a metadata-preserving 10MB provenance
-   canary, and 32K/65K tokenizer prototypes now pass their local gates;
-5. later in Phase 2: representative tokenizer data, MLX, and GGUF conversion;
-6. only then: a small real-corpus pilot and measured GPU throughput.
+   canary, and 32K/65K tokenizer prototypes pass their local gates;
+5. a contextual-PII-v4 1GB development sample passes all 23 component quotas,
+   language/secret/provenance gates, near-deduplication, benchmark
+   decontamination, full post-write validation, and manual PII snippet review;
+6. next: an explicitly licensed Bangla/multilingual tokenizer slice,
+   representative tokenizer data, then MLX and GGUF conversion;
+7. only then: a small real-corpus pilot and measured GPU throughput.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
 
 ## Quick start
 
-Use Python 3.11 or 3.12.
+Use Python 3.12. The quality-gated data pipeline pins Lingua 2.2.0, whose wheel
+requires Python 3.12 or newer; using one interpreter and detector version keeps
+language decisions reproducible.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,data]'
 pytest
 python scripts/count_parameters.py configs/lumi-4b.json
 python scripts/smoke_train.py --steps 20
@@ -56,3 +62,5 @@ records. The candidate source mix and acquisition gates are in
 in [`docs/data-canary-v0.1.md`](docs/data-canary-v0.1.md).
 The metadata-preserving follow-up is in
 [`docs/provenance-canary-v0.2.md`](docs/provenance-canary-v0.2.md).
+The current audited all-component result is in
+[`docs/development-sample-v0.4.md`](docs/development-sample-v0.4.md).

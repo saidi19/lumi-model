@@ -10,6 +10,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import io
+import ipaddress
 import json
 import math
 import re
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from lumi.data_quality import DataQualityGate, validate_quality_config
+
 REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA1_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -32,7 +35,7 @@ PROVENANCE_KEY_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
 SECRET_PATTERNS = {
     "private_key": re.compile(
-        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----",
+        r"-----BEGIN (?:[A-Z0-9]+(?: [A-Z0-9]+)* )?PRIVATE KEY-----",
         re.IGNORECASE,
     ),
     "aws_access_key": re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])"),
@@ -41,26 +44,110 @@ SECRET_PATTERNS = {
     ),
     "google_api_key": re.compile(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_-]{35}(?![A-Za-z0-9])"),
     "slack_token": re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{20,}"),
+    "anthropic_api_key": re.compile(r"(?<![A-Za-z0-9])sk-ant-[A-Za-z0-9_-]{20,}"),
+    "openai_api_key": re.compile(
+        r"(?<![A-Za-z0-9])sk-(?:(?:proj|svcacct|admin)-)?[A-Za-z0-9_-]{20,}"
+    ),
+    "huggingface_token": re.compile(r"(?<![A-Za-z0-9])hf_[A-Za-z0-9]{30,}"),
+    "gitlab_token": re.compile(r"(?<![A-Za-z0-9])glpat-[A-Za-z0-9_-]{20,}"),
+    "npm_token": re.compile(r"(?<![A-Za-z0-9])npm_[A-Za-z0-9]{30,}"),
+    "stripe_secret": re.compile(r"(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{20,}"),
+    "sendgrid_api_key": re.compile(
+        r"(?<![A-Za-z0-9])SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{20,}"
+    ),
+    "twilio_api_key": re.compile(r"(?<![A-Za-z0-9])SK[0-9a-fA-F]{32}(?![A-Za-z0-9])"),
+    "jwt": re.compile(
+        r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\."
+        r"[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
+    ),
+    "credentialed_uri": re.compile(
+        r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://"
+        r"[^\s:/@]{1,128}:[^\s/@]{8,}@"
+    ),
+    "aws_secret_access_key": re.compile(
+        r"(?i)\baws[_-]?secret[_-]?access[_-]?key\s*[:=]\s*[\"']?"
+        r"[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"
+    ),
     "assigned_credential": re.compile(
-        r"(?i)\b(?:api[_-]?key|access[_-]?token|password|passwd|secret)\s*[:=]\s*"
+        r"(?i)\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|bearer[_-]?token|"
+        r"client[_-]?secret|password|passwd|private[_-]?token|secret)\s*[:=]\s*"
         r"[\"']?[A-Za-z0-9_./+=-]{20,}"
     ),
 }
 
+PII_DETECTOR_VERSION = "contextual-v4"
+
+EMAIL_PATTERN = re.compile(
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I
+)
+IPV4_CANDIDATE_PATTERN = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d|\.\d)")
+PHONE_CANDIDATE_PATTERN = re.compile(
+    r"(?<![\w.])(?:\+\d{1,3}[-. ]?)?(?:\(\d{2,4}\)[-. ]?|\d{2,4}[-. ])"
+    r"\d{3,4}[-. ]\d{4}(?![\w.])"
+)
+IPV4_DIRECT_CONTEXT_PATTERN = re.compile(
+    r"(?:\bip(?:v4)?(?:[-_ ]?addresses?)?|"
+    r"(?:client|host|remote|server)[-_ ]?(?:addr|ip)|\baddress)"
+    r"[^\w\n]{0,12}$",
+    re.I,
+)
+IPV4_RANGE_CONTEXT_PATTERN = re.compile(
+    r"\bip(?:v4)?(?:[-_ ]?addresses?)?\s*\([^)]*$", re.I
+)
+IPV4_NETWORK_CONTEXT_PATTERN = re.compile(
+    r"(?:\b(?:bind|connect(?:ed)?|curl|listen|ping|ssh|telnet|traceroute)"
+    r"(?:\s+(?:at|to))?|\b(?:dns|gateway|host|machine|network|node|proxy|router|server|subnet)"
+    r"[^\w\n]{0,8}|(?:--(?:host|ip|ip-address)|init\.sh))\s*$",
+    re.I,
+)
+IPV4_NON_PII_CONTEXT_PATTERN = re.compile(
+    r"\b(?:appendix|build|chapter|doi|ec|enzyme|equation|figure|firmware|item|jcpds|"
+    r"kernel|library|package|release|revision|sections?|software|table|theorem|version|"
+    r"ver)\b|§",
+    re.I,
+)
+URL_HOST_PREFIX_PATTERN = re.compile(r"(?:https?|ftp|ssh)://(?:[^\s/@]+@)?$", re.I)
+IPV4_PRIVATE_CONFIG_SUFFIX_PATTERN = re.compile(
+    r"^\s*(?::\d{1,5}\b|/\d{1,2}\b|\((?:ro|rw|sync)\b)", re.I
+)
+PHONE_PREFIX_CONTEXT_PATTERN = re.compile(
+    r"(?:\b(?:fax|helpline|hotline|mobile|ph|phone|sms|tel|telephone|voice|whatsapp)\.?"
+    r"(?:\s+(?:no\.?|number))?(?:\s+(?:at|on))?[^\w\n]{0,12}|"
+    r"\b(?:call|contact)\b.{0,48})$",
+    re.I,
+)
+PHONE_SUFFIX_CONTEXT_PATTERN = re.compile(
+    r"^[^\w\n]{0,8}\b(?:fax|helpline|hotline|mobile|phone|tel|telephone|whatsapp)\b",
+    re.I,
+)
+PHONE_NON_PII_CONTEXT_PATTERN = re.compile(
+    r"\b(?:angle|award|doi|ec|figure|grant|isbn|issn|jcpds|orcid|pmid|spectrum|table|"
+    r"version|wavenumbers?|year)\b|cm\s*[-−]\s*1",
+    re.I,
+)
+
+SENSITIVE_LOCAL_IPV4_NETWORKS = tuple(
+    ipaddress.IPv4Network(network)
+    for network in (
+        "10.0.0.0/8",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    )
+)
+
 PII_PATTERNS = {
     "email": (
-        re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I),
+        EMAIL_PATTERN,
         "[EMAIL]",
     ),
     "ipv4": (
-        re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d|\.\d)"),
+        IPV4_CANDIDATE_PATTERN,
         "[IP_ADDRESS]",
     ),
     "phone": (
-        re.compile(
-            r"(?<!\w)(?:\+\d{1,3}[-. ]?)?(?:\(\d{2,4}\)[-. ]?|\d{2,4}[-. ])"
-            r"\d{3,4}[-. ]\d{4}(?!\w)"
-        ),
+        PHONE_CANDIDATE_PATTERN,
         "[PHONE_NUMBER]",
     ),
 }
@@ -103,10 +190,75 @@ def detect_secret(text: str) -> str | None:
     return None
 
 
+def _is_contextual_ipv4(text: str, match: re.Match[str]) -> bool:
+    try:
+        address = ipaddress.IPv4Address(match.group(0))
+    except ipaddress.AddressValueError:
+        return False
+
+    before = text[max(0, match.start() - 80) : match.start()]
+    after = text[match.end() : min(len(text), match.end() + 48)]
+    if URL_HOST_PREFIX_PATTERN.search(before):
+        return True
+    label_context = before[-56:] + after[:24]
+    if IPV4_NON_PII_CONTEXT_PATTERN.search(label_context):
+        return False
+    if IPV4_DIRECT_CONTEXT_PATTERN.search(before) or IPV4_RANGE_CONTEXT_PATTERN.search(before):
+        return True
+    if any(address in network for network in SENSITIVE_LOCAL_IPV4_NETWORKS) and (
+        IPV4_PRIVATE_CONFIG_SUFFIX_PATTERN.search(after) is not None
+    ):
+        return True
+    return IPV4_NETWORK_CONTEXT_PATTERN.search(before[-56:]) is not None
+
+
+def _is_contextual_phone(text: str, match: re.Match[str]) -> bool:
+    value = match.group(0)
+    digit_count = sum(character.isdigit() for character in value)
+    if not 7 <= digit_count <= 15:
+        return False
+
+    before = text[max(0, match.start() - 64) : match.start()]
+    after = text[match.end() : min(len(text), match.end() + 32)]
+    if PHONE_NON_PII_CONTEXT_PATTERN.search(before[-48:] + after[:16]):
+        return False
+    if value.startswith("+"):
+        return True
+    return (
+        PHONE_PREFIX_CONTEXT_PATTERN.search(before) is not None
+        or PHONE_SUFFIX_CONTEXT_PATTERN.search(after) is not None
+    )
+
+
+def _is_pii_match(kind: str, text: str, match: re.Match[str]) -> bool:
+    if kind == "email":
+        return True
+    if kind == "ipv4":
+        return _is_contextual_ipv4(text, match)
+    if kind == "phone":
+        return _is_contextual_phone(text, match)
+    raise ValueError(f"unsupported PII kind: {kind}")
+
+
+def _redact_pii_kind(text: str, kind: str, replacement: str) -> tuple[str, int]:
+    pattern = PII_PATTERNS[kind][0]
+    count = 0
+
+    def replace_if_contextual(match: re.Match[str]) -> str:
+        nonlocal count
+        if not _is_pii_match(kind, text, match):
+            return match.group(0)
+        count += 1
+        return replacement
+
+    return pattern.sub(replace_if_contextual, text), count
+
+
 def detect_pii(text: str) -> str | None:
     for name, (pattern, _) in PII_PATTERNS.items():
-        if pattern.search(text):
-            return name
+        for match in pattern.finditer(text):
+            if _is_pii_match(name, text, match):
+                return name
     return None
 
 
@@ -137,8 +289,8 @@ def filter_document(text: str, policy: Mapping[str, Any]) -> FilterResult:
             return FilterResult(None, "repeated_lines", {}, raw_sha256)
 
     redactions: dict[str, int] = {}
-    for name, (pattern, replacement) in PII_PATTERNS.items():
-        normalized, count = pattern.subn(replacement, normalized)
+    for name, (_, replacement) in PII_PATTERNS.items():
+        normalized, count = _redact_pii_kind(normalized, name, replacement)
         if count:
             redactions[name] = count
     return FilterResult(normalized, None, redactions, raw_sha256)
@@ -214,6 +366,12 @@ def validate_sample_config(config: Mapping[str, Any]) -> None:
     if int(filters["min_document_characters"]) < 1:
         raise ValueError("min_document_characters must be positive")
 
+    quality = config.get("quality")
+    if quality is not None:
+        if not isinstance(quality, Mapping):
+            raise ValueError("sample config quality must be an object")
+        validate_quality_config(quality)
+
     mixture = config.get("mixture")
     if not isinstance(mixture, list) or not mixture:
         raise ValueError("sample config mixture must be a non-empty list")
@@ -235,6 +393,27 @@ def validate_sample_config(config: Mapping[str, Any]) -> None:
         sources = entry.get("sources")
         if not isinstance(sources, list) or not sources:
             raise ValueError(f"category {category} must have at least one source")
+        weighted_sources = ["weight_within_category" in source for source in sources]
+        if any(weighted_sources) and not all(weighted_sources):
+            raise ValueError(
+                f"category {category} must weight either every source or no sources"
+            )
+        if all(weighted_sources):
+            source_weight_total = 0.0
+            for source in sources:
+                source_weight = source["weight_within_category"]
+                if (
+                    not isinstance(source_weight, (int, float))
+                    or isinstance(source_weight, bool)
+                    or source_weight <= 0
+                ):
+                    raise ValueError(f"category {category} has an invalid source weight")
+                source_weight_total += float(source_weight)
+            if not math.isclose(source_weight_total, 1.0, abs_tol=1e-9):
+                raise ValueError(
+                    f"source weights for {category} must sum to 1.0, got "
+                    f"{source_weight_total}"
+                )
         for source in sources:
             component = source.get("component")
             source_file = source.get("file")
@@ -304,9 +483,14 @@ def validate_sample_config(config: Mapping[str, Any]) -> None:
         raise ValueError(f"mixture weights must sum to 1.0, got {total_weight}")
 
 
-def load_sample_config(path: Path) -> dict[str, Any]:
+def load_sample_config(
+    path: Path, *, quality_path: Path | None = None
+) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
         config = json.load(handle)
+    if quality_path is not None:
+        with quality_path.open(encoding="utf-8") as handle:
+            config["quality"] = json.load(handle)
     validate_sample_config(config)
     return config
 
@@ -332,6 +516,40 @@ def _source_dataset(
         "id": str(source.get("dataset_id", default_dataset["id"])),
         "revision": str(source.get("revision", default_dataset["revision"])),
     }
+
+
+def _source_key(
+    default_dataset: Mapping[str, Any], source: Mapping[str, Any], category: str
+) -> tuple[str, str, str, str]:
+    source_dataset = _source_dataset(default_dataset, source)
+    return (
+        source_dataset["id"],
+        source_dataset["revision"],
+        str(source["file"]),
+        category,
+    )
+
+
+def _source_targets(
+    config: Mapping[str, Any], category_targets: Mapping[str, int]
+) -> dict[tuple[str, str, str, str], int]:
+    targets: dict[tuple[str, str, str, str], int] = {}
+    for entry in config["mixture"]:
+        sources = entry["sources"]
+        if not all("weight_within_category" in source for source in sources):
+            continue
+        category = entry["category"]
+        remaining = category_targets[category]
+        for index, source in enumerate(sources):
+            if index == len(sources) - 1:
+                source_target = remaining
+            else:
+                source_target = int(
+                    category_targets[category] * float(source["weight_within_category"])
+                )
+                remaining -= source_target
+            targets[_source_key(config["dataset"], source, category)] = source_target
+    return targets
 
 
 def _source_url(dataset: Mapping[str, Any], source: Mapping[str, Any]) -> str:
@@ -413,6 +631,10 @@ def _scan_records(sample_path: Path) -> dict[str, Any]:
         "content_hashes": set(),
         "document_ids": set(),
         "documents": 0,
+        "language_labels": Counter(),
+        "pii_redactions": Counter(),
+        "source_bytes": defaultdict(int),
+        "source_documents": defaultdict(int),
         "source_files": set(),
         "text_bytes": 0,
     }
@@ -427,6 +649,12 @@ def _scan_records(sample_path: Path) -> dict[str, Any]:
                 document_id = record["id"]
                 content_hash = record["content_sha256"]
                 source_file = record["provenance"]["source_file"]
+                source_key = (
+                    record["provenance"]["dataset_id"],
+                    record["provenance"]["dataset_revision"],
+                    source_file,
+                    category,
+                )
             except (json.JSONDecodeError, KeyError, TypeError) as error:
                 raise ValueError(
                     f"invalid existing sample at line {line_number}: {error}"
@@ -445,6 +673,16 @@ def _scan_records(sample_path: Path) -> dict[str, Any]:
             stats["text_bytes"] += text_bytes
             stats["category_bytes"][category] += text_bytes
             stats["category_documents"][category] += 1
+            stats["source_bytes"][source_key] += text_bytes
+            stats["source_documents"][source_key] += 1
+            stats["pii_redactions"].update(
+                record.get("transformations", {}).get("pii_redactions", {})
+            )
+            quality = record.get("quality")
+            if isinstance(quality, Mapping):
+                label = quality.get("language", {}).get("label")
+                if isinstance(label, str):
+                    stats["language_labels"][label] += 1
     return stats
 
 
@@ -467,8 +705,12 @@ def _manifest_from_run(
         for category, target in targets.items()
     }
     source_files = []
+    source_targets = _source_targets(config, targets)
     for mixture_entry in config["mixture"]:
         for source in mixture_entry["sources"]:
+            source_key = _source_key(
+                config["dataset"], source, mixture_entry["category"]
+            )
             source_files.append(
                 {
                     "blob_sha1": source["blob_sha1"],
@@ -481,20 +723,40 @@ def _manifest_from_run(
                         "required_non_null_provenance", []
                     ),
                     "revision": _source_dataset(config["dataset"], source)["revision"],
-                    "used": source["file"] in stats["source_files"],
+                    "statistics": {
+                        "documents": int(stats["source_documents"].get(source_key, 0)),
+                        "target_text_utf8_bytes": source_targets.get(source_key),
+                        "text_utf8_bytes": int(stats["source_bytes"].get(source_key, 0)),
+                    },
+                    "used": source_key in stats["source_bytes"],
+                    "weight_within_category": source.get("weight_within_category"),
                 }
             )
-    return {
+    quality_enabled = "quality" in config
+    limitations = [
+        "Development sample only: this does not approve a pilot or full-model training run.",
+        "Secret and PII detection is conservative and cannot prove that no sensitive data remains.",
+    ]
+    if quality_enabled:
+        limitations.extend(
+            [
+                "Language identification and MinHash near-deduplication are probabilistic.",
+                "Benchmark decontamination covers only the examples present in the "
+                "pinned registry.",
+            ]
+        )
+    else:
+        limitations.append(
+            "Near-duplicate removal, language identification, and benchmark decontamination "
+            "are not yet applied."
+        )
+    manifest = {
         "config_sha256": config_sha256,
         "created_at": _utc_now(),
         "dataset": dict(config["dataset"]),
         "filters": dict(config["filters"]),
-        "limitations": [
-            "Canary only: this sample does not approve a pilot or full-model training run.",
-            "Near-duplicate removal, language identification, and benchmark "
-            "decontamination are not yet applied.",
-            "Secret and PII detection is pattern-based and is not an exhaustive privacy audit.",
-        ],
+        "implementation": {"pii_detector": PII_DETECTOR_VERSION},
+        "limitations": limitations,
         "output": {
             "file": sample_path.name,
             "file_bytes": sample_path.stat().st_size,
@@ -502,7 +764,7 @@ def _manifest_from_run(
             "text_utf8_bytes": int(stats["text_bytes"]),
         },
         "run_fingerprint": run_fingerprint,
-        "schema_version": 1,
+        "schema_version": 2 if quality_enabled else 1,
         "source_files": source_files,
         "statistics": {
             "categories": categories,
@@ -515,6 +777,14 @@ def _manifest_from_run(
         "target_uncompressed_text_bytes": sum(targets.values()),
         "version": config["version"],
     }
+    if quality_enabled:
+        manifest["quality"] = dict(config["quality"])
+        manifest["statistics"]["quality"] = {
+            "language_labels": dict(sorted(stats["language_labels"].items())),
+        }
+    if "composition" in config:
+        manifest["composition"] = dict(config["composition"])
+    return manifest
 
 
 def build_sample(
@@ -537,9 +807,16 @@ def build_sample(
     if effective_target <= 0:
         raise ValueError("target_bytes must be positive")
     targets = _category_targets(config, effective_target)
+    source_targets = _source_targets(config, targets)
     config_sha256 = _sha256_bytes(_canonical_json_bytes(config))
     run_fingerprint = _sha256_bytes(
-        _canonical_json_bytes({"config_sha256": config_sha256, "target_bytes": effective_target})
+        _canonical_json_bytes(
+            {
+                "config_sha256": config_sha256,
+                "pii_detector": PII_DETECTOR_VERSION,
+                "target_bytes": effective_target,
+            }
+        )
     )
 
     output_directory.mkdir(parents=True, exist_ok=True)
@@ -553,7 +830,10 @@ def build_sample(
         with state_path.open(encoding="utf-8") as handle:
             state = json.load(handle)
         if state.get("run_fingerprint") != run_fingerprint:
-            raise ValueError("existing output was created with a different config or target")
+            raise ValueError(
+                "existing output was created with a different config or target, or a different "
+                "implementation"
+            )
         if state.get("status") == "complete" and manifest_path.exists():
             validate_sample(output_directory, expected_config=config)
             with manifest_path.open(encoding="utf-8") as handle:
@@ -563,8 +843,14 @@ def build_sample(
             raise ValueError("cannot resume sample without matching run-state.json")
         state = {
             "config_sha256": config_sha256,
+            "implementation": {"pii_detector": PII_DETECTOR_VERSION},
+            "language_labels": {},
             "network_retries": 0,
             "pii_redactions": {},
+            "progress": {
+                "documents": 0,
+                "text_utf8_bytes": 0,
+            },
             "rejections": {},
             "run_fingerprint": run_fingerprint,
             "schema_version": 1,
@@ -576,27 +862,57 @@ def build_sample(
 
     stats = _scan_records(sample_path)
     rejections = Counter(state.get("rejections", {}))
-    pii_redactions = Counter(state.get("pii_redactions", {}))
+    pii_redactions = Counter(stats["pii_redactions"])
+    language_labels = Counter(stats["language_labels"])
     dataset = config["dataset"]
     policy = config["filters"]
+    quality_gate = None
+    if "quality" in config:
+        quality_gate = DataQualityGate(
+            config["quality"], Path(__file__).resolve().parents[2]
+        )
+        if sample_path.exists():
+            with sample_path.open(encoding="utf-8") as existing_sample:
+                for line_number, line in enumerate(existing_sample, start=1):
+                    quality_gate.verify_and_accept_record(json.loads(line), line_number)
     writes_since_state = 0
 
     with sample_path.open("a", encoding="utf-8") as output:
         for mixture_entry in config["mixture"]:
             category = mixture_entry["category"]
             target = targets[category]
-            if stats["category_bytes"].get(category, 0) >= target:
+            weighted_category = all(
+                "weight_within_category" in source
+                for source in mixture_entry["sources"]
+            )
+            if not weighted_category and stats["category_bytes"].get(category, 0) >= target:
                 continue
             for source in mixture_entry["sources"]:
-                if stats["category_bytes"].get(category, 0) >= target:
+                source_key = _source_key(dataset, source, category)
+                source_target = source_targets.get(source_key)
+                if source_target is None and stats["category_bytes"].get(category, 0) >= target:
                     break
+                if (
+                    source_target is not None
+                    and stats["source_bytes"].get(source_key, 0) >= source_target
+                ):
+                    continue
                 last_error: Exception | None = None
                 source_dataset = _source_dataset(dataset, source)
                 for attempt in range(retries + 1):
                     try:
                         source_lines = _iter_source_lines(dataset, source, timeout_seconds)
                         for source_line, line in source_lines:
-                            if stats["category_bytes"].get(category, 0) >= target:
+                            if source_target is None:
+                                target_reached = (
+                                    stats["category_bytes"].get(category, 0) >= target
+                                )
+                            else:
+                                target_reached = (
+                                    stats["source_bytes"].get(source_key, 0)
+                                    >= source_target
+                                )
+                            if target_reached:
                                 break
                             try:
                                 upstream_record = json.loads(line)
@@ -626,7 +942,16 @@ def build_sample(
                                 int(policy["min_document_characters"]),
                             )
                             for segment_index, segment in enumerate(segments):
-                                if stats["category_bytes"].get(category, 0) >= target:
+                                if source_target is None:
+                                    target_reached = (
+                                        stats["category_bytes"].get(category, 0) >= target
+                                    )
+                                else:
+                                    target_reached = (
+                                        stats["source_bytes"].get(source_key, 0)
+                                        >= source_target
+                                    )
+                                if target_reached:
                                     break
                                 document_id = _record_id(
                                     source_dataset,
@@ -641,6 +966,12 @@ def build_sample(
                                 if content_hash in stats["content_hashes"]:
                                     rejections["exact_duplicate"] += 1
                                     continue
+                                quality_evaluation = None
+                                if quality_gate is not None:
+                                    quality_evaluation = quality_gate.evaluate(segment, category)
+                                    if quality_evaluation.rejection_reason is not None:
+                                        rejections[quality_evaluation.rejection_reason] += 1
+                                        continue
                                 record = {
                                     "content_sha256": content_hash,
                                     "id": document_id,
@@ -663,6 +994,8 @@ def build_sample(
                                         ),
                                     },
                                 }
+                                if quality_evaluation is not None:
+                                    record["quality"] = quality_evaluation.metadata
                                 if retained_provenance:
                                     record["retained_provenance"] = retained_provenance
                                 output.write(
@@ -674,6 +1007,12 @@ def build_sample(
                                     )
                                     + "\n"
                                 )
+                                if quality_evaluation is not None:
+                                    quality_gate.accept(document_id, quality_evaluation)
+                                    assert quality_evaluation.metadata is not None
+                                    language_labels[
+                                        quality_evaluation.metadata["language"]["label"]
+                                    ] += 1
                                 if not redactions_recorded:
                                     pii_redactions.update(filtered.redactions)
                                     redactions_recorded = True
@@ -684,11 +1023,24 @@ def build_sample(
                                 stats["text_bytes"] += len(segment_bytes)
                                 stats["category_bytes"][category] += len(segment_bytes)
                                 stats["category_documents"][category] += 1
+                                stats["source_bytes"][source_key] += len(segment_bytes)
+                                stats["source_documents"][source_key] += 1
                                 writes_since_state += 1
                                 if writes_since_state >= 100:
                                     output.flush()
                                     state["rejections"] = dict(rejections)
                                     state["pii_redactions"] = dict(pii_redactions)
+                                    state["language_labels"] = dict(language_labels)
+                                    state["progress"] = {
+                                        "current_category": category,
+                                        "current_component": source["component"],
+                                        "current_source_target_bytes": source_target,
+                                        "current_source_text_bytes": int(
+                                            stats["source_bytes"].get(source_key, 0)
+                                        ),
+                                        "documents": int(stats["documents"]),
+                                        "text_utf8_bytes": int(stats["text_bytes"]),
+                                    }
                                     state["updated_at"] = _utc_now()
                                     _atomic_json_write(state_path, state)
                                     writes_since_state = 0
@@ -699,11 +1051,22 @@ def build_sample(
                         if attempt >= retries:
                             break
                         state["network_retries"] = int(state.get("network_retries", 0)) + 1
+                        state["updated_at"] = _utc_now()
+                        _atomic_json_write(state_path, state)
                         time.sleep(min(2**attempt, 4))
                 if last_error is not None:
                     raise RuntimeError(
                         f"failed streaming pinned source {source['file']}"
                     ) from last_error
+                if (
+                    source_target is not None
+                    and stats["source_bytes"].get(source_key, 0) < source_target
+                ):
+                    raise RuntimeError(
+                        f"pinned source {source['file']} ended at "
+                        f"{stats['source_bytes'].get(source_key, 0)} of "
+                        f"{source_target} target bytes"
+                    )
             if stats["category_bytes"].get(category, 0) < target:
                 raise RuntimeError(
                     f"pinned sources for {category} ended at "
@@ -712,6 +1075,12 @@ def build_sample(
             output.flush()
             state["rejections"] = dict(rejections)
             state["pii_redactions"] = dict(pii_redactions)
+            state["language_labels"] = dict(language_labels)
+            state["progress"] = {
+                "current_category": category,
+                "documents": int(stats["documents"]),
+                "text_utf8_bytes": int(stats["text_bytes"]),
+            }
             state["updated_at"] = _utc_now()
             _atomic_json_write(state_path, state)
 
@@ -762,6 +1131,11 @@ def validate_sample(
         raise ValueError("sample output SHA-256 does not match manifest")
 
     filters = manifest["filters"]
+    quality_gate = None
+    if "quality" in manifest:
+        quality_gate = DataQualityGate(
+            manifest["quality"], Path(__file__).resolve().parents[2]
+        )
     default_dataset = manifest["dataset"]
     allowed_sources = {
         (
@@ -785,6 +1159,9 @@ def validate_sample(
     document_ids: set[str] = set()
     category_bytes: Counter[str] = Counter()
     category_documents: Counter[str] = Counter()
+    language_labels: Counter[str] = Counter()
+    source_bytes: Counter[tuple[str, str, str, str]] = Counter()
+    source_documents: Counter[tuple[str, str, str, str]] = Counter()
     total_text_bytes = 0
     with sample_path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -847,11 +1224,22 @@ def validate_sample(
                     raise ValueError(
                         f"required retained provenance {name!r} is missing at line {line_number}"
                     )
+            if quality_gate is not None:
+                quality_gate.verify_and_accept_record(record, line_number)
+                language_labels[record["quality"]["language"]["label"]] += 1
             content_hashes.add(content_hash)
             document_ids.add(document_id)
             total_text_bytes += len(text_bytes)
             category_bytes[provenance["category"]] += len(text_bytes)
             category_documents[provenance["category"]] += 1
+            validation_source_key = (
+                provenance["dataset_id"],
+                provenance["dataset_revision"],
+                provenance["source_file"],
+                provenance["category"],
+            )
+            source_bytes[validation_source_key] += len(text_bytes)
+            source_documents[validation_source_key] += 1
 
     if total_text_bytes != expected_output["text_utf8_bytes"]:
         raise ValueError("sample text byte count does not match manifest")
@@ -864,6 +1252,27 @@ def validate_sample(
             raise ValueError(f"category document count mismatch for {category}")
         if category_bytes[category] < expected["target_text_utf8_bytes"]:
             raise ValueError(f"category target was not reached for {category}")
+    if quality_gate is not None:
+        expected_labels = manifest["statistics"]["quality"]["language_labels"]
+        if dict(sorted(language_labels.items())) != expected_labels:
+            raise ValueError("quality language-label counts do not match manifest")
+    for source in manifest["source_files"]:
+        expected_source = source.get("statistics")
+        if not isinstance(expected_source, Mapping):
+            continue
+        validation_source_key = (
+            source.get("dataset_id", default_dataset["id"]),
+            source.get("revision", default_dataset["revision"]),
+            source["file"],
+            source["category"],
+        )
+        if source_bytes[validation_source_key] != expected_source["text_utf8_bytes"]:
+            raise ValueError(f"source byte count mismatch for {source['file']}")
+        if source_documents[validation_source_key] != expected_source["documents"]:
+            raise ValueError(f"source document count mismatch for {source['file']}")
+        source_target = expected_source.get("target_text_utf8_bytes")
+        if source_target is not None and source_bytes[validation_source_key] < source_target:
+            raise ValueError(f"source target was not reached for {source['file']}")
     return {
         "documents": len(document_ids),
         "sha256": expected_output["sha256"],

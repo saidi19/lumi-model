@@ -2,6 +2,10 @@
 
 Status: **passed as a pipeline canary; not approved for model training**
 
+Historical note: this artifact used the superseded broad PII regex and is not
+eligible for tokenizer or model input. The audited replacement is documented in
+[`development-sample-v0.4.md`](development-sample-v0.4.md).
+
 Run date: 2026-07-15. GPU usage: none.
 
 ## Reproducibility anchor
