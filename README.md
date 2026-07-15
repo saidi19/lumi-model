@@ -25,9 +25,10 @@ tokenizer, data, and deployment portability before any expensive GPU run:
    coverage and a real 25MB, 23-source disconnect/resume canary;
 7. a SHA-256-pinned Bengali Wikipedia Parquet source, category-scoped language
    policy, and 1MB real-network canary pass with retained article URLs;
-8. the combined 24-source tokenizer canary passes every source quota plus fresh,
-   cached, and completed-resume validation; next: the 6GB representative sample
-   and a measured 32K/65K tokenizer comparison;
+8. the first 6GB attempt exposed three capacity-limited sources without spending
+   GPU credit; a pinned v0.2 capacity report, safe-margin allocations, preflight
+   guard, and corrected 24-source canary now pass; next: the fresh 6GB sample and
+   a measured 32K/65K tokenizer comparison;
 9. only then: MLX/GGUF conversion, a small real-corpus pilot, and measured GPU
    throughput.
 
@@ -70,7 +71,7 @@ The metadata-preserving follow-up is in
 [`docs/provenance-canary-v0.2.md`](docs/provenance-canary-v0.2.md).
 The current audited all-component result is in
 [`docs/development-sample-v0.4.md`](docs/development-sample-v0.4.md).
-The scale-up gates are in
-[`docs/tokenizer-sample-v0.1.md`](docs/tokenizer-sample-v0.1.md), and the pinned
+The current scale-up gates are in
+[`docs/tokenizer-sample-v0.2.md`](docs/tokenizer-sample-v0.2.md), and the pinned
 Bengali source decision is in
 [`docs/multilingual-source-v0.1.md`](docs/multilingual-source-v0.1.md).

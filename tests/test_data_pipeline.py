@@ -514,6 +514,51 @@ def test_weighted_source_quotas_force_every_source_into_sample(tmp_path: Path) -
         build_sample(invalid, tmp_path / "invalid-weighted")
 
 
+def test_verified_source_capacity_rejects_an_impossible_plan_before_writing(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    for entry in config["mixture"]:
+        entry["sources"][0]["weight_within_category"] = 1.0
+    config["mixture"][0]["sources"][0][
+        "verified_capacity_text_utf8_bytes"
+    ] = 2_999
+    output = tmp_path / "impossible-capacity"
+
+    with pytest.raises(ValueError, match="exceeding verified capacity 2999"):
+        build_sample(config, output)
+    assert not output.exists()
+
+
+def test_failed_build_records_failure_and_resume_clears_stale_error(
+    tmp_path: Path,
+) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    config["target_uncompressed_text_bytes"] = 10_000_000
+    output = tmp_path / "failed-state"
+
+    with pytest.raises(RuntimeError, match="ended at"):
+        build_sample(config, output)
+    state = json.loads((output / "run-state.json").read_text())
+    assert state["status"] == "failed"
+    assert state["failure"]["type"] == "RuntimeError"
+    assert "ended at" in state["failure"]["message"]
+
+    with pytest.raises(RuntimeError, match="ended at"):
+        build_sample(config, output, resume=True)
+    resumed_state = json.loads((output / "run-state.json").read_text())
+    assert resumed_state["status"] == "failed"
+    assert resumed_state["failure"]["type"] == "RuntimeError"
+
+
 def test_pipeline_applies_and_revalidates_composed_quality_gates(tmp_path: Path) -> None:
     first_source = tmp_path / "education.jsonl.gz"
     second_source = tmp_path / "code.jsonl.gz"

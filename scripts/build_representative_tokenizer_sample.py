@@ -12,7 +12,7 @@ from lumi.data_pipeline import build_sample
 from lumi.development_config import compose_development_config
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
-DEFAULT_PLAN = REPOSITORY_ROOT / "configs" / "tokenizer-sample-v0.1.json"
+DEFAULT_PLAN = REPOSITORY_ROOT / "configs" / "tokenizer-sample-v0.2.json"
 
 
 def parse_args() -> argparse.Namespace:
