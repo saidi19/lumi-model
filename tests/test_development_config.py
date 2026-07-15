@@ -7,6 +7,7 @@ import math
 import re
 from pathlib import Path
 
+from lumi.data_pipeline import preflight_sample_config
 from lumi.data_quality import sha256_file
 from lumi.development_config import compose_development_config
 
@@ -132,6 +133,16 @@ def test_v03_composes_component_level_continuation_files() -> None:
     )
     assert stack["verified_capacity_text_utf8_bytes"] == 1_101_302_254
     assert stack["continuation_files"][0]["verified_capacity_text_utf8_bytes"] == 100_003_598
+    preflight = preflight_sample_config(config)
+    required = {
+        source["component"]: source
+        for source in preflight["sources"]
+        if source["component"] in config["required_capacity_preflight_components"]
+    }
+    assert preflight["status"] == "pass"
+    assert all(source["status"] == "verified" for source in required.values())
+    assert required["wikiteam"]["verified_capacity_lower_bound_text_utf8_bytes"] == 250_000_118
+    assert required["cccc"]["verified_capacity_lower_bound_text_utf8_bytes"] == 650_000_832
 
 
 def test_hash_only_benchmark_registry_is_pinned_and_contains_no_raw_text() -> None:

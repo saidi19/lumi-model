@@ -1,7 +1,7 @@
 # Lumi representative tokenizer sample v0.3
 
-Status: **multi-shard implementation and Stack capacity gate passed; WikiTeam and
-CCCC capacity audits pending; 6GB resume blocked by design**
+Status: **multi-shard implementation, every mandatory capacity gate, and the
+25MB all-source canary passed; migration apply and 6GB resume pending**
 
 ## Why v0.3 exists
 
@@ -52,17 +52,35 @@ and [CCCC](https://huggingface.co/datasets/common-pile/cccc_filtered/tree/03a3de
 | Component | Full-plan target | Verified lower bound | Status |
 |---|---:|---:|---|
 | Stack v2 educational code | 1,180,872,000 | 1,201,305,852 across primary + continuation | Pass |
-| WikiTeam | 222,750,000 | pending bounded audit | Blocked |
-| CCCC | 594,000,000 | pending bounded audit | Blocked |
+| WikiTeam | 222,750,000 | 250,000,118 | Pass |
+| CCCC | 594,000,000 | 650,000,832 | Pass |
 
 The Stack continuation audit accepted 100,003,598 bytes across 30,362 documents,
 with zero network retries, then passed full post-write validation. Its sample
 SHA-256 is
 `6c3ba9bcc26550edc53cd3475d4ce9dbd5ecad0277a546920b993e182bc2154c`.
 
-The remaining audits require network permission. The no-download full-plan
-preflight currently refuses to launch and reports both missing capacities. No
-GPU or Lambda credit is involved in these audits.
+The WikiTeam audit accepted 250,000,118 bytes across 186,994 documents; its
+sample SHA-256 is
+`de839456c8ec44cb859a13ff411ea2b7342ece7e0ad27ffe77dc7bc4b3e25c67`.
+The CCCC audit accepted 650,000,832 bytes across 143,973 documents; its sample
+SHA-256 is
+`afa46b265dac82e99d92ece17c7e8b8c20b3f3d8a93f118939cb2ff253c9f553`.
+Both completed with zero network retries and passed full post-write validation.
+The no-download 6GB quota preflight now passes. No GPU or Lambda credit was
+used by these audits.
+
+## v0.3 all-source canary
+
+The 25MB v0.3 canary completed with 25,391,622 accepted text bytes, 4,859
+documents, all 24 logical sources meeting quota, and zero network retries. Fresh
+validation passed, cached validation resumed from line 4,859, and a completed
+`--resume` returned without another source read.
+
+Its SHA-256 is
+`9eba9d35593c77d0579edfb5e740c106cd08a410e0d75c52678c1964fce1a32f`,
+identical to the v0.2 canary. The data-selection semantics therefore remained
+byte-for-byte stable while v0.3 added continuation and capacity metadata.
 
 ## Existing-sample migration
 
@@ -80,14 +98,10 @@ update `run-state.json`.
 
 ## Remaining gates
 
-1. Complete and validate the bounded WikiTeam and CCCC capacity audits.
-2. Make the 6GB no-download quota preflight pass.
-3. Run the v0.3 25MB all-source fresh, cached-validation, and completed-resume
-   canary.
-4. Repeat the deterministic migration dry run, apply it with a state backup,
+1. Repeat the deterministic migration dry run, apply it with a state backup,
    and rename the artifact to v0.3.
-5. Resume the existing sample under `caffeinate` and persistent network retry.
-6. Run fresh and cached full validation before training tokenizer candidates.
+2. Resume the existing sample under `caffeinate` and persistent network retry.
+3. Run fresh and cached full validation before training tokenizer candidates.
 
 The full H100/H200 model-training phase remains unapproved until the tokenizer,
 small real-corpus model pilot, checkpoint, and throughput gates pass.

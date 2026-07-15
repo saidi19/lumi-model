@@ -706,6 +706,8 @@ def preflight_sample_config(
                 status = "verified"
             elif all_exhaustive:
                 status = "impossible"
+            elif source["component"] not in required:
+                status = "not_required"
             else:
                 status = "unverified"
             sources.append(

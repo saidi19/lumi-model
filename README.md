@@ -28,8 +28,9 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 8. the v0.2 full-size attempt exposed a single-anchor assumption in a multi-file
    component without spending GPU credit; v0.3 now has generic component-level
    continuation, per-file provenance, resumable exhaustion state, and mandatory
-   full-quota capacity gates; Stack passes, while WikiTeam and CCCC audits still
-   block the 6GB resume;
+   full-quota capacity gates; Stack, WikiTeam, and CCCC audits plus the 6GB
+   no-download preflight and v0.3 all-source canary pass; next: migrate and
+   resume the verified 2.883GB artifact;
 9. only then: MLX/GGUF conversion, a small real-corpus pilot, and measured GPU
    throughput.
 
