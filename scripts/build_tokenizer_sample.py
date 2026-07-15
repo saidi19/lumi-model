@@ -16,23 +16,30 @@ DEFAULT_CONFIG = REPOSITORY_ROOT / "configs" / "tokenizer-canary-v0.1.json"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--quality-config", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--target-bytes", type=int)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--timeout-seconds", type=float, default=60.0)
     parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument(
+        "--retry-forever",
+        action="store_true",
+        help="wait through network outages and resume without Codex supervision",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     manifest = build_sample(
-        load_sample_config(args.config),
+        load_sample_config(args.config, quality_path=args.quality_config),
         args.output,
         target_bytes=args.target_bytes,
         resume=args.resume,
         timeout_seconds=args.timeout_seconds,
         retries=args.retries,
+        retry_forever=args.retry_forever,
     )
     summary = {
         "documents": manifest["statistics"]["documents"],

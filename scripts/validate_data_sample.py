@@ -14,9 +14,23 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=Path, required=True)
     parser.add_argument("--config", type=Path)
+    parser.add_argument("--quality-config", type=Path)
+    parser.add_argument("--checkpoint-interval", type=int, default=1000)
+    parser.add_argument("--restart-validation", action="store_true")
     args = parser.parse_args()
-    expected_config = load_sample_config(args.config) if args.config is not None else None
-    result = validate_sample(args.sample, expected_config=expected_config)
+    if args.quality_config is not None and args.config is None:
+        raise ValueError("--quality-config requires --config")
+    expected_config = (
+        load_sample_config(args.config, quality_path=args.quality_config)
+        if args.config is not None
+        else None
+    )
+    result = validate_sample(
+        args.sample,
+        expected_config=expected_config,
+        resume_validation=not args.restart_validation,
+        checkpoint_interval=args.checkpoint_interval,
+    )
     print("PASS: sample data, safety scan, hashes, and manifest are valid")
     print(json.dumps(result, indent=2, sort_keys=True))
 

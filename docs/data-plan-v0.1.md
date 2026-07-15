@@ -1,6 +1,6 @@
 # Lumi data plan v0.1
 
-Status: **candidate; 25MB tokenizer and 10MB provenance canaries passed, but no training is approved**
+Status: **candidate; the audited contextual-PII-v4 1GB development sample passed, but no GPU training is approved**
 
 ## Default source direction
 
@@ -64,14 +64,24 @@ candidate is [`configs/data-mix-v0.1.json`](../configs/data-mix-v0.1.json).
   required IDs, licenses/basis, URLs, and collection provenance in every
   accepted record; see
   [`provenance-canary-v0.2.md`](provenance-canary-v0.2.md).
-- Next, build a 1GB-2GB development sample across more source components and
-  add a small, explicitly licensed Bangla/multilingual tokenizer slice.
+- Completed all-component development gate: 1,000,895,350 accepted UTF-8 text
+  bytes across all 23 pinned components passed source/category quotas, language
+  filtering, secret scanning, provenance checks, MinHash near-deduplication,
+  hashed benchmark decontamination, full post-write validation, and manual PII
+  snippet review; see
+  [`development-sample-v0.4.md`](development-sample-v0.4.md).
+- Next, add a small, explicitly licensed Bangla/multilingual tokenizer slice.
 - Use the metadata-preserving component repositories, audit null/malformed
   license rates, and treat CCCC as a documented source-level-license exception:
   its card describes whole-domain license review, but 0 of 10,000 audited raw
   and filtered rows contained the per-document license field claimed by the
   card.
-- Stream a stratified 6GB-12GB uncompressed sample across every domain.
+- Disk-backed SQLite MinHash state, exact-ID/content indexes, and byte-offset
+  validation checkpoints are now implemented with network retry-forever mode.
+  A 25MB all-component network canary passed with 5,055 documents, all 23
+  sources, a recorded network retry, and both fresh and cached validation.
+- Then stream a stratified 6GB-12GB uncompressed tokenizer-only sample across
+  every domain.
 - Keep document IDs, source component, revision, license metadata, and hashes.
 - Train both 32K and 65K tokenizers from exactly the same sample.
 - Do not store the sample or generated tokenizer in Git.
