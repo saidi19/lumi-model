@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import time
@@ -22,6 +23,7 @@ from .packed_data import PackedTokenDataset, validate_packed_manifest
 TRAINING_SCHEMA_VERSION = 1
 TRAINING_STATE_FILENAME = "training-state.json"
 METRICS_FILENAME = "metrics.jsonl"
+LR_SCHEDULES = {"constant", "cosine"}
 
 
 def _utc_now() -> str:
@@ -155,6 +157,86 @@ def _append_metric(path: Path, metric: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def scheduled_learning_rate(
+    *,
+    base_learning_rate: float,
+    step: int,
+    schedule: str,
+    warmup_steps: int,
+    schedule_steps: int | None,
+    min_learning_rate_ratio: float,
+) -> float:
+    """Return the deterministic learning rate for one one-indexed optimizer step."""
+
+    if base_learning_rate <= 0:
+        raise ValueError("base learning rate must be positive")
+    if isinstance(step, bool) or not isinstance(step, int) or step < 1:
+        raise ValueError("learning-rate step must be positive")
+    if schedule not in LR_SCHEDULES:
+        raise ValueError(f"learning-rate schedule must be one of {sorted(LR_SCHEDULES)}")
+    if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 0:
+        raise ValueError("warmup steps cannot be negative")
+    if schedule_steps is not None and (
+        isinstance(schedule_steps, bool) or not isinstance(schedule_steps, int)
+    ):
+        raise ValueError("schedule steps must be an integer")
+    if not 0.0 <= min_learning_rate_ratio <= 1.0:
+        raise ValueError("minimum learning-rate ratio must be between 0 and 1")
+    if warmup_steps and step <= warmup_steps:
+        return base_learning_rate * step / warmup_steps
+    if schedule == "constant":
+        return base_learning_rate
+    if schedule_steps is None or schedule_steps < 1:
+        raise ValueError("cosine scheduling requires positive schedule steps")
+    if warmup_steps >= schedule_steps:
+        raise ValueError("warmup steps must be shorter than cosine schedule steps")
+    if step > schedule_steps:
+        raise ValueError("learning-rate step exceeds cosine schedule horizon")
+    progress = (step - warmup_steps) / (schedule_steps - warmup_steps)
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    multiplier = min_learning_rate_ratio + (1.0 - min_learning_rate_ratio) * cosine
+    return base_learning_rate * multiplier
+
+
+def _optimizer_identity(
+    *,
+    batch_size: int,
+    gradient_accumulation_steps: int,
+    gradient_checkpointing: bool,
+    keep_checkpoints: int | None,
+    learning_rate: float,
+    lr_schedule: str,
+    max_grad_norm: float,
+    min_learning_rate_ratio: float,
+    schedule_steps: int | None,
+    warmup_steps: int,
+    weight_decay: float,
+) -> dict[str, Any]:
+    identity: dict[str, Any] = {
+        "batch_size": batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "learning_rate": learning_rate,
+        "max_grad_norm": max_grad_norm,
+        "weight_decay": weight_decay,
+    }
+    # Keep the original v1 identity byte-compatible when every new feature is
+    # disabled, so archived 150M checkpoints remain resumable.
+    if gradient_checkpointing:
+        identity["gradient_checkpointing"] = True
+    if keep_checkpoints is not None:
+        identity["keep_checkpoints"] = keep_checkpoints
+    if lr_schedule != "constant" or warmup_steps or schedule_steps is not None:
+        identity.update(
+            {
+                "lr_schedule": lr_schedule,
+                "min_learning_rate_ratio": min_learning_rate_ratio,
+                "schedule_steps": schedule_steps,
+                "warmup_steps": warmup_steps,
+            }
+        )
+    return identity
+
+
 def _checkpoint_state(path: Path) -> dict[str, Any]:
     with (path / TRAINING_STATE_FILENAME).open(encoding="utf-8") as handle:
         state = json.load(handle)
@@ -180,6 +262,42 @@ def _discover_latest_checkpoint(
         return None
     _, path, state = max(candidates, key=lambda item: item[0])
     return path, state
+
+
+def _prune_checkpoints(
+    output: Path,
+    *,
+    run_fingerprint: str,
+    keep_checkpoints: int,
+) -> list[str]:
+    """Remove older matching checkpoints only after a newer one is durable."""
+
+    if isinstance(keep_checkpoints, bool) or not isinstance(keep_checkpoints, int):
+        raise ValueError("keep-checkpoints must be a positive integer")
+    if keep_checkpoints < 1:
+        raise ValueError("keep-checkpoints must be a positive integer")
+    candidates: list[tuple[int, Path]] = []
+    for path in output.glob("checkpoint-*"):
+        if not path.is_dir() or not (path / TRAINING_STATE_FILENAME).is_file():
+            continue
+        state = _checkpoint_state(path)
+        if state.get("run_fingerprint") != run_fingerprint:
+            continue
+        step = state.get("step")
+        if isinstance(step, int) and step >= 0:
+            candidates.append((step, path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    removed = []
+    for _, path in candidates[keep_checkpoints:]:
+        shutil.rmtree(path)
+        removed.append(path.name)
+    if removed:
+        descriptor = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return removed
 
 
 def _save_checkpoint(
@@ -264,6 +382,12 @@ def train_packed_pilot(
     seed: int = 7,
     device: str = "auto",
     resume: bool = False,
+    gradient_checkpointing: bool = False,
+    keep_checkpoints: int | None = None,
+    lr_schedule: str = "constant",
+    warmup_steps: int = 0,
+    schedule_steps: int | None = None,
+    min_learning_rate_ratio: float = 0.1,
 ) -> dict[str, Any]:
     """Train a single-device Lumi pilot with exact data-position resume."""
 
@@ -276,8 +400,33 @@ def train_packed_pilot(
         raise ValueError("batch size and gradient accumulation must be positive")
     if checkpoint_steps < 1:
         raise ValueError("checkpoint-steps must be positive")
+    if not isinstance(gradient_checkpointing, bool):
+        raise ValueError("gradient-checkpointing must be boolean")
+    if keep_checkpoints is not None and (
+        isinstance(keep_checkpoints, bool)
+        or not isinstance(keep_checkpoints, int)
+        or keep_checkpoints < 1
+    ):
+        raise ValueError("keep-checkpoints must be positive")
     if learning_rate <= 0 or weight_decay < 0 or max_grad_norm <= 0:
         raise ValueError("optimizer hyperparameters are invalid")
+    if lr_schedule not in LR_SCHEDULES:
+        raise ValueError(f"lr-schedule must be one of {sorted(LR_SCHEDULES)}")
+    if isinstance(warmup_steps, bool) or not isinstance(warmup_steps, int) or warmup_steps < 0:
+        raise ValueError("warmup-steps cannot be negative")
+    if schedule_steps is not None and (
+        isinstance(schedule_steps, bool) or not isinstance(schedule_steps, int)
+    ):
+        raise ValueError("schedule-steps must be an integer")
+    if not 0.0 <= min_learning_rate_ratio <= 1.0:
+        raise ValueError("min-learning-rate-ratio must be between 0 and 1")
+    if lr_schedule == "cosine":
+        if schedule_steps is None or schedule_steps < steps:
+            raise ValueError("cosine schedule-steps must cover the requested steps")
+        if warmup_steps >= schedule_steps:
+            raise ValueError("warmup-steps must be shorter than schedule-steps")
+    elif schedule_steps is not None:
+        raise ValueError("schedule-steps is only valid with the cosine schedule")
     if not config_path.is_file():
         raise FileNotFoundError(f"model config does not exist: {config_path}")
 
@@ -291,6 +440,19 @@ def train_packed_pilot(
         raise ValueError("packed sequence length exceeds the model maximum")
 
     manifest_bytes = manifest_path.read_bytes()
+    optimizer_identity = _optimizer_identity(
+        batch_size=batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
+        keep_checkpoints=keep_checkpoints,
+        learning_rate=learning_rate,
+        lr_schedule=lr_schedule,
+        max_grad_norm=max_grad_norm,
+        min_learning_rate_ratio=min_learning_rate_ratio,
+        schedule_steps=schedule_steps,
+        warmup_steps=warmup_steps,
+        weight_decay=weight_decay,
+    )
     run_identity = {
         "config": {
             "sha256": hashlib.sha256(config_bytes).hexdigest(),
@@ -299,13 +461,7 @@ def train_packed_pilot(
             "build_fingerprint": manifest["build_fingerprint"],
             "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
         },
-        "optimizer": {
-            "batch_size": batch_size,
-            "gradient_accumulation_steps": gradient_accumulation_steps,
-            "learning_rate": learning_rate,
-            "max_grad_norm": max_grad_norm,
-            "weight_decay": weight_decay,
-        },
+        "optimizer": optimizer_identity,
         "schema_version": TRAINING_SCHEMA_VERSION,
         "seed": seed,
     }
@@ -379,6 +535,8 @@ def train_packed_pilot(
             learning_rate=learning_rate,
             weight_decay=weight_decay,
         )
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
 
     dataset = PackedTokenDataset(manifest_path, verify_hashes=False)
     if len(dataset) == 0:
@@ -386,6 +544,16 @@ def train_packed_pilot(
     model.train()
 
     while state["step"] < steps:
+        step_learning_rate = scheduled_learning_rate(
+            base_learning_rate=learning_rate,
+            step=state["step"] + 1,
+            schedule=lr_schedule,
+            warmup_steps=warmup_steps,
+            schedule_steps=schedule_steps,
+            min_learning_rate_ratio=min_learning_rate_ratio,
+        )
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = step_learning_rate
         optimizer.zero_grad(set_to_none=True)
         accumulated_loss = 0.0
         step_tokens = 0
@@ -432,6 +600,7 @@ def train_packed_pilot(
             "device": training_device.type,
             "elapsed_seconds": elapsed,
             "gradient_norm": float(gradient_norm),
+            "learning_rate": step_learning_rate,
             "loss": state["last_loss"],
             "peak_memory_allocated_bytes": (
                 torch.cuda.max_memory_allocated(training_device)
@@ -475,6 +644,12 @@ def train_packed_pilot(
         _append_metric(metrics_path, metric)
         if should_checkpoint:
             _write_json_atomic(state_path, state)
+            if keep_checkpoints is not None:
+                _prune_checkpoints(
+                    output,
+                    run_fingerprint=run_fingerprint,
+                    keep_checkpoints=keep_checkpoints,
+                )
 
     state["status"] = "complete"
     state["updated_at"] = _utc_now()

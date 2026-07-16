@@ -757,8 +757,13 @@ def test_training_resume_matches_uninterrupted_run(
         "batch_size": 2,
         "checkpoint_steps": 1,
         "device": "cpu",
+        "gradient_checkpointing": True,
         "learning_rate": 1e-3,
+        "lr_schedule": "cosine",
+        "min_learning_rate_ratio": 0.2,
+        "schedule_steps": 4,
         "seed": 19,
+        "warmup_steps": 1,
         "weight_decay": 0.0,
     }
 

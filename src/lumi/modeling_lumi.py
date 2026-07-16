@@ -210,7 +210,7 @@ class LumiDecoderLayer(nn.Module):
 class LumiPreTrainedModel(PreTrainedModel):
     config_class = LumiConfig
     base_model_prefix = "model"
-    supports_gradient_checkpointing = False
+    supports_gradient_checkpointing = True
     _supports_sdpa = True
     _supports_attention_backend = True
     _supports_cache_class = False
@@ -237,6 +237,7 @@ class LumiModel(LumiPreTrainedModel):
             [LumiDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LumiRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
@@ -284,12 +285,21 @@ class LumiModel(LumiPreTrainedModel):
         )
 
         for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                **kwargs,
-            )
+            if self.gradient_checkpointing and self.training:
+                hidden_states = self._gradient_checkpointing_func(
+                    layer.__call__,
+                    hidden_states,
+                    causal_mask,
+                    position_ids,
+                    **kwargs,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    **kwargs,
+                )
         hidden_states = self.norm(hidden_states)
 
         if not return_dict:

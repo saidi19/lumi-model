@@ -1,0 +1,100 @@
+{
+  "approval": {
+    "full_4b_training": false,
+    "paid_gpu_launch": false
+  },
+  "data": {
+    "heldout": {
+      "build_fingerprint": "77455ce7eb2606d8f258ef13f715bbdfeb8be4f5d7910cc26348552f52c96298",
+      "documents": 3988,
+      "manifest_sha256": "c5022ce7ba9ed41dd9cdf1777639278c5ed111ef679e09d9fbc12e36fd6260dd",
+      "selection_ledger_sha256": "5dc1fe84fd347cbaf7cd8f2a0a51125ab1272ec594d649762a50b66661ebdb97",
+      "tokens": 4999168
+    },
+    "selection": {
+      "mode": "within_source_hash_ranked_excluding_heldout",
+      "seed": 20260717,
+      "source_strata": 24,
+      "target_tokens_effective": 1399996416,
+      "target_tokens_requested": 1400000000
+    },
+    "sequence_length": 4096,
+    "source_sample": {
+      "accepted_text_bytes": 6000636724,
+      "documents": 1128089,
+      "manifest_sha256": "0ed48330993f956782004681bc30aad4e92c879aa763680c2ccfa30e0c8ccc70",
+      "observed_tokens": 1476228500,
+      "sample_sha256": "80bea9f9634a8daca542b2ffd0aad1c8c994a7cbeef909a5e529b6272671102a",
+      "token_count_report_sha256": "dd4403b8bbeb862cbbad3596c820586d02be6ddd576d8bc804a3ad61c805483f"
+    }
+  },
+  "evaluation": {
+    "baseline_150m": {
+      "heldout_loss": 4.680811614054532,
+      "heldout_perplexity": 107.85757578157164,
+      "parameters": 150625536,
+      "report_sha256": "0c171bdf4c1caba468ece1f0c8133b6056ba6fb62194443bc0aeac7597310a81",
+      "training_tokens": 50003968
+    },
+    "require_loss_below_baseline": true,
+    "require_zero_overlap": true
+  },
+  "model": {
+    "config": "lumi-1b.json",
+    "config_sha256": "7fd53cab43b4cde02f8f09bc33e69f4aeb3594a60d7abf0def1bfc5f496829ce",
+    "parameters": 1050981888,
+    "reference_config": "lumi-4b.json",
+    "reference_config_sha256": "fc2f8e8a2b36026d6b037ffc3b6ed313ef0dabfa1c8016afd001f09cd4de9b14",
+    "reference_parameters": 4002376704
+  },
+  "optimizer": {
+    "learning_rate": 0.0002,
+    "lr_schedule": "cosine",
+    "max_grad_norm": 1.0,
+    "min_learning_rate_ratio": 0.1,
+    "schedule_steps": 42725,
+    "seed": 7,
+    "warmup_steps": 500,
+    "weight_decay": 0.1
+  },
+  "schema_version": 1,
+  "stages": [
+    {
+      "name": "smoke_resume",
+      "processed_tokens": 65536,
+      "repeated_tokens": 0,
+      "steps": 2,
+      "target_tokens": 65536
+    },
+    {
+      "name": "calibration",
+      "processed_tokens": 3276800,
+      "repeated_tokens": 0,
+      "steps": 100,
+      "target_tokens": 3276800
+    },
+    {
+      "name": "learning_gate",
+      "processed_tokens": 250019840,
+      "repeated_tokens": 20480,
+      "steps": 7630,
+      "target_tokens": 249999360
+    },
+    {
+      "name": "unique_corpus",
+      "processed_tokens": 1400012800,
+      "repeated_tokens": 16384,
+      "steps": 42725,
+      "target_tokens": 1399996416
+    }
+  ],
+  "training": {
+    "batch_size": 1,
+    "checkpoint_steps": 2500,
+    "gradient_accumulation_steps": 8,
+    "gradient_checkpointing": true,
+    "keep_checkpoints": 2,
+    "precision": "bf16_autocast_fp32_parameters",
+    "tokens_per_step": 32768
+  }
+}

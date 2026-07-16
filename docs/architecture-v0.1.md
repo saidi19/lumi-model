@@ -34,6 +34,19 @@ The design uses public, established Transformer components. It is OpenAI-style
 in the broad GPT decoder sense and in its many-small-query-head layout, but it
 does not claim to reproduce any undisclosed GPT or Claude architecture.
 
+## Controlled 1B scaling proxy
+
+`configs/lumi-1b.json` freezes a 1,050,981,888-parameter proxy with the same 36
+layers, 4,096-token context, 65,536-token vocabulary, and 64-wide heads as the
+4B candidate. Its residual width, intermediate width, query heads, and KV heads
+are all exactly half of 4B. This isolates width scaling and exercises the final
+context instead of comparing against an unrelated 1B architecture.
+
+The proxy's staged plan ends at only 1.4B processed tokens, or 1.332 tokens per
+parameter. It is a scaling and optimization gate, not compute-optimal training.
+See [`scaling-pilot-1b-v0.1.md`](scaling-pilot-1b-v0.1.md). Paid training remains
+blocked on materializing and sealing the permanent-held-out-excluding data.
+
 ## Why dense for v1
 
 A total-parameter MoE introduces routing, expert-parallel communication,
