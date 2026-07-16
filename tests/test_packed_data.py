@@ -25,7 +25,7 @@ from lumi import (
     validate_heldout_manifest,
     validate_packed_manifest,
 )
-from lumi.cloud_pilot import preflight_cloud_pilot
+from lumi.cloud_pilot import load_cloud_pilot_plan, preflight_cloud_pilot
 
 
 @pytest.fixture(scope="module")
@@ -719,6 +719,400 @@ def test_cloud_pilot_preflight_pins_portable_artifacts(
             manifest_path=manifest_path,
             tokenizer_path=tokenizer,
         )
+
+
+def _build_scaling_cloud_fixture(
+    *,
+    tiny_tokenizer: Path,
+    stratified_corpus: tuple[Path, Path],
+    tmp_path: Path,
+) -> dict[str, Path]:
+    corpus, source_manifest = stratified_corpus
+    tokenizer = tmp_path / "scaling-tokenizer"
+    shutil.copytree(tiny_tokenizer, tokenizer)
+    packed = tmp_path / "scaling-packed"
+    manifest = build_packed_dataset(
+        input_path=corpus,
+        tokenizer_path=tokenizer,
+        output=packed,
+        sequence_length=8,
+        sequences_per_shard=4,
+        target_tokens=96,
+        checkpoint_documents=1,
+        expected_vocab_size=320,
+        source_mix_manifest_path=source_manifest,
+    )
+    for shard in manifest["shards"]:
+        path = packed / shard["name"]
+        values = torch.from_file(
+            str(path),
+            shared=False,
+            size=shard["tokens"],
+            dtype=torch.int32,
+        )
+        path.write_bytes(
+            b"".join(
+                int(value).to_bytes(2, "little") for value in values.tolist()
+            )
+        )
+        shard["bytes"] = path.stat().st_size
+        shard["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    proof_path = packed / "selection-proof.json"
+    proof_path.write_text('{"status":"complete"}\n', encoding="utf-8")
+    state_path = packed / "scaling-packing-state.sqlite3"
+    state_path.write_bytes(b"sealed synthetic scaling state")
+    manifest["format"] = {
+        "dtype": "uint16",
+        "endianness": "little",
+        "layout": "flat_fixed_sequences",
+        "token_bytes": 2,
+    }
+    manifest["leakage"] = {
+        "content_sha256_overlap": 0,
+        "document_id_overlap": 0,
+        "exact_documents_excluded": 2,
+        "family_documents_excluded": 2,
+        "near_duplicate_sha256_overlap": 0,
+    }
+    manifest["packing"].update(
+        {
+            "purpose": "final",
+            "target_tokens_effective": 96,
+            "target_tokens_requested": 96,
+        }
+    )
+    manifest["selection"].update(
+        {
+            "mode": "within_source_hash_ranked_excluding_heldout",
+            "seed": 23,
+            "source_index": {
+                "build_fingerprint": "2" * 64,
+                "bytes": 123,
+                "path": "/sealed/source-index/manifest.json",
+                "sha256": "1" * 64,
+            },
+        }
+    )
+    manifest["selection_proof"] = {
+        "bytes": proof_path.stat().st_size,
+        "name": proof_path.name,
+        "sha256": hashlib.sha256(proof_path.read_bytes()).hexdigest(),
+    }
+    manifest["selection_state"] = {
+        "bytes": state_path.stat().st_size,
+        "name": state_path.name,
+        "sha256": hashlib.sha256(state_path.read_bytes()).hexdigest(),
+    }
+    manifest["statistics"]["documents_selected"] = manifest["statistics"][
+        "documents_packed"
+    ]
+    manifest_path = packed / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    plan_directory = tmp_path / "scaling-configs"
+    plan_directory.mkdir()
+    pilot_config = LumiConfig(
+        vocab_size=320,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=8,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        doc_token_id=3,
+        tie_word_embeddings=True,
+        use_cache=False,
+    )
+    reference_config = LumiConfig(
+        vocab_size=320,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=8,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        doc_token_id=3,
+        tie_word_embeddings=True,
+        use_cache=False,
+    )
+    pilot_config_path = plan_directory / "pilot.json"
+    reference_config_path = plan_directory / "reference.json"
+    pilot_config.to_json_file(pilot_config_path)
+    reference_config.to_json_file(reference_config_path)
+    digest = "0" * 64
+    scaling_plan = {
+        "approval": {"full_4b_training": False, "paid_gpu_launch": False},
+        "data": {
+            "heldout": {
+                "build_fingerprint": digest,
+                "documents": 2,
+                "manifest_sha256": digest,
+                "selection_ledger_sha256": digest,
+                "tokens": 8,
+            },
+            "selection": {
+                "mode": "within_source_hash_ranked_excluding_heldout",
+                "seed": 23,
+                "source_strata": 2,
+                "target_tokens_effective": 96,
+                "target_tokens_requested": 96,
+            },
+            "sequence_length": 8,
+            "source_sample": {
+                "accepted_text_bytes": 1000,
+                "documents": manifest["statistics"]["documents_seen"],
+                "manifest_sha256": digest,
+                "observed_tokens": 200,
+                "sample_sha256": digest,
+                "token_count_report_sha256": digest,
+            },
+        },
+        "evaluation": {
+            "baseline_150m": {
+                "heldout_loss": 5.0,
+                "heldout_perplexity": 148.0,
+                "parameters": 100,
+                "report_sha256": digest,
+                "training_tokens": 64,
+            },
+            "require_loss_below_baseline": True,
+            "require_zero_overlap": True,
+        },
+        "model": {
+            "config": pilot_config_path.name,
+            "config_sha256": hashlib.sha256(
+                pilot_config_path.read_bytes()
+            ).hexdigest(),
+            "parameters": parameter_breakdown(pilot_config).total,
+            "reference_config": reference_config_path.name,
+            "reference_config_sha256": hashlib.sha256(
+                reference_config_path.read_bytes()
+            ).hexdigest(),
+            "reference_parameters": parameter_breakdown(reference_config).total,
+        },
+        "optimizer": {
+            "learning_rate": 0.001,
+            "lr_schedule": "cosine",
+            "max_grad_norm": 1.0,
+            "min_learning_rate_ratio": 0.1,
+            "schedule_steps": 12,
+            "seed": 7,
+            "warmup_steps": 1,
+            "weight_decay": 0.0,
+        },
+        "schema_version": 1,
+        "stages": [
+            {
+                "name": name,
+                "processed_tokens": target,
+                "repeated_tokens": 0,
+                "steps": target // 8,
+                "target_tokens": target,
+            }
+            for name, target in (
+                ("smoke_resume", 8),
+                ("calibration", 16),
+                ("learning_gate", 32),
+                ("unique_corpus", 96),
+            )
+        ],
+        "training": {
+            "batch_size": 1,
+            "checkpoint_steps": 1,
+            "gradient_accumulation_steps": 1,
+            "gradient_checkpointing": True,
+            "keep_checkpoints": 2,
+            "precision": "bf16_autocast_fp32_parameters",
+            "tokens_per_step": 8,
+        },
+    }
+    scaling_plan_path = plan_directory / "scaling-plan.json"
+    scaling_plan_path.write_text(json.dumps(scaling_plan), encoding="utf-8")
+    data_contract = {
+        "final": {
+            "expected_shards": len(manifest["shards"]),
+            "sequences_per_shard": 4,
+            "target_tokens_effective": 96,
+            "target_tokens_requested": 96,
+        },
+        "packing": {"sequence_length": 8},
+        "schema_version": 1,
+    }
+    data_contract_path = plan_directory / "scaling-data.json"
+    data_contract_path.write_text(json.dumps(data_contract), encoding="utf-8")
+    shard_bytes = sum(item["bytes"] for item in manifest["shards"])
+    parameters = parameter_breakdown(pilot_config).total
+    cloud_plan = {
+        "approval": {
+            "full_1b_stage": False,
+            "full_4b_training": False,
+            "paid_gpu_launch": False,
+        },
+        "artifact": {
+            "build_fingerprint": manifest["build_fingerprint"],
+            "documents_seen": manifest["statistics"]["documents_seen"],
+            "documents_selected": manifest["statistics"]["documents_selected"],
+            "dtype": "uint16",
+            "endianness": "little",
+            "heldout_exact_documents": 2,
+            "heldout_family_documents": 2,
+            "index_build_fingerprint": "2" * 64,
+            "index_manifest_sha256": "1" * 64,
+            "layout": "flat_fixed_sequences",
+            "leakage": {
+                "content_sha256_overlap": 0,
+                "document_id_overlap": 0,
+                "near_duplicate_sha256_overlap": 0,
+            },
+            "manifest_bytes": manifest_path.stat().st_size,
+            "manifest_sha256": hashlib.sha256(
+                manifest_path.read_bytes()
+            ).hexdigest(),
+            "purpose": "final",
+            "selection_mode": "within_source_hash_ranked_excluding_heldout",
+            "selection_proof_sha256": manifest["selection_proof"]["sha256"],
+            "selection_seed": 23,
+            "selection_state_sha256": manifest["selection_state"]["sha256"],
+            "sequence_length": 8,
+            "sequences": 12,
+            "sequences_per_shard": 4,
+            "shard_bytes": shard_bytes,
+            "shards": len(manifest["shards"]),
+            "source_strata": 2,
+            "target_tokens_requested": 96,
+            "token_bytes": 2,
+            "tokens": 96,
+        },
+        "contracts": {
+            "scaling_data": {
+                "path": data_contract_path.name,
+                "sha256": hashlib.sha256(data_contract_path.read_bytes()).hexdigest(),
+            },
+            "scaling_pilot": {
+                "path": scaling_plan_path.name,
+                "sha256": hashlib.sha256(scaling_plan_path.read_bytes()).hexdigest(),
+            },
+        },
+        "model": {
+            "config": pilot_config_path.name,
+            "config_sha256": hashlib.sha256(
+                pilot_config_path.read_bytes()
+            ).hexdigest(),
+            "parameters": parameters,
+        },
+        "pilot_kind": "scaling_1b",
+        "runtime": {
+            "minimum_compute_capability": [0, 0],
+            "minimum_cuda_devices": 1,
+            "minimum_cuda_memory_bytes": 1,
+            "minimum_host_memory_bytes": 1,
+            "requires_bf16": True,
+        },
+        "schema_version": 2,
+        "storage": {
+            "checkpoint_bytes_per_parameter": 1,
+            "fixed_overhead_bytes": 0,
+            "minimum_free_disk_bytes": parameters + shard_bytes,
+            "peak_checkpoint_copies": 1,
+        },
+    }
+    cloud_plan_path = plan_directory / "cloud-plan.json"
+    cloud_plan_path.write_text(json.dumps(cloud_plan), encoding="utf-8")
+    return {
+        "cloud_plan": cloud_plan_path,
+        "data_contract": data_contract_path,
+        "manifest": manifest_path,
+        "proof": proof_path,
+        "tokenizer": tokenizer,
+        "workspace": tmp_path,
+    }
+
+
+def test_scaling_cloud_preflight_pins_proof_contracts_and_runtime(
+    tiny_tokenizer: Path,
+    stratified_corpus: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = _build_scaling_cloud_fixture(
+        tiny_tokenizer=tiny_tokenizer,
+        stratified_corpus=stratified_corpus,
+        tmp_path=tmp_path,
+    )
+    report = preflight_cloud_pilot(
+        plan_path=fixture["cloud_plan"],
+        manifest_path=fixture["manifest"],
+        tokenizer_path=fixture["tokenizer"],
+        workspace_path=fixture["workspace"],
+    )
+    assert report["status"] == "pass"
+    assert report["kind"] == "scaling_1b"
+    assert report["artifact"]["dtype"] == "uint16"
+    assert report["integrity"] == {
+        "auxiliary_hashes_verified": True,
+        "shard_hashes_verified": True,
+        "tokenizer_hashes_verified": True,
+    }
+    assert report["runtime"]["gates"]["minimum_free_disk"] is True
+    assert report["authorization"]["paid_gpu_launch"] is False
+    with pytest.raises(ValueError, match="cannot skip shard hashes"):
+        preflight_cloud_pilot(
+            plan_path=fixture["cloud_plan"],
+            manifest_path=fixture["manifest"],
+            tokenizer_path=fixture["tokenizer"],
+            workspace_path=fixture["workspace"],
+            require_cuda=True,
+            verify_shards=False,
+        )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="CUDA is unavailable"):
+        preflight_cloud_pilot(
+            plan_path=fixture["cloud_plan"],
+            manifest_path=fixture["manifest"],
+            tokenizer_path=fixture["tokenizer"],
+            workspace_path=fixture["workspace"],
+            require_cuda=True,
+        )
+
+    original_proof = fixture["proof"].read_bytes()
+    fixture["proof"].write_bytes(original_proof + b"tamper")
+    with pytest.raises(ValueError, match="selection proof size changed"):
+        preflight_cloud_pilot(
+            plan_path=fixture["cloud_plan"],
+            manifest_path=fixture["manifest"],
+            tokenizer_path=fixture["tokenizer"],
+            workspace_path=fixture["workspace"],
+        )
+    fixture["proof"].write_bytes(original_proof)
+
+    with fixture["data_contract"].open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    with pytest.raises(ValueError, match="contracts.scaling_data SHA-256 changed"):
+        load_cloud_pilot_plan(fixture["cloud_plan"])
+
+
+def test_canonical_scaling_cloud_plan_loads() -> None:
+    repository_root = Path(__file__).parents[1]
+    plan = load_cloud_pilot_plan(
+        repository_root / "configs" / "cloud-pilot-1b-v0.1.json"
+    )
+    assert plan["schema_version"] == 2
+    assert plan["artifact"]["tokens"] == 1_399_996_416
+    assert plan["artifact"]["shards"] == 42
+    assert plan["approval"]["paid_gpu_launch"] is False
 
 
 def test_training_resume_matches_uninterrupted_run(
