@@ -40,12 +40,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     process through step 2;
 12. the 24-source 50M target is materialized at 49,999,872 tokens in 48
     hash-verified shards;
-13. a content-pinned Lambda plan and portable preflight now verify the model,
-    shards, tokenizer, and local runtime; next, run the approved H100
-    training/throughput pilot, then complete the MLX/GGUF conversion gates.
+13. the content-pinned Lambda preflight and paid H100 gate pass: a fresh-process
+    smoke resume advances through step 2, and the 150,625,536-parameter model
+    completes 763 steps over 50,003,968 tokens at a measured mean of 117,888
+    tokens/second; the final resumable checkpoint is hash-verified on the Mac;
+14. next, complete the MLX/GGUF conversion and inference gates before deciding
+    whether the 4B candidate is ready for a larger training pilot.
 
-The 4B configuration is a candidate until all deployment gates pass. Do not
-start a full H100 training run from this repository yet.
+The 4B configuration is a candidate until all deployment gates pass. The 150M
+H100 plumbing pilot is complete, but it is not evidence that a 4B training run
+is ready or that the resulting 150M checkpoint is a production-quality model.
 
 ## Quick start
 
