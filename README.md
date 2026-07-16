@@ -53,7 +53,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 16. a self-identifying Lumi MLX artifact passes exact config/tensor/RoPE gates,
     prompt-logit parity, and 128/128 cached greedy tokens; its 4-bit affine form
     passes a 98,256-prediction-token stratified quality gate, is 83.70% smaller,
-    and reaches a measured 522.3 cached decode tokens/second on the 16GB M5 Mac.
+    and reaches a measured 522.3 cached decode tokens/second on the 16GB M5 Mac;
+17. the sealed 4-bit artifact serves through a loopback-first OpenAI-compatible
+    chat-completions API and responsive local UI; a real M5 black-box gate passes
+    packaged HTML/CSS/JavaScript, model discovery, JSON generation, SSE
+    streaming, usage accounting, and terminal `[DONE]` handling.
 
 The 4B configuration is a candidate until all deployment gates pass. The 150M
 H100 plumbing pilot is complete, but it is not evidence that a 4B training run
@@ -86,6 +90,9 @@ in [`docs/evaluation-pilot-v0.1.md`](docs/evaluation-pilot-v0.1.md).
 The native MLX conversion, FP32 parity, 4-bit quality, and M5 runtime results are
 documented in
 [`docs/local-inference-gate-v0.1.md`](docs/local-inference-gate-v0.1.md).
+The loopback OpenAI-compatible API, local chat UI, security boundary, and real
+server gate are documented in
+[`docs/local-serving-v0.1.md`](docs/local-serving-v0.1.md).
 
 ## Repository policy
 

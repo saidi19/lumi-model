@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <meta
+      name="description"
+      content="Lumi local chat — a private Apple-Silicon inference demo by Afnan Technologies."
+    />
+    <title>Lumi — Local Chat</title>
+    <link rel="stylesheet" href="/styles.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="Lumi navigation">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"><span></span></div>
+          <div>
+            <p class="brand-name">Lumi</p>
+            <p class="brand-company">Afnan Technologies</p>
+          </div>
+        </div>
+
+        <button class="new-chat" id="new-chat" type="button">
+          <span aria-hidden="true">＋</span>
+          New conversation
+        </button>
+
+        <div class="sidebar-spacer"></div>
+
+        <section class="runtime-card" aria-labelledby="runtime-title">
+          <div class="runtime-heading">
+            <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+            <p id="runtime-title">Local runtime</p>
+          </div>
+          <p class="runtime-status" id="runtime-status">Checking Lumi…</p>
+          <dl>
+            <div><dt>Model</dt><dd>Lumi-150M</dd></div>
+            <div><dt>Format</dt><dd>MLX · 4-bit</dd></div>
+            <div><dt>Privacy</dt><dd>On this Mac</dd></div>
+          </dl>
+        </section>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">LOCAL INFERENCE</p>
+            <h1>Lumi-150M <span>Base</span></h1>
+          </div>
+          <div class="topbar-actions">
+            <button class="mobile-new-chat" id="mobile-new-chat" type="button">＋ New</button>
+            <div class="topbar-badge"><span></span> Apple Silicon</div>
+          </div>
+        </header>
+
+        <section class="conversation" id="conversation" aria-live="polite">
+          <div class="welcome" id="welcome">
+            <div class="lumi-orb" aria-hidden="true">
+              <span class="orb-core"></span>
+              <span class="orb-ring ring-one"></span>
+              <span class="orb-ring ring-two"></span>
+            </div>
+            <p class="welcome-kicker">YOUR MODEL. YOUR MACHINE.</p>
+            <h2>Meet Lumi, locally.</h2>
+            <p class="welcome-copy">
+              A private inference preview running from the sealed 4-bit checkpoint on this Mac.
+            </p>
+
+            <div class="warning-card" role="note">
+              <span class="warning-symbol" aria-hidden="true">i</span>
+              <p>
+                <strong>Research checkpoint:</strong> this 150M base model is a deployment demo,
+                not an instruction-tuned assistant. Expect repetition and incorrect answers.
+              </p>
+            </div>
+
+            <div class="suggestions" aria-label="Example prompts">
+              <button type="button" data-prompt="The capital of France is">Complete a fact</button>
+              <button type="button" data-prompt="In Python, a list comprehension can">Continue code text</button>
+              <button type="button" data-prompt="বাংলাদেশের রাজধানী">Try Bengali text</button>
+            </div>
+          </div>
+          <div class="messages" id="messages"></div>
+        </section>
+
+        <footer class="composer-wrap">
+          <form class="composer" id="composer">
+            <label class="sr-only" for="prompt">Message Lumi</label>
+            <textarea
+              id="prompt"
+              rows="1"
+              maxlength="8000"
+              placeholder="Continue text with Lumi…"
+              autocomplete="off"
+            ></textarea>
+            <div class="composer-actions">
+              <div class="settings" aria-label="Generation settings">
+                <label for="temperature">Temperature</label>
+                <select id="temperature">
+                  <option value="0" selected>0 · Greedy</option>
+                  <option value="0.3">0.3</option>
+                  <option value="0.7">0.7</option>
+                  <option value="1">1.0</option>
+                </select>
+                <span class="setting-divider" aria-hidden="true"></span>
+                <label for="max-tokens">Length</label>
+                <select id="max-tokens">
+                  <option value="32">32</option>
+                  <option value="64" selected>64</option>
+                  <option value="128">128</option>
+                  <option value="256">256</option>
+                </select>
+              </div>
+              <button class="send-button" id="send-button" type="submit" aria-label="Send message">
+                <span class="send-label">Send</span>
+                <span class="send-arrow" aria-hidden="true">↑</span>
+              </button>
+            </div>
+          </form>
+          <p class="composer-note">Lumi can make mistakes. This preview never leaves your Mac.</p>
+        </footer>
+      </main>
+    </div>
+  </body>
+</html>
