@@ -12,13 +12,16 @@ import torch
 from transformers import AutoTokenizer
 
 from lumi import (
+    LumiConfig,
     LumiForCausalLM,
     PackedTokenDataset,
     build_packed_dataset,
     packed_data,
+    parameter_breakdown,
     train_packed_pilot,
     validate_packed_manifest,
 )
+from lumi.cloud_pilot import preflight_cloud_pilot
 
 
 @pytest.fixture(scope="module")
@@ -297,6 +300,114 @@ def test_source_manifest_stratification_scans_clustered_sources(
             target_tokens=96,
             expected_vocab_size=320,
             source_mix_manifest_path=changed_manifest,
+        )
+
+
+def test_cloud_pilot_preflight_pins_portable_artifacts(
+    tiny_tokenizer: Path,
+    stratified_corpus: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, source_manifest = stratified_corpus
+    tokenizer = tmp_path / "tokenizer"
+    shutil.copytree(tiny_tokenizer, tokenizer)
+    packed = tmp_path / "packed"
+    manifest = build_packed_dataset(
+        input_path=corpus,
+        tokenizer_path=tokenizer,
+        output=packed,
+        sequence_length=8,
+        sequences_per_shard=4,
+        target_tokens=96,
+        checkpoint_documents=1,
+        expected_vocab_size=320,
+        source_mix_manifest_path=source_manifest,
+    )
+    manifest_path = packed / "manifest.json"
+
+    plan_directory = tmp_path / "configs"
+    plan_directory.mkdir()
+    config = LumiConfig(
+        vocab_size=320,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=16,
+        max_position_embeddings=8,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+        doc_token_id=3,
+        tie_word_embeddings=True,
+        use_cache=False,
+    )
+    config_path = plan_directory / "model.json"
+    config.to_json_file(config_path)
+    plan_path = plan_directory / "plan.json"
+    plan_path.write_text(
+        json.dumps(
+            {
+                "artifact": {
+                    "build_fingerprint": manifest["build_fingerprint"],
+                    "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                    "sequence_length": 8,
+                    "sequences": 12,
+                    "source_strata": 2,
+                    "tokens": 96,
+                },
+                "full": {
+                    "batch_size": 2,
+                    "checkpoint_steps": 1,
+                    "gradient_accumulation_steps": 2,
+                    "processed_tokens": 96,
+                    "repeated_tokens": 0,
+                    "steps": 3,
+                    "tokens_per_step": 32,
+                },
+                "model": {
+                    "config": config_path.name,
+                    "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
+                    "parameters": parameter_breakdown(config).total,
+                },
+                "optimizer": {
+                    "learning_rate": 3e-4,
+                    "max_grad_norm": 1.0,
+                    "seed": 7,
+                    "weight_decay": 0.1,
+                },
+                "requires_bf16": True,
+                "schema_version": 1,
+                "smoke": {
+                    "batch_size": 1,
+                    "checkpoint_steps": 1,
+                    "first_steps": 1,
+                    "gradient_accumulation_steps": 1,
+                    "resume_steps": 2,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = preflight_cloud_pilot(
+        plan_path=plan_path,
+        manifest_path=manifest_path,
+        tokenizer_path=tokenizer,
+    )
+    assert report["status"] == "pass"
+    assert report["artifact"]["source_strata"] == 2
+    assert report["parameters"] == parameter_breakdown(config).total
+    assert isinstance(report["runtime"]["bf16_supported"], bool)
+
+    with (tokenizer / "tokenizer_config.json").open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    with pytest.raises(ValueError, match="tokenizer file size changed"):
+        preflight_cloud_pilot(
+            plan_path=plan_path,
+            manifest_path=manifest_path,
+            tokenizer_path=tokenizer,
         )
 
 

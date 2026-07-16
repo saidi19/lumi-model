@@ -39,8 +39,10 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     real-corpus Apple-MPS smoke run saved at step 1 and resumed in a fresh
     process through step 2;
 12. the 24-source 50M target is materialized at 49,999,872 tokens in 48
-    hash-verified shards; next, run the paid 150M training/throughput pilot,
-    then complete the MLX/GGUF conversion gates.
+    hash-verified shards;
+13. a content-pinned Lambda plan and portable preflight now verify the model,
+    shards, tokenizer, and local runtime; next, run the approved H100
+    training/throughput pilot, then complete the MLX/GGUF conversion gates.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
@@ -65,6 +67,8 @@ python scripts/check_isolated_hf.py
 The real-data packer and resumable pilot runner are documented in
 [`docs/real-data-pilot-v0.1.md`](docs/real-data-pilot-v0.1.md). Keep their
 generated shards and checkpoints outside Git.
+The paid CUDA gate and exact transfer/training contract are documented in
+[`docs/lambda-pilot-v0.1.md`](docs/lambda-pilot-v0.1.md).
 
 ## Repository policy
 
