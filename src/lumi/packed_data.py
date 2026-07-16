@@ -86,6 +86,87 @@ def _input_artifact(input_path: Path) -> dict[str, Any]:
     }
 
 
+def _stratum_id(category: str, component: str) -> str:
+    return json.dumps([category, component], ensure_ascii=False, separators=(",", ":"))
+
+
+def _source_mix_selection(
+    *, manifest_path: Path, input_artifact: dict[str, Any], target_tokens: int
+) -> dict[str, Any]:
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"source-mix manifest does not exist: {manifest_path}")
+    manifest_bytes = manifest_path.read_bytes()
+    manifest = json.loads(manifest_bytes)
+    if manifest.get("status") != "complete":
+        raise ValueError("source-mix manifest is not complete")
+    source_output = manifest.get("output", {})
+    if source_output.get("file_bytes") != input_artifact["bytes"]:
+        raise ValueError("source-mix manifest byte count does not match packing input")
+    if source_output.get("sha256") != input_artifact["sha256"]:
+        raise ValueError("source-mix manifest SHA-256 does not match packing input")
+
+    weighted: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for source in manifest.get("source_files", []):
+        if not source.get("used"):
+            continue
+        category = source.get("category")
+        component = source.get("component")
+        target_text_bytes = source.get("statistics", {}).get("target_text_utf8_bytes")
+        if not isinstance(category, str) or not category:
+            raise ValueError("source-mix manifest has an invalid source category")
+        if not isinstance(component, str) or not component:
+            raise ValueError("source-mix manifest has an invalid source component")
+        if not isinstance(target_text_bytes, int) or target_text_bytes <= 0:
+            raise ValueError("source-mix manifest has an invalid source target")
+        key = (category, component)
+        if key in seen:
+            raise ValueError(f"source-mix manifest repeats source stratum {key!r}")
+        seen.add(key)
+        weighted.append(
+            {
+                "category": category,
+                "component": component,
+                "id": _stratum_id(category, component),
+                "target_text_utf8_bytes": target_text_bytes,
+            }
+        )
+    if not weighted:
+        raise ValueError("source-mix manifest contains no used source strata")
+
+    total_weight = sum(item["target_text_utf8_bytes"] for item in weighted)
+    assigned = 0
+    for item in weighted:
+        numerator = target_tokens * item["target_text_utf8_bytes"]
+        item["target_tokens"] = numerator // total_weight
+        item["allocation_remainder"] = numerator % total_weight
+        assigned += item["target_tokens"]
+    leftovers = target_tokens - assigned
+    remainder_order = sorted(
+        weighted,
+        key=lambda item: (
+            -item["allocation_remainder"],
+            item["category"],
+            item["component"],
+        ),
+    )
+    for item in remainder_order[:leftovers]:
+        item["target_tokens"] += 1
+    for item in weighted:
+        item.pop("allocation_remainder")
+
+    return {
+        "mode": "source_manifest_stratified",
+        "source_manifest": {
+            "bytes": len(manifest_bytes),
+            "path": str(manifest_path.resolve()),
+            "sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        },
+        "source_total_target_text_utf8_bytes": total_weight,
+        "strata": weighted,
+    }
+
+
 def _shard_path(output: Path, shard_index: int) -> Path:
     return output / f"shard-{shard_index:05d}.bin"
 
@@ -195,6 +276,35 @@ def validate_packed_manifest(
         raise ValueError("packed manifest sequence total does not match its shards")
     if total_tokens != total_sequences * sequence_length:
         raise ValueError("packed manifest totals are not sequence aligned")
+    selection = manifest.get("selection")
+    if selection is not None:
+        if selection.get("mode") != "source_manifest_stratified":
+            raise ValueError("unsupported packed-data selection mode")
+        expected = {
+            item["id"]: (
+                item["category"],
+                item["component"],
+                item["target_tokens"],
+                item["target_tokens"],
+            )
+            for item in selection.get("strata", [])
+        }
+        actual_items = statistics.get("strata", [])
+        actual = {
+            item["id"]: (
+                item["category"],
+                item["component"],
+                item["target_tokens"],
+                item["tokens"],
+            )
+            for item in actual_items
+        }
+        if len(expected) != len(selection.get("strata", [])) or not expected:
+            raise ValueError("packed selection has invalid source strata")
+        if len(actual) != len(actual_items) or actual != expected:
+            raise ValueError("packed source strata do not meet their token quotas")
+        if sum(item[2] for item in expected.values()) != total_tokens:
+            raise ValueError("packed source-stratum quotas do not match total tokens")
     return manifest
 
 
@@ -211,6 +321,7 @@ def build_packed_dataset(
     checkpoint_documents: int = 1_000,
     expected_vocab_size: int | None = None,
     expected_doc_token_id: int = 3,
+    source_mix_manifest_path: str | Path | None = None,
     resume: bool = False,
 ) -> dict[str, Any]:
     """Pack JSONL documents into deterministic fixed-length uint32 shards.
@@ -232,12 +343,22 @@ def build_packed_dataset(
         raise ValueError("max-documents must be positive")
     if target_tokens is not None and target_tokens < sequence_length:
         raise ValueError("target-tokens must cover at least one full sequence")
+    if source_mix_manifest_path is not None and target_tokens is None:
+        raise ValueError("source-mix stratification requires target-tokens")
 
     effective_target = (
         None if target_tokens is None else (target_tokens // sequence_length) * sequence_length
     )
     input_artifact = _input_artifact(input_path)
     tokenizer_artifact = _tokenizer_artifact(tokenizer_path)
+    selection = None
+    if source_mix_manifest_path is not None:
+        assert effective_target is not None
+        selection = _source_mix_selection(
+            manifest_path=Path(source_mix_manifest_path),
+            input_artifact=input_artifact,
+            target_tokens=effective_target,
+        )
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
     vocab_size = len(tokenizer)
     if expected_vocab_size is not None and vocab_size != expected_vocab_size:
@@ -276,6 +397,16 @@ def build_packed_dataset(
             "vocab_size": vocab_size,
         },
     }
+    if selection is not None:
+        build_specification["selection"] = selection
+    strata_by_key = (
+        {
+            (item["category"], item["component"]): item
+            for item in selection["strata"]
+        }
+        if selection is not None
+        else {}
+    )
     build_fingerprint = _fingerprint(build_specification)
     manifest_path = output / MANIFEST_FILENAME
     state_path = output / STATE_FILENAME
@@ -312,6 +443,16 @@ def build_packed_dataset(
             "tokens_written": 0,
             "truncated_final_document": False,
         }
+        if selection is not None:
+            state["stratum_documents_packed"] = {
+                item["id"]: 0 for item in selection["strata"]
+            }
+            state["stratum_tokens_written"] = {
+                item["id"]: 0 for item in selection["strata"]
+            }
+            state["stratum_truncated_final_document"] = {
+                item["id"]: False for item in selection["strata"]
+            }
         _write_json_atomic(state_path, state)
 
     shard_capacity = sequence_length * sequences_per_shard
@@ -348,11 +489,32 @@ def build_packed_dataset(
         _flush_and_sync(current_handle)
         _write_json_atomic(state_path, live)
 
+    def stratified_complete() -> bool:
+        if selection is None:
+            return False
+        return all(
+            live["stratum_tokens_written"].get(item["id"]) == item["target_tokens"]
+            for item in selection["strata"]
+        )
+
+    if selection is not None:
+        expected_stratum_ids = {item["id"] for item in selection["strata"]}
+        for field in (
+            "stratum_documents_packed",
+            "stratum_tokens_written",
+            "stratum_truncated_final_document",
+        ):
+            if set(live.get(field, {})) != expected_stratum_ids:
+                raise ValueError(f"packing checkpoint has invalid {field}")
+
     end_reason = "input_exhausted"
     try:
         with input_path.open("rb") as input_handle:
             input_handle.seek(live["input_offset"])
             while True:
+                if stratified_complete():
+                    end_reason = "source_manifest_stratified_target"
+                    break
                 if max_documents is not None and live["documents_seen"] >= max_documents:
                     end_reason = "max_documents"
                     break
@@ -369,14 +531,35 @@ def build_packed_dataset(
 
                 live["documents_seen"] += 1
                 live["input_offset"] = next_offset
-                if text:
+                stratum = None
+                stratum_remaining = None
+                if selection is not None:
+                    provenance = record.get("provenance")
+                    if not isinstance(provenance, dict):
+                        raise ValueError("stratified record is missing provenance")
+                    key = (provenance.get("category"), provenance.get("component"))
+                    stratum = strata_by_key.get(key)
+                    if stratum is None:
+                        raise ValueError(f"record has an unknown source stratum: {key!r}")
+                    stratum_remaining = (
+                        stratum["target_tokens"]
+                        - live["stratum_tokens_written"][stratum["id"]]
+                    )
+
+                if text and (stratum_remaining is None or stratum_remaining > 0):
                     encoded = tokenizer.backend_tokenizer.encode(
                         text, add_special_tokens=False
                     ).ids
                     token_ids = [expected_doc_token_id, *encoded]
                     if any(token_id < 0 or token_id >= vocab_size for token_id in token_ids):
                         raise ValueError("tokenizer emitted an ID outside its vocabulary")
-                    if effective_target is not None:
+                    if stratum_remaining is not None:
+                        if len(token_ids) > stratum_remaining:
+                            token_ids = token_ids[:stratum_remaining]
+                            live["truncated_final_document"] = True
+                            assert stratum is not None
+                            live["stratum_truncated_final_document"][stratum["id"]] = True
+                    elif effective_target is not None:
                         remaining = effective_target - live["tokens_written"]
                         if len(token_ids) > remaining:
                             token_ids = token_ids[:remaining]
@@ -385,9 +568,20 @@ def build_packed_dataset(
                         append_tokens(token_ids)
                         live["documents_packed"] += 1
                         live["encoded_text_bytes"] += len(text.encode("utf-8"))
+                        if stratum is not None:
+                            live["stratum_documents_packed"][stratum["id"]] += 1
+                            live["stratum_tokens_written"][stratum["id"]] += len(token_ids)
 
                 should_checkpoint = live["documents_seen"] % checkpoint_documents == 0
-                if effective_target is not None and live["tokens_written"] >= effective_target:
+                if stratified_complete():
+                    end_reason = "source_manifest_stratified_target"
+                    checkpoint()
+                    break
+                if (
+                    selection is None
+                    and effective_target is not None
+                    and live["tokens_written"] >= effective_target
+                ):
                     end_reason = "target_tokens"
                     checkpoint()
                     break
@@ -399,6 +593,18 @@ def build_packed_dataset(
             _flush_and_sync(current_handle)
             current_handle.close()
             current_handle = None
+
+    if selection is not None:
+        if not stratified_complete():
+            missing = {
+                item["id"]: item["target_tokens"]
+                - live["stratum_tokens_written"][item["id"]]
+                for item in selection["strata"]
+                if live["stratum_tokens_written"][item["id"]] != item["target_tokens"]
+            }
+            raise RuntimeError(f"packing input ended before source quotas were met: {missing}")
+        if live["tokens_written"] != effective_target:
+            raise RuntimeError("stratified source quotas do not add up to the target")
 
     tail_tokens = live["tokens_written"] % sequence_length
     if tail_tokens:
@@ -433,6 +639,31 @@ def build_packed_dataset(
         )
         total_sequences += sequences
 
+    statistics = {
+        "documents_packed": live["documents_packed"],
+        "documents_seen": live["documents_seen"],
+        "encoded_text_bytes": live["encoded_text_bytes"],
+        "sequences": total_sequences,
+        "tail_tokens_dropped": tail_tokens,
+        "tokens": live["tokens_written"],
+        "truncated_final_document": live["truncated_final_document"],
+    }
+    if selection is not None:
+        statistics["strata"] = [
+            {
+                "category": item["category"],
+                "component": item["component"],
+                "documents_packed": live["stratum_documents_packed"][item["id"]],
+                "id": item["id"],
+                "target_tokens": item["target_tokens"],
+                "tokens": live["stratum_tokens_written"][item["id"]],
+                "truncated_final_document": live["stratum_truncated_final_document"][
+                    item["id"]
+                ],
+            }
+            for item in selection["strata"]
+        ]
+
     manifest = {
         **build_specification,
         "build_fingerprint": build_fingerprint,
@@ -440,15 +671,7 @@ def build_packed_dataset(
         "end_reason": end_reason,
         "schema_version": PACKED_DATA_SCHEMA_VERSION,
         "shards": shards,
-        "statistics": {
-            "documents_packed": live["documents_packed"],
-            "documents_seen": live["documents_seen"],
-            "encoded_text_bytes": live["encoded_text_bytes"],
-            "sequences": total_sequences,
-            "tail_tokens_dropped": tail_tokens,
-            "tokens": live["tokens_written"],
-            "truncated_final_document": live["truncated_final_document"],
-        },
+        "statistics": statistics,
         "status": "complete",
     }
     _write_json_atomic(manifest_path, manifest)

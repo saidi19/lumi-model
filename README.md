@@ -34,11 +34,13 @@ tokenizer, data, and deployment portability before any expensive GPU run:
    resumed full validation and the cached validation check pass;
 10. the full 1,128,089-document bakeoff selects 65K: it emits 4.39% fewer
     tokens overall and wins in all eight measured domains;
-11. deterministic fixed-sequence packing and checkpointed training now pass
-    interruption/resume tests; an 8,192-token real-corpus Apple-MPS smoke run
-    saved at step 1 and resumed in a fresh process through step 2;
-12. next, run the paid 50M-token 150M real-corpus plumbing pilot and measured
-    single-GPU throughput, then complete the MLX/GGUF conversion gates.
+11. deterministic fixed-sequence packing, sealed-manifest source stratification,
+    and checkpointed training pass interruption/resume tests; an 8,192-token
+    real-corpus Apple-MPS smoke run saved at step 1 and resumed in a fresh
+    process through step 2;
+12. the 24-source 50M target is materialized at 49,999,872 tokens in 48
+    hash-verified shards; next, run the paid 150M training/throughput pilot,
+    then complete the MLX/GGUF conversion gates.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.
