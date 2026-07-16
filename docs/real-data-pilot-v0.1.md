@@ -1,8 +1,9 @@
 # Lumi real-data pilot plumbing v0.1
 
 Status: **deterministic packing, 24-source stratification, crash-safe resume,
-checkpointed training, a real-corpus Apple-Silicon smoke run, and 50M-token
-input materialization pass; paid 150M training has not started**
+checkpointed training, a real-corpus Apple-Silicon smoke run, 50M-token input
+materialization, and the portable cloud preflight pass; paid 150M training has
+not started**
 
 ## Purpose
 
@@ -127,7 +128,7 @@ can justify a 4B scale-up.
 
 ## Verification
 
-- all 77 repository tests pass;
+- all 78 repository tests pass;
 - Ruff and `git diff --check` pass;
 - interrupted packing resumes byte-identically;
 - interrupted training resumes tensor-identically in the deterministic CPU
@@ -143,6 +144,12 @@ GPU, hourly price, expected maximum runtime/cost, storage, image, and shutdown
 rule. The run must demonstrate finite loss, stop/restart recovery, measured
 tokens/s, peak memory, checkpoint duration, and cost. Only then can the 1B-3B
 token 150M pilot or any 4B run be approved.
+
+`configs/cloud-pilot-v0.1.json` and
+[`lambda-pilot-v0.1.md`](lambda-pilot-v0.1.md) pin the selected Lambda H100,
+artifact hashes, local/cloud preflight, smoke/resume commands, and 763-step full
+run. The owner approved proceeding without a fixed wall-time cap; completion or
+a terminal failure still requires prompt instance termination.
 
 The completed materialization is reproducible with:
 
