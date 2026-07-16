@@ -171,9 +171,12 @@ resume continued.
    uninterrupted regression run; a 4.29M-parameter, 8,192-token real-corpus
    Apple-MPS smoke checkpoint resumed successfully in a fresh process. See
    [`real-data-pilot-v0.1.md`](real-data-pilot-v0.1.md).
-5. Next: run the 50M-token 150M real-corpus plumbing pilot and measure
-   single-GPU end-to-end throughput and cost before approving any larger run.
-6. Next: complete the trained-checkpoint MLX/GGUF conversion gates.
+5. Completed: the exact 24-source mix is materialized as 49,999,872 tokens in
+   48 hash-verified shards; cached resume validation passes.
+6. Next: train the 150M model on that artifact and measure single-GPU
+   throughput, peak memory, checkpoint duration, restart recovery, and cost
+   before approving any larger run.
+7. Next: complete the trained-checkpoint MLX/GGUF conversion gates.
 
 The full 4B H100/H200 model-training phase remains unapproved until the 150M
 real-corpus pilot, measured checkpoint/throughput gates, and conversion gates

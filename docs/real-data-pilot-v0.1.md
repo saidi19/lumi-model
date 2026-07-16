@@ -1,8 +1,8 @@
 # Lumi real-data pilot plumbing v0.1
 
-Status: **deterministic packing, crash-safe resume, checkpointed training, and a
-real-corpus Apple-Silicon smoke run pass; the paid 150M/50M-token run has not
-started**
+Status: **deterministic packing, 24-source stratification, crash-safe resume,
+checkpointed training, a real-corpus Apple-Silicon smoke run, and 50M-token
+input materialization pass; paid 150M training has not started**
 
 ## Purpose
 
@@ -25,6 +25,16 @@ The manifest pins:
 - sequence length, shard capacity, target, and build fingerprint;
 - every shard's byte count, token count, sequence count, and SHA-256.
 
+The sealed sample is intentionally written in category/component blocks, so a
+linear 50M-token prefix would be dominated by the first source. For scaled
+pilots, `--source-mix-manifest` pins the sealed sample manifest, verifies that
+its byte count and SHA-256 match the JSONL input, and allocates exact per-source
+token quotas from all 24 planned source byte weights using largest remainders.
+The packer scans the clustered file through the final required source while
+skipping already-filled strata. Training then shuffles the resulting fixed
+sequences deterministically. The small 8,192-token Mac smoke intentionally used
+linear mode because it tested plumbing rather than mixture quality.
+
 Packing state commits only after shard bytes are flushed. A resume reconciles
 each shard to the durable token count, truncates uncommitted crash-tail bytes,
 and continues from the committed JSONL byte offset. Tests simulate an exception
@@ -46,6 +56,11 @@ crash happens after the checkpoint directory is committed but before the outer
 state file is updated, the newest matching checkpoint is discovered and
 recovered. A regression test proves that `2 steps + resume to 4` produces the
 same losses and model tensors as an uninterrupted four-step CPU run.
+
+On CUDA, the runner uses fused AdamW when PyTorch supports it and records peak
+allocated/reserved GPU memory, tokens per second, and checkpoint duration. This
+makes the short cloud pilot a measurable cost and capacity gate rather than a
+blind training run.
 
 ## Real Mac smoke result
 
@@ -76,9 +91,43 @@ The local artifacts live outside Git under
 `~/Documents/lumi-data/real-pilot-smoke-v0.1/`. Generated data, optimizer state,
 and weights remain excluded by repository policy.
 
+## Stratified canary and 50M artifact
+
+A 24,576-token real-data canary exercised the clustered-file scan and exact
+largest-remainder quotas across all 24 sources and all eight categories. It
+produced 192 sequences in three shards, and cached `--resume` validation passed.
+Its build fingerprint is
+`6e1f8fb5375c10df518d52af5f1eb7d6f9a988e63e3fc8416c919a8df3e53c7e`.
+
+The cloud-pilot input was then materialized locally at
+`~/Documents/lumi-data/real-pilot-50m-v0.1/packed/`. It contains exactly
+49,999,872 tokens, or 24,414 complete 2,048-token sequences, in 48 hashed
+shards. All 24 source quotas and all eight category totals validate exactly,
+and a cached `--resume` check passed. The packed manifest SHA-256 is
+`a8d964164221f81acb5805de767ea0cc1d5baf75eda31462ad01badae4b9522c`;
+the build fingerprint is
+`2a7187332b1f42f7290310091d11ad0d8cca3a2005b4d6b9df402a98e3347645`.
+
+| Category | Packed tokens |
+|---|---:|
+| Science and education | 14,849,961 |
+| Code | 9,899,975 |
+| Reference | 7,424,981 |
+| Questions and discussion | 7,424,981 |
+| Open web | 4,949,987 |
+| Books | 2,474,994 |
+| Government, legal, and patents | 2,474,994 |
+| Bengali reference slice | 499,999 |
+
+This artifact proves mixture and training plumbing, not model quality. Within
+each source block it deterministically takes the earliest documents needed to
+meet that source's quota. A later 1B-3B-token quality pilot must add a pinned
+within-source hash shuffle and held-out, domain-stratified validation before it
+can justify a 4B scale-up.
+
 ## Verification
 
-- all 76 repository tests pass;
+- all 77 repository tests pass;
 - Ruff and `git diff --check` pass;
 - interrupted packing resumes byte-identically;
 - interrupted training resumes tensor-identically in the deterministic CPU
@@ -94,3 +143,16 @@ GPU, hourly price, expected maximum runtime/cost, storage, image, and shutdown
 rule. The run must demonstrate finite loss, stop/restart recovery, measured
 tokens/s, peak memory, checkpoint duration, and cost. Only then can the 1B-3B
 token 150M pilot or any 4B run be approved.
+
+The completed materialization is reproducible with:
+
+```bash
+python scripts/pack_pilot_data.py \
+  --input "$LUMI_DATA/tokenizer-sample-v0.3/sample.jsonl" \
+  --source-mix-manifest "$LUMI_DATA/tokenizer-sample-v0.3/manifest.json" \
+  --tokenizer "$LUMI_DATA/tokenizer-candidates-v0.2/lumi-tokenizer-65k" \
+  --model-config configs/lumi-150m.json \
+  --output "$LUMI_DATA/real-pilot-50m-v0.1/packed" \
+  --target-tokens 50000000 \
+  --resume
+```

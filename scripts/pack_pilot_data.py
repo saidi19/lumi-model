@@ -20,6 +20,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-length", type=int)
     parser.add_argument("--sequences-per-shard", type=int, default=512)
     parser.add_argument("--target-tokens", type=int, required=True)
+    parser.add_argument(
+        "--source-mix-manifest",
+        type=Path,
+        help="sealed sample manifest used to enforce per-source token quotas",
+    )
     parser.add_argument("--text-key", default="text")
     parser.add_argument("--max-documents", type=int)
     parser.add_argument("--checkpoint-documents", type=int, default=1_000)
@@ -49,6 +54,7 @@ def main() -> None:
         checkpoint_documents=args.checkpoint_documents,
         expected_vocab_size=config.vocab_size,
         expected_doc_token_id=config.doc_token_id,
+        source_mix_manifest_path=args.source_mix_manifest,
         resume=args.resume,
     )
     statistics = manifest["statistics"]

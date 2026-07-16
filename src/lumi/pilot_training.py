@@ -90,6 +90,21 @@ def _synchronize(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
+def _create_optimizer(
+    model: LumiForCausalLM,
+    *,
+    device: torch.device,
+    learning_rate: float,
+    weight_decay: float,
+) -> torch.optim.AdamW:
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        fused=device.type == "cuda",
+    )
+
+
 def _batch_indices(
     *, cursor: int, count: int, dataset_length: int, seed: int
 ) -> list[int]:
@@ -215,8 +230,11 @@ def _restore_checkpoint(
 ) -> tuple[LumiForCausalLM, torch.optim.AdamW]:
     model = LumiForCausalLM.from_pretrained(checkpoint, local_files_only=True)
     model.to(device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+    optimizer = _create_optimizer(
+        model,
+        device=device,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
     )
     trainer_payload = torch.load(
         checkpoint / "trainer.pt", map_location="cpu", weights_only=True
@@ -348,8 +366,11 @@ def train_packed_pilot(
         torch.manual_seed(seed)
         model = LumiForCausalLM(config)
         model.to(training_device)
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        optimizer = _create_optimizer(
+            model,
+            device=training_device,
+            learning_rate=learning_rate,
+            weight_decay=weight_decay,
         )
     else:
         model, optimizer = _restore_checkpoint(
@@ -369,6 +390,8 @@ def train_packed_pilot(
         accumulated_loss = 0.0
         step_tokens = 0
         _synchronize(training_device)
+        if training_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(training_device)
         started = time.perf_counter()
         for _ in range(gradient_accumulation_steps):
             indices = _batch_indices(
@@ -410,11 +433,20 @@ def train_packed_pilot(
             "elapsed_seconds": elapsed,
             "gradient_norm": float(gradient_norm),
             "loss": state["last_loss"],
+            "peak_memory_allocated_bytes": (
+                torch.cuda.max_memory_allocated(training_device)
+                if training_device.type == "cuda"
+                else None
+            ),
+            "peak_memory_reserved_bytes": (
+                torch.cuda.max_memory_reserved(training_device)
+                if training_device.type == "cuda"
+                else None
+            ),
             "step": state["step"],
             "tokens_per_second": step_tokens / elapsed,
             "tokens_seen": state["tokens_seen"],
         }
-        _append_metric(metrics_path, metric)
         print(
             f"step={state['step']:06d} loss={state['last_loss']:.6f} "
             f"tokens_per_second={metric['tokens_per_second']:.1f}",
@@ -423,11 +455,25 @@ def train_packed_pilot(
 
         should_checkpoint = state["step"] % checkpoint_steps == 0 or state["step"] == steps
         if should_checkpoint:
+            _synchronize(training_device)
+            checkpoint_started = time.perf_counter()
             checkpoint = _save_checkpoint(
                 output=output, model=model, optimizer=optimizer, state=state
             )
+            _synchronize(training_device)
+            checkpoint_seconds = time.perf_counter() - checkpoint_started
             state["latest_checkpoint"] = checkpoint.name
+            state["last_checkpoint_seconds"] = checkpoint_seconds
             state["status"] = "active"
+            metric["checkpoint_seconds"] = checkpoint_seconds
+            print(
+                f"checkpoint={checkpoint.name} seconds={checkpoint_seconds:.3f}",
+                flush=True,
+            )
+        else:
+            metric["checkpoint_seconds"] = None
+        _append_metric(metrics_path, metric)
+        if should_checkpoint:
             _write_json_atomic(state_path, state)
 
     state["status"] = "complete"

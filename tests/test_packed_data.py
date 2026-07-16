@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
@@ -79,6 +80,57 @@ def packing_corpus(tmp_path: Path) -> Path:
             record = {"text": f"pilot record {index} block {index % 7}"}
             handle.write(json.dumps(record) + "\n")
     return path
+
+
+@pytest.fixture
+def stratified_corpus(tmp_path: Path) -> tuple[Path, Path]:
+    path = tmp_path / "stratified-corpus.jsonl"
+    with path.open("w", encoding="utf-8") as handle:
+        for category, component, marker in (
+            ("category_a", "component_a", "alpha"),
+            ("category_b", "component_b", "beta"),
+        ):
+            for index in range(20):
+                handle.write(
+                    json.dumps(
+                        {
+                            "provenance": {
+                                "category": category,
+                                "component": component,
+                            },
+                            "text": f"{marker} {marker} source record {index}",
+                        }
+                    )
+                    + "\n"
+                )
+    source_manifest = tmp_path / "source-manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "output": {
+                    "file_bytes": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                },
+                "source_files": [
+                    {
+                        "category": "category_a",
+                        "component": "component_a",
+                        "statistics": {"target_text_utf8_bytes": 100},
+                        "used": True,
+                    },
+                    {
+                        "category": "category_b",
+                        "component": "component_b",
+                        "statistics": {"target_text_utf8_bytes": 300},
+                        "used": True,
+                    },
+                ],
+                "status": "complete",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path, source_manifest
 
 
 def _build(corpus: Path, tokenizer: Path, output: Path, *, resume: bool = False) -> dict:
@@ -184,6 +236,68 @@ def test_interrupted_build_resumes_byte_identically(
     assert [item["sha256"] for item in resumed["shards"]] == [
         item["sha256"] for item in fresh["shards"]
     ]
+
+
+def test_source_manifest_stratification_scans_clustered_sources(
+    tiny_tokenizer: Path,
+    stratified_corpus: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, source_manifest = stratified_corpus
+    output = tmp_path / "stratified-packed"
+    manifest = build_packed_dataset(
+        input_path=corpus,
+        tokenizer_path=tiny_tokenizer,
+        output=output,
+        sequence_length=8,
+        sequences_per_shard=4,
+        target_tokens=96,
+        checkpoint_documents=1,
+        expected_vocab_size=320,
+        source_mix_manifest_path=source_manifest,
+    )
+
+    assert manifest["end_reason"] == "source_manifest_stratified_target"
+    assert manifest["statistics"]["documents_seen"] > 20
+    assert [item["tokens"] for item in manifest["statistics"]["strata"]] == [24, 72]
+    assert [item["target_tokens"] for item in manifest["selection"]["strata"]] == [
+        24,
+        72,
+    ]
+    dataset = PackedTokenDataset(output / "manifest.json")
+    flattened = torch.stack([dataset[index] for index in range(len(dataset))]).flatten()
+    tokenizer = AutoTokenizer.from_pretrained(tiny_tokenizer, local_files_only=True)
+    assert "alpha" in tokenizer.decode(flattened[:24], skip_special_tokens=True)
+    assert "beta" in tokenizer.decode(flattened[24:], skip_special_tokens=True)
+
+    cached = build_packed_dataset(
+        input_path=corpus,
+        tokenizer_path=tiny_tokenizer,
+        output=output,
+        sequence_length=8,
+        sequences_per_shard=4,
+        target_tokens=96,
+        checkpoint_documents=1,
+        expected_vocab_size=320,
+        source_mix_manifest_path=source_manifest,
+        resume=True,
+    )
+    assert cached == manifest
+
+    changed_manifest = tmp_path / "changed-source-manifest.json"
+    changed = json.loads(source_manifest.read_text(encoding="utf-8"))
+    changed["output"]["sha256"] = "0" * 64
+    changed_manifest.write_text(json.dumps(changed), encoding="utf-8")
+    with pytest.raises(ValueError, match="SHA-256 does not match"):
+        build_packed_dataset(
+            input_path=corpus,
+            tokenizer_path=tiny_tokenizer,
+            output=tmp_path / "rejected-stratified-packed",
+            sequence_length=8,
+            target_tokens=96,
+            expected_vocab_size=320,
+            source_mix_manifest_path=changed_manifest,
+        )
 
 
 def test_training_resume_matches_uninterrupted_run(
