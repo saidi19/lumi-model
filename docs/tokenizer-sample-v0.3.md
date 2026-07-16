@@ -158,13 +158,17 @@ physical-source state. Fast quality-index restoration reused 417,700 committed
 entries and rebuilt only the 40-record crash tail before the network-backed
 resume continued.
 
-## Next gates
+## Outcome and next gates
 
-1. Train and compare 32K and 65K tokenizer candidates from this exact sealed
-   sample.
-2. Freeze one tokenizer contract only after compression, round-trip, special
-   token, and multilingual/code evaluation pass.
-3. Run the small real-corpus model and measured single-GPU throughput pilots.
+1. Completed: corrected 32K and 65K tokenizer candidates were trained from this
+   exact sealed sample with identical settings.
+2. Completed: the full-sample comparison, round-trip, special-token,
+   vocabulary-length, and multilingual/code gates pass; 65K is frozen in
+   [`tokenizer-v0.1.md`](tokenizer-v0.1.md).
+3. Next: run the 50M-token 150M real-corpus plumbing pilot, then checkpoint and
+   MLX/GGUF conversion gates.
+4. Next: measure single-GPU end-to-end throughput and cost before approving any
+   larger training run.
 
 The full H100/H200 model-training phase remains unapproved until the tokenizer,
 small real-corpus model pilot, checkpoint, and throughput gates pass.
