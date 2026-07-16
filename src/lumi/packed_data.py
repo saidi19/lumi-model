@@ -278,7 +278,10 @@ def validate_packed_manifest(
         raise ValueError("packed manifest totals are not sequence aligned")
     selection = manifest.get("selection")
     if selection is not None:
-        if selection.get("mode") != "source_manifest_stratified":
+        if selection.get("mode") not in {
+            "source_manifest_stratified",
+            "post_training_hash_ranked",
+        }:
             raise ValueError("unsupported packed-data selection mode")
         expected = {
             item["id"]: (

@@ -44,8 +44,13 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     smoke resume advances through step 2, and the 150,625,536-parameter model
     completes 763 steps over 50,003,968 tokens at a measured mean of 117,888
     tokens/second; the final resumable checkpoint is hash-verified on the Mac;
-14. next, complete the MLX/GGUF conversion and inference gates before deciding
-    whether the 4B candidate is ready for a larger training pilot.
+14. a hash-ranked, 24-source model-weight-held-out set is sealed at 4,999,168
+    tokens with zero ID/content/near-duplicate overlap; a forced-stop MPS run
+    resumes and completes at loss 4.680812, perplexity 107.858, and 4,686.9
+    tokens/second on the 16GB M5 Mac;
+15. fixed generations remain repetitive and factually wrong, as expected from
+    a 150M model trained on only 50M tokens; next, complete MLX logits parity,
+    4-bit local inference, and serving gates before designing the 1B pilot.
 
 The 4B configuration is a candidate until all deployment gates pass. The 150M
 H100 plumbing pilot is complete, but it is not evidence that a 4B training run
@@ -73,6 +78,8 @@ The real-data packer and resumable pilot runner are documented in
 generated shards and checkpoints outside Git.
 The paid CUDA gate and exact transfer/training contract are documented in
 [`docs/lambda-pilot-v0.1.md`](docs/lambda-pilot-v0.1.md).
+The held-out construction, MPS evaluation, and quality decision are documented
+in [`docs/evaluation-pilot-v0.1.md`](docs/evaluation-pilot-v0.1.md).
 
 ## Repository policy
 
