@@ -2,7 +2,9 @@
 
 from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
+from .checkpoint_evaluation import evaluate_checkpoint
 from .configuration_lumi import LumiConfig
+from .evaluation_data import build_heldout_evaluation, validate_heldout_manifest
 from .modeling_lumi import LumiForCausalLM, LumiModel
 from .packed_data import PackedTokenDataset, build_packed_dataset, validate_packed_manifest
 from .parameter_count import ParameterBreakdown, parameter_breakdown
@@ -29,8 +31,11 @@ __all__ = [
     "PackedTokenDataset",
     "ParameterBreakdown",
     "build_packed_dataset",
+    "build_heldout_evaluation",
+    "evaluate_checkpoint",
     "parameter_breakdown",
     "register_lumi",
     "train_packed_pilot",
+    "validate_heldout_manifest",
     "validate_packed_manifest",
 ]

@@ -173,11 +173,15 @@ resume continued.
    [`real-data-pilot-v0.1.md`](real-data-pilot-v0.1.md).
 5. Completed: the exact 24-source mix is materialized as 49,999,872 tokens in
    48 hash-verified shards; cached resume validation passes.
-6. Next: train the 150M model on that artifact and measure single-GPU
-   throughput, peak memory, checkpoint duration, restart recovery, and cost
-   before approving any larger run.
-7. Next: complete the trained-checkpoint MLX/GGUF conversion gates.
+6. Completed: the 150M Lambda H100 plumbing run processes 50,003,968 tokens,
+   passes fresh-process resume, and its final checkpoint is hash-verified on the
+   Mac. See [`lambda-pilot-v0.1.md`](lambda-pilot-v0.1.md).
+7. Completed: a 4,999,168-token, 24-source model-weight-held-out artifact has
+   zero ID/content/near-duplicate overlap; the resumed M5/MPS evaluation records
+   loss 4.680812 and perplexity 107.858. Fixed generations remain unusable. See
+   [`evaluation-pilot-v0.1.md`](evaluation-pilot-v0.1.md).
+8. Next: complete trained-checkpoint MLX parity, 4-bit local inference, and the
+   local serving gate before designing the 1B scaling pilot.
 
-The full 4B H100/H200 model-training phase remains unapproved until the 150M
-real-corpus pilot, measured checkpoint/throughput gates, and conversion gates
-pass.
+The full 4B H100/H200 model-training phase remains unapproved until the 1B
+quality pilot and conversion/serving gates pass.

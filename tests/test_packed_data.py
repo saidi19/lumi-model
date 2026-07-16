@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -15,10 +16,13 @@ from lumi import (
     LumiConfig,
     LumiForCausalLM,
     PackedTokenDataset,
+    build_heldout_evaluation,
     build_packed_dataset,
+    evaluate_checkpoint,
     packed_data,
     parameter_breakdown,
     train_packed_pilot,
+    validate_heldout_manifest,
     validate_packed_manifest,
 )
 from lumi.cloud_pilot import preflight_cloud_pilot
@@ -136,6 +140,69 @@ def stratified_corpus(tmp_path: Path) -> tuple[Path, Path]:
     return path, source_manifest
 
 
+@pytest.fixture
+def heldout_corpus(tmp_path: Path) -> tuple[Path, Path]:
+    path = tmp_path / "heldout-corpus.jsonl"
+    sources = (
+        ("category_a", "component_a", "alpha", 100),
+        ("category_b", "component_b", "beta", 300),
+    )
+    with path.open("w", encoding="utf-8") as handle:
+        for category, component, marker, _ in sources:
+            for index in range(80):
+                text = (
+                    f"{marker} source document {index} has unique value "
+                    f"{index * 101 + len(marker)}"
+                )
+                handle.write(
+                    json.dumps(
+                        {
+                            "content_sha256": hashlib.sha256(
+                                text.encode("utf-8")
+                            ).hexdigest(),
+                            "id": f"{category}/{component}/{index}",
+                            "provenance": {
+                                "category": category,
+                                "component": component,
+                            },
+                            "quality": {
+                                "near_duplicate": {
+                                    "fingerprint_sha256": hashlib.sha256(
+                                        f"near/{category}/{component}/{index}".encode()
+                                    ).hexdigest()
+                                }
+                            },
+                            "text": text,
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+    source_manifest = tmp_path / "heldout-source-manifest.json"
+    source_manifest.write_text(
+        json.dumps(
+            {
+                "output": {
+                    "file_bytes": path.stat().st_size,
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                },
+                "source_files": [
+                    {
+                        "category": category,
+                        "component": component,
+                        "statistics": {"target_text_utf8_bytes": target_bytes},
+                        "used": True,
+                    }
+                    for category, component, _, target_bytes in sources
+                ],
+                "status": "complete",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path, source_manifest
+
+
 def _build(corpus: Path, tokenizer: Path, output: Path, *, resume: bool = False) -> dict:
     return build_packed_dataset(
         input_path=corpus,
@@ -147,6 +214,48 @@ def _build(corpus: Path, tokenizer: Path, output: Path, *, resume: bool = False)
         checkpoint_documents=1,
         expected_vocab_size=320,
         resume=resume,
+    )
+
+
+def _build_training_for_heldout(
+    corpus: Path, source_manifest: Path, tokenizer: Path, output: Path
+) -> dict:
+    return build_packed_dataset(
+        input_path=corpus,
+        tokenizer_path=tokenizer,
+        output=output,
+        sequence_length=8,
+        sequences_per_shard=4,
+        target_tokens=96,
+        checkpoint_documents=5,
+        expected_vocab_size=320,
+        source_mix_manifest_path=source_manifest,
+    )
+
+
+def _build_heldout(
+    corpus: Path,
+    tokenizer: Path,
+    training_manifest: Path,
+    output: Path,
+    *,
+    resume: bool = False,
+    interrupt_after_documents: int | None = None,
+) -> dict:
+    return build_heldout_evaluation(
+        input_path=corpus,
+        tokenizer_path=tokenizer,
+        training_manifest_path=training_manifest,
+        output=output,
+        target_tokens=64,
+        sequence_length=8,
+        sequences_per_shard=2,
+        seed=23,
+        candidate_fraction_denominator=1,
+        checkpoint_documents=5,
+        expected_vocab_size=320,
+        resume=resume,
+        _interrupt_after_documents=interrupt_after_documents,
     )
 
 
@@ -301,6 +410,207 @@ def test_source_manifest_stratification_scans_clustered_sources(
             expected_vocab_size=320,
             source_mix_manifest_path=changed_manifest,
         )
+
+
+def test_heldout_builder_replays_training_and_proves_zero_overlap(
+    tiny_tokenizer: Path,
+    heldout_corpus: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, source_manifest = heldout_corpus
+    training_output = tmp_path / "heldout-training"
+    _build_training_for_heldout(
+        corpus, source_manifest, tiny_tokenizer, training_output
+    )
+    output = tmp_path / "heldout-evaluation"
+    manifest = _build_heldout(
+        corpus,
+        tiny_tokenizer,
+        training_output / "manifest.json",
+        output,
+    )
+
+    assert manifest["selection"]["mode"] == "post_training_hash_ranked"
+    assert manifest["statistics"]["tokens"] == 64
+    assert manifest["statistics"]["sequences"] == 8
+    assert manifest["leakage"]["document_id_overlap"] == 0
+    assert manifest["leakage"]["content_sha256_overlap"] == 0
+    assert manifest["leakage"]["near_duplicate_sha256_overlap"] == 0
+    assert [item["tokens"] for item in manifest["statistics"]["strata"]] == [
+        16,
+        48,
+    ]
+
+    def ledger(name: str) -> list[dict]:
+        return [
+            json.loads(line)
+            for line in (output / name).read_text(encoding="utf-8").splitlines()
+        ]
+
+    training_rows = ledger("training-exclusion-ledger.jsonl")
+    selected_rows = ledger("selection-ledger.jsonl")
+    for key in ("document_id", "content_sha256", "near_duplicate_sha256"):
+        assert {row[key] for row in training_rows}.isdisjoint(
+            {row[key] for row in selected_rows}
+        )
+
+    dataset = PackedTokenDataset(output / "manifest.json")
+    assert len(dataset) == 8
+    assert validate_heldout_manifest(output / "manifest.json") == manifest
+    cached = _build_heldout(
+        corpus,
+        tiny_tokenizer,
+        training_output / "manifest.json",
+        output,
+        resume=True,
+    )
+    assert cached == manifest
+
+
+def test_heldout_interruption_resumes_byte_identically(
+    tiny_tokenizer: Path,
+    heldout_corpus: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, source_manifest = heldout_corpus
+    training_output = tmp_path / "resume-training"
+    _build_training_for_heldout(
+        corpus, source_manifest, tiny_tokenizer, training_output
+    )
+    training_manifest = training_output / "manifest.json"
+    interrupted_output = tmp_path / "interrupted-heldout"
+    with pytest.raises(RuntimeError, match="simulated held-out scan interruption"):
+        _build_heldout(
+            corpus,
+            tiny_tokenizer,
+            training_manifest,
+            interrupted_output,
+            interrupt_after_documents=17,
+        )
+
+    connection = sqlite3.connect(interrupted_output / "heldout-state.sqlite3")
+    try:
+        row = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'state'"
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    durable_state = json.loads(row[0])
+    assert durable_state["status"] == "scanning"
+    assert durable_state["documents_seen"] == 17
+
+    resumed = _build_heldout(
+        corpus,
+        tiny_tokenizer,
+        training_manifest,
+        interrupted_output,
+        resume=True,
+    )
+    fresh_output = tmp_path / "fresh-heldout"
+    fresh = _build_heldout(
+        corpus,
+        tiny_tokenizer,
+        training_manifest,
+        fresh_output,
+    )
+
+    assert resumed["build_fingerprint"] == fresh["build_fingerprint"]
+    assert resumed["statistics"] == fresh["statistics"]
+    assert resumed["selection_ledger"]["sha256"] == fresh["selection_ledger"][
+        "sha256"
+    ]
+    assert resumed["training_exclusion_ledger"]["sha256"] == fresh[
+        "training_exclusion_ledger"
+    ]["sha256"]
+    assert [item["sha256"] for item in resumed["shards"]] == [
+        item["sha256"] for item in fresh["shards"]
+    ]
+
+
+def test_checkpoint_evaluation_resumes_and_caches(
+    tiny_tokenizer: Path,
+    heldout_corpus: tuple[Path, Path],
+    tmp_path: Path,
+) -> None:
+    corpus, source_manifest = heldout_corpus
+    training_output = tmp_path / "evaluation-training"
+    _build_training_for_heldout(
+        corpus, source_manifest, tiny_tokenizer, training_output
+    )
+    heldout_output = tmp_path / "evaluation-heldout"
+    _build_heldout(
+        corpus,
+        tiny_tokenizer,
+        training_output / "manifest.json",
+        heldout_output,
+    )
+
+    checkpoint = tmp_path / "evaluation-model"
+    torch.manual_seed(29)
+    model = LumiForCausalLM(
+        LumiConfig(
+            vocab_size=320,
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            max_position_embeddings=8,
+            pad_token_id=0,
+            bos_token_id=1,
+            eos_token_id=2,
+            doc_token_id=3,
+            tie_word_embeddings=True,
+            use_cache=False,
+        )
+    )
+    model.save_pretrained(checkpoint, safe_serialization=True)
+
+    common = {
+        "checkpoint_path": checkpoint,
+        "manifest_path": heldout_output / "manifest.json",
+        "tokenizer_path": tiny_tokenizer,
+        "prompts": ["x"],
+        "generation_max_new_tokens": 1,
+        "batch_size": 2,
+        "checkpoint_batches": 1,
+        "device": "cpu",
+    }
+    interrupted_output = tmp_path / "interrupted-evaluation"
+    with pytest.raises(
+        RuntimeError, match="simulated checkpoint evaluation interruption"
+    ):
+        evaluate_checkpoint(
+            output=interrupted_output,
+            _interrupt_after_sequences=2,
+            **common,
+        )
+    interrupted_state = json.loads(
+        (interrupted_output / "evaluation-state.json").read_text(encoding="utf-8")
+    )
+    assert interrupted_state["status"] == "active"
+    assert interrupted_state["sequence_cursor"] == 2
+
+    resumed = evaluate_checkpoint(output=interrupted_output, resume=True, **common)
+    fresh = evaluate_checkpoint(output=tmp_path / "fresh-evaluation", **common)
+    assert resumed["loss"] == fresh["loss"]
+    assert resumed["generation"][0]["new_token_ids"] == fresh["generation"][0][
+        "new_token_ids"
+    ]
+    assert resumed["runtime"]["sequences"] == 8
+    assert resumed["runtime"]["model_parameters"] == parameter_breakdown(
+        model.config
+    ).total
+    cached = evaluate_checkpoint(output=interrupted_output, resume=True, **common)
+    assert cached == resumed
+    report_path = interrupted_output / "evaluation-report.json"
+    tampered = json.loads(report_path.read_text(encoding="utf-8"))
+    tampered["loss"]["mean"] += 1.0
+    report_path.write_text(json.dumps(tampered), encoding="utf-8")
+    with pytest.raises(ValueError, match="mean loss changed"):
+        evaluate_checkpoint(output=interrupted_output, resume=True, **common)
 
 
 def test_cloud_pilot_preflight_pins_portable_artifacts(
