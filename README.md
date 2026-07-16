@@ -62,12 +62,17 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     36 layers and 4K context at half width; its fail-closed plan pins permanent
     held-out exclusion, four cumulative stages through 1.4B tokens, gradient
     checkpointing, cosine scheduling, bounded checkpoints, and measured-input
-    cost projection without approving a paid GPU launch.
+    cost projection without approving a paid GPU launch;
+19. a reusable full-corpus source index reproduces 1,476,228,500 tokenizer
+    tokens and leaves 1,472,219,479 held-out-safe eligible tokens; a 16,777,216-
+    token canary and final 1,399,996,416-token uint16 artifact pass fresh-process
+    resume, cached-resume, rank-prefix, shard-integrity, and zero-leakage gates.
+    The final payload is 2,799,992,832 bytes in 42 shards; no GPU was launched.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
-design is frozen, but its hash-ranked, held-out-excluding data artifact has not
-been materialized and no paid 1B GPU launch is approved. The completed 150M
-plumbing checkpoint is not a production-quality model.
+design and hash-ranked held-out-excluding data artifact are frozen, but no paid
+1B GPU launch is approved. The completed 150M plumbing checkpoint is not a
+production-quality model.
 
 ## Quick start
 
@@ -102,6 +107,9 @@ server gate are documented in
 The exact 1B architecture, staged token contract, trainer changes, input audit,
 and measured-throughput cost rule are documented in
 [`docs/scaling-pilot-1b-v0.1.md`](docs/scaling-pilot-1b-v0.1.md).
+The deterministic source index, 16M canary, final aligned 1.4B pack, resume
+boundary, and verified hashes are documented in
+[`docs/scaling-data-1b-v0.1.md`](docs/scaling-data-1b-v0.1.md).
 
 ## Repository policy
 

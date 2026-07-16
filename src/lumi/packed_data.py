@@ -20,6 +20,10 @@ PACKED_DATA_SCHEMA_VERSION = 1
 TOKEN_BYTES = 4
 TOKEN_DTYPE = "uint32"
 TOKEN_ENDIANNESS = "little"
+SUPPORTED_TOKEN_FORMATS = {
+    "uint16": {"token_bytes": 2, "torch_dtype": torch.uint16},
+    "uint32": {"token_bytes": 4, "torch_dtype": torch.int32},
+}
 STATE_FILENAME = "packing-state.json"
 MANIFEST_FILENAME = "manifest.json"
 
@@ -239,13 +243,17 @@ def validate_packed_manifest(
     sequence_length = packing["sequence_length"]
     if not isinstance(sequence_length, int) or sequence_length < 2:
         raise ValueError("packed sequence length must be at least 2")
-    if manifest["format"] != {
-        "dtype": TOKEN_DTYPE,
-        "endianness": TOKEN_ENDIANNESS,
-        "layout": "flat_fixed_sequences",
-        "token_bytes": TOKEN_BYTES,
-    }:
+    token_format = manifest["format"]
+    dtype = token_format.get("dtype")
+    supported = SUPPORTED_TOKEN_FORMATS.get(dtype)
+    if (
+        supported is None
+        or token_format.get("endianness") != TOKEN_ENDIANNESS
+        or token_format.get("layout") != "flat_fixed_sequences"
+        or token_format.get("token_bytes") != supported["token_bytes"]
+    ):
         raise ValueError("unsupported packed token format")
+    token_bytes = supported["token_bytes"]
 
     total_tokens = 0
     total_sequences = 0
@@ -260,7 +268,7 @@ def validate_packed_manifest(
             raise FileNotFoundError(f"packed shard does not exist: {path}")
         if path.stat().st_size != shard["bytes"]:
             raise ValueError(f"packed shard size changed: {path}")
-        if shard["bytes"] != shard["tokens"] * TOKEN_BYTES:
+        if shard["bytes"] != shard["tokens"] * token_bytes:
             raise ValueError(f"packed shard byte/token mismatch: {path}")
         if shard["tokens"] != shard["sequences"] * sequence_length:
             raise ValueError(f"packed shard is not sequence aligned: {path}")
@@ -281,6 +289,7 @@ def validate_packed_manifest(
         if selection.get("mode") not in {
             "source_manifest_stratified",
             "post_training_hash_ranked",
+            "within_source_hash_ranked_excluding_heldout",
         }:
             raise ValueError("unsupported packed-data selection mode")
         expected = {
@@ -694,13 +703,15 @@ class PackedTokenDataset(Dataset[torch.Tensor]):
             self.manifest_path, verify_hashes=verify_hashes
         )
         self.sequence_length = self.manifest["packing"]["sequence_length"]
+        self.token_dtype = self.manifest["format"]["dtype"]
+        mapped_dtype = SUPPORTED_TOKEN_FORMATS[self.token_dtype]["torch_dtype"]
         self._shards: list[torch.Tensor] = []
         self._sequence_ends: list[int] = []
         sequence_total = 0
         for shard in self.manifest["shards"]:
             path = self.manifest_path.parent / shard["name"]
             mapped = torch.from_file(
-                str(path), shared=False, size=shard["tokens"], dtype=torch.int32
+                str(path), shared=False, size=shard["tokens"], dtype=mapped_dtype
             ).view(shard["sequences"], self.sequence_length)
             self._shards.append(mapped)
             sequence_total += shard["sequences"]

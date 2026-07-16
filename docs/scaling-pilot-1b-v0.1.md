@@ -1,7 +1,7 @@
 # Lumi-1B Scaling Pilot v0.1
 
-Status: **design and local input audit pass; training data is not yet
-materialized and no paid GPU launch is approved**
+Status: **design, local input audit, and held-out-safe 1.4B data gate pass; no
+paid GPU launch is approved**
 
 ## Decision
 
@@ -69,11 +69,16 @@ selection mode is `within_source_hash_ranked_excluding_heldout`, with all 24
 source strata preserved and every selected held-out ID, content hash, and
 near-duplicate family excluded before token packing.
 
-The existing generic packer does not yet implement that selection mode. Also,
-the 6GB artifact was originally approved as a validated development/tokenizer
-sample, not automatically as final pretraining data. Consequently, the next
-gate is a local, checkpointed data-builder implementation plus a full capacity
-and leakage audit. No current file is being relabeled silently as training-ready.
+The dedicated checkpointed builder now implements that selection mode without
+silently relabeling the original 6GB development/tokenizer sample. It sealed a
+reusable 1,472,219,479-token eligible source index, a 16,777,216-token canary,
+and the final 1,399,996,416-token artifact. Independent validation reports zero
+held-out ID, content-hash, or near-duplicate-family overlap across all 24
+strata. The final uint16 payload is 2,799,992,832 bytes in 42 shards; its
+manifest SHA-256 is
+`9228fa610d4a985d05e15057e8ef12619a14cbedbb5a6a5ab513d3aeca2832c8`.
+The full evidence and reproduction commands are in
+`docs/scaling-data-1b-v0.1.md`.
 
 ## Staged run contract
 
@@ -142,15 +147,15 @@ unpriced until the 100-step calibration records real throughput.
 
 ## Fail-closed approval gates
 
-Before any GPU launch:
+The first four local gates are complete: the hash-ranked held-out-excluding
+builder, byte-identical interruption/resume canary, 24-stratum capacity proof,
+and sealed final manifests/shards/hashes all pass. Before any GPU launch:
 
-1. implement the hash-ranked, held-out-excluding 1.4B data builder;
-2. pass a small interruption/resume canary byte-identically;
-3. prove all 24 per-source capacities before the full local build;
-4. seal the packed manifest, shards, tokenizer, exclusion ledger, and hashes;
-5. extend cloud preflight to the new plan and exact packed artifact;
-6. choose an actually available AWS or Lambda instance and enter its current
-   hourly rate—quota alone does not prove capacity.
+1. extend cloud preflight to the new plan and exact packed artifact;
+2. choose an actually available AWS or Lambda instance and enter its current
+   hourly rate—quota alone does not prove capacity;
+3. transfer the exact artifact and verify all hashes on the remote disk before
+   starting a trainer process.
 
 On the first GPU, run only the one-step smoke and a fresh-process resume. If
 finite loss, gradient norm, checkpoint recovery, BF16, memory, and disk gates

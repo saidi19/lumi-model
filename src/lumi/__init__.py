@@ -9,6 +9,13 @@ from .modeling_lumi import LumiForCausalLM, LumiModel
 from .packed_data import PackedTokenDataset, build_packed_dataset, validate_packed_manifest
 from .parameter_count import ParameterBreakdown, parameter_breakdown
 from .pilot_training import train_packed_pilot
+from .scaling_data import (
+    build_scaling_packed_dataset,
+    build_scaling_source_index,
+    create_scaling_data_contract,
+    validate_scaling_packed_manifest,
+    validate_scaling_source_index,
+)
 
 
 def register_lumi() -> None:
@@ -31,11 +38,16 @@ __all__ = [
     "PackedTokenDataset",
     "ParameterBreakdown",
     "build_packed_dataset",
+    "build_scaling_packed_dataset",
+    "build_scaling_source_index",
     "build_heldout_evaluation",
     "evaluate_checkpoint",
     "parameter_breakdown",
+    "create_scaling_data_contract",
     "register_lumi",
     "train_packed_pilot",
     "validate_heldout_manifest",
     "validate_packed_manifest",
+    "validate_scaling_packed_manifest",
+    "validate_scaling_source_index",
 ]
