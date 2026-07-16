@@ -1,8 +1,9 @@
 # Lumi-1B Cloud Preflight v0.1
 
 Status: **canonical local and Lambda A100 remote preflights, the two-step
-smoke/resume gate, local checkpoint verification, and instance shutdown pass;
-the 100-step calibration and later stages remain unapproved**
+smoke/resume gate, cumulative 100-step calibration, local checkpoint
+verification, and both instance shutdowns pass; the 250M-token and later
+stages remain unapproved**
 
 ## Decision
 
@@ -13,9 +14,15 @@ advanced the run through step 2 with finite metrics and exact checkpoint/data
 recovery. Checkpoint 2 and its reports were copied back to the Mac, verified
 against the server-generated checksums, and the instance was terminated.
 
-This completes only the smoke/resume boundary. The schema-v2 gate still extends
-the existing 150M preflight without changing its schema-v1 contract, and the
-technical PASS does not authorize the 100-step, 250M-token, 1.4B-token, or 4B
+A separately authorized second A100 host repeated the exact remote preflight,
+verified the archived checkpoint-2 hashes, and resumed that run to cumulative
+step 100. Checkpoint 100 and all calibration evidence were copied back, all 21
+server-generated hashes passed on the Mac, and the second instance was
+terminated only after that verification.
+
+This completes the 100-step calibration boundary. The schema-v2 gate still
+extends the existing 150M preflight without changing its schema-v1 contract,
+and the technical PASS does not authorize the 250M-token, 1.4B-token, or 4B
 stages.
 
 ## Pinned bundle
@@ -137,7 +144,7 @@ python scripts/preflight_cloud_pilot.py \
 Remote mode refuses `--skip-shard-hashes`. It must report `runtime_ready=true`
 before any trainer process starts.
 
-## Verified Lambda A100 admission
+## Verified smoke-host Lambda A100 admission
 
 The live target was selected immediately before launch:
 
@@ -218,10 +225,10 @@ Its run fingerprint is
 `66a9c146a0dd085df0de461cc4d30dfa43cebafd030d6933330b3ae3214ec1e9`.
 Checkpoint 2 contains a 4,203,973,544-byte model file and an
 8,408,144,175-byte optimizer/RNG file. These two cold smoke measurements are
-not a steady-state throughput estimate and are not used to authorize or cost
-the 100-step calibration.
+not a steady-state throughput estimate and were not used as the measured cost
+input; the separately authorized calibration supplied that measurement.
 
-## Verified local archive and shutdown
+## Verified smoke archive and shutdown
 
 The reports and latest resumable checkpoint are outside Git at
 `lumi-data/scaling-pilot-1b-v0.1/a100-smoke-v0.1/`. The archive occupies about
@@ -231,4 +238,66 @@ The manifest itself has SHA-256
 `f69bfa9905288c4178d04a1668fa9244b8ac053056488b7bd8eef156018040e4`.
 
 After verification, Lambda Cloud reported **No running instances** at
-2026-07-16 19:08:54 UTC. No 100-step calibration or later training stage ran.
+2026-07-16 19:08:54 UTC. No calibration or later stage ran on that first host.
+
+## Verified 100-step calibration
+
+The second launch used the same `gpu_1x_a100_sxm4` type, `asia-south-1`
+region, Lambda Stack 22.04 image, and observed USD 1.99/hour rate. It booted at
+2026-07-16 21:46:05 UTC. Before training, the full no-skip remote preflight
+passed again with 1,050,981,888 parameters, 1,399,996,416 packed tokens,
+CUDA/BF16 enabled, 232,205,602,816 bytes of host memory, and 506,572,943,360
+bytes of initial free disk. The report has SHA-256
+`96b313c7c8796ee57397533bbbf88f6cb526cf32b7a69b17f2cc4314d71cd2ac`.
+All nine checkpoint-2 checksum entries also passed remotely before resume.
+
+The fresh trainer process restored step 2, sequence cursor 16, 65,536 tokens,
+optimizer state, and the unchanged run fingerprint
+`66a9c146a0dd085df0de461cc4d30dfa43cebafd030d6933330b3ae3214ec1e9`.
+It ran from 2026-07-16 22:00:26 UTC to 22:06:45 UTC and stopped at the authorized
+cumulative step 100 boundary:
+
+| Field | Verified value |
+| --- | ---: |
+| Cumulative tokens / sequence cursor | 3,276,800 / 800 |
+| First resumed loss / final loss | 11.335843 / 7.690175 |
+| Final gradient norm / learning rate | 2.202486 / 0.00004 |
+| Median tokens/s, steps 10--99 | 9,379.6 |
+| Steady-state min / max tokens/s | 9,097.4 / 9,449.0 |
+| End-to-end resume tokens/s | 8,495.4 |
+| Peak allocated / reserved HBM | 20.611GiB / 23.744GiB |
+| Final checkpoint time | 17.160s |
+| Training-segment wall time / rate cost | 378s / USD 0.20895 |
+| Median / maximum GPU utilization | 89.5% / 100% |
+| Maximum memory / temperature | 24,841MiB / 65C |
+
+Checkpoint 100 contains a 4,203,973,544-byte model and an
+8,408,144,175-byte optimizer/RNG file; its seven files total 12,612,139,802
+bytes. The loss reduction is an optimization-health result, not a general
+quality claim: only 0.003 tokens per parameter have been processed at this
+boundary.
+
+## Calibration archive, cost report, and shutdown
+
+The calibration archive is outside Git at
+`lumi-data/scaling-pilot-1b-v0.1/a100-calibration-v0.1/` and occupies about
+12GB. Every one of the 21 entries in the 2,407-byte server-generated checksum
+manifest passed locally. The manifest itself has SHA-256
+`ea986c336a134fb0dde444a331cff95c0debe2a4b7aa54b3f6efa7cc8dec24ab`.
+
+After verification, the console reported **No running instances** at
+2026-07-16 22:30:28 UTC. Boot to confirmed shutdown was 44 minutes 23 seconds.
+At the observed rate that is a conservative USD 1.472 wall-lifecycle estimate;
+it is not an invoice value because Lambda states that booting time is not
+billed. Subtracting the steady-state calibration compute estimate leaves a
+conservative 0.642680-hour setup, transfer, checkpoint, archive, and teardown
+allowance for planning.
+
+The measured cost report is outside Git beside the archive at
+`measured-cost-projection-v0.1.json`. It is 2,711 bytes with SHA-256
+`0cf7ad8069b03a1269b05b852b9b8881dacfe9562e020089996af4cbc95d7f2d`.
+At 9,379.6 tokens/second and USD 1.99/hour, it projects the cumulative
+250,019,840-token gate at 7.40 compute-hours and USD 16.01 including that
+allowance, and the 1,400,012,800-token gate at 41.46 compute-hours and USD
+83.79. These projections do not authorize either stage. No 250M-token or later
+training ran.

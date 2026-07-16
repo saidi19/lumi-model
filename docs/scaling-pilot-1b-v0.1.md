@@ -1,8 +1,8 @@
 # Lumi-1B Scaling Pilot v0.1
 
-Status: **design, local data gates, Lambda A100 remote preflight, and the
-two-step smoke/resume gate pass; the 100-step calibration and later stages
-remain unapproved**
+Status: **design, local data gates, Lambda A100 remote preflight, the two-step
+smoke/resume gate, and the cumulative 100-step calibration pass; the 250M-token
+and later stages remain unapproved**
 
 ## Decision
 
@@ -118,7 +118,33 @@ measure steady-state throughput, so they do not replace the 100-step
 calibration or authorize any later stage. Full environment, preflight, and
 checkpoint details are in `docs/cloud-pilot-1b-v0.1.md`. The latest checkpoint
 was archived on the Mac with all 14 server-generated checksums verified before
-the Lambda console reported no running instances.
+the first Lambda instance was terminated.
+
+## Verified A100 calibration gate
+
+A separately authorized Lambda A100 run repeated the no-skip remote preflight,
+verified the archived checkpoint-2 hashes, and restored the exact optimizer,
+RNG, schedule, and sequence position. The fresh process then advanced from
+step 2 to the cumulative step-100 stop:
+
+| Field | Verified value |
+| --- | ---: |
+| Cumulative processed tokens | 3,276,800 |
+| First resumed / final loss | 11.335843 / 7.690175 |
+| Final gradient norm / learning rate | 2.202486 / 0.00004 |
+| Median throughput, steps 10--99 | 9,379.6 tokens/s |
+| End-to-end resume throughput | 8,495.4 tokens/s |
+| Peak allocated / reserved HBM | 20.611GiB / 23.744GiB |
+| Final checkpoint time / bytes | 17.160s / 12,612,139,802 |
+| Training-segment wall time / rate cost | 378s / USD 0.20895 |
+
+The final loss is the best observed loss in this short segment and the
+run fingerprint remains
+`66a9c146a0dd085df0de461cc4d30dfa43cebafd030d6933330b3ae3214ec1e9`.
+Checkpoint 100 and its evidence were archived on the Mac; all 21
+server-generated hashes passed before the second console shutdown was
+confirmed. This gate validates runtime stability and supplies measured costing
+inputs. It is not a held-out quality result and does not authorize 250M tokens.
 
 ## Trainer changes required by 1B
 
@@ -143,8 +169,8 @@ checkpointing enabled, peak learning rate 2e-4, 500 warm-up steps, cosine decay
 to 10%, weight decay 0.1, gradient clipping at 1.0, checkpoints every 2,500
 steps plus every requested stop point, and retention of the newest two matching
 checkpoints. The two-step A100 gate measured 23.744GiB peak reserved memory;
-steady-state memory, throughput, and checkpoint behavior remain mandatory
-100-step calibration outputs.
+the 100-step gate then reproduced that 23.744GiB peak while measuring steady
+throughput and a 17.160-second full checkpoint.
 
 ## Costing rule and scenarios
 
@@ -153,20 +179,24 @@ price. It costs cumulative milestones only after receiving both a measured
 tokens/second value and the selected instance's hourly rate. The report also
 records the explicit fixed overhead and optional credit balance.
 
-For scale only, the table below uses the previously observed Lambda H100 rate
-of USD 4.29/hour, 0.25 setup/teardown hours, and hypothetical—not measured—1B
-throughputs:
+The measured report uses the calibration's 9,379.612 tokens/second median and
+the selected Lambda A100 rate of USD 1.99/hour. Boot to confirmed shutdown was
+44 minutes 23 seconds. Subtracting the steady-state calibration compute
+estimate yields a conservative 0.642680-hour fixed allowance for setup,
+transfer, checkpointing, archive, and teardown:
 
-| Hypothetical throughput | 1.4B compute time | Scenario cost |
-| ---: | ---: | ---: |
-| 5,000 tokens/s | 77.78 hours | USD 334.74 |
-| 10,000 tokens/s | 38.89 hours | USD 167.91 |
-| 20,000 tokens/s | 19.44 hours | USD 84.49 |
+| Cumulative stage | Compute hours | Raw compute cost | With fixed allowance |
+| --- | ---: | ---: | ---: |
+| Calibration, 3,276,800 tokens | 0.10 | USD 0.19 | USD 1.47 |
+| Learning gate, 250,019,840 tokens | 7.40 | USD 14.73 | USD 16.01 |
+| Unique corpus, 1,400,012,800 tokens | 41.46 | USD 82.51 | USD 83.79 |
 
-These are arithmetic scenarios, not a forecast. Checkpoint duration, provider
-availability, storage, data transfer, idle time, and the actual 1B throughput
-can change the bill. The canonical design report remains intentionally
-unpriced until the 100-step calibration records real throughput.
+The measured compute-only rate is USD 58.93 per billion processed tokens. The
+resumed step-2-to-100 training segment itself cost USD 0.20895 at the observed
+rate. The fixed allowance deliberately treats the entire boot-to-shutdown wall
+interval as billable; it is a safe planning estimate, not an invoice value,
+because Lambda states that booting time is not billed. Provider availability,
+storage, data transfer, retries, and idle time can still change the bill.
 
 ## Fail-closed approval gates
 
@@ -183,10 +213,13 @@ pass. The first Lambda launch then followed the required sequence:
    trainer process.
 
 The first GPU stopped after the one-step smoke and fresh-process resume passed.
-Continuing to the 100-step calibration is still a separate decision. That run
-must record median steady-state tokens/second, peak allocated/reserved HBM,
-checkpoint seconds/bytes, startup overhead, and actual rate; then the cost
-planner must be rerun before the 250M stage.
+A separately approved second launch stopped at cumulative step 100 after
+recording median steady-state tokens/second, peak allocated/reserved HBM,
+checkpoint seconds/bytes, lifecycle overhead, and the selected rate. The
+archive and measured cost report were verified before shutdown. Continuing to
+the 250M learning gate remains a separate owner decision; after that run, the
+checkpoint must beat the frozen 150M held-out loss before the 1.4B stage can be
+considered.
 
 The 4B/80B run remains unapproved even if the 1.4B stage passes. That result may
 lock a measured final-training plan, but the 4B run still needs an approximately
@@ -217,16 +250,20 @@ python scripts/plan_scaling_pilot.py \
   --output "$LUMI_DATA/scaling-pilot-1b-v0.1/design-report-next.json"
 ```
 
-After calibration, cost with measured values:
+Reproduce the calibration cost arithmetic to a new immutable report path:
 
 ```bash
 python scripts/plan_scaling_pilot.py \
-  --tokens-per-second "$MEASURED_TOKENS_PER_SECOND" \
-  --hourly-rate "$SELECTED_GPU_HOURLY_RATE" \
-  --fixed-overhead-hours "$MEASURED_OVERHEAD_HOURS" \
-  --credit-balance "$CURRENT_SERVICE_CREDIT"
+  --tokens-per-second 9379.612129584133 \
+  --hourly-rate 1.99 \
+  --fixed-overhead-hours 0.642679592991180 \
+  --output \
+    "$LUMI_DATA/scaling-pilot-1b-v0.1/a100-calibration-v0.1/measured-cost-projection-next.json"
 ```
 
 The canonical unpriced report is outside Git at
 `lumi-data/scaling-pilot-1b-v0.1/design-report.json`, SHA-256
 `de9aa950feb8ce17a9323198f1bace8c24689d32d440514d15b7dec243047941`.
+The canonical measured report is beside the calibration archive at
+`measured-cost-projection-v0.1.json`, SHA-256
+`0cf7ad8069b03a1269b05b852b9b8881dacfe9562e020089996af4cbc95d7f2d`.
