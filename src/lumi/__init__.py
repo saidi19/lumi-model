@@ -4,7 +4,9 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from .configuration_lumi import LumiConfig
 from .modeling_lumi import LumiForCausalLM, LumiModel
+from .packed_data import PackedTokenDataset, build_packed_dataset, validate_packed_manifest
 from .parameter_count import ParameterBreakdown, parameter_breakdown
+from .pilot_training import train_packed_pilot
 
 
 def register_lumi() -> None:
@@ -24,7 +26,11 @@ __all__ = [
     "LumiConfig",
     "LumiForCausalLM",
     "LumiModel",
+    "PackedTokenDataset",
     "ParameterBreakdown",
+    "build_packed_dataset",
     "parameter_breakdown",
     "register_lumi",
+    "train_packed_pilot",
+    "validate_packed_manifest",
 ]

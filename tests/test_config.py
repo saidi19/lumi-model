@@ -28,6 +28,13 @@ def test_lumi_pilot_candidate_parameter_count() -> None:
     assert parameter_breakdown(config).total == 150_625_536
 
 
+def test_lumi_real_data_smoke_parameter_count() -> None:
+    path = Path(__file__).parents[1] / "configs" / "lumi-real-smoke.json"
+    with path.open(encoding="utf-8") as handle:
+        config = LumiConfig(**json.load(handle))
+    assert parameter_breakdown(config).total == 4_292_928
+
+
 def test_special_token_ids_must_be_distinct() -> None:
     with pytest.raises(ValueError, match="must be distinct"):
         LumiConfig(pad_token_id=0, bos_token_id=1, eos_token_id=2, doc_token_id=2)
