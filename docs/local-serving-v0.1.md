@@ -135,9 +135,8 @@ python scripts/check_local_server.py \
 
 ## Next gate
 
-The next task is to design, review, and cost a 1B scaling pilot before starting
-another paid GPU. It must freeze the exact architecture and parameter count,
-training-token scope, data/version fingerprints, checkpoint-resume contract,
-single-GPU throughput and memory gates, held-out evaluation, and later MLX/M5
-deployment criteria. A passing 1B pilot is required before locking a 4B/80B
-full-training plan.
+The 1B architecture and staged scaling contract are now frozen in
+[`scaling-pilot-1b-v0.1.md`](scaling-pilot-1b-v0.1.md). The next task is local:
+implement and seal its within-source hash-ranked, permanent-held-out-excluding
+1.4B-token packed artifact. No paid GPU starts until that build, capacity audit,
+leakage proof, and cloud preflight pass.

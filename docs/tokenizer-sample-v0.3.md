@@ -180,8 +180,11 @@ resume continued.
    zero ID/content/near-duplicate overlap; the resumed M5/MPS evaluation records
    loss 4.680812 and perplexity 107.858. Fixed generations remain unusable. See
    [`evaluation-pilot-v0.1.md`](evaluation-pilot-v0.1.md).
-8. Next: complete trained-checkpoint MLX parity, 4-bit local inference, and the
-   local serving gate before designing the 1B scaling pilot.
+8. Completed: trained-checkpoint MLX parity, 4-bit local inference, and the
+   loopback OpenAI-compatible local serving gate pass.
+9. Completed: an exact 1,050,981,888-parameter 1B scaling architecture and
+   staged, unpriced plan are frozen. Next: implement and materialize its
+   hash-ranked, permanent-held-out-excluding 1.4B-token local data artifact.
 
 The full 4B H100/H200 model-training phase remains unapproved until the 1B
 quality pilot and conversion/serving gates pass.

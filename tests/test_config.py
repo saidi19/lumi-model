@@ -21,6 +21,13 @@ def test_lumi_4b_candidate_parameter_count() -> None:
     assert parameter_breakdown(config).total == 4_002_376_704
 
 
+def test_lumi_1b_scaling_candidate_parameter_count() -> None:
+    path = Path(__file__).parents[1] / "configs" / "lumi-1b.json"
+    with path.open(encoding="utf-8") as handle:
+        config = LumiConfig(**json.load(handle))
+    assert parameter_breakdown(config).total == 1_050_981_888
+
+
 def test_lumi_pilot_candidate_parameter_count() -> None:
     path = Path(__file__).parents[1] / "configs" / "lumi-150m.json"
     with path.open(encoding="utf-8") as handle:

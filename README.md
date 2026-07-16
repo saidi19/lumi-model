@@ -57,11 +57,17 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 17. the sealed 4-bit artifact serves through a loopback-first OpenAI-compatible
     chat-completions API and responsive local UI; a real M5 black-box gate passes
     packaged HTML/CSS/JavaScript, model discovery, JSON generation, SSE
-    streaming, usage accounting, and terminal `[DONE]` handling.
+    streaming, usage accounting, and terminal `[DONE]` handling;
+18. an exact 1,050,981,888-parameter scaling candidate preserves the 4B model's
+    36 layers and 4K context at half width; its fail-closed plan pins permanent
+    held-out exclusion, four cumulative stages through 1.4B tokens, gradient
+    checkpointing, cosine scheduling, bounded checkpoints, and measured-input
+    cost projection without approving a paid GPU launch.
 
-The 4B configuration is a candidate until all deployment gates pass. The 150M
-H100 plumbing pilot is complete, but it is not evidence that a 4B training run
-is ready or that the resulting 150M checkpoint is a production-quality model.
+The 4B configuration is a candidate until all deployment gates pass. The 1B
+design is frozen, but its hash-ranked, held-out-excluding data artifact has not
+been materialized and no paid 1B GPU launch is approved. The completed 150M
+plumbing checkpoint is not a production-quality model.
 
 ## Quick start
 
@@ -93,6 +99,9 @@ documented in
 The loopback OpenAI-compatible API, local chat UI, security boundary, and real
 server gate are documented in
 [`docs/local-serving-v0.1.md`](docs/local-serving-v0.1.md).
+The exact 1B architecture, staged token contract, trainer changes, input audit,
+and measured-throughput cost rule are documented in
+[`docs/scaling-pilot-1b-v0.1.md`](docs/scaling-pilot-1b-v0.1.md).
 
 ## Repository policy
 

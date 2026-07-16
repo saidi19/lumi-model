@@ -72,6 +72,38 @@ def test_input_and_output_embeddings_are_tied(tiny_config: LumiConfig) -> None:
     assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
 
 
+def test_gradient_checkpointing_preserves_loss_and_gradients(tiny_config: LumiConfig) -> None:
+    torch.manual_seed(23)
+    model = LumiForCausalLM(tiny_config).train()
+    input_ids = torch.tensor([[1, 8, 9, 10, 11, 2]])
+
+    baseline = model(input_ids=input_ids, labels=input_ids)
+    baseline.loss.backward()
+    expected_loss = baseline.loss.detach().clone()
+    expected_gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.grad is not None
+    }
+
+    model.zero_grad(set_to_none=True)
+    model.gradient_checkpointing_enable()
+    checkpointed = model(input_ids=input_ids, labels=input_ids)
+    checkpointed.loss.backward()
+
+    assert model.is_gradient_checkpointing
+    torch.testing.assert_close(checkpointed.loss, expected_loss, rtol=0.0, atol=1e-7)
+    for name, parameter in model.named_parameters():
+        if name in expected_gradients:
+            torch.testing.assert_close(
+                parameter.grad,
+                expected_gradients[name],
+                rtol=1e-5,
+                atol=1e-7,
+                msg=name,
+            )
+
+
 def test_save_load_round_trip_preserves_logits(tiny_config: LumiConfig, tmp_path) -> None:
     torch.manual_seed(4)
     model = LumiForCausalLM(tiny_config).eval()
