@@ -49,8 +49,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     resumes and completes at loss 4.680812, perplexity 107.858, and 4,686.9
     tokens/second on the 16GB M5 Mac;
 15. fixed generations remain repetitive and factually wrong, as expected from
-    a 150M model trained on only 50M tokens; next, complete MLX logits parity,
-    4-bit local inference, and serving gates before designing the 1B pilot.
+    a 150M model trained on only 50M tokens;
+16. a self-identifying Lumi MLX artifact passes exact config/tensor/RoPE gates,
+    prompt-logit parity, and 128/128 cached greedy tokens; its 4-bit affine form
+    passes a 98,256-prediction-token stratified quality gate, is 83.70% smaller,
+    and reaches a measured 522.3 cached decode tokens/second on the 16GB M5 Mac.
 
 The 4B configuration is a candidate until all deployment gates pass. The 150M
 H100 plumbing pilot is complete, but it is not evidence that a 4B training run
@@ -80,6 +83,9 @@ The paid CUDA gate and exact transfer/training contract are documented in
 [`docs/lambda-pilot-v0.1.md`](docs/lambda-pilot-v0.1.md).
 The held-out construction, MPS evaluation, and quality decision are documented
 in [`docs/evaluation-pilot-v0.1.md`](docs/evaluation-pilot-v0.1.md).
+The native MLX conversion, FP32 parity, 4-bit quality, and M5 runtime results are
+documented in
+[`docs/local-inference-gate-v0.1.md`](docs/local-inference-gate-v0.1.md).
 
 ## Repository policy
 
