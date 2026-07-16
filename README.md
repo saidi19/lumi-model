@@ -67,7 +67,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     tokens and leaves 1,472,219,479 held-out-safe eligible tokens; a 16,777,216-
     token canary and final 1,399,996,416-token uint16 artifact pass fresh-process
     resume, cached-resume, rank-prefix, shard-integrity, and zero-leakage gates.
-    The final payload is 2,799,992,832 bytes in 42 shards; no GPU was launched.
+    The final payload is 2,799,992,832 bytes in 42 shards; no GPU was launched;
+20. a backward-compatible schema-v2 cloud preflight pins that exact manifest,
+    selection proof/state, tokenizer, 1B config, and scaling contracts. A full
+    local rehash passes; the Mac correctly fails CUDA and 32GiB host-memory
+    admission floors, and provider selection and paid launch remain unapproved.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design and hash-ranked held-out-excluding data artifact are frozen, but no paid
@@ -110,6 +114,9 @@ and measured-throughput cost rule are documented in
 The deterministic source index, 16M canary, final aligned 1.4B pack, resume
 boundary, and verified hashes are documented in
 [`docs/scaling-data-1b-v0.1.md`](docs/scaling-data-1b-v0.1.md).
+The exact 1B transfer bundle, runtime/storage floors, local preflight result,
+remote CUDA gate, and one-step smoke boundary are documented in
+[`docs/cloud-pilot-1b-v0.1.md`](docs/cloud-pilot-1b-v0.1.md).
 
 ## Repository policy
 

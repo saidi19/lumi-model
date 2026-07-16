@@ -135,8 +135,8 @@ python scripts/check_local_server.py \
 
 ## Next gate
 
-The 1B architecture and staged scaling contract are now frozen in
-[`scaling-pilot-1b-v0.1.md`](scaling-pilot-1b-v0.1.md). The next task is local:
-implement and seal its within-source hash-ranked, permanent-held-out-excluding
-1.4B-token packed artifact. No paid GPU starts until that build, capacity audit,
-leakage proof, and cloud preflight pass.
+The 1B architecture, held-out-safe 1.4B-token artifact, and local cloud
+preflight are now sealed in [`scaling-pilot-1b-v0.1.md`](scaling-pilot-1b-v0.1.md)
+and [`cloud-pilot-1b-v0.1.md`](cloud-pilot-1b-v0.1.md). No paid GPU starts until
+an actually available provider target is recorded, the exact bundle is
+transferred, and the remote CUDA/BF16/resource/hash preflight passes.

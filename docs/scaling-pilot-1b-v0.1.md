@@ -1,7 +1,7 @@
 # Lumi-1B Scaling Pilot v0.1
 
-Status: **design, local input audit, and held-out-safe 1.4B data gate pass; no
-paid GPU launch is approved**
+Status: **design, local input/data gates, and exact-artifact cloud preflight
+pass; provider selection and paid GPU launch remain unapproved**
 
 ## Decision
 
@@ -147,15 +147,17 @@ unpriced until the 100-step calibration records real throughput.
 
 ## Fail-closed approval gates
 
-The first four local gates are complete: the hash-ranked held-out-excluding
+The local gates are complete: the hash-ranked held-out-excluding
 builder, byte-identical interruption/resume canary, 24-stratum capacity proof,
-and sealed final manifests/shards/hashes all pass. Before any GPU launch:
+sealed final manifests/shards/hashes, and schema-v2 exact-artifact cloud
+preflight all pass. Before any GPU launch:
 
-1. extend cloud preflight to the new plan and exact packed artifact;
-2. choose an actually available AWS or Lambda instance and enter its current
+1. choose an actually available AWS or Lambda instance and enter its current
    hourly rate—quota alone does not prove capacity;
-3. transfer the exact artifact and verify all hashes on the remote disk before
-   starting a trainer process.
+2. transfer only the exact artifact, tokenizer, and repository;
+3. rerun the preflight remotely with mandatory CUDA/BF16, HBM, host-memory,
+   free-disk, proof/state, tokenizer, and all-shard hash gates before starting a
+   trainer process.
 
 On the first GPU, run only the one-step smoke and a fresh-process resume. If
 finite loss, gradient norm, checkpoint recovery, BF16, memory, and disk gates

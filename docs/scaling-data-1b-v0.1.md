@@ -261,6 +261,7 @@ python scripts/build_scaling_data.py validate \
 The canonical source index, 16M canary, and final aligned pack now satisfy the
 local data gate: all 24 strata have nonzero exact quotas, leakage is zero, and
 resume and shard-integrity checks pass. This still does not launch an H100. The
-next gate is cloud preflight pinned to the exact final manifest, followed by a
-one-step 1B smoke run, fresh-process resume, and only then the 100-step measured
-calibration.
+schema-v2 local cloud preflight pinned to this exact manifest now also passes.
+The next gate is current provider selection, transfer, and remote CUDA preflight,
+followed by a one-step 1B smoke run, fresh-process resume, and only then the
+100-step measured calibration.
