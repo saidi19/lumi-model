@@ -197,14 +197,24 @@ def test_sqlite_minhash_matches_memory_and_survives_reopen(tmp_path: Path) -> No
     assert disk.duplicate_of(
         disk.signature(original), exclude_document_id="first"
     ) is None
+    replacement = disk.signature(unrelated)
+    disk.replace("first", replacement)
+    memory.replace("first", memory.signature(unrelated))
+    assert disk.duplicate_of(disk.signature(unrelated)) == "first"
+    assert disk.duplicate_of(disk.signature(original)) is None
+    assert disk.duplicate_of(disk.signature(near_copy)) == memory.duplicate_of(
+        memory.signature(near_copy)
+    )
     disk.close()
 
     reopened = SQLiteMinHashNearDuplicateIndex(config, path=database_path)
     assert reopened.count() == 1
-    assert reopened.duplicate_of(reopened.signature(near_copy)) == "first"
-    reopened.add("first", reopened.signature(original))
+    assert reopened.duplicate_of(reopened.signature(unrelated)) == "first"
+    reopened.add("first", reopened.signature(unrelated))
     with pytest.raises(ValueError, match="signature changed"):
-        reopened.add("first", reopened.signature(unrelated))
+        reopened.add("first", reopened.signature(original))
+    with pytest.raises(KeyError, match="does not exist"):
+        reopened.replace("missing", reopened.signature(original))
     reopened.close()
 
 

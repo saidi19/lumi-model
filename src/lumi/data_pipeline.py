@@ -74,7 +74,8 @@ SECRET_PATTERNS = {
     ),
 }
 
-PII_DETECTOR_VERSION = "contextual-v4"
+PII_DETECTOR_VERSION = "contextual-v5"
+PII_REDACTION_MAX_PASSES = 16
 
 EMAIL_PATTERN = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", re.I)
 IPV4_CANDIDATE_PATTERN = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\d|\.\d)")
@@ -283,12 +284,27 @@ def filter_document(text: str, policy: Mapping[str, Any]) -> FilterResult:
         if repeated_fraction > float(policy["max_repeated_line_fraction"]):
             return FilterResult(None, "repeated_lines", {}, raw_sha256)
 
-    redactions: dict[str, int] = {}
-    for name, (_, replacement) in PII_PATTERNS.items():
-        normalized, count = _redact_pii_kind(normalized, name, replacement)
-        if count:
-            redactions[name] = count
-    return FilterResult(normalized, None, redactions, raw_sha256)
+    redactions: Counter[str] = Counter()
+    for _ in range(PII_REDACTION_MAX_PASSES):
+        pass_redactions = 0
+        for name, (_, replacement) in PII_PATTERNS.items():
+            normalized, count = _redact_pii_kind(normalized, name, replacement)
+            if count:
+                redactions[name] += count
+                pass_redactions += count
+
+        remaining_pii = detect_pii(normalized)
+        if remaining_pii is None:
+            return FilterResult(normalized, None, dict(redactions), raw_sha256)
+        if pass_redactions == 0:
+            return FilterResult(
+                None,
+                f"pii_redaction_stalled:{remaining_pii}",
+                dict(redactions),
+                raw_sha256,
+            )
+
+    return FilterResult(None, "pii_redaction_max_passes", dict(redactions), raw_sha256)
 
 
 def split_utf8(text: str, max_bytes: int, min_characters: int) -> Iterator[str]:
@@ -1881,6 +1897,12 @@ def validate_sample(
         manifest = json.load(handle)
     if manifest.get("status") != "complete":
         raise ValueError("sample manifest is not complete")
+    manifest_pii_detector = manifest.get("implementation", {}).get("pii_detector")
+    if manifest_pii_detector != PII_DETECTOR_VERSION:
+        raise ValueError(
+            "sample manifest PII detector does not match this validator: "
+            f"{manifest_pii_detector!r} != {PII_DETECTOR_VERSION!r}"
+        )
     if expected_config is not None:
         validate_sample_config(expected_config)
         expected_config_sha256 = _sha256_bytes(_canonical_json_bytes(expected_config))

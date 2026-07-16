@@ -1,7 +1,7 @@
 # Lumi representative tokenizer sample v0.3
 
-Status: **multi-shard implementation, every mandatory capacity gate, and the
-25MB all-source canary passed; migration apply and 6GB resume pending**
+Status: **the 6GB contextual-v5 sample is sealed; resumed full validation and
+the cached validation check both pass**
 
 ## Why v0.3 exists
 
@@ -82,7 +82,67 @@ Its SHA-256 is
 identical to the v0.2 canary. The data-selection semantics therefore remained
 byte-for-byte stable while v0.3 added continuation and capacity metadata.
 
-## Existing-sample migration
+## Full 6GB result
+
+The deterministic v0.2-to-v0.3 migration passed, was applied with a state
+backup, and resumed the intact 2.88GB prefix. The final build accepted
+6,000,636,724 UTF-8 text bytes across 1,128,089 documents. All 24 logical
+sources met quota, using 25 of 27 pinned physical files. One source-stream
+network retry recovered automatically; no GPU or Lambda credit was used.
+
+| Domain | Documents | Target text bytes | Accepted text bytes |
+|---|---:|---:|---:|
+| Science and education | 79,285 | 1,782,000,000 | 1,782,214,394 |
+| Code | 363,153 | 1,188,000,000 | 1,188,003,140 |
+| Reference | 275,316 | 891,000,000 | 891,033,923 |
+| Questions and discussion | 248,691 | 891,000,000 | 891,003,784 |
+| Open web | 132,245 | 594,000,000 | 594,000,301 |
+| Books | 15,540 | 297,000,000 | 297,134,268 |
+| Government, legal, patents | 10,019 | 297,000,000 | 297,225,059 |
+| Bengali reference slice | 3,840 | 60,000,000 | 60,021,855 |
+
+The sealed contextual-v5 artifact is 7,709,921,712 bytes and has sample
+SHA-256
+`80bea9f9634a8daca542b2ffd0aad1c8c994a7cbeef909a5e529b6272671102a`.
+It contains 761,096 English, 363,153 code-bypass (`zxx`), and 3,840 Bengali
+language labels. The build removed 23,063 MinHash near-duplicates, 25 hashed
+benchmark matches, 2,100 records missing a required license, and 1,536
+secret-bearing records. It redacted 11,622 email addresses, 40 contextual IPv4
+addresses, and 6,322 contextual phone values.
+
+Resumed full validation completed all 1,128,089 records and all
+7,709,921,712 file bytes from the preserved line-166,000 checkpoint. The
+canonical representative-sample `--resume` seal then returned the same
+document count, accepted-text count, 24-source count, and SHA-256 without
+another source read. A final cached validation resumed from line 1,128,089 and
+passed the data, safety-scan, hash, and manifest gates without rescanning the
+sample.
+
+## Contextual-v5 safety repair
+
+The first full validation stopped safely at line 166,022. One-pass contextual
+redaction had replaced an earlier phone value, shortening its context window
+and exposing another phone value to the same final-state detector. The validated
+prefix through line 166,000 and byte offset 2,341,853,602 remained committed in
+SQLite.
+
+`scripts/audit_sample_pii.py` scanned all 962,089 unvalidated records without
+retaining matched values. It found exactly two residual contextual phone
+records: the first failure and one later record. Contextual v5 now repeats the
+same conservative predicates to a fixed point and fails closed if they cannot
+converge. `scripts/repair_sample_pii.py` then atomically repaired those two
+records, recomputed their content hashes, language/benchmark/MinHash metadata,
+updated the durable quality index and manifest, and migrated the checkpoint
+fingerprint without changing any byte in the validated prefix.
+
+The pre-repair sample SHA-256 was
+`3d619aa6f9a81ba6393d9adbf546051698101aa3fab7797e64e5286983676597`;
+the two additional `[PHONE_NUMBER]` replacements added four text/file bytes.
+The original sample, manifest, state, and value-free audit remain as local,
+uncommitted rollback backups pending explicit cleanup. They are not tokenizer
+training inputs.
+
+## Existing-sample migration history
 
 `scripts/migrate_tokenizer_sample_plan.py` performs a read-only dry run by
 default. It checks the old config hash and run fingerprint, proves that source
@@ -92,16 +152,23 @@ and hashes the entire sample.
 
 The first dry run passed with sample SHA-256
 `d08a8f717faa5cfb244356b3a2b34f4342c7cffd18df617440d223c2fcdc4dd2`.
-It did not modify the sample or run state. The dry run must be repeated after the
-final capacity report is committed; only then may `--apply` create a backup and
-update `run-state.json`.
+After the final capacity report was committed, the repeated dry run passed and
+`--apply` created `run-state.pre-v0.3.json` before updating the fingerprint and
+physical-source state. Fast quality-index restoration reused 417,700 committed
+entries and rebuilt only the 40-record crash tail before the network-backed
+resume continued.
 
-## Remaining gates
+## Outcome and next gates
 
-1. Repeat the deterministic migration dry run, apply it with a state backup,
-   and rename the artifact to v0.3.
-2. Resume the existing sample under `caffeinate` and persistent network retry.
-3. Run fresh and cached full validation before training tokenizer candidates.
+1. Completed: corrected 32K and 65K tokenizer candidates were trained from this
+   exact sealed sample with identical settings.
+2. Completed: the full-sample comparison, round-trip, special-token,
+   vocabulary-length, and multilingual/code gates pass; 65K is frozen in
+   [`tokenizer-v0.1.md`](tokenizer-v0.1.md).
+3. Next: run the 50M-token 150M real-corpus plumbing pilot, then checkpoint and
+   MLX/GGUF conversion gates.
+4. Next: measure single-GPU end-to-end throughput and cost before approving any
+   larger training run.
 
 The full H100/H200 model-training phase remains unapproved until the tokenizer,
 small real-corpus model pilot, checkpoint, and throughput gates pass.

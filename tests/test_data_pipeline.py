@@ -180,6 +180,20 @@ def test_filter_redacts_contextual_phone_numbers() -> None:
     assert result.redactions == {"phone": 1}
 
 
+def test_filter_repeats_redaction_until_no_contextual_phone_remains() -> None:
+    text = (
+        "Call +123 1234 5678 9012 "
+        + ("x" * 27)
+        + " 212-555-0144 for support and additional educational context."
+    )
+    result = filter_document(text, _policy())
+    assert result.rejection_reason is None
+    assert result.text is not None
+    assert result.text.count("[PHONE_NUMBER]") == 2
+    assert result.redactions == {"phone": 2}
+    assert detect_pii(result.text) is None
+
+
 def test_filter_redacts_labelled_ip_ranges_and_phone_fields() -> None:
     text = (
         "The two nodes use fixed IP addresses (192.0.2.10 - 192.0.2.11), while the support "
@@ -480,6 +494,23 @@ def test_validation_resumes_from_committed_sqlite_checkpoint(
     assert resumed["documents"] == manifest["statistics"]["documents"]
 
 
+def test_validation_rejects_a_different_pii_implementation(tmp_path: Path) -> None:
+    first_source = tmp_path / "education.jsonl.gz"
+    second_source = tmp_path / "code.jsonl.gz"
+    _write_source(first_source, "education")
+    _write_source(second_source, "code")
+    config = _config(first_source, second_source)
+    output = tmp_path / "implementation-mismatch"
+    build_sample(config, output)
+
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["implementation"]["pii_detector"] = "contextual-v4"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="PII detector does not match"):
+        validate_sample(output)
+
+
 def test_weighted_source_quotas_force_every_source_into_sample(tmp_path: Path) -> None:
     first_source = tmp_path / "education.jsonl.gz"
     second_source = tmp_path / "code.jsonl.gz"
@@ -685,7 +716,7 @@ def test_pipeline_applies_and_revalidates_composed_quality_gates(
     manifest = build_sample(config, output)
     result = validate_sample(output, expected_config=config)
     assert manifest["schema_version"] == 2
-    assert manifest["implementation"]["pii_detector"] == "contextual-v4"
+    assert manifest["implementation"]["pii_detector"] == "contextual-v5"
     assert manifest["statistics"]["quality"]["language_labels"] == {"en": 1, "zxx": 1}
     assert result["documents"] == 2
     with sqlite3.connect(output / "build-quality-state.sqlite3") as connection:

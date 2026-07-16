@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -57,3 +58,24 @@ def test_tiny_tokenizer_training_preserves_special_ids(tmp_path: Path) -> None:
         assert tokenizer.get_vocab()[specification["token"]] == specification["id"]
     encoded = tokenizer.encode("বাংলা café 日本語", add_special_tokens=False)
     assert tokenizer.unk_token_id not in encoded
+    tokenizer_data = json.loads((output / "tokenizer.json").read_text(encoding="utf-8"))
+    assert max(map(len, tokenizer_data["model"]["vocab"])) <= 32
+
+    metadata = json.loads((output / "lumi_tokenizer_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["documents_seen"] == 600
+    assert metadata["input_files"] == [
+        {
+            "file_bytes": corpus.stat().st_size,
+            "path": str(corpus.resolve()),
+            "sha256": hashlib.sha256(corpus.read_bytes()).hexdigest(),
+        }
+    ]
+    assert metadata["training"] == {
+        "max_documents": None,
+        "max_token_length": 32,
+        "min_frequency": 1,
+        "model_max_length": 4096,
+        "text_key": "text",
+    }
+    assert metadata["versions"]["tokenizers"]
+    assert metadata["versions"]["transformers"]

@@ -61,6 +61,11 @@ def _count_tokens(tokenizer: Any, text: str) -> int:
     return len(tokenizer.backend_tokenizer.encode(text, add_special_tokens=False).ids)
 
 
+def _count_batch_tokens(tokenizer: Any, texts: list[str]) -> list[int]:
+    encodings = tokenizer.backend_tokenizer.encode_batch(texts, add_special_tokens=False)
+    return [len(encoding.ids) for encoding in encodings]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=Path, required=True)
@@ -73,6 +78,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--max-documents", type=int)
+    parser.add_argument("--batch-size", type=int, default=128)
     return parser.parse_args()
 
 
@@ -82,6 +88,8 @@ def main() -> None:
         raise FileExistsError(f"refusing to overwrite comparison output: {args.output}")
     if args.max_documents is not None and args.max_documents < 1:
         raise ValueError("max-documents must be positive")
+    if args.batch_size < 1:
+        raise ValueError("batch-size must be positive")
     sample_validation = validate_sample(args.sample)
     sample_path = args.sample / "sample.jsonl"
 
@@ -105,17 +113,19 @@ def main() -> None:
             "overall_counter": {"documents": 0, "text_bytes": 0, "tokens": 0, "words": 0},
         }
 
-    with sample_path.open(encoding="utf-8") as handle:
-        for document_index, line in enumerate(handle):
-            if args.max_documents is not None and document_index >= args.max_documents:
-                break
-            record = json.loads(line)
-            text = record["text"]
-            category = record["provenance"]["category"]
-            text_bytes = len(text.encode("utf-8"))
-            words = len(re.findall(r"\S+", text))
-            for label, tokenizer in tokenizers.items():
-                tokens = _count_tokens(tokenizer, text)
+    documents_evaluated = 0
+    batch: list[tuple[str, str, int, int]] = []
+
+    def process_batch() -> None:
+        nonlocal documents_evaluated
+        if not batch:
+            return
+        texts = [item[0] for item in batch]
+        for label, tokenizer in tokenizers.items():
+            token_counts = _count_batch_tokens(tokenizer, texts)
+            for (_, category, text_bytes, words), tokens in zip(
+                batch, token_counts, strict=True
+            ):
                 for counter in (
                     tokenizer_results[label]["overall_counter"],
                     tokenizer_results[label]["category_counters"][category],
@@ -124,6 +134,26 @@ def main() -> None:
                     counter["text_bytes"] += text_bytes
                     counter["tokens"] += tokens
                     counter["words"] += words
+        documents_evaluated += len(batch)
+        batch.clear()
+
+    with sample_path.open(encoding="utf-8") as handle:
+        for document_index, line in enumerate(handle):
+            if args.max_documents is not None and document_index >= args.max_documents:
+                break
+            record = json.loads(line)
+            text = record["text"]
+            batch.append(
+                (
+                    text,
+                    record["provenance"]["category"],
+                    len(text.encode("utf-8")),
+                    len(re.findall(r"\S+", text)),
+                )
+            )
+            if len(batch) >= args.batch_size:
+                process_batch()
+    process_batch()
 
     output_tokenizers = {}
     for label, result in tokenizer_results.items():
@@ -146,13 +176,18 @@ def main() -> None:
 
     report = {
         "created_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
+        "evaluation": {
+            "batch_size": args.batch_size,
+            "documents": documents_evaluated,
+            "max_documents": args.max_documents,
+        },
         "sample": {
             "documents": sample_validation["documents"],
             "output_sha256": sample_validation["sha256"],
             "path": str(args.sample.resolve()),
             "text_utf8_bytes": sample_validation["text_utf8_bytes"],
         },
-        "schema_version": 1,
+        "schema_version": 2,
         "tokenizers": output_tokenizers,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -161,7 +196,7 @@ def main() -> None:
         handle.write("\n")
     print(
         f"PASS: compared {len(tokenizers)} tokenizers on "
-        f"{sample_validation['documents']} documents"
+        f"{documents_evaluated} documents"
     )
     for label, result in output_tokenizers.items():
         print(

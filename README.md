@@ -15,9 +15,9 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 
 1. self-contained Hugging Face export and isolated-process loading;
 2. vLLM Transformers-backend compatibility;
-3. one tokenizer contract shared by the 150M pilot and 4B candidate;
+3. one frozen 65,536-token contract shared by the 150M pilot and 4B candidate;
 4. a pinned 25MB tokenizer canary, a metadata-preserving 10MB provenance
-   canary, and 32K/65K tokenizer prototypes pass their local gates;
+   canary, and corrected 32K/65K tokenizer prototypes pass their local gates;
 5. a contextual-PII-v4 1GB development sample passes all 23 component quotas,
    language/secret/provenance gates, near-deduplication, benchmark
    decontamination, full post-write validation, and manual PII snippet review;
@@ -26,13 +26,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 7. a SHA-256-pinned Bengali Wikipedia Parquet source, category-scoped language
    policy, and 1MB real-network canary pass with retained article URLs;
 8. the v0.2 full-size attempt exposed a single-anchor assumption in a multi-file
-   component without spending GPU credit; v0.3 now has generic component-level
+   component without spending GPU credit; v0.3 adds generic component-level
    continuation, per-file provenance, resumable exhaustion state, and mandatory
-   full-quota capacity gates; Stack, WikiTeam, and CCCC audits plus the 6GB
-   no-download preflight and v0.3 all-source canary pass; next: migrate and
-   resume the verified 2.883GB artifact;
-9. only then: MLX/GGUF conversion, a small real-corpus pilot, and measured GPU
-   throughput.
+   full-quota capacity gates;
+9. the resulting 6GB accepted-text sample is sealed at 1,128,089 documents and
+   SHA-256 `80bea9f9634a8daca542b2ffd0aad1c8c994a7cbeef909a5e529b6272671102a`;
+   resumed full validation and the cached validation check pass;
+10. the full 1,128,089-document bakeoff selects 65K: it emits 4.39% fewer
+    tokens overall and wins in all eight measured domains; next, run the
+    50M-token 150M real-corpus plumbing pilot, checkpoint/conversion gates, and
+    measured single-GPU throughput.
 
 The 4B configuration is a candidate until all deployment gates pass. Do not
 start a full H100 training run from this repository yet.

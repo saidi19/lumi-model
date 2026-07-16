@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 from collections.abc import Iterator
+from importlib.metadata import version as package_version
 from pathlib import Path
 
 from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
@@ -14,6 +15,14 @@ from transformers import PreTrainedTokenizerFast
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 DEFAULT_CONTRACT = REPOSITORY_ROOT / "configs" / "tokenizer-v0.1.json"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 class DocumentStream:
@@ -59,7 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--vocab-size", type=int)
-    parser.add_argument("--min-frequency", type=int, default=2)
+    parser.add_argument("--min-frequency", type=int)
+    parser.add_argument("--max-token-length", type=int)
     parser.add_argument("--text-key", default="text")
     parser.add_argument("--max-documents", type=int)
     parser.add_argument("--model-max-length", type=int, default=4096)
@@ -82,11 +92,38 @@ def main() -> None:
     args = parse_args()
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite tokenizer output: {args.output}")
-    if args.min_frequency < 1:
-        raise ValueError("min-frequency must be positive")
+    input_files = []
+    input_snapshots = {}
+    for path in args.input:
+        if not path.is_file():
+            raise FileNotFoundError(f"tokenizer input does not exist: {path}")
+        stat = path.stat()
+        input_snapshots[path] = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        input_files.append(
+            {
+                "file_bytes": stat.st_size,
+                "path": str(path.resolve()),
+                "sha256": _sha256_file(path),
+            }
+        )
 
     contract_bytes = args.contract.read_bytes()
     contract = json.loads(contract_bytes)
+    training_contract = contract.get("training", {})
+    min_frequency = (
+        args.min_frequency
+        if args.min_frequency is not None
+        else training_contract.get("min_frequency", 2)
+    )
+    max_token_length = (
+        args.max_token_length
+        if args.max_token_length is not None
+        else training_contract.get("max_token_length", 32)
+    )
+    if min_frequency < 1:
+        raise ValueError("min-frequency must be positive")
+    if max_token_length < 1:
+        raise ValueError("max-token-length must be positive")
     vocab_size = args.vocab_size or contract["vocab_size"]
     special_tokens = contract["special_tokens"]
     special_token_strings = [item["token"] for item in special_tokens.values()]
@@ -102,7 +139,8 @@ def main() -> None:
     tokenizer.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
-        min_frequency=args.min_frequency,
+        min_frequency=min_frequency,
+        max_token_length=max_token_length,
         show_progress=not args.no_progress,
         special_tokens=special_token_strings,
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
@@ -111,6 +149,11 @@ def main() -> None:
     tokenizer.train_from_iterator(documents, trainer=trainer)
     if documents.documents_yielded == 0:
         raise ValueError("tokenizer input did not contain any non-empty documents")
+    for path, expected_snapshot in input_snapshots.items():
+        stat = path.stat()
+        actual_snapshot = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if actual_snapshot != expected_snapshot:
+            raise RuntimeError(f"tokenizer input changed during training: {path}")
 
     additional_special_tokens = [
         specification["token"]
@@ -139,7 +182,19 @@ def main() -> None:
         "algorithm": contract["algorithm"],
         "contract_sha256": hashlib.sha256(contract_bytes).hexdigest(),
         "documents_seen": documents.documents_yielded,
+        "input_files": input_files,
         "normalization": contract["normalization"],
+        "training": {
+            "max_documents": args.max_documents,
+            "max_token_length": max_token_length,
+            "min_frequency": min_frequency,
+            "model_max_length": args.model_max_length,
+            "text_key": args.text_key,
+        },
+        "versions": {
+            "tokenizers": package_version("tokenizers"),
+            "transformers": package_version("transformers"),
+        },
         "version": contract["version"],
         "vocab_size": len(fast_tokenizer),
     }
