@@ -1,7 +1,8 @@
 # Lumi-1B Scaling Pilot v0.1
 
-Status: **design, local input/data gates, and exact-artifact cloud preflight
-pass; provider selection and paid GPU launch remain unapproved**
+Status: **design, local data gates, Lambda A100 remote preflight, and the
+two-step smoke/resume gate pass; the 100-step calibration and later stages
+remain unapproved**
 
 ## Decision
 
@@ -98,6 +99,27 @@ Each stage is a stop/go decision. Passing smoke does not authorize calibration;
 passing calibration does not authorize 250M tokens; and the 1.4B stage starts
 only after the 250M checkpoint improves on the frozen 150M held-out baseline.
 
+## Verified A100 smoke gate
+
+A Lambda 1x A100 40GB SXM4 in `asia-south-1`, observed at USD 1.99/hour,
+passed the exact-artifact remote CUDA/BF16/resource preflight before training.
+Step 1 and a separate fresh-process resume to step 2 then produced:
+
+| Step | Loss | Gradient norm | Tokens/s | Peak allocated | Peak reserved |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 11.451070 | 9.422230 | 7,997.4 | 15.721GiB | 17.039GiB |
+| 2 | 11.448407 | 10.372132 | 8,734.3 | 20.611GiB | 23.744GiB |
+
+The resumed process reached sequence cursor 16 and 65,536 tokens with run
+fingerprint
+`66a9c146a0dd085df0de461cc4d30dfa43cebafd030d6933330b3ae3214ec1e9`.
+This validates single-A100 fit and checkpoint recovery. Two cold steps do not
+measure steady-state throughput, so they do not replace the 100-step
+calibration or authorize any later stage. Full environment, preflight, and
+checkpoint details are in `docs/cloud-pilot-1b-v0.1.md`. The latest checkpoint
+was archived on the Mac with all 14 server-generated checksums verified before
+the Lambda console reported no running instances.
+
 ## Trainer changes required by 1B
 
 The correctness-first trainer now supports these optional, resume-pinned
@@ -120,8 +142,9 @@ The pinned 1B settings are BF16 autocast with FP32 parameters, gradient
 checkpointing enabled, peak learning rate 2e-4, 500 warm-up steps, cosine decay
 to 10%, weight decay 0.1, gradient clipping at 1.0, checkpoints every 2,500
 steps plus every requested stop point, and retention of the newest two matching
-checkpoints. Actual H100 peak memory remains unmeasured and is a mandatory
-calibration output.
+checkpoints. The two-step A100 gate measured 23.744GiB peak reserved memory;
+steady-state memory, throughput, and checkpoint behavior remain mandatory
+100-step calibration outputs.
 
 ## Costing rule and scenarios
 
@@ -147,10 +170,10 @@ unpriced until the 100-step calibration records real throughput.
 
 ## Fail-closed approval gates
 
-The local gates are complete: the hash-ranked held-out-excluding
-builder, byte-identical interruption/resume canary, 24-stratum capacity proof,
-sealed final manifests/shards/hashes, and schema-v2 exact-artifact cloud
-preflight all pass. Before any GPU launch:
+The local gates are complete: the hash-ranked held-out-excluding builder,
+byte-identical interruption/resume canary, 24-stratum capacity proof, sealed
+final manifests/shards/hashes, and schema-v2 exact-artifact cloud preflight all
+pass. The first Lambda launch then followed the required sequence:
 
 1. choose an actually available AWS or Lambda instance and enter its current
    hourly rate—quota alone does not prove capacity;
@@ -159,11 +182,11 @@ preflight all pass. Before any GPU launch:
    free-disk, proof/state, tokenizer, and all-shard hash gates before starting a
    trainer process.
 
-On the first GPU, run only the one-step smoke and a fresh-process resume. If
-finite loss, gradient norm, checkpoint recovery, BF16, memory, and disk gates
-pass, continue only to the 100-step calibration. Record median steady-state
-tokens/second, peak allocated/reserved HBM, checkpoint seconds/bytes, startup
-overhead, and actual rate; then rerun the cost planner before the 250M stage.
+The first GPU stopped after the one-step smoke and fresh-process resume passed.
+Continuing to the 100-step calibration is still a separate decision. That run
+must record median steady-state tokens/second, peak allocated/reserved HBM,
+checkpoint seconds/bytes, startup overhead, and actual rate; then the cost
+planner must be rerun before the 250M stage.
 
 The 4B/80B run remains unapproved even if the 1.4B stage passes. That result may
 lock a measured final-training plan, but the 4B run still needs an approximately

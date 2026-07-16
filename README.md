@@ -71,12 +71,20 @@ tokenizer, data, and deployment portability before any expensive GPU run:
 20. a backward-compatible schema-v2 cloud preflight pins that exact manifest,
     selection proof/state, tokenizer, 1B config, and scaling contracts. A full
     local rehash passes; the Mac correctly fails CUDA and 32GiB host-memory
-    admission floors, and provider selection and paid launch remain unapproved.
+    admission floors;
+21. the same no-skip preflight passes on a live Lambda 1x A100 40GB SXM4 in
+    India before training. One optimizer step and a separate fresh-process
+    resume advance the 1,050,981,888-parameter model through step 2 and 65,536
+    tokens with finite loss/gradient norm, exact data-position recovery, and a
+    23.744GiB measured peak CUDA reservation. The latest checkpoint is archived
+    on the Mac with all 14 server-generated hashes verified, and the Lambda
+    instance is terminated.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
-design and hash-ranked held-out-excluding data artifact are frozen, but no paid
-1B GPU launch is approved. The completed 150M plumbing checkpoint is not a
-production-quality model.
+design, hash-ranked held-out-excluding artifact, and two-step A100 smoke gate
+are complete. The 100-step calibration and every later 1B or 4B stage remain
+unapproved. The completed 150M plumbing checkpoint is not a production-quality
+model.
 
 ## Quick start
 
