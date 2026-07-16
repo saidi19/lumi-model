@@ -1,18 +1,22 @@
 # Lumi-1B Cloud Preflight v0.1
 
-Status: **canonical local artifact preflight passes; provider selection, remote
-runtime preflight, and paid GPU launch remain unapproved**
+Status: **canonical local and Lambda A100 remote preflights, the two-step
+smoke/resume gate, local checkpoint verification, and instance shutdown pass;
+the 100-step calibration and later stages remain unapproved**
 
 ## Decision
 
-The sealed 1.4B-token artifact is technically ready to transfer to a candidate
-GPU host. It may not be trained merely because its local preflight passes. The
-same command must run again on the selected host with `--require-cuda`, all
-shard hashes enabled, and the intended checkpoint workspace supplied.
+The sealed 1.4B-token artifact was transferred to a selected Lambda A100 host.
+The same no-skip command passed there with `--require-cuda` before any trainer
+process started. One optimizer step and a separate fresh-process resume then
+advanced the run through step 2 with finite metrics and exact checkpoint/data
+recovery. Checkpoint 2 and its reports were copied back to the Mac, verified
+against the server-generated checksums, and the instance was terminated.
 
-This schema-v2 gate extends the existing 150M preflight without changing its
-schema-v1 contract. A technical PASS never grants spending authority or
-approval for the 100-step, 250M-token, 1.4B-token, or 4B stages.
+This completes only the smoke/resume boundary. The schema-v2 gate still extends
+the existing 150M preflight without changing its schema-v1 contract, and the
+technical PASS does not authorize the 100-step, 250M-token, 1.4B-token, or 4B
+stages.
 
 ## Pinned bundle
 
@@ -80,6 +84,10 @@ planning-contract hashes. The report is outside Git at
 | `runtime_ready` | false, expected on the Mac |
 | Paid launch approved | false |
 
+The false approval field is intentional: a technical preflight never grants
+spending authority. The later Lambda launch was authorized separately by the
+owner immediately after live instance type, region, and rate selection.
+
 The same implementation also re-ran the archived schema-v1 150M/50M
 preflight against its real sealed artifact and reproduced its original
 150,625,536 parameters, 49,999,872 tokens, manifest hash, and build fingerprint.
@@ -129,6 +137,35 @@ python scripts/preflight_cloud_pilot.py \
 Remote mode refuses `--skip-shard-hashes`. It must report `runtime_ready=true`
 before any trainer process starts.
 
+## Verified Lambda A100 admission
+
+The live target was selected immediately before launch:
+
+- provider: Lambda Cloud;
+- instance: 1x A100 40GB SXM4 (`gpu_1x_a100_sxm4`);
+- region: India (`asia-south-1`);
+- image: Lambda Stack 22.04;
+- observed rate: USD 1.99/hour;
+- persistent filesystem: none;
+- SSH key: the existing `Afnan` public key; its private key remained off-server.
+
+The host booted at 2026-07-16 18:14:21 UTC. The runtime audit and remote report
+recorded:
+
+| Field | Verified value |
+| --- | ---: |
+| GPU | NVIDIA A100-SXM4-40GB |
+| CUDA device memory | 40,960MiB |
+| Compute capability | 8.0 |
+| Driver | 580.105.08 |
+| Host memory | 232,205,586,432 bytes |
+| Initial free disk | 506,388,217,856 bytes |
+| Python | 3.12.13 |
+| PyTorch / CUDA | 2.7.0+cu126 / 12.6 |
+| CUDA / BF16 | true / true |
+| Remote report SHA-256 | `0a48500e18936334c756387968d87b4e2d83b18328f000802b2af0c28c7253b2` |
+| `runtime_ready` | true |
+
 ## Smoke/resume boundary
 
 Only after provider selection, transfer verification, and remote preflight pass
@@ -164,3 +201,34 @@ advance exactly, BF16 is active, CUDA memory metrics are present, and the
 checkpoint restores. Stop after step 2. The 100-step calibration remains a
 separate decision using measured throughput, peak HBM, checkpoint time/bytes,
 startup overhead, and the current hourly rate.
+
+## Verified smoke/resume result
+
+The first process completed one step and wrote checkpoint 1. A separate Python
+process restored model, optimizer, CPU/CUDA RNG, and sequence cursor before
+advancing to step 2 and checkpoint 2:
+
+| Step | Loss | Gradient norm | Tokens/s | Peak allocated | Peak reserved | Checkpoint |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 11.451070 | 9.422230 | 7,997.4 | 15.721GiB | 17.039GiB | 18.228s |
+| 2, fresh resume | 11.448407 | 10.372132 | 8,734.3 | 20.611GiB | 23.744GiB | 16.487s |
+
+The final state is `complete` at step 2, sequence cursor 16, and 65,536 tokens.
+Its run fingerprint is
+`66a9c146a0dd085df0de461cc4d30dfa43cebafd030d6933330b3ae3214ec1e9`.
+Checkpoint 2 contains a 4,203,973,544-byte model file and an
+8,408,144,175-byte optimizer/RNG file. These two cold smoke measurements are
+not a steady-state throughput estimate and are not used to authorize or cost
+the 100-step calibration.
+
+## Verified local archive and shutdown
+
+The reports and latest resumable checkpoint are outside Git at
+`lumi-data/scaling-pilot-1b-v0.1/a100-smoke-v0.1/`. The archive occupies about
+12GB and contains 14 payload files plus the checksum manifest. All 14 entries
+in the 1,540-byte server-generated manifest passed local SHA-256 verification.
+The manifest itself has SHA-256
+`f69bfa9905288c4178d04a1668fa9244b8ac053056488b7bd8eef156018040e4`.
+
+After verification, Lambda Cloud reported **No running instances** at
+2026-07-16 19:08:54 UTC. No 100-step calibration or later training stage ran.
