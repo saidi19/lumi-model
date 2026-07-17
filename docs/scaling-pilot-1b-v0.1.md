@@ -193,10 +193,13 @@ The Lambda console was then verified to show no running instances.
 
 This run deliberately preserves the current separator-only fixed packing and
 ordinary causal attention, under which adjacent packed documents can
-cross-attend. Any document-isolated varlen/`cu_seqlens` implementation and A/B
-comparison is a separate controlled experiment; it did not alter this gate.
-The PASS makes the cumulative 1.4B-token stage eligible for consideration, but
-neither that stage nor the 4B/80B run is authorized by this result.
+cross-attend. A later separate controlled experiment verified the
+document-isolated varlen/`cu_seqlens` implementation on A100 and measured 6.17%
+higher steady throughput with identical peak reserved HBM; see
+`docs/packed-attention-ab-v0.1.md`. It did not alter this checkpoint. The PASS
+makes a 1.4B-token stage eligible for consideration, but an isolated-policy run
+must start fresh at step zero. Neither that run nor the 4B/80B run is authorized
+by this result.
 
 ## Trainer changes required by 1B
 
