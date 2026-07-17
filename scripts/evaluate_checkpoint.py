@@ -17,6 +17,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--attention-implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+    )
+    parser.add_argument("--document-isolation", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -35,6 +40,8 @@ def main() -> None:
         generation_max_new_tokens=evaluation["generation_max_new_tokens"],
         batch_size=evaluation["batch_size"],
         checkpoint_batches=evaluation["checkpoint_batches"],
+        attention_implementation=args.attention_implementation,
+        document_isolation=args.document_isolation,
         device=args.device,
         resume=args.resume,
     )
