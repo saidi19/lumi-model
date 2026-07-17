@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-from lumi import LumiConfig, LumiForCausalLM, LumiModel
+from lumi import (
+    LumiConfig,
+    LumiForCausalLM,
+    LumiModel,
+    build_document_causal_mask,
+    build_packed_document_metadata,
+)
+from lumi.modeling_lumi import _lumi_eager_attention_forward
 
 
 def test_forward_shape_and_finite_loss(tiny_config: LumiConfig) -> None:
@@ -39,6 +47,151 @@ def test_eager_attention_path_remains_causal(tiny_config: LumiConfig) -> None:
         first_logits = model(input_ids=first).logits[:, :3]
         second_logits = model(input_ids=second).logits[:, :3]
     torch.testing.assert_close(first_logits, second_logits, rtol=0.0, atol=1e-6)
+
+
+def test_packed_document_metadata_resets_positions_and_flattens_boundaries() -> None:
+    input_ids = torch.tensor(
+        [
+            [3, 10, 11, 3, 12, 13],
+            [20, 21, 3, 30, 3, 40],
+        ]
+    )
+
+    metadata = build_packed_document_metadata(input_ids, doc_token_id=3)
+
+    assert metadata.position_ids.tolist() == [
+        [0, 1, 2, 0, 1, 2],
+        [0, 1, 0, 1, 0, 1],
+    ]
+    assert metadata.cu_seq_lens.dtype == torch.int32
+    assert metadata.cu_seq_lens.tolist() == [0, 3, 6, 8, 10, 12]
+    assert metadata.max_length == 3
+
+
+def test_document_causal_mask_blocks_other_segments() -> None:
+    position_ids = torch.tensor([[0, 1, 2, 0, 1]])
+
+    mask = build_document_causal_mask(position_ids)
+
+    expected = torch.tensor(
+        [
+            [True, False, False, False, False],
+            [True, True, False, False, False],
+            [True, True, True, False, False],
+            [False, False, False, True, False],
+            [False, False, False, True, True],
+        ]
+    )
+    assert torch.equal(mask[0, 0], expected)
+
+
+def test_document_isolation_prevents_prefix_leakage(tiny_config: LumiConfig) -> None:
+    tiny_config._attn_implementation = "eager"
+    torch.manual_seed(24)
+    model = LumiForCausalLM(tiny_config).eval()
+    first = torch.tensor([[3, 8, 9, 3, 20, 21]])
+    second = torch.tensor([[3, 55, 56, 3, 20, 21]])
+
+    with torch.no_grad():
+        isolated_first = model(input_ids=first, document_isolation=True).logits[:, 3:]
+        isolated_second = model(input_ids=second, document_isolation=True).logits[:, 3:]
+        packed_first = model(input_ids=first).logits[:, 3:]
+        packed_second = model(input_ids=second).logits[:, 3:]
+
+    torch.testing.assert_close(isolated_first, isolated_second, rtol=0.0, atol=1e-6)
+    assert not torch.allclose(packed_first, packed_second, rtol=0.0, atol=1e-6)
+
+
+def test_flash_varlen_contract_matches_dense_reference(
+    tiny_config: LumiConfig, monkeypatch
+) -> None:
+    torch.manual_seed(25)
+    model = LumiForCausalLM(tiny_config).eval()
+    input_ids = torch.tensor(
+        [
+            [3, 8, 9, 3, 10, 11],
+            [12, 13, 3, 14, 15, 16],
+        ]
+    )
+    metadata = build_packed_document_metadata(input_ids, doc_token_id=3)
+    common = {
+        "cu_seq_lens_k": metadata.cu_seq_lens,
+        "cu_seq_lens_q": metadata.cu_seq_lens,
+        "document_isolation": True,
+        "max_length_k": metadata.max_length,
+        "max_length_q": metadata.max_length,
+        "position_ids": metadata.position_ids,
+    }
+
+    model.config._attn_implementation = "eager"
+    with torch.no_grad():
+        expected = model(input_ids=input_ids, **common).logits
+
+    calls = []
+
+    def fake_flash_varlen(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        *,
+        cu_seq_lens_q,
+        cu_seq_lens_k,
+        max_length_q,
+        max_length_k,
+        scaling,
+        **kwargs,
+    ):
+        del kwargs
+        assert attention_mask is None
+        assert torch.equal(cu_seq_lens_q, cu_seq_lens_k)
+        assert max_length_q == max_length_k == metadata.max_length
+        calls.append(cu_seq_lens_q.tolist())
+
+        batch, _, sequence, _ = query.shape
+        flat_query = query.transpose(1, 2).reshape(-1, query.shape[1], query.shape[-1])
+        flat_key = key.transpose(1, 2).reshape(-1, key.shape[1], key.shape[-1])
+        flat_value = value.transpose(1, 2).reshape(-1, value.shape[1], value.shape[-1])
+        outputs = []
+        boundaries = cu_seq_lens_q.tolist()
+        for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+            segment_output, _ = _lumi_eager_attention_forward(
+                module,
+                flat_query[start:end].transpose(0, 1).unsqueeze(0),
+                flat_key[start:end].transpose(0, 1).unsqueeze(0),
+                flat_value[start:end].transpose(0, 1).unsqueeze(0),
+                None,
+                scaling=scaling,
+            )
+            outputs.append(segment_output.squeeze(0))
+        return torch.cat(outputs, dim=0).view(batch, sequence, query.shape[1], -1), None
+
+    monkeypatch.setitem(
+        ALL_ATTENTION_FUNCTIONS._global_mapping,
+        "flash_attention_2",
+        fake_flash_varlen,
+    )
+    model.config._attn_implementation = "flash_attention_2"
+    with torch.no_grad():
+        actual = model(input_ids=input_ids, **common).logits
+
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert calls == [metadata.cu_seq_lens.tolist()] * tiny_config.num_hidden_layers
+
+
+def test_document_isolation_rejects_invalid_position_resets(tiny_config: LumiConfig) -> None:
+    model = LumiForCausalLM(tiny_config).eval()
+    with pytest.raises(ValueError, match="increment by one or reset"):
+        model(
+            input_ids=torch.tensor([[3, 8, 9, 3, 10]]),
+            position_ids=torch.tensor([[0, 1, 3, 0, 1]]),
+            document_isolation=True,
+        )
+
+
+def test_lumi_declares_flash_attention_support() -> None:
+    assert LumiForCausalLM._supports_flash_attn is True
 
 
 def test_left_padding_does_not_change_content_logits(tiny_config: LumiConfig) -> None:
@@ -115,6 +268,24 @@ def test_save_load_round_trip_preserves_logits(tiny_config: LumiConfig, tmp_path
     loaded = AutoModelForCausalLM.from_pretrained(tmp_path).eval()
     with torch.no_grad():
         actual = loaded(input_ids=input_ids).logits
+    torch.testing.assert_close(actual, expected)
+
+
+def test_save_load_round_trip_preserves_document_isolated_logits(
+    tiny_config: LumiConfig, tmp_path
+) -> None:
+    tiny_config._attn_implementation = "eager"
+    torch.manual_seed(26)
+    model = LumiForCausalLM(tiny_config).eval()
+    input_ids = torch.tensor([[3, 8, 9, 3, 10, 11]])
+    with torch.no_grad():
+        expected = model(input_ids=input_ids, document_isolation=True).logits
+
+    model.save_pretrained(tmp_path)
+    loaded = AutoModelForCausalLM.from_pretrained(tmp_path).eval()
+    loaded.config._attn_implementation = "eager"
+    with torch.no_grad():
+        actual = loaded(input_ids=input_ids, document_isolation=True).logits
     torch.testing.assert_close(actual, expected)
 
 

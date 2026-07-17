@@ -1,8 +1,9 @@
 # Lumi-1B Scaling Pilot v0.1
 
 Status: **design, local data gates, Lambda A100 remote preflight, the two-step
-smoke/resume gate, and the cumulative 100-step calibration pass; the 250M-token
-and later stages remain unapproved**
+smoke/resume gate, the cumulative 100-step calibration, and the cumulative
+250M-token learning gate complete; the 1.4B-token and 4B stages remain
+unapproved**
 
 ## Decision
 
@@ -19,6 +20,12 @@ would be about 21.02B tokens. The current experiment is therefore deliberately
 undertrained: it can measure scaling, optimization, reliability, and early
 quality movement, but it cannot establish ChatGPT-like quality or justify a
 production model.
+
+The separately authorized 250M-token gate has now passed its frozen held-out
+criterion: loss fell from the 150M baseline of 4.6808116141 to 3.2655044363.
+This confirms learning movement at the cumulative checkpoint, not useful chat
+behavior. Fixed greedy continuations remain repetitive and factually wrong, as
+expected for a 1.05B-parameter base model trained on only 250M tokens.
 
 ## Exact architecture
 
@@ -144,7 +151,55 @@ run fingerprint remains
 Checkpoint 100 and its evidence were archived on the Mac; all 21
 server-generated hashes passed before the second console shutdown was
 confirmed. This gate validates runtime stability and supplies measured costing
-inputs. It is not a held-out quality result and does not authorize 250M tokens.
+inputs. It was not a held-out quality result and did not itself authorize the
+later 250M-token run.
+
+## Verified A100 250M learning gate
+
+A separately authorized third Lambda A100 run verified the exact inputs and
+checkpoint-100 archive, resumed the same optimizer/RNG/schedule/data position,
+and stopped at the hard cumulative boundary of step 7,630. The frozen held-out
+evaluation then ran before the result was sealed:
+
+| Field | Verified value |
+| --- | ---: |
+| Model parameters | 1,050,981,888 |
+| Resume / final cumulative step | 100 / 7,630 |
+| Cumulative processed tokens | 250,019,840 |
+| First resumed / final / best segment loss | 7.815707 / 2.776807 / 2.249702 |
+| Frozen 150M baseline / 1B held-out loss | 4.680812 / 3.265504 |
+| Held-out loss delta / perplexity | -1.415307 / 26.193321 |
+| Quality-gate result | PASS |
+| Median steady-state / end-to-end throughput | 9,382.6 / 9,263.9 tokens/s |
+| Training / evaluation duration | 26,635s / 1,230s |
+| Peak HBM / median GPU utilization / max temperature | 24,841MiB / 96% / 67C |
+| Final checkpoint time / bytes | 16.681s / 12,612,139,807 |
+| Training-segment cost at USD 1.99/hour | USD 14.723236 |
+
+The held-out loss is strictly below the frozen baseline, so the specified
+learning criterion passes. This proves substantial next-token-learning movement
+at 250M tokens. It is not a chatbot-quality pass: all four fixed greedy probes
+remain repetitive or factually wrong, including the France-capital,
+photosynthesis, Python, and Bengali probes.
+
+Milestone checkpoints 2,500, 5,000, and 7,500 and final
+`checkpoint-00007630` are archived outside Git on the Mac. The final checkpoint
+contains 12,612,139,807 bytes, including the 4,203,973,544-byte model and
+8,408,144,175-byte trainer state. All 35 entries in the server-generated final
+manifest passed an independent local SHA-256 verification. The manifest itself
+has SHA-256
+`4109929835ca18d39fea868032ea851e8f5ec71b5cebf9e4119b979741d007a1`.
+The Lambda console was then verified to show no running instances.
+
+This run deliberately preserves the current separator-only fixed packing and
+ordinary causal attention, under which adjacent packed documents can
+cross-attend. A later separate controlled experiment verified the
+document-isolated varlen/`cu_seqlens` implementation on A100 and measured 6.17%
+higher steady throughput with identical peak reserved HBM; see
+`docs/packed-attention-ab-v0.1.md`. It did not alter this checkpoint. The PASS
+makes a 1.4B-token stage eligible for consideration, but an isolated-policy run
+must start fresh at step zero. Neither that run nor the 4B/80B run is authorized
+by this result.
 
 ## Trainer changes required by 1B
 
@@ -217,9 +272,9 @@ A separately approved second launch stopped at cumulative step 100 after
 recording median steady-state tokens/second, peak allocated/reserved HBM,
 checkpoint seconds/bytes, lifecycle overhead, and the selected rate. The
 archive and measured cost report were verified before shutdown. Continuing to
-the 250M learning gate remains a separate owner decision; after that run, the
-checkpoint must beat the frozen 150M held-out loss before the 1.4B stage can be
-considered.
+the 250M learning gate was a separate owner decision. That run is now complete
+and passed the frozen held-out-loss rule, but it does not itself authorize the
+1.4B-token stage.
 
 The 4B/80B run remains unapproved even if the 1.4B stage passes. That result may
 lock a measured final-training plan, but the 4B run still needs an approximately

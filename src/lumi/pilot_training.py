@@ -17,13 +17,14 @@ from typing import Any
 import torch
 
 from .configuration_lumi import LumiConfig
-from .modeling_lumi import LumiForCausalLM
+from .modeling_lumi import LumiForCausalLM, build_packed_document_metadata
 from .packed_data import PackedTokenDataset, validate_packed_manifest
 
 TRAINING_SCHEMA_VERSION = 1
 TRAINING_STATE_FILENAME = "training-state.json"
 METRICS_FILENAME = "metrics.jsonl"
 LR_SCHEDULES = {"constant", "cosine"}
+ATTENTION_IMPLEMENTATIONS = {"eager", "sdpa", "flash_attention_2"}
 
 
 def _utc_now() -> str:
@@ -211,6 +212,8 @@ def _optimizer_identity(
     schedule_steps: int | None,
     warmup_steps: int,
     weight_decay: float,
+    attention_implementation: str | None = None,
+    document_isolation: bool = False,
 ) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "batch_size": batch_size,
@@ -225,6 +228,10 @@ def _optimizer_identity(
         identity["gradient_checkpointing"] = True
     if keep_checkpoints is not None:
         identity["keep_checkpoints"] = keep_checkpoints
+    if attention_implementation is not None:
+        identity["attention_implementation"] = attention_implementation
+    if document_isolation:
+        identity["document_isolation"] = "position_reset_varlen_v0.1"
     if lr_schedule != "constant" or warmup_steps or schedule_steps is not None:
         identity.update(
             {
@@ -344,9 +351,16 @@ def _save_checkpoint(
 
 
 def _restore_checkpoint(
-    *, checkpoint: Path, device: torch.device, learning_rate: float, weight_decay: float
+    *,
+    checkpoint: Path,
+    device: torch.device,
+    learning_rate: float,
+    weight_decay: float,
+    attention_implementation: str | None,
 ) -> tuple[LumiForCausalLM, torch.optim.AdamW]:
     model = LumiForCausalLM.from_pretrained(checkpoint, local_files_only=True)
+    if attention_implementation is not None:
+        model.config._attn_implementation = attention_implementation
     model.to(device)
     optimizer = _create_optimizer(
         model,
@@ -388,6 +402,8 @@ def train_packed_pilot(
     warmup_steps: int = 0,
     schedule_steps: int | None = None,
     min_learning_rate_ratio: float = 0.1,
+    attention_implementation: str | None = None,
+    document_isolation: bool = False,
 ) -> dict[str, Any]:
     """Train a single-device Lumi pilot with exact data-position resume."""
 
@@ -402,6 +418,16 @@ def train_packed_pilot(
         raise ValueError("checkpoint-steps must be positive")
     if not isinstance(gradient_checkpointing, bool):
         raise ValueError("gradient-checkpointing must be boolean")
+    if not isinstance(document_isolation, bool):
+        raise ValueError("document-isolation must be boolean")
+    if (
+        attention_implementation is not None
+        and attention_implementation not in ATTENTION_IMPLEMENTATIONS
+    ):
+        raise ValueError(
+            "attention-implementation must be one of "
+            f"{sorted(ATTENTION_IMPLEMENTATIONS)}"
+        )
     if keep_checkpoints is not None and (
         isinstance(keep_checkpoints, bool)
         or not isinstance(keep_checkpoints, int)
@@ -433,11 +459,26 @@ def train_packed_pilot(
     manifest = validate_packed_manifest(manifest_path)
     config_bytes = config_path.read_bytes()
     config = LumiConfig(**json.loads(config_bytes))
+    config._attn_implementation = attention_implementation
     sequence_length = manifest["packing"]["sequence_length"]
     if config.vocab_size != manifest["tokenizer"]["vocab_size"]:
         raise ValueError("model and packed dataset vocabulary sizes differ")
+    if config.doc_token_id != manifest["tokenizer"]["doc_token_id"]:
+        raise ValueError("model and packed dataset document-token IDs differ")
     if sequence_length > config.max_position_embeddings:
         raise ValueError("packed sequence length exceeds the model maximum")
+
+    training_device = _resolve_device(device)
+    if attention_implementation == "flash_attention_2" and training_device.type != "cuda":
+        raise ValueError("flash_attention_2 training requires CUDA")
+    if (
+        document_isolation
+        and training_device.type == "cuda"
+        and attention_implementation != "flash_attention_2"
+    ):
+        raise ValueError(
+            "CUDA document isolation requires flash_attention_2 varlen attention"
+        )
 
     manifest_bytes = manifest_path.read_bytes()
     optimizer_identity = _optimizer_identity(
@@ -452,6 +493,8 @@ def train_packed_pilot(
         schedule_steps=schedule_steps,
         warmup_steps=warmup_steps,
         weight_decay=weight_decay,
+        attention_implementation=attention_implementation,
+        document_isolation=document_isolation,
     )
     run_identity = {
         "config": {
@@ -517,7 +560,6 @@ def train_packed_pilot(
             }
     _trim_metrics(metrics_path, state["step"])
 
-    training_device = _resolve_device(device)
     if state["latest_checkpoint"] is None:
         torch.manual_seed(seed)
         model = LumiForCausalLM(config)
@@ -534,6 +576,7 @@ def train_packed_pilot(
             device=training_device,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
+            attention_implementation=attention_implementation,
         )
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -568,9 +611,24 @@ def train_packed_pilot(
                 dataset_length=len(dataset),
                 seed=seed,
             )
-            batch = torch.stack([dataset[index] for index in indices]).to(training_device)
+            cpu_batch = torch.stack([dataset[index] for index in indices])
+            model_kwargs: dict[str, Any] = {}
+            if document_isolation:
+                metadata = build_packed_document_metadata(
+                    cpu_batch, doc_token_id=config.doc_token_id
+                )
+                cu_seq_lens = metadata.cu_seq_lens.to(training_device)
+                model_kwargs = {
+                    "cu_seq_lens_k": cu_seq_lens,
+                    "cu_seq_lens_q": cu_seq_lens,
+                    "document_isolation": True,
+                    "max_length_k": metadata.max_length,
+                    "max_length_q": metadata.max_length,
+                    "position_ids": metadata.position_ids.to(training_device),
+                }
+            batch = cpu_batch.to(training_device)
             with _autocast_context(training_device):
-                loss = model(input_ids=batch, labels=batch).loss
+                loss = model(input_ids=batch, labels=batch, **model_kwargs).loss
             if loss is None or not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite loss before step {state['step'] + 1}: {loss}")
             (loss / gradient_accumulation_steps).backward()

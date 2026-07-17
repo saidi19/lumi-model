@@ -37,6 +37,27 @@ def test_default_optimizer_identity_remains_legacy_checkpoint_compatible() -> No
     }
 
 
+def test_document_isolation_and_backend_are_resume_pinned() -> None:
+    identity = _optimizer_identity(
+        batch_size=1,
+        gradient_accumulation_steps=8,
+        gradient_checkpointing=True,
+        keep_checkpoints=2,
+        learning_rate=2e-4,
+        lr_schedule="cosine",
+        max_grad_norm=1.0,
+        min_learning_rate_ratio=0.1,
+        schedule_steps=42_725,
+        warmup_steps=500,
+        weight_decay=0.1,
+        attention_implementation="flash_attention_2",
+        document_isolation=True,
+    )
+
+    assert identity["attention_implementation"] == "flash_attention_2"
+    assert identity["document_isolation"] == "position_reset_varlen_v0.1"
+
+
 def test_cosine_learning_rate_has_linear_warmup_and_pinned_floor() -> None:
     common = {
         "base_learning_rate": 1.0,

@@ -1115,8 +1115,12 @@ def test_canonical_scaling_cloud_plan_loads() -> None:
     assert plan["approval"]["paid_gpu_launch"] is False
 
 
+@pytest.mark.parametrize("document_isolation", [False, True])
 def test_training_resume_matches_uninterrupted_run(
-    tiny_tokenizer: Path, packing_corpus: Path, tmp_path: Path
+    tiny_tokenizer: Path,
+    packing_corpus: Path,
+    tmp_path: Path,
+    document_isolation: bool,
 ) -> None:
     packed_output = tmp_path / "packed-training"
     _build(packing_corpus, tiny_tokenizer, packed_output)
@@ -1151,6 +1155,7 @@ def test_training_resume_matches_uninterrupted_run(
         "batch_size": 2,
         "checkpoint_steps": 1,
         "device": "cpu",
+        "document_isolation": document_isolation,
         "gradient_checkpointing": True,
         "learning_rate": 1e-3,
         "lr_schedule": "cosine",
@@ -1161,7 +1166,8 @@ def test_training_resume_matches_uninterrupted_run(
         "weight_decay": 0.0,
     }
 
-    resumed_output = tmp_path / "resumed-training"
+    mode = "isolated" if document_isolation else "current"
+    resumed_output = tmp_path / f"resumed-training-{mode}"
     first = train_packed_pilot(output=resumed_output, steps=2, **common)
     assert first["status"] == "complete"
     assert first["step"] == 2
@@ -1189,7 +1195,7 @@ def test_training_resume_matches_uninterrupted_run(
         output=resumed_output, steps=4, resume=True, **relocated_common
     )
 
-    fresh_output = tmp_path / "fresh-training"
+    fresh_output = tmp_path / f"fresh-training-{mode}"
     fresh = train_packed_pilot(output=fresh_output, steps=4, **common)
     assert resumed["step"] == fresh["step"] == 4
     assert resumed["tokens_seen"] == fresh["tokens_seen"] == 64

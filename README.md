@@ -84,13 +84,33 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     7.690175, steps 10--99 sustain a 9,379.6 tokens/second median, and peak CUDA
     reservation remains 23.744GiB. Checkpoint 100 and its reports occupy about
     12GB on the Mac, all 21 server-generated hashes pass, and the second Lambda
-    instance is also terminated.
+    instance is also terminated;
+23. a third authorized A100 run resumes that state and hard-stops at cumulative
+    step 7,630 and 250,019,840 tokens. Frozen held-out loss improves from the
+    150M baseline of 4.680812 to 3.265504 (perplexity 26.193), so the learning
+    gate passes, while fixed greedy generations remain repetitive and wrong.
+    Median steady-state throughput is 9,382.6 tokens/second and the training
+    segment costs USD 14.723236 at USD 1.99/hour. The final 12,612,139,807-byte
+    checkpoint and all run evidence are archived on the Mac; all 35 final
+    manifest hashes pass independently, and the third Lambda instance is
+    terminated;
+24. the optional document-isolated packed-attention path passes 125 local and
+    cloud tests, Ruff, and a real A100 FlashAttention 2.8.3 varlen gate. CUDA
+    logits match the dense reference at 0.999982 cosine similarity and later-
+    document leakage is exactly zero. In two fresh paired 100-step runs, the
+    isolated path reaches 9,809.5 versus 9,239.5 steady tokens/second (+6.17%),
+    uses identical peak reserved HBM, and ends at loss 7.576857 versus 7.690148.
+    All 32 downloaded manifest entries pass independent hashes, evidence is
+    archived on the Mac, and the Lambda instance is terminated. The result
+    selects isolation for the next fresh scaling candidate but does not alter
+    the existing separator-only 250M checkpoint or authorize another paid run.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and
-100-step calibration are complete. The 250M-token gate and every later 1B or 4B
-stage remain unapproved. The completed 150M plumbing checkpoint is not a
-production-quality model.
+100-step calibration and 250M-token learning gate are complete. The 1.4B-token
+stage and every 4B stage remain unapproved. A future isolated-policy 1.4B run
+must begin from step zero rather than resume the separator-only 250M checkpoint.
+The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
 
@@ -123,8 +143,12 @@ The loopback OpenAI-compatible API, local chat UI, security boundary, and real
 server gate are documented in
 [`docs/local-serving-v0.1.md`](docs/local-serving-v0.1.md).
 The exact 1B architecture, staged token contract, trainer changes, input audit,
-and measured-throughput cost rule are documented in
+measured-throughput cost rule, and verified 250M-token learning gate are
+documented in
 [`docs/scaling-pilot-1b-v0.1.md`](docs/scaling-pilot-1b-v0.1.md).
+The position-reset/varlen document-isolation policy, resume boundary, completed
+A100 CUDA A/B result, and evidence contract are documented in
+[`docs/packed-attention-ab-v0.1.md`](docs/packed-attention-ab-v0.1.md).
 The deterministic source index, 16M canary, final aligned 1.4B pack, resume
 boundary, and verified hashes are documented in
 [`docs/scaling-data-1b-v0.1.md`](docs/scaling-data-1b-v0.1.md).

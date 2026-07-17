@@ -5,7 +5,13 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 from .checkpoint_evaluation import evaluate_checkpoint
 from .configuration_lumi import LumiConfig
 from .evaluation_data import build_heldout_evaluation, validate_heldout_manifest
-from .modeling_lumi import LumiForCausalLM, LumiModel
+from .modeling_lumi import (
+    LumiForCausalLM,
+    LumiModel,
+    PackedDocumentMetadata,
+    build_document_causal_mask,
+    build_packed_document_metadata,
+)
 from .packed_data import PackedTokenDataset, build_packed_dataset, validate_packed_manifest
 from .parameter_count import ParameterBreakdown, parameter_breakdown
 from .pilot_training import train_packed_pilot
@@ -36,8 +42,11 @@ __all__ = [
     "LumiForCausalLM",
     "LumiModel",
     "PackedTokenDataset",
+    "PackedDocumentMetadata",
     "ParameterBreakdown",
     "build_packed_dataset",
+    "build_document_causal_mask",
+    "build_packed_document_metadata",
     "build_scaling_packed_dataset",
     "build_scaling_source_index",
     "build_heldout_evaluation",

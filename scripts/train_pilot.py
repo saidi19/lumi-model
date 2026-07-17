@@ -28,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--schedule-steps", type=int)
     parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--attention-implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+    )
+    parser.add_argument("--document-isolation", action="store_true")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -53,6 +58,8 @@ def main() -> None:
         warmup_steps=args.warmup_steps,
         schedule_steps=args.schedule_steps,
         min_learning_rate_ratio=args.min_learning_rate_ratio,
+        attention_implementation=args.attention_implementation,
+        document_isolation=args.document_isolation,
         device=args.device,
         resume=args.resume,
     )
