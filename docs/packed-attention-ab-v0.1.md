@@ -1,14 +1,21 @@
 # Lumi Packed-Attention A/B Gate v0.1
 
 Status: **optional document-isolated path implemented and locally verified;
-real CUDA/FlashAttention execution not yet verified**
+controlled real CUDA/FlashAttention A/B execution not yet verified**
 
 ## Decision
 
-The completed 250M-token Lumi-1B checkpoint remains the immutable A baseline.
+The completed 250M-token Lumi-1B checkpoint remains the immutable quality A baseline.
 It uses the existing separator-only fixed packing and ordinary causal attention,
 so later documents in one packed row may attend to earlier documents. That is a
 valid pretraining policy, not a correctness bug.
+
+Its historical 100-step throughput cannot by itself be the controlled speed
+baseline for the new path because that run used the eager attention backend. A
+short CUDA comparison therefore trains two fresh 100-step controls with the
+same FlashAttention backend: current separator-only causal attention and the
+new document-isolated varlen policy. This keeps the kernel, initialization,
+data order, optimizer, and schedule fixed while changing packing semantics.
 
 This branch adds an opt-in B policy for future from-scratch experiments. It does
 not change the default model or trainer behavior, does not rewrite the sealed
@@ -94,8 +101,17 @@ python scripts/train_pilot.py \
   --device cuda
 ```
 
-The first real CUDA gate should hard-stop at cumulative step 100 (3,276,800
-tokens), seal loss/throughput/HBM evidence, and compare it with the existing
-100-step A calibration. It is an implementation and speed smoke, not enough to
-claim that one packing policy produces a better model. No 250M rerun, 1.4B
-continuation, or 4B training is authorized by this document.
+The canonical cloud harness is
+`scripts/run_packed_attention_cuda_smoke.sh`. It first requires the actual
+FlashAttention varlen kernel to match the dense reference, preserve document
+isolation, and produce finite backward gradients. It then creates two fresh
+hard-capped runs:
+
+1. current packing with `flash_attention_2`, without document isolation;
+2. isolated packing with `flash_attention_2` and `--document-isolation`.
+
+Each run stops at step 100 (3,276,800 tokens). The seal compares paired losses,
+steady-state throughput, HBM usage, telemetry, runtime, and fingerprints. This
+is an implementation and speed smoke, not enough to claim that one packing
+policy produces a better model. No 250M rerun, 1.4B continuation, or 4B
+training is authorized by this document.
