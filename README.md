@@ -84,13 +84,22 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     7.690175, steps 10--99 sustain a 9,379.6 tokens/second median, and peak CUDA
     reservation remains 23.744GiB. Checkpoint 100 and its reports occupy about
     12GB on the Mac, all 21 server-generated hashes pass, and the second Lambda
-    instance is also terminated.
+    instance is also terminated;
+23. a third authorized A100 run resumes that state and hard-stops at cumulative
+    step 7,630 and 250,019,840 tokens. Frozen held-out loss improves from the
+    150M baseline of 4.680812 to 3.265504 (perplexity 26.193), so the learning
+    gate passes, while fixed greedy generations remain repetitive and wrong.
+    Median steady-state throughput is 9,382.6 tokens/second and the training
+    segment costs USD 14.723236 at USD 1.99/hour. The final 12,612,139,807-byte
+    checkpoint and all run evidence are archived on the Mac; all 35 final
+    manifest hashes pass independently, and the third Lambda instance is
+    terminated.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and
-100-step calibration are complete. The 250M-token gate and every later 1B or 4B
-stage remain unapproved. The completed 150M plumbing checkpoint is not a
-production-quality model.
+100-step calibration and 250M-token learning gate are complete. The 1.4B-token
+stage and every 4B stage remain unapproved. The completed 150M and 1B pilot
+checkpoints are not production-quality models.
 
 ## Quick start
 
@@ -123,7 +132,8 @@ The loopback OpenAI-compatible API, local chat UI, security boundary, and real
 server gate are documented in
 [`docs/local-serving-v0.1.md`](docs/local-serving-v0.1.md).
 The exact 1B architecture, staged token contract, trainer changes, input audit,
-and measured-throughput cost rule are documented in
+measured-throughput cost rule, and verified 250M-token learning gate are
+documented in
 [`docs/scaling-pilot-1b-v0.1.md`](docs/scaling-pilot-1b-v0.1.md).
 The deterministic source index, 16M canary, final aligned 1.4B pack, resume
 boundary, and verified hashes are documented in
