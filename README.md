@@ -78,13 +78,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     tokens with finite loss/gradient norm, exact data-position recovery, and a
     23.744GiB measured peak CUDA reservation. The latest checkpoint is archived
     on the Mac with all 14 server-generated hashes verified, and the Lambda
-    instance is terminated.
+    instance is terminated;
+22. a separately authorized A100 run restores that exact checkpoint and reaches
+    cumulative step 100 and 3,276,800 tokens. Loss falls from 11.335843 to
+    7.690175, steps 10--99 sustain a 9,379.6 tokens/second median, and peak CUDA
+    reservation remains 23.744GiB. Checkpoint 100 and its reports occupy about
+    12GB on the Mac, all 21 server-generated hashes pass, and the second Lambda
+    instance is also terminated.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
-design, hash-ranked held-out-excluding artifact, and two-step A100 smoke gate
-are complete. The 100-step calibration and every later 1B or 4B stage remain
-unapproved. The completed 150M plumbing checkpoint is not a production-quality
-model.
+design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and
+100-step calibration are complete. The 250M-token gate and every later 1B or 4B
+stage remain unapproved. The completed 150M plumbing checkpoint is not a
+production-quality model.
 
 ## Quick start
 
@@ -123,7 +129,8 @@ The deterministic source index, 16M canary, final aligned 1.4B pack, resume
 boundary, and verified hashes are documented in
 [`docs/scaling-data-1b-v0.1.md`](docs/scaling-data-1b-v0.1.md).
 The exact 1B transfer bundle, runtime/storage floors, local preflight result,
-remote CUDA gate, and one-step smoke boundary are documented in
+remote CUDA gate, smoke/resume boundary, and measured 100-step calibration are
+documented in
 [`docs/cloud-pilot-1b-v0.1.md`](docs/cloud-pilot-1b-v0.1.md).
 
 ## Repository policy
