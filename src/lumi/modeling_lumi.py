@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -13,6 +13,104 @@ from transformers.modeling_outputs import BaseModelOutput, CausalLMOutput
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .configuration_lumi import LumiConfig
+
+FLASH_VARLEN_IMPLEMENTATIONS = {"flash_attention_2"}
+
+
+class PackedDocumentMetadata(NamedTuple):
+    """Per-batch metadata for document-isolated packed attention."""
+
+    position_ids: torch.LongTensor
+    cu_seq_lens: torch.IntTensor
+    max_length: int
+
+
+def build_packed_document_metadata(
+    input_ids: torch.LongTensor, *, doc_token_id: int
+) -> PackedDocumentMetadata:
+    """Build reset positions and flattened varlen boundaries from DOC markers.
+
+    Every fixed-length row is an independent attention container. A row may
+    start in the middle of a source document, so position zero is always a new
+    local segment even when its first token is not ``doc_token_id``.
+    """
+
+    if input_ids.ndim != 2 or input_ids.shape[1] < 1:
+        raise ValueError("packed input_ids must have shape (batch, sequence) with sequence > 0")
+    if isinstance(doc_token_id, bool) or not isinstance(doc_token_id, int) or doc_token_id < 0:
+        raise ValueError("doc_token_id must be a non-negative integer")
+
+    batch, sequence = input_ids.shape
+    starts = input_ids.eq(doc_token_id)
+    starts = starts.clone()
+    starts[:, 0] = True
+
+    offsets = torch.arange(sequence, device=input_ids.device, dtype=torch.long)
+    row_offsets = offsets.unsqueeze(0).expand(batch, -1)
+    last_start = torch.where(starts, row_offsets, torch.zeros_like(row_offsets)).cummax(
+        dim=1
+    ).values
+    position_ids = row_offsets - last_start
+
+    flat_starts = torch.nonzero(starts.reshape(-1), as_tuple=False).flatten().to(torch.int32)
+    total_tokens = torch.tensor([input_ids.numel()], device=input_ids.device, dtype=torch.int32)
+    cu_seq_lens = torch.cat((flat_starts, total_tokens))
+    max_length = int((cu_seq_lens[1:] - cu_seq_lens[:-1]).max().item())
+    return PackedDocumentMetadata(
+        position_ids=position_ids,
+        cu_seq_lens=cu_seq_lens,
+        max_length=max_length,
+    )
+
+
+def _validate_packed_position_ids(position_ids: torch.LongTensor) -> None:
+    if position_ids.ndim != 2 or position_ids.shape[1] < 1:
+        raise ValueError("packed position_ids must have shape (batch, sequence)")
+    if position_ids.dtype not in {
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.uint8,
+    }:
+        raise TypeError("packed position_ids must use an integer dtype")
+    if not bool(position_ids[:, 0].eq(0).all()):
+        raise ValueError("every packed row must start at position zero")
+    if bool(position_ids.lt(0).any()):
+        raise ValueError("packed position_ids cannot be negative")
+    if position_ids.shape[1] > 1:
+        current = position_ids[:, 1:]
+        previous = position_ids[:, :-1]
+        valid_transition = current.eq(0) | current.eq(previous + 1)
+        if not bool(valid_transition.all()):
+            raise ValueError("packed position_ids must increment by one or reset to zero")
+
+
+def _flash_metadata_from_position_ids(
+    position_ids: torch.LongTensor,
+) -> tuple[torch.IntTensor, int]:
+    _validate_packed_position_ids(position_ids)
+    starts = torch.nonzero(position_ids.reshape(-1).eq(0), as_tuple=False).flatten()
+    cu_seq_lens = torch.cat(
+        (
+            starts.to(torch.int32),
+            torch.tensor([position_ids.numel()], device=position_ids.device, dtype=torch.int32),
+        )
+    )
+    max_length = int((cu_seq_lens[1:] - cu_seq_lens[:-1]).max().item())
+    return cu_seq_lens, max_length
+
+
+def build_document_causal_mask(position_ids: torch.LongTensor) -> torch.BoolTensor:
+    """Return the dense reference mask for reset-position packed documents."""
+
+    _validate_packed_position_ids(position_ids)
+    batch, sequence = position_ids.shape
+    segment_ids = position_ids.eq(0).cumsum(dim=-1)
+    same_document = segment_ids[:, None, :, None].eq(segment_ids[:, None, None, :])
+    token_indices = torch.arange(sequence, device=position_ids.device)
+    causal = token_indices[None, None, None, :].le(token_indices[None, None, :, None])
+    return same_document & causal.expand(batch, 1, -1, -1)
 
 
 class LumiRMSNorm(nn.Module):
@@ -160,6 +258,7 @@ class LumiAttention(nn.Module):
             value,
             attention_mask,
             dropout=0.0,
+            position_ids=position_ids,
             scaling=self.scaling,
             **kwargs,
         )
@@ -251,6 +350,11 @@ class LumiModel(LumiPreTrainedModel):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        document_isolation: bool = False,
+        cu_seq_lens_q: torch.IntTensor | None = None,
+        cu_seq_lens_k: torch.IntTensor | None = None,
+        max_length_q: int | None = None,
+        max_length_k: int | None = None,
         inputs_embeds: torch.Tensor | None = None,
         return_dict: bool | None = None,
         **kwargs: Any,
@@ -266,23 +370,79 @@ class LumiModel(LumiPreTrainedModel):
                 f"sequence length {sequence} exceeds configured maximum "
                 f"{self.config.max_position_embeddings}"
             )
-        if position_ids is None:
-            position_ids = torch.arange(sequence, device=hidden_states.device).unsqueeze(0)
-            position_ids = position_ids.expand(batch, -1)
-
+        if not isinstance(document_isolation, bool):
+            raise TypeError("document_isolation must be boolean")
         if attention_mask is not None and attention_mask.ndim == 2:
             if attention_mask.shape != (batch, sequence):
                 raise ValueError(
                     "attention_mask must have shape "
                     f"{(batch, sequence)}, got {tuple(attention_mask.shape)}"
                 )
-        causal_mask = create_causal_mask(
-            config=self.config,
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
-            past_key_values=None,
-            position_ids=position_ids,
-        )
+
+        flash_varlen = self.config._attn_implementation in FLASH_VARLEN_IMPLEMENTATIONS
+        if document_isolation:
+            if attention_mask is not None:
+                raise ValueError("document-isolated packed attention does not support padding")
+            if position_ids is None:
+                if input_ids is None:
+                    raise ValueError(
+                        "document isolation requires input_ids or explicit packed position_ids"
+                    )
+                metadata = build_packed_document_metadata(
+                    input_ids, doc_token_id=self.config.doc_token_id
+                )
+                position_ids = metadata.position_ids
+                if cu_seq_lens_q is None:
+                    cu_seq_lens_q = metadata.cu_seq_lens
+                if cu_seq_lens_k is None:
+                    cu_seq_lens_k = metadata.cu_seq_lens
+                if max_length_q is None:
+                    max_length_q = metadata.max_length
+                if max_length_k is None:
+                    max_length_k = metadata.max_length
+            elif position_ids.shape != (batch, sequence):
+                raise ValueError(
+                    "position_ids must have shape "
+                    f"{(batch, sequence)}, got {tuple(position_ids.shape)}"
+                )
+
+            if flash_varlen:
+                supplied = (cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k)
+                if any(item is None for item in supplied):
+                    if any(item is not None for item in supplied):
+                        raise ValueError("flash varlen metadata must be supplied together")
+                    cu_seq_lens_q, inferred_max = _flash_metadata_from_position_ids(position_ids)
+                    cu_seq_lens_k = cu_seq_lens_q
+                    max_length_q = max_length_k = inferred_max
+                assert cu_seq_lens_q is not None and cu_seq_lens_k is not None
+                assert max_length_q is not None and max_length_k is not None
+                if cu_seq_lens_q.ndim != 1 or cu_seq_lens_k.ndim != 1:
+                    raise ValueError("flash varlen cumulative lengths must be one-dimensional")
+                if cu_seq_lens_q.dtype != torch.int32 or cu_seq_lens_k.dtype != torch.int32:
+                    raise TypeError("flash varlen cumulative lengths must use int32")
+                if not 0 < max_length_q <= sequence or not 0 < max_length_k <= sequence:
+                    raise ValueError("flash varlen maximum lengths are invalid")
+                causal_mask = None
+                kwargs = {
+                    **kwargs,
+                    "cu_seq_lens_q": cu_seq_lens_q,
+                    "cu_seq_lens_k": cu_seq_lens_k,
+                    "max_length_q": max_length_q,
+                    "max_length_k": max_length_k,
+                }
+            else:
+                causal_mask = build_document_causal_mask(position_ids)
+        else:
+            if position_ids is None:
+                position_ids = torch.arange(sequence, device=hidden_states.device).unsqueeze(0)
+                position_ids = position_ids.expand(batch, -1)
+            causal_mask = create_causal_mask(
+                config=self.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                position_ids=position_ids,
+            )
 
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
@@ -345,6 +505,11 @@ class LumiForCausalLM(LumiPreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
+        document_isolation: bool = False,
+        cu_seq_lens_q: torch.IntTensor | None = None,
+        cu_seq_lens_k: torch.IntTensor | None = None,
+        max_length_q: int | None = None,
+        max_length_k: int | None = None,
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.LongTensor | None = None,
         return_dict: bool | None = None,
@@ -355,6 +520,11 @@ class LumiForCausalLM(LumiPreTrainedModel, GenerationMixin):
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            document_isolation=document_isolation,
+            cu_seq_lens_q=cu_seq_lens_q,
+            cu_seq_lens_k=cu_seq_lens_k,
+            max_length_q=max_length_q,
+            max_length_k=max_length_k,
             inputs_embeds=inputs_embeds,
             return_dict=True,
             **kwargs,

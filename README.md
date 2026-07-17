@@ -93,7 +93,14 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     segment costs USD 14.723236 at USD 1.99/hour. The final 12,612,139,807-byte
     checkpoint and all run evidence are archived on the Mac; all 35 final
     manifest hashes pass independently, and the third Lambda instance is
-    terminated.
+    terminated;
+24. an optional document-isolated packed-attention path now derives reset RoPE
+    positions and flattened int32 cumulative sequence boundaries directly from
+    the existing `<|doc|>` markers. Its dense reference mask blocks verified
+    cross-document leakage, a fake varlen kernel matches reference logits, and
+    isolated checkpoint resume exactly matches uninterrupted training. Default
+    behavior and archived checkpoint identity remain compatible; all 124 local
+    tests and Ruff pass. Real CUDA/FlashAttention execution is not yet verified.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and
@@ -135,6 +142,9 @@ The exact 1B architecture, staged token contract, trainer changes, input audit,
 measured-throughput cost rule, and verified 250M-token learning gate are
 documented in
 [`docs/scaling-pilot-1b-v0.1.md`](docs/scaling-pilot-1b-v0.1.md).
+The optional position-reset/varlen document-isolation policy, local correctness
+evidence, resume boundary, and short CUDA A/B contract are documented in
+[`docs/packed-attention-ab-v0.1.md`](docs/packed-attention-ab-v0.1.md).
 The deterministic source index, 16M canary, final aligned 1.4B pack, resume
 boundary, and verified hashes are documented in
 [`docs/scaling-data-1b-v0.1.md`](docs/scaling-data-1b-v0.1.md).
