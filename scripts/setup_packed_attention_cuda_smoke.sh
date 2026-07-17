@@ -30,7 +30,7 @@ pip_bin="$HOME/lumi-model/.venv/bin/pip"
 "$pip_bin" install \
   --index-url https://download.pytorch.org/whl/cu126 \
   torch==2.7.0
-"$pip_bin" install -e "$HOME/lumi-model[dev]"
+"$pip_bin" install -e "$HOME/lumi-model[data,dev]"
 "$pip_bin" install transformers==5.14.1 packaging psutil ninja
 MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.0 \
   "$pip_bin" install flash-attn==2.8.3 --no-build-isolation
