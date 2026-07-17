@@ -11,6 +11,7 @@ import resource
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -19,12 +20,13 @@ import torch
 from transformers import AutoTokenizer
 
 from .evaluation_data import validate_heldout_manifest
-from .modeling_lumi import LumiForCausalLM
+from .modeling_lumi import LumiForCausalLM, build_packed_document_metadata
 from .packed_data import PackedTokenDataset
 
 EVALUATION_SCHEMA_VERSION = 1
 EVALUATION_STATE_FILENAME = "evaluation-state.json"
 EVALUATION_REPORT_FILENAME = "evaluation-report.json"
+ATTENTION_IMPLEMENTATIONS = {"eager", "sdpa", "flash_attention_2"}
 
 
 def _utc_now() -> str:
@@ -127,6 +129,14 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
     elif device.type == "mps":
         torch.mps.synchronize()
+
+
+def _autocast_context(device: torch.device, attention_implementation: str | None):
+    if device.type != "cuda" or attention_implementation != "flash_attention_2":
+        return nullcontext()
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError("FlashAttention evaluation requires CUDA BF16 support")
+    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 
 
 def _device_memory(device: torch.device) -> dict[str, int | None]:
@@ -314,6 +324,8 @@ def evaluate_checkpoint(
     generation_max_new_tokens: int = 32,
     batch_size: int = 1,
     checkpoint_batches: int = 10,
+    attention_implementation: str | None = None,
+    document_isolation: bool = False,
     device: str = "auto",
     resume: bool = False,
     _interrupt_after_sequences: int | None = None,
@@ -328,6 +340,16 @@ def evaluate_checkpoint(
         raise ValueError("evaluation batch and checkpoint sizes must be positive")
     if generation_max_new_tokens < 1:
         raise ValueError("generation_max_new_tokens must be positive")
+    if (
+        attention_implementation is not None
+        and attention_implementation not in ATTENTION_IMPLEMENTATIONS
+    ):
+        raise ValueError(
+            "attention-implementation must be one of "
+            f"{sorted(ATTENTION_IMPLEMENTATIONS)}"
+        )
+    if not isinstance(document_isolation, bool):
+        raise ValueError("document-isolation must be boolean")
     if not prompts or any(not isinstance(prompt, str) or not prompt for prompt in prompts):
         raise ValueError("evaluation requires non-empty fixed prompts")
 
@@ -338,6 +360,16 @@ def evaluate_checkpoint(
         tokenizer_path, heldout_manifest["tokenizer"]["files"]
     )
     evaluation_device = _resolve_device(device)
+    if attention_implementation == "flash_attention_2" and evaluation_device.type != "cuda":
+        raise ValueError("flash_attention_2 evaluation requires CUDA")
+    if (
+        document_isolation
+        and evaluation_device.type == "cuda"
+        and attention_implementation != "flash_attention_2"
+    ):
+        raise ValueError(
+            "CUDA document isolation requires flash_attention_2 varlen attention"
+        )
     identity = {
         "batch_size": batch_size,
         "checkpoint": checkpoint_artifact,
@@ -351,6 +383,10 @@ def evaluate_checkpoint(
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "tokenizer": tokenizer_artifact,
     }
+    if attention_implementation is not None:
+        identity["attention_implementation"] = attention_implementation
+    if document_isolation:
+        identity["document_isolation"] = "position_reset_varlen_v0.1"
     evaluation_fingerprint = _fingerprint(identity)
     report_path = output / EVALUATION_REPORT_FILENAME
     state_path = output / EVALUATION_STATE_FILENAME
@@ -404,6 +440,8 @@ def evaluate_checkpoint(
         local_files_only=True,
         dtype=torch.float32,
     )
+    if attention_implementation is not None:
+        model.config._attn_implementation = attention_implementation
     model.to(evaluation_device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, local_files_only=True)
@@ -422,10 +460,26 @@ def evaluate_checkpoint(
             count = min(batch_size, stratum["sequence_end"] - cursor)
             _synchronize(evaluation_device)
             started = time.perf_counter()
-            batch = torch.stack(
+            cpu_batch = torch.stack(
                 [dataset[index] for index in range(cursor, cursor + count)]
-            ).to(evaluation_device)
-            outputs = model(input_ids=batch, labels=batch)
+            )
+            model_kwargs: dict[str, Any] = {}
+            if document_isolation:
+                metadata = build_packed_document_metadata(
+                    cpu_batch, doc_token_id=model.config.doc_token_id
+                )
+                cu_seq_lens = metadata.cu_seq_lens.to(evaluation_device)
+                model_kwargs = {
+                    "cu_seq_lens_k": cu_seq_lens,
+                    "cu_seq_lens_q": cu_seq_lens,
+                    "document_isolation": True,
+                    "max_length_k": metadata.max_length,
+                    "max_length_q": metadata.max_length,
+                    "position_ids": metadata.position_ids.to(evaluation_device),
+                }
+            batch = cpu_batch.to(evaluation_device)
+            with _autocast_context(evaluation_device, attention_implementation):
+                outputs = model(input_ids=batch, labels=batch, **model_kwargs)
             loss = outputs.loss
             if loss is None or not torch.isfinite(loss):
                 raise RuntimeError(f"non-finite held-out loss at sequence {cursor}: {loss}")
@@ -452,7 +506,7 @@ def evaluate_checkpoint(
             stratum_state["sequences"] += count
             stratum_state["total_negative_log_likelihood"] += negative_log_likelihood
             state["updated_at"] = _utc_now()
-            del outputs, loss, batch
+            del outputs, loss, batch, cpu_batch
 
             should_checkpoint = (
                 state["batches"] % checkpoint_batches == 0
@@ -491,14 +545,15 @@ def evaluate_checkpoint(
             input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=evaluation_device)
             _synchronize(evaluation_device)
             started = time.perf_counter()
-            generated = model.generate(
-                input_ids=input_ids,
-                max_new_tokens=generation_max_new_tokens,
-                do_sample=False,
-                use_cache=False,
-                pad_token_id=model.config.pad_token_id,
-                eos_token_id=model.config.eos_token_id,
-            )
+            with _autocast_context(evaluation_device, attention_implementation):
+                generated = model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=generation_max_new_tokens,
+                    do_sample=False,
+                    use_cache=False,
+                    pad_token_id=model.config.pad_token_id,
+                    eos_token_id=model.config.eos_token_id,
+                )
             _synchronize(evaluation_device)
             elapsed = max(time.perf_counter() - started, 1e-9)
             new_token_ids = generated[0, len(prompt_ids) :].tolist()
@@ -548,6 +603,14 @@ def evaluate_checkpoint(
             state["device_memory_peak_observed"], cuda_peak
         )
     report = {
+        "attention": {
+            "implementation": attention_implementation or "default",
+            "policy": (
+                "position_reset_varlen_v0.1"
+                if document_isolation
+                else "separator_only_causal"
+            ),
+        },
         "artifacts": {
             "checkpoint": checkpoint_artifact,
             "heldout_manifest": manifest_artifact,

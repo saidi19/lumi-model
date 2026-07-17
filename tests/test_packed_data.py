@@ -605,6 +605,26 @@ def test_checkpoint_evaluation_resumes_and_caches(
     ).total
     cached = evaluate_checkpoint(output=interrupted_output, resume=True, **common)
     assert cached == resumed
+
+    isolated_output = tmp_path / "isolated-evaluation"
+    isolated = evaluate_checkpoint(
+        output=isolated_output,
+        document_isolation=True,
+        **common,
+    )
+    assert isolated["attention"] == {
+        "implementation": "default",
+        "policy": "position_reset_varlen_v0.1",
+    }
+    with pytest.raises(ValueError, match="cached evaluation report does not match"):
+        evaluate_checkpoint(output=isolated_output, resume=True, **common)
+    with pytest.raises(ValueError, match="flash_attention_2 evaluation requires CUDA"):
+        evaluate_checkpoint(
+            output=tmp_path / "flash-on-cpu-evaluation",
+            attention_implementation="flash_attention_2",
+            **common,
+        )
+
     report_path = interrupted_output / "evaluation-report.json"
     tampered = json.loads(report_path.read_text(encoding="utf-8"))
     tampered["loss"]["mean"] += 1.0

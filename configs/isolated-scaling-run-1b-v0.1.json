@@ -1,0 +1,102 @@
+{
+  "approval": {
+    "full_1b_stage": false,
+    "full_4b_training": false,
+    "paid_gpu_launch": false
+  },
+  "artifacts": {
+    "heldout_build_fingerprint": "77455ce7eb2606d8f258ef13f715bbdfeb8be4f5d7910cc26348552f52c96298",
+    "heldout_manifest_sha256": "c5022ce7ba9ed41dd9cdf1777639278c5ed111ef679e09d9fbc12e36fd6260dd",
+    "model_config_sha256": "7fd53cab43b4cde02f8f09bc33e69f4aeb3594a60d7abf0def1bfc5f496829ce",
+    "training_build_fingerprint": "0bce4d9e4a51de1b831b0226e0052ea33130733eae2bb61992c6eacaf203e0c8",
+    "training_manifest_sha256": "9228fa610d4a985d05e15057e8ef12619a14cbedbb5a6a5ab513d3aeca2832c8"
+  },
+  "contracts": {
+    "cloud_pilot": {
+      "path": "cloud-pilot-1b-v0.1.json",
+      "sha256": "9111b6532e64e20189a71f68259afc5749f3edd2822a205dca9a1f09494d05a9"
+    },
+    "evaluation": {
+      "path": "evaluation-pilot-v0.1.json",
+      "sha256": "59f5c87a2a6a99f3c065fc46f0941a9c38356496e57b2598b45786c04230f3c9"
+    },
+    "scaling_pilot": {
+      "path": "scaling-pilot-1b-v0.1.json",
+      "sha256": "90f81e4d46c0677d62396cfa83d11afb91b40cfe0af9e35bd260e1b25967fa11"
+    }
+  },
+  "evaluation": {
+    "cached_resume_check": true,
+    "legacy_final_attention_implementation": "eager",
+    "legacy_final_policy": "separator_only_causal",
+    "milestone_steps": [
+      100,
+      7630,
+      42725
+    ],
+    "primary_attention_implementation": "flash_attention_2",
+    "primary_policy": "position_reset_varlen_v0.1"
+  },
+  "milestones": [
+    {
+      "evaluate": false,
+      "name": "smoke_fresh",
+      "processed_tokens": 32768,
+      "step": 1
+    },
+    {
+      "evaluate": false,
+      "name": "smoke_resume",
+      "processed_tokens": 65536,
+      "step": 2
+    },
+    {
+      "evaluate": true,
+      "name": "calibration",
+      "processed_tokens": 3276800,
+      "step": 100
+    },
+    {
+      "evaluate": true,
+      "name": "learning_gate",
+      "processed_tokens": 250019840,
+      "step": 7630
+    },
+    {
+      "evaluate": true,
+      "name": "unique_corpus",
+      "processed_tokens": 1400012800,
+      "step": 42725
+    }
+  ],
+  "policy": {
+    "attention_implementation": "flash_attention_2",
+    "document_isolation": "position_reset_varlen_v0.1",
+    "initialization": "fresh_step_zero",
+    "legacy_checkpoint_resume_allowed": false
+  },
+  "reference_measurement": {
+    "evidence_manifest_sha256": "3164c93a2ab543796897f244899c7e3ba3098941958978bec71ac4ddc70840b7",
+    "hourly_rate_usd": 1.99,
+    "isolated_tokens_per_second": 9809.508788719386,
+    "non_training_allowance_hours": 2.0
+  },
+  "run_kind": "lumi_1b_isolated_1p4b_v0.1",
+  "schema_version": 1,
+  "training": {
+    "batch_size": 1,
+    "checkpoint_steps": 2500,
+    "gradient_accumulation_steps": 8,
+    "gradient_checkpointing": true,
+    "keep_checkpoints": 2,
+    "learning_rate": 0.0002,
+    "lr_schedule": "cosine",
+    "max_grad_norm": 1.0,
+    "min_learning_rate_ratio": 0.1,
+    "schedule_steps": 42725,
+    "seed": 7,
+    "tokens_per_step": 32768,
+    "warmup_steps": 500,
+    "weight_decay": 0.1
+  }
+}

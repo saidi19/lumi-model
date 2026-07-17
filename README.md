@@ -104,6 +104,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     archived on the Mac, and the Lambda instance is terminated. The result
     selects isolation for the next fresh scaling candidate but does not alter
     the existing separator-only 250M checkpoint or authorize another paid run.
+25. the next fresh 1B run now has a fail-closed, planning-only orchestration
+    contract: the old checkpoint cannot cross the packing boundary, isolated
+    held-out evaluation is fingerprinted separately, step 1/2 fresh-process
+    recovery and cumulative 100/7,630/42,725 boundaries are fixed, model-only
+    evaluation snapshots survive trainer pruning, and the final server seal
+    validates all metrics and hashes. Measured isolated throughput projects
+    39.64 pure-training hours and USD 78.89 at the previously observed A100
+    rate, or about USD 82.87 with a two-hour lifecycle allowance. All 130 tests,
+    Ruff, and shell syntax gates pass. No launch authorization has been created
+    and no GPU is running.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and
@@ -149,6 +159,10 @@ documented in
 The position-reset/varlen document-isolation policy, resume boundary, completed
 A100 CUDA A/B result, and evidence contract are documented in
 [`docs/packed-attention-ab-v0.1.md`](docs/packed-attention-ab-v0.1.md).
+The fresh step-zero 1B/1.4B isolated-run contract, corrected evaluation
+semantics, measured cost projection, authorization boundary, disconnect-safe
+runner, and final evidence seal are documented in
+[`docs/isolated-scaling-run-1b-v0.1.md`](docs/isolated-scaling-run-1b-v0.1.md).
 The deterministic source index, 16M canary, final aligned 1.4B pack, resume
 boundary, and verified hashes are documented in
 [`docs/scaling-data-1b-v0.1.md`](docs/scaling-data-1b-v0.1.md).

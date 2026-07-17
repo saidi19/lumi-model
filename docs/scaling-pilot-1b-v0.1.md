@@ -281,6 +281,12 @@ lock a measured final-training plan, but the 4B run still needs an approximately
 80B-token provenance-tracked corpus, distributed-training design, and a new
 cost/capacity gate.
 
+The fresh isolated-policy orchestration is now prepared separately in
+`docs/isolated-scaling-run-1b-v0.1.md`. It starts at step zero, treats 250M as a
+milestone inside the 1.4B run, evaluates with the same document-isolation
+semantics, and requires an out-of-repository owner authorization bound to the
+exact merged source commit before any paid command can run.
+
 ## Reproduction
 
 Validate the architecture and unpriced plan:
