@@ -310,6 +310,7 @@ class LumiPreTrainedModel(PreTrainedModel):
     config_class = LumiConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _supports_flash_attn = True
     _supports_sdpa = True
     _supports_attention_backend = True
     _supports_cache_class = False

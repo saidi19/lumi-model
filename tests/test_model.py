@@ -190,6 +190,10 @@ def test_document_isolation_rejects_invalid_position_resets(tiny_config: LumiCon
         )
 
 
+def test_lumi_declares_flash_attention_support() -> None:
+    assert LumiForCausalLM._supports_flash_attn is True
+
+
 def test_left_padding_does_not_change_content_logits(tiny_config: LumiConfig) -> None:
     torch.manual_seed(22)
     model = LumiForCausalLM(tiny_config).eval()
