@@ -91,6 +91,36 @@ def _sha256(value: Any, *, name: str) -> str:
     return value
 
 
+def _validate_resume_authorization(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("launch authorization resume must be an object")
+    if value.get("checkpoint_step") != 100:
+        raise ValueError("resume checkpoint_step must be the isolated calibration step")
+    if value.get("metrics_prefix_available") is not False:
+        raise ValueError("resume metrics_prefix_available must record the missing prefix")
+    _sha256(
+        value.get("checkpoint_export_manifest_sha256"),
+        name="resume.checkpoint_export_manifest_sha256",
+    )
+    _sha256(value.get("evaluation_report_sha256"), name="resume.evaluation_report_sha256")
+    _sha256(value.get("snapshot_manifest_sha256"), name="resume.snapshot_manifest_sha256")
+    _sha256(value.get("run_fingerprint"), name="resume.run_fingerprint")
+    checkpoint_files = value.get("checkpoint_files")
+    required_files = {
+        "config.json",
+        "model.safetensors",
+        "trainer.pt",
+        "training-state.json",
+    }
+    if not isinstance(checkpoint_files, dict) or set(checkpoint_files) != required_files:
+        raise ValueError("resume checkpoint_files must bind the exact resumable checkpoint")
+    for name, digest in checkpoint_files.items():
+        _sha256(digest, name=f"resume.checkpoint_files.{name}")
+    return value
+
+
 def _contract_path(plan_path: Path, specification: Any, *, name: str) -> Path:
     if not isinstance(specification, dict):
         raise ValueError(f"contracts.{name} must be an object")
@@ -382,6 +412,7 @@ def validate_launch_authorization(
         "I approve this paid Lumi-1B run through the recorded step."
     ):
         raise ValueError("launch authorization acknowledgement changed")
+    _validate_resume_authorization(authorization.get("resume"))
     return authorization
 
 
@@ -434,6 +465,186 @@ def snapshot_model_checkpoint(
     return snapshot
 
 
+def _link_or_copy(source: str, destination: str) -> str:
+    try:
+        os.link(source, destination)
+    except OSError:
+        shutil.copy2(source, destination)
+    return destination
+
+
+def _verify_checksum_manifest(root: Path, manifest_path: Path) -> int:
+    count = 0
+    for line_number, line in enumerate(
+        manifest_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        try:
+            digest, relative_value = line.split("  ", 1)
+        except ValueError as error:
+            raise ValueError(f"invalid checksum manifest line {line_number}") from error
+        _sha256(digest, name=f"checksum manifest line {line_number}")
+        relative = Path(relative_value)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError(f"checksum path escapes export at line {line_number}")
+        path = root / relative
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(path)
+        if sha256_file(path) != digest:
+            raise ValueError(f"checksum changed: {relative_value}")
+        count += 1
+    if count < 1:
+        raise ValueError("checkpoint export checksum manifest is empty")
+    return count
+
+
+def import_isolated_scaling_resume(
+    *,
+    plan_path: str | Path,
+    authorization_path: str | Path,
+    source_commit: str,
+    source_export: str | Path,
+    workspace: str | Path,
+) -> dict[str, Any]:
+    """Import a hash-bound isolated step-100 checkpoint without inventing metrics."""
+
+    plan_path = Path(plan_path)
+    source_export = Path(source_export)
+    workspace = Path(workspace)
+    plan = load_isolated_scaling_run_plan(plan_path)
+    authorization = validate_launch_authorization(
+        plan_path=plan_path,
+        authorization_path=authorization_path,
+        source_commit=source_commit,
+    )
+    resume = _validate_resume_authorization(authorization.get("resume"))
+    if resume is None:
+        raise ValueError("launch authorization has no resume checkpoint")
+    if (workspace / "resume-import.complete").exists():
+        return _validate_resume_import(workspace, resume)
+
+    for relative in (
+        "training",
+        "milestones/checkpoint-00000100",
+        "evaluations/step-00000100-isolated",
+    ):
+        if (workspace / relative).exists():
+            raise FileExistsError(workspace / relative)
+
+    checksum_manifest = source_export / "SHA256SUMS"
+    if sha256_file(checksum_manifest) != resume["checkpoint_export_manifest_sha256"]:
+        raise ValueError("checkpoint export manifest does not match authorization")
+    checksum_entries = _verify_checksum_manifest(source_export, checksum_manifest)
+
+    step = resume["checkpoint_step"]
+    checkpoint_name = f"checkpoint-{step:08d}"
+    source_checkpoint = source_export / checkpoint_name
+    for name, digest in resume["checkpoint_files"].items():
+        if sha256_file(source_checkpoint / name) != digest:
+            raise ValueError(f"authorized resume checkpoint changed: {name}")
+    checkpoint_state = _read_json(source_checkpoint / "training-state.json")
+    expected_identity = expected_training_identity(plan)
+    specification = checkpoint_state.get("run_specification")
+    if not isinstance(specification, dict):
+        raise ValueError("resume checkpoint has no run specification")
+    for key, expected in expected_identity.items():
+        if specification.get(key) != expected:
+            raise ValueError(f"resume checkpoint identity changed at {key}")
+    if checkpoint_state.get("run_fingerprint") != resume["run_fingerprint"]:
+        raise ValueError("resume checkpoint run fingerprint changed")
+    expected_values = {
+        "latest_checkpoint": checkpoint_name,
+        "sequence_cursor": step
+        * plan["training"]["batch_size"]
+        * plan["training"]["gradient_accumulation_steps"],
+        "step": step,
+        "tokens_seen": step * plan["training"]["tokens_per_step"],
+    }
+    for key, expected in expected_values.items():
+        if checkpoint_state.get(key) != expected:
+            raise ValueError(f"resume checkpoint state mismatch for {key}")
+
+    evaluation_source = (
+        source_export
+        / "evidence"
+        / "evaluations"
+        / "step-00000100-isolated"
+    )
+    if sha256_file(evaluation_source / "evaluation-report.json") != resume[
+        "evaluation_report_sha256"
+    ]:
+        raise ValueError("resume evaluation report changed")
+    snapshot_manifest_source = source_export / "milestone" / "snapshot-manifest.json"
+    if sha256_file(snapshot_manifest_source) != resume["snapshot_manifest_sha256"]:
+        raise ValueError("resume snapshot manifest changed")
+    snapshot_manifest = _read_json(snapshot_manifest_source)
+    if snapshot_manifest.get("source_checkpoint") != checkpoint_name:
+        raise ValueError("resume snapshot targets a different checkpoint")
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    temporary = workspace / f".resume-import.{uuid.uuid4().hex}.tmp"
+    temporary.mkdir()
+    try:
+        training = temporary / "training"
+        training.mkdir()
+        shutil.copytree(
+            source_checkpoint,
+            training / checkpoint_name,
+            copy_function=_link_or_copy,
+        )
+        root_state = {**checkpoint_state, "status": "complete"}
+        _write_json_atomic(training / "training-state.json", root_state)
+        (training / "metrics.jsonl").touch()
+
+        snapshot = temporary / "milestones" / checkpoint_name
+        snapshot.mkdir(parents=True)
+        for item in snapshot_manifest.get("files", []):
+            name = item.get("name")
+            if not isinstance(name, str) or Path(name).name != name:
+                raise ValueError("resume snapshot manifest has an invalid filename")
+            _link_or_copy(str(source_checkpoint / name), str(snapshot / name))
+        shutil.copy2(snapshot_manifest_source, snapshot / "snapshot-manifest.json")
+
+        shutil.copytree(
+            evaluation_source,
+            temporary / "evaluations" / "step-00000100-isolated",
+        )
+        evidence = source_export / "evidence"
+        for name in (
+            "milestone-smoke_fresh.complete",
+            "milestone-smoke_fresh.log",
+            "milestone-smoke_resume.complete",
+            "milestone-smoke_resume.log",
+            "milestone-calibration.complete",
+            "milestone-calibration.log",
+            "evaluation-step-00000100-isolated.complete",
+        ):
+            shutil.copy2(evidence / name, temporary / name)
+        prefix_evidence = temporary / "resume-prefix-evidence"
+        prefix_evidence.mkdir()
+        shutil.copy2(checksum_manifest, prefix_evidence / "SHA256SUMS")
+
+        report = {
+            "authorization": resume,
+            "checkpoint_state_derived": True,
+            "checksum_entries": checksum_entries,
+            "metrics_first_step": step + 1,
+            "schema_version": 1,
+            "status": "pass",
+        }
+        _write_json_atomic(temporary / "resume-import.json", report)
+        (temporary / "resume-import.complete").touch()
+        for path in temporary.iterdir():
+            destination = workspace / path.name
+            if destination.exists():
+                raise FileExistsError(destination)
+            path.replace(destination)
+        temporary.rmdir()
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return report
+
+
 def validate_training_state(
     *, plan: dict[str, Any], training_output: str | Path, expected_step: int
 ) -> dict[str, Any]:
@@ -470,8 +681,10 @@ def validate_training_state(
 
 
 def _read_metrics(
-    path: Path, *, training: dict[str, Any]
+    path: Path, *, training: dict[str, Any], first_step: int = 1
 ) -> list[dict[str, Any]]:
+    if first_step < 1:
+        raise ValueError("metrics first step must be positive")
     tokens_per_step = training["tokens_per_step"]
     metrics: list[dict[str, Any]] = []
     with path.open(encoding="utf-8") as handle:
@@ -479,7 +692,7 @@ def _read_metrics(
             if not line.strip():
                 continue
             item = json.loads(line)
-            expected_step = len(metrics) + 1
+            expected_step = first_step + len(metrics)
             if item.get("step") != expected_step:
                 raise ValueError(
                     f"metrics step changed at line {line_number}: "
@@ -584,6 +797,19 @@ def _validate_snapshot(path: Path, *, checkpoint_name: str) -> dict[str, Any]:
     return manifest
 
 
+def _validate_resume_import(workspace: Path, resume: dict[str, Any]) -> dict[str, Any]:
+    report = _read_json(workspace / "resume-import.json")
+    if report.get("schema_version") != 1 or report.get("status") != "pass":
+        raise ValueError("resume import did not pass")
+    if report.get("authorization") != resume:
+        raise ValueError("resume import does not match the launch authorization")
+    if report.get("metrics_first_step") != resume["checkpoint_step"] + 1:
+        raise ValueError("resume import metrics boundary changed")
+    if report.get("checkpoint_state_derived") is not True:
+        raise ValueError("resume import did not record the derived root state")
+    return report
+
+
 def seal_isolated_scaling_run(
     *,
     plan_path: str | Path,
@@ -601,6 +827,7 @@ def seal_isolated_scaling_run(
         authorization_path=authorization_path,
         source_commit=source_commit,
     )
+    resume = _validate_resume_authorization(authorization.get("resume"))
     if authorization["approved_through_step"] != MILESTONE_STEPS[-1]:
         raise ValueError("final seal requires authorization through the unique-corpus step")
     if (workspace / "seal.complete").exists():
@@ -623,6 +850,13 @@ def seal_isolated_scaling_run(
             workspace / f"evaluation-step-{step:08d}-isolated.complete"
         )
     required.append(workspace / "evaluation-step-00042725-legacy.complete")
+    if resume is not None:
+        required.extend(
+            [
+                workspace / "resume-import.complete",
+                workspace / "resume-import.json",
+            ]
+        )
     for path in required:
         if not path.is_file():
             raise FileNotFoundError(path)
@@ -658,11 +892,18 @@ def seal_isolated_scaling_run(
     state = validate_training_state(
         plan=plan, training_output=training_output, expected_step=final_step
     )
+    metrics_first_step = 1
+    resume_report = None
+    if resume is not None:
+        resume_report = _validate_resume_import(workspace, resume)
+        metrics_first_step = resume_report["metrics_first_step"]
     metrics = _read_metrics(
         training_output / "metrics.jsonl",
         training=plan["training"],
+        first_step=metrics_first_step,
     )
-    if len(metrics) != final_step:
+    expected_metrics = final_step - metrics_first_step + 1
+    if len(metrics) != expected_metrics or metrics[-1]["step"] != final_step:
         raise ValueError("training metrics do not end at the unique-corpus step")
 
     evaluation_summaries = []
@@ -702,6 +943,13 @@ def seal_isolated_scaling_run(
         raise ValueError("training metrics have no steady-state window")
     summed_training_seconds = sum(float(item["elapsed_seconds"]) for item in metrics)
     hourly_rate = float(authorization["hourly_rate_usd"])
+    best_loss = state.get("best_loss")
+    if (
+        isinstance(best_loss, bool)
+        or not isinstance(best_loss, (int, float))
+        or not math.isfinite(float(best_loss))
+    ):
+        raise ValueError("training state best loss is invalid")
     summary = {
         "authorization": {
             "approved_through_step": authorization["approved_through_step"],
@@ -726,15 +974,19 @@ def seal_isolated_scaling_run(
         "source_commit": source_commit,
         "status": "pass",
         "training": {
-            "best_loss": min(float(item["loss"]) for item in metrics),
+            "best_loss": float(best_loss),
+            "compute_cost_scope": f"steps_{metrics_first_step}_to_{final_step}",
             "estimated_step_compute_cost_usd": summed_training_seconds / 3_600 * hourly_rate,
             "final_loss": float(metrics[-1]["loss"]),
+            "metrics_first_step": metrics_first_step,
             "median_tokens_per_second_steps_100_to_42724": statistics.median(steady),
             "processed_tokens": state["tokens_seen"],
             "step": state["step"],
             "summed_step_compute_seconds": summed_training_seconds,
         },
     }
+    if resume_report is not None:
+        summary["resume"] = resume_report
     summary_path = workspace / "summary.json"
     _write_json_atomic(summary_path, summary)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -10,6 +11,7 @@ from lumi.scaling_run import (
     ISOLATION_POLICY,
     RUN_KIND,
     expected_training_identity,
+    import_isolated_scaling_resume,
     load_isolated_scaling_run_plan,
     plan_isolated_scaling_run,
     sha256_file,
@@ -135,3 +137,147 @@ def test_model_snapshot_excludes_optimizer_and_is_atomic(tmp_path) -> None:
     assert (output / "snapshot-manifest.json").is_file()
     with pytest.raises(FileExistsError):
         snapshot_model_checkpoint(checkpoint, output)
+
+
+def test_hash_bound_step100_resume_import_records_missing_metrics_prefix(tmp_path) -> None:
+    plan = load_isolated_scaling_run_plan(PLAN)
+    export = tmp_path / "export"
+    checkpoint = export / "checkpoint-00000100"
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "config.json").write_text("{}", encoding="utf-8")
+    (checkpoint / "model.safetensors").write_bytes(b"weights")
+    (checkpoint / "trainer.pt").write_bytes(b"optimizer")
+
+    identity = expected_training_identity(plan)
+    run_fingerprint = hashlib.sha256(
+        json.dumps(
+            identity,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    checkpoint_state = {
+        "best_loss": 7.5,
+        "last_loss": 7.5,
+        "latest_checkpoint": "checkpoint-00000100",
+        "run_fingerprint": run_fingerprint,
+        "run_specification": {**identity, "locations": {}},
+        "schema_version": 1,
+        "sequence_cursor": 800,
+        "status": "checkpoint",
+        "step": 100,
+        "tokens_seen": 3_276_800,
+    }
+    (checkpoint / "training-state.json").write_text(
+        json.dumps(checkpoint_state), encoding="utf-8"
+    )
+
+    snapshot_dir = export / "milestone"
+    snapshot_dir.mkdir()
+    snapshot = {
+        "files": [
+            {
+                "bytes": (checkpoint / name).stat().st_size,
+                "name": name,
+                "sha256": sha256_file(checkpoint / name),
+            }
+            for name in ("config.json", "model.safetensors")
+        ],
+        "schema_version": 1,
+        "source_checkpoint": "checkpoint-00000100",
+        "status": "complete",
+    }
+    (snapshot_dir / "snapshot-manifest.json").write_text(
+        json.dumps(snapshot), encoding="utf-8"
+    )
+
+    evidence = export / "evidence"
+    evaluation = evidence / "evaluations" / "step-00000100-isolated"
+    evaluation.mkdir(parents=True)
+    (evaluation / "evaluation-report.json").write_text("{}", encoding="utf-8")
+    (evaluation / "evaluation-state.json").write_text("{}", encoding="utf-8")
+    for name in (
+        "milestone-smoke_fresh.complete",
+        "milestone-smoke_fresh.log",
+        "milestone-smoke_resume.complete",
+        "milestone-smoke_resume.log",
+        "milestone-calibration.complete",
+        "milestone-calibration.log",
+        "evaluation-step-00000100-isolated.complete",
+    ):
+        (evidence / name).write_text("", encoding="utf-8")
+
+    checksum_manifest = export / "SHA256SUMS"
+    files = sorted(path for path in export.rglob("*") if path.is_file())
+    checksum_manifest.write_text(
+        "".join(
+            f"{sha256_file(path)}  ./{path.relative_to(export)}\n" for path in files
+        ),
+        encoding="utf-8",
+    )
+    commit = "a" * 40
+    resume = {
+        "checkpoint_export_manifest_sha256": sha256_file(checksum_manifest),
+        "checkpoint_files": {
+            name: sha256_file(checkpoint / name)
+            for name in (
+                "config.json",
+                "model.safetensors",
+                "trainer.pt",
+                "training-state.json",
+            )
+        },
+        "checkpoint_step": 100,
+        "evaluation_report_sha256": sha256_file(
+            evaluation / "evaluation-report.json"
+        ),
+        "metrics_prefix_available": False,
+        "run_fingerprint": run_fingerprint,
+        "snapshot_manifest_sha256": sha256_file(
+            snapshot_dir / "snapshot-manifest.json"
+        ),
+    }
+    authorization = {
+        "approved_at_utc": "2026-07-18T00:00:00Z",
+        "approved_through_step": 42_725,
+        "full_4b_training": False,
+        "hourly_rate_usd": 4.29,
+        "instance_type": "gpu_1x_h100_sxm5",
+        "owner_acknowledgement": (
+            "I approve this paid Lumi-1B run through the recorded step."
+        ),
+        "plan_sha256": sha256_file(PLAN),
+        "provider": "lambda",
+        "resume": resume,
+        "run_kind": RUN_KIND,
+        "schema_version": 1,
+        "source_archive_sha256": "c" * 64,
+        "source_commit": commit,
+        "status": "owner_approved",
+    }
+    authorization_path = tmp_path / "authorization.json"
+    authorization_path.write_text(json.dumps(authorization), encoding="utf-8")
+    workspace = tmp_path / "workspace"
+
+    report = import_isolated_scaling_resume(
+        plan_path=PLAN,
+        authorization_path=authorization_path,
+        source_commit=commit,
+        source_export=export,
+        workspace=workspace,
+    )
+
+    assert report["metrics_first_step"] == 101
+    assert (workspace / "training" / "metrics.jsonl").read_text() == ""
+    assert json.loads(
+        (workspace / "training" / "training-state.json").read_text()
+    )["status"] == "complete"
+    assert (workspace / "resume-import.complete").is_file()
+    assert import_isolated_scaling_resume(
+        plan_path=PLAN,
+        authorization_path=authorization_path,
+        source_commit=commit,
+        source_export=export,
+        workspace=workspace,
+    ) == report

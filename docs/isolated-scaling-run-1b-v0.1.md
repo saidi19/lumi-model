@@ -125,27 +125,40 @@ owner-approved authorization JSON outside Git. That artifact must bind the
 exact merged source commit, transferred source-archive SHA-256, run-plan
 SHA-256, provider, instance type, current hourly rate, and one declared maximum
 step. It can authorize only steps 1, 2, 100, 7,630, or 42,725 and must keep 4B
-training false. No authorization artifact has been created in this preparation
-stage.
+training false. The repository plan itself never grants launch authority.
 
 After an explicit owner decision, the safe order is:
 
 1. merge this preparation branch and bind the resulting source commit;
 2. create the out-of-repository authorization for the chosen milestone;
 3. create a `git archive` with the `lumi-model/` prefix, bind its SHA-256 in the
-   authorization, then launch one A100-class server and transfer that source
+   authorization, then launch one validated A100/H100 server and transfer that source
    archive, the 1.4B-token artifact, held-out artifact, tokenizer, and
    authorization;
 4. run `scripts/setup_isolated_scaling_run.sh` inside `tmux`;
-5. run `scripts/run_isolated_scaling_1b.sh` inside `tmux`;
-6. independently download and verify the sealed manifest;
-7. terminate the server before considering any later stage.
+5. when the authorization binds an isolated step-100 resume, run
+   `scripts/import_isolated_scaling_resume.py` to verify and import it;
+6. run `scripts/run_isolated_scaling_1b.sh` inside `tmux`;
+7. independently download and verify the sealed manifest;
+8. terminate the server before considering any later stage.
 
 Rerunning the runner after a disconnect resumes only the matching isolated
 fingerprint. It preserves model-only snapshots at the three evaluation
-milestones before trainer checkpoint pruning. The final seal checks all 42,725
-metric rows, the exact data cursor, CUDA runtime gates, varlen parity, every
-evaluation policy, model parameter count, and all server artifact hashes.
+milestones before trainer checkpoint pruning. For a fresh step-zero run, the
+final seal checks all 42,725 metric rows, the exact data cursor, CUDA runtime
+gates, varlen parity, every evaluation policy, model parameter count, and all
+server artifact hashes.
+
+The archived isolated step-100 checkpoint contains the exact model, optimizer,
+RNG, cursor, checkpoint state, model snapshot manifest, held-out evaluation,
+and a 34-file SHA-256 manifest. Its export did not include the first 100 rows of
+`metrics.jsonl`. The resume importer therefore never substitutes rows from a
+different run or fabricates missing values: it binds the export and checkpoint
+hashes in the owner authorization, records that the root state is derived from
+the checkpoint state, and starts new measured metrics at step 101. For this
+explicit resume path, the final seal validates 42,625 contiguous metric rows
+from step 101 through 42,725 plus the hash-bound step-100 checkpoint, snapshot,
+and evaluation evidence.
 
 ## What this run can establish
 
