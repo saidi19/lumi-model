@@ -111,9 +111,9 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     evaluation snapshots survive trainer pruning, and the final server seal
     validates all metrics and hashes. Measured isolated throughput projects
     39.64 pure-training hours and USD 78.89 at the previously observed A100
-    rate, or about USD 82.87 with a two-hour lifecycle allowance. All 130 tests,
-    Ruff, and shell syntax gates pass. No launch authorization has been created
-    and no GPU is running.
+    rate, or about USD 82.87 with a two-hour lifecycle allowance. The full test
+    suite, Ruff, and shell syntax gates pass. The repository itself never
+    authorizes a paid launch; every run requires a separate owner artifact.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and

@@ -70,6 +70,11 @@ fi
   --source-commit "$source_commit" \
   --output "$workspace/authorization-verified.json"
 approved_step="$("$python_bin" -c 'import json,sys; print(json.load(open(sys.argv[1]))["approved_through_step"])' "$workspace/authorization-verified.json")"
+resume_required="$("$python_bin" -c 'import json,sys; print("true" if json.load(open(sys.argv[1])).get("resume") else "false")' "$workspace/authorization-verified.json")"
+if [[ "$resume_required" == "true" ]]; then
+  test -f "$workspace/resume-import.complete"
+  test -f "$workspace/resume-import.json"
+fi
 
 if [[ ! -f "$workspace/preflight.complete" ]]; then
   exec 3>&1
