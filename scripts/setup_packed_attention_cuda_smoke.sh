@@ -32,7 +32,22 @@ pip_bin="$HOME/lumi-model/.venv/bin/pip"
   torch==2.7.0
 "$pip_bin" install -e "$HOME/lumi-model[data,dev]"
 "$pip_bin" install transformers==5.14.1 packaging psutil ninja
-MAX_JOBS=4 TORCH_CUDA_ARCH_LIST=8.0 \
+cuda_arch="$("$python_bin" - <<'PY'
+import torch
+
+major, minor = torch.cuda.get_device_capability()
+print(f"{major}.{minor}")
+PY
+)"
+case "$cuda_arch" in
+  8.0|9.0) ;;
+  *)
+    echo "ERROR: unsupported CUDA compute capability for pinned FlashAttention: $cuda_arch" >&2
+    exit 2
+    ;;
+esac
+echo "torch_cuda_arch_list=$cuda_arch"
+MAX_JOBS=4 TORCH_CUDA_ARCH_LIST="$cuda_arch" \
   "$pip_bin" install flash-attn==2.8.3 --no-build-isolation
 "$pip_bin" check
 

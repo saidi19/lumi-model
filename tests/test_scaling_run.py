@@ -52,6 +52,18 @@ def test_projection_is_measured_but_never_authorizes_launch() -> None:
     )
 
 
+def test_cuda_setup_detects_a100_or_h100_architecture() -> None:
+    for relative_path in (
+        "scripts/setup_isolated_scaling_run.sh",
+        "scripts/setup_packed_attention_cuda_smoke.sh",
+    ):
+        script = (ROOT / relative_path).read_text(encoding="utf-8")
+        assert "torch.cuda.get_device_capability()" in script
+        assert "8.0|9.0" in script
+        assert 'TORCH_CUDA_ARCH_LIST="$cuda_arch"' in script
+        assert "TORCH_CUDA_ARCH_LIST=8.0" not in script
+
+
 def test_tampered_milestone_is_rejected(tmp_path) -> None:
     configs = tmp_path / "configs"
     shutil.copytree(ROOT / "configs", configs)

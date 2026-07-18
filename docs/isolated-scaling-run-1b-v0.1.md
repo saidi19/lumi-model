@@ -98,10 +98,15 @@ python scripts/plan_isolated_scaling_run.py
 
 The output must say `planning_only` and `paid_gpu_launch=false`.
 
-The completed free gate passes all 130 repository tests, Ruff, both shell
+The completed free gate passes the full repository test suite, Ruff, both shell
 syntax checks, canonical contract/hash validation, projection arithmetic,
 authorization-tamper tests, atomic model-only snapshot tests, and isolated
 evaluation resume/fingerprint tests.
+
+The pinned FlashAttention setup detects the active GPU compute capability from
+PyTorch and builds only for that architecture. It currently permits the
+validated A100 (`8.0`) and H100 (`9.0`) paths and fails closed on other GPU
+architectures instead of silently producing an incompatible extension.
 
 ## Paid-run authorization boundary
 
