@@ -1,37 +1,62 @@
-"""Public Lumi model API and Hugging Face auto-class registration."""
+"""Public Lumi API with optional lazy loading of the model-training stack."""
 
-from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+from __future__ import annotations
 
-from .checkpoint_evaluation import evaluate_checkpoint
-from .configuration_lumi import LumiConfig
-from .distributed_training import (
-    DistributedContext,
-    EpochPermutationPlanner,
-    train_distributed_packed,
-    verify_distributed_checkpoint,
-)
-from .evaluation_data import build_heldout_evaluation, validate_heldout_manifest
-from .modeling_lumi import (
-    LumiForCausalLM,
-    LumiModel,
-    PackedDocumentMetadata,
-    build_document_causal_mask,
-    build_packed_document_metadata,
-)
-from .packed_data import PackedTokenDataset, build_packed_dataset, validate_packed_manifest
-from .parameter_count import ParameterBreakdown, parameter_breakdown
-from .pilot_training import train_packed_pilot
-from .scaling_data import (
-    build_scaling_packed_dataset,
-    build_scaling_source_index,
-    create_scaling_data_contract,
-    validate_scaling_packed_manifest,
-    validate_scaling_source_index,
-)
+import importlib
+import importlib.util
+from typing import Any
+
+_PUBLIC_ATTRIBUTES = {
+    "DistributedContext": (".distributed_training", "DistributedContext"),
+    "EpochPermutationPlanner": (".distributed_training", "EpochPermutationPlanner"),
+    "LumiConfig": (".configuration_lumi", "LumiConfig"),
+    "LumiForCausalLM": (".modeling_lumi", "LumiForCausalLM"),
+    "LumiModel": (".modeling_lumi", "LumiModel"),
+    "PackedDocumentMetadata": (".modeling_lumi", "PackedDocumentMetadata"),
+    "PackedTokenDataset": (".packed_data", "PackedTokenDataset"),
+    "ParameterBreakdown": (".parameter_count", "ParameterBreakdown"),
+    "build_document_causal_mask": (".modeling_lumi", "build_document_causal_mask"),
+    "build_heldout_evaluation": (".evaluation_data", "build_heldout_evaluation"),
+    "build_packed_dataset": (".packed_data", "build_packed_dataset"),
+    "build_packed_document_metadata": (".modeling_lumi", "build_packed_document_metadata"),
+    "build_scaling_packed_dataset": (".scaling_data", "build_scaling_packed_dataset"),
+    "build_scaling_source_index": (".scaling_data", "build_scaling_source_index"),
+    "create_scaling_data_contract": (".scaling_data", "create_scaling_data_contract"),
+    "evaluate_checkpoint": (".checkpoint_evaluation", "evaluate_checkpoint"),
+    "parameter_breakdown": (".parameter_count", "parameter_breakdown"),
+    "train_distributed_packed": (".distributed_training", "train_distributed_packed"),
+    "train_packed_pilot": (".pilot_training", "train_packed_pilot"),
+    "validate_heldout_manifest": (".evaluation_data", "validate_heldout_manifest"),
+    "validate_packed_manifest": (".packed_data", "validate_packed_manifest"),
+    "validate_scaling_packed_manifest": (
+        ".scaling_data",
+        "validate_scaling_packed_manifest",
+    ),
+    "validate_scaling_source_index": (".scaling_data", "validate_scaling_source_index"),
+    "verify_distributed_checkpoint": (
+        ".distributed_training",
+        "verify_distributed_checkpoint",
+    ),
+}
+
+
+def __getattr__(name: str) -> Any:
+    target = _PUBLIC_ATTRIBUTES.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(target[0], __name__)
+    value = getattr(module, target[1])
+    globals()[name] = value
+    return value
 
 
 def register_lumi() -> None:
     """Register local and exported-checkpoint auto classes; safe to call repeatedly."""
+
+    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
+
+    from .configuration_lumi import LumiConfig
+    from .modeling_lumi import LumiForCausalLM, LumiModel
 
     AutoConfig.register(LumiConfig.model_type, LumiConfig, exist_ok=True)
     AutoModel.register(LumiConfig, LumiModel, exist_ok=True)
@@ -41,32 +66,11 @@ def register_lumi() -> None:
     LumiForCausalLM.register_for_auto_class("AutoModelForCausalLM")
 
 
-register_lumi()
+# Preserve the historical auto-registration behavior in full model environments,
+# while allowing CPU-only data workers to import ``lumi.production_corpus`` without
+# installing PyTorch or Transformers.
+if importlib.util.find_spec("transformers") is not None:
+    register_lumi()
 
-__all__ = [
-    "LumiConfig",
-    "LumiForCausalLM",
-    "LumiModel",
-    "PackedTokenDataset",
-    "PackedDocumentMetadata",
-    "ParameterBreakdown",
-    "DistributedContext",
-    "EpochPermutationPlanner",
-    "build_packed_dataset",
-    "build_document_causal_mask",
-    "build_packed_document_metadata",
-    "build_scaling_packed_dataset",
-    "build_scaling_source_index",
-    "build_heldout_evaluation",
-    "evaluate_checkpoint",
-    "parameter_breakdown",
-    "create_scaling_data_contract",
-    "register_lumi",
-    "train_packed_pilot",
-    "train_distributed_packed",
-    "validate_heldout_manifest",
-    "validate_packed_manifest",
-    "validate_scaling_packed_manifest",
-    "validate_scaling_source_index",
-    "verify_distributed_checkpoint",
-]
+
+__all__ = [*_PUBLIC_ATTRIBUTES, "register_lumi"]
