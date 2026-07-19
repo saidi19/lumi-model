@@ -127,12 +127,21 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     artifacts pass an independently downloaded post-seal manifest, the
     35.3GiB archive is retained on the Mac, and the H100 is terminated. The
     authorization still records `full_4b_training=false`.
+27. the final local initialization/optimizer gate runs a 9,865,344-parameter,
+    eight-layer proxy across four factorial variants and three paired seeds on
+    Apple M5 MPS. Residual-scaled output projections with legacy AdamW improve
+    median held-out loss from 9.079972 to 8.981004 (1.08997%) at a 0.37374%
+    median-throughput cost and improve all three seeds. Both beta2=0.95 grouped-
+    decay variants fail the quality conditions. A fresh 4B v0.2 candidate
+    therefore selects residual-scaled initialization and retains legacy AdamW;
+    all 136 sealed evidence hashes pass independently, while historical 150M/1B
+    configs and checkpoints remain unchanged.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
-A/B, and the isolated 1.4B-token H100 run are complete. Every 4B stage remains
-unapproved. The completed 150M and 1B pilot checkpoints are not
-production-quality models.
+A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
+initialization/optimizer gate are complete. Every 4B stage remains unapproved.
+The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
 
@@ -182,6 +191,9 @@ The exact 1B transfer bundle, runtime/storage floors, local preflight result,
 remote CUDA gate, smoke/resume boundary, and measured 100-step calibration are
 documented in
 [`docs/cloud-pilot-1b-v0.1.md`](docs/cloud-pilot-1b-v0.1.md).
+The paired-seed residual-initialization and AdamW-profile experiment, resume
+canary, conservative decision rule, and sealed M5 evidence are documented in
+[`docs/init-optimizer-ab-v0.1.md`](docs/init-optimizer-ab-v0.1.md).
 
 ## Repository policy
 
