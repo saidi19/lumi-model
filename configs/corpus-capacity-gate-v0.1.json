@@ -1,0 +1,77 @@
+{
+  "authorization": {
+    "bounded_metadata_and_canary_work": true,
+    "bulk_corpus_materialization": false,
+    "full_4b_training": false,
+    "paid_compute": false
+  },
+  "gate": "corpus_source_capacity_v0.1",
+  "inputs": {
+    "mixture": "configs/data-mix-v0.1.json",
+    "published_capacity_snapshot": "configs/common-pile-capacity-snapshot-v0.1.json",
+    "quality_config": "configs/data-quality-v0.1.json",
+    "source_inventory": "configs/component-sources-v0.1.json",
+    "tokenizer_contract": "configs/tokenizer-final-ab-v0.1.json"
+  },
+  "requirements_before_bulk_materialization": [
+    "full_post_filter_token_counts_with_frozen_tokenizer",
+    "cross_component_exact_and_near_dedup_capacity",
+    "all_component_license_value_audit",
+    "owner_review_of_cccc_source_level_license_basis",
+    "pii_secret_and_benchmark_removal_ledger",
+    "object_storage_versioning_and_manifest_plan"
+  ],
+  "schema_version": 1,
+  "targets": {
+    "final_training_tokens": 80000000000,
+    "minimum_category_candidate_multiplier": {
+      "denominator": 2,
+      "numerator": 3
+    },
+    "raw_candidate_tokens": {
+      "maximum": 150000000000,
+      "minimum": 130000000000,
+      "planning": 140000000000
+    }
+  },
+  "tokenizer_calibration": {
+    "categories": {
+      "books": {
+        "sample_text_utf8_bytes": 297134268,
+        "sample_tokens": 69551230
+      },
+      "code": {
+        "sample_text_utf8_bytes": 1188003140,
+        "sample_tokens": 324238624
+      },
+      "government_legal_and_patents": {
+        "sample_text_utf8_bytes": 297225059,
+        "sample_tokens": 64181268
+      },
+      "open_web": {
+        "sample_text_utf8_bytes": 594000301,
+        "sample_tokens": 137176284
+      },
+      "questions_and_discussion": {
+        "sample_text_utf8_bytes": 891003784,
+        "sample_tokens": 224924660
+      },
+      "reference": {
+        "sample_text_utf8_bytes": 891033923,
+        "sample_tokens": 217166030
+      },
+      "science_and_education": {
+        "sample_text_utf8_bytes": 1782214394,
+        "sample_tokens": 422415961
+      }
+    },
+    "label": "current_65k",
+    "sample_documents": 1128089,
+    "sample_output_sha256": "80bea9f9634a8daca542b2ffd0aad1c8c994a7cbeef909a5e529b6272671102a",
+    "sample_text_utf8_bytes": 6000636724,
+    "sample_tokens": 1476228500,
+    "tokenizer_json_sha256": "1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee",
+    "vocab_size": 65536
+  },
+  "version": "0.1"
+}

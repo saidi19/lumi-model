@@ -1,6 +1,7 @@
 # Lumi data plan v0.1
 
-Status: **candidate; the audited contextual-PII-v4 1GB development sample passed, but no GPU training is approved**
+Status: **candidate; pinned source metadata passes the 80B capacity planning
+estimate, but bulk corpus materialization and GPU training are not approved**
 
 ## Default source direction
 
@@ -54,6 +55,14 @@ The mix is frozen only after token counts are recomputed with the final Lumi
 tokenizer and quality/duplication statistics are available. The machine-readable
 candidate is [`configs/data-mix-v0.1.json`](../configs/data-mix-v0.1.json).
 
+The planning-only source-capacity gate now inventories all 23 exact revisions:
+their official cards report 1.735TB of UTF-8 text and their repository trees
+total 499.82GB compressed. Category-specific frozen-tokenizer fertility gives
+a 405.37B-token planning estimate. Every category clears a 1.5-times candidate
+floor, but open web has only 11.62% estimated headroom. These are upstream
+metadata estimates, not post-filter unique-token measurements; see
+[`corpus-capacity-gate-v0.1.md`](corpus-capacity-gate-v0.1.md).
+
 ## Staged acquisition
 
 ### 1. Tokenizer sample — no GPU
@@ -105,6 +114,9 @@ candidate is [`configs/data-mix-v0.1.json`](../configs/data-mix-v0.1.json).
 
 ### 4. Final corpus — 80B first target
 
+- First acquire bounded canaries from open web, questions/discussion, and
+  reference; bulk acquisition remains blocked until their post-filter capacity
+  and the object-storage plan pass.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.
