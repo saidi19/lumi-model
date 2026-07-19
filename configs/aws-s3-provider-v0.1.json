@@ -1,0 +1,55 @@
+{
+  "authorization": {
+    "bounded_canary_max_payload_bytes": 33554432,
+    "bulk_corpus_materialization": false,
+    "create_bounded_canary_resources": true,
+    "full_4b_training": false,
+    "local_planning": true,
+    "paid_compute": false,
+    "transfer_bulk_source_data": false
+  },
+  "canary": {
+    "cleanup_required": true,
+    "conditional_put_bytes": 1048576,
+    "maximum_canary_cost_usd": "0.10",
+    "multipart_part_bytes": 8388608,
+    "multipart_payload_bytes": 16777339,
+    "range_end_byte": 1049599,
+    "range_start_byte": 1024,
+    "retain_bucket_after_success": false
+  },
+  "cost_policy": {
+    "conservative_internet_egress_bytes_per_month": 20000000000,
+    "estimated_get_and_other_requests_per_month": 100000,
+    "estimated_put_copy_post_list_requests_per_month": 20000,
+    "owner_approved_s3_monthly_cost_cap_usd": "100.00",
+    "pricing_uses_global_free_tier": false
+  },
+  "gate": "aws_s3_provider_and_bounded_io_canary_v0.1",
+  "inputs": {
+    "base_storage_contract": "configs/corpus-object-storage-v0.1.json",
+    "pricing_snapshot": "configs/aws-s3-us-east-1-pricing-v0.1.json"
+  },
+  "provider": {
+    "bucket_key_enabled": false,
+    "data_bucket_prefix": "lumi-corpus-canary",
+    "default_encryption": "AES256",
+    "deny_insecure_transport": true,
+    "expected_bucket_owner_required": true,
+    "log_bucket_prefix": "lumi-corpus-audit",
+    "object_ownership": "BucketOwnerEnforced",
+    "public_access_block": {
+      "block_public_acls": true,
+      "block_public_policy": true,
+      "ignore_public_acls": true,
+      "restrict_public_buckets": true
+    },
+    "region": "us-east-1",
+    "server_access_logging": true,
+    "service": "aws_s3",
+    "storage_class": "STANDARD",
+    "versioning": "Enabled"
+  },
+  "schema_version": 1,
+  "version": "0.1"
+}
