@@ -1,8 +1,8 @@
 # Lumi bounded corpus-retention canary v0.1
 
 Status: **the three tightest corpus categories pass their measured capacity
-floors; object-storage and adaptive-acquisition design is next; bulk corpus
-materialization, paid compute, and 4B training remain unapproved**
+floors and the follow-up local object-storage design passes; provider pricing,
+bulk corpus materialization, paid compute, and 4B training remain unapproved**
 
 ## Purpose and boundary
 
@@ -117,8 +117,11 @@ cross-source deduplication, and the CCCC source-level licensing exception still
 needs an explicit owner decision. The canary therefore does not prove complete
 license-value compliance, final 80B packed-corpus readiness, or model quality.
 
-The next roadmap gate is a provider-neutral private object-storage and
-adaptive-acquisition design: immutable source manifests, resumable streaming
-workers, staged clean shards, a removal ledger, lifecycle/cost caps, and
-fail-closed stop conditions. Only a later owner-approved acquisition pilot may
-create cloud storage or download bulk source data.
+The provider-neutral private object-storage and adaptive-acquisition design is
+now complete; see
+[`corpus-object-storage-v0.1.md`](corpus-object-storage-v0.1.md). It specifies
+immutable source manifests, resumable streaming workers, staged clean shards,
+a removal ledger, lifecycle/storage caps, and fail-closed stop conditions. The
+next gate is provider selection and pinned pricing. Only a later, separately
+owner-approved bounded I/O canary may create cloud storage; bulk source data is
+still not authorized.

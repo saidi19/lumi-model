@@ -1,8 +1,8 @@
 # Lumi data plan v0.1
 
-Status: **candidate; pinned metadata and bounded measured retention pass their
-capacity gates, but object storage, bulk materialization, and GPU training are
-not approved**
+Status: **candidate; capacity, bounded retention, and local object-storage
+design pass, but provider selection, cloud resources, bulk materialization, and
+GPU training are not approved**
 
 ## Default source direction
 
@@ -75,6 +75,11 @@ The 130B-150B planning envelope is not a required local dataset size. It is a
 candidate-token safety buffer around the final 80B mix. Bulk acquisition must
 be adaptive: stop when verified per-category quotas, deduplication reserve, and
 held-out requirements are met instead of downloading an arbitrary fixed total.
+The sealed storage design makes that rule exact: seven 1.5-times category
+floors total 120B tokens, while 150B is only a fail-closed hard maximum. Its
+future cloud forecast peaks at 1.0375TB under a 2TB hard cap; the local planning
+evidence itself is only 16,750 bytes. See
+[`corpus-object-storage-v0.1.md`](corpus-object-storage-v0.1.md).
 
 ## Staged acquisition
 
@@ -129,9 +134,11 @@ held-out requirements are met instead of downloading an arbitrary fixed total.
 
 - Completed: bounded canaries from open web, questions/discussion, and reference
   pass their post-filter capacity floors without retaining corpus text.
-- Next: design provider-neutral private object storage, immutable manifests,
-  resumable workers, lifecycle/cost caps, and adaptive stop conditions. This
-  design does not itself authorize creating cloud resources.
+- Completed locally: provider-neutral private object storage, immutable
+  manifests, resumable workers, lifecycle/storage caps, a removal ledger, and
+  adaptive stop conditions.
+- Next: compare providers with pinned current pricing and request separate
+  approval for a bounded put/get/resume/delete canary. No bucket exists yet.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

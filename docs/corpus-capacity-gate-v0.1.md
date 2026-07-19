@@ -1,8 +1,8 @@
 # Lumi corpus source and capacity gate v0.1
 
-Status: **official pinned metadata passes the planning estimate and the bounded
-retention canary passes; object-storage design is next; bulk corpus
-materialization, paid compute, and 4B training remain unapproved**
+Status: **official pinned metadata, bounded retention, and local object-storage
+design pass; provider pricing is next; bulk corpus materialization, paid
+compute, and 4B training remain unapproved**
 
 ## Purpose
 
@@ -92,11 +92,13 @@ It permits only bounded metadata and source-canary work. It explicitly records
 `bulk_corpus_materialization=false`, `paid_compute=false`, and
 `full_4b_training=false`.
 
-The bounded streaming and retention measurements are complete. The next gate
-will design versioned private object storage, immutable source and shard
-manifests, resumable workers, a deletion ledger, lifecycle/cost caps, and
-adaptive stop conditions. It will not create a bucket, download bulk data, or
-start training without separate owner approval.
+The bounded streaming and retention measurements are complete. The follow-up
+storage design now specifies versioned private object storage, immutable source
+and shard manifests, resumable workers, a deletion ledger, lifecycle/storage
+caps, and adaptive stop conditions; see
+[`corpus-object-storage-v0.1.md`](corpus-object-storage-v0.1.md). Provider
+selection and pinned pricing are next. No bucket, bulk data, or training may be
+started without separate owner approval.
 
 Run the deterministic planning report locally with:
 

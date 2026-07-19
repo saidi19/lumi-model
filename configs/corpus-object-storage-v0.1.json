@@ -1,0 +1,162 @@
+{
+  "adaptive_acquisition": {
+    "candidate_hard_maximum_tokens": 150000000000,
+    "candidate_multiplier": {
+      "denominator": 2,
+      "numerator": 3
+    },
+    "final_training_tokens": 80000000000,
+    "forbid_repetition_to_fill_quota": true,
+    "holdout_reserved_before_global_deduplication": true,
+    "stop_when_every_category_floor_is_met": true
+  },
+  "authorization": {
+    "bulk_corpus_materialization": false,
+    "create_cloud_resources": false,
+    "full_4b_training": false,
+    "local_design_and_simulation": true,
+    "paid_compute": false,
+    "transfer_bulk_source_data": false
+  },
+  "cost_policy": {
+    "approved_monthly_cost_cap_usd": null,
+    "egress_usd_per_gb": null,
+    "owner_approval_required": true,
+    "provider": null,
+    "provider_overlay_required": true,
+    "request_pricing": null,
+    "storage_usd_per_gb_month": null
+  },
+  "deletion_ledger": {
+    "event_key_template": "lumi-corpus/v0.1/control/removals/events/{event_sha256}.json",
+    "immutable_events": true,
+    "lookup_partition_bits": 12,
+    "rebuild_affected_shards_before_next_training_manifest": true,
+    "required_lookup_keys": [
+      "dataset_id",
+      "dataset_revision",
+      "source_file",
+      "upstream_document_id",
+      "content_sha256"
+    ]
+  },
+  "gate": "corpus_object_storage_and_acquisition_design_v0.1",
+  "inputs": {
+    "capacity_contract": "configs/corpus-capacity-gate-v0.1.json",
+    "mixture": "configs/data-mix-v0.1.json",
+    "retention_snapshot": "configs/corpus-retention-snapshot-v0.1.json",
+    "source_inventory": "configs/component-sources-v0.1.json",
+    "tokenizer_contract": "configs/tokenizer-final-ab-v0.1.json"
+  },
+  "lifecycle": {
+    "abort_incomplete_multipart_upload_days": 1,
+    "clean_candidate_retention": "until_superseded_generation_verified",
+    "control_manifests_retention": "permanent",
+    "final_packed_retention": "permanent",
+    "raw_source_payload_retention": "never_persist",
+    "removal_ledger_retention": "permanent",
+    "superseded_staging_days": 7,
+    "superseded_tokenized_generation_days": 30
+  },
+  "manifest_contracts": {
+    "clean_shard_required_fields": [
+      "schema_version",
+      "shard_id",
+      "category",
+      "object_key",
+      "object_sha256",
+      "source_manifest_sha256",
+      "documents",
+      "accepted_text_utf8_bytes",
+      "tokens",
+      "provenance_index_sha256",
+      "removal_ledger_generation"
+    ],
+    "removal_event_required_fields": [
+      "schema_version",
+      "event_id",
+      "created_at",
+      "reason",
+      "lookup",
+      "affected_shards"
+    ],
+    "source_object_required_fields": [
+      "schema_version",
+      "component",
+      "dataset_id",
+      "dataset_revision",
+      "source_file",
+      "source_bytes",
+      "source_digest",
+      "license_policy",
+      "provenance_paths"
+    ]
+  },
+  "object_store": {
+    "credential_material_in_manifests": false,
+    "key_layout": {
+      "clean_shard": "lumi-corpus/v0.1/staging/clean/{category}/{object_sha256}.jsonl.zst",
+      "control_manifest": "lumi-corpus/v0.1/control/manifests/{manifest_sha256}.json",
+      "final_packed_shard": "lumi-corpus/v0.1/final/packed/{generation}/{object_sha256}.bin",
+      "provenance_index": "lumi-corpus/v0.1/control/provenance/{partition}/{object_sha256}.parquet",
+      "tokenized_candidate_shard": "lumi-corpus/v0.1/staging/tokenized/{category}/{object_sha256}.bin"
+    },
+    "namespace": "lumi-corpus/v0.1",
+    "provider": null,
+    "raw_source_payload_persistence": false,
+    "required_capabilities": {
+      "access_audit_log": true,
+      "abortable_multipart_upload": true,
+      "bucket_versioning": true,
+      "conditional_create": true,
+      "deny_public_access": true,
+      "lifecycle_rules": true,
+      "object_sha256_metadata": true,
+      "range_get": true,
+      "server_side_encryption": true,
+      "tls_transport": true
+    },
+    "write_once_content_addressed_keys": true
+  },
+  "requirements_before_acquisition_pilot": [
+    "provider_overlay_with_pinned_pricing",
+    "owner_approved_monthly_cost_cap",
+    "private_bucket_policy_and_encryption_audit",
+    "full_source_file_name_size_and_revision_manifest",
+    "owner_decision_for_cccc_source_level_license_basis",
+    "bounded_object_store_put_get_resume_delete_canary"
+  ],
+  "schema_version": 1,
+  "shards": {
+    "candidate_token_id_bytes": 2,
+    "clean_candidate_target_tokens": 100000000,
+    "clean_text_codec": "zstd",
+    "final_packed_target_tokens": 500000000,
+    "maximum_category_overshoot_tokens": 100000000,
+    "maximum_inflight_shards_per_worker": 1,
+    "multipart_part_bytes": 134217728,
+    "packed_token_dtype": "uint16",
+    "worker_local_scratch_hard_cap_bytes": 20000000000
+  },
+  "storage_budget": {
+    "candidate_index_bytes_per_token": {
+      "denominator": 2,
+      "numerator": 1
+    },
+    "clean_text_compression_fraction": {
+      "denominator": 2,
+      "numerator": 1
+    },
+    "control_plane_reserve_bytes": 10000000000,
+    "hard_logical_storage_bytes": 2000000000000,
+    "maximum_uncompressed_text_bytes_per_token": {
+      "denominator": 1,
+      "numerator": 6
+    },
+    "transient_copy_fraction": {
+      "denominator": 4,
+      "numerator": 1
+    }
+  },
+  "version": "0.1"
+}
