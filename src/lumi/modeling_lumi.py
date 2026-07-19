@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, NamedTuple
 
 import torch
@@ -47,9 +48,9 @@ def build_packed_document_metadata(
 
     offsets = torch.arange(sequence, device=input_ids.device, dtype=torch.long)
     row_offsets = offsets.unsqueeze(0).expand(batch, -1)
-    last_start = torch.where(starts, row_offsets, torch.zeros_like(row_offsets)).cummax(
-        dim=1
-    ).values
+    last_start = (
+        torch.where(starts, row_offsets, torch.zeros_like(row_offsets)).cummax(dim=1).values
+    )
     position_ids = row_offsets - last_start
 
     flat_starts = torch.nonzero(starts.reshape(-1), as_tuple=False).flatten().to(torch.int32)
@@ -227,6 +228,7 @@ class LumiAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, self.key_value_size, bias=config.attention_bias)
         self.v_proj = nn.Linear(config.hidden_size, self.key_value_size, bias=config.attention_bias)
         self.o_proj = nn.Linear(self.query_size, config.hidden_size, bias=config.attention_bias)
+        self.o_proj._lumi_residual_output_projection = True
         self.rotary = LumiRotaryEmbedding(config)
 
     def _shape(self, states: torch.Tensor, heads: int) -> torch.Tensor:
@@ -272,6 +274,7 @@ class LumiMLP(nn.Module):
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.down_proj._lumi_residual_output_projection = True
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states))
@@ -318,7 +321,12 @@ class LumiPreTrainedModel(PreTrainedModel):
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            standard_deviation = self.config.initializer_range
+            if self.config.initialization_strategy == "residual_scaled_v0.1" and getattr(
+                module, "_lumi_residual_output_projection", False
+            ):
+                standard_deviation /= math.sqrt(2 * self.config.num_hidden_layers)
+            module.weight.data.normal_(mean=0.0, std=standard_deviation)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):

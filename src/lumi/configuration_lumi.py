@@ -10,6 +10,8 @@ LUMI_AUTO_MAP = {
     "AutoModelForCausalLM": "modeling_lumi.LumiForCausalLM",
 }
 
+INITIALIZATION_STRATEGIES = {"standard", "residual_scaled_v0.1"}
+
 
 class LumiConfig(PretrainedConfig):
     """Configuration container for the Lumi architecture.
@@ -34,6 +36,7 @@ class LumiConfig(PretrainedConfig):
         rope_theta: float = 1_000_000.0,
         rms_norm_eps: float = 1e-5,
         initializer_range: float = 0.02,
+        initialization_strategy: str = "standard",
         attention_bias: bool = False,
         use_cache: bool = False,
         pad_token_id: int = 0,
@@ -54,6 +57,7 @@ class LumiConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rms_norm_eps = rms_norm_eps
         self.initializer_range = initializer_range
+        self.initialization_strategy = initialization_strategy
         self.attention_bias = attention_bias
         self.use_cache = use_cache
         self.doc_token_id = doc_token_id
@@ -104,6 +108,12 @@ class LumiConfig(PretrainedConfig):
             raise ValueError("head_dim must be even for rotary embeddings")
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be positive")
+        if self.initializer_range <= 0:
+            raise ValueError("initializer_range must be positive")
+        if self.initialization_strategy not in INITIALIZATION_STRATEGIES:
+            raise ValueError(
+                f"initialization_strategy must be one of {sorted(INITIALIZATION_STRATEGIES)}"
+            )
 
         special_ids = {
             "PAD": self.pad_token_id,
