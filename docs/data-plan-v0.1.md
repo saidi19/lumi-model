@@ -137,8 +137,12 @@ evidence itself is only 16,750 bytes. See
 - Completed locally: provider-neutral private object storage, immutable
   manifests, resumable workers, lifecycle/storage caps, a removal ledger, and
   adaptive stop conditions.
-- Next: compare providers with pinned current pricing and request separate
-  approval for a bounded put/get/resume/delete canary. No bucket exists yet.
+- Completed: AWS S3 `us-east-1` pricing and the bounded
+  put/get/resume/range/delete canary pass, and both temporary buckets are
+  deleted; see
+  [`aws-s3-provider-canary-v0.1.md`](aws-s3-provider-canary-v0.1.md).
+- Next: seal the complete source-file manifest, record the CCCC source-level
+  license decision, and request separate production-acquisition approval.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

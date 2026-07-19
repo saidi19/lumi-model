@@ -193,15 +193,24 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     logical storage under a 2TB hard cap, while the local evidence is only
     16,750 bytes. No provider, price, bucket, bulk transfer, paid compute, or
     training is authorized.
+33. AWS S3 in `us-east-1` is then selected with exact public Price List hashes,
+    a conservative $25.8025 monthly projection, and a $100 S3-only cap. A live
+    17,825,915-byte synthetic canary proves fully private encrypted/versioned
+    buckets, access logging, conditional-create rejection, a three-part
+    fresh-process multipart resume, full SHA-256 and range-GET parity, and
+    complete version-aware deletion. Both temporary buckets and the unusable
+    temporary IAM role are confirmed absent afterward. The estimated canary
+    charge is at most $0.003586. This selects and validates storage only; bulk
+    corpus materialization, paid compute, and training remain unapproved.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
 A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
-The bounded corpus-retention canary and local object-storage/acquisition design
-are complete. Provider selection/pricing, a separately approved bounded object
-I/O canary, a 4B learning pilot, and the full 4B/80B pretraining run remain
-unapproved.
+The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
+provider pricing, and live bounded I/O canary are complete. The complete source
+file manifest, CCCC owner decision, production acquisition authorization, a 4B
+learning pilot, and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -274,6 +283,10 @@ The adaptive 120B-floor acquisition rule, provider-neutral object contract,
 storage forecast, removal ledger, resumable state, and unchanged authorization
 boundary are documented in
 [`docs/corpus-object-storage-v0.1.md`](docs/corpus-object-storage-v0.1.md).
+The pinned AWS S3 rates, conservative cost projection, security contract,
+fresh-process multipart canary, cleanup evidence, and unchanged no-bulk/no-GPU
+boundary are documented in
+[`docs/aws-s3-provider-canary-v0.1.md`](docs/aws-s3-provider-canary-v0.1.md).
 
 ## Repository policy
 

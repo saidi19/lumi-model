@@ -1,8 +1,8 @@
 # Lumi corpus object-storage and adaptive-acquisition design v0.1
 
-Status: **local design and simulation pass; provider selection, pricing, owner
-cost cap, cloud resources, bulk corpus materialization, paid compute, and 4B
-training remain unapproved**
+Status: **local design and simulation pass; follow-up AWS S3 selection, pricing,
+and bounded I/O canary also pass; production cloud resources, bulk corpus
+materialization, paid compute, and 4B training remain unapproved**
 
 ## Purpose and authorization boundary
 
@@ -131,16 +131,22 @@ PYTHONPATH=src python scripts/verify_corpus_storage_plan.py \
   --manifest "$LUMI_DATA/corpus-object-storage-plan-v0.1/manifest.sha256"
 ```
 
-## Next gate
+## Completed provider follow-up
 
-Before even a tiny object I/O canary, all six blockers must close:
+AWS S3 `us-east-1` is now selected. Its exact pricing snapshot, $100 S3-only
+monthly cap, private/encrypted/versioned bucket policy, conditional writes,
+fresh-process multipart resume, range GET, hashes, access logging, and complete
+cleanup all pass; see
+[`aws-s3-provider-canary-v0.1.md`](aws-s3-provider-canary-v0.1.md).
 
-1. select a provider overlay with pinned current pricing;
-2. record an owner-approved monthly cost cap;
-3. audit private-bucket policy and encryption;
-4. seal the complete source-file name/size/revision manifest;
-5. record the owner's decision for the CCCC source-level license basis; and
-6. separately approve a bounded put/get/resume/delete canary.
+## Remaining gate
 
-Provider comparison and pricing are next. Bucket creation and bulk acquisition
-remain separate explicit owner decisions.
+The first three original provider blockers and the bounded I/O canary are now
+closed. Before production acquisition, these decisions remain:
+
+1. seal the complete source-file name/size/revision manifest;
+2. record the owner's decision for the CCCC source-level license basis; and
+3. separately approve the production S3 namespace and adaptive acquisition.
+
+The successful canary buckets were deleted. Production bucket creation and
+bulk acquisition remain separate explicit owner decisions.
