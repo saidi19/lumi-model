@@ -1,16 +1,33 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from lumi.aws_s3_canary import (
+    AwsCli,
     _bucket_names,
     _validate_run_id,
     _verify_download,
     _write_payload,
 )
+
+
+def test_aws_cli_can_use_ec2_instance_role_without_named_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr("lumi.aws_s3_canary.subprocess.run", fake_run)
+    AwsCli(None, "us-east-1").call("sts", "get-caller-identity")
+    assert commands[0][:3] == ["aws", "--region", "us-east-1"]
+    assert "--profile" not in commands[0]
 
 
 def test_bucket_names_are_bounded_and_do_not_expose_account_id() -> None:

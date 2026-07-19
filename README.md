@@ -221,16 +221,28 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     The owner selected `include_with_caveat` for the stated personal/research
     scope with traceability and removal controls. This resolves only the CCCC
     license-basis blocker; no data transfer or training is authorized.
+36. the first owner-authorized production acquisition is stopped safely after
+    preserving 237,769,640 accepted tokens and 38,349 documents. Its two sealed
+    shards, partial current shard, eight-file manual-stop archive, SQLite state,
+    38,349 immutable dedup anchors, hashes, and source-line resume boundary pass
+    independent verification; the EC2 instance and both volumes are deleted.
+    A replacement AWS Glue/Spark backend now matches the original sequential
+    source-order exact/near-dedup result in real local Spark tests, repeats
+    deterministically, and fails closed on unsafe conflict sizes or checkpoint
+    locations. The release package is non-authorizing. The next possible paid
+    action is a separately approved 8-DPU, 30-minute parity canary capped at
+    $1.76; distributed production, GPU compute, and model training remain off.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
 A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
 The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
-provider pricing, and live bounded I/O canary are complete. The complete source
-file manifest and the fail-closed CCCC decision are also complete. Production
-acquisition authorization, a 4B learning pilot, and the full 4B/80B pretraining
-run remain unapproved.
+provider pricing, live bounded I/O canary, preserved production prefix, and
+local distributed-acquisition parity gate are complete. The complete source
+file manifest and the fail-closed CCCC decision are also complete. A bounded
+paid Glue parity canary, distributed production resume, a 4B learning pilot,
+and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -314,6 +326,10 @@ documented in
 The pinned CCCC evidence, include/exclude consequences, explicit owner record,
 and fail-closed source-manifest policy are documented in
 [`docs/cccc-owner-decision-v0.1.md`](docs/cccc-owner-decision-v0.1.md).
+The preserved 237.77M-token prefix, immutable resume anchors, ordered parallel
+deduplication proof, real local Spark parity gate, fail-closed limits, and
+separately authorized $1.76 Glue canary boundary are documented in
+[`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 
 ## Repository policy
 

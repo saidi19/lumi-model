@@ -1,8 +1,8 @@
 # Lumi data plan v0.1
 
-Status: **candidate; capacity, bounded retention, and local object-storage
-design pass, but provider selection, cloud resources, bulk materialization, and
-GPU training are not approved**
+Status: **candidate; capacity, bounded retention, S3 storage, and local
+distributed-acquisition gates pass. The first production prefix is preserved,
+but paid Glue migration and GPU training are not approved**
 
 ## Default source direction
 
@@ -147,8 +147,19 @@ evidence itself is only 16,750 bytes. See
 - Completed: the pinned CCCC evidence and fail-closed include/exclude packet;
   the owner selected `include_with_caveat`. See
   [`cccc-owner-decision-v0.1.md`](cccc-owner-decision-v0.1.md).
-- Next: request separate production-acquisition approval; this decision alone
-  does not authorize transfer, cloud compute, or training.
+- Completed and preserved: the owner-authorized single-writer acquisition
+  produced 237,769,640 accepted tokens across 38,349 documents before it was
+  safely stopped for inadequate parallel throughput. Its two sealed shards,
+  partial shard, SQLite state, and 38,349 immutable resume anchors pass
+  independent verification; the EC2 instance and volumes are gone.
+- Completed locally: a Spark/Glue execution path preserves source-order exact
+  and near-deduplication semantics and resumes after the verified prefix. Real
+  local Spark parity, repeatability, fail-closed limits, release packaging, and
+  the complete repository test suite pass. See
+  [`distributed-corpus-glue-v0.1.md`](distributed-corpus-glue-v0.1.md).
+- Next: obtain explicit approval only for the bounded 8-DPU, 30-minute,
+  maximum-$1.76 Glue parity canary. Distributed production remains a separate
+  later approval after measured canary throughput and cost.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.
