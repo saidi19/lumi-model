@@ -33,7 +33,10 @@ tokenizer, data, and deployment portability before any expensive GPU run:
    SHA-256 `80bea9f9634a8daca542b2ffd0aad1c8c994a7cbeef909a5e529b6272671102a`;
    resumed full validation and the cached validation check pass;
 10. the full 1,128,089-document bakeoff selects 65K: it emits 4.39% fewer
-    tokens overall and wins in all eight measured domains;
+    tokens overall than 32K and wins in all eight measured domains; a later
+    Unicode 1–3 digit-segmentation candidate is also rejected because it emits
+    23,750,193 extra tokens (+1.6088%), so the original 65K vocabulary remains
+    frozen;
 11. deterministic fixed-sequence packing, sealed-manifest source stratification,
     and checkpointed training pass interruption/resume tests; an 8,192-token
     real-corpus Apple-MPS smoke run saved at step 1 and resumed in a fresh

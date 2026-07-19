@@ -1,6 +1,6 @@
 # Lumi tokenizer decision record v0.1
 
-Status: **frozen for Lumi tokenizer v0.1 at 65,536 tokens; full model training remains unapproved**
+Status: **frozen for Lumi tokenizer v0.1 at 65,536 tokens; reconfirmed after the final digit-segmentation gate; full model training remains unapproved**
 
 ## Frozen design
 
@@ -57,6 +57,49 @@ The frozen 65K directory also pins:
 - `tokenizer_config.json`: `d31c91cf95389f72e3b5edcb71b67129e259e4f36149fb435e0a3cc15437d0a5`
 - `lumi_tokenizer_metadata.json`: `16964e683e2ea264d54ca6129cb2c6eec51ec07c3481495d6f16727ff3d71047`
 
+## Final digit-segmentation gate
+
+On 2026-07-19, the final pre-4B tokenizer gate compared the frozen 65K
+tokenizer with a same-size candidate whose pre-tokenizer isolates every Unicode
+number run into chunks of at most three digits. Both candidates used the exact
+same 1,128,089-document sealed sample, NFC normalization, special-token IDs,
+minimum frequency, maximum token length, vocabulary size, and package versions.
+
+| Candidate | `tokenizer.json` SHA-256 | Tokens | Bytes/token | Tokens/word |
+|---|---|---:|---:|---:|
+| **Current 65K (kept)** | `1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee` | **1,476,228,500** | **4.064843** | **1.634320** |
+| Unicode 1–3 digit 65K | `6fd159b05824239876388b171745a20b5c4ca503ea59b415f44b95833d3f0776` | 1,499,978,693 | 4.000481 | 1.660613 |
+
+The digit candidate emits 23,750,193 more tokens, an overall increase of
+1.608843%. This exceeds the pinned 1% gate. Every measured domain emits more
+tokens; government/legal/patent data rises 3.860410%, open web 2.284127%,
+reference 2.320019%, and science/education 2.011264%, each exceeding the pinned
+2% per-domain limit. Fixed code and mathematics probes also regress by two and
+four tokens respectively, above the one-token allowance.
+
+The candidate's intended structural property does pass: Latin, Bengali, and
+Arabic-Indic numeric probes, structured JSON, URLs, dates, versions, and IP
+addresses contain no pre-tokenized numeric span longer than three digits. That
+property is not enough to offset the measured fertility regression. The gate
+therefore records `keep_current_65k`; no learning A/B or candidate promotion is
+required.
+
+The same gate hardens control-token handling independently of the rejected
+candidate. All 1,128,089 sample documents contain zero literal occurrences of
+the eleven reserved tokens. Untrusted prompt encoding now forces strings such
+as `<|system|>` through ordinary BPE pieces and rejects any emitted reserved ID,
+while deliberate control-token serialization remains available to trusted
+post-training code.
+
+The external evidence is sealed at
+`tokenizer-final-ab-v0.1/`. All 11 entries in `manifest.sha256` independently
+verify. Key report hashes are:
+
+- `comparison.json`: `b764f4906f9f1b7ddcacf5aeab69fbd3ae69de6bb3f6b747450e0a1a6d6dad70`
+- `decision.json`: `b79ed17225da526f2694b463b7268831733c7159fb58ef7cd06aad3e58cd3fe1`
+- `reserved-token-audit.json`: `df363c8685e54982297a4c2a5daf41c58eb017037147b383ac3d0f110155ad26`
+- `manifest.sha256`: `ef565c0d6d209c461aa8683d1537b54cd1cecc78a583f7eaa7870f70399f30c5`
+
 ## Decision
 
 Lumi v0.1 freezes the 65K candidate. All eight measured domains improve, and
@@ -67,9 +110,10 @@ parameters to the 3,072-wide 4B model: about 192 MiB in BF16 or 48 MiB as raw
 that pilot exists to validate the final tokenizer and pipeline, not to optimize
 a standalone 150M product.
 
-This freeze covers normalization, training settings, vocabulary, and all
-special-token IDs. Any change requires a new tokenizer version and model
-pretraining from a fresh initialization; it is not an in-place model update.
+This freeze covers normalization, pre-tokenization, training settings,
+vocabulary, and all special-token IDs. Any change requires a new tokenizer
+version and model pretraining from a fresh initialization; it is not an
+in-place model update.
 
 ## Frozen special-token IDs
 
@@ -108,6 +152,9 @@ does not need embedding-table surgery later.
 6. The 65K tokenizer is frozen before the real 150M-data pilot. The 4B run is
    still blocked on the real-data plumbing, checkpoint, conversion, and
    measured single-GPU throughput gates.
+7. The final Unicode 1–3 digit-segmentation gate passes structural and security
+   checks but fails pinned overall, domain, code, and mathematics fertility
+   limits. The original 65K tokenizer remains frozen.
 
 The frozen machine-readable contract is
 [`configs/tokenizer-v0.1.json`](../configs/tokenizer-v0.1.json). For a future
