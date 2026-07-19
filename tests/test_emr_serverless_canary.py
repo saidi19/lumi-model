@@ -12,6 +12,7 @@ from lumi.emr_serverless_canary import (
     EMR_CANARY_APPROVAL_TEXT,
     _cost_envelope,
     _release_fingerprint,
+    _require_clean_source_commit,
     _validate_contract,
     bind_emr_serverless_image,
     build_emr_serverless_application_request,
@@ -185,6 +186,11 @@ def test_emr_contract_is_local_only_and_cost_is_exact() -> None:
     }
     assert not any(contract["authorization"].values())
     assert contract["canary"]["maximum_total_source_compressed_bytes"] == 1_500_000_000
+
+
+def test_package_source_commit_must_be_checked_out_head() -> None:
+    with pytest.raises(ValueError, match="checked-out Git HEAD"):
+        _require_clean_source_commit(ROOT, "0" * 40)
 
 
 def test_emr_image_context_is_digest_and_dependency_hash_pinned() -> None:

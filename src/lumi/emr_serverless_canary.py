@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import zipfile
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -208,6 +209,29 @@ def _release_fingerprint(material: dict[str, Any]) -> str:
     return hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
 
 
+def _require_clean_source_commit(root: Path, expected_commit: str) -> None:
+    """Fail unless package bytes come from the exact clean checked-out commit."""
+
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if head != expected_commit:
+        raise ValueError("EMR canary source commit is not the checked-out Git HEAD")
+    status = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if status:
+        raise ValueError("EMR canary package requires a clean Git worktree")
+
+
 def build_emr_serverless_canary_package(
     *,
     contract_path: Path,
@@ -220,6 +244,7 @@ def build_emr_serverless_canary_package(
 
     root = repository_root.resolve()
     commit = _valid_commit(source_commit)
+    _require_clean_source_commit(root, commit)
     contract = _read_json(contract_path)
     paths = _validate_contract(contract, root)
     source_plan = build_distributed_corpus_plan(
