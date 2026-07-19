@@ -164,12 +164,22 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     and the instance is terminated. This proves the distributed CUDA and
     checkpoint/resume plumbing, not model quality, and still records
     `full_4b_training=false`.
+30. the planning-only 80B corpus source/capacity gate pins official metadata for
+    all 23 selected filtered Common Pile repositories. Their exact revisions
+    expose 188,143,662 published documents, 1.735TB of UTF-8 text, and 499.82GB
+    of compressed payload. Category-specific fertility from the frozen Lumi
+    tokenizer estimates 405.37B published tokens; every category clears its
+    1.5-times candidate floor, although open web has only 11.62% headroom. This
+    permits bounded source canaries only: post-filter unique capacity, complete
+    license-value audit, object storage, bulk materialization, paid compute, and
+    4B training remain blocked.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
 A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
-The 4B learning pilot and full 4B/80B pretraining run remain unapproved.
+The bounded corpus-source canaries, 4B learning pilot, and full 4B/80B
+pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -231,6 +241,10 @@ The exact two-GPU Lumi-4B smoke fixture, source-commit-bound planning flow,
 two-step resume boundary, server seal, and verified Lambda H100 result are
 documented in
 [`docs/distributed-cuda-smoke-v0.1.md`](docs/distributed-cuda-smoke-v0.1.md).
+The pinned upstream storage inventory, frozen-tokenizer capacity estimate,
+per-category candidate floors, and fail-closed acquisition boundary are
+documented in
+[`docs/corpus-capacity-gate-v0.1.md`](docs/corpus-capacity-gate-v0.1.md).
 
 ## Repository policy
 
