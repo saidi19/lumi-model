@@ -8,6 +8,8 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
+from lumi.tokenizer_gate import maximum_digit_span
+
 
 def test_tiny_tokenizer_training_preserves_special_ids(tmp_path: Path) -> None:
     repository_root = Path(__file__).parents[1]
@@ -77,5 +79,60 @@ def test_tiny_tokenizer_training_preserves_special_ids(tmp_path: Path) -> None:
         "model_max_length": 4096,
         "text_key": "text",
     }
+    assert metadata["pre_tokenizer"] == {
+        "digit_chunk_size": None,
+        "type": "byte_level",
+    }
     assert metadata["versions"]["tokenizers"]
     assert metadata["versions"]["transformers"]
+
+
+def test_digit_chunked_tokenizer_preserves_round_trip_and_three_digit_boundary(
+    tmp_path: Path,
+) -> None:
+    repository_root = Path(__file__).parents[1]
+    contract = json.loads(
+        (repository_root / "configs" / "tokenizer-v0.1.json").read_text(encoding="utf-8")
+    )
+    contract["vocab_size"] = 320
+    contract_path = tmp_path / "contract.json"
+    contract_path.write_text(json.dumps(contract), encoding="utf-8")
+    corpus = tmp_path / "sample.jsonl"
+    with corpus.open("w", encoding="utf-8") as handle:
+        for index in range(600):
+            text = f"record {index:06d} value 1234567890 বাংলা ১২৩৪৫৬ আরবি ١٢٣٤٥٦"
+            handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+    output = tmp_path / "digit-tokenizer"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(repository_root / "scripts" / "train_tokenizer.py"),
+            "--input",
+            str(corpus),
+            "--output",
+            str(output),
+            "--contract",
+            str(contract_path),
+            "--digit-chunk-size",
+            "3",
+            "--min-frequency",
+            "1",
+            "--no-progress",
+        ],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}"
+    tokenizer = AutoTokenizer.from_pretrained(output, local_files_only=True)
+    probe = "v2.10 id=1234567890 বাংলা=১২৩৪৫৬ আরবি=١٢٣٤٥٦"
+    pieces = tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(probe)
+    assert maximum_digit_span(pieces, probe) == 3
+    ids = tokenizer.encode(probe, add_special_tokens=False)
+    assert tokenizer.decode(ids, clean_up_tokenization_spaces=False) == probe
+    metadata = json.loads((output / "lumi_tokenizer_metadata.json").read_text())
+    assert metadata["pre_tokenizer"] == {
+        "digit_chunk_size": 3,
+        "type": "digit_chunked_byte_level",
+    }

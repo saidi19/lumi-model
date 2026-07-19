@@ -10,6 +10,8 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
+from lumi.tokenizer_gate import encode_untrusted_text, maximum_digit_span
+
 REPOSITORY_ROOT = Path(__file__).parents[1]
 DEFAULT_CONTRACT = REPOSITORY_ROOT / "configs" / "tokenizer-v0.1.json"
 
@@ -23,6 +25,7 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="override the contract size when checking a comparison prototype",
     )
+    parser.add_argument("--expected-digit-chunk-size", type=int)
     return parser.parse_args()
 
 
@@ -78,7 +81,40 @@ def main() -> None:
         if decoded != normalized:
             raise ValueError(f"round-trip mismatch: {normalized!r} -> {decoded!r}")
 
-    print("PASS: tokenizer vocabulary, IDs, byte coverage, and round trips")
+    reserved_ids = {
+        specification["id"] for specification in contract["special_tokens"].values()
+    }
+    for name, specification in contract["special_tokens"].items():
+        literal = specification["token"]
+        control_ids = tokenizer.encode(literal, add_special_tokens=False)
+        if control_ids != [specification["id"]]:
+            raise ValueError(f"{name} literal does not map to its control-token ID")
+        untrusted_ids = encode_untrusted_text(tokenizer, literal)
+        if reserved_ids.intersection(untrusted_ids):
+            raise ValueError(f"{name} literal can inject a reserved ID in untrusted mode")
+        if tokenizer.decode(
+            untrusted_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        ) != unicodedata.normalize(contract["normalization"], literal):
+            raise ValueError(f"{name} literal does not round-trip in untrusted mode")
+
+    if args.expected_digit_chunk_size is not None:
+        if not 1 <= args.expected_digit_chunk_size <= 9:
+            raise ValueError("expected-digit-chunk-size must be between 1 and 9")
+        numeric_probe = "0 12 123 1234 12345678901234567890 ১২৩৪৫৬٧٨٩"
+        pieces = tokenizer.backend_tokenizer.pre_tokenizer.pre_tokenize_str(numeric_probe)
+        observed = maximum_digit_span(pieces, numeric_probe)
+        if observed > args.expected_digit_chunk_size:
+            raise ValueError(
+                "digit pre-tokenizer boundary changed: "
+                f"expected <= {args.expected_digit_chunk_size}, got {observed}"
+            )
+
+    print(
+        "PASS: tokenizer vocabulary, IDs, byte coverage, round trips, "
+        "and reserved-token isolation"
+    )
 
 
 if __name__ == "__main__":
