@@ -54,15 +54,15 @@ def _decided_specification(option: str) -> dict:
     return specification
 
 
-def test_pinned_packet_is_pending_fail_closed_and_downloads_nothing() -> None:
+def test_pinned_packet_records_explicit_include_without_authorizing_acquisition() -> None:
     report = build_cccc_owner_decision_report(CONTRACT, repository_root=ROOT)
     assert report["decision"] == {
-        "acquisition_status": "blocked_pending_owner_decision",
-        "license_basis_resolution": "pending_owner_decision",
-        "next_action": "owner_select_include_with_caveat_or_exclude_and_replace",
-        "owner_decision": "pending_owner_decision",
+        "acquisition_status": "blocked_pending_separate_production_authorization",
+        "license_basis_resolution": "owner_accepted_source_level_domain_audit",
+        "next_action": "request_separate_production_acquisition_authorization",
+        "owner_decision": "decided",
         "production_acquisition": "not_authorized",
-        "selected_option": None,
+        "selected_option": "include_with_caveat",
     }
     assert report["impact"] == {
         "compressed_source_bytes": 21_497_337_171,
@@ -86,6 +86,21 @@ def test_pinned_packet_is_pending_fail_closed_and_downloads_nothing() -> None:
             "transfer_source_payload",
         )
     )
+
+
+def test_pending_record_remains_supported_and_fail_closed() -> None:
+    specification, *_ = _inputs()
+    specification["decision_record"] = {
+        "acknowledgements": {},
+        "decided_at": None,
+        "owner": None,
+        "reason": None,
+        "selected_option": None,
+        "state": "pending_owner_decision",
+    }
+    report = _evaluate(specification)
+    assert report["decision"]["acquisition_status"] == "blocked_pending_owner_decision"
+    assert report["decision"]["selected_option"] is None
 
 
 def test_include_and_exclude_require_explicit_complete_owner_record() -> None:

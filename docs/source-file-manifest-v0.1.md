@@ -66,9 +66,10 @@ CCCC is included so the upstream tree is complete, but its records remain
 Completing this manifest is not a license approval.
 
 The follow-up evidence and fail-closed owner-choice mechanism are implemented
-in [`cccc-owner-decision-v0.1.md`](cccc-owner-decision-v0.1.md). Until that
-record contains an explicit owner selection, CCCC cannot pass a future source
-object manifest.
+in [`cccc-owner-decision-v0.1.md`](cccc-owner-decision-v0.1.md). The owner later
+selected `include_with_caveat`; a future source object manifest must consume
+that separately sealed decision and production acquisition still needs its own
+approval.
 
 ## Resumability and evidence
 
