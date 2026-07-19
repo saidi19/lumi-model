@@ -1,0 +1,105 @@
+{
+  "authorization": {
+    "bulk_corpus_materialization": false,
+    "create_cloud_resources": false,
+    "fetch_public_metadata": false,
+    "full_4b_training": false,
+    "local_evidence_review": true,
+    "paid_compute": false,
+    "transfer_source_payload": false
+  },
+  "decision_record": {
+    "acknowledgements": {},
+    "decided_at": null,
+    "owner": null,
+    "reason": null,
+    "selected_option": null,
+    "state": "pending_owner_decision"
+  },
+  "gate": "cccc_owner_decision_v0.1",
+  "inputs": {
+    "mixture": "configs/data-mix-v0.1.json",
+    "provenance_audit": "reports/component-provenance-audit-v0.1.json",
+    "retention_snapshot": "configs/corpus-retention-snapshot-v0.1.json",
+    "source_file_manifest": "configs/common-pile-source-files-v0.1.json",
+    "source_inventory": "configs/component-sources-v0.1.json"
+  },
+  "options": {
+    "exclude_and_replace": {
+      "requirements": [
+        "keep every CCCC object blocked",
+        "pin and audit replacement open-web source revisions",
+        "measure replacement retention before changing the mixture",
+        "meet the full 12B open-web candidate floor without silent repetition or reweighting"
+      ],
+      "resolved_license_policy": "excluded_pending_open_web_replacement"
+    },
+    "include_with_caveat": {
+      "requirements": [
+        "preserve source ID, source label, provenance, URL, and WARC URL where present",
+        "record the source-level domain-audit basis instead of inventing per-document licenses",
+        "keep a permanent removal ledger and rebuild affected shards before training",
+        "retain the pinned dataset revision, exact file hashes, card hash, and caveat in every generation"
+      ],
+      "resolved_license_policy": "owner_accepted_source_level_domain_audit"
+    }
+  },
+  "required_acknowledgements": {
+    "all_options": [
+      "source_level_domain_audit_is_not_per_document_license_metadata",
+      "local_audit_found_no_claimed_per_document_license_field",
+      "upstream_warns_about_license_laundering_and_inaccurate_metadata",
+      "this_engineering_record_is_not_legal_advice",
+      "this_decision_does_not_authorize_data_transfer_cloud_compute_or_training"
+    ],
+    "exclude_and_replace": [
+      "open_web_floor_requires_a_pinned_measured_replacement",
+      "other_categories_will_not_be_silently_reweighted_or_repeated"
+    ],
+    "include_with_caveat": [
+      "accept_source_level_basis_for_lumi_personal_research",
+      "preserve_document_and_warc_traceability",
+      "maintain_removal_ledger_and_rebuild_affected_shards"
+    ]
+  },
+  "reviewed_upstream_evidence": {
+    "filtered_dataset_card": {
+      "bytes": 4060,
+      "claims": {
+        "common_crawl_snapshots": 52,
+        "contains_unresolved_removed_domain_placeholder": true,
+        "licenses_named": [
+          "CC BY",
+          "CC BY-SA",
+          "CC0"
+        ],
+        "manual_domains_reviewed": 1000,
+        "per_document_metadata_license_claimed": true,
+        "retained_domains": 537,
+        "warns_about_license_laundering_and_inaccurate_metadata": true
+      },
+      "git_blob_sha1": "5c632ee7dcdd38e6834a731968bddcc6dbea9b62",
+      "sha256": "13b727dd5bc1045a502705fa70ada1254586fa19b7ddc2fd987dec89763422ad",
+      "url": "https://huggingface.co/datasets/common-pile/cccc_filtered/blob/03a3de5713a0bb23267d26724346508af0f25327/README.md"
+    },
+    "paper": {
+      "arxiv_id": "2506.05209",
+      "claims": {
+        "collection_license_does_not_license_underlying_documents": true,
+        "license_laundering_cannot_be_exhaustively_eliminated": true,
+        "licenses_can_change_after_collection": true,
+        "top_domains_manually_verified": true
+      },
+      "url": "https://arxiv.org/abs/2506.05209"
+    }
+  },
+  "schema_version": 1,
+  "source": {
+    "category": "open_web",
+    "component": "cccc",
+    "dataset_id": "common-pile/cccc_filtered",
+    "dataset_revision": "03a3de5713a0bb23267d26724346508af0f25327"
+  },
+  "verified_at": "2026-07-19",
+  "version": "0.1"
+}

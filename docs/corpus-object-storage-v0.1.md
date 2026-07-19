@@ -96,6 +96,11 @@ The metadata-only SQLite simulation binds state to the complete plan
 fingerprint, publishes shard commits atomically, makes identical retries
 idempotent, detects conflicting retries, and resumes from durable state.
 
+The current planner also consumes the CCCC owner-decision contract. A future
+CCCC source manifest is rejected while that record is pending, and the older
+automatic `approved_source_level_basis` policy is not accepted. See
+[`cccc-owner-decision-v0.1.md`](cccc-owner-decision-v0.1.md).
+
 Removal events are immutable and content-addressed. Their lookup supports
 dataset ID, pinned revision, source file, upstream document ID, and content
 SHA-256 across 4,096 partitions. A pending removal blocks affected shards and
@@ -146,7 +151,7 @@ complete 23-component source-file manifest are now closed. See
 [`source-file-manifest-v0.1.md`](source-file-manifest-v0.1.md). Before production
 acquisition, these decisions remain:
 
-1. record the owner's decision for the CCCC source-level license basis; and
+1. select one option in the implemented CCCC owner-decision packet; and
 2. separately approve the production S3 namespace and adaptive acquisition.
 
 The successful canary buckets were deleted. Production bucket creation and

@@ -212,6 +212,15 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     verification. CCCC remains blocked pending the owner's license decision;
     bulk acquisition, cloud resources, paid compute, and training remain
     unapproved.
+35. the CCCC owner-decision gate pins the exact 4,060-byte upstream card, its
+    Git blob and SHA-256, the source-level domain-audit claims and caveats, the
+    0-of-10,000 local license-field mismatch, 53 source objects, and the
+    measured open-web capacity consequence. It removes the automatic
+    `approved_source_level_basis` shortcut: CCCC now fails closed until the
+    owner explicitly chooses `include_with_caveat` or `exclude_and_replace`.
+    The engineering recommendation for the stated personal/research scope is
+    include with traceability and removal controls, but no option is
+    preselected and no data transfer or training is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -219,9 +228,9 @@ A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
 The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, and live bounded I/O canary are complete. The complete source
-file manifest is also complete. The CCCC owner decision, production acquisition
-authorization, a 4B learning pilot, and the full 4B/80B pretraining run remain
-unapproved.
+file manifest and the fail-closed CCCC decision packet are also complete. The
+owner's CCCC choice, production acquisition authorization, a 4B learning pilot,
+and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -302,6 +311,9 @@ The exact 23-repository file inventory, upstream object hashes, resumable
 metadata state, independent seal, and unchanged no-payload/no-GPU boundary are
 documented in
 [`docs/source-file-manifest-v0.1.md`](docs/source-file-manifest-v0.1.md).
+The pinned CCCC evidence, include/exclude consequences, explicit owner record,
+and fail-closed source-manifest policy are documented in
+[`docs/cccc-owner-decision-v0.1.md`](docs/cccc-owner-decision-v0.1.md).
 
 ## Repository policy
 

@@ -105,9 +105,10 @@ def test_storage_design_passes_without_authorizing_resources_or_data() -> None:
     assert report["decision"] == {
         "adaptive_acquisition_design": "pass",
         "bulk_corpus_materialization": "not_authorized",
+        "cccc_license_basis": "pending_owner_decision",
         "cloud_resource_creation": "not_authorized",
         "full_4b_training": "not_authorized",
-        "next_action": "provider_selection_pricing_and_bounded_io_canary",
+        "next_action": "owner_cccc_license_decision",
         "paid_compute": "not_authorized",
         "provider_readiness": "blocked_unselected_unpriced_unapproved",
     }
@@ -190,20 +191,29 @@ def test_future_source_clean_shard_and_removal_manifests_validate() -> None:
         "component": "cccc",
         "dataset_id": "common-pile/cccc_filtered",
         "dataset_revision": "03a3de5713a0bb23267d26724346508af0f25327",
-        "license_policy": "approved_source_level_basis",
+        "license_policy": "owner_accepted_source_level_domain_audit",
         "provenance_paths": ["id", "source", "metadata.provenance", "metadata.url"],
         "schema_version": 1,
         "source_bytes": 490_876_041,
         "source_digest": {"algorithm": "sha256", "value": "1" * 64},
         "source_file": "dolma-cccc-filtered-0000.json.gz",
     }
-    validate_source_object_manifest(source, report)
+    with pytest.raises(ValueError, match="pending explicit owner decision"):
+        validate_source_object_manifest(source, report)
+    included_report = copy.deepcopy(report)
+    included_cccc = next(
+        row for row in included_report["sources"] if row["component"] == "cccc"
+    )
+    included_cccc["license_basis_resolution"] = (
+        "owner_accepted_source_level_domain_audit"
+    )
+    validate_source_object_manifest(source, included_report)
     unsafe_source = {**source, "text": "must never enter a control manifest"}
     with pytest.raises(ValueError, match="forbidden field text"):
-        validate_source_object_manifest(unsafe_source, report)
+        validate_source_object_manifest(unsafe_source, included_report)
     wrong_license = {**source, "license_policy": "document_license_required"}
     with pytest.raises(ValueError, match="differs from its inventory"):
-        validate_source_object_manifest(wrong_license, report)
+        validate_source_object_manifest(wrong_license, included_report)
 
     shard = _clean_shard(report)
     validate_clean_shard_manifest(shard, report)

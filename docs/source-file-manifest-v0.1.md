@@ -65,6 +65,11 @@ CCCC is included so the upstream tree is complete, but its records remain
 `blocked_pending_owner_cccc_license_decision_and_production_authorization`.
 Completing this manifest is not a license approval.
 
+The follow-up evidence and fail-closed owner-choice mechanism are implemented
+in [`cccc-owner-decision-v0.1.md`](cccc-owner-decision-v0.1.md). Until that
+record contains an explicit owner selection, CCCC cannot pass a future source
+object manifest.
+
 ## Resumability and evidence
 
 The runner commits each completed repository tree atomically to SQLite. With

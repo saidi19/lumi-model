@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
+from .cccc_decision import build_cccc_owner_decision_report
 from .corpus_capacity import build_corpus_capacity_report
 
 SCHEMA_VERSION = 1
@@ -83,6 +84,7 @@ FORBIDDEN_PAYLOAD_KEYS = {
     "text",
 }
 IMPLEMENTATION_FILES = (
+    "src/lumi/cccc_decision.py",
     "src/lumi/corpus_capacity.py",
     "src/lumi/corpus_storage.py",
 )
@@ -256,6 +258,7 @@ def evaluate_corpus_storage_plan(
     capacity_report: dict[str, Any],
     retention_snapshot: dict[str, Any],
     tokenizer_contract: dict[str, Any],
+    cccc_decision_report: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Validate the local-only design and return a deterministic storage plan."""
 
@@ -271,6 +274,31 @@ def evaluate_corpus_storage_plan(
         raise ValueError("the pinned metadata capacity gate has not passed")
     categories = _unique_by(mixture_plan["mixture"], "category", "mixture category")
     inventory = _unique_by(source_inventory["sources"], "component", "source inventory")
+    if "cccc" not in inventory:
+        raise ValueError("CCCC is absent from the source inventory")
+    cccc_resolution = "pending_owner_decision"
+    if cccc_decision_report is not None:
+        cccc_source = cccc_decision_report.get("source")
+        if not isinstance(cccc_source, Mapping):
+            raise ValueError("CCCC owner-decision source is missing")
+        if (
+            cccc_source.get("component") != "cccc"
+            or cccc_source.get("dataset_id") != inventory["cccc"]["dataset_id"]
+            or cccc_source.get("dataset_revision") != inventory["cccc"]["revision"]
+        ):
+            raise ValueError("CCCC owner-decision source differs from the inventory")
+        cccc_decision = cccc_decision_report.get("decision")
+        if not isinstance(cccc_decision, Mapping):
+            raise ValueError("CCCC owner-decision result is missing")
+        if cccc_decision.get("production_acquisition") != "not_authorized":
+            raise ValueError("CCCC decision must not authorize production acquisition")
+        cccc_resolution = str(cccc_decision.get("license_basis_resolution"))
+        if cccc_resolution not in {
+            "pending_owner_decision",
+            "owner_accepted_source_level_domain_audit",
+            "excluded_pending_open_web_replacement",
+        }:
+            raise ValueError("CCCC owner-decision resolution is unsupported")
     component_categories: dict[str, str] = {}
     for category, item in categories.items():
         for component in item["source_components"]:
@@ -510,6 +538,9 @@ def evaluate_corpus_storage_plan(
             "category": component_categories[component],
             "component": component,
             "dataset_id": row["dataset_id"],
+            "license_basis_resolution": (
+                cccc_resolution if component == "cccc" else "not_applicable"
+            ),
             "license_policy_status": row["status"],
             "revision": row["revision"],
         }
@@ -522,9 +553,18 @@ def evaluate_corpus_storage_plan(
         "decision": {
             "adaptive_acquisition_design": "pass",
             "bulk_corpus_materialization": "not_authorized",
+            "cccc_license_basis": cccc_resolution,
             "cloud_resource_creation": "not_authorized",
             "full_4b_training": "not_authorized",
-            "next_action": "provider_selection_pricing_and_bounded_io_canary",
+            "next_action": (
+                "owner_cccc_license_decision"
+                if cccc_resolution == "pending_owner_decision"
+                else (
+                    "pin_audit_and_measure_open_web_replacement"
+                    if cccc_resolution == "excluded_pending_open_web_replacement"
+                    else "provider_selection_pricing_and_bounded_io_canary"
+                )
+            ),
             "paid_compute": "not_authorized",
             "provider_readiness": "blocked_unselected_unpriced_unapproved",
         },
@@ -597,6 +637,9 @@ def build_corpus_storage_report(
         for label, raw_path in specification["inputs"].items()
     }
     capacity_report = build_corpus_capacity_report(paths["capacity_contract"], repository_root=root)
+    cccc_decision_report = build_cccc_owner_decision_report(
+        paths["cccc_decision_contract"], repository_root=root
+    )
     linked_inputs = {
         "mixture": "mixture",
         "source_inventory": "source_inventory",
@@ -612,6 +655,7 @@ def build_corpus_storage_report(
         capacity_report,
         _read_json(paths["retention_snapshot"]),
         _read_json(paths["tokenizer_contract"]),
+        cccc_decision_report,
     )
     report["inputs"] = {
         "contract": {
@@ -636,6 +680,7 @@ def build_corpus_storage_report(
                 "inputs": report["inputs"],
                 "manifest_contracts": report["manifest_contracts"],
                 "object_store": report["object_store"],
+                "sources": report["sources"],
                 "storage_forecast": report["storage_forecast"],
             }
         )
@@ -674,13 +719,18 @@ def validate_source_object_manifest(manifest: Mapping[str, Any], report: Mapping
         raise ValueError("source object digest must use SHA-256")
     _sha256(digest.get("value"), "source object digest")
     if manifest["license_policy"] not in {
-        "approved_source_level_basis",
         "document_license_required",
+        "owner_accepted_source_level_domain_audit",
     }:
         raise ValueError("source manifest has an unsupported license policy")
+    resolution = source.get("license_basis_resolution")
+    if resolution == "pending_owner_decision":
+        raise ValueError("source-level license basis is pending explicit owner decision")
+    if resolution == "excluded_pending_open_web_replacement":
+        raise ValueError("excluded source cannot enter an acquisition manifest")
     expected_license_policy = (
-        "approved_source_level_basis"
-        if "source_level_basis" in source["license_policy_status"]
+        "owner_accepted_source_level_domain_audit"
+        if resolution == "owner_accepted_source_level_domain_audit"
         else "document_license_required"
     )
     if manifest["license_policy"] != expected_license_policy:
