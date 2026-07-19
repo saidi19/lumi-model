@@ -1,7 +1,7 @@
 # Lumi distributed CUDA smoke v0.1
 
-Status: **local planning and regression gates pass; paid two-GPU run not yet
-launched**
+Status: **the owner-authorized two-H100 run passed, its evidence is
+independently verified on the Mac, and the Lambda instance is terminated**
 
 This is the final infrastructure gate before a short 4B multi-GPU pilot. It is
 not a learning run and it cannot authorize the 80B-token pretraining run. The
@@ -69,6 +69,48 @@ The source repository never contains a paid approval.
    checkpoint on the server and seals a small downloadable evidence bundle.
    The instance must then be terminated.
 
+## Verified Lambda 2x H100 result
+
+On 2026-07-19, the bounded smoke ran on Lambda Cloud's `2x H100 (80 GB
+SXM5)` instance from exact source commit
+`208c7ed9dd00313727f08d3b54da1b1dd4999b80`. The server-generated plan
+retained `full_4b_training=false`, fixed world size 2, and authorized only
+steps 1 and 2. Its run fingerprint was
+`ef83bc851bffa69cda3770f6f958c7f11c559f93a0ed50030034efea3f9d869b`.
+
+Remote preflight passed all 159 tests, Ruff, fixture hashes, and the real CUDA
+FlashAttention varlen parity/isolation gate. The latter reached 0.99998188
+cosine similarity to the dense reference, 0.0078125 maximum absolute error,
+finite backward gradients, and exactly zero later-document leakage.
+
+| Field | Verified result |
+|---|---|
+| Runtime | Python 3.12.13, PyTorch 2.7.0+cu126, FlashAttention 2.8.3 |
+| Model | 4,002,376,704 parameters, BF16, FSDP `FULL_SHARD`, NCCL |
+| Attention | position-reset varlen document isolation |
+| Fresh boundary | step 1, 8,192 tokens, loss 11.655620, 7,824.7 tokens/s |
+| Resume boundary | fresh process to step 2, 16,384 cumulative tokens, loss 16.791336, 10,861.3 tokens/s |
+| Checkpoint time | 95.654 seconds at step 1; 96.369 seconds at step 2 |
+| Peak observed HBM | 47,531 MiB on GPU 0; 47,959 MiB on GPU 1 |
+| Final checkpoint | `checkpoint-00000002`, all six entries rehashed |
+| Checkpoint-manifest SHA-256 | `68c2857239eefcb75aac7ffff96b55ca32719c963666c7fb290475e9be1fcbaa` |
+| Canonical final-model SHA-256 | `707a54af49721e21fa35c6de81d33bdc7bc0e14f359ce443e662e0e462d169f9` |
+| Run phase | 555 seconds; USD 1.2919 compute estimate at USD 8.38/hour |
+
+The loss values cover only two different batches and are not a quality or
+convergence result. The throughput values measure optimizer execution, while
+the checkpoint/resume path dominates this deliberately short lifecycle. The
+USD 1.2919 figure covers the sealed 555-second run phase only; provider usage
+or invoice data remains authoritative for the complete setup-to-termination
+lifecycle.
+
+The small sealed archive is stored outside Git at
+`lumi-data/distributed-cuda-smoke-v0.1/lambda-2xh100-run-v0.1`. All 24 entries
+listed by its downloaded manifest pass local SHA-256 verification. The archive
+manifest itself has SHA-256
+`2130512c3408c3d4cc2b1fc1dbe01890f34f58a438ca5fd3bfdc87cd2e5629dc`.
+The Lambda dashboard subsequently reported no running instances.
+
 ## Verified local regression
 
 - 159 tests pass and Ruff passes.
@@ -82,6 +124,6 @@ The source repository never contains a paid approval.
   fingerprint is not a launch authorization because the Mac has no CUDA and
   uses a different PyTorch version.
 
-No paid GPU, 4B optimizer step, or 80B-token corpus work has been started by
-these local checks.
-
+Those local checks did not authorize a launch. The later owner artifact
+authorized only the verified two-step smoke above; no 4B learning pilot, full
+4B/80B run, or 80B-token corpus build was started.
