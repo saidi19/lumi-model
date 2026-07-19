@@ -170,16 +170,27 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     of compressed payload. Category-specific fertility from the frozen Lumi
     tokenizer estimates 405.37B published tokens; every category clears its
     1.5-times candidate floor, although open web has only 11.62% headroom. This
-    permits bounded source canaries only: post-filter unique capacity, complete
-    license-value audit, object storage, bulk materialization, paid compute, and
-    4B training remain blocked.
+    initially permits bounded source canaries only: post-filter unique capacity,
+    complete license-value audit, object storage, bulk materialization, paid
+    compute, and 4B training remain blocked.
+31. the bounded, text-free retention canary then streams 192,528,033 raw UTF-8
+    bytes from the three tightest categories through the frozen tokenizer and
+    production quality gates. It accepts 190,915,171 bytes and 45,981,609
+    tokens without persisting corpus text. Measured projections clear every
+    floor: open web 13.210B versus 12B, questions/discussion 21.863B versus 18B,
+    and reference 25.153B versus 18B. The 194,260,992-byte SQLite evidence,
+    report, source/config/code fingerprints, dedup indexes, and authorization
+    boundaries pass independent verification. This approves object-storage and
+    adaptive-acquisition design only; bulk data, paid compute, and training are
+    still not authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
 A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
-The bounded corpus-source canaries, 4B learning pilot, and full 4B/80B
-pretraining run remain unapproved.
+The bounded corpus-retention canary is complete. Object-storage/acquisition
+design, a 4B learning pilot, and the full 4B/80B pretraining run remain
+unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -245,6 +256,9 @@ The pinned upstream storage inventory, frozen-tokenizer capacity estimate,
 per-category candidate floors, and fail-closed acquisition boundary are
 documented in
 [`docs/corpus-capacity-gate-v0.1.md`](docs/corpus-capacity-gate-v0.1.md).
+The bounded text-free retention run, measured tight-category projections,
+sealed local evidence, and next storage boundary are documented in
+[`docs/corpus-retention-canary-v0.1.md`](docs/corpus-retention-canary-v0.1.md).
 
 ## Repository policy
 
