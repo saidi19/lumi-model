@@ -202,6 +202,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     temporary IAM role are confirmed absent afterward. The estimated canary
     charge is at most $0.003586. This selects and validates storage only; bulk
     corpus materialization, paid compute, and training remain unapproved.
+34. the metadata-only source-file gate seals all 758 data objects across all 23
+    pinned Common Pile repositories: exact paths and revisions, 499,817,285,384
+    compressed bytes, Git blob IDs, Git LFS SHA-256 identities, optional Xet
+    hashes, and 46 repository control files. Every count and byte aggregate
+    matches the prior capacity snapshot, all 758 LFS digests are unique, and no
+    corpus payload is downloaded. The resumable SQLite state, flattened JSONL,
+    repository snapshot, report, and SHA manifest pass independent
+    verification. CCCC remains blocked pending the owner's license decision;
+    bulk acquisition, cloud resources, paid compute, and training remain
+    unapproved.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -209,8 +219,9 @@ A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
 The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, and live bounded I/O canary are complete. The complete source
-file manifest, CCCC owner decision, production acquisition authorization, a 4B
-learning pilot, and the full 4B/80B pretraining run remain unapproved.
+file manifest is also complete. The CCCC owner decision, production acquisition
+authorization, a 4B learning pilot, and the full 4B/80B pretraining run remain
+unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -287,6 +298,10 @@ The pinned AWS S3 rates, conservative cost projection, security contract,
 fresh-process multipart canary, cleanup evidence, and unchanged no-bulk/no-GPU
 boundary are documented in
 [`docs/aws-s3-provider-canary-v0.1.md`](docs/aws-s3-provider-canary-v0.1.md).
+The exact 23-repository file inventory, upstream object hashes, resumable
+metadata state, independent seal, and unchanged no-payload/no-GPU boundary are
+documented in
+[`docs/source-file-manifest-v0.1.md`](docs/source-file-manifest-v0.1.md).
 
 ## Repository policy
 

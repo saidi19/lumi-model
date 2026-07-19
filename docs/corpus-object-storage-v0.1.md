@@ -141,12 +141,13 @@ cleanup all pass; see
 
 ## Remaining gate
 
-The first three original provider blockers and the bounded I/O canary are now
-closed. Before production acquisition, these decisions remain:
+Provider selection, pricing, security controls, the bounded I/O canary, and the
+complete 23-component source-file manifest are now closed. See
+[`source-file-manifest-v0.1.md`](source-file-manifest-v0.1.md). Before production
+acquisition, these decisions remain:
 
-1. seal the complete source-file name/size/revision manifest;
-2. record the owner's decision for the CCCC source-level license basis; and
-3. separately approve the production S3 namespace and adaptive acquisition.
+1. record the owner's decision for the CCCC source-level license basis; and
+2. separately approve the production S3 namespace and adaptive acquisition.
 
 The successful canary buckets were deleted. Production bucket creation and
 bulk acquisition remain separate explicit owner decisions.

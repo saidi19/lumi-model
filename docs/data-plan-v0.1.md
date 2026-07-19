@@ -141,8 +141,11 @@ evidence itself is only 16,750 bytes. See
   put/get/resume/range/delete canary pass, and both temporary buckets are
   deleted; see
   [`aws-s3-provider-canary-v0.1.md`](aws-s3-provider-canary-v0.1.md).
-- Next: seal the complete source-file manifest, record the CCCC source-level
-  license decision, and request separate production-acquisition approval.
+- Completed: the exact path, size, revision, Git blob ID, and LFS SHA-256 for
+  all 758 files across all 23 pinned repositories are metadata-only sealed; see
+  [`source-file-manifest-v0.1.md`](source-file-manifest-v0.1.md).
+- Next: record the CCCC source-level license decision and request separate
+  production-acquisition approval.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.
