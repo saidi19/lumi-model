@@ -138,11 +138,13 @@ PYTHONPATH=src python scripts/verify_aws_s3_canary.py \
 ## Next gate
 
 Provider pricing, private-bucket controls, and bounded I/O behavior are now
-proven. Before production acquisition, Lumi still needs:
+proven. The complete 23-component source-file name/size/revision/hash manifest
+has since passed; see
+[`source-file-manifest-v0.1.md`](source-file-manifest-v0.1.md). Before production
+acquisition, Lumi still needs:
 
-1. a complete source-file name/size/revision manifest for all 23 components;
-2. an explicit owner decision for the CCCC source-level license basis; and
-3. a separate authorization to create the production S3 namespace and begin
+1. an explicit owner decision for the CCCC source-level license basis; and
+2. a separate authorization to create the production S3 namespace and begin
    adaptive acquisition.
 
 The production acquisition will stop at the seven category floors totaling
