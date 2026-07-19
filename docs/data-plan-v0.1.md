@@ -1,8 +1,9 @@
 # Lumi data plan v0.1
 
 Status: **candidate; capacity, bounded retention, S3 storage, and local
-distributed-acquisition gates pass. The first production prefix is preserved,
-but paid Glue migration and GPU training are not approved**
+distributed-acquisition gates pass. The first production prefix is preserved;
+the Glue canary failed safe, and its EMR replacement, production resume, and
+GPU training are not approved**
 
 ## Default source direction
 
@@ -157,9 +158,20 @@ evidence itself is only 16,750 bytes. See
   local Spark parity, repeatability, fail-closed limits, release packaging, and
   the complete repository test suite pass. See
   [`distributed-corpus-glue-v0.1.md`](distributed-corpus-glue-v0.1.md).
-- Next: obtain explicit approval only for the bounded 8-DPU, 30-minute,
-  maximum-$1.76 Glue parity canary. Distributed production remains a separate
-  later approval after measured canary throughput and cost.
+- Completed safely: the exact owner-authorized 8-DPU Glue canary stopped in
+  dependency bootstrap because Glue 5.1's Python 3.11 cannot install pinned
+  Lingua 2.2.0. It read no source records, wrote no corpus objects, started no
+  training, cost an estimated $0.0374, and all temporary Glue/IAM resources are
+  deleted.
+- Completed locally: an EMR Serverless 7.13.0 replacement preserves the same
+  eight-source/all-category bounds and Spark semantics while using a
+  digest-pinned Python 3.12 image. Package, authorization, cost, capacity, and
+  request gates remain non-authorizing; see
+  [`distributed-corpus-emr-serverless-v0.1.md`](distributed-corpus-emr-serverless-v0.1.md).
+- Next: seal the non-authorizing EMR package, then obtain a new exact approval
+  only for one bounded image build and one maximum-30-minute parity canary.
+  Distributed production remains a separate later approval after measured
+  canary throughput and cost.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

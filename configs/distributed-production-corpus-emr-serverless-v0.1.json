@@ -1,0 +1,90 @@
+{
+  "application": {
+    "architecture": "X86_64",
+    "auto_start": true,
+    "auto_stop_idle_timeout_minutes": 5,
+    "initial_capacity_workers": 0,
+    "maximum_disk_gib": 80,
+    "maximum_memory_gib": 64,
+    "maximum_vcpu": 16
+  },
+  "authorization": {
+    "full_4b_training": false,
+    "model_training": false,
+    "paid_codebuild_image": false,
+    "paid_emr_serverless_canary": false,
+    "paid_emr_serverless_production": false,
+    "paid_gpu_compute": false
+  },
+  "canary": {
+    "maximum_records_per_source": 2000,
+    "maximum_runtime_minutes": 30,
+    "maximum_source_compressed_bytes": 700000000,
+    "maximum_total_source_compressed_bytes": 1500000000,
+    "requires_new_owner_approval": true,
+    "source_files": 8
+  },
+  "gate": "distributed_production_corpus_emr_serverless_canary_v0.1",
+  "image": {
+    "base_digest": "sha256:3e465888c2b00add9d298a2b4c14c7951262d9c2b35a3f8c1b109dc21cd9714d",
+    "base_uri": "public.ecr.aws/emr-serverless/spark/emr-7.13.0@sha256:3e465888c2b00add9d298a2b4c14c7951262d9c2b35a3f8c1b109dc21cd9714d",
+    "dockerfile": {
+      "path": "containers/emr-serverless-7.13-python312/Dockerfile",
+      "sha256": "fd85d5549a37b568739e774276a5fc867b0703484e0a98757d7b69a59842fef9"
+    },
+    "maximum_image_gib": 10,
+    "python_executable": "/opt/lumi/python312/bin/python",
+    "python_minor": "3.12",
+    "requirements_lock": {
+      "path": "containers/emr-serverless-7.13-python312/requirements-linux-x86_64.lock",
+      "sha256": "9ebc8e25680d88ab684e2c620875726f293696a123b460fa6d927491581e5489"
+    },
+    "verifier": {
+      "path": "containers/emr-serverless-7.13-python312/verify_runtime.py",
+      "sha256": "bf82831a306d0527c364598ba509e7f3bf29902fdfd9cedd8818f60ece4eb3cd"
+    }
+  },
+  "image_build": {
+    "compute_type": "BUILD_GENERAL1_SMALL",
+    "maximum_build_minutes": 30,
+    "maximum_compute_usd": "0.15",
+    "requires_new_owner_approval": true
+  },
+  "inputs": {
+    "codebuild_pricing": {
+      "path": "configs/aws-codebuild-us-east-1-pricing-v0.1.json",
+      "sha256": "4ee791b02b837ec07893fdc9e863d168c9462859652d599d5edb67c2226ee566"
+    },
+    "emr_pricing": {
+      "path": "configs/aws-emr-serverless-us-east-1-pricing-v0.1.json",
+      "sha256": "20c0defd54b4df7101c38e994491cc6436687b38c29ab6c6facddb0d5522abcd"
+    },
+    "source_contract": {
+      "path": "configs/distributed-production-corpus-v0.1.json",
+      "sha256": "7b66d899113321dc07bd00dc55141d7ac22287cd05cccce3ad86b3202aee4fd8"
+    }
+  },
+  "job": {
+    "driver": {
+      "cores": 4,
+      "disk_gib": 20,
+      "memory_gib": 14
+    },
+    "dynamic_allocation": false,
+    "executor": {
+      "cores": 4,
+      "disk_gib": 20,
+      "instances": 3,
+      "memory_gib": 14
+    },
+    "spark_shuffle_partitions": 12
+  },
+  "region": "us-east-1",
+  "runtime": {
+    "release_label": "emr-7.13.0",
+    "service": "aws_emr_serverless",
+    "spark_version": "3.5.6"
+  },
+  "schema_version": 1,
+  "version": "0.1"
+}

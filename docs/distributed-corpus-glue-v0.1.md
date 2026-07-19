@@ -1,7 +1,8 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **local implementation and Spark parity gate pass; paid Glue canary and
-distributed production acquisition are not authorized**
+Status: **the owner-authorized bounded Glue canary failed safe before data
+processing because Glue 5.1 is fixed to Python 3.11; all temporary compute and
+IAM resources are deleted and distributed production remains unauthorized**
 
 ## Why this migration exists
 
@@ -86,9 +87,10 @@ The local package is intentionally non-authorizing. A package and a paid owner
 authorization are separate artifacts, so merely building or uploading code
 cannot start compute.
 
-## Bounded paid canary
+## Bounded paid canary result
 
-The next decision is only a parity canary, not production acquisition.
+The exact bounded canary was owner-authorized and launched once from source
+commit `08cee80f2d6a335302d3bb0a748f8cb284e483e3`. Its envelope was:
 
 | Bound | Hard maximum |
 |---|---:|
@@ -105,24 +107,36 @@ The next decision is only a parity canary, not production acquisition.
 | Price | $0.44 per DPU-hour |
 | Maximum compute cost | $1.76 |
 
-The canary may write only beneath the distributed canary control prefix. It
-cannot publish production shards. It compares Spark accepted IDs and rejection
-reasons with an independent sequential evaluation of the same bounded records.
-Any mismatch fails the gate.
+AWS Glue 5.1 started the dependency-bootstrap phase, but its fixed Python 3.11
+runtime could not install the pinned `lingua-language-detector==2.2.0` wheel,
+which requires Python 3.12 or newer. The job therefore failed before reading a
+source record or running Lumi's mapping/deduplication code.
 
-The canary requires a new, exact, release-bound owner authorization. Current
-configuration records `paid_glue_canary=false`, `paid_glue_production=false`,
-`paid_gpu_compute=false`, `model_training=false`, and
-`full_4b_training=false`.
+| Result | Verified value |
+|---|---:|
+| Job state | `failed_safe_before_data_processing` |
+| DPU seconds | 306 |
+| Execution time | 38 seconds |
+| Estimated Glue compute | $0.0374 |
+| Canary objects written | 0 |
+| Production shards written | false |
+| Model training started | false |
 
-## Production boundary after the canary
+The Glue job and its IAM role now return `EntityNotFound`/`NoSuchEntity`, the
+canary output prefix is empty, and no EMR Serverless application or CodeBuild
+build exists. Existing immutable corpus-prefix objects were retained.
 
-A passing canary provides throughput, shuffle size, dedup-round count, and cost
-measurements. Only then can a separate production proposal be calculated. The
-current planning envelope permits an initial ceiling of 64 DPU ($28.16/hour)
-and fails closed above 128 DPU ($56.32/hour), but neither value authorizes a
-job. A new owner decision must set an explicit runtime and dollar cap before
-distributed production resumes.
+## Decision after the canary
+
+This result does not reject the Spark design; it rejects Glue 5.1 as Lumi's
+runtime because silently downgrading Lingua would change already-sealed language
+filter decisions. The same bounded parity gate is being moved to EMR Serverless
+7.13.0 with a digest-pinned Python 3.12 custom image. See
+[`distributed-corpus-emr-serverless-v0.1.md`](distributed-corpus-emr-serverless-v0.1.md).
+
+The old Glue authorization is consumed and cannot authorize EMR, CodeBuild, or
+production acquisition. No production resume is permitted until the replacement
+canary passes and a separate production proposal receives explicit approval.
 
 ## Reproduction commands
 
@@ -139,7 +153,7 @@ PYTHONPATH=src python3 scripts/package_glue_distributed_canary.py \
   --output-directory "$LUMI_DATA/distributed-corpus-v0.1/glue-canary-package"
 ```
 
-The package builder binds the release to the current full Git commit, verifies
-all packaged hashes, and reports `verified_not_authorized`. Launch tooling must
-still validate a separate unexpired owner authorization against that exact
-release fingerprint.
+The archived Glue package remains reproducible evidence of the attempted gate;
+it must not be relaunched. The replacement keeps the same source bounds,
+ordered-dedup semantics, immutable resume anchors, and no-production-output
+policy while changing only the managed runtime.
