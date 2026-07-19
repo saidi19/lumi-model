@@ -1,0 +1,100 @@
+{
+  "authorization": {
+    "full_4b_training": false,
+    "model_training": false,
+    "paid_glue_canary": false,
+    "paid_glue_production": false,
+    "paid_gpu_compute": false,
+    "production_adaptive_acquisition": true
+  },
+  "backend": {
+    "deduplication": "ordered_parallel_greedy_mis_v0.1",
+    "dpu_per_worker": 1,
+    "engine": "spark",
+    "glue_version": "5.1",
+    "maximum_candidate_pairs": 50000000,
+    "maximum_lsh_bucket_documents": 10000,
+    "maximum_near_dedup_rounds": 256,
+    "python_version": "3.11",
+    "service": "aws_glue",
+    "source_partitioning": "one_pinned_gzip_file_per_task_v0.1",
+    "worker_type": "G.1X"
+  },
+  "canary": {
+    "maximum_dpu": 8,
+    "maximum_records_per_source": 2000,
+    "maximum_runtime_minutes": 30,
+    "maximum_source_compressed_bytes": 700000000,
+    "maximum_total_source_compressed_bytes": 1500000000,
+    "requires_new_owner_approval": true,
+    "source_files": 8
+  },
+  "external_artifacts": {
+    "frozen_tokenizer": {
+      "bytes": 4647195,
+      "s3_key": "lumi-corpus/v0.1/control/bootstrap/artifacts/frozen_tokenizer/1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee.json",
+      "sha256": "1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee"
+    },
+    "training_exclusion_ledger": {
+      "bytes": 12476739,
+      "entries": 35889,
+      "s3_key": "lumi-corpus/v0.1/control/bootstrap/artifacts/training_exclusion_ledger/709027bb95f3e0f956b22a79d4b29f21490ef0b360ba10f2faca7d5db3d06c62.jsonl",
+      "sha256": "709027bb95f3e0f956b22a79d4b29f21490ef0b360ba10f2faca7d5db3d06c62"
+    }
+  },
+  "gate": "distributed_production_corpus_glue_v0.1",
+  "inputs": {
+    "baseline_evidence": {
+      "path": "configs/distributed-baseline-v0.1.json",
+      "sha256": "a7366195c5ccfcac42ea452f1fdec143d713d59f8d5c7a9d13f9fbc2cabe8180"
+    },
+    "component_inventory": {
+      "path": "configs/component-sources-v0.1.json",
+      "sha256": "37a24dd4803e6c4ae2a8967e277c67549e5bfb38aaf3574f8c26bba25efb0ef9"
+    },
+    "data_mix": {
+      "path": "configs/data-mix-v0.1.json",
+      "sha256": "f76fbc2599674d8210bfaa9f4361d417e05d9a7da618b79a8677d76ec4d6627c"
+    },
+    "data_quality": {
+      "path": "configs/data-quality-v0.1.json",
+      "sha256": "b271bddd603949ac7577b7bb81ab4d1f0ed4b7cb6e8a2c7ba91956b1237430cc"
+    },
+    "filter_policy": {
+      "path": "configs/development-sample-v0.1.json",
+      "sha256": "b0081a08a7d952264667d9a7fd2e90b39a946359f7d869a3611209feb5c20c6f"
+    },
+    "glue_pricing": {
+      "path": "configs/aws-glue-us-east-1-pricing-v0.1.json",
+      "sha256": "578de46e4053c69eb65288ce32f9e3844681b23df60b4d86b8392448a4e926a3"
+    },
+    "production_authorization": {
+      "path": "configs/production-acquisition-v0.1.json",
+      "sha256": "76bc9d2bf7eb89408f4517d1f999d5490415b1ef07213fd6a4ba5c1c43a7e0ab"
+    },
+    "production_worker": {
+      "path": "configs/production-acquisition-worker-v0.1.json",
+      "sha256": "b6ac7994f10f41c142f6cae399f55eaa27453b32f4957512d872bee5bfcf4851"
+    },
+    "source_file_manifest": {
+      "path": "configs/common-pile-source-files-v0.1.json",
+      "sha256": "5289fa01c094ddbb456fe7628ea6e134f8e8455d5b8a5fc0bdc5d7d612e87c38"
+    }
+  },
+  "limits": {
+    "candidate_hard_maximum_tokens": 150000000000,
+    "candidate_total_floor_tokens": 120000000000,
+    "final_training_tokens": 80000000000,
+    "hard_logical_storage_bytes": 2000000000000,
+    "maximum_category_overshoot_tokens": 100000000
+  },
+  "production": {
+    "adaptive_scaling": true,
+    "hard_maximum_dpu": 128,
+    "initial_maximum_dpu": 64,
+    "requires_new_owner_approval": true,
+    "resume_from_verified_prefix": true
+  },
+  "schema_version": 1,
+  "version": "0.1"
+}
