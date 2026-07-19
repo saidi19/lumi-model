@@ -1,0 +1,1194 @@
+"""Correctness-first distributed training primitives for Lumi.
+
+This module is intentionally separate from :mod:`lumi.pilot_training`.  The
+archived single-device checkpoints keep their byte-for-byte identity while the
+distributed path can use rank-aware data assignment and sharded checkpoints.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import time
+import uuid
+from contextlib import nullcontext
+from dataclasses import dataclass
+from datetime import timedelta
+from functools import partial
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
+from torch import nn
+from torch.distributed.checkpoint.state_dict import (
+    get_model_state_dict,
+    set_model_state_dict,
+)
+from torch.distributed.fsdp import (
+    BackwardPrefetch,
+    FullyShardedDataParallel,
+    MixedPrecision,
+    ShardingStrategy,
+)
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.nn.parallel import DistributedDataParallel
+
+from .configuration_lumi import LumiConfig
+from .modeling_lumi import (
+    LumiDecoderLayer,
+    LumiForCausalLM,
+    build_packed_document_metadata,
+)
+from .packed_data import PackedTokenDataset, validate_packed_manifest
+from .parameter_count import parameter_breakdown
+from .pilot_training import (
+    ATTENTION_IMPLEMENTATIONS,
+    LR_SCHEDULES,
+    OPTIMIZER_PROFILES,
+    _append_metric,
+    _canonical_json_bytes,
+    _create_optimizer,
+    _fingerprint,
+    _fsync_tree,
+    _optimizer_identity,
+    _synchronize,
+    _trim_metrics,
+    _utc_now,
+    _write_json_atomic,
+    scheduled_learning_rate,
+)
+
+DISTRIBUTED_TRAINING_SCHEMA_VERSION = 1
+DISTRIBUTED_CHECKPOINT_SCHEMA_VERSION = 1
+DISTRIBUTED_AUTHORIZATION_SCHEMA_VERSION = 1
+DISTRIBUTED_TRAINING_STATE_FILENAME = "distributed-training-state.json"
+DISTRIBUTED_METRICS_FILENAME = "distributed-metrics.jsonl"
+DISTRIBUTED_STRATEGIES = {"ddp", "fsdp_full_shard"}
+DISTRIBUTED_PRECISIONS = {"fp32", "bf16"}
+GRADIENT_SYNC_MODES = {"every_microbatch", "last_microbatch"}
+
+LOCAL_PREFLIGHT_MAX_PARAMETERS = 20_000_000
+LOCAL_PREFLIGHT_MAX_STEPS = 8
+LOCAL_PREFLIGHT_MAX_TOKENS = 2_000_000
+LOCAL_PREFLIGHT_MAX_WORLD_SIZE = 2
+PAID_SMOKE_MAX_STEPS = 1_000
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    """One initialized process-group participant."""
+
+    rank: int
+    local_rank: int
+    world_size: int
+    backend: str
+    device: torch.device
+
+    @property
+    def is_rank_zero(self) -> bool:
+        return self.rank == 0
+
+
+class EpochPermutationPlanner:
+    """Cache one deterministic epoch permutation instead of rebuilding it per batch."""
+
+    def __init__(self, *, dataset_length: int, seed: int) -> None:
+        if dataset_length < 1:
+            raise ValueError("distributed dataset length must be positive")
+        self.dataset_length = dataset_length
+        self.seed = seed
+        self._epoch: int | None = None
+        self._permutation: torch.Tensor | None = None
+
+    def _for_epoch(self, epoch: int) -> torch.Tensor:
+        if self._epoch != epoch:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.seed + epoch)
+            self._permutation = torch.randperm(
+                self.dataset_length,
+                generator=generator,
+                dtype=torch.int64,
+            )
+            self._epoch = epoch
+        assert self._permutation is not None
+        return self._permutation
+
+    def global_indices(self, *, cursor: int, count: int) -> tuple[list[int], int]:
+        if cursor < 0 or count < 1:
+            raise ValueError("distributed cursor must be non-negative and count positive")
+        indices: list[int] = []
+        next_cursor = cursor
+        while len(indices) < count:
+            epoch, offset = divmod(next_cursor, self.dataset_length)
+            permutation = self._for_epoch(epoch)
+            take = min(count - len(indices), self.dataset_length - offset)
+            indices.extend(permutation[offset : offset + take].tolist())
+            next_cursor += take
+        return indices, next_cursor
+
+    def rank_batch(
+        self,
+        *,
+        cursor: int,
+        per_rank_batch_size: int,
+        rank: int,
+        world_size: int,
+    ) -> tuple[list[int], int]:
+        if per_rank_batch_size < 1 or world_size < 1:
+            raise ValueError("batch size and world size must be positive")
+        if rank < 0 or rank >= world_size:
+            raise ValueError("rank must be inside the distributed world")
+        global_batch_size = per_rank_batch_size * world_size
+        global_indices, next_cursor = self.global_indices(
+            cursor=cursor,
+            count=global_batch_size,
+        )
+        start = rank * per_rank_batch_size
+        return global_indices[start : start + per_rank_batch_size], next_cursor
+
+
+def _environment_integer(name: str) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        raise RuntimeError(f"{name} is required; launch with torchrun")
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise RuntimeError(f"{name} must be an integer") from error
+    if value < 0:
+        raise RuntimeError(f"{name} cannot be negative")
+    return value
+
+
+def initialize_distributed_from_environment(
+    *,
+    device: str = "auto",
+    backend: str | None = None,
+    timeout_seconds: int = 1_800,
+) -> DistributedContext:
+    """Initialize the process group described by ``torchrun`` environment variables."""
+
+    if dist.is_initialized():
+        raise RuntimeError("a distributed process group is already initialized")
+    if timeout_seconds < 1:
+        raise ValueError("distributed timeout must be positive")
+
+    rank = _environment_integer("RANK")
+    local_rank = _environment_integer("LOCAL_RANK")
+    world_size = _environment_integer("WORLD_SIZE")
+    if world_size < 2:
+        raise RuntimeError("the distributed trainer requires at least two processes")
+    if rank >= world_size:
+        raise RuntimeError("RANK must be smaller than WORLD_SIZE")
+
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device not in {"cpu", "cuda"}:
+        raise ValueError("distributed device must be auto, cpu, or cuda")
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA distributed training was requested but CUDA is unavailable")
+        if local_rank >= torch.cuda.device_count():
+            raise RuntimeError("LOCAL_RANK exceeds the visible CUDA device count")
+        torch.cuda.set_device(local_rank)
+        training_device = torch.device("cuda", local_rank)
+    else:
+        training_device = torch.device("cpu")
+
+    selected_backend = backend or ("nccl" if training_device.type == "cuda" else "gloo")
+    if selected_backend not in {"gloo", "nccl"}:
+        raise ValueError("distributed backend must be gloo or nccl")
+    if selected_backend == "nccl" and training_device.type != "cuda":
+        raise ValueError("NCCL requires CUDA")
+    if training_device.type == "cuda" and selected_backend != "nccl":
+        raise ValueError("production CUDA training requires NCCL")
+
+    dist.init_process_group(
+        backend=selected_backend,
+        init_method="env://",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=timeout_seconds),
+    )
+    return DistributedContext(
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        backend=selected_backend,
+        device=training_device,
+    )
+
+
+def destroy_distributed() -> None:
+    """Destroy the active process group without hiding an earlier training error."""
+
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def distributed_batch_indices(
+    *,
+    cursor: int,
+    per_rank_batch_size: int,
+    dataset_length: int,
+    seed: int,
+    rank: int,
+    world_size: int,
+) -> tuple[list[int], int]:
+    """Return one rank's disjoint slice of a deterministic global batch.
+
+    The returned cursor advances by the *global* batch size.  Every rank can
+    therefore reconstruct its own samples from the same checkpoint cursor
+    without serializing a sampler object.
+    """
+
+    if cursor < 0:
+        raise ValueError("distributed data cursor cannot be negative")
+    if per_rank_batch_size < 1 or dataset_length < 1 or world_size < 1:
+        raise ValueError("batch size, dataset length, and world size must be positive")
+    if rank < 0 or rank >= world_size:
+        raise ValueError("rank must be inside the distributed world")
+    planner = EpochPermutationPlanner(dataset_length=dataset_length, seed=seed)
+    return planner.rank_batch(
+        cursor=cursor,
+        per_rank_batch_size=per_rank_batch_size,
+        rank=rank,
+        world_size=world_size,
+    )
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _write_checksum_manifest(root: Path) -> int:
+    entries = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.name != "manifest.sha256":
+            entries.append((_sha256_file(path), path.relative_to(root).as_posix()))
+    if not entries:
+        raise RuntimeError("refusing to publish an empty distributed checkpoint")
+    manifest = root / "manifest.sha256"
+    with manifest.open("w", encoding="utf-8") as handle:
+        for digest, relative in entries:
+            handle.write(f"{digest}  {relative}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return len(entries)
+
+
+def verify_distributed_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
+    """Verify one immutable distributed checkpoint and return its state."""
+
+    checkpoint = Path(checkpoint)
+    manifest = checkpoint / "manifest.sha256"
+    state_path = checkpoint / DISTRIBUTED_TRAINING_STATE_FILENAME
+    if not checkpoint.is_dir() or not manifest.is_file() or not state_path.is_file():
+        raise ValueError(f"incomplete distributed checkpoint: {checkpoint}")
+    entries = 0
+    for line_number, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            digest, relative = line.split("  ", 1)
+        except ValueError as error:
+            raise ValueError(f"invalid checkpoint manifest line {line_number}") from error
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"invalid checkpoint digest at line {line_number}")
+        relative_path = Path(relative)
+        path = checkpoint / relative_path
+        if (
+            relative_path.is_absolute()
+            or not path.resolve().is_relative_to(checkpoint.resolve())
+            or not path.is_file()
+        ):
+            raise ValueError(f"checkpoint manifest references an invalid file: {relative}")
+        if _sha256_file(path) != digest:
+            raise ValueError(f"distributed checkpoint hash changed: {relative}")
+        entries += 1
+    if entries < 3:
+        raise ValueError("distributed checkpoint manifest is unexpectedly small")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    if state.get("checkpoint_schema_version") != DISTRIBUTED_CHECKPOINT_SCHEMA_VERSION:
+        raise ValueError("unsupported distributed checkpoint schema")
+    expected_ranks = state.get("run_specification", {}).get("distributed", {}).get("world_size")
+    if not isinstance(expected_ranks, int) or expected_ranks < 2:
+        raise ValueError("checkpoint has an invalid distributed world size")
+    for rank in range(expected_ranks):
+        if not (checkpoint / f"trainer-rank-{rank:05d}.pt").is_file():
+            raise ValueError(f"checkpoint is missing trainer state for rank {rank}")
+    return state
+
+
+def _discover_latest_checkpoint(
+    output: Path, *, run_fingerprint: str
+) -> tuple[Path, dict[str, Any]] | None:
+    candidates = []
+    for path in output.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        state = verify_distributed_checkpoint(path)
+        step = state.get("step")
+        if state.get("run_fingerprint") == run_fingerprint and isinstance(step, int):
+            candidates.append((step, path, state))
+    if not candidates:
+        return None
+    _, path, state = max(candidates, key=lambda item: item[0])
+    return path, state
+
+
+def _prune_checkpoints(
+    output: Path, *, run_fingerprint: str, keep_checkpoints: int
+) -> list[str]:
+    candidates = []
+    for path in output.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        state = verify_distributed_checkpoint(path)
+        if state.get("run_fingerprint") == run_fingerprint:
+            candidates.append((int(state["step"]), path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    removed = []
+    for _, path in candidates[keep_checkpoints:]:
+        shutil.rmtree(path)
+        removed.append(path.name)
+    if removed:
+        descriptor = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    return removed
+
+
+def _rank_zero_object(context: DistributedContext, callback) -> Any:
+    envelope: list[Any] = [None]
+    if context.is_rank_zero:
+        try:
+            envelope[0] = {"ok": True, "value": callback()}
+        except Exception as error:  # noqa: BLE001 - serialized to every rank
+            envelope[0] = {
+                "error": f"{type(error).__name__}: {error}",
+                "ok": False,
+            }
+    dist.broadcast_object_list(envelope, src=0)
+    result = envelope[0]
+    if not result["ok"]:
+        raise RuntimeError(f"rank-zero operation failed: {result['error']}")
+    return result["value"]
+
+
+def _autocast_context(device: torch.device, precision: str):
+    if precision == "fp32":
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+
+
+def _wrap_model(
+    model: LumiForCausalLM,
+    *,
+    context: DistributedContext,
+    strategy: str,
+    precision: str,
+) -> nn.Module:
+    if strategy == "ddp":
+        model.to(context.device)
+        device_ids = [context.local_rank] if context.device.type == "cuda" else None
+        return DistributedDataParallel(
+            model,
+            device_ids=device_ids,
+            find_unused_parameters=False,
+            forward_sync_buffers=False,
+            gradient_as_bucket_view=True,
+        )
+
+    mixed_precision = None
+    if precision == "bf16":
+        mixed_precision = MixedPrecision(
+            param_dtype=torch.bfloat16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.bfloat16,
+        )
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={LumiDecoderLayer},
+    )
+    return FullyShardedDataParallel(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
+        device_id=context.device,
+        forward_prefetch=False,
+        limit_all_gathers=True,
+        mixed_precision=mixed_precision,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        sync_module_states=False,
+        use_orig_params=True,
+    )
+
+
+def _runtime_rng_state(device: torch.device) -> dict[str, Any]:
+    state: dict[str, Any] = {"cpu": torch.get_rng_state()}
+    if device.type == "cuda":
+        state["cuda"] = torch.cuda.get_rng_state(device)
+    return state
+
+
+def _restore_runtime_rng_state(payload: dict[str, Any], device: torch.device) -> None:
+    torch.set_rng_state(payload["cpu"])
+    if device.type == "cuda" and "cuda" in payload:
+        torch.cuda.set_rng_state(payload["cuda"], device=device)
+
+
+def _save_distributed_checkpoint(
+    *,
+    context: DistributedContext,
+    output: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    state: dict[str, Any],
+    checkpoint_metric: dict[str, Any],
+) -> Path:
+    checkpoint_name = f"checkpoint-{state['step']:08d}"
+    checkpoint = output / checkpoint_name
+
+    def prepare() -> str:
+        if checkpoint.exists():
+            raise FileExistsError(f"refusing to overwrite checkpoint: {checkpoint}")
+        temporary_name = f".{checkpoint_name}.{uuid.uuid4().hex}.tmp"
+        (output / temporary_name).mkdir()
+        return temporary_name
+
+    temporary_name = _rank_zero_object(context, prepare)
+    temporary = output / temporary_name
+    dist.barrier()
+
+    model_state = get_model_state_dict(model)
+    dcp.save({"model": model_state}, checkpoint_id=temporary / "model")
+    torch.save(
+        {
+            "optimizer": optimizer.state_dict(),
+            "rng_state": _runtime_rng_state(context.device),
+        },
+        temporary / f"trainer-rank-{context.rank:05d}.pt",
+    )
+    dist.barrier()
+
+    checkpoint_state = {
+        **state,
+        "checkpoint_schema_version": DISTRIBUTED_CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_metric": checkpoint_metric,
+        "latest_checkpoint": checkpoint_name,
+        "status": "checkpoint",
+        "updated_at": _utc_now(),
+    }
+
+    def publish() -> str:
+        _write_json_atomic(
+            temporary / DISTRIBUTED_TRAINING_STATE_FILENAME,
+            checkpoint_state,
+        )
+        _write_checksum_manifest(temporary)
+        _fsync_tree(temporary)
+        temporary.replace(checkpoint)
+        descriptor = os.open(output, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        verify_distributed_checkpoint(checkpoint)
+        return checkpoint_name
+
+    _rank_zero_object(context, publish)
+    dist.barrier()
+    return checkpoint
+
+
+def _restore_distributed_checkpoint(
+    *,
+    context: DistributedContext,
+    checkpoint: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    verify_distributed_checkpoint(checkpoint)
+    model_state = get_model_state_dict(model)
+    dcp.load({"model": model_state}, checkpoint_id=checkpoint / "model")
+    incompatible = set_model_state_dict(model, model_state)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(f"distributed model restore was incompatible: {incompatible}")
+    trainer = torch.load(
+        checkpoint / f"trainer-rank-{context.rank:05d}.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    optimizer.load_state_dict(trainer["optimizer"])
+    _restore_runtime_rng_state(trainer["rng_state"], context.device)
+    dist.barrier()
+
+
+def _state_dict_digest(state: dict[str, Any]) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    tensor_count = 0
+    parameter_values = 0
+    for name in sorted(state):
+        value = state[name]
+        if not isinstance(value, torch.Tensor):
+            continue
+        tensor = value.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8") + b"\0")
+        digest.update(str(tensor.dtype).encode("ascii") + b"\0")
+        digest.update(_canonical_json_bytes(list(tensor.shape)) + b"\0")
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+        tensor_count += 1
+        parameter_values += tensor.numel()
+    return {
+        "algorithm": "sha256-canonical-full-model-state-v0.1",
+        "parameter_values_with_tied_aliases": parameter_values,
+        "sha256": digest.hexdigest(),
+        "tensor_count": tensor_count,
+    }
+
+
+def write_final_model_digest(
+    *,
+    config_path: str | Path,
+    checkpoint: str | Path,
+    output: str | Path,
+) -> dict[str, Any]:
+    """Load a distributed model checkpoint into one plain CPU model and hash it.
+
+    This deliberately runs *after* the process group is destroyed.  Gathering
+    a classic FSDP full state in-process is unstable on macOS CPU builds and is
+    unnecessary: DCP can reshard the same checkpoint directly into a plain
+    model for independent verification.
+    """
+
+    checkpoint = Path(checkpoint)
+    output = Path(output)
+    verify_distributed_checkpoint(checkpoint)
+    config = LumiConfig(**json.loads(Path(config_path).read_bytes()))
+    model = LumiForCausalLM(config)
+    state = model.state_dict()
+    dcp.load({"model": state}, checkpoint_id=checkpoint / "model", no_dist=True)
+    incompatible = model.load_state_dict(state)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(f"plain-model distributed restore was incompatible: {incompatible}")
+    result = {
+        **_state_dict_digest(state),
+        "checkpoint": checkpoint.name,
+        "checkpoint_manifest_sha256": _sha256_file(checkpoint / "manifest.sha256"),
+    }
+    _write_json_atomic(output / "final-model-digest.json", result)
+    return result
+
+
+def _validate_paid_authorization(
+    path: Path,
+    *,
+    run_fingerprint: str,
+    context: DistributedContext,
+    strategy: str,
+    steps: int,
+) -> dict[str, Any]:
+    authorization = json.loads(path.read_text(encoding="utf-8"))
+    if authorization.get("schema_version") != DISTRIBUTED_AUTHORIZATION_SCHEMA_VERSION:
+        raise ValueError("unsupported distributed launch authorization")
+    if authorization.get("status") != "owner_approved":
+        raise ValueError("distributed launch is not owner-approved")
+    if authorization.get("run_kind") != "lumi_distributed_smoke_v0.1":
+        raise ValueError("authorization targets a different run kind")
+    if authorization.get("run_fingerprint") != run_fingerprint:
+        raise ValueError("authorization does not match the distributed run")
+    if authorization.get("world_size") != context.world_size:
+        raise ValueError("authorization world size changed")
+    if authorization.get("strategy") != strategy:
+        raise ValueError("authorization strategy changed")
+    approved_step = authorization.get("approved_through_step")
+    if not isinstance(approved_step, int) or not steps <= approved_step <= PAID_SMOKE_MAX_STEPS:
+        raise ValueError("authorization step boundary is invalid")
+    if authorization.get("paid_gpu") is not True:
+        raise ValueError("paid CUDA launch must be explicit")
+    if authorization.get("full_4b_training") is not False:
+        raise ValueError("the smoke authorization cannot approve full 4B training")
+    if authorization.get("owner_acknowledgement") != (
+        "I approve this paid Lumi distributed smoke run through the recorded step."
+    ):
+        raise ValueError("authorization acknowledgement changed")
+    return authorization
+
+
+def _validate_execution_scope(
+    *,
+    authorization_path: Path | None,
+    config: LumiConfig,
+    context: DistributedContext,
+    run_fingerprint: str,
+    strategy: str,
+    steps: int,
+    target_tokens: int,
+) -> dict[str, Any]:
+    if authorization_path is not None:
+        if context.device.type != "cuda" or context.backend != "nccl":
+            raise ValueError("paid distributed authorization requires CUDA/NCCL")
+        return _validate_paid_authorization(
+            authorization_path,
+            run_fingerprint=run_fingerprint,
+            context=context,
+            strategy=strategy,
+            steps=steps,
+        )
+
+    parameters = parameter_breakdown(config).total
+    if context.device.type != "cpu" or context.backend != "gloo":
+        raise PermissionError("CUDA training requires a hash-bound owner authorization")
+    if context.world_size > LOCAL_PREFLIGHT_MAX_WORLD_SIZE:
+        raise PermissionError("unauthorized local preflight world size is too large")
+    if parameters > LOCAL_PREFLIGHT_MAX_PARAMETERS:
+        raise PermissionError("unauthorized local preflight model is too large")
+    if steps > LOCAL_PREFLIGHT_MAX_STEPS or target_tokens > LOCAL_PREFLIGHT_MAX_TOKENS:
+        raise PermissionError("unauthorized local preflight budget is too large")
+    return {
+        "full_4b_training": False,
+        "mode": "local_cpu_preflight",
+        "paid_gpu": False,
+        "parameter_cap": LOCAL_PREFLIGHT_MAX_PARAMETERS,
+        "step_cap": LOCAL_PREFLIGHT_MAX_STEPS,
+        "token_cap": LOCAL_PREFLIGHT_MAX_TOKENS,
+        "world_size_cap": LOCAL_PREFLIGHT_MAX_WORLD_SIZE,
+    }
+
+
+def _reduce_mean(value: float, context: DistributedContext) -> float:
+    tensor = torch.tensor(value, device=context.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item() / context.world_size)
+
+
+def _reduce_max(value: float | int, context: DistributedContext) -> float:
+    tensor = torch.tensor(float(value), device=context.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
+    return float(tensor.item())
+
+
+def _collective_validate_packed_manifest(
+    manifest_path: Path,
+    context: DistributedContext,
+) -> tuple[dict[str, Any], str]:
+    """Validate local corpus visibility and hash each node's copy once."""
+
+    manifest: dict[str, Any] | None = None
+    local_result: dict[str, Any]
+    try:
+        manifest = validate_packed_manifest(
+            manifest_path,
+            verify_hashes=context.local_rank == 0,
+        )
+        local_result = {
+            "build_fingerprint": manifest["build_fingerprint"],
+            "error": None,
+            "manifest_sha256": _sha256_file(manifest_path),
+            "rank": context.rank,
+        }
+    except Exception as error:  # noqa: BLE001 - report every rank before failing
+        local_result = {
+            "error": f"{type(error).__name__}: {error}",
+            "rank": context.rank,
+        }
+    gathered: list[dict[str, Any] | None] = [None] * context.world_size
+    dist.all_gather_object(gathered, local_result)
+    failures = [item for item in gathered if item is not None and item.get("error")]
+    if failures:
+        details = "; ".join(
+            f"rank {item['rank']}: {item['error']}" for item in failures
+        )
+        raise RuntimeError(f"distributed packed-data validation failed: {details}")
+    identities = {
+        (item["manifest_sha256"], item["build_fingerprint"])
+        for item in gathered
+        if item is not None
+    }
+    if len(identities) != 1:
+        raise RuntimeError("distributed ranks do not share one packed-data manifest")
+    assert manifest is not None
+    manifest_sha256, _ = next(iter(identities))
+    return manifest, manifest_sha256
+
+
+def _reconcile_checkpoint_metric(
+    metrics_path: Path,
+    state: dict[str, Any],
+) -> None:
+    """Recover the metric committed inside a newer checkpoint after a crash."""
+
+    checkpoint_metric = state.pop("checkpoint_metric", None)
+    if checkpoint_metric is None:
+        return
+    committed_step = int(state["step"])
+    if int(checkpoint_metric.get("step", -1)) != committed_step:
+        raise ValueError("checkpoint metric does not match its committed step")
+    records = [
+        json.loads(line)
+        for line in metrics_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    steps = [int(record["step"]) for record in records]
+    if steps != sorted(set(steps)):
+        raise ValueError("distributed metrics are duplicated or out of order")
+    if committed_step in steps:
+        existing = records[steps.index(committed_step)]
+        stable_fields = set(checkpoint_metric) - {"checkpoint_seconds"}
+        if any(existing.get(field) != checkpoint_metric[field] for field in stable_fields):
+            raise ValueError("checkpoint metric conflicts with the durable metrics log")
+        return
+    expected_previous = committed_step - 1
+    if (steps[-1] if steps else 0) != expected_previous:
+        raise ValueError("distributed metrics have a gap before the checkpoint")
+    recovered = {
+        **checkpoint_metric,
+        "checkpoint_seconds": None,
+        "recovered_from_checkpoint": True,
+    }
+    _append_metric(metrics_path, recovered)
+
+
+def _setup_output(
+    *,
+    context: DistributedContext,
+    output: Path,
+    run_fingerprint: str,
+    run_specification: dict[str, Any],
+    resume: bool,
+) -> dict[str, Any]:
+    state_path = output / DISTRIBUTED_TRAINING_STATE_FILENAME
+    metrics_path = output / DISTRIBUTED_METRICS_FILENAME
+
+    def setup() -> dict[str, Any]:
+        if output.exists() and not output.is_dir():
+            raise NotADirectoryError(output)
+        output.mkdir(parents=True, exist_ok=True)
+        if state_path.exists():
+            if not resume:
+                raise FileExistsError(f"distributed state exists; pass --resume: {state_path}")
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            if state.get("run_fingerprint") != run_fingerprint:
+                raise ValueError("distributed state does not match the requested run")
+        else:
+            if any(output.iterdir()):
+                raise FileExistsError(f"distributed output is not empty: {output}")
+            state = {
+                "best_loss": None,
+                "created_at": _utc_now(),
+                "last_loss": None,
+                "latest_checkpoint": None,
+                "run_fingerprint": run_fingerprint,
+                "run_specification": run_specification,
+                "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
+                "sequence_cursor": 0,
+                "status": "active",
+                "step": 0,
+                "tokens_seen": 0,
+                "updated_at": _utc_now(),
+            }
+            _write_json_atomic(state_path, state)
+
+        recovered = _discover_latest_checkpoint(output, run_fingerprint=run_fingerprint)
+        if recovered is not None:
+            checkpoint, checkpoint_state = recovered
+            if checkpoint_state["step"] >= state["step"]:
+                state = {
+                    **state,
+                    **checkpoint_state,
+                    "latest_checkpoint": checkpoint.name,
+                    "status": "active",
+                }
+        _trim_metrics(metrics_path, int(state["step"]))
+        _reconcile_checkpoint_metric(metrics_path, state)
+        _write_json_atomic(state_path, state)
+        return state
+
+    return _rank_zero_object(context, setup)
+
+
+def train_distributed_packed(
+    *,
+    context: DistributedContext,
+    manifest_path: str | Path,
+    config_path: str | Path,
+    output: str | Path,
+    steps: int,
+    strategy: str,
+    per_rank_batch_size: int = 1,
+    gradient_accumulation_steps: int = 1,
+    learning_rate: float = 3e-4,
+    weight_decay: float = 0.1,
+    max_grad_norm: float = 1.0,
+    checkpoint_steps: int = 10,
+    keep_checkpoints: int | None = None,
+    seed: int = 7,
+    resume: bool = False,
+    gradient_checkpointing: bool = False,
+    lr_schedule: str = "constant",
+    warmup_steps: int = 0,
+    schedule_steps: int | None = None,
+    min_learning_rate_ratio: float = 0.1,
+    attention_implementation: str | None = None,
+    document_isolation: bool = False,
+    optimizer_profile: str = "legacy",
+    precision: str = "fp32",
+    gradient_sync_mode: str = "every_microbatch",
+    torch_compile: bool = False,
+    authorization_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Train Lumi with DDP or FSDP and exact global-cursor resume."""
+
+    if not dist.is_initialized():
+        raise RuntimeError("distributed process group is not initialized")
+    if (context.rank, context.world_size) != (dist.get_rank(), dist.get_world_size()):
+        raise RuntimeError("distributed context does not match the active process group")
+    if strategy not in DISTRIBUTED_STRATEGIES:
+        raise ValueError(f"strategy must be one of {sorted(DISTRIBUTED_STRATEGIES)}")
+    if precision not in DISTRIBUTED_PRECISIONS:
+        raise ValueError(f"precision must be one of {sorted(DISTRIBUTED_PRECISIONS)}")
+    if gradient_sync_mode not in GRADIENT_SYNC_MODES:
+        raise ValueError(f"gradient sync mode must be one of {sorted(GRADIENT_SYNC_MODES)}")
+    if steps < 1 or per_rank_batch_size < 1 or gradient_accumulation_steps < 1:
+        raise ValueError("steps and batch sizes must be positive")
+    if checkpoint_steps < 1:
+        raise ValueError("checkpoint steps must be positive")
+    if keep_checkpoints is not None and keep_checkpoints < 1:
+        raise ValueError("keep checkpoints must be positive")
+    if learning_rate <= 0 or weight_decay < 0 or max_grad_norm <= 0:
+        raise ValueError("optimizer hyperparameters are invalid")
+    if lr_schedule not in LR_SCHEDULES:
+        raise ValueError(f"learning-rate schedule must be one of {sorted(LR_SCHEDULES)}")
+    if optimizer_profile not in OPTIMIZER_PROFILES:
+        raise ValueError(f"optimizer profile must be one of {sorted(OPTIMIZER_PROFILES)}")
+    if attention_implementation is not None and (
+        attention_implementation not in ATTENTION_IMPLEMENTATIONS
+    ):
+        raise ValueError("unsupported attention implementation")
+    if context.device.type == "cuda" and precision != "bf16":
+        raise ValueError("production CUDA training is pinned to bf16 in v0.1")
+    if precision == "bf16" and context.device.type == "cuda" and (
+        not torch.cuda.is_bf16_supported()
+    ):
+        raise RuntimeError("the selected CUDA device does not support bf16")
+    if attention_implementation == "flash_attention_2" and context.device.type != "cuda":
+        raise ValueError("flash_attention_2 requires CUDA")
+    if document_isolation and context.device.type == "cuda" and (
+        attention_implementation != "flash_attention_2"
+    ):
+        raise ValueError("CUDA document isolation requires flash_attention_2")
+    if lr_schedule == "cosine":
+        if schedule_steps is None or schedule_steps < steps or warmup_steps >= schedule_steps:
+            raise ValueError("cosine schedule does not cover the requested steps")
+    elif schedule_steps is not None:
+        raise ValueError("schedule steps are only valid for cosine learning rate")
+
+    manifest_path = Path(manifest_path)
+    config_path = Path(config_path)
+    output = Path(output)
+    authorization = None if authorization_path is None else Path(authorization_path)
+    manifest, manifest_sha256 = _collective_validate_packed_manifest(
+        manifest_path,
+        context,
+    )
+    config_bytes = config_path.read_bytes()
+    config = LumiConfig(**json.loads(config_bytes))
+    config._attn_implementation = attention_implementation
+    sequence_length = int(manifest["packing"]["sequence_length"])
+    if config.vocab_size != manifest["tokenizer"]["vocab_size"]:
+        raise ValueError("model and distributed dataset vocabulary sizes differ")
+    if config.doc_token_id != manifest["tokenizer"]["doc_token_id"]:
+        raise ValueError("model and distributed dataset document-token IDs differ")
+    if sequence_length > config.max_position_embeddings:
+        raise ValueError("distributed sequence length exceeds the model maximum")
+
+    optimizer_identity = _optimizer_identity(
+        batch_size=per_rank_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
+        keep_checkpoints=keep_checkpoints,
+        learning_rate=learning_rate,
+        lr_schedule=lr_schedule,
+        max_grad_norm=max_grad_norm,
+        min_learning_rate_ratio=min_learning_rate_ratio,
+        schedule_steps=schedule_steps,
+        warmup_steps=warmup_steps,
+        weight_decay=weight_decay,
+        attention_implementation=attention_implementation,
+        document_isolation=document_isolation,
+        optimizer_profile=optimizer_profile,
+    )
+    run_identity = {
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "data": {
+            "build_fingerprint": manifest["build_fingerprint"],
+            "manifest_sha256": manifest_sha256,
+            "sequence_order": "cached_epoch_randperm_v0.1",
+        },
+        "distributed": {
+            "backend": context.backend,
+            "checkpoint_format": "dcp-model_rank-local-optimizer-v0.1",
+            "gradient_sync_mode": gradient_sync_mode,
+            "per_rank_batch_size": per_rank_batch_size,
+            "precision": precision,
+            "strategy": strategy,
+            "torch_compile": torch_compile,
+            "world_size": context.world_size,
+        },
+        "optimizer": optimizer_identity,
+        "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
+        "seed": seed,
+        "torch_version": torch.__version__,
+    }
+    run_fingerprint = _fingerprint(run_identity)
+    global_tokens_per_step = (
+        context.world_size
+        * per_rank_batch_size
+        * gradient_accumulation_steps
+        * sequence_length
+    )
+    scope = _validate_execution_scope(
+        authorization_path=authorization,
+        config=config,
+        context=context,
+        run_fingerprint=run_fingerprint,
+        strategy=strategy,
+        steps=steps,
+        target_tokens=steps * global_tokens_per_step,
+    )
+    run_specification = {
+        **run_identity,
+        "authorization": scope,
+        "distributed": {
+            **run_identity["distributed"],
+            "global_tokens_per_step": global_tokens_per_step,
+        },
+        "locations": {
+            "config_path": str(config_path.resolve()),
+            "manifest_path": str(manifest_path.resolve()),
+        },
+    }
+    state = _setup_output(
+        context=context,
+        output=output,
+        run_fingerprint=run_fingerprint,
+        run_specification=run_specification,
+        resume=resume,
+    )
+
+    torch.manual_seed(seed)
+    if context.device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    model = LumiForCausalLM(config)
+    if gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+    if torch_compile:
+        # PyTorch recommends compiling the inner module before DDP/FSDP. FSDP
+        # compilation also requires use_orig_params=True, which _wrap_model pins.
+        model.compile(dynamic=False, fullgraph=False)
+    distributed_model = _wrap_model(
+        model,
+        context=context,
+        strategy=strategy,
+        precision=precision,
+    )
+    optimizer = _create_optimizer(
+        distributed_model,
+        device=context.device,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        optimizer_profile=optimizer_profile,
+    )
+    torch.manual_seed(seed + 10_000 + context.rank)
+    if context.device.type == "cuda":
+        torch.cuda.manual_seed_all(seed + 10_000 + context.rank)
+    if state["latest_checkpoint"] is not None:
+        _restore_distributed_checkpoint(
+            context=context,
+            checkpoint=output / state["latest_checkpoint"],
+            model=distributed_model,
+            optimizer=optimizer,
+        )
+
+    dataset = PackedTokenDataset(manifest_path, verify_hashes=False)
+    if len(dataset) < context.world_size * per_rank_batch_size:
+        raise ValueError("distributed dataset cannot fill one global microbatch")
+    distributed_model.train()
+    sequence_planner = EpochPermutationPlanner(dataset_length=len(dataset), seed=seed)
+    metrics_path = output / DISTRIBUTED_METRICS_FILENAME
+    state_path = output / DISTRIBUTED_TRAINING_STATE_FILENAME
+
+    while state["step"] < steps:
+        step_learning_rate = scheduled_learning_rate(
+            base_learning_rate=learning_rate,
+            step=state["step"] + 1,
+            schedule=lr_schedule,
+            warmup_steps=warmup_steps,
+            schedule_steps=schedule_steps,
+            min_learning_rate_ratio=min_learning_rate_ratio,
+        )
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = step_learning_rate
+        optimizer.zero_grad(set_to_none=True)
+        accumulated_local_loss = 0.0
+        step_cursor = int(state["sequence_cursor"])
+        _synchronize(context.device)
+        if context.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(context.device)
+        started = time.perf_counter()
+
+        for accumulation_index in range(gradient_accumulation_steps):
+            indices, step_cursor = sequence_planner.rank_batch(
+                cursor=step_cursor,
+                per_rank_batch_size=per_rank_batch_size,
+                rank=context.rank,
+                world_size=context.world_size,
+            )
+            cpu_batch = torch.stack([dataset[index] for index in indices])
+            if context.device.type == "cuda":
+                cpu_batch = cpu_batch.pin_memory()
+            batch = cpu_batch.to(context.device, non_blocking=context.device.type == "cuda")
+            model_kwargs: dict[str, Any] = {}
+            if document_isolation:
+                metadata = build_packed_document_metadata(
+                    cpu_batch,
+                    doc_token_id=config.doc_token_id,
+                )
+                cumulative = metadata.cu_seq_lens.to(context.device, non_blocking=True)
+                model_kwargs = {
+                    "cu_seq_lens_k": cumulative,
+                    "cu_seq_lens_q": cumulative,
+                    "document_isolation": True,
+                    "max_length_k": metadata.max_length,
+                    "max_length_q": metadata.max_length,
+                    "position_ids": metadata.position_ids.to(
+                        context.device,
+                        non_blocking=True,
+                    ),
+                }
+            should_defer_sync = (
+                gradient_sync_mode == "last_microbatch"
+                and accumulation_index < gradient_accumulation_steps - 1
+            )
+            synchronization = distributed_model.no_sync() if should_defer_sync else nullcontext()
+            with synchronization:
+                with _autocast_context(context.device, precision):
+                    loss = distributed_model(input_ids=batch, labels=batch, **model_kwargs).loss
+                if loss is None or not torch.isfinite(loss):
+                    raise RuntimeError(f"non-finite distributed loss at step {state['step'] + 1}")
+                (loss / gradient_accumulation_steps).backward()
+            accumulated_local_loss += float(loss.detach())
+
+        if strategy == "fsdp_full_shard":
+            gradient_norm = distributed_model.clip_grad_norm_(max_grad_norm)
+        else:
+            gradient_norm = torch.nn.utils.clip_grad_norm_(
+                distributed_model.parameters(),
+                max_grad_norm,
+            )
+        if not torch.isfinite(gradient_norm):
+            raise RuntimeError(f"non-finite distributed gradient at step {state['step'] + 1}")
+        optimizer.step()
+        _synchronize(context.device)
+        elapsed = _reduce_max(max(time.perf_counter() - started, 1e-9), context)
+        global_loss = _reduce_mean(
+            accumulated_local_loss / gradient_accumulation_steps,
+            context,
+        )
+        global_gradient_norm = _reduce_max(float(gradient_norm), context)
+
+        state["step"] += 1
+        state["sequence_cursor"] = step_cursor
+        state["tokens_seen"] = step_cursor * sequence_length
+        state["last_loss"] = global_loss
+        state["best_loss"] = (
+            global_loss if state["best_loss"] is None else min(state["best_loss"], global_loss)
+        )
+        state["updated_at"] = _utc_now()
+        metric = {
+            "backend": context.backend,
+            "device": context.device.type,
+            "elapsed_seconds": elapsed,
+            "global_tokens_per_step": global_tokens_per_step,
+            "gradient_norm": global_gradient_norm,
+            "learning_rate": step_learning_rate,
+            "loss": global_loss,
+            "peak_memory_allocated_bytes": (
+                int(_reduce_max(torch.cuda.max_memory_allocated(context.device), context))
+                if context.device.type == "cuda"
+                else None
+            ),
+            "peak_memory_reserved_bytes": (
+                int(_reduce_max(torch.cuda.max_memory_reserved(context.device), context))
+                if context.device.type == "cuda"
+                else None
+            ),
+            "step": state["step"],
+            "strategy": strategy,
+            "tokens_per_second": global_tokens_per_step / elapsed,
+            "tokens_seen": state["tokens_seen"],
+            "world_size": context.world_size,
+        }
+        if context.is_rank_zero:
+            print(
+                f"step={state['step']:06d} loss={global_loss:.6f} "
+                f"global_tokens_per_second={metric['tokens_per_second']:.1f}",
+                flush=True,
+            )
+
+        should_checkpoint = state["step"] % checkpoint_steps == 0 or state["step"] == steps
+        if should_checkpoint:
+            _synchronize(context.device)
+            checkpoint_started = time.perf_counter()
+            checkpoint = _save_distributed_checkpoint(
+                context=context,
+                output=output,
+                model=distributed_model,
+                optimizer=optimizer,
+                state=state,
+                checkpoint_metric={**metric, "checkpoint_seconds": None},
+            )
+            _synchronize(context.device)
+            checkpoint_seconds = _reduce_max(
+                time.perf_counter() - checkpoint_started,
+                context,
+            )
+            state["latest_checkpoint"] = checkpoint.name
+            state["last_checkpoint_seconds"] = checkpoint_seconds
+            metric["checkpoint_seconds"] = checkpoint_seconds
+        else:
+            metric["checkpoint_seconds"] = None
+
+        if context.is_rank_zero:
+            _append_metric(metrics_path, metric)
+            if should_checkpoint:
+                _write_json_atomic(state_path, state)
+        dist.barrier()
+        if should_checkpoint and keep_checkpoints is not None:
+            _rank_zero_object(
+                context,
+                lambda: _prune_checkpoints(
+                    output,
+                    run_fingerprint=run_fingerprint,
+                    keep_checkpoints=keep_checkpoints,
+                ),
+            )
+            dist.barrier()
+
+    if context.is_rank_zero:
+        state["status"] = "complete"
+        state["updated_at"] = _utc_now()
+        _write_json_atomic(state_path, state)
+    dist.barrier()
+    result = [state if context.is_rank_zero else None]
+    dist.broadcast_object_list(result, src=0)
+    return result[0]

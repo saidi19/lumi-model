@@ -4,6 +4,12 @@ from transformers import AutoConfig, AutoModel, AutoModelForCausalLM
 
 from .checkpoint_evaluation import evaluate_checkpoint
 from .configuration_lumi import LumiConfig
+from .distributed_training import (
+    DistributedContext,
+    EpochPermutationPlanner,
+    train_distributed_packed,
+    verify_distributed_checkpoint,
+)
 from .evaluation_data import build_heldout_evaluation, validate_heldout_manifest
 from .modeling_lumi import (
     LumiForCausalLM,
@@ -44,6 +50,8 @@ __all__ = [
     "PackedTokenDataset",
     "PackedDocumentMetadata",
     "ParameterBreakdown",
+    "DistributedContext",
+    "EpochPermutationPlanner",
     "build_packed_dataset",
     "build_document_causal_mask",
     "build_packed_document_metadata",
@@ -55,8 +63,10 @@ __all__ = [
     "create_scaling_data_contract",
     "register_lumi",
     "train_packed_pilot",
+    "train_distributed_packed",
     "validate_heldout_manifest",
     "validate_packed_manifest",
     "validate_scaling_packed_manifest",
     "validate_scaling_source_index",
+    "verify_distributed_checkpoint",
 ]
