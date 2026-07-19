@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -223,6 +225,55 @@ def test_loss_is_shifted_exactly_once(tiny_config: LumiConfig) -> None:
 def test_input_and_output_embeddings_are_tied(tiny_config: LumiConfig) -> None:
     model = LumiForCausalLM(tiny_config)
     assert model.get_input_embeddings().weight is model.get_output_embeddings().weight
+
+
+def test_residual_scaled_initialization_targets_only_residual_outputs() -> None:
+    config = LumiConfig(
+        vocab_size=4096,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=8,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        max_position_embeddings=32,
+        initialization_strategy="residual_scaled_v0.1",
+    )
+    torch.manual_seed(27)
+    model = LumiForCausalLM(config)
+    expected_residual_std = config.initializer_range / math.sqrt(2 * config.num_hidden_layers)
+
+    assert model.model.layers[0].self_attn.q_proj.weight.std().item() == pytest.approx(
+        config.initializer_range, rel=0.08
+    )
+    assert model.model.layers[0].self_attn.o_proj.weight.std().item() == pytest.approx(
+        expected_residual_std, rel=0.08
+    )
+    assert model.model.layers[0].mlp.down_proj.weight.std().item() == pytest.approx(
+        expected_residual_std, rel=0.08
+    )
+
+
+def test_standard_initialization_keeps_residual_outputs_unscaled() -> None:
+    config = LumiConfig(
+        vocab_size=256,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        max_position_embeddings=16,
+    )
+    torch.manual_seed(28)
+    model = LumiForCausalLM(config)
+
+    assert model.model.layers[0].self_attn.o_proj.weight.std().item() == pytest.approx(
+        config.initializer_range, rel=0.12
+    )
+    assert model.model.layers[0].mlp.down_proj.weight.std().item() == pytest.approx(
+        config.initializer_range, rel=0.12
+    )
 
 
 def test_gradient_checkpointing_preserves_loss_and_gradients(tiny_config: LumiConfig) -> None:

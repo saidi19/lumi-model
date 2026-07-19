@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
         choices=("eager", "sdpa", "flash_attention_2"),
     )
     parser.add_argument("--document-isolation", action="store_true")
+    parser.add_argument(
+        "--optimizer-profile",
+        choices=("legacy", "grouped_adamw_beta2_0.95_v0.1"),
+        default="legacy",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -60,6 +65,7 @@ def main() -> None:
         min_learning_rate_ratio=args.min_learning_rate_ratio,
         attention_implementation=args.attention_implementation,
         document_isolation=args.document_isolation,
+        optimizer_profile=args.optimizer_profile,
         device=args.device,
         resume=args.resume,
     )

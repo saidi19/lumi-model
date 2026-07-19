@@ -25,6 +25,7 @@ TRAINING_STATE_FILENAME = "training-state.json"
 METRICS_FILENAME = "metrics.jsonl"
 LR_SCHEDULES = {"constant", "cosine"}
 ATTENTION_IMPLEMENTATIONS = {"eager", "sdpa", "flash_attention_2"}
+OPTIMIZER_PROFILES = {"legacy", "grouped_adamw_beta2_0.95_v0.1"}
 
 
 def _utc_now() -> str:
@@ -99,7 +100,29 @@ def _create_optimizer(
     device: torch.device,
     learning_rate: float,
     weight_decay: float,
+    optimizer_profile: str = "legacy",
 ) -> torch.optim.AdamW:
+    if optimizer_profile not in OPTIMIZER_PROFILES:
+        raise ValueError(f"optimizer profile must be one of {sorted(OPTIMIZER_PROFILES)}")
+    if optimizer_profile == "grouped_adamw_beta2_0.95_v0.1":
+        decay_parameters = []
+        no_decay_parameters = []
+        seen_parameter_ids: set[int] = set()
+        for _, parameter in model.named_parameters():
+            if not parameter.requires_grad or id(parameter) in seen_parameter_ids:
+                continue
+            seen_parameter_ids.add(id(parameter))
+            target = decay_parameters if parameter.ndim >= 2 else no_decay_parameters
+            target.append(parameter)
+        return torch.optim.AdamW(
+            [
+                {"params": decay_parameters, "weight_decay": weight_decay},
+                {"params": no_decay_parameters, "weight_decay": 0.0},
+            ],
+            lr=learning_rate,
+            betas=(0.9, 0.95),
+            fused=device.type == "cuda",
+        )
     return torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
@@ -108,9 +131,7 @@ def _create_optimizer(
     )
 
 
-def _batch_indices(
-    *, cursor: int, count: int, dataset_length: int, seed: int
-) -> list[int]:
+def _batch_indices(*, cursor: int, count: int, dataset_length: int, seed: int) -> list[int]:
     """Return a stateless epoch-shuffled slice and its cross-epoch continuation."""
 
     indices: list[int] = []
@@ -214,6 +235,7 @@ def _optimizer_identity(
     weight_decay: float,
     attention_implementation: str | None = None,
     document_isolation: bool = False,
+    optimizer_profile: str = "legacy",
 ) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "batch_size": batch_size,
@@ -232,6 +254,8 @@ def _optimizer_identity(
         identity["attention_implementation"] = attention_implementation
     if document_isolation:
         identity["document_isolation"] = "position_reset_varlen_v0.1"
+    if optimizer_profile != "legacy":
+        identity["optimizer_profile"] = optimizer_profile
     if lr_schedule != "constant" or warmup_steps or schedule_steps is not None:
         identity.update(
             {
@@ -357,6 +381,7 @@ def _restore_checkpoint(
     learning_rate: float,
     weight_decay: float,
     attention_implementation: str | None,
+    optimizer_profile: str,
 ) -> tuple[LumiForCausalLM, torch.optim.AdamW]:
     model = LumiForCausalLM.from_pretrained(checkpoint, local_files_only=True)
     if attention_implementation is not None:
@@ -367,10 +392,9 @@ def _restore_checkpoint(
         device=device,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        optimizer_profile=optimizer_profile,
     )
-    trainer_payload = torch.load(
-        checkpoint / "trainer.pt", map_location="cpu", weights_only=True
-    )
+    trainer_payload = torch.load(checkpoint / "trainer.pt", map_location="cpu", weights_only=True)
     optimizer.load_state_dict(trainer_payload["optimizer"])
     rng_state = trainer_payload["rng_state"]
     torch.set_rng_state(rng_state["cpu"])
@@ -404,6 +428,7 @@ def train_packed_pilot(
     min_learning_rate_ratio: float = 0.1,
     attention_implementation: str | None = None,
     document_isolation: bool = False,
+    optimizer_profile: str = "legacy",
 ) -> dict[str, Any]:
     """Train a single-device Lumi pilot with exact data-position resume."""
 
@@ -420,13 +445,14 @@ def train_packed_pilot(
         raise ValueError("gradient-checkpointing must be boolean")
     if not isinstance(document_isolation, bool):
         raise ValueError("document-isolation must be boolean")
+    if optimizer_profile not in OPTIMIZER_PROFILES:
+        raise ValueError(f"optimizer-profile must be one of {sorted(OPTIMIZER_PROFILES)}")
     if (
         attention_implementation is not None
         and attention_implementation not in ATTENTION_IMPLEMENTATIONS
     ):
         raise ValueError(
-            "attention-implementation must be one of "
-            f"{sorted(ATTENTION_IMPLEMENTATIONS)}"
+            f"attention-implementation must be one of {sorted(ATTENTION_IMPLEMENTATIONS)}"
         )
     if keep_checkpoints is not None and (
         isinstance(keep_checkpoints, bool)
@@ -476,9 +502,7 @@ def train_packed_pilot(
         and training_device.type == "cuda"
         and attention_implementation != "flash_attention_2"
     ):
-        raise ValueError(
-            "CUDA document isolation requires flash_attention_2 varlen attention"
-        )
+        raise ValueError("CUDA document isolation requires flash_attention_2 varlen attention")
 
     manifest_bytes = manifest_path.read_bytes()
     optimizer_identity = _optimizer_identity(
@@ -495,6 +519,7 @@ def train_packed_pilot(
         weight_decay=weight_decay,
         attention_implementation=attention_implementation,
         document_isolation=document_isolation,
+        optimizer_profile=optimizer_profile,
     )
     run_identity = {
         "config": {
@@ -569,6 +594,7 @@ def train_packed_pilot(
             device=training_device,
             learning_rate=learning_rate,
             weight_decay=weight_decay,
+            optimizer_profile=optimizer_profile,
         )
     else:
         model, optimizer = _restore_checkpoint(
@@ -577,6 +603,7 @@ def train_packed_pilot(
             learning_rate=learning_rate,
             weight_decay=weight_decay,
             attention_implementation=attention_implementation,
+            optimizer_profile=optimizer_profile,
         )
     if gradient_checkpointing:
         model.gradient_checkpointing_enable()

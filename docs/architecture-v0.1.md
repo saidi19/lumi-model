@@ -14,6 +14,10 @@ Status: **candidate; not approved for full-scale training**
 
 ## Candidate 4B configuration
 
+Fresh post-gate experiments use `configs/lumi-4b-v0.2.json`. The original
+`configs/lumi-4b.json` remains unchanged because it is hash-bound as the
+historical reference for the completed 1B scaling evidence.
+
 | Field | Value |
 |---|---:|
 | Layers | 36 |
@@ -29,6 +33,8 @@ Status: **candidate; not approved for full-scale training**
 | Normalization | Pre-RMSNorm |
 | Embeddings | Input/output tied |
 | Biases/dropout | Disabled |
+| Initialization | Residual outputs scaled by `1 / sqrt(2L)` |
+| Optimizer | Legacy AdamW; grouped beta2=0.95 candidate rejected |
 
 The design uses public, established Transformer components. It is OpenAI-style
 in the broad GPT decoder sense and in its many-small-query-head layout, but it
@@ -64,6 +70,22 @@ budget is better spent validating one dense model and a high-quality corpus.
 The 80B-token point is a compute-balance reference, not a promise of perfect
 quality. Dataset quality, coverage, optimization, and post-training remain
 critical.
+
+## Initialization and optimizer gate
+
+A local 2x2 factorial experiment compared standard versus residual-scaled
+initialization and legacy AdamW versus grouped-decay AdamW with beta2=0.95. Four
+variants, three paired seeds, identical real data, and identical 32,768-token
+budgets selected residual-scaled initialization with legacy AdamW. Median
+held-out loss improved by 1.08997% across all paired seeds with a 0.37374%
+throughput reduction. Both grouped-optimizer variants were worse than the
+baseline and were rejected.
+
+Only attention `o_proj` and MLP `down_proj` weights receive the scaled standard
+deviation. Historical checkpoints and configs retain their original standard
+initialization. See
+[`init-optimizer-ab-v0.1.md`](init-optimizer-ab-v0.1.md) for the pinned design,
+thresholds, metrics, and independent evidence checks.
 
 ## Mandatory gates
 

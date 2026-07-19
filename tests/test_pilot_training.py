@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 
 import pytest
+import torch
 
+from lumi import LumiConfig, LumiForCausalLM
 from lumi.pilot_training import (
     TRAINING_SCHEMA_VERSION,
     TRAINING_STATE_FILENAME,
+    _create_optimizer,
     _optimizer_identity,
     _prune_checkpoints,
     scheduled_learning_rate,
@@ -56,6 +59,59 @@ def test_document_isolation_and_backend_are_resume_pinned() -> None:
 
     assert identity["attention_implementation"] == "flash_attention_2"
     assert identity["document_isolation"] == "position_reset_varlen_v0.1"
+
+
+def test_grouped_optimizer_profile_is_resume_pinned() -> None:
+    identity = _optimizer_identity(
+        batch_size=1,
+        gradient_accumulation_steps=1,
+        gradient_checkpointing=False,
+        keep_checkpoints=None,
+        learning_rate=3e-4,
+        lr_schedule="constant",
+        max_grad_norm=1.0,
+        min_learning_rate_ratio=0.1,
+        schedule_steps=None,
+        warmup_steps=0,
+        weight_decay=0.1,
+        optimizer_profile="grouped_adamw_beta2_0.95_v0.1",
+    )
+
+    assert identity["optimizer_profile"] == "grouped_adamw_beta2_0.95_v0.1"
+
+
+def test_grouped_optimizer_decays_only_matrix_parameters_once() -> None:
+    model = LumiForCausalLM(
+        LumiConfig(
+            vocab_size=64,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            max_position_embeddings=16,
+        )
+    )
+    optimizer = _create_optimizer(
+        model,
+        device=torch.device("cpu"),
+        learning_rate=3e-4,
+        weight_decay=0.1,
+        optimizer_profile="grouped_adamw_beta2_0.95_v0.1",
+    )
+
+    decayed = {id(parameter) for parameter in optimizer.param_groups[0]["params"]}
+    not_decayed = {id(parameter) for parameter in optimizer.param_groups[1]["params"]}
+    expected = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.1)
+    assert optimizer.param_groups[1]["weight_decay"] == pytest.approx(0.0)
+    assert optimizer.param_groups[0]["betas"] == (0.9, 0.95)
+    assert optimizer.param_groups[1]["betas"] == (0.9, 0.95)
+    assert decayed.isdisjoint(not_decayed)
+    assert decayed | not_decayed == expected
+    assert all(parameter.ndim >= 2 for parameter in optimizer.param_groups[0]["params"])
+    assert all(parameter.ndim < 2 for parameter in optimizer.param_groups[1]["params"])
 
 
 def test_cosine_learning_rate_has_linear_warmup_and_pinned_floor() -> None:

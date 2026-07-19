@@ -21,6 +21,14 @@ def test_lumi_4b_candidate_parameter_count() -> None:
     assert parameter_breakdown(config).total == 4_002_376_704
 
 
+def test_lumi_4b_v0_2_selects_residual_initialization_without_changing_size() -> None:
+    path = Path(__file__).parents[1] / "configs" / "lumi-4b-v0.2.json"
+    with path.open(encoding="utf-8") as handle:
+        config = LumiConfig(**json.load(handle))
+    assert config.initialization_strategy == "residual_scaled_v0.1"
+    assert parameter_breakdown(config).total == 4_002_376_704
+
+
 def test_lumi_1b_scaling_candidate_parameter_count() -> None:
     path = Path(__file__).parents[1] / "configs" / "lumi-1b.json"
     with path.open(encoding="utf-8") as handle:

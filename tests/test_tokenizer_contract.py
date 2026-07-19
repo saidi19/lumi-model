@@ -27,7 +27,7 @@ def test_model_configs_match_target_tokenizer_contract() -> None:
     expected_ids = {
         name: contract["special_tokens"][name]["id"] for name in ("pad", "bos", "eos", "doc")
     }
-    for config_name in ("lumi-150m.json", "lumi-4b.json"):
+    for config_name in ("lumi-150m.json", "lumi-4b.json", "lumi-4b-v0.2.json"):
         config = LumiConfig(**_read_json(REPOSITORY_ROOT / "configs" / config_name))
         assert config.vocab_size == contract["vocab_size"]
         assert config.pad_token_id == expected_ids["pad"]
