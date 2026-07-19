@@ -150,20 +150,26 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     independently. CUDA/NCCL, BF16, FlashAttention, compiled CUDA throughput,
     and real 4B memory/throughput remain a separate owner-authorized smoke gate;
     no paid GPU or 4B run was started.
-29. that paid gate now has a planning-only, source-commit-bound harness. It
-    extracts a hash-pinned 262,144-token real-data fixture from the sealed 1.4B
-    pack and limits the real 4,002,376,704-parameter FSDP/NCCL/BF16/isolated-
-    FlashAttention run to step 1 plus a fresh-process resume through step 2
-    (16,384 processed tokens total). The complete 159-test suite, Ruff, and the
-    seven-launch historical DDP/FSDP regression pass; the old exact model
-    digests are unchanged. A server-generated plan and separate out-of-repo
-    owner artifact are still mandatory, so no paid GPU has been launched by
-    this planning commit.
+29. the separately owner-authorized real Lumi-4B CUDA smoke passes on Lambda
+    Cloud `2x H100 (80 GB SXM5)`. Exact commit `208c7ed` runs the
+    4,002,376,704-parameter model with FSDP `FULL_SHARD`, NCCL, BF16, and
+    document-isolated FlashAttention through fresh step 1 and a new-process
+    resume to step 2, hard-stopping at 16,384 tokens. The two optimizer steps
+    reach 7,824.7 and 10,861.3 tokens/second; peak observed HBM is 47,531 and
+    47,959 MiB. The final six-entry distributed checkpoint is fully rehashed,
+    its manifest SHA-256 is `68c2857239eefcb75aac7ffff96b55ca32719c963666c7fb290475e9be1fcbaa`,
+    and the canonical model digest is
+    `707a54af49721e21fa35c6de81d33bdc7bc0e14f359ce443e662e0e462d169f9`.
+    All 24 downloaded evidence-manifest entries pass independently on the Mac,
+    and the instance is terminated. This proves the distributed CUDA and
+    checkpoint/resume plumbing, not model quality, and still records
+    `full_4b_training=false`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
 A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
-initialization/optimizer gate are complete. Every 4B stage remains unapproved.
+initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
+The 4B learning pilot and full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -222,7 +228,7 @@ format, local interruption gate, safety caps, and remaining CUDA boundary are
 documented in
 [`docs/distributed-trainer-v0.1.md`](docs/distributed-trainer-v0.1.md).
 The exact two-GPU Lumi-4B smoke fixture, source-commit-bound planning flow,
-two-step resume boundary, server seal, and current local-only result are
+two-step resume boundary, server seal, and verified Lambda H100 result are
 documented in
 [`docs/distributed-cuda-smoke-v0.1.md`](docs/distributed-cuda-smoke-v0.1.md).
 
