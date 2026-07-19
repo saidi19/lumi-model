@@ -1,7 +1,8 @@
 # Lumi data plan v0.1
 
-Status: **candidate; pinned source metadata passes the 80B capacity planning
-estimate, but bulk corpus materialization and GPU training are not approved**
+Status: **candidate; pinned metadata and bounded measured retention pass their
+capacity gates, but object storage, bulk materialization, and GPU training are
+not approved**
 
 ## Default source direction
 
@@ -63,6 +64,18 @@ floor, but open web has only 11.62% estimated headroom. These are upstream
 metadata estimates, not post-filter unique-token measurements; see
 [`corpus-capacity-gate-v0.1.md`](corpus-capacity-gate-v0.1.md).
 
+The bounded follow-up measured 192,528,033 raw bytes from the three tightest
+categories without persisting text. It accepted 45,981,609 frozen-tokenizer
+tokens and projects 13.210B open-web, 21.863B questions/discussion, and 25.153B
+reference tokens after the current filters. All three floors pass; see
+[`corpus-retention-canary-v0.1.md`](corpus-retention-canary-v0.1.md). This is
+still first-shard evidence, not authorization for a full-source download.
+
+The 130B-150B planning envelope is not a required local dataset size. It is a
+candidate-token safety buffer around the final 80B mix. Bulk acquisition must
+be adaptive: stop when verified per-category quotas, deduplication reserve, and
+held-out requirements are met instead of downloading an arbitrary fixed total.
+
 ## Staged acquisition
 
 ### 1. Tokenizer sample — no GPU
@@ -114,9 +127,11 @@ metadata estimates, not post-filter unique-token measurements; see
 
 ### 4. Final corpus — 80B first target
 
-- First acquire bounded canaries from open web, questions/discussion, and
-  reference; bulk acquisition remains blocked until their post-filter capacity
-  and the object-storage plan pass.
+- Completed: bounded canaries from open web, questions/discussion, and reference
+  pass their post-filter capacity floors without retaining corpus text.
+- Next: design provider-neutral private object storage, immutable manifests,
+  resumable workers, lifecycle/cost caps, and adaptive stop conditions. This
+  design does not itself authorize creating cloud resources.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.
@@ -134,10 +149,12 @@ metadata estimates, not post-filter unique-token measurements; see
 
 ## Storage boundary
 
-A 1TB Mac can hold tokenizer samples and selected processed shards, but keeping
-raw source pools, multiple dedup stages, final shards, and checkpoints together
-can exceed that space. Full corpus artifacts belong in versioned private object
-storage. The Mac should keep manifests, small samples, and development shards.
+A 1TB Mac can hold tokenizer samples, the 192MB text-free retention evidence,
+and selected development shards, but raw source pools, multiple dedup stages,
+final shards, and checkpoints together can exceed that space. Even an 80B
+uint16 token stream is roughly 160GB before indexes, metadata, optimizer state,
+or checkpoints. Full corpus artifacts belong in versioned private object
+storage. The Mac should keep manifests, small samples, and bounded evidence.
 
 Official references:
 
