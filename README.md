@@ -231,7 +231,20 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     deterministically, and fails closed on unsafe conflict sizes or checkpoint
     locations. The release package is non-authorizing. The next possible paid
     action is a separately approved 8-DPU, 30-minute parity canary capped at
-    $1.76; distributed production, GPU compute, and model training remain off.
+    $1.76. That exact owner-authorized canary then fails safe during dependency
+    bootstrap because Glue 5.1's fixed Python 3.11 cannot install Lumi's pinned
+    Lingua 2.2.0 wheel. It reads no source records, writes no canary or
+    production objects, starts no model training, costs an estimated $0.0374,
+    and its Glue job and IAM role are deleted.
+37. the bounded parity gate is therefore adapted locally—not launched—to EMR
+    Serverless 7.13.0 / Spark 3.5.6 with a digest-pinned x86 image and Python
+    3.12. The fully hash-pinned image context, 16-vCPU/64GB/30-minute application
+    ceiling, eight-source/all-category canary, immutable-prefix anchors,
+    source-order Spark/sequential parity harness, request renderer, and separate
+    release/authorization checks pass local verification. The maximum EMR plus
+    CodeBuild compute envelope is $0.755904. The old Glue approval cannot
+    authorize it; no image build, EMR application, production acquisition, GPU
+    compute, or model training has started.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -241,8 +254,8 @@ The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate are complete. The complete source
 file manifest and the fail-closed CCCC decision are also complete. A bounded
-paid Glue parity canary, distributed production resume, a 4B learning pilot,
-and the full 4B/80B pretraining run remain unapproved.
+replacement EMR parity canary, distributed production resume, a 4B learning
+pilot, and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -327,9 +340,13 @@ The pinned CCCC evidence, include/exclude consequences, explicit owner record,
 and fail-closed source-manifest policy are documented in
 [`docs/cccc-owner-decision-v0.1.md`](docs/cccc-owner-decision-v0.1.md).
 The preserved 237.77M-token prefix, immutable resume anchors, ordered parallel
-deduplication proof, real local Spark parity gate, fail-closed limits, and
-separately authorized $1.76 Glue canary boundary are documented in
+deduplication proof, real local Spark parity gate, fail-closed limits, and the
+failed-safe $0.0374 Glue result are documented in
 [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
+envelope, non-authorizing package, and separately approved next boundary are
+documented in
+[`docs/distributed-corpus-emr-serverless-v0.1.md`](docs/distributed-corpus-emr-serverless-v0.1.md).
 
 ## Repository policy
 
