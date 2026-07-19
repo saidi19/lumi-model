@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from .tokenizer_gate import encode_untrusted_text
+
 DEFAULT_MODEL_ID = "lumi-150m-local"
 DEFAULT_MAX_TOKENS = 128
 MAX_REQUEST_BYTES = 1024 * 1024
@@ -309,7 +311,7 @@ class MLXChatEngine:
         self.load()
         assert self._model is not None and self._tokenizer is not None
         prompt = render_chat_prompt(request.messages)
-        prompt_ids = self._tokenizer.encode(prompt, add_special_tokens=True)
+        prompt_ids = encode_untrusted_text(self._tokenizer, prompt)
         if len(prompt_ids) + request.max_tokens > self.context_window:
             available = max(self.context_window - len(prompt_ids), 0)
             raise APIError(

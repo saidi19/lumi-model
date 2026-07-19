@@ -15,6 +15,7 @@ from typing import Any
 from transformers import AutoTokenizer
 
 from lumi.data_pipeline import validate_sample
+from lumi.tokenizer_gate import maximum_digit_span
 
 PROBES = {
     "bangla": "বাংলা ভাষায় একটি ছোট পরীক্ষা: আমি আজ একটি মডেল বানাচ্ছি।",
@@ -22,7 +23,12 @@ PROBES = {
     "english": "Lumi should answer carefully, cite evidence, and admit uncertainty.",
     "japanese": "日本語のトークナイザー効率を確認します。",
     "math": "For x ∈ ℝ, solve x² − 5x + 6 = 0; therefore x ∈ {2, 3}.",
+    "numbers": "0 7 12 123 1234 12345678901234567890 -3.14159 6.022e23",
+    "numbers_bengali": "বাংলা সংখ্যা: ০ ১২ ১২৩ ১২৩৪ ১২৩৪৫৬৭৮৯০",
+    "numbers_arabic_indic": "الأرقام: ٠ ١٢ ١٢٣ ١٢٣٤ ١٢٣٤٥٦٧٨٩٠",
     "structured": '{"model":"Lumi","parameters":4000000000,"active":true}',
+    "url": "https://example.com/v2/items/123456789?limit=100&offset=200",
+    "version_date_ip": "release 2.10.34 on 2026-07-19 from 192.0.2.42",
 }
 
 
@@ -171,6 +177,16 @@ def main() -> None:
                 for category, counter in sorted(result["category_counters"].items())
             },
             "overall": _metrics(result["overall_counter"]),
+            "pretokenizer_diagnostics": {
+                probe_name: {
+                    "max_consecutive_digits_per_piece": maximum_digit_span(
+                        tokenizers[label]
+                        .backend_tokenizer.pre_tokenizer.pre_tokenize_str(text),
+                        text,
+                    )
+                }
+                for probe_name, text in PROBES.items()
+            },
             "probes": probe_metrics,
         }
 

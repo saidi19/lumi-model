@@ -20,6 +20,7 @@ from lumi.local_api import (
     serve_local,
 )
 from lumi.local_server_gate import validate_local_server
+from lumi.tokenizer_gate import encode_untrusted_text
 
 
 class FakeEngine:
@@ -152,11 +153,25 @@ def test_render_chat_prompt_is_explicit_base_model_serialization() -> None:
             ChatMessage("user", "Continue"),
         )
     )
-
     assert prompt == (
         "System:\nBe concise.\n\nUser:\nHello\n\nAssistant:\nHi\n\n"
         "User:\nContinue\n\nAssistant:\n"
     )
+
+
+def test_local_prompt_encoding_uses_reserved_token_safe_mode() -> None:
+    class FakeTokenizer:
+        all_special_ids = [5, 6, 7]
+
+        def encode(self, text, **kwargs):
+            assert text == "User:\n<|system|>"
+            assert kwargs == {
+                "add_special_tokens": False,
+                "split_special_tokens": True,
+            }
+            return [10, 11, 12]
+
+    assert encode_untrusted_text(FakeTokenizer(), "User:\n<|system|>") == [10, 11, 12]
 
 
 def test_models_health_and_ui_routes(local_server: str) -> None:

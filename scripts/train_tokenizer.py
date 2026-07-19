@@ -10,7 +10,7 @@ from collections.abc import Iterator
 from importlib.metadata import version as package_version
 from pathlib import Path
 
-from tokenizers import Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
+from tokenizers import Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers, trainers
 from transformers import PreTrainedTokenizerFast
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
@@ -73,6 +73,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--text-key", default="text")
     parser.add_argument("--max-documents", type=int)
     parser.add_argument("--model-max-length", type=int, default=4096)
+    parser.add_argument(
+        "--digit-chunk-size",
+        type=int,
+        help="experimentally isolate Unicode number runs into chunks of at most this size",
+    )
     parser.add_argument("--no-progress", action="store_true")
     return parser.parse_args()
 
@@ -86,6 +91,23 @@ def _validate_special_tokens(tokenizer, contract: dict) -> None:
                 f"{name} ID changed during training: expected {specification['id']}, "
                 f"got {actual_id}"
             )
+
+
+def _build_pre_tokenizer(digit_chunk_size: int | None):
+    byte_level = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+    if digit_chunk_size is None:
+        return byte_level
+    if not 1 <= digit_chunk_size <= 9:
+        raise ValueError("digit-chunk-size must be between 1 and 9")
+    return pre_tokenizers.Sequence(
+        [
+            pre_tokenizers.Split(
+                Regex(rf"\p{{N}}{{1,{digit_chunk_size}}}"),
+                behavior="isolated",
+            ),
+            byte_level,
+        ]
+    )
 
 
 def main() -> None:
@@ -135,7 +157,7 @@ def main() -> None:
 
     tokenizer = Tokenizer(models.BPE(unk_token=special_tokens["unk"]["token"]))
     tokenizer.normalizer = normalizers.NFC()
-    tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=True)
+    tokenizer.pre_tokenizer = _build_pre_tokenizer(args.digit_chunk_size)
     tokenizer.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(
         vocab_size=vocab_size,
@@ -184,6 +206,14 @@ def main() -> None:
         "documents_seen": documents.documents_yielded,
         "input_files": input_files,
         "normalization": contract["normalization"],
+        "pre_tokenizer": {
+            "digit_chunk_size": args.digit_chunk_size,
+            "type": (
+                "digit_chunked_byte_level"
+                if args.digit_chunk_size is not None
+                else "byte_level"
+            ),
+        },
         "training": {
             "max_documents": args.max_documents,
             "max_token_length": max_token_length,
