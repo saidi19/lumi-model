@@ -78,6 +78,97 @@ LOCAL_PREFLIGHT_MAX_WORLD_SIZE = 2
 PAID_SMOKE_MAX_STEPS = 1_000
 
 
+def _validate_source_commit(source_commit: str | None) -> str | None:
+    if source_commit is None:
+        return None
+    normalized = source_commit.strip().lower()
+    if len(normalized) != 40 or any(
+        character not in "0123456789abcdef" for character in normalized
+    ):
+        raise ValueError("source commit must be a full 40-character Git SHA-1")
+    return normalized
+
+
+def build_distributed_run_identity(
+    *,
+    config_bytes: bytes,
+    manifest: dict[str, Any],
+    manifest_sha256: str,
+    backend: str,
+    world_size: int,
+    strategy: str,
+    per_rank_batch_size: int,
+    gradient_accumulation_steps: int,
+    learning_rate: float,
+    weight_decay: float,
+    max_grad_norm: float,
+    keep_checkpoints: int | None,
+    seed: int,
+    gradient_checkpointing: bool,
+    lr_schedule: str,
+    warmup_steps: int,
+    schedule_steps: int | None,
+    min_learning_rate_ratio: float,
+    attention_implementation: str | None,
+    document_isolation: bool,
+    optimizer_profile: str,
+    precision: str,
+    gradient_sync_mode: str,
+    torch_compile: bool,
+    source_commit: str | None = None,
+    torch_version: str | None = None,
+) -> dict[str, Any]:
+    """Build the canonical identity shared by planning and training.
+
+    Historical CPU-preflight identities stay byte-compatible when
+    ``source_commit`` is omitted. Paid CUDA smoke runs must provide a full
+    commit and therefore bind their authorization to the exact source tree.
+    """
+
+    normalized_commit = _validate_source_commit(source_commit)
+    optimizer_identity = _optimizer_identity(
+        batch_size=per_rank_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
+        keep_checkpoints=keep_checkpoints,
+        learning_rate=learning_rate,
+        lr_schedule=lr_schedule,
+        max_grad_norm=max_grad_norm,
+        min_learning_rate_ratio=min_learning_rate_ratio,
+        schedule_steps=schedule_steps,
+        warmup_steps=warmup_steps,
+        weight_decay=weight_decay,
+        attention_implementation=attention_implementation,
+        document_isolation=document_isolation,
+        optimizer_profile=optimizer_profile,
+    )
+    identity: dict[str, Any] = {
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "data": {
+            "build_fingerprint": manifest["build_fingerprint"],
+            "manifest_sha256": manifest_sha256,
+            "sequence_order": "cached_epoch_randperm_v0.1",
+        },
+        "distributed": {
+            "backend": backend,
+            "checkpoint_format": "dcp-model_rank-local-optimizer-v0.1",
+            "gradient_sync_mode": gradient_sync_mode,
+            "per_rank_batch_size": per_rank_batch_size,
+            "precision": precision,
+            "strategy": strategy,
+            "torch_compile": torch_compile,
+            "world_size": world_size,
+        },
+        "optimizer": optimizer_identity,
+        "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
+        "seed": seed,
+        "torch_version": torch.__version__ if torch_version is None else torch_version,
+    }
+    if normalized_commit is not None:
+        identity["source_commit"] = normalized_commit
+    return identity
+
+
 @dataclass(frozen=True)
 class DistributedContext:
     """One initialized process-group participant."""
@@ -593,6 +684,7 @@ def _validate_paid_authorization(
     path: Path,
     *,
     run_fingerprint: str,
+    source_commit: str | None,
     context: DistributedContext,
     strategy: str,
     steps: int,
@@ -606,6 +698,11 @@ def _validate_paid_authorization(
         raise ValueError("authorization targets a different run kind")
     if authorization.get("run_fingerprint") != run_fingerprint:
         raise ValueError("authorization does not match the distributed run")
+    normalized_commit = _validate_source_commit(source_commit)
+    if normalized_commit is None:
+        raise ValueError("paid distributed smoke requires an exact source commit")
+    if authorization.get("source_commit") != normalized_commit:
+        raise ValueError("authorization source commit changed")
     if authorization.get("world_size") != context.world_size:
         raise ValueError("authorization world size changed")
     if authorization.get("strategy") != strategy:
@@ -630,6 +727,7 @@ def _validate_execution_scope(
     config: LumiConfig,
     context: DistributedContext,
     run_fingerprint: str,
+    source_commit: str | None,
     strategy: str,
     steps: int,
     target_tokens: int,
@@ -640,6 +738,7 @@ def _validate_execution_scope(
         return _validate_paid_authorization(
             authorization_path,
             run_fingerprint=run_fingerprint,
+            source_commit=source_commit,
             context=context,
             strategy=strategy,
             steps=steps,
@@ -844,6 +943,7 @@ def train_distributed_packed(
     precision: str = "fp32",
     gradient_sync_mode: str = "every_microbatch",
     torch_compile: bool = False,
+    source_commit: str | None = None,
     authorization_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Train Lumi with DDP or FSDP and exact global-cursor resume."""
@@ -911,44 +1011,33 @@ def train_distributed_packed(
     if sequence_length > config.max_position_embeddings:
         raise ValueError("distributed sequence length exceeds the model maximum")
 
-    optimizer_identity = _optimizer_identity(
-        batch_size=per_rank_batch_size,
+    run_identity = build_distributed_run_identity(
+        config_bytes=config_bytes,
+        manifest=manifest,
+        manifest_sha256=manifest_sha256,
+        backend=context.backend,
+        world_size=context.world_size,
+        strategy=strategy,
+        per_rank_batch_size=per_rank_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
-        gradient_checkpointing=gradient_checkpointing,
-        keep_checkpoints=keep_checkpoints,
         learning_rate=learning_rate,
-        lr_schedule=lr_schedule,
-        max_grad_norm=max_grad_norm,
-        min_learning_rate_ratio=min_learning_rate_ratio,
-        schedule_steps=schedule_steps,
-        warmup_steps=warmup_steps,
         weight_decay=weight_decay,
+        max_grad_norm=max_grad_norm,
+        keep_checkpoints=keep_checkpoints,
+        seed=seed,
+        gradient_checkpointing=gradient_checkpointing,
+        lr_schedule=lr_schedule,
+        warmup_steps=warmup_steps,
+        schedule_steps=schedule_steps,
+        min_learning_rate_ratio=min_learning_rate_ratio,
         attention_implementation=attention_implementation,
         document_isolation=document_isolation,
         optimizer_profile=optimizer_profile,
+        precision=precision,
+        gradient_sync_mode=gradient_sync_mode,
+        torch_compile=torch_compile,
+        source_commit=source_commit,
     )
-    run_identity = {
-        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
-        "data": {
-            "build_fingerprint": manifest["build_fingerprint"],
-            "manifest_sha256": manifest_sha256,
-            "sequence_order": "cached_epoch_randperm_v0.1",
-        },
-        "distributed": {
-            "backend": context.backend,
-            "checkpoint_format": "dcp-model_rank-local-optimizer-v0.1",
-            "gradient_sync_mode": gradient_sync_mode,
-            "per_rank_batch_size": per_rank_batch_size,
-            "precision": precision,
-            "strategy": strategy,
-            "torch_compile": torch_compile,
-            "world_size": context.world_size,
-        },
-        "optimizer": optimizer_identity,
-        "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
-        "seed": seed,
-        "torch_version": torch.__version__,
-    }
     run_fingerprint = _fingerprint(run_identity)
     global_tokens_per_step = (
         context.world_size
@@ -961,6 +1050,7 @@ def train_distributed_packed(
         config=config,
         context=context,
         run_fingerprint=run_fingerprint,
+        source_commit=source_commit,
         strategy=strategy,
         steps=steps,
         target_tokens=steps * global_tokens_per_step,
