@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backend", choices=("gloo", "nccl"))
     parser.add_argument("--timeout-seconds", type=int, default=1_800)
     parser.add_argument("--authorization", type=Path)
+    parser.add_argument("--source-commit")
+    parser.add_argument("--skip-final-model-digest", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -94,6 +96,7 @@ def main() -> None:
             precision=args.precision,
             gradient_sync_mode=args.gradient_sync_mode,
             torch_compile=args.torch_compile,
+            source_commit=args.source_commit,
             authorization_path=args.authorization,
             resume=args.resume,
         )
@@ -101,11 +104,12 @@ def main() -> None:
         destroy_distributed()
     if context.is_rank_zero:
         assert state is not None
-        write_final_model_digest(
-            config_path=args.config,
-            checkpoint=args.output / state["latest_checkpoint"],
-            output=args.output,
-        )
+        if not args.skip_final_model_digest:
+            write_final_model_digest(
+                config_path=args.config,
+                checkpoint=args.output / state["latest_checkpoint"],
+                output=args.output,
+            )
         print(
             f"PASS: distributed step={state['step']} tokens={state['tokens_seen']} "
             f"loss={state['last_loss']:.6f} checkpoint={state['latest_checkpoint']}",

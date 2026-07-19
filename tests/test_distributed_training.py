@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 import torch
 
 from lumi import LumiConfig
+from lumi.distributed_smoke import (
+    plan_distributed_cuda_smoke,
+    write_owner_authorization,
+)
 from lumi.distributed_training import (
     DISTRIBUTED_CHECKPOINT_SCHEMA_VERSION,
     DISTRIBUTED_TRAINING_STATE_FILENAME,
@@ -16,6 +21,7 @@ from lumi.distributed_training import (
     _validate_execution_scope,
     _validate_paid_authorization,
     _write_checksum_manifest,
+    build_distributed_run_identity,
     distributed_batch_indices,
     verify_distributed_checkpoint,
 )
@@ -93,6 +99,7 @@ def test_local_preflight_scope_allows_only_tiny_cpu_work() -> None:
         config=tiny,
         context=context,
         run_fingerprint="a" * 64,
+        source_commit=None,
         strategy="ddp",
         steps=4,
         target_tokens=512,
@@ -128,6 +135,7 @@ def test_local_preflight_scope_rejects_4b_config() -> None:
             config=config,
             context=context,
             run_fingerprint="a" * 64,
+            source_commit=None,
             strategy="fsdp_full_shard",
             steps=1,
             target_tokens=8_192,
@@ -148,6 +156,7 @@ def test_paid_smoke_authorization_cannot_approve_full_4b(tmp_path) -> None:
                 "run_fingerprint": "a" * 64,
                 "run_kind": "lumi_distributed_smoke_v0.1",
                 "schema_version": 1,
+                "source_commit": "c" * 40,
                 "status": "owner_approved",
                 "strategy": "fsdp_full_shard",
                 "world_size": 2,
@@ -167,10 +176,126 @@ def test_paid_smoke_authorization_cannot_approve_full_4b(tmp_path) -> None:
         _validate_paid_authorization(
             path,
             run_fingerprint="a" * 64,
+            source_commit="c" * 40,
             context=context,
             strategy="fsdp_full_shard",
             steps=10,
         )
+
+
+def test_distributed_identity_binds_paid_source_commit() -> None:
+    common = {
+        "config_bytes": b"{}",
+        "manifest": {"build_fingerprint": "data"},
+        "manifest_sha256": "d" * 64,
+        "backend": "gloo",
+        "world_size": 2,
+        "strategy": "ddp",
+        "per_rank_batch_size": 1,
+        "gradient_accumulation_steps": 1,
+        "learning_rate": 3e-4,
+        "weight_decay": 0.1,
+        "max_grad_norm": 1.0,
+        "keep_checkpoints": 1,
+        "seed": 7,
+        "gradient_checkpointing": False,
+        "lr_schedule": "constant",
+        "warmup_steps": 0,
+        "schedule_steps": None,
+        "min_learning_rate_ratio": 0.1,
+        "attention_implementation": None,
+        "document_isolation": False,
+        "optimizer_profile": "legacy",
+        "precision": "fp32",
+        "gradient_sync_mode": "every_microbatch",
+        "torch_compile": False,
+        "torch_version": "test",
+    }
+
+    historical = build_distributed_run_identity(**common)
+    paid = build_distributed_run_identity(**common, source_commit="a" * 40)
+
+    assert "source_commit" not in historical
+    assert paid["source_commit"] == "a" * 40
+    assert historical != paid
+    with pytest.raises(ValueError, match="full 40-character"):
+        build_distributed_run_identity(**common, source_commit="short")
+
+
+def test_cuda_smoke_plan_and_owner_authorization_remain_narrow(tmp_path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    data = tmp_path / "data"
+    data.mkdir()
+    sequence_length = 4096
+    sequences = 64
+    row = [3, *([17] * (sequence_length - 1))]
+    values = torch.tensor(row * sequences, dtype=torch.uint16).numpy().tobytes()
+    shard = data / "shard-00000.bin"
+    shard.write_bytes(values)
+    shard_sha256 = hashlib.sha256(values).hexdigest()
+    manifest = {
+        "build_fingerprint": "fixture-build",
+        "format": {
+            "dtype": "uint16",
+            "endianness": "little",
+            "layout": "flat_fixed_sequences",
+            "token_bytes": 2,
+        },
+        "packing": {"sequence_length": sequence_length},
+        "provenance": {
+            "build_fingerprint": (
+                "0bce4d9e4a51de1b831b0226e0052ea33130733eae2bb61992c6eacaf203e0c8"
+            ),
+            "manifest_sha256": (
+                "9228fa610d4a985d05e15057e8ef12619a14cbedbb5a6a5ab513d3aeca2832c8"
+            ),
+        },
+        "schema_version": 1,
+        "shards": [
+            {
+                "bytes": len(values),
+                "name": shard.name,
+                "sequences": sequences,
+                "sha256": shard_sha256,
+                "tokens": sequences * sequence_length,
+            }
+        ],
+        "statistics": {
+            "document_markers": sequences,
+            "sequences": sequences,
+            "tokens": sequences * sequence_length,
+        },
+        "status": "complete",
+        "tokenizer": {"doc_token_id": 3, "vocab_size": 65536},
+    }
+    manifest_path = data / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    plan = plan_distributed_cuda_smoke(
+        contract_path=root / "configs/distributed-cuda-smoke-v0.1.json",
+        manifest_path=manifest_path,
+        config_path=root / "configs/lumi-4b-v0.2.json",
+        source_commit="b" * 40,
+        require_cuda=False,
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    authorization = write_owner_authorization(
+        plan_path=plan_path,
+        output=tmp_path / "authorization.json",
+        provider="test-provider",
+        instance_type="2x-test-gpu",
+        hourly_rate_usd=1.0,
+        max_runtime_minutes=30,
+    )
+
+    assert plan["target"] == {
+        "fresh_through_step": 1,
+        "resume_through_step": 2,
+        "tokens_through_resume": 16_384,
+    }
+    assert authorization["approved_through_step"] == 2
+    assert authorization["paid_gpu"] is True
+    assert authorization["full_4b_training"] is False
 
 
 def test_distributed_checkpoint_manifest_detects_tampering(tmp_path) -> None:

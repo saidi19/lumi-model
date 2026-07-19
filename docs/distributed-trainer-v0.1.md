@@ -137,3 +137,6 @@ The Mac gate cannot validate:
 Those are the only reasons for the later short paid smoke. It is an
 infrastructure measurement, not another 250M/1.4B learning run. No CUDA launch
 may occur without a new explicit owner approval and a hash-bound authorization.
+
+The concrete two-GPU, two-step Lumi-4B harness and its local regression result
+are documented in [`distributed-cuda-smoke-v0.1.md`](distributed-cuda-smoke-v0.1.md).

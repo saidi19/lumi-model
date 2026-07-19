@@ -150,6 +150,15 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     independently. CUDA/NCCL, BF16, FlashAttention, compiled CUDA throughput,
     and real 4B memory/throughput remain a separate owner-authorized smoke gate;
     no paid GPU or 4B run was started.
+29. that paid gate now has a planning-only, source-commit-bound harness. It
+    extracts a hash-pinned 262,144-token real-data fixture from the sealed 1.4B
+    pack and limits the real 4,002,376,704-parameter FSDP/NCCL/BF16/isolated-
+    FlashAttention run to step 1 plus a fresh-process resume through step 2
+    (16,384 processed tokens total). The complete 159-test suite, Ruff, and the
+    seven-launch historical DDP/FSDP regression pass; the old exact model
+    digests are unchanged. A server-generated plan and separate out-of-repo
+    owner artifact are still mandatory, so no paid GPU has been launched by
+    this planning commit.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -212,6 +221,10 @@ The DDP/FSDP topology, cached global data cursor, distributed checkpoint/resume
 format, local interruption gate, safety caps, and remaining CUDA boundary are
 documented in
 [`docs/distributed-trainer-v0.1.md`](docs/distributed-trainer-v0.1.md).
+The exact two-GPU Lumi-4B smoke fixture, source-commit-bound planning flow,
+two-step resume boundary, server seal, and current local-only result are
+documented in
+[`docs/distributed-cuda-smoke-v0.1.md`](docs/distributed-cuda-smoke-v0.1.md).
 
 ## Repository policy
 
