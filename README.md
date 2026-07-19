@@ -183,13 +183,24 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     boundaries pass independent verification. This approves object-storage and
     adaptive-acquisition design only; bulk data, paid compute, and training are
     still not authorized.
+32. the provider-neutral object-storage and adaptive-acquisition design passes
+    deterministic local planning and independent reproduction. Acquisition now
+    stops when all seven category floors total 120B accepted candidate tokens;
+    150B is only a hard safety maximum, not a fixed download. Content-addressed
+    immutable manifests, atomic resumable shard publication, 20GB worker
+    scratch caps, a 4,096-partition removal ledger, and fail-closed authorization
+    boundaries are specified. The forecast peak is 1.0375TB of future cloud
+    logical storage under a 2TB hard cap, while the local evidence is only
+    16,750 bytes. No provider, price, bucket, bulk transfer, paid compute, or
+    training is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
 A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
-The bounded corpus-retention canary is complete. Object-storage/acquisition
-design, a 4B learning pilot, and the full 4B/80B pretraining run remain
+The bounded corpus-retention canary and local object-storage/acquisition design
+are complete. Provider selection/pricing, a separately approved bounded object
+I/O canary, a 4B learning pilot, and the full 4B/80B pretraining run remain
 unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
@@ -259,6 +270,10 @@ documented in
 The bounded text-free retention run, measured tight-category projections,
 sealed local evidence, and next storage boundary are documented in
 [`docs/corpus-retention-canary-v0.1.md`](docs/corpus-retention-canary-v0.1.md).
+The adaptive 120B-floor acquisition rule, provider-neutral object contract,
+storage forecast, removal ledger, resumable state, and unchanged authorization
+boundary are documented in
+[`docs/corpus-object-storage-v0.1.md`](docs/corpus-object-storage-v0.1.md).
 
 ## Repository policy
 
