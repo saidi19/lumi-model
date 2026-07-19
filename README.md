@@ -218,9 +218,9 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     measured open-web capacity consequence. It removes the automatic
     `approved_source_level_basis` shortcut: CCCC now fails closed until the
     owner explicitly chooses `include_with_caveat` or `exclude_and_replace`.
-    The engineering recommendation for the stated personal/research scope is
-    include with traceability and removal controls, but no option is
-    preselected and no data transfer or training is authorized.
+    The owner selected `include_with_caveat` for the stated personal/research
+    scope with traceability and removal controls. This resolves only the CCCC
+    license-basis blocker; no data transfer or training is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -228,9 +228,9 @@ A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
 The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, and live bounded I/O canary are complete. The complete source
-file manifest and the fail-closed CCCC decision packet are also complete. The
-owner's CCCC choice, production acquisition authorization, a 4B learning pilot,
-and the full 4B/80B pretraining run remain unapproved.
+file manifest and the fail-closed CCCC decision are also complete. Production
+acquisition authorization, a 4B learning pilot, and the full 4B/80B pretraining
+run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

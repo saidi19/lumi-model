@@ -149,10 +149,11 @@ cleanup all pass; see
 Provider selection, pricing, security controls, the bounded I/O canary, and the
 complete 23-component source-file manifest are now closed. See
 [`source-file-manifest-v0.1.md`](source-file-manifest-v0.1.md). Before production
-acquisition, these decisions remain:
+acquisition, one decision remains:
 
-1. select one option in the implemented CCCC owner-decision packet; and
-2. separately approve the production S3 namespace and adaptive acquisition.
+The owner has selected `include_with_caveat` in the separately sealed CCCC
+decision packet. The remaining decision is to approve the production S3
+namespace and adaptive acquisition.
 
 The successful canary buckets were deleted. Production bucket creation and
 bulk acquisition remain separate explicit owner decisions.

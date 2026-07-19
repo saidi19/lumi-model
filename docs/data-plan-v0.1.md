@@ -144,11 +144,11 @@ evidence itself is only 16,750 bytes. See
 - Completed: the exact path, size, revision, Git blob ID, and LFS SHA-256 for
   all 758 files across all 23 pinned repositories are metadata-only sealed; see
   [`source-file-manifest-v0.1.md`](source-file-manifest-v0.1.md).
-- Implemented: the pinned CCCC evidence and fail-closed include/exclude packet;
-  the owner's explicit choice is still pending. See
+- Completed: the pinned CCCC evidence and fail-closed include/exclude packet;
+  the owner selected `include_with_caveat`. See
   [`cccc-owner-decision-v0.1.md`](cccc-owner-decision-v0.1.md).
-- After the choice: request separate production-acquisition approval if CCCC is
-  included, or pin and measure replacement open-web sources if it is excluded.
+- Next: request separate production-acquisition approval; this decision alone
+  does not authorize transfer, cloud compute, or training.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

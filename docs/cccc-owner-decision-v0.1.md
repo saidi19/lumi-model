@@ -1,8 +1,8 @@
 # Lumi CCCC owner-decision gate v0.1
 
-Status: **evidence verified; owner choice pending; CCCC acquisition remains
-blocked; no corpus payload, cloud resource, paid compute, or training is
-authorized**
+Status: **owner selected `include_with_caveat`; decision evidence verified;
+production acquisition remains separately unapproved; no corpus payload,
+cloud resource, paid compute, or training is authorized**
 
 ## Why this gate exists
 
@@ -65,30 +65,25 @@ Excluding does not permit silently repeating another category or changing the
 80B mixture. Replacement sources must pass the same provenance, retention,
 deduplication, contamination, PII, and source-file gates first.
 
-## Engineering recommendation
+## Owner decision
 
-For the currently stated personal/research Lumi v0.1 scope, the engineering
-recommendation is **`include_with_caveat`**, because the source is pinned, the
-upstream domain audit is documented, traceability/removal controls are already
-part of the design, and exclusion creates a measured 12B-token hole. This is
-still an owner risk decision, not a claim that every document has been legally
-adjudicated. Any later commercial release should trigger a fresh licensing and
-attribution review.
+On 2026-07-19 the owner, Afnan Technologies Inc., selected
+**`include_with_caveat`** for the stated Lumi v0.1 personal/research scope. The
+source is pinned, the upstream domain audit is documented, and traceability and
+removal controls are mandatory. This does not claim that every document has
+been legally adjudicated. Any later commercial release must trigger a fresh
+licensing and attribution review.
 
-No option is preselected in Git. The decision remains
-`pending_owner_decision` until the owner explicitly chooses one option and all
-required acknowledgements are recorded.
-
-The independently reproduced pending packet is stored outside Git at
+The independently reproduced decision packet is stored outside Git at
 `lumi-data/cccc-owner-decision-v0.1/`:
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
-| `report.json` | 5,075 | `f738452331c90da3faf8e5b58182064cf3fd100b94dd7c3e467e7344a5b27c46` |
-| `manifest.sha256` | 78 | `1361d78e56bf7d0e87851ad6ffa5cb988217c1799385ffeae2fb03c0319d35df` |
+| `report.json` | 5,112 | `c1a5273b565cb7d49de8f36e0ced6ce2bdd5d6d8b0fb8ef1eca3379c07497c91` |
+| `manifest.sha256` | 78 | `9fbfc76d85d264ed4f74e69ba8f1ec8a50cd8a98efe7fdcec0c536de4199678f` |
 
-The pending decision fingerprint is
-`9df98b984feafa79b6f3892b33d3f426242aae2ff5f05ec52c173c424f449a40`.
+The final decision fingerprint is
+`8e8cce997d8f4e173652b3b92befd096ee63283cbca86d2b870caf1cef1729d1`.
 
 ## Fail-closed behavior
 
@@ -114,10 +109,7 @@ PYTHONPATH=src python scripts/verify_cccc_owner_decision.py \
 
 ## Next boundary
 
-After the owner choice is recorded and independently verified:
-
-- include: request separate approval for the production S3 namespace and
-  adaptive acquisition; or
-- exclude: pin, audit, and measure replacement open-web source(s).
-
-Neither path starts corpus transfer or 4B training automatically.
+The CCCC license-basis blocker is resolved. The next and only immediate
+boundary is separate owner approval for the production S3 namespace and
+adaptive acquisition. This decision does not start corpus transfer or 4B
+training automatically.
