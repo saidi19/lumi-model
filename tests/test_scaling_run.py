@@ -10,6 +10,7 @@ import pytest
 from lumi.scaling_run import (
     ISOLATION_POLICY,
     RUN_KIND,
+    _isolated_manifest_paths,
     expected_training_identity,
     import_isolated_scaling_resume,
     load_isolated_scaling_run_plan,
@@ -64,6 +65,21 @@ def test_cuda_setup_detects_a100_or_h100_architecture() -> None:
         assert "8.0|9.0" in script
         assert 'TORCH_CUDA_ARCH_LIST="$cuda_arch"' in script
         assert "TORCH_CUDA_ARCH_LIST=8.0" not in script
+
+
+def test_isolated_manifest_excludes_the_live_outer_command_log(tmp_path) -> None:
+    (tmp_path / "summary.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "run-command.log").write_text("still receiving stdout", encoding="utf-8")
+    (tmp_path / "manifest.sha256").write_text("old manifest", encoding="utf-8")
+    (tmp_path / "seal.complete").touch()
+    (tmp_path / ".temporary").write_text("partial", encoding="utf-8")
+
+    selected = [
+        path.relative_to(tmp_path).as_posix()
+        for path in _isolated_manifest_paths(tmp_path)
+    ]
+
+    assert selected == ["summary.json"]
 
 
 def test_tampered_milestone_is_rejected(tmp_path) -> None:

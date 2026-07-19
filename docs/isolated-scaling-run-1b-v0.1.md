@@ -1,7 +1,46 @@
 # Lumi-1B Isolated 1.4B-Token Run v0.1
 
-Status: **free preparation and local gates complete; no paid GPU launch is
-authorized or running**
+Status: **the authorized 1.4B-token H100 run passed, its archive is independently
+verified, the Lambda instance is terminated, and no paid GPU is running**
+
+## Verified H100 outcome
+
+The canonical isolated run began from random initialization, exported an exact
+step-100 resumable state, and then continued on one Lambda H100 from cumulative
+step 101 through the hard stop at step 42,725. It processed exactly
+`1,400,012,800` tokens with the `1,050,981,888`-parameter model. The owner
+authorization remained capped at step 42,725 and recorded
+`full_4b_training=false`; no 4B command was launched.
+
+| Frozen held-out evaluation | Loss | Perplexity |
+| --- | ---: | ---: |
+| Isolated, step 100 | 7.794926 | 2,428.251 |
+| Isolated, step 7,630 | 3.266177 | 26.211 |
+| Isolated, step 42,725 | 2.596964 | 13.423 |
+| Legacy separator-only semantics, step 42,725 | 2.643961 | 14.069 |
+
+The decreasing isolated held-out curve establishes learning and stable long-run
+execution. It does not make this deliberately undertrained 1B checkpoint a
+production chat model. The final isolated evaluation is also better than the
+explicitly labelled legacy evaluation on this fixed artifact, but that is an
+evaluation-policy comparison, not a frontier-model benchmark.
+
+Steps 101--42,725 sustained a measured median of `19,900.242` tokens/second.
+Their summed step time was `70,593.663` seconds (`19.609` hours), giving a
+recorded step-compute estimate of USD `84.1241` at the authorized H100 rate of
+USD `4.29`/hour. This excludes setup, evaluation, archive-transfer, and any
+provider billing granularity, so it is not an invoice total.
+
+The downloaded archive binds source commit
+`5c5c20162369d56cd6e467fdb7e9b633a64cca2e`. All 77 current server artifacts
+pass the independently downloaded post-seal manifest whose SHA-256 is
+`36379874d55d71d36c06f53650254f474d7500cc96d14071d669bd4eaba5c615`.
+The original in-workspace manifest passed 76 of 77 entries; its only mismatch
+was `run-command.log`. Its expected digest matches the exact log prefix present
+when sealing occurred, while the suffix contains only the seal command's final
+JSON and PASS line appended by the outer `tee`. Model, optimizer, checkpoint,
+evaluation, and authorization artifacts all matched. The sealer now excludes
+that necessarily live outer command log from future in-process manifests.
 
 ## Outcome of the packed-attention experiment
 
@@ -23,13 +62,12 @@ hardware, and FlashAttention fixed. The document-isolated policy:
 - used the same peak reserved HBM.
 
 This removes both identified risks: accidental cross-document context and the
-assumption that correctness must cost throughput. It does not prove better
-final reasoning from only 100 steps. The existing separator-only 250M
-checkpoint stays valid and immutable, but it cannot be resumed into the new
-policy. The next isolated model must start from random initialization at step
-zero.
+assumption that correctness must cost throughput. It did not prove better final
+reasoning from only 100 steps. The existing separator-only 250M checkpoint stays
+valid and immutable, but it was not resumed into the new policy; the canonical
+isolated run started from random initialization at step zero.
 
-## Prepared run
+## Executed run contract
 
 `configs/isolated-scaling-run-1b-v0.1.json` cross-pins the existing cloud,
 scaling, evaluation, model, training-data, and held-out contracts. It fixes:
@@ -74,7 +112,7 @@ the primary isolated score and one explicitly labelled legacy score.
 
 ## Time and cost projection
 
-The preparation report uses the measured isolated A100 median of
+The original preparation report used the measured isolated A100 median of
 `9,809.508788719386` tokens/second. At the previously observed Lambda rate of
 USD `1.99` per hour:
 
@@ -98,8 +136,8 @@ python scripts/plan_isolated_scaling_run.py
 
 The output must say `planning_only` and `paid_gpu_launch=false`.
 
-The completed free gate passes the full repository test suite, Ruff, both shell
-syntax checks, canonical contract/hash validation, projection arithmetic,
+The completed preparation gate passed the full repository test suite, Ruff,
+both shell syntax checks, canonical contract/hash validation, projection arithmetic,
 authorization-tamper tests, atomic model-only snapshot tests, and isolated
 evaluation resume/fingerprint tests.
 
@@ -127,7 +165,7 @@ SHA-256, provider, instance type, current hourly rate, and one declared maximum
 step. It can authorize only steps 1, 2, 100, 7,630, or 42,725 and must keep 4B
 training false. The repository plan itself never grants launch authority.
 
-After an explicit owner decision, the safe order is:
+The completed run followed this safe order:
 
 1. merge this preparation branch and bind the resulting source commit;
 2. create the out-of-repository authorization for the chosen milestone;
@@ -162,7 +200,7 @@ and evaluation evidence.
 
 ## What this run can establish
 
-A successful 1.4B-token gate can establish that the 1B architecture, optimizer,
+The successful 1.4B-token gate establishes that the 1B architecture, optimizer,
 isolated attention, resume path, held-out curve, and long single-GPU runtime are
 stable. At only 1.33 training tokens per parameter, it is still intentionally
 undertrained. It should not be expected to become ChatGPT-quality, and it does

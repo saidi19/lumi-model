@@ -114,13 +114,22 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     rate, or about USD 82.87 with a two-hour lifecycle allowance. The full test
     suite, Ruff, and shell syntax gates pass. The repository itself never
     authorizes a paid launch; every run requires a separate owner artifact.
+26. the separately owner-authorized isolated run resumes its hash-bound step-100
+    state and hard-stops exactly at cumulative step 42,725 and 1,400,012,800
+    tokens on one Lambda H100. Isolated held-out loss falls from 7.794926 at
+    step 100 to 3.266177 at step 7,630 and 2.596964 at the final checkpoint
+    (perplexity 13.423); the final legacy-policy evaluation is 2.643961.
+    Steps 101--42,725 sustain a 19,900.2 tokens/second median and USD 84.1241
+    measured step-compute estimate at USD 4.29/hour. All 77 current server
+    artifacts pass an independently downloaded post-seal manifest, the
+    35.3GiB archive is retained on the Mac, and the H100 is terminated. The
+    authorization still records `full_4b_training=false`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
-design, hash-ranked held-out-excluding artifact, two-step A100 smoke gate, and
-100-step calibration and 250M-token learning gate are complete. The 1.4B-token
-stage and every 4B stage remain unapproved. A future isolated-policy 1.4B run
-must begin from step zero rather than resume the separator-only 250M checkpoint.
-The completed 150M and 1B pilot checkpoints are not production-quality models.
+design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
+A/B, and the isolated 1.4B-token H100 run are complete. Every 4B stage remains
+unapproved. The completed 150M and 1B pilot checkpoints are not
+production-quality models.
 
 ## Quick start
 

@@ -31,6 +31,11 @@ MILESTONE_NAMES = (
 MILESTONE_STEPS = (1, 2, 100, 7_630, 42_725)
 MODEL_SNAPSHOT_EXCLUDES = {"trainer.pt", "training-state.json"}
 MODEL_PARAMETERS = 1_050_981_888
+ISOLATED_MANIFEST_EXCLUDES = {
+    "manifest.sha256",
+    "run-command.log",
+    "seal.complete",
+}
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -57,6 +62,18 @@ def sha256_file(path: str | Path) -> str:
         for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _isolated_manifest_paths(workspace: Path) -> list[Path]:
+    """Return artifacts that are immutable when the in-process seal is written."""
+
+    return sorted(
+        path
+        for path in workspace.rglob("*")
+        if path.is_file()
+        and path.name not in ISOLATED_MANIFEST_EXCLUDES
+        and not path.name.startswith(".")
+    )
 
 
 def _fingerprint(value: Any) -> str:
@@ -990,13 +1007,10 @@ def seal_isolated_scaling_run(
     summary_path = workspace / "summary.json"
     _write_json_atomic(summary_path, summary)
 
-    selected = sorted(
-        path
-        for path in workspace.rglob("*")
-        if path.is_file()
-        and path.name not in {"manifest.sha256", "seal.complete"}
-        and not path.name.startswith(".")
-    )
+    # The outer tmux command may still be teeing this process's final JSON and
+    # PASS line into run-command.log. It cannot be part of an in-process fixed
+    # manifest because the log is necessarily still open and mutable here.
+    selected = _isolated_manifest_paths(workspace)
     manifest_path = workspace / "manifest.sha256"
     temporary = manifest_path.with_name(f".{manifest_path.name}.{uuid.uuid4().hex}.tmp")
     with temporary.open("w", encoding="utf-8") as handle:
