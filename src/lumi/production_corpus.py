@@ -40,6 +40,7 @@ IMPLEMENTATION_FILES = (
     "pyproject.toml",
     "scripts/run_production_acquisition.py",
     "src/lumi/__init__.py",
+    "src/lumi/aws_s3_canary.py",
     "src/lumi/production_corpus.py",
     "src/lumi/data_pipeline.py",
     "src/lumi/data_quality.py",
@@ -1226,7 +1227,7 @@ def _run_production_acquisition_locked(
     training_exclusion_ledger: Path,
     production_report: Path,
     state_directory: Path,
-    profile: str = "default",
+    profile: str | None = None,
     maximum_runtime_seconds: int | None = None,
     batch_records: int = 32,
 ) -> dict[str, Any]:
@@ -1565,7 +1566,7 @@ def run_production_acquisition(
     training_exclusion_ledger: Path,
     production_report: Path,
     state_directory: Path,
-    profile: str = "default",
+    profile: str | None = None,
     maximum_runtime_seconds: int | None = None,
     batch_records: int = 32,
 ) -> dict[str, Any]:

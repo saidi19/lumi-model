@@ -64,9 +64,9 @@ def _write_json_atomic(path: Path, value: dict[str, Any], *, private: bool = Fal
 class AwsCli:
     """Small AWS CLI adapter that never logs credentials or environment values."""
 
-    def __init__(self, profile: str, region: str) -> None:
-        if not profile or not region:
-            raise ValueError("AWS profile and region are required")
+    def __init__(self, profile: str | None, region: str) -> None:
+        if profile == "" or not region:
+            raise ValueError("AWS profile must be None or non-empty, and region is required")
         self.profile = profile
         self.region = region
 
@@ -77,19 +77,21 @@ class AwsCli:
         *arguments: str,
         allow_failure: bool = False,
     ) -> tuple[int, dict[str, Any], str]:
-        command = [
-            "aws",
-            "--profile",
-            self.profile,
-            "--region",
-            self.region,
-            "--no-cli-pager",
-            "--output",
-            "json",
-            service,
-            operation,
-            *arguments,
-        ]
+        command = ["aws"]
+        if self.profile is not None:
+            command.extend(("--profile", self.profile))
+        command.extend(
+            [
+                "--region",
+                self.region,
+                "--no-cli-pager",
+                "--output",
+                "json",
+                service,
+                operation,
+                *arguments,
+            ]
+        )
         environment = {**os.environ, "AWS_PAGER": ""}
         completed = subprocess.run(
             command,

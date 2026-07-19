@@ -18,7 +18,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer", type=Path, required=True)
     parser.add_argument("--training-exclusion-ledger", type=Path, required=True)
     parser.add_argument("--production-report", type=Path, required=True)
-    parser.add_argument("--profile", default="default")
+    parser.add_argument(
+        "--profile",
+        help="Named local AWS profile; omit on EC2 to use the instance role.",
+    )
     parser.add_argument("--maximum-runtime-seconds", type=int)
     parser.add_argument("--batch-records", type=int, default=32)
     parser.add_argument(

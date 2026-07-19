@@ -683,7 +683,7 @@ chmod 0755 /usr/local/sbin/run-lumi-acquisition
 cat >/etc/systemd/system/lumi-production-acquisition.service <<'UNIT'
 [Unit]
 Description=Lumi bounded production corpus acquisition
-After=network-online.target cloud-final.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]

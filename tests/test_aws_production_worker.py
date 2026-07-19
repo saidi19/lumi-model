@@ -114,6 +114,7 @@ def test_launch_plan_and_userdata_preserve_bounded_cpu_worker(tmp_path: Path) ->
     assert "--maximum-runtime-seconds 259200" in user_data
     assert "HttpTokens" not in user_data
     assert "shutdown -h now" in user_data
+    assert "cloud-final.service" not in user_data
     assert "training-exclusion-ledger" in user_data
     assert "torch" not in user_data.lower()
 
