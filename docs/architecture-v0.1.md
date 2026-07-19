@@ -87,6 +87,20 @@ initialization. See
 [`init-optimizer-ab-v0.1.md`](init-optimizer-ab-v0.1.md) for the pinned design,
 thresholds, metrics, and independent evidence checks.
 
+## Distributed trainer gate
+
+The production trainer has separate DDP and FSDP `FULL_SHARD` strategies, a
+rank-partitioned cached epoch permutation, one global checkpoint cursor, DCP
+model shards, rank-local optimizer/RNG state, atomic hash manifests, and an
+independent full-model reconstruction check. A two-process CPU/Gloo gate passes
+exact interrupted resume for both strategies. The optional `torch.compile`
+path compiles the inner Lumi module before wrapping, matching current PyTorch
+guidance; it remains disabled until measured on CUDA.
+
+This is not a multi-GPU approval. NCCL, BF16, FlashAttention, compile speed,
+4B HBM, and production checkpoint I/O still require one short hash-bound CUDA
+smoke. See [`distributed-trainer-v0.1.md`](distributed-trainer-v0.1.md).
+
 ## Mandatory gates
 
 ### Architecture correctness
@@ -116,6 +130,7 @@ not branding, decide the frozen architecture.
 - A 50M-150M pilot learns from a real clean corpus.
 - A larger pilot establishes loss trend, memory use, MFU/throughput, checkpoint
 reliability, and cost per billion tokens.
+- DDP/FSDP exact resume passes locally before a short CUDA/NCCL smoke.
 
 See [`portability-v0.1.md`](portability-v0.1.md) for per-backend status and
 [`tokenizer-v0.1.md`](tokenizer-v0.1.md) for the tokenizer freeze gates.

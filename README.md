@@ -136,6 +136,20 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     therefore selects residual-scaled initialization and retains legacy AdamW;
     all 136 sealed evidence hashes pass independently, while historical 150M/1B
     configs and checkpoints remain unchanged.
+28. the production distributed-trainer plumbing now passes a real two-process
+    M5/CPU gate for both DDP and FSDP `FULL_SHARD`. Rank-disjoint cached-epoch
+    data order, global cursor accounting, DCP model shards, rank-local
+    optimizer/RNG state, atomic manifests, pruning, and post-group full-model
+    reconstruction are implemented. Corpus hashes are checked once per node,
+    while every rank confirms the same manifest identity. After simulated
+    partial checkpoints plus a crash between checkpoint publication and root
+    state/metric commit, uninterrupted and resumed four-step runs have exact
+    per-step quality metrics and exact final model hashes in both strategies.
+    A one-step two-process CPU `torch.compile` compatibility canary also
+    completes with a verified checkpoint. All 83 archived evidence hashes pass
+    independently. CUDA/NCCL, BF16, FlashAttention, compiled CUDA throughput,
+    and real 4B memory/throughput remain a separate owner-authorized smoke gate;
+    no paid GPU or 4B run was started.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -194,6 +208,10 @@ documented in
 The paired-seed residual-initialization and AdamW-profile experiment, resume
 canary, conservative decision rule, and sealed M5 evidence are documented in
 [`docs/init-optimizer-ab-v0.1.md`](docs/init-optimizer-ab-v0.1.md).
+The DDP/FSDP topology, cached global data cursor, distributed checkpoint/resume
+format, local interruption gate, safety caps, and remaining CUDA boundary are
+documented in
+[`docs/distributed-trainer-v0.1.md`](docs/distributed-trainer-v0.1.md).
 
 ## Repository policy
 
