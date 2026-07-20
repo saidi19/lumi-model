@@ -77,7 +77,8 @@ def _map_source_partition(
         candidate_to_spark_row,
         load_training_exclusions,
     )
-    from lumi.production_corpus import _download_source, _iter_gzip_records
+    from lumi.production_corpus import _iter_gzip_records
+    from lumi.s3_staged_corpus import download_staged_source
 
     _verify_python_runtime()
     quality = json.loads(json.dumps(runtime["data_quality"]))
@@ -97,15 +98,19 @@ def _map_source_partition(
         excluded_content_sha256=exclusions[1],
         excluded_near_sha256=exclusions[2],
     )
+    import boto3
+
+    s3_client = boto3.client("s3")
     context = TaskContext.get()
     partition_id = -1 if context is None else context.partitionId()
     for source in source_iterator:
         scratch = Path(tempfile.mkdtemp(prefix=f"lumi-emr-{partition_id}-"))
         try:
-            source_path = _download_source(
+            source_path = download_staged_source(
                 source,
                 scratch,
-                int(source["source_bytes"]) + 16 * 1024 * 1024,
+                scratch_cap=int(source["source_bytes"]) + 16 * 1024 * 1024,
+                s3_client=s3_client,
             )
             records = []
             processed = 0

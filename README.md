@@ -261,6 +261,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     No parity report, production shard, or model training is produced. All
     temporary resources are deleted or terminated. The next revision must stage
     pinned inputs in S3 and keep EMR on same-Region S3 I/O.
+39. that S3-only revision is now implemented and verified locally. Its exact
+    eight-source plan covers all seven categories and 1,456,514,440 compressed
+    bytes. Content-addressed conditional writes, stored SHA-256 checksums,
+    wrong-object refusal, interrupted range resume, and a no-HTTP-fallback EMR
+    source path pass 79 corpus-focused tests including real Spark/sequential
+    parity; the complete repository suite passes 239/239. The eight downloads
+    are now folded into the same bounded 30-minute CodeBuild image build, with
+    two workers and a verified 64GB-disk/4GiB-memory envelope. No source object
+    was uploaded and no paid work is authorized; see
+    [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -268,7 +278,8 @@ A/B, isolated 1.4B-token H100 run, final tokenizer gate, and local
 initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
 The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, live bounded I/O canary, preserved production prefix, and
-local distributed-acquisition parity gate are complete. The complete source
+local distributed-acquisition parity gate, and local S3-only source transport
+gate are complete. The complete source
 file manifest and the fail-closed CCCC decision are also complete. A bounded
 S3-staged replacement EMR parity canary, distributed production resume, a 4B
 learning pilot, and the full 4B/80B pretraining run remain unapproved.
@@ -363,6 +374,10 @@ The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
 envelope, successful image build, external-egress diagnosis, cleanup, and
 S3-staged next boundary are documented in
 [`docs/distributed-corpus-emr-serverless-v0.1.md`](docs/distributed-corpus-emr-serverless-v0.1.md).
+The immutable S3 source binding, bounded same-build producer, resumable S3-only
+consumer, 79-test focused result, 239-test full-suite result, and unchanged
+no-cloud/no-training boundary are documented in
+[`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
 
 ## Repository policy
 

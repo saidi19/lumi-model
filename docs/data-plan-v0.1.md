@@ -179,10 +179,21 @@ evidence itself is only 16,750 bytes. See
   job was cancelled at 273 seconds, no retry/parity/production write occurred,
   combined build-plus-EMR compute is estimated at $0.139446578, and all
   temporary resources are gone or terminated.
-- Next: stage exact pinned source objects in the private S3 bucket and revise
-  the bounded parity job to read only S3. A new exact approval is still required
-  for that canary. Distributed production remains a separate later approval
-  after measured parity, throughput, and cost.
+- Completed locally: the replacement source transport stages exact pinned
+  files under SHA-256-addressed private S3 keys and makes EMR consume only those
+  objects. Conditional writes, stored checksum/metadata verification,
+  interrupted range resume, wrong-object refusal, and real Spark/sequential
+  parity pass 79 corpus-focused tests; the complete repository suite passes
+  239/239. The unchanged eight-source plan covers
+  all seven categories and 1,456,514,440 compressed bytes; no cloud write or
+  paid compute occurred. See [`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
+- Completed locally: the internet-facing producer now runs before the image
+  build inside the same `BUILD_GENERAL1_SMALL` CodeBuild. Two streaming workers
+  stage the eight files, verified existing objects skip upstream downloads, and
+  the original 30-minute/$0.15 build cap is unchanged. The clean package must
+  now be rebuilt from this exact commit before requesting a new approval.
+  Distributed production remains a separate later approval after measured
+  parity, throughput, and cost.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

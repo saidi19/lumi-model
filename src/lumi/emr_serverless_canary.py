@@ -36,10 +36,17 @@ from .production_corpus import (
     _sha256_file,
     build_round_robin_source_schedule,
 )
+from .s3_staged_corpus import (
+    bind_staged_sources,
+    build_s3_staging_plan,
+    validate_s3_staging_plan,
+    validate_staged_consumer_source,
+    write_s3_staging_plan,
+)
 
 EMR_CANARY_APPROVAL_TEXT = (
-    "I approve one bounded Lumi AWS CodeBuild image build and one bounded AWS EMR "
-    "Serverless distributed corpus canary only."
+    "I approve one bounded Lumi AWS CodeBuild source-staging and image build and "
+    "one bounded AWS EMR Serverless distributed corpus canary only."
 )
 EMR_RELEASE_SCHEMA_VERSION = 1
 EMR_AUTHORIZATION_SCHEMA_VERSION = 1
@@ -49,11 +56,15 @@ RELEASE_FILE = "emr-serverless-canary-release-v0.1.json"
 CODE_ARCHIVE = "lumi-emr-serverless-code-v0.1.zip"
 IMAGE_CONTEXT = "lumi-emr-serverless-image-context-v0.1.zip"
 JOB_SCRIPT = "run_emr_serverless_distributed_canary.py"
+S3_STAGING_PLAN = "s3-staging-plan-v0.1.json"
+STAGING_REQUIREMENTS = "requirements-staging-linux-x86_64.lock"
+STAGING_SCRIPT = "stage_s3_corpus_canary.py"
 BASE_IMAGE_DIGEST = "sha256:3e465888c2b00add9d298a2b4c14c7951262d9c2b35a3f8c1b109dc21cd9714d"
 BASE_IMAGE_URI = (
     "public.ecr.aws/emr-serverless/spark/emr-7.13.0@" + BASE_IMAGE_DIGEST
 )
-BUILDSPEC_SHA256 = "b2f60bf5a3ecdbeb921c2893038e3b2621147bc8ca1c1494cb9ac75ba8bd461d"
+BUILDSPEC_SHA256 = "fdd179efbad8a4499eb00432b074e7be32849fff098d4db243dfd61319d0a041"
+CODEBUILD_STANDARD_IMAGE = "aws/codebuild/amazonlinux-x86_64-standard:6.0-26.05.12"
 PRIVATE_IMAGE_PATTERN = re.compile(
     r"^(?P<account>[0-9]{12})\.dkr\.ecr\.us-east-1\.amazonaws\.com/"
     r"lumi-emr-serverless@(?P<digest>sha256:[0-9a-f]{64})$"
@@ -101,7 +112,12 @@ def _validate_contract(contract: dict[str, Any], root: Path) -> dict[str, Path]:
     if contract.get("authorization") != expected_authorization:
         raise ValueError("EMR canary contract must not authorize paid work or training")
     pins = contract.get("inputs", {})
-    if set(pins) != {"codebuild_pricing", "emr_pricing", "source_contract"}:
+    if set(pins) != {
+        "codebuild_pricing",
+        "emr_pricing",
+        "source_contract",
+        "source_transport",
+    }:
         raise ValueError("EMR canary input set changed")
     paths = {name: _verify_pin(root, pin, name) for name, pin in pins.items()}
     image = contract.get("image", {})
@@ -109,7 +125,14 @@ def _validate_contract(contract: dict[str, Any], root: Path) -> dict[str, Path]:
         raise ValueError("EMR Serverless base image digest changed")
     if image.get("base_uri") != BASE_IMAGE_URI:
         raise ValueError("EMR Serverless base image URI changed")
-    for label in ("buildspec", "dockerfile", "requirements_lock", "verifier"):
+    for label in (
+        "buildspec",
+        "dockerfile",
+        "requirements_lock",
+        "staging_requirements_lock",
+        "staging_script",
+        "verifier",
+    ):
         paths[label] = _verify_pin(root, image.get(label, {}), label)
     if image.get("python_minor") != "3.12" or image.get("python_executable") != (
         "/opt/lumi/python312/bin/python"
@@ -290,10 +313,16 @@ def build_emr_serverless_canary_package(
         )
     if len(sources) != 8 or sources[0]["start_line"] != 38_849:
         raise ValueError("EMR canary source slice changed")
+    staging_plan = build_s3_staging_plan(
+        paths["source_transport"], repository_root=root
+    )
+    sources = bind_staged_sources(sources, staging_plan)
 
     output_directory.mkdir(parents=True, exist_ok=True)
     code_path = output_directory / CODE_ARCHIVE
     implementation = _zip_code(root, code_path)
+    staging_plan_path = output_directory / S3_STAGING_PLAN
+    write_s3_staging_plan(staging_plan_path, staging_plan)
     job_source = root / "scripts" / JOB_SCRIPT
     job_copy = output_directory / JOB_SCRIPT
     _write_bytes_atomic(job_copy, job_source.read_bytes())
@@ -303,10 +332,19 @@ def build_emr_serverless_canary_package(
         (paths["buildspec"], "buildspec.yml"),
         (paths["dockerfile"], "Dockerfile"),
         (paths["requirements_lock"], "requirements-linux-x86_64.lock"),
+        (paths["staging_requirements_lock"], STAGING_REQUIREMENTS),
+        (paths["staging_script"], STAGING_SCRIPT),
         (paths["verifier"], "verify_runtime.py"),
     ]
     context_path = output_directory / IMAGE_CONTEXT
-    _zip_named_files(context_path, container_files)
+    _zip_named_files(
+        context_path,
+        [
+            *container_files,
+            (code_path, CODE_ARCHIVE),
+            (staging_plan_path, S3_STAGING_PLAN),
+        ],
+    )
     packaged_container = []
     for source, name in container_files:
         destination = output_directory / name
@@ -443,6 +481,15 @@ def build_emr_serverless_canary_package(
         "schema_version": EMR_RELEASE_SCHEMA_VERSION,
         "source_commit": commit,
         "source_plan_fingerprint": source_plan["plan_fingerprint"],
+        "source_transport": {
+            "direct_external_http_fallback": False,
+            "network_path": "same_region_s3_only",
+            "plan_fingerprint": staging_plan["plan_fingerprint"],
+            "producer": deepcopy(staging_plan["producer"]),
+            "source_bytes": staging_plan["summary"]["source_bytes"],
+            "source_files": staging_plan["summary"]["source_files"],
+            "staging_plan_sha256": _sha256_file(staging_plan_path),
+        },
         "sources": sources,
     }
     fingerprint = _release_fingerprint(release_material)
@@ -466,6 +513,7 @@ def build_emr_serverless_canary_package(
         release_path,
         code_path,
         context_path,
+        staging_plan_path,
         packaged_anchors,
         job_copy,
         *packaged_container,
@@ -569,6 +617,46 @@ def validate_emr_serverless_canary_release(
     }
     if {str(source["category"]) for source in sources} != expected_categories:
         raise ValueError("EMR canary category coverage changed")
+    transport = release.get("source_transport")
+    if not isinstance(transport, dict) or set(transport) != {
+        "direct_external_http_fallback",
+        "network_path",
+        "plan_fingerprint",
+        "producer",
+        "source_bytes",
+        "source_files",
+        "staging_plan_sha256",
+    }:
+        raise ValueError("EMR canary source transport is missing")
+    if (
+        transport.get("direct_external_http_fallback") is not False
+        or transport.get("network_path") != "same_region_s3_only"
+        or transport.get("source_files") != 8
+        or transport.get("source_bytes")
+        != sum(int(source["source_bytes"]) for source in sources)
+        or transport.get("producer")
+        != {
+            "compute_type": "BUILD_GENERAL1_SMALL",
+            "disk_gb": 64,
+            "direct_source_network_required": True,
+            "launch_authorized": False,
+            "maximum_build_minutes": 30,
+            "maximum_parallel_downloads": 2,
+            "memory_gib": 4,
+            "service": "aws_codebuild_same_image_build",
+            "source_files": 8,
+            "vcpu": 2,
+        }
+        or re.fullmatch(r"[0-9a-f]{64}", str(transport.get("plan_fingerprint", "")))
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}", str(transport.get("staging_plan_sha256", ""))
+        )
+        is None
+    ):
+        raise ValueError("EMR canary source transport changed")
+    for source in sources:
+        validate_staged_consumer_source(source)
     image = release.get("image", {})
     if (
         image.get("base_digest") != BASE_IMAGE_DIGEST
@@ -695,6 +783,254 @@ def _bounded_s3_file(uri: str, *, bucket: str | None = None) -> tuple[str, str]:
     return parsed.netloc, Path(parsed.path).name
 
 
+def _codebuild_inputs(
+    release: dict[str, Any],
+    authorization: dict[str, Any],
+    *,
+    account_id: str,
+    context_version_id: str,
+    now: datetime | None,
+) -> dict[str, Any]:
+    validate_emr_serverless_canary_release(release)
+    validate_emr_serverless_canary_authorization(authorization, release, now=now)
+    if release["image"]["state"] != "build_not_authorized":
+        raise ValueError("CodeBuild request requires an image-unbound release")
+    if re.fullmatch(r"[0-9]{12}", account_id) is None:
+        raise ValueError("CodeBuild account ID is invalid")
+    if (
+        not isinstance(context_version_id, str)
+        or not 1 <= len(context_version_id) <= 1_024
+        or any(ord(character) < 33 or ord(character) == 127 for character in context_version_id)
+    ):
+        raise ValueError("CodeBuild S3 source version ID is invalid")
+    context_uri = release["artifacts"]["image_context"]["s3_uri"]
+    _bounded_s3_file(context_uri)
+    parsed = urlparse(context_uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.strip("/"):
+        raise ValueError("CodeBuild image context must be a private S3 object")
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    fingerprint = release["release_fingerprint"]
+    project_name = f"lumi-emr-staged-{fingerprint[:12]}"
+    repository_name = "lumi-emr-serverless"
+    registry_uri = f"{account_id}.dkr.ecr.us-east-1.amazonaws.com"
+    implementation = release["implementation"]
+    environment = {
+        "AUTHORIZED_STAGING_PLAN_FINGERPRINT": authorization[
+            "source_staging_plan_fingerprint"
+        ],
+        "EXPECTED_CODE_ARCHIVE_SHA256": release["artifacts"]["code_archive"][
+            "sha256"
+        ],
+        "EXPECTED_DOCKERFILE_SHA256": implementation[
+            "containers/emr-serverless-7.13-python312/Dockerfile"
+        ],
+        "EXPECTED_REQUIREMENTS_SHA256": implementation[
+            "containers/emr-serverless-7.13-python312/requirements-linux-x86_64.lock"
+        ],
+        "EXPECTED_SOURCE_VERSION": context_version_id,
+        "EXPECTED_STAGING_PLAN_FINGERPRINT": release["source_transport"][
+            "plan_fingerprint"
+        ],
+        "EXPECTED_STAGING_PLAN_SHA256": release["source_transport"][
+            "staging_plan_sha256"
+        ],
+        "EXPECTED_STAGING_REQUIREMENTS_SHA256": implementation[
+            "containers/emr-serverless-7.13-python312/requirements-staging-linux-x86_64.lock"
+        ],
+        "EXPECTED_STAGING_SCRIPT_SHA256": implementation[
+            "scripts/stage_s3_corpus_canary.py"
+        ],
+        "EXPECTED_VERIFIER_SHA256": implementation[
+            "containers/emr-serverless-7.13-python312/verify_runtime.py"
+        ],
+        "IMAGE_TAG": authorization["run_token"],
+        "REGISTRY_URI": registry_uri,
+        "RELEASE_FINGERPRINT": fingerprint,
+        "REPOSITORY_NAME": repository_name,
+        "REPOSITORY_URI": f"{registry_uri}/{repository_name}",
+        "SOURCE_COMMIT": release["source_commit"],
+    }
+    return {
+        "bucket": bucket,
+        "context_version_id": context_version_id,
+        "environment": environment,
+        "key": key,
+        "project_name": project_name,
+        "repository_name": repository_name,
+    }
+
+
+def build_codebuild_project_request(
+    release: dict[str, Any],
+    authorization: dict[str, Any],
+    *,
+    account_id: str,
+    context_version_id: str,
+    service_role_arn: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Render one no-retry source-staging/image-build project without calling AWS."""
+
+    inputs = _codebuild_inputs(
+        release,
+        authorization,
+        account_id=account_id,
+        context_version_id=context_version_id,
+        now=now,
+    )
+    role_pattern = (
+        rf"arn:aws:iam::{account_id}:role/"
+        rf"lumi-codebuild-emr-canary-{release['release_fingerprint'][:12]}"
+    )
+    if re.fullmatch(role_pattern, service_role_arn) is None:
+        raise ValueError("CodeBuild service role is not release-scoped")
+    environment_variables = [
+        {"name": name, "type": "PLAINTEXT", "value": value}
+        for name, value in sorted(inputs["environment"].items())
+    ]
+    return {
+        "artifacts": {"type": "NO_ARTIFACTS"},
+        "autoRetryLimit": 0,
+        "badgeEnabled": False,
+        "concurrentBuildLimit": 1,
+        "description": "One bounded Lumi S3 source-staging and EMR image build",
+        "environment": {
+            "computeType": "BUILD_GENERAL1_SMALL",
+            "environmentVariables": environment_variables,
+            "image": CODEBUILD_STANDARD_IMAGE,
+            "imagePullCredentialsType": "CODEBUILD",
+            "privilegedMode": True,
+            "type": "LINUX_CONTAINER",
+        },
+        "logsConfig": {
+            "cloudWatchLogs": {
+                "groupName": f"/aws/codebuild/{inputs['project_name']}",
+                "status": "ENABLED",
+                "streamName": "one-authorized-build",
+            },
+            "s3Logs": {"status": "DISABLED"},
+        },
+        "name": inputs["project_name"],
+        "queuedTimeoutInMinutes": 10,
+        "serviceRole": service_role_arn,
+        "source": {
+            "location": f"{inputs['bucket']}/{inputs['key']}",
+            "type": "S3",
+        },
+        "sourceVersion": context_version_id,
+        "tags": [
+            {"key": "LumiReleaseFingerprint", "value": release["release_fingerprint"]},
+            {"key": "LumiScope", "value": "bounded-corpus-canary-only"},
+        ],
+        "timeoutInMinutes": 30,
+    }
+
+
+def build_codebuild_start_request(
+    release: dict[str, Any],
+    authorization: dict[str, Any],
+    *,
+    account_id: str,
+    context_version_id: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Render an idempotent no-retry StartBuild request without calling AWS."""
+
+    inputs = _codebuild_inputs(
+        release,
+        authorization,
+        account_id=account_id,
+        context_version_id=context_version_id,
+        now=now,
+    )
+    return {
+        "autoRetryLimitOverride": 0,
+        "idempotencyToken": authorization["run_token"],
+        "projectName": inputs["project_name"],
+        "queuedTimeoutInMinutesOverride": 10,
+        "sourceVersion": context_version_id,
+        "timeoutInMinutesOverride": 30,
+    }
+
+
+def build_codebuild_service_policy(
+    release: dict[str, Any], *, account_id: str
+) -> dict[str, Any]:
+    """Render the exact build-role policy; no delete, EMR, GPU, or broad S3 access."""
+
+    validate_emr_serverless_canary_release(release)
+    if re.fullmatch(r"[0-9]{12}", account_id) is None:
+        raise ValueError("CodeBuild account ID is invalid")
+    raw_context_uri = release["artifacts"]["image_context"]["s3_uri"]
+    _bounded_s3_file(raw_context_uri)
+    context_uri = urlparse(raw_context_uri)
+    bucket = context_uri.netloc
+    context_key = context_uri.path.lstrip("/")
+    if any(source["staged_object"]["bucket"] != bucket for source in release["sources"]):
+        raise ValueError("CodeBuild staged objects must use the sealed corpus bucket")
+    raw_objects = sorted(
+        f"arn:aws:s3:::{source['staged_object']['bucket']}/{source['staged_object']['key']}"
+        for source in release["sources"]
+    )
+    fingerprint = release["release_fingerprint"]
+    log_group = f"/aws/codebuild/lumi-emr-staged-{fingerprint[:12]}"
+    repository = f"arn:aws:ecr:us-east-1:{account_id}:repository/lumi-emr-serverless"
+    return {
+        "Statement": [
+            {
+                "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+                "Effect": "Allow",
+                "Resource": [
+                    f"arn:aws:logs:us-east-1:{account_id}:log-group:{log_group}",
+                    f"arn:aws:logs:us-east-1:{account_id}:log-group:{log_group}:*",
+                ],
+                "Sid": "BuildLogs",
+            },
+            {
+                "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+                "Effect": "Allow",
+                "Resource": f"arn:aws:s3:::{bucket}/{context_key}",
+                "Sid": "ReadPinnedImageContext",
+            },
+            {
+                "Action": ["s3:GetObject", "s3:PutObject"],
+                "Effect": "Allow",
+                "Resource": raw_objects,
+                "Sid": "StageExactSourceObjects",
+            },
+            {
+                "Action": ["s3:GetBucketAcl", "s3:GetBucketLocation"],
+                "Effect": "Allow",
+                "Resource": f"arn:aws:s3:::{bucket}",
+                "Sid": "InspectBuildBucket",
+            },
+            {
+                "Action": "ecr:GetAuthorizationToken",
+                "Effect": "Allow",
+                "Resource": "*",
+                "Sid": "EcrLogin",
+            },
+            {
+                "Action": [
+                    "ecr:BatchCheckLayerAvailability",
+                    "ecr:BatchGetImage",
+                    "ecr:CompleteLayerUpload",
+                    "ecr:DescribeImages",
+                    "ecr:GetDownloadUrlForLayer",
+                    "ecr:InitiateLayerUpload",
+                    "ecr:PutImage",
+                    "ecr:UploadLayerPart",
+                ],
+                "Effect": "Allow",
+                "Resource": repository,
+                "Sid": "PushOneCanaryImage",
+            },
+        ],
+        "Version": "2012-10-17",
+    }
+
+
 def build_emr_serverless_job_request(
     release: dict[str, Any],
     authorization: dict[str, Any],
@@ -804,7 +1140,10 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
         "benchmark-signatures-v0.1.jsonl.gz",
         "buildspec.yml",
         "requirements-linux-x86_64.lock",
+        STAGING_REQUIREMENTS,
         "resume-anchors-v0.1.jsonl.gz",
+        S3_STAGING_PLAN,
+        STAGING_SCRIPT,
         "verify_runtime.py",
         JOB_SCRIPT,
     }
@@ -822,6 +1161,16 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
     validated = validate_emr_serverless_canary_release(release)
     if validated["image_state"] != "build_not_authorized":
         raise ValueError("packaged EMR release must remain image-unbound")
+    staging_plan_path = output_directory / S3_STAGING_PLAN
+    staging_plan = _read_json(staging_plan_path)
+    staging_verified = validate_s3_staging_plan(staging_plan)
+    if (
+        _sha256_file(staging_plan_path)
+        != release["source_transport"]["staging_plan_sha256"]
+        or staging_verified["plan_fingerprint"]
+        != release["source_transport"]["plan_fingerprint"]
+    ):
+        raise ValueError("packaged S3 staging plan changed")
     for artifact in release["artifacts"].values():
         package_file = artifact.get("package_file")
         if package_file is None:
@@ -844,7 +1193,11 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
         if set(archive.namelist()) != {
             "Dockerfile",
             "buildspec.yml",
+            CODE_ARCHIVE,
             "requirements-linux-x86_64.lock",
+            STAGING_REQUIREMENTS,
+            S3_STAGING_PLAN,
+            STAGING_SCRIPT,
             "verify_runtime.py",
         }:
             raise ValueError("EMR canary image context changed")
@@ -862,12 +1215,16 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
     buildspec = (output_directory / "buildspec.yml").read_text(encoding="utf-8")
     required_buildspec_fragments = (
         'test "$CODEBUILD_SOURCE_VERSION" = "$EXPECTED_SOURCE_VERSION"',
+        'test "$AUTHORIZED_STAGING_PLAN_FINGERPRINT" = "$EXPECTED_STAGING_PLAN_FINGERPRINT"',
+        'stage_s3_corpus_canary.py',
         'docker build --pull --no-cache',
         'docker push "$REPOSITORY_URI:$IMAGE_TAG"',
         '/opt/lumi/python312/bin/python',
     )
     if not all(fragment in buildspec for fragment in required_buildspec_fragments):
         raise ValueError("EMR canary CodeBuild contract changed")
+    if buildspec.index("stage_s3_corpus_canary.py") > buildspec.index("docker build"):
+        raise ValueError("EMR canary must stage exact sources before building the image")
     if "CODEBUILD_RESOLVED_SOURCE_VERSION" in buildspec:
         raise ValueError("EMR canary CodeBuild uses an unavailable S3 source variable")
     return {
@@ -875,6 +1232,7 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
         "image_context_sha256": _sha256_file(output_directory / IMAGE_CONTEXT),
         "release_fingerprint": validated["release_fingerprint"],
         "release_sha256": _sha256_file(output_directory / RELEASE_FILE),
+        "staging_plan_sha256": _sha256_file(staging_plan_path),
         "status": "verified_not_authorized",
     }
 
@@ -905,6 +1263,14 @@ def validate_emr_serverless_canary_authorization(
         raise ValueError("EMR canary authorization targets another source commit")
     if authorization.get("image_context_sha256") != release["image"]["context_sha256"]:
         raise ValueError("EMR canary authorization targets another image context")
+    if authorization.get("source_staging_plan_fingerprint") != release[
+        "source_transport"
+    ]["plan_fingerprint"]:
+        raise ValueError("EMR canary authorization targets another S3 staging plan")
+    if authorization.get("source_staging_plan_sha256") != release["source_transport"][
+        "staging_plan_sha256"
+    ]:
+        raise ValueError("EMR canary authorization targets changed S3 staging bytes")
     if authorization.get("authorization") != {
         "full_4b_training": False,
         "model_training": False,
@@ -916,7 +1282,10 @@ def validate_emr_serverless_canary_authorization(
         raise ValueError("EMR canary authorization boundary changed")
     expected_bounds = {
         "maximum_codebuild_compute_usd": "0.15",
+        "maximum_codebuild_disk_gb": 64,
+        "maximum_codebuild_memory_gib": 4,
         "maximum_codebuild_minutes": 30,
+        "maximum_codebuild_vcpu": 2,
         "maximum_combined_compute_usd": "0.755904",
         "maximum_emr_compute_usd": "0.605904",
         "maximum_emr_disk_gib": 80,
@@ -926,6 +1295,7 @@ def validate_emr_serverless_canary_authorization(
         "maximum_records_per_source": 2_000,
         "maximum_source_compressed_bytes": 700_000_000,
         "maximum_source_files": 8,
+        "maximum_staging_parallel_downloads": 2,
         "maximum_total_source_compressed_bytes": 1_500_000_000,
     }
     if authorization.get("bounds") != expected_bounds:
@@ -956,7 +1326,7 @@ def validate_emr_serverless_canary_authorization(
         "expires_at": expires_utc.isoformat().replace("+00:00", "Z"),
         "release_fingerprint": expected_release,
         "status": (
-            "authorized_one_bounded_image_build_and_canary_only"
+            "authorized_one_bounded_source_staging_image_build_and_canary_only"
             if release_validation["image_state"] == "build_not_authorized"
             else "authorized_bounded_canary_from_approved_image_context"
         ),

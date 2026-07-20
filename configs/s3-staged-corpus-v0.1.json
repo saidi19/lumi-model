@@ -1,0 +1,66 @@
+{
+  "authorization": {
+    "cloud_mutation": false,
+    "full_4b_training": false,
+    "model_training": false,
+    "paid_compute": false,
+    "production_acquisition": false
+  },
+  "consumer": {
+    "direct_external_http_fallback": false,
+    "network_path": "same_region_s3_only",
+    "service": "aws_emr_serverless"
+  },
+  "canary": {
+    "maximum_records_per_source": 2000,
+    "maximum_source_compressed_bytes": 700000000,
+    "maximum_total_source_compressed_bytes": 1500000000,
+    "source_files": 8
+  },
+  "gate": "s3_staged_corpus_transport_v0.1",
+  "inputs": {
+    "baseline_evidence": {
+      "path": "configs/distributed-baseline-v0.1.json",
+      "sha256": "a7366195c5ccfcac42ea452f1fdec143d713d59f8d5c7a9d13f9fbc2cabe8180"
+    },
+    "component_inventory": {
+      "path": "configs/component-sources-v0.1.json",
+      "sha256": "37a24dd4803e6c4ae2a8967e277c67549e5bfb38aaf3574f8c26bba25efb0ef9"
+    },
+    "data_mix": {
+      "path": "configs/data-mix-v0.1.json",
+      "sha256": "f76fbc2599674d8210bfaa9f4361d417e05d9a7da618b79a8677d76ec4d6627c"
+    },
+    "production_authorization": {
+      "path": "configs/production-acquisition-v0.1.json",
+      "sha256": "76bc9d2bf7eb89408f4517d1f999d5490415b1ef07213fd6a4ba5c1c43a7e0ab"
+    },
+    "source_file_manifest": {
+      "path": "configs/common-pile-source-files-v0.1.json",
+      "sha256": "5289fa01c094ddbb456fe7628ea6e134f8e8455d5b8a5fc0bdc5d7d612e87c38"
+    }
+  },
+  "object_contract": {
+    "checksum_algorithm": "SHA256",
+    "content_type": "application/gzip",
+    "key_prefix": "lumi-corpus/v0.1/raw/source-objects/sha256",
+    "maximum_single_put_bytes": 5000000000,
+    "maximum_source_bytes": 2704144015,
+    "raw_retention": "transient_until_processed_output_is_verified",
+    "server_side_encryption": "AES256",
+    "write_condition": "IfNoneMatch:*"
+  },
+  "producer": {
+    "compute_type": "BUILD_GENERAL1_SMALL",
+    "disk_gb": 64,
+    "direct_source_network_required": true,
+    "launch_authorized": false,
+    "maximum_build_minutes": 30,
+    "maximum_parallel_downloads": 2,
+    "memory_gib": 4,
+    "service": "aws_codebuild_same_image_build",
+    "source_files": 8,
+    "vcpu": 2
+  },
+  "schema_version": 1
+}

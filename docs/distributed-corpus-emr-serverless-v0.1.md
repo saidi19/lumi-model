@@ -169,14 +169,23 @@ all temporary compute/IAM resources, and leaves production stopped.
 
 ## Next boundary
 
-Do not rerun the same direct-Hugging-Face job. The next implementation revision
-must stage exact hash-pinned source objects into the existing private S3 bucket
-and make EMR consume only those S3 objects. This avoids a NAT gateway, preserves
-source identity, and matches EMR's default same-Region AWS-service access. A
-small S3-staged parity canary still requires a new exact owner approval; only a
-passing result can produce the measured production-resume proposal. Resuming
-acquisition toward the 120B floors remains a later, separately priced and
-separately authorized roadmap action.
+Do not rerun the same direct-Hugging-Face job. The replacement is now
+implemented locally: exact source files bind to content-addressed S3 objects,
+and the EMR mapper uses verified, resumable S3 GETs with no direct-HTTP
+fallback. The unchanged eight-source/all-category slice totals 1,456,514,440
+compressed bytes. Its local integrity, restart, and real Spark/sequential
+parity suite passes 79/79 focused tests, and the complete repository suite
+passes 239/239; see
+[`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
+
+No source payload was uploaded and no paid compute was authorized by that local
+result. The bounded producer now stages the eight objects at the start of the
+same 30-minute `BUILD_GENERAL1_SMALL` image build; no separate Batch service,
+VPC, or producer compute charge is introduced. A new clean package and a fresh
+owner approval are still required before that combined build or one replacement
+EMR canary. Only a passing cloud parity result can produce the measured
+production-resume proposal. Resuming acquisition toward the 120B floors remains
+a later, separately priced and separately authorized roadmap action.
 
 Official runtime references:
 
