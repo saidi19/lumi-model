@@ -1,8 +1,7 @@
 # Lumi S3-staged corpus transport v0.1
 
-Status: **exact real-source Mac/Spark parity pass; the first bounded cloud
-source-staging attempt failed safe before download, and no cloud retry or EMR
-run is authorized**
+Status: **exact real-source Mac/Spark and bounded S3/EMR cloud parity pass; no
+production acquisition, GPU, or model training is authorized**
 
 ## Decision
 
@@ -187,22 +186,53 @@ seconds. All raw-source entries in `manifest.sha256` pass an independent hash
 check. No S3 object, AWS service, GPU, production shard, or training process was
 created.
 
+## Authorized S3-only cloud parity result
+
+A fresh release from merged source commit
+`f2251db105bc951d9413cc2d6342e7a0c0648bb1` and one exact owner authorization
+permitted one CodeBuild source-staging/image build and one EMR Serverless job.
+CodeBuild passed all source checks, staged the eight content-addressed objects,
+built and pushed the immutable image, and completed without retry.
+
+| Result | Verified value |
+|---|---:|
+| CodeBuild ID | `lumi-emr-staged-7bdcf1b7999f:1d0b1a2c-84ba-4b19-8222-914d8181c7e0` |
+| CodeBuild status / duration / retries | `SUCCEEDED` / 650 seconds / 0 |
+| Image digest | `sha256:8294908a75cbd27301322abfc0c713ed5cd0568c751b9f7c58594136fd8097c9` |
+| Image bytes | 2,631,167,482 |
+| EMR application / job | `00g7bpg9jgq0b509` / `00g7bph6oo8evg0b` |
+| EMR status / attempts / execution | `SUCCESS` / 1 / 361 seconds |
+| Billed vCPU-hours / memory-GB-hours | 1.57 / 6.28 |
+| Candidate documents / tokens | 13,027 / 39,196,478 |
+| Accepted / near rejected | 12,999 / 28 |
+| Local/cloud parity SHA-256 | `13edb46411c3b5eeaaf35237f70e379d72eb22b8a223c0d70586ece649c96837` |
+| Production shards / model training | false / false |
+| Combined compute estimate | $0.173908660 |
+
+The downloaded cloud report has SHA-256
+`399b0087b4f1c1fec72c3b0784bbc817768c10c573959d0cb24bd874b78df553`.
+An independent local read of the cloud accepted/rejected Parquet files
+reproduces the Mac parity digest exactly, not only the aggregate counts. The
+72-file evidence archive is sealed by manifest SHA-256
+`4c2aefa6c7374cc401f0d713841f5b308b9a20287f3ecd5f17ac36b9590d6d92`.
+The machine-readable summary is
+`reports/emr-s3-parity-canary-v0.3.json`.
+
+After evidence verification, the EMR application, CodeBuild project/log group,
+both temporary IAM roles, ECR image/repository, and every version of this run's
+raw source, checkpoint, result, and release-scoped control objects were removed.
+Post-cleanup listings contain zero matching versions. The authorization is
+consumed and cannot be reused.
+
 ## Next bounded boundary
 
-The local real-source data and deduplication gate is now complete, but it does
-not prove AWS IAM, S3 transport, or EMR runtime behavior. No cloud retry is
-implied by this result. Before another paid action:
-
-1. obtain a new exact owner authorization—the previous approval is consumed;
-2. stage only the eight pinned objects and independently verify all S3 heads;
-3. run one no-retry EMR parity canary and require exact accepted-ID and
-   rejection-reason parity;
-4. preserve evidence and delete temporary image, roles, application, and raw
-   canary objects.
-
-Only a passing parity result can unlock a separately approved distributed
-production resume toward the 120B candidate floors. It cannot authorize model
-training, GPUs, the 4B pilot, or the 4B/80B run.
+The bounded cloud parity condition is now satisfied. The next possible action
+is a separately priced and separately owner-authorized distributed production
+resume from the preserved 237,769,640-token prefix toward the seven category
+floors totaling 120B candidate tokens. Its capacity, checkpoint cadence,
+runtime, spend ceiling, and auto-stop boundary must be measured and approved
+before launch. This result does not authorize production acquisition, GPUs, the
+4B pilot, or the 4B/80B run.
 
 ## Official references
 

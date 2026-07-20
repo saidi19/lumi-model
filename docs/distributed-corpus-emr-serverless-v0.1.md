@@ -1,10 +1,8 @@
 # Lumi distributed corpus canary on EMR Serverless v0.1
 
-Status: **the corrected owner-authorized image build passed and one bounded EMR
-job started successfully, but the job was cancelled safely after its source
-tasks proved that default EMR Serverless networking cannot reach
-`huggingface.co`; parity was not reached, no production shard was written, and
-all temporary resources are deleted or terminated**
+Status: **the direct-Hugging-Face attempt failed safe, and its S3-only
+replacement subsequently passed exact cloud/local parity; no production shard
+or model training was created and all temporary resources are deleted**
 
 ## Scope
 
@@ -82,7 +80,7 @@ An image-unbound package cannot create an application. A future authorization
 must exactly match the package fingerprint, image-context hash, source commit,
 run token, expiry, source/runtime/cost caps, and this text:
 
-> I approve one bounded Lumi AWS CodeBuild image build and one bounded AWS EMR Serverless distributed corpus canary only.
+> I approve one bounded Lumi AWS CodeBuild source-staging and image build and one bounded AWS EMR Serverless distributed corpus canary only.
 
 The previous Glue approval does not match and is rejected. Even a matching
 authorization cannot enable production acquisition, GPU compute, model
@@ -167,25 +165,37 @@ match exactly, runtime and artifact hashes match, all safety caps remain intact,
 and no production shard is written. Failure preserves bounded evidence, cleans
 all temporary compute/IAM resources, and leaves production stopped.
 
+## Verified S3-only replacement result
+
+The replacement ran once from source commit
+`f2251db105bc951d9413cc2d6342e7a0c0648bb1`. CodeBuild staged all eight pinned
+objects and produced immutable image digest
+`sha256:8294908a75cbd27301322abfc0c713ed5cd0568c751b9f7c58594136fd8097c9`.
+The only EMR job, `00g7bph6oo8evg0b`, reached `SUCCESS` on attempt 1 in 361
+seconds. It consumed 1.57 vCPU-hours and 6.28 memory-GB-hours.
+
+The cloud report contains 13,027 candidates / 39,196,478 tokens, 12,999
+accepted documents, and 28 near-duplicate rejections against 38,349 immutable
+anchors. Spark IDs and reasons match its independent sequential reference. A
+second local verification of the downloaded Parquet IDs produces digest
+`13edb46411c3b5eeaaf35237f70e379d72eb22b8a223c0d70586ece649c96837`,
+which exactly equals the real-source Mac result. Combined CodeBuild/EMR compute
+is estimated at $0.173908660, below the $0.755904 hard ceiling.
+
+The cloud report, API responses, complete Spark logs, accepted/rejected ID
+files, launch artifacts, and cleanup proof are retained in a 72-file local
+archive with manifest SHA-256
+`4c2aefa6c7374cc401f0d713841f5b308b9a20287f3ecd5f17ac36b9590d6d92`.
+All temporary AWS resources and versioned canary payloads are removed. See
+[`reports/emr-s3-parity-canary-v0.3.json`](../reports/emr-s3-parity-canary-v0.3.json).
+
 ## Next boundary
 
-Do not rerun the same direct-Hugging-Face job. The replacement is now
-implemented locally: exact source files bind to content-addressed S3 objects,
-and the EMR mapper uses verified, resumable S3 GETs with no direct-HTTP
-fallback. The unchanged eight-source/all-category slice totals 1,456,514,440
-compressed bytes. Its local integrity, restart, and real Spark/sequential
-parity suite passes 79/79 focused tests, and the complete repository suite
-passes 239/239; see
-[`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
-
-No source payload was uploaded and no paid compute was authorized by that local
-result. The bounded producer now stages the eight objects at the start of the
-same 30-minute `BUILD_GENERAL1_SMALL` image build; no separate Batch service,
-VPC, or producer compute charge is introduced. A new clean package and a fresh
-owner approval are still required before that combined build or one replacement
-EMR canary. Only a passing cloud parity result can produce the measured
-production-resume proposal. Resuming acquisition toward the 120B floors remains
-a later, separately priced and separately authorized roadmap action.
+Do not rerun either canary. The S3-only parity gate is complete; see
+[`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md). The next possible action
+is a new, separately priced and separately owner-authorized distributed
+production resume toward the 120B candidate floors. This canary cannot
+authorize that resume, GPU compute, or model training.
 
 Official runtime references:
 
