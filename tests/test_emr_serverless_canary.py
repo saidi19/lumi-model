@@ -21,6 +21,7 @@ from lumi.emr_serverless_canary import (
     validate_emr_serverless_canary_authorization,
     validate_emr_serverless_canary_release,
 )
+from lumi.s3_staged_corpus import build_staged_object
 
 ROOT = Path(__file__).parents[1]
 
@@ -36,15 +37,27 @@ def _sources() -> list[dict[str, object]]:
         "government_legal_and_patents",
         "science_and_education",
     )
-    return [
+    sources = [
         {
             "category": category,
+            "component": f"component_{index}",
+            "dataset_id": "common-pile/fixture",
             "maximum_records": 2_000,
             "ordinal": index,
+            "revision": "b" * 40,
             "source_bytes": 1_000,
+            "source_file": f"fixture-{index}.json.gz",
+            "source_sha256": f"{index + 1:064x}",
         }
         for index, category in enumerate(categories)
     ]
+    for source in sources:
+        source["staged_object"] = build_staged_object(
+            source,
+            bucket="lumi-corpus-fixture",
+            key_prefix="lumi-corpus/v0.1/raw/source-objects/sha256",
+        )
+    return sources
 
 
 def _synthetic_release() -> dict[str, object]:
@@ -125,6 +138,13 @@ def _synthetic_release() -> dict[str, object]:
         },
         "schema_version": 1,
         "source_commit": "a" * 40,
+        "source_transport": {
+            "direct_external_http_fallback": False,
+            "network_path": "same_region_s3_only",
+            "plan_fingerprint": "e" * 64,
+            "source_bytes": 8_000,
+            "source_files": 8,
+        },
         "sources": _sources(),
     }
     release["release_fingerprint"] = _release_fingerprint(release)
@@ -338,3 +358,9 @@ def test_emr_requests_keep_exact_capacity_runtime_and_no_retry() -> None:
     assert "awsglue" not in (
         ROOT / "scripts" / "run_emr_serverless_distributed_canary.py"
     ).read_text()
+    job_source = (
+        ROOT / "scripts" / "run_emr_serverless_distributed_canary.py"
+    ).read_text()
+    assert "download_staged_source" in job_source
+    assert "_download_source" not in job_source
+    assert "huggingface.co" not in job_source

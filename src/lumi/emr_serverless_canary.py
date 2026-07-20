@@ -36,6 +36,11 @@ from .production_corpus import (
     _sha256_file,
     build_round_robin_source_schedule,
 )
+from .s3_staged_corpus import (
+    bind_staged_sources,
+    build_s3_staging_plan,
+    validate_staged_consumer_source,
+)
 
 EMR_CANARY_APPROVAL_TEXT = (
     "I approve one bounded Lumi AWS CodeBuild image build and one bounded AWS EMR "
@@ -101,7 +106,12 @@ def _validate_contract(contract: dict[str, Any], root: Path) -> dict[str, Path]:
     if contract.get("authorization") != expected_authorization:
         raise ValueError("EMR canary contract must not authorize paid work or training")
     pins = contract.get("inputs", {})
-    if set(pins) != {"codebuild_pricing", "emr_pricing", "source_contract"}:
+    if set(pins) != {
+        "codebuild_pricing",
+        "emr_pricing",
+        "source_contract",
+        "source_transport",
+    }:
         raise ValueError("EMR canary input set changed")
     paths = {name: _verify_pin(root, pin, name) for name, pin in pins.items()}
     image = contract.get("image", {})
@@ -290,6 +300,10 @@ def build_emr_serverless_canary_package(
         )
     if len(sources) != 8 or sources[0]["start_line"] != 38_849:
         raise ValueError("EMR canary source slice changed")
+    staging_plan = build_s3_staging_plan(
+        paths["source_transport"], repository_root=root
+    )
+    sources = bind_staged_sources(sources, staging_plan)
 
     output_directory.mkdir(parents=True, exist_ok=True)
     code_path = output_directory / CODE_ARCHIVE
@@ -443,6 +457,13 @@ def build_emr_serverless_canary_package(
         "schema_version": EMR_RELEASE_SCHEMA_VERSION,
         "source_commit": commit,
         "source_plan_fingerprint": source_plan["plan_fingerprint"],
+        "source_transport": {
+            "direct_external_http_fallback": False,
+            "network_path": "same_region_s3_only",
+            "plan_fingerprint": staging_plan["plan_fingerprint"],
+            "source_bytes": staging_plan["summary"]["source_bytes"],
+            "source_files": staging_plan["summary"]["source_files"],
+        },
         "sources": sources,
     }
     fingerprint = _release_fingerprint(release_material)
@@ -569,6 +590,27 @@ def validate_emr_serverless_canary_release(
     }
     if {str(source["category"]) for source in sources} != expected_categories:
         raise ValueError("EMR canary category coverage changed")
+    transport = release.get("source_transport")
+    if not isinstance(transport, dict) or set(transport) != {
+        "direct_external_http_fallback",
+        "network_path",
+        "plan_fingerprint",
+        "source_bytes",
+        "source_files",
+    }:
+        raise ValueError("EMR canary source transport is missing")
+    if (
+        transport.get("direct_external_http_fallback") is not False
+        or transport.get("network_path") != "same_region_s3_only"
+        or transport.get("source_files") != 8
+        or transport.get("source_bytes")
+        != sum(int(source["source_bytes"]) for source in sources)
+        or re.fullmatch(r"[0-9a-f]{64}", str(transport.get("plan_fingerprint", "")))
+        is None
+    ):
+        raise ValueError("EMR canary source transport changed")
+    for source in sources:
+        validate_staged_consumer_source(source)
     image = release.get("image", {})
     if (
         image.get("base_digest") != BASE_IMAGE_DIGEST
