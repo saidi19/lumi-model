@@ -31,6 +31,20 @@ def test_mlx_config_preserves_lumi_architecture_identity() -> None:
     assert source["quantization"] == {"bits": 8}
 
 
+def test_mlx_config_preserves_final_4b_wide_query_projection() -> None:
+    root = Path(__file__).parents[1]
+    source = json.loads((root / "configs" / "lumi-4b-v0.2.json").read_text(encoding="utf-8"))
+
+    converted = build_mlx_config(source, dtype="float32")
+
+    assert converted["hidden_size"] == 3072
+    assert converted["num_attention_heads"] == 64
+    assert converted["num_key_value_heads"] == 8
+    assert converted["head_dim"] == 64
+    assert converted["num_attention_heads"] * converted["head_dim"] == 4096
+    assert converted["num_key_value_heads"] * converted["head_dim"] == 512
+
+
 def test_mlx_config_rejects_architecture_drift() -> None:
     source = _source_config()
     source["model_type"] = "llama"
