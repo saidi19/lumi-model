@@ -126,6 +126,251 @@ def _estimated_jaccard_udf(codec: MinHashCodec) -> Any:
     return estimated_jaccard
 
 
+def select_ordered_token_prefix(
+    candidates: Any,
+    *,
+    target_tokens: int,
+    maximum_overshoot_tokens: int,
+    partitions: int | None = None,
+) -> dict[str, Any]:
+    """Select a canonical token prefix without a single-partition window.
+
+    Range partitions are individually sorted by the complete source-order key.
+    Only tiny per-partition token totals are collected by the driver.  The
+    cutoff partition then streams until the first document that reaches the
+    requested token target, preserving the sequential document-boundary rule.
+    """
+
+    from pyspark.sql import functions as F
+
+    if not isinstance(target_tokens, int) or isinstance(target_tokens, bool):
+        raise ValueError("ordered token-prefix target must be an integer")
+    if target_tokens <= 0:
+        raise ValueError("ordered token-prefix target must be positive")
+    if not isinstance(maximum_overshoot_tokens, int) or isinstance(
+        maximum_overshoot_tokens, bool
+    ):
+        raise ValueError("ordered token-prefix overshoot cap must be an integer")
+    if maximum_overshoot_tokens < 0:
+        raise ValueError("ordered token-prefix overshoot cap must be non-negative")
+    required = {
+        "document_id",
+        "segment_index",
+        "source_line",
+        "source_ordinal",
+        "token_count",
+    }
+    if not required.issubset(candidates.columns):
+        raise ValueError("ordered token-prefix input schema is missing required columns")
+    if partitions is None:
+        partitions = int(candidates.sparkSession.conf.get("spark.sql.shuffle.partitions"))
+    if not isinstance(partitions, int) or isinstance(partitions, bool) or partitions < 1:
+        raise ValueError("ordered token-prefix partition count must be positive")
+    order = ["source_ordinal", "source_line", "segment_index", "document_id"]
+    ordered = (
+        candidates.repartitionByRange(partitions, *[F.col(name) for name in order])
+        .sortWithinPartitions(*[F.col(name).asc() for name in order])
+        .persist()
+    )
+
+    def summarize(index: int, rows: Any) -> Any:
+        documents = 0
+        tokens = 0
+        for row in rows:
+            documents += 1
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("ordered token-prefix row has no tokens")
+            tokens += token_count
+        yield index, documents, tokens
+
+    summaries = sorted(ordered.rdd.mapPartitionsWithIndex(summarize).collect())
+    total_documents = sum(int(row[1]) for row in summaries)
+    total_tokens = sum(int(row[2]) for row in summaries)
+    if total_documents == 0 or total_tokens == 0:
+        ordered.unpersist()
+        raise ValueError("ordered token-prefix input is empty")
+    before_tokens = 0
+    cutoff_partition = summaries[-1][0]
+    reached_target = total_tokens >= target_tokens
+    if reached_target:
+        for partition, _, tokens in summaries:
+            if before_tokens + int(tokens) >= target_tokens:
+                cutoff_partition = int(partition)
+                break
+            before_tokens += int(tokens)
+    else:
+        cutoff_partition = summaries[-1][0]
+        before_tokens = total_tokens - int(summaries[-1][2])
+    cutoff_target = target_tokens - before_tokens
+
+    def select(index: int, rows: Any) -> Any:
+        if index < cutoff_partition:
+            yield from rows
+            return
+        if index > cutoff_partition:
+            return
+        selected_tokens = 0
+        for row in rows:
+            if reached_target and selected_tokens >= cutoff_target:
+                break
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("ordered token-prefix row has no tokens")
+            yield row
+            selected_tokens += token_count
+
+    selected = candidates.sparkSession.createDataFrame(
+        ordered.rdd.mapPartitionsWithIndex(select), schema=candidates.schema
+    ).persist()
+    totals = selected.agg(
+        F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
+    ).first()
+    selected_documents = int(totals["documents"] or 0)
+    selected_tokens = int(totals["tokens"] or 0)
+    if selected_documents == 0 or selected_tokens == 0:
+        selected.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered token-prefix selected no documents")
+    overshoot = max(0, selected_tokens - target_tokens)
+    if reached_target and selected_tokens < target_tokens:
+        selected.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered token-prefix stopped before its target")
+    if overshoot > maximum_overshoot_tokens:
+        selected.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered token-prefix exceeded its overshoot cap")
+    last = selected.orderBy(*[F.col(name).desc() for name in order]).first()
+    assert last is not None
+    ordered.unpersist()
+    return {
+        "available_documents": total_documents,
+        "available_tokens": total_tokens,
+        "cutoff": {name: last[name] for name in order},
+        "overshoot_tokens": overshoot,
+        "reached_target": reached_target,
+        "selected": selected,
+        "selected_documents": selected_documents,
+        "selected_tokens": selected_tokens,
+    }
+
+
+def assign_ordered_token_shards(
+    candidates: Any,
+    *,
+    target_tokens: int,
+    maximum_overshoot_tokens: int,
+    start_sequence: int = 0,
+    initial_tokens: int = 0,
+    partitions: int | None = None,
+) -> dict[str, Any]:
+    """Assign deterministic shard IDs without a global single-partition window."""
+
+    from pyspark.sql import functions as F
+    from pyspark.sql import types as T
+
+    for value, label, allow_zero in (
+        (target_tokens, "target", False),
+        (maximum_overshoot_tokens, "overshoot", True),
+        (start_sequence, "start sequence", True),
+        (initial_tokens, "initial tokens", True),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"ordered shard {label} must be an integer")
+        if value < 0 or (value == 0 and not allow_zero):
+            raise ValueError(f"ordered shard {label} is outside its allowed range")
+    required = {
+        "document_id",
+        "segment_index",
+        "source_line",
+        "source_ordinal",
+        "token_count",
+    }
+    if not required.issubset(candidates.columns):
+        raise ValueError("ordered shard input schema is missing required columns")
+    if partitions is None:
+        partitions = int(candidates.sparkSession.conf.get("spark.sql.shuffle.partitions"))
+    if not isinstance(partitions, int) or isinstance(partitions, bool) or partitions < 1:
+        raise ValueError("ordered shard partition count must be positive")
+    order = ["source_ordinal", "source_line", "segment_index", "document_id"]
+    ordered = (
+        candidates.repartitionByRange(partitions, *[F.col(name) for name in order])
+        .sortWithinPartitions(*[F.col(name).asc() for name in order])
+        .persist()
+    )
+
+    def summarize(index: int, rows: Any) -> Any:
+        documents = 0
+        tokens = 0
+        for row in rows:
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("ordered shard row has no tokens")
+            documents += 1
+            tokens += token_count
+        yield index, documents, tokens
+
+    summaries = sorted(ordered.rdd.mapPartitionsWithIndex(summarize).collect())
+    total_documents = sum(int(row[1]) for row in summaries)
+    total_tokens = sum(int(row[2]) for row in summaries)
+    if total_documents == 0 or total_tokens == 0:
+        ordered.unpersist()
+        raise ValueError("ordered shard input is empty")
+    offsets = {}
+    running = initial_tokens
+    for index, _, tokens in summaries:
+        offsets[int(index)] = running
+        running += int(tokens)
+    def assign(index: int, rows: Any) -> Any:
+        cumulative = int(offsets[index])
+        for row in rows:
+            token_count = int(row["token_count"])
+            sequence = start_sequence + cumulative // target_tokens
+            yield (*tuple(row), sequence)
+            cumulative += token_count
+
+    schema = T.StructType(
+        [*candidates.schema.fields, T.StructField("shard_sequence", T.LongType(), False)]
+    )
+    assigned = candidates.sparkSession.createDataFrame(
+        ordered.rdd.mapPartitionsWithIndex(assign), schema=schema
+    ).persist()
+    totals = assigned.agg(
+        F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
+    ).first()
+    if int(totals["documents"] or 0) != total_documents or int(
+        totals["tokens"] or 0
+    ) != total_tokens:
+        assigned.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered shard assignment does not conserve its input")
+    shard_totals = assigned.groupBy("shard_sequence").agg(
+        F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
+    )
+    maximum = shard_totals.agg(F.max("tokens").alias("tokens")).first()
+    if int(maximum["tokens"] or 0) > target_tokens + maximum_overshoot_tokens:
+        assigned.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered shard assignment exceeded its overshoot cap")
+    minimum_sequence = int(shard_totals.agg(F.min("shard_sequence")).first()[0])
+    maximum_sequence = int(shard_totals.agg(F.max("shard_sequence")).first()[0])
+    shard_count = int(shard_totals.count())
+    if shard_count != maximum_sequence - minimum_sequence + 1:
+        assigned.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered shard assignment sequence is not contiguous")
+    ordered.unpersist()
+    return {
+        "assigned": assigned,
+        "documents": total_documents,
+        "first_sequence": minimum_sequence,
+        "last_sequence": maximum_sequence,
+        "shard_count": shard_count,
+        "tokens": total_tokens,
+    }
+
+
 def spark_deduplicate_candidates(
     candidates: Any,
     *,

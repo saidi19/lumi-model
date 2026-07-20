@@ -1,0 +1,141 @@
+{
+  "application": {
+    "architecture": "X86_64",
+    "auto_stop_idle_timeout_minutes": 5,
+    "bootstrap_maximum_vcpu": 16,
+    "driver": {
+      "cores": 4,
+      "disk_gib": 20,
+      "memory_gib": 14
+    },
+    "executor": {
+      "cores": 4,
+      "disk_gib": 20,
+      "memory_gib": 14
+    },
+    "production_maximum_vcpu": 128,
+    "quota_code": "L-D05C8A75",
+    "ramp_maximum_vcpu": 64,
+    "requested_account_vcpu": 128
+  },
+  "authorization": {
+    "full_4b_training": false,
+    "model_training": false,
+    "paid_cpu_stager": false,
+    "paid_emr_production": false,
+    "paid_gpu_compute": false,
+    "production_adaptive_acquisition": true
+  },
+  "budget": {
+    "contingency_usd": "250.00",
+    "hard_total_usd": "2000.00",
+    "maximum_archive_migration_usd": "250.00",
+    "maximum_emr_compute_usd": "1200.00",
+    "maximum_s3_logs_requests_usd": "100.00",
+    "maximum_stager_compute_usd": "200.00"
+  },
+  "checkpoint": {
+    "commit_after_each_source": true,
+    "commit_after_each_target_shard": true,
+    "content_addressed": true,
+    "immutable_previous_checkpoint_chain": true,
+    "resume_from_verified_prefix": true
+  },
+  "gate": "lumi_emr_serverless_production_resume_plan_v0.1",
+  "inputs": {
+    "baseline_evidence": {
+      "path": "configs/distributed-baseline-v0.1.json",
+      "sha256": "a7366195c5ccfcac42ea452f1fdec143d713d59f8d5c7a9d13f9fbc2cabe8180"
+    },
+    "canary_parity_report": {
+      "path": "reports/emr-s3-parity-canary-v0.3.json",
+      "sha256": "34e6aa560c5cadab80632ff385d942e98d1658a9f07a071271ce4167488c7456"
+    },
+    "component_inventory": {
+      "path": "configs/component-sources-v0.1.json",
+      "sha256": "37a24dd4803e6c4ae2a8967e277c67549e5bfb38aaf3574f8c26bba25efb0ef9"
+    },
+    "corpus_storage": {
+      "path": "configs/corpus-object-storage-v0.1.json",
+      "sha256": "eb913df66a0b7fa01a43e332c16ed95e12f1f15d8c0ba384cab40cb9ae0f65c5"
+    },
+    "data_mix": {
+      "path": "configs/data-mix-v0.1.json",
+      "sha256": "f76fbc2599674d8210bfaa9f4361d417e05d9a7da618b79a8677d76ec4d6627c"
+    },
+    "data_quality": {
+      "path": "configs/data-quality-v0.1.json",
+      "sha256": "b271bddd603949ac7577b7bb81ab4d1f0ed4b7cb6e8a2c7ba91956b1237430cc"
+    },
+    "emr_pricing": {
+      "path": "configs/aws-emr-serverless-us-east-1-pricing-v0.1.json",
+      "sha256": "20c0defd54b4df7101c38e994491cc6436687b38c29ab6c6facddb0d5522abcd"
+    },
+    "filter_policy": {
+      "path": "configs/development-sample-v0.1.json",
+      "sha256": "b0081a08a7d952264667d9a7fd2e90b39a946359f7d869a3611209feb5c20c6f"
+    },
+    "benchmark_registry": {
+      "path": "data/benchmark-signatures-v0.1.jsonl.gz",
+      "sha256": "be02bdbd7f2c0e807c86cf9678eff86d711aaa34ffdc8e6ebb687a26220ffcbb"
+    },
+    "production_authorization": {
+      "path": "configs/production-acquisition-v0.1.json",
+      "sha256": "76bc9d2bf7eb89408f4517d1f999d5490415b1ef07213fd6a4ba5c1c43a7e0ab"
+    },
+    "source_file_manifest": {
+      "path": "configs/common-pile-source-files-v0.1.json",
+      "sha256": "5289fa01c094ddbb456fe7628ea6e134f8e8455d5b8a5fc0bdc5d7d612e87c38"
+    },
+    "stager_pricing": {
+      "path": "configs/aws-production-worker-pricing-v0.1.json",
+      "sha256": "c7a81016fd4c9f6dc2ea292567881f9a38149f6f445dd05262b613c6ce8711ed"
+    }
+  },
+  "limits": {
+    "candidate_hard_maximum_tokens": 150000000000,
+    "candidate_total_floor_tokens": 120000000000,
+    "clean_shard_target_tokens": 100000000,
+    "final_training_tokens": 80000000000,
+    "hard_logical_storage_bytes": 2000000000000,
+    "maximum_category_overshoot_tokens": 100000000,
+    "maximum_transient_source_bytes": 100000000000
+  },
+  "pipeline": {
+    "global_dedup_job_timeout_hours": "24",
+    "global_dedup_job_vcpu": 128,
+    "map_chunks_per_job": 8,
+    "map_job_timeout_hours": "2",
+    "map_job_vcpu": 16,
+    "mapped_category_multiplier": "1.20",
+    "maximum_concurrent_map_jobs": 7,
+    "maximum_concurrent_shard_writers": 7,
+    "shard_writer_job_vcpu": 16,
+    "shard_writer_job_timeout_hours": "12",
+    "strategy": "two_pass_map_global_dedup_shard_v0.1"
+  },
+  "region": "us-east-1",
+  "runtime": {
+    "custom_python": "3.12",
+    "release_label": "emr-7.13.0",
+    "service": "aws_emr_serverless",
+    "spark_version": "3.5.6"
+  },
+  "schema_version": 1,
+  "source_stager": {
+    "bootstrap_maximum_chunks": 8,
+    "instance_memory_gib": 128,
+    "instance_type": "r7i.4xlarge",
+    "instance_vcpus": 16,
+    "maximum_local_staged_bytes": 12000000000,
+    "maximum_prefetched_sources": 1,
+    "maximum_runtime_hours": 96,
+    "production_maximum_chunks": null,
+    "raw_retention": "delete_after_verified_checkpoint_commit",
+    "ramp_maximum_chunks": 32,
+    "split_chunk_uncompressed_bytes": 134217728,
+    "strategy": "internet_facing_cpu_stage_once_to_private_s3_v0.1",
+    "volume_gib": 100
+  },
+  "version": "0.1"
+}

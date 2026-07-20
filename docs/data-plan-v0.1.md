@@ -212,6 +212,14 @@ evidence itself is only 16,750 bytes. See
   versioned payloads are removed after the 72-file local evidence archive is
   verified. Distributed production remains a separate later approval; this
   canary did not resume acquisition or create training shards.
+- Completed locally: the production EMR resume harness preserves the verified
+  237,769,640-token prefix and the proven external-stager/private-S3 network
+  boundary. Seven independent 16-vCPU category lanes, one 128-vCPU global
+  dedup, adaptive exact-cursor continuation, category-partitioned distributed
+  shard writing, AWS billed-resource accounting, and the final 120B corpus seal
+  pass the full 278-test repository suite. Its total budget is hard-capped at
+  $2,000. No production run or model training is authorized; see
+  [`production-emr-resume-v0.1.md`](production-emr-resume-v0.1.md).
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

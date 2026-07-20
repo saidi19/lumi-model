@@ -521,8 +521,10 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
     from pyspark.sql import SparkSession
 
     from lumi.glue_corpus import (
+        assign_ordered_token_shards,
         candidate_spark_schema,
         dedup_anchor_spark_schema,
+        select_ordered_token_prefix,
         spark_deduplicate_candidates,
     )
 
@@ -606,5 +608,75 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
             for row in repeated["accepted_ids"].select("document_id").collect()
         } == spark_accepted
         assert repeated["metrics"] == result["metrics"]
+
+        prefix_candidates = []
+        for ordinal, tokens in enumerate((3, 4, 5, 2, 6, 1)):
+            row = _candidate(
+                codec,
+                f"prefix-{ordinal}",
+                ordinal + 10,
+                f"prefix text {ordinal}",
+                100 + ordinal,
+            )
+            row["token_count"] = tokens
+            row["token_bytes"] = b"\x01\x00" * tokens
+            prefix_candidates.append(row)
+        random.Random(7).shuffle(prefix_candidates)
+        prefix_frame = spark.createDataFrame(
+            [candidate_to_spark_row(row) for row in prefix_candidates],
+            schema=candidate_spark_schema(),
+        )
+        prefix = select_ordered_token_prefix(
+            prefix_frame,
+            target_tokens=10,
+            maximum_overshoot_tokens=2,
+            partitions=3,
+        )
+        assert prefix["reached_target"] is True
+        assert prefix["selected_tokens"] == 12
+        assert prefix["overshoot_tokens"] == 2
+        assert [
+            row["document_id"]
+            for row in prefix["selected"]
+            .orderBy("source_ordinal", "source_line", "segment_index", "document_id")
+            .collect()
+        ] == ["prefix-0", "prefix-1", "prefix-2"]
+        prefix["selected"].unpersist()
+        all_rows = select_ordered_token_prefix(
+            prefix_frame,
+            target_tokens=100,
+            maximum_overshoot_tokens=2,
+            partitions=3,
+        )
+        assert all_rows["reached_target"] is False
+        assert all_rows["selected_documents"] == 6
+        assert all_rows["selected_tokens"] == 21
+        all_rows["selected"].unpersist()
+        with pytest.raises(RuntimeError, match="overshoot"):
+            select_ordered_token_prefix(
+                prefix_frame,
+                target_tokens=10,
+                maximum_overshoot_tokens=1,
+                partitions=3,
+            )
+        shards = assign_ordered_token_shards(
+            prefix_frame,
+            target_tokens=10,
+            maximum_overshoot_tokens=5,
+            partitions=3,
+        )
+        shard_totals = {
+            int(row["shard_sequence"]): int(row["tokens"])
+            for row in shards["assigned"]
+            .groupBy("shard_sequence")
+            .sum("token_count")
+            .withColumnRenamed("sum(token_count)", "tokens")
+            .collect()
+        }
+        assert shard_totals == {0: 12, 1: 8, 2: 1}
+        assert shards["documents"] == 6
+        assert shards["tokens"] == 21
+        assert shards["shard_count"] == 3
+        shards["assigned"].unpersist()
     finally:
         spark.stop()
