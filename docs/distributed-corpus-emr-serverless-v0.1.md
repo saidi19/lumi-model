@@ -179,9 +179,12 @@ passes 236/236; see
 [`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
 
 No source payload was uploaded and no paid compute was authorized by that local
-result. A clean release package, exact cost envelope, and new owner approval are
-still required before staging the eight objects or running one replacement EMR
-canary. Only a passing cloud parity result can produce the measured
+result. A clean, image-unbound package from source commit `9c67a76` is now
+independently verified; its release fingerprint is
+`0d2043bceacd06919fd3efe1b323f435ecdf4949740b7482cf8820de8ca4af88`.
+The bounded source-staging runner, its exact compute cap, and a new owner
+approval are still required before staging the eight objects or running one
+replacement EMR canary. Only a passing cloud parity result can produce the measured
 production-resume proposal. Resuming acquisition toward the 120B floors remains
 a later, separately priced and separately authorized roadmap action.
 

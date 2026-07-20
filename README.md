@@ -266,8 +266,10 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     bytes. Content-addressed conditional writes, stored SHA-256 checksums,
     wrong-object refusal, interrupted range resume, and a no-HTTP-fallback EMR
     source path pass 76 corpus-focused tests including real Spark/sequential
-    parity; the complete repository suite passes 236/236. No source object was
-    uploaded and no paid work is authorized; see
+    parity; the complete repository suite passes 236/236. A clean,
+    image-unbound package from commit `9c67a76` is independently hash-verified
+    and durably archived. No source object was uploaded and no paid work is
+    authorized; see
     [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B

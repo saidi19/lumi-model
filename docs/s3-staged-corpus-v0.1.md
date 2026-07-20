@@ -80,12 +80,35 @@ suite passed **236/236 tests**, under Python 3.12.13, Java 17.0.19, and PySpark
 Ruff passes for the complete repository. The temporary test environment and
 generated plan stay outside Git.
 
+## Clean package result
+
+The non-authorizing EMR package was built from clean source commit
+`9c67a766b9a1503d2bb99971fee9f92e0ae15e03` and independently verified after
+copying to durable local storage.
+
+| Package field | Verified value |
+|---|---|
+| Release fingerprint | `0d2043bceacd06919fd3efe1b323f435ecdf4949740b7482cf8820de8ca4af88` |
+| Release SHA-256 | `2d2821e2a61519a3670554e4165c754a27f69f59882fcfbd119b843046593125` |
+| Code archive SHA-256 | `e29aa542a414596e363ba1250b1a3e75833ee575add78e03a8803731d5267243` |
+| Image context SHA-256 | `3f492b734aab2060af9f4efae039c0c665c8e68bf7356401a824a4f0c94c418d` |
+| Manifest SHA-256 | `6af6a170efa442becc0f154e91fe8e9ab9151986cab8ad3e9868ca81eb40214d` |
+| Package status | `verified_not_authorized` |
+
+The pinned build-plus-EMR compute ceiling is $0.755904. At current pinned S3
+prices, eight source PUTs cost $0.00004, inbound and same-Region transfer cost
+$0, and retaining all 1.4565 GB for a full month would cost about $0.03350.
+Those figures deliberately exclude the internet-facing producer's compute:
+that runner and its own hard runtime/cost cap must be packaged and verified
+before a fresh cloud authorization can be requested.
+
 ## Next bounded boundary
 
 No cloud retry is implied by this result. Before another paid action:
 
-1. create a clean, commit-exact release package containing this transport;
-2. calculate and show the exact staging/build/EMR cost and cleanup envelope;
+1. package and locally test the bounded internet-facing staging runner;
+2. calculate and show its exact compute cap alongside the verified
+   build/EMR/S3 envelope;
 3. obtain a new exact owner authorization—the previous approval is consumed;
 4. stage only the eight pinned objects and independently verify all S3 heads;
 5. run one no-retry EMR parity canary and require exact accepted-ID and

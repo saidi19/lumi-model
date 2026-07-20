@@ -188,9 +188,13 @@ evidence itself is only 16,750 bytes. See
   all seven categories and 1,456,514,440 compressed bytes; no cloud write or
   paid compute occurred. See [`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
 - Next: package the clean commit, price the exact eight-object staging plus one
-  EMR parity canary, and request a new exact approval. Distributed production
-  remains a separate later approval after measured parity, throughput, and
-  cost.
+  EMR parity canary, and request a new exact approval. The clean EMR package is
+  now complete and independently verified at source commit `9c67a76`; its
+  release fingerprint is
+  `0d2043bceacd06919fd3efe1b323f435ecdf4949740b7482cf8820de8ca4af88`.
+  The remaining local prerequisite is the bounded internet-facing staging
+  runner plus its exact compute cap. Distributed production remains a separate
+  later approval after measured parity, throughput, and cost.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.
