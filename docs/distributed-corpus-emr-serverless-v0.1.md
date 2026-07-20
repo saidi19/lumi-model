@@ -1,9 +1,10 @@
 # Lumi distributed corpus canary on EMR Serverless v0.1
 
-Status: **the first owner-authorized CodeBuild attempt failed safe before Docker
-build because the S3 source-version variable was wrong; no image or EMR job was
-created, all temporary resources are deleted, and the corrected release remains
-locally verified but unauthorized**
+Status: **the corrected owner-authorized image build passed and one bounded EMR
+job started successfully, but the job was cancelled safely after its source
+tasks proved that default EMR Serverless networking cannot reach
+`huggingface.co`; parity was not reached, no production shard was written, and
+all temporary resources are deleted or terminated**
 
 ## Scope
 
@@ -116,6 +117,44 @@ The corrected buildspec now uses `CODEBUILD_SOURCE_VERSION`, is included inside
 the digest-pinned image context, and is therefore covered by the release
 fingerprint rather than being an untracked launch-time input.
 
+## Corrected build and bounded EMR result
+
+A fresh exact authorization permitted one corrected build and, only after that
+build passed, one EMR canary. CodeBuild completed its runtime smoke, Docker build,
+and immutable ECR push. EMR then resolved that exact digest, started the driver
+and all three executors, and completed the initial anchor and shuffle stages.
+
+The source-fetch stage could not reach `huggingface.co:443`. This is the expected
+default EMR Serverless network boundary, not a corpus-filter or Spark-runtime
+failure: without VPC connectivity, jobs can reach selected same-Region AWS
+services such as S3, but outbound internet access is blocked. Executor logs
+record `curl (28)` connection timeouts. The job was cancelled after 273 seconds
+instead of allowing ten long curl retries to consume the 30-minute ceiling.
+There was no retry or second job.
+
+| Result | Verified value |
+|---|---:|
+| CodeBuild status / duration | `SUCCEEDED` / 545 seconds |
+| Runtime smoke | passed |
+| Image digest / size | `sha256:9d7ad4a1e8690f37b8514c250ae81506cd2ee7a4c94d72b249b7155e3a4ce74d` / 2,631,167,478 bytes |
+| EMR application / job | `00g7bkjsn1bm5u09` / `00g7bkm8v6n0700b` |
+| EMR attempts | 1 |
+| Driver / executors started | 1 / 3 |
+| EMR billed vCPU-hours / memory-GB-hours | 1.181 / 4.724 |
+| Measured EMR compute estimate | $0.089446578 |
+| Conservative successful-build estimate | $0.05 |
+| Combined compute estimate | $0.139446578 |
+| Sequential parity reached | false |
+| Production shards/model training | false / false |
+
+The CodeBuild project and log group, both temporary IAM roles, ECR image and
+repository, and live S3 authorization object were deleted and independently
+confirmed absent. The EMR application is `TERMINATED`; the earlier EC2 worker is
+also absent. The complete terminal record is
+[`reports/emr-serverless-canary-v0.2.json`](../reports/emr-serverless-canary-v0.2.json),
+and the downloaded Spark logs are retained outside Git with the sealed launch
+package.
+
 ## Canary pass condition
 
 Workers run the existing quality, provenance, PII/secret, benchmark-exclusion,
@@ -130,16 +169,19 @@ all temporary compute/IAM resources, and leaves production stopped.
 
 ## Next boundary
 
-After the corrected non-authorizing package is sealed, another new owner
-decision may authorize exactly one image build and one canary within the
-envelope above. The consumed approval cannot be reused. Only a passing canary
-can produce a measured production-resume proposal. Resuming acquisition toward
-the 120B floors remains a later, separately priced and separately authorized
-roadmap action.
+Do not rerun the same direct-Hugging-Face job. The next implementation revision
+must stage exact hash-pinned source objects into the existing private S3 bucket
+and make EMR consume only those S3 objects. This avoids a NAT gateway, preserves
+source identity, and matches EMR's default same-Region AWS-service access. A
+small S3-staged parity canary still requires a new exact owner approval; only a
+passing result can produce the measured production-resume proposal. Resuming
+acquisition toward the 120B floors remains a later, separately priced and
+separately authorized roadmap action.
 
 Official runtime references:
 
 - [EMR Serverless 7.13.0 release](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/release-version-7130.html)
 - [EMR Serverless custom images](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/application-custom-image.html)
 - [Custom Python images](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/using-custom-images.html)
+- [EMR Serverless network access](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/vpc-access.html)
 - [EMR Serverless pricing](https://aws.amazon.com/emr/pricing/)

@@ -250,6 +250,17 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     temporary roles, empty ECR repository, and live authorization are deleted.
     The corrected buildspec uses `CODEBUILD_SOURCE_VERSION` and is now included
     in the release-fingerprinted image context; a retry needs new approval.
+38. a fresh exact authorization then produces one successful corrected
+    CodeBuild image and one bounded EMR job. The 2,631,167,478-byte image passes
+    its runtime smoke, resolves by immutable ECR digest, and starts Spark plus
+    all three executors. Initial anchor/shuffle stages pass, but source tasks
+    cannot reach `huggingface.co:443` because EMR Serverless blocks outbound
+    internet by default. The run is cancelled safely after 273 seconds instead
+    of exhausting its curl retries; it uses 1.181 vCPU-hours and 4.724
+    memory-GB-hours, with combined build/EMR compute estimated at $0.139446578.
+    No parity report, production shard, or model training is produced. All
+    temporary resources are deleted or terminated. The next revision must stage
+    pinned inputs in S3 and keep EMR on same-Region S3 I/O.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -259,8 +270,8 @@ The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate are complete. The complete source
 file manifest and the fail-closed CCCC decision are also complete. A bounded
-replacement EMR parity canary, distributed production resume, a 4B learning
-pilot, and the full 4B/80B pretraining run remain unapproved.
+S3-staged replacement EMR parity canary, distributed production resume, a 4B
+learning pilot, and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -349,8 +360,8 @@ deduplication proof, real local Spark parity gate, fail-closed limits, and the
 failed-safe $0.0374 Glue result are documented in
 [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
-envelope, non-authorizing package, and separately approved next boundary are
-documented in
+envelope, successful image build, external-egress diagnosis, cleanup, and
+S3-staged next boundary are documented in
 [`docs/distributed-corpus-emr-serverless-v0.1.md`](docs/distributed-corpus-emr-serverless-v0.1.md).
 
 ## Repository policy
