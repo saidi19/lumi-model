@@ -268,9 +268,25 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     source path pass 79 corpus-focused tests including real Spark/sequential
     parity; the complete repository suite passes 239/239. The eight downloads
     are now folded into the same bounded 30-minute CodeBuild image build, with
-    two workers and a verified 64GB-disk/4GiB-memory envelope. No source object
-    was uploaded and no paid work is authorized; see
+    two workers and a verified 64GB-disk/4GiB-memory envelope. Its first exact
+    source-staging authorization is consumed by one CodeBuild attempt that
+    fails safe before source download: S3 returns `403` for an absent
+    `HeadObject` because the temporary role lacks `s3:ListBucket`. No raw
+    source, image, EMR job, production shard, or model training is created;
+    compute is bounded above by $0.03 and every temporary resource is deleted.
+    The role renderer now includes the required read-only bucket permission and
+    a regression test. A retry remains unapproved; see
     [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
+40. the exact eight-source transport and corpus path now also passes a bounded
+    real-source Mac canary. All 1,456,514,440 compressed bytes were downloaded
+    once and independently hash-verified on resume. The production tokenizer,
+    filters, benchmark/held-out exclusions, and secret/PII handling reduced
+    14,061 raw records to 13,027 candidates carrying 39,196,478 tokens. Against
+    38,349 immutable resume anchors, localhost Spark and the independent
+    sequential reference produced the same 12,999 accepted IDs and 28
+    near-duplicate rejections. The sealed parity digest is
+    `13edb46411c3b5eeaaf35237f70e379d72eb22b8a223c0d70586ece649c96837`.
+    No AWS resource, GPU, production shard, or model training was started.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -279,8 +295,8 @@ initialization/optimizer gate, and bounded two-step 4B CUDA smoke are complete.
 The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate, and local S3-only source transport
-gate are complete. The complete source
-file manifest and the fail-closed CCCC decision are also complete. A bounded
+gate—including the exact real-source Mac canary—are complete. The complete
+source file manifest and the fail-closed CCCC decision are also complete. A bounded
 S3-staged replacement EMR parity canary, distributed production resume, a 4B
 learning pilot, and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.

@@ -190,8 +190,21 @@ evidence itself is only 16,750 bytes. See
 - Completed locally: the internet-facing producer now runs before the image
   build inside the same `BUILD_GENERAL1_SMALL` CodeBuild. Two streaming workers
   stage the eight files, verified existing objects skip upstream downloads, and
-  the original 30-minute/$0.15 build cap is unchanged. The clean package must
-  now be rebuilt from this exact commit before requesting a new approval.
+  the original 30-minute/$0.15 build cap is unchanged.
+- Completed safely: the first exact S3-staging build authorization was consumed
+  by one attempt that failed before source download because the role omitted
+  `s3:ListBucket`, causing absent `HeadObject` checks to return `403`. It staged
+  zero raw objects, built zero images, launched no EMR or training, cost at most
+  $0.03, and every temporary resource is deleted. The policy and regression
+  test are corrected locally; another cloud attempt needs fresh approval.
+- Completed locally on exact source bytes: one bounded Mac canary downloaded
+  the eight pinned objects once (1,456,514,440 compressed bytes), then
+  hash-verified and reused them on resume. Production tokenization and filters
+  mapped 14,061 raw records to 13,027 candidates / 39,196,478 tokens. Against
+  the preserved 38,349 anchors, Spark and the independent sequential reference
+  exactly matched at 12,999 accepted documents and 28 near-duplicate
+  rejections. The manifest, report, run log, raw files, and parity digest pass
+  independent verification; no cloud resource or model training was started.
   Distributed production remains a separate later approval after measured
   parity, throughput, and cost.
 - Materialize only the selected, cleaned shards in private object storage.

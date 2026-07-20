@@ -1000,6 +1000,12 @@ def build_codebuild_service_policy(
                 "Sid": "StageExactSourceObjects",
             },
             {
+                "Action": "s3:ListBucket",
+                "Effect": "Allow",
+                "Resource": f"arn:aws:s3:::{bucket}",
+                "Sid": "ResolveAbsentSourceObjects",
+            },
+            {
                 "Action": ["s3:GetBucketAcl", "s3:GetBucketLocation"],
                 "Effect": "Allow",
                 "Resource": f"arn:aws:s3:::{bucket}",
