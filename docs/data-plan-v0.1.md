@@ -172,11 +172,17 @@ evidence itself is only 16,750 bytes. See
   build that failed in `PRE_BUILD` before Docker because the S3 source-version
   variable was wrong. No image or EMR job was created, the conservative compute
   upper bound is $0.03, and every temporary resource is confirmed deleted.
-- Next: seal the corrected non-authorizing EMR package, then obtain another new
-  exact approval only for one bounded image build and one maximum-30-minute
-  parity canary.
-  Distributed production remains a separate later approval after measured
-  canary throughput and cost.
+- Completed safely: the corrected exact CodeBuild image passed, and one bounded
+  EMR job resolved it, started Spark plus three executors, and consumed 1.181
+  vCPU-hours and 4.724 memory-GB-hours. Its source tasks then proved the default
+  EMR Serverless external-network block while connecting to Hugging Face. The
+  job was cancelled at 273 seconds, no retry/parity/production write occurred,
+  combined build-plus-EMR compute is estimated at $0.139446578, and all
+  temporary resources are gone or terminated.
+- Next: stage exact pinned source objects in the private S3 bucket and revise
+  the bounded parity job to read only S3. A new exact approval is still required
+  for that canary. Distributed production remains a separate later approval
+  after measured parity, throughput, and cost.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.
