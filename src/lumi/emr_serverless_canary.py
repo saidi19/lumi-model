@@ -53,6 +53,7 @@ BASE_IMAGE_DIGEST = "sha256:3e465888c2b00add9d298a2b4c14c7951262d9c2b35a3f8c1b10
 BASE_IMAGE_URI = (
     "public.ecr.aws/emr-serverless/spark/emr-7.13.0@" + BASE_IMAGE_DIGEST
 )
+BUILDSPEC_SHA256 = "b2f60bf5a3ecdbeb921c2893038e3b2621147bc8ca1c1494cb9ac75ba8bd461d"
 PRIVATE_IMAGE_PATTERN = re.compile(
     r"^(?P<account>[0-9]{12})\.dkr\.ecr\.us-east-1\.amazonaws\.com/"
     r"lumi-emr-serverless@(?P<digest>sha256:[0-9a-f]{64})$"
@@ -108,7 +109,7 @@ def _validate_contract(contract: dict[str, Any], root: Path) -> dict[str, Path]:
         raise ValueError("EMR Serverless base image digest changed")
     if image.get("base_uri") != BASE_IMAGE_URI:
         raise ValueError("EMR Serverless base image URI changed")
-    for label in ("dockerfile", "requirements_lock", "verifier"):
+    for label in ("buildspec", "dockerfile", "requirements_lock", "verifier"):
         paths[label] = _verify_pin(root, image.get(label, {}), label)
     if image.get("python_minor") != "3.12" or image.get("python_executable") != (
         "/opt/lumi/python312/bin/python"
@@ -299,6 +300,7 @@ def build_emr_serverless_canary_package(
     implementation[str(job_source.relative_to(root))] = _sha256_file(job_source)
 
     container_files = [
+        (paths["buildspec"], "buildspec.yml"),
         (paths["dockerfile"], "Dockerfile"),
         (paths["requirements_lock"], "requirements-linux-x86_64.lock"),
         (paths["verifier"], "verify_runtime.py"),
@@ -405,6 +407,7 @@ def build_emr_serverless_canary_package(
         "image": {
             "base_digest": contract["image"]["base_digest"],
             "base_uri": contract["image"]["base_uri"],
+            "buildspec_sha256": _sha256_file(paths["buildspec"]),
             "context_sha256": _sha256_file(context_path),
             "custom_image_bytes": None,
             "custom_image_digest": None,
@@ -570,6 +573,7 @@ def validate_emr_serverless_canary_release(
     if (
         image.get("base_digest") != BASE_IMAGE_DIGEST
         or image.get("base_uri") != BASE_IMAGE_URI
+        or image.get("buildspec_sha256") != BUILDSPEC_SHA256
         or image.get("maximum_image_gib") != 10
     ):
         raise ValueError("EMR canary image boundary changed")
@@ -798,6 +802,7 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
         RELEASE_FILE,
         "Dockerfile",
         "benchmark-signatures-v0.1.jsonl.gz",
+        "buildspec.yml",
         "requirements-linux-x86_64.lock",
         "resume-anchors-v0.1.jsonl.gz",
         "verify_runtime.py",
@@ -838,6 +843,7 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
     with zipfile.ZipFile(output_directory / IMAGE_CONTEXT) as archive:
         if set(archive.namelist()) != {
             "Dockerfile",
+            "buildspec.yml",
             "requirements-linux-x86_64.lock",
             "verify_runtime.py",
         }:
@@ -853,6 +859,17 @@ def verify_emr_serverless_canary_package(output_directory: Path) -> dict[str, An
     protected = ("JAVA_HOME", "SPARK_HOME", "HIVE_HOME", "TEZ_HOME")
     if any(f"ENV {name}" in dockerfile for name in protected):
         raise ValueError("EMR canary Dockerfile modifies a protected EMR environment variable")
+    buildspec = (output_directory / "buildspec.yml").read_text(encoding="utf-8")
+    required_buildspec_fragments = (
+        'test "$CODEBUILD_SOURCE_VERSION" = "$EXPECTED_SOURCE_VERSION"',
+        'docker build --pull --no-cache',
+        'docker push "$REPOSITORY_URI:$IMAGE_TAG"',
+        '/opt/lumi/python312/bin/python',
+    )
+    if not all(fragment in buildspec for fragment in required_buildspec_fragments):
+        raise ValueError("EMR canary CodeBuild contract changed")
+    if "CODEBUILD_RESOLVED_SOURCE_VERSION" in buildspec:
+        raise ValueError("EMR canary CodeBuild uses an unavailable S3 source variable")
     return {
         "code_archive_sha256": _sha256_file(output_directory / CODE_ARCHIVE),
         "image_context_sha256": _sha256_file(output_directory / IMAGE_CONTEXT),

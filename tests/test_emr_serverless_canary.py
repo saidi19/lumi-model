@@ -9,6 +9,7 @@ import pytest
 from lumi.emr_serverless_canary import (
     BASE_IMAGE_DIGEST,
     BASE_IMAGE_URI,
+    BUILDSPEC_SHA256,
     EMR_CANARY_APPROVAL_TEXT,
     _cost_envelope,
     _release_fingerprint,
@@ -96,6 +97,7 @@ def _synthetic_release() -> dict[str, object]:
         "image": {
             "base_digest": BASE_IMAGE_DIGEST,
             "base_uri": BASE_IMAGE_URI,
+            "buildspec_sha256": BUILDSPEC_SHA256,
             "context_sha256": "c" * 64,
             "custom_image_bytes": None,
             "custom_image_digest": None,
@@ -193,6 +195,23 @@ def test_package_source_commit_must_be_checked_out_head() -> None:
         _require_clean_source_commit(ROOT, "0" * 40)
 
 
+def test_first_codebuild_attempt_failed_safe_and_cleanup_is_complete() -> None:
+    report = json.loads(
+        (ROOT / "reports" / "emr-codebuild-canary-v0.1.json").read_text()
+    )
+    assert report["status"] == "failed_safe_before_image_build"
+    assert report["approval_consumed"] is True
+    assert report["docker_build_started"] is False
+    assert report["ecr_images_pushed"] == 0
+    assert report["emr_job_started"] is False
+    assert report["estimated_compute_usd_upper_bound"] == "0.03"
+    assert set(report["cleanup"].values()) <= {
+        "absent",
+        "absent_404_delete_marker_created",
+        0,
+    }
+
+
 def test_emr_image_context_is_digest_and_dependency_hash_pinned() -> None:
     directory = ROOT / "containers" / "emr-serverless-7.13-python312"
     dockerfile = (directory / "Dockerfile").read_text()
@@ -214,6 +233,11 @@ def test_emr_image_context_is_digest_and_dependency_hash_pinned() -> None:
     assert len(rows) == 27
     assert all("==" in row and " --hash=sha256:" in row for row in rows)
     assert any(row.startswith("lingua-language-detector==2.2.0 ") for row in rows)
+    buildspec = (directory / "buildspec.yml").read_text()
+    assert 'test "$CODEBUILD_SOURCE_VERSION" = "$EXPECTED_SOURCE_VERSION"' in buildspec
+    assert "CODEBUILD_RESOLVED_SOURCE_VERSION" not in buildspec
+    assert "docker build --pull --no-cache" in buildspec
+    assert 'docker push "$REPOSITORY_URI:$IMAGE_TAG"' in buildspec
 
 
 def test_one_approval_is_bound_to_exact_image_context_and_derived_digest() -> None:

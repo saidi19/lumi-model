@@ -243,8 +243,13 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     source-order Spark/sequential parity harness, request renderer, and separate
     release/authorization checks pass local verification. The maximum EMR plus
     CodeBuild compute envelope is $0.755904. The old Glue approval cannot
-    authorize it; no image build, EMR application, production acquisition, GPU
-    compute, or model training has started.
+    authorize it. Its first exact CodeBuild authorization is consumed by one
+    attempt that fails in `PRE_BUILD` before Docker because the S3 source used
+    the wrong built-in version variable. No image or EMR job is created, the
+    conservative compute upper bound is $0.03, and the project, log group,
+    temporary roles, empty ECR repository, and live authorization are deleted.
+    The corrected buildspec uses `CODEBUILD_SOURCE_VERSION` and is now included
+    in the release-fingerprinted image context; a retry needs new approval.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
