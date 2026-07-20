@@ -1,6 +1,7 @@
 # Lumi portability gate v0.1
 
-Status: **in progress; full-scale training is not approved**
+Status: **Hugging Face and native MLX topology pass; vLLM runtime and GGUF
+remain pending; full-scale training is not approved**
 
 ## Current result
 
@@ -8,12 +9,13 @@ Status: **in progress; full-scale training is not approved**
 |---|---|---|
 | Hugging Face | PASS (tiny checkpoint) | Export includes model code and `auto_map`; isolated Python loads `AutoModel` and `AutoModelForCausalLM`, preserves logits, and generates |
 | vLLM | CODE READY; runtime test pending | Base model now routes attention through the Transformers attention interface and forwards backend kwargs; test on Linux/CUDA with `model_impl="transformers"` is still required |
-| MLX-LM | DESIGN REVIEWED; adapter pending | MLX's Llama implementation supports an independent `head_dim`, including Lumi's wider query projection; Lumi still needs a custom model adapter and real converted-checkpoint test on the M5 Mac |
+| MLX-LM | PASS (150M trained checkpoint + final-width fixture) | Native `lumi_mlx.py` preserves Lumi identity, independent `head_dim`, wide query projection, GQA, RoPE, strict weights, cached generation, and final 4B projection shapes on the M5 Mac |
 | GGUF / llama.cpp | NOT IMPLEMENTED | A custom `LumiForCausalLM` converter/architecture mapping and Metal generation test are required |
 
-Passing Hugging Face does not imply that MLX, GGUF, or vLLM passed. The 64x64
-attention layout remains a candidate until all three runtime gates execute with
-the same tiny checkpoint and produce numerically sensible logits.
+Passing Hugging Face or MLX does not imply that GGUF or vLLM passed. The final
+64-head × 64-dimension layout now passes PyTorch/MLX strict conversion and
+runtime parity, while the vLLM CUDA runtime and llama.cpp architecture mapping
+remain separate gates.
 
 ## Why the Hugging Face test is isolated
 
@@ -47,11 +49,17 @@ minutes, not days.
 
 ## MLX and GGUF gates
 
-Both local formats need the frozen tokenizer files. The next implementation
-pass will add a tiny MLX adapter and GGUF conversion mapping, then compare
-greedy output on the M5 Mac. If the wider 64x64 attention projection causes a
-backend implementation problem, compare the existing 24x128 fallback at the
-same pilot scale before changing the 4B architecture.
+The native MLX adapter, trained 150M conversion/quantization gate, and reduced-
+depth final-width 4B topology gate now pass. The latter preserves the 3,072
+hidden width, 8,384 MLP width, 64 query heads, eight key/value heads, 64-wide
+head dimension, 65,536-token vocabulary, and 4,096 context contract while
+reducing only depth from 36 layers to one. It achieves 60/60 prompt-position
+top-1 agreement and 16/16 exact cached generated tokens on the M5 Mac. See
+[`mlx-final-topology-gate-v0.1.md`](mlx-final-topology-gate-v0.1.md).
+
+GGUF remains unimplemented. It needs a real `LumiForCausalLM` converter and
+llama.cpp architecture mapping before Metal generation can be claimed. The
+wider-layout fallback must not change merely because GGUF support is pending.
 
 Official implementation references:
 

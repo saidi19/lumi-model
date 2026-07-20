@@ -311,6 +311,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     authorization are still required; no production job, GPU, or training is
     running. See
     [`docs/production-emr-resume-v0.1.md`](docs/production-emr-resume-v0.1.md).
+43. the final-width native MLX portability gate passes locally on the 16GB M5
+    Mac without cloud compute. A 306,914,304-parameter fixture preserves the
+    final 4B model's 3,072 hidden width, 8,384 MLP width, 64 query heads, eight
+    key/value heads, 64-wide head dimension, 65,536-token vocabulary, and 4,096
+    context contract while reducing only depth from 36 layers to one. Config
+    and saved tensors are exact, RoPE error is 4.768e-7, prompt top-1 agreement
+    is 60/60, and cached greedy generation is 16/16 exact. The self-contained
+    manifest and copied implementation provenance pass independent
+    verification. This proves final projection-layout portability, not trained
+    4B quality, full-model memory, quantization, or speed; vLLM CUDA and GGUF
+    remain pending. See
+    [`docs/mlx-final-topology-gate-v0.1.md`](docs/mlx-final-topology-gate-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -353,6 +365,9 @@ in [`docs/evaluation-pilot-v0.1.md`](docs/evaluation-pilot-v0.1.md).
 The native MLX conversion, FP32 parity, 4-bit quality, and M5 runtime results are
 documented in
 [`docs/local-inference-gate-v0.1.md`](docs/local-inference-gate-v0.1.md).
+The reduced-depth final-width 4B projection-shape conversion, strict FP32
+parity, copied implementation provenance, and M5 result are documented in
+[`docs/mlx-final-topology-gate-v0.1.md`](docs/mlx-final-topology-gate-v0.1.md).
 The loopback OpenAI-compatible API, local chat UI, security boundary, and real
 server gate are documented in
 [`docs/local-serving-v0.1.md`](docs/local-serving-v0.1.md).
