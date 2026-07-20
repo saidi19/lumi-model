@@ -1,9 +1,8 @@
 # Lumi data plan v0.1
 
-Status: **candidate; capacity, bounded retention, S3 storage, and local
-distributed-acquisition gates pass. The first production prefix is preserved;
-the Glue canary failed safe, and its EMR replacement, production resume, and
-GPU training are not approved**
+Status: **candidate; capacity, retention, S3 storage, local distributed, and
+bounded S3/EMR cloud parity gates pass. The first production prefix is
+preserved; production resume and GPU training are not approved**
 
 ## Default source direction
 
@@ -205,8 +204,14 @@ evidence itself is only 16,750 bytes. See
   exactly matched at 12,999 accepted documents and 28 near-duplicate
   rejections. The manifest, report, run log, raw files, and parity digest pass
   independent verification; no cloud resource or model training was started.
-  Distributed production remains a separate later approval after measured
-  parity, throughput, and cost.
+- Completed in the bounded cloud envelope: one no-retry CodeBuild and one
+  no-retry EMR Serverless job process the same eight objects and exactly match
+  the Mac accepted IDs and rejection reasons. The job maps 13,027 candidates /
+  39,196,478 tokens, accepts 12,999 documents, and rejects 28 near duplicates.
+  Combined compute is estimated at $0.173908660. All temporary resources and
+  versioned payloads are removed after the 72-file local evidence archive is
+  verified. Distributed production remains a separate later approval; this
+  canary did not resume acquisition or create training shards.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

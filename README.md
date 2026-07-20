@@ -287,6 +287,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     near-duplicate rejections. The sealed parity digest is
     `13edb46411c3b5eeaaf35237f70e379d72eb22b8a223c0d70586ece649c96837`.
     No AWS resource, GPU, production shard, or model training was started.
+41. one fresh bounded cloud authorization then closes the S3/EMR parity gate.
+    CodeBuild stages and independently verifies all eight objects, builds the
+    2,631,167,482-byte immutable image, and succeeds without retry. The single
+    EMR job processes 13,027 candidates / 39,196,478 tokens and exactly matches
+    the Mac reference: 12,999 accepted IDs, 28 near-duplicate rejections, and
+    parity SHA-256
+    `13edb46411c3b5eeaaf35237f70e379d72eb22b8a223c0d70586ece649c96837`.
+    It runs for 361 seconds using 1.57 vCPU-hours and 6.28 memory-GB-hours;
+    combined build/EMR compute is estimated at $0.173908660. No production
+    shard or model training is created, and all temporary compute, IAM, ECR,
+    raw, checkpoint, result, and control versions are removed after the
+    72-file evidence archive passes independent verification.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -296,9 +308,9 @@ The bounded corpus-retention canary, object-storage/acquisition design, AWS S3
 provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate, and local S3-only source transport
 gate—including the exact real-source Mac canary—are complete. The complete
-source file manifest and the fail-closed CCCC decision are also complete. A bounded
-S3-staged replacement EMR parity canary, distributed production resume, a 4B
-learning pilot, and the full 4B/80B pretraining run remain unapproved.
+source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
+parity canary are also complete. Distributed production resume, a 4B learning
+pilot, and the full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
