@@ -408,6 +408,17 @@ def test_codebuild_requests_are_exact_idempotent_no_retry_and_least_privilege() 
     assert stage["Action"] == ["s3:GetObject", "s3:PutObject"]
     assert len(stage["Resource"]) == 8
     assert all(resource.endswith(".json.gz") for resource in stage["Resource"])
+    absence = next(
+        statement
+        for statement in policy["Statement"]
+        if statement["Sid"] == "ResolveAbsentSourceObjects"
+    )
+    assert absence == {
+        "Action": "s3:ListBucket",
+        "Effect": "Allow",
+        "Resource": "arn:aws:s3:::lumi-corpus-fixture",
+        "Sid": "ResolveAbsentSourceObjects",
+    }
     serialized = json.dumps(policy, sort_keys=True)
     assert "s3:DeleteObject" not in serialized
     assert "emr-serverless:" not in serialized

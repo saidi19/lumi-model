@@ -1,7 +1,8 @@
 # Lumi S3-staged corpus transport v0.1
 
-Status: **local implementation and real Spark parity pass; no source payload was
-uploaded, no AWS resource was created, and no paid compute is authorized**
+Status: **exact real-source Mac/Spark parity pass; the first bounded cloud
+source-staging attempt failed safe before download, and no cloud retry or EMR
+run is authorized**
 
 ## Decision
 
@@ -126,9 +127,71 @@ EMR Serverless.
 | Manifest SHA-256 | `5e6d747359f3e7b6fb0b6c8a3f270ade40a01dae6403e70a2ab8ece8b3b1605a` |
 | Package status | `verified_not_authorized` |
 
+## First authorized source-staging build
+
+One fresh exact authorization started CodeBuild build
+`lumi-emr-staged-f6ac38bb85bd:c014a713-9146-484e-8b4d-3cc118f2bbfb` from the
+version-pinned image context. It spent 303 seconds provisioning and failed in
+eight seconds of `PRE_BUILD`, before any external source download, S3 raw write,
+Docker build, ECR image push, or EMR launch.
+
+The failure was an IAM contract omission. The producer checks whether each
+content-addressed destination already exists with `HeadObject`. AWS returns
+`404 Not Found` for a missing object only when the caller also has
+`s3:ListBucket`; otherwise the same missing key returns `403 Forbidden`. The
+temporary role granted exact-key `s3:GetObject`/`s3:PutObject` but omitted the
+bucket-level read-only permission, so the fail-closed client correctly refused
+to interpret the `403` as absence.
+
+Post-run verification found zero staged raw objects, zero ECR images, and zero
+EMR applications. The CodeBuild project, log group, empty ECR repository, and
+temporary IAM role are deleted; EC2 and EMR remain empty. The conservative
+CodeBuild compute upper bound is $0.03. Full API/log hashes and cleanup evidence
+are recorded in `reports/emr-codebuild-s3-staging-v0.1.json`.
+
+The policy renderer now adds `s3:ListBucket` on only the sealed corpus bucket;
+payload reads and writes remain restricted to the exact eight object ARNs. A
+regression test requires this permission and continues to reject S3 delete,
+EMR, EC2, production, GPU, and model-training access. The consumed approval
+cannot authorize a retry.
+
+## Exact real-source Mac canary
+
+The owner-authorized local canary then exercised the production-shaped data
+path on the exact eight pinned source objects without mutating AWS. The files
+were downloaded once, verified against the sealed byte and SHA-256 pins, and
+reused only after another complete hash check. Git contains only the compact
+result; the 1.456GB raw cache remains outside the repository.
+
+| Result | Verified value |
+|---|---:|
+| Source objects / categories | 8 / all 7 |
+| Compressed source bytes | 1,456,514,440 |
+| Raw records processed | 14,061 |
+| Filtered candidates / tokens | 13,027 / 39,196,478 |
+| Immutable resume anchors | 38,349 |
+| Sequential accepted / rejected | 12,999 / 28 |
+| Spark accepted / rejected | 12,999 / 28 |
+| Exact / near-duplicate rejections | 0 / 28 |
+| Spark/sequential parity | exact IDs and reasons |
+| Parity SHA-256 | `13edb46411c3b5eeaaf35237f70e379d72eb22b8a223c0d70586ece649c96837` |
+| Report SHA-256 | `cb18d437339eefbf4e4c57e2d91b5f9f00b9b54b745d271e8e4bdb760a391ace` |
+| Manifest SHA-256 | `a568a676c47725fefeab5f60192df32e576967b1117a56d7a5e5cab10397df3a` |
+
+The first local Spark transfer exposed a macOS socket-buffer limit when one
+large Python partition was sent to the JVM. Partitioning candidates into 16
+bounded slices and anchors into 32 bounded slices fixed the transport issue;
+the filtering, source order, deduplication rules, and accepted/rejected result
+did not change. The corrected cached-resume attempt completed in 316.007
+seconds. All raw-source entries in `manifest.sha256` pass an independent hash
+check. No S3 object, AWS service, GPU, production shard, or training process was
+created.
+
 ## Next bounded boundary
 
-No cloud retry is implied by this result. Before another paid action:
+The local real-source data and deduplication gate is now complete, but it does
+not prove AWS IAM, S3 transport, or EMR runtime behavior. No cloud retry is
+implied by this result. Before another paid action:
 
 1. obtain a new exact owner authorization—the previous approval is consumed;
 2. stage only the eight pinned objects and independently verify all S3 heads;
@@ -147,6 +210,7 @@ training, GPUs, the 4B pilot, or the 4B/80B run.
 - [EMR Serverless same-Region service access](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/considerations.html)
 - [S3 upload checksum validation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
 - [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+- [S3 `HeadObject` missing-key permission semantics](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html)
 - [CodeBuild compute, memory, and disk sizes](https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-compute-types.html)
 - [AWS CLI conditional/checksummed `PutObject`](https://docs.aws.amazon.com/cli/latest/reference/s3api/put-object.html)
 - [Spark 3.5.6 supported Java runtimes](https://spark.apache.org/docs/3.5.6/)
