@@ -174,17 +174,16 @@ implemented locally: exact source files bind to content-addressed S3 objects,
 and the EMR mapper uses verified, resumable S3 GETs with no direct-HTTP
 fallback. The unchanged eight-source/all-category slice totals 1,456,514,440
 compressed bytes. Its local integrity, restart, and real Spark/sequential
-parity suite passes 76/76 focused tests, and the complete repository suite
-passes 236/236; see
+parity suite passes 79/79 focused tests, and the complete repository suite
+passes 239/239; see
 [`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
 
 No source payload was uploaded and no paid compute was authorized by that local
-result. A clean, image-unbound package from source commit `9c67a76` is now
-independently verified; its release fingerprint is
-`0d2043bceacd06919fd3efe1b323f435ecdf4949740b7482cf8820de8ca4af88`.
-The bounded source-staging runner, its exact compute cap, and a new owner
-approval are still required before staging the eight objects or running one
-replacement EMR canary. Only a passing cloud parity result can produce the measured
+result. The bounded producer now stages the eight objects at the start of the
+same 30-minute `BUILD_GENERAL1_SMALL` image build; no separate Batch service,
+VPC, or producer compute charge is introduced. A new clean package and a fresh
+owner approval are still required before that combined build or one replacement
+EMR canary. Only a passing cloud parity result can produce the measured
 production-resume proposal. Resuming acquisition toward the 120B floors remains
 a later, separately priced and separately authorized roadmap action.
 

@@ -21,7 +21,7 @@ previous canary and makes every worker consume the same immutable bytes.
 
 | Boundary | Verified value |
 |---|---:|
-| Plan fingerprint | `aac99c3587a611a0b255338d81309cda588d04c7d5ef31827720ac4129dc5468` |
+| Plan fingerprint | `f1a95f43a6df8209345f368c2b6c75435849b566557d91ddb3a1f4f358629333` |
 | Canary source objects | 8 |
 | Canary compressed bytes | 1,456,514,440 |
 | Category coverage | all 7 categories |
@@ -44,6 +44,10 @@ Each staged key is derived only from its upstream SHA-256:
 
 The producer:
 
+- runs with two streaming workers at the start of the same bounded
+  `BUILD_GENERAL1_SMALL` image build;
+- keeps the existing 30-minute/$0.15 CodeBuild hard cap and uses its documented
+  64GB disk and 4GiB memory envelope;
 - verifies the downloaded file's exact byte size and SHA-256 before upload;
 - supplies S3's base64 SHA-256 checksum and SSE-S3 (`AES256`);
 - uses `If-None-Match: *`, so an existing key cannot be overwritten;
@@ -64,8 +68,8 @@ candidate floors, 150B fail-closed maximum, or final 80B training mix.
 
 ## Local verification
 
-The corpus-focused suite passed **76/76 tests**, and the complete repository
-suite passed **236/236 tests**, under Python 3.12.13, Java 17.0.19, and PySpark
+The corpus-focused suite passed **79/79 tests**, and the complete repository
+suite passed **239/239 tests**, under Python 3.12.13, Java 17.0.19, and PySpark
 3.5.6. It covers:
 
 - new write, verified reuse, conditional collision, and wrong-object refusal;
@@ -80,11 +84,13 @@ suite passed **236/236 tests**, under Python 3.12.13, Java 17.0.19, and PySpark
 Ruff passes for the complete repository. The temporary test environment and
 generated plan stay outside Git.
 
-## Clean package result
+## Superseded package evidence
 
 The non-authorizing EMR package was built from clean source commit
 `9c67a766b9a1503d2bb99971fee9f92e0ae15e03` and independently verified after
-copying to durable local storage.
+copying to durable local storage. It was never launched. The later same-build
+producer integration intentionally supersedes it, so its approval boundary and
+fingerprint cannot be reused.
 
 | Package field | Verified value |
 |---|---|
@@ -95,25 +101,23 @@ copying to durable local storage.
 | Manifest SHA-256 | `6af6a170efa442becc0f154e91fe8e9ab9151986cab8ad3e9868ca81eb40214d` |
 | Package status | `verified_not_authorized` |
 
-The pinned build-plus-EMR compute ceiling is $0.755904. At current pinned S3
+The pinned build-plus-EMR compute ceiling remains $0.755904. At current pinned S3
 prices, eight source PUTs cost $0.00004, inbound and same-Region transfer cost
 $0, and retaining all 1.4565 GB for a full month would cost about $0.03350.
-Those figures deliberately exclude the internet-facing producer's compute:
-that runner and its own hard runtime/cost cap must be packaged and verified
-before a fresh cloud authorization can be requested.
+The internet-facing producer now runs inside that same CodeBuild ceiling, so
+there is no separate Batch/Fargate compute line item.
 
 ## Next bounded boundary
 
 No cloud retry is implied by this result. Before another paid action:
 
-1. package and locally test the bounded internet-facing staging runner;
-2. calculate and show its exact compute cap alongside the verified
-   build/EMR/S3 envelope;
-3. obtain a new exact owner authorization—the previous approval is consumed;
-4. stage only the eight pinned objects and independently verify all S3 heads;
-5. run one no-retry EMR parity canary and require exact accepted-ID and
+1. build and independently verify one clean package from the same-build source
+   commit;
+2. obtain a new exact owner authorization—the previous approval is consumed;
+3. stage only the eight pinned objects and independently verify all S3 heads;
+4. run one no-retry EMR parity canary and require exact accepted-ID and
    rejection-reason parity;
-6. preserve evidence and delete temporary image, roles, application, and raw
+5. preserve evidence and delete temporary image, roles, application, and raw
    canary objects.
 
 Only a passing parity result can unlock a separately approved distributed
@@ -126,5 +130,6 @@ training, GPUs, the 4B pilot, or the 4B/80B run.
 - [EMR Serverless same-Region service access](https://docs.aws.amazon.com/emr/latest/EMR-Serverless-UserGuide/considerations.html)
 - [S3 upload checksum validation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
 - [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
-- [AWS Batch array jobs for future production staging](https://docs.aws.amazon.com/batch/latest/userguide/array_jobs.html)
+- [CodeBuild compute, memory, and disk sizes](https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-compute-types.html)
+- [AWS CLI conditional/checksummed `PutObject`](https://docs.aws.amazon.com/cli/latest/reference/s3api/put-object.html)
 - [Spark 3.5.6 supported Java runtimes](https://spark.apache.org/docs/3.5.6/)

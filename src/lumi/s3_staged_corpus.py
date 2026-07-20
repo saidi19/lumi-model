@@ -13,20 +13,12 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 from collections.abc import Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
-
-from .glue_canary import _select_canary_sources
-from .production_corpus import (
-    _canonical_json_bytes,
-    _component_provenance,
-    _download_source,
-    _read_json,
-    _scratch_bytes,
-    _sha256_file,
-    build_round_robin_source_schedule,
-)
+from urllib.parse import quote
 
 SCHEMA_VERSION = 1
 PLAN_GATE = "lumi_s3_staged_corpus_plan_v0.1"
@@ -48,10 +40,16 @@ EXPECTED_CONSUMER = {
     "service": "aws_emr_serverless",
 }
 EXPECTED_PRODUCER = {
+    "compute_type": "BUILD_GENERAL1_SMALL",
+    "disk_gb": 64,
     "direct_source_network_required": True,
-    "future_canary_array_size": 8,
-    "future_service": "aws_batch_fargate_array",
     "launch_authorized": False,
+    "maximum_build_minutes": 30,
+    "maximum_parallel_downloads": 2,
+    "memory_gib": 4,
+    "service": "aws_codebuild_same_image_build",
+    "source_files": 8,
+    "vcpu": 2,
 }
 EXPECTED_INPUTS = {
     "baseline_evidence",
@@ -66,6 +64,81 @@ EXPECTED_CANARY = {
     "maximum_total_source_compressed_bytes": 1_500_000_000,
     "source_files": 8,
 }
+
+
+def _canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"expected JSON object: {path}")
+    return value
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _scratch_bytes(scratch: Path) -> int:
+    return sum(path.stat().st_size for path in scratch.rglob("*") if path.is_file())
+
+
+def _source_url(source: Mapping[str, Any]) -> str:
+    dataset_id = quote(str(source["dataset_id"]), safe="/")
+    revision = quote(str(source["revision"]), safe="")
+    source_file = quote(str(source["source_file"]), safe="/")
+    return f"https://huggingface.co/datasets/{dataset_id}/resolve/{revision}/{source_file}"
+
+
+def _download_source(source: Mapping[str, Any], scratch: Path, scratch_cap: int) -> Path:
+    """Resume and verify one exact pinned upstream object with CodeBuild's curl."""
+
+    scratch.mkdir(parents=True, exist_ok=True)
+    digest = _valid_sha256(source.get("source_sha256"), "staged source SHA-256")
+    expected_bytes = _positive_int(source.get("source_bytes"), "staged source bytes")
+    final = scratch / f"source-{digest}.json.gz"
+    partial = scratch / f"source-{digest}.json.gz.part"
+    if final.exists():
+        if final.stat().st_size == expected_bytes and _sha256_file(final) == digest:
+            return final
+        raise ValueError("cached upstream source failed size or SHA-256")
+    partial_bytes = partial.stat().st_size if partial.exists() else 0
+    if partial_bytes > expected_bytes:
+        raise ValueError("partial upstream source is larger than its pin")
+    if _scratch_bytes(scratch) + expected_bytes - partial_bytes > scratch_cap:
+        raise RuntimeError("S3 staging scratch cap would be exceeded by source download")
+    completed = subprocess.run(
+        [
+            "curl",
+            "--location",
+            "--fail",
+            "--show-error",
+            "--retry",
+            "10",
+            "--retry-all-errors",
+            "--continue-at",
+            "-",
+            "--output",
+            str(partial),
+            _source_url(source),
+        ],
+        check=False,
+    )
+    if completed.returncode:
+        raise RuntimeError(f"failed downloading pinned source: {source['source_file']}")
+    if partial.stat().st_size != expected_bytes or _sha256_file(partial) != digest:
+        raise RuntimeError(f"pinned source failed size or SHA-256: {source['source_file']}")
+    partial.replace(final)
+    return final
 
 
 def _valid_sha256(value: Any, label: str) -> str:
@@ -247,11 +320,17 @@ def verify_staged_object_head(
     metadata = head.get("Metadata")
     if not isinstance(metadata, Mapping) or dict(metadata) != _object_metadata(source):
         raise ValueError("staged S3 object identity metadata changed")
+    etag = head.get("ETag")
+    version_id = head.get("VersionId")
+    if not isinstance(etag, str) or not etag:
+        raise ValueError("staged S3 object ETag is missing")
+    if not isinstance(version_id, str) or not version_id or version_id == "null":
+        raise ValueError("staged S3 object version ID is missing")
     return {
         "bytes": expected["bytes"],
-        "etag": head.get("ETag"),
+        "etag": etag,
         "sha256": expected["sha256"],
-        "version_id": head.get("VersionId"),
+        "version_id": version_id,
     }
 
 
@@ -270,10 +349,9 @@ def stage_source_file(
         raise FileNotFoundError(f"missing pinned source payload: {path}")
     if path.stat().st_size != expected["bytes"] or _sha256_file(path) != expected["sha256"]:
         raise ValueError("local pinned source payload failed size or SHA-256")
-    existing = _head_or_none(s3_client, staged_object)
+    existing = verify_existing_staged_source(entry, s3_client=s3_client)
     if existing is not None:
-        verified = verify_staged_object_head(source, staged_object, existing)
-        return {**verified, "s3_uri": expected["s3_uri"], "status": "reused_verified"}
+        return existing
     try:
         with path.open("rb") as body:
             s3_client.put_object(
@@ -300,6 +378,23 @@ def stage_source_file(
     return {**verified, "s3_uri": expected["s3_uri"], "status": status}
 
 
+def verify_existing_staged_source(
+    entry: Mapping[str, Any], *, s3_client: Any
+) -> dict[str, Any] | None:
+    """Return a verified immutable object without downloading its upstream again."""
+
+    source = entry.get("source")
+    staged_object = entry.get("object")
+    if not isinstance(source, Mapping) or not isinstance(staged_object, Mapping):
+        raise ValueError("staging entry is incomplete")
+    expected = _validate_object_binding(source, staged_object)
+    head = _head_or_none(s3_client, staged_object)
+    if head is None:
+        return None
+    verified = verify_staged_object_head(source, staged_object, head)
+    return {**verified, "s3_uri": expected["s3_uri"], "status": "reused_verified"}
+
+
 def fetch_and_stage_source(
     entry: Mapping[str, Any],
     scratch: Path,
@@ -312,8 +407,81 @@ def fetch_and_stage_source(
     source = entry.get("source")
     if not isinstance(source, Mapping):
         raise ValueError("staging entry has no source identity")
+    existing = verify_existing_staged_source(entry, s3_client=s3_client)
+    if existing is not None:
+        return existing
     source_path = _download_source(source, scratch, scratch_cap)
     return stage_source_file(entry, source_path, s3_client=s3_client)
+
+
+def stage_s3_staging_plan(
+    plan: Mapping[str, Any],
+    scratch: Path,
+    *,
+    scratch_cap: int,
+    s3_client: Any,
+    max_workers: int = 2,
+) -> dict[str, Any]:
+    """Stage the exact bounded plan inside one already-authorized build."""
+
+    verified = validate_s3_staging_plan(plan)
+    producer = plan["producer"]
+    if max_workers != producer["maximum_parallel_downloads"]:
+        raise ValueError("S3 staging worker count changed")
+    minimum_cap = int(plan["summary"]["source_bytes"]) + 128 * 1024 * 1024
+    if scratch_cap < minimum_cap:
+        raise ValueError("S3 staging scratch cap is below the bounded source plan")
+    scratch.mkdir(parents=True, exist_ok=True)
+
+    def stage_one(entry: Mapping[str, Any]) -> dict[str, Any]:
+        staged = fetch_and_stage_source(
+            entry,
+            scratch,
+            scratch_cap=scratch_cap,
+            s3_client=s3_client,
+        )
+        source = entry["source"]
+        return {
+            "bytes": staged["bytes"],
+            "etag": staged["etag"],
+            "ordinal": source["ordinal"],
+            "s3_uri": staged["s3_uri"],
+            "sha256": staged["sha256"],
+            "status": staged["status"],
+            "version_id": staged["version_id"],
+        }
+
+    results = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(stage_one, entry) for entry in plan["sources"]]
+        for future in as_completed(futures):
+            results.append(future.result())
+    results.sort(key=lambda row: int(row["ordinal"]))
+    if len(results) != verified["source_files"]:
+        raise RuntimeError("S3 staging build did not verify every source object")
+    if sum(int(row["bytes"]) for row in results) != verified["source_bytes"]:
+        raise RuntimeError("S3 staging build byte accounting changed")
+    allowed = {"reused_after_conditional_race", "reused_verified", "staged_new"}
+    if any(row["status"] not in allowed for row in results):
+        raise RuntimeError("S3 staging build returned an unexpected object status")
+    return {
+        "authorization": {
+            "full_4b_training": False,
+            "model_training": False,
+            "production_acquisition": False,
+        },
+        "gate": "lumi_s3_staged_corpus_codebuild_result_v0.1",
+        "plan_fingerprint": verified["plan_fingerprint"],
+        "results": results,
+        "schema_version": SCHEMA_VERSION,
+        "status": "verified_all_source_objects_staged",
+        "summary": {
+            "reused_objects": sum(row["status"] != "staged_new" for row in results),
+            "source_bytes": verified["source_bytes"],
+            "source_files": verified["source_files"],
+            "staged_new_objects": sum(row["status"] == "staged_new" for row in results),
+        },
+    }
 
 
 def _body_chunks(body: Any, chunk_size: int) -> Iterable[bytes]:
@@ -481,6 +649,12 @@ def build_s3_staging_plan(
     contract_path: Path, *, repository_root: Path
 ) -> dict[str, Any]:
     """Build the deterministic eight-source S3-staged parity plan locally."""
+
+    from .glue_canary import _select_canary_sources
+    from .production_corpus import (
+        _component_provenance,
+        build_round_robin_source_schedule,
+    )
 
     contract, paths, inputs = _load_contract(contract_path, repository_root)
     baseline = _read_json(paths["baseline_evidence"])

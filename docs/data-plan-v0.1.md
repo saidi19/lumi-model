@@ -183,18 +183,17 @@ evidence itself is only 16,750 bytes. See
   files under SHA-256-addressed private S3 keys and makes EMR consume only those
   objects. Conditional writes, stored checksum/metadata verification,
   interrupted range resume, wrong-object refusal, and real Spark/sequential
-  parity pass 76 corpus-focused tests; the complete repository suite passes
-  236/236. The unchanged eight-source plan covers
+  parity pass 79 corpus-focused tests; the complete repository suite passes
+  239/239. The unchanged eight-source plan covers
   all seven categories and 1,456,514,440 compressed bytes; no cloud write or
   paid compute occurred. See [`s3-staged-corpus-v0.1.md`](s3-staged-corpus-v0.1.md).
-- Next: package the clean commit, price the exact eight-object staging plus one
-  EMR parity canary, and request a new exact approval. The clean EMR package is
-  now complete and independently verified at source commit `9c67a76`; its
-  release fingerprint is
-  `0d2043bceacd06919fd3efe1b323f435ecdf4949740b7482cf8820de8ca4af88`.
-  The remaining local prerequisite is the bounded internet-facing staging
-  runner plus its exact compute cap. Distributed production remains a separate
-  later approval after measured parity, throughput, and cost.
+- Completed locally: the internet-facing producer now runs before the image
+  build inside the same `BUILD_GENERAL1_SMALL` CodeBuild. Two streaming workers
+  stage the eight files, verified existing objects skip upstream downloads, and
+  the original 30-minute/$0.15 build cap is unchanged. The clean package must
+  now be rebuilt from this exact commit before requesting a new approval.
+  Distributed production remains a separate later approval after measured
+  parity, throughput, and cost.
 - Materialize only the selected, cleaned shards in private object storage.
 - Pin every upstream dataset revision; never train from a floating `main`.
 - Maintain a removal ledger mapping source document IDs to processed shards.

@@ -10,12 +10,16 @@ from lumi.emr_serverless_canary import (
     BASE_IMAGE_DIGEST,
     BASE_IMAGE_URI,
     BUILDSPEC_SHA256,
+    CODEBUILD_STANDARD_IMAGE,
     EMR_CANARY_APPROVAL_TEXT,
     _cost_envelope,
     _release_fingerprint,
     _require_clean_source_commit,
     _validate_contract,
     bind_emr_serverless_image,
+    build_codebuild_project_request,
+    build_codebuild_service_policy,
+    build_codebuild_start_request,
     build_emr_serverless_application_request,
     build_emr_serverless_job_request,
     validate_emr_serverless_canary_authorization,
@@ -65,8 +69,12 @@ def _synthetic_release() -> dict[str, object]:
     prefix = f"s3://{bucket}/lumi-corpus/v0.1/control/distributed/emr-serverless"
     artifacts = {
         "benchmark_registry": {"s3_uri": f"{prefix}/benchmark/signatures.jsonl.gz"},
-        "code_archive": {"s3_uri": f"{prefix}/code/lumi.zip"},
+        "code_archive": {"s3_uri": f"{prefix}/code/lumi.zip", "sha256": "1" * 64},
         "frozen_tokenizer": {"s3_uri": f"{prefix}/tokenizer/tokenizer.json"},
+        "image_context": {
+            "s3_uri": f"{prefix}/image/context.zip",
+            "sha256": "2" * 64,
+        },
         "job_script": {"s3_uri": f"{prefix}/jobs/run.py"},
         "resume_anchors": {"s3_uri": f"{prefix}/anchors/resume.jsonl.gz"},
         "training_exclusion_ledger": {"s3_uri": f"{prefix}/ledger/exclusions.jsonl"},
@@ -119,6 +127,15 @@ def _synthetic_release() -> dict[str, object]:
             "source_release_fingerprint": None,
             "state": "build_not_authorized",
         },
+        "implementation": {
+            "containers/emr-serverless-7.13-python312/Dockerfile": "3" * 64,
+            "containers/emr-serverless-7.13-python312/requirements-linux-x86_64.lock": "4"
+            * 64,
+            "containers/emr-serverless-7.13-python312/requirements-staging-linux-x86_64.lock": "5"
+            * 64,
+            "containers/emr-serverless-7.13-python312/verify_runtime.py": "6" * 64,
+            "scripts/stage_s3_corpus_canary.py": "7" * 64,
+        },
         "job": {
             "driver": {"cores": 4, "disk_gib": 20, "memory_gib": 14},
             "dynamic_allocation": False,
@@ -142,8 +159,21 @@ def _synthetic_release() -> dict[str, object]:
             "direct_external_http_fallback": False,
             "network_path": "same_region_s3_only",
             "plan_fingerprint": "e" * 64,
+            "producer": {
+                "compute_type": "BUILD_GENERAL1_SMALL",
+                "disk_gb": 64,
+                "direct_source_network_required": True,
+                "launch_authorized": False,
+                "maximum_build_minutes": 30,
+                "maximum_parallel_downloads": 2,
+                "memory_gib": 4,
+                "service": "aws_codebuild_same_image_build",
+                "source_files": 8,
+                "vcpu": 2,
+            },
             "source_bytes": 8_000,
             "source_files": 8,
+            "staging_plan_sha256": "f" * 64,
         },
         "sources": _sources(),
     }
@@ -171,7 +201,10 @@ def _authorization(release: dict[str, object], now: datetime) -> dict[str, objec
         },
         "bounds": {
             "maximum_codebuild_compute_usd": "0.15",
+            "maximum_codebuild_disk_gb": 64,
+            "maximum_codebuild_memory_gib": 4,
             "maximum_codebuild_minutes": 30,
+            "maximum_codebuild_vcpu": 2,
             "maximum_combined_compute_usd": "0.755904",
             "maximum_emr_compute_usd": "0.605904",
             "maximum_emr_disk_gib": 80,
@@ -181,6 +214,7 @@ def _authorization(release: dict[str, object], now: datetime) -> dict[str, objec
             "maximum_records_per_source": 2_000,
             "maximum_source_compressed_bytes": 700_000_000,
             "maximum_source_files": 8,
+            "maximum_staging_parallel_downloads": 2,
             "maximum_total_source_compressed_bytes": 1_500_000_000,
         },
         "expires_at": (now + timedelta(hours=2)).isoformat().replace("+00:00", "Z"),
@@ -191,6 +225,12 @@ def _authorization(release: dict[str, object], now: datetime) -> dict[str, objec
         "run_token": "1" * 32,
         "schema_version": 1,
         "source_commit": release["source_commit"],
+        "source_staging_plan_fingerprint": release["source_transport"][
+            "plan_fingerprint"
+        ],
+        "source_staging_plan_sha256": release["source_transport"][
+            "staging_plan_sha256"
+        ],
     }
 
 
@@ -258,6 +298,17 @@ def test_emr_image_context_is_digest_and_dependency_hash_pinned() -> None:
     assert "CODEBUILD_RESOLVED_SOURCE_VERSION" not in buildspec
     assert "docker build --pull --no-cache" in buildspec
     assert 'docker push "$REPOSITORY_URI:$IMAGE_TAG"' in buildspec
+    assert "stage_s3_corpus_canary.py" in buildspec
+    assert buildspec.index("stage_s3_corpus_canary.py") < buildspec.index("docker build")
+    staging_rows = [
+        row
+        for row in (directory / "requirements-staging-linux-x86_64.lock")
+        .read_text()
+        .splitlines()
+        if row and not row.startswith("#")
+    ]
+    assert len(staging_rows) == 7
+    assert all("==" in row and " --hash=sha256:" in row for row in staging_rows)
 
 
 def test_one_approval_is_bound_to_exact_image_context_and_derived_digest() -> None:
@@ -268,7 +319,9 @@ def test_one_approval_is_bound_to_exact_image_context_and_derived_digest() -> No
     )
     authorization = _authorization(release, now)
     before = validate_emr_serverless_canary_authorization(authorization, release, now=now)
-    assert before["status"] == "authorized_one_bounded_image_build_and_canary_only"
+    assert before["status"] == (
+        "authorized_one_bounded_source_staging_image_build_and_canary_only"
+    )
 
     digest = "sha256:" + "d" * 64
     bound = bind_emr_serverless_image(
@@ -290,6 +343,75 @@ def test_one_approval_is_bound_to_exact_image_context_and_derived_digest() -> No
     tampered["release_fingerprint"] = _release_fingerprint(material)
     with pytest.raises(ValueError, match="another image context"):
         validate_emr_serverless_canary_authorization(authorization, tampered, now=now)
+
+    wrong_staging = _authorization(release, now)
+    wrong_staging["source_staging_plan_fingerprint"] = "0" * 64
+    with pytest.raises(ValueError, match="another S3 staging plan"):
+        validate_emr_serverless_canary_authorization(wrong_staging, release, now=now)
+
+
+def test_codebuild_requests_are_exact_idempotent_no_retry_and_least_privilege() -> None:
+    now = datetime(2026, 7, 20, tzinfo=UTC)
+    release = _synthetic_release()
+    authorization = _authorization(release, now)
+    account_id = "123456789012"
+    fingerprint = release["release_fingerprint"]
+    role = f"arn:aws:iam::{account_id}:role/lumi-codebuild-emr-canary-{fingerprint[:12]}"
+    version_id = "fixture+version/1="
+
+    project = build_codebuild_project_request(
+        release,
+        authorization,
+        account_id=account_id,
+        context_version_id=version_id,
+        service_role_arn=role,
+        now=now,
+    )
+    assert project["autoRetryLimit"] == 0
+    assert project["concurrentBuildLimit"] == 1
+    assert project["timeoutInMinutes"] == 30
+    assert project["sourceVersion"] == version_id
+    assert project["environment"]["image"] == CODEBUILD_STANDARD_IMAGE
+    assert project["environment"]["computeType"] == "BUILD_GENERAL1_SMALL"
+    assert "vpcConfig" not in project
+    variables = {
+        row["name"]: row["value"] for row in project["environment"]["environmentVariables"]
+    }
+    assert variables["EXPECTED_SOURCE_VERSION"] == version_id
+    assert variables["AUTHORIZED_STAGING_PLAN_FINGERPRINT"] == release[
+        "source_transport"
+    ]["plan_fingerprint"]
+    assert variables["EXPECTED_CODE_ARCHIVE_SHA256"] == "1" * 64
+
+    start = build_codebuild_start_request(
+        release,
+        authorization,
+        account_id=account_id,
+        context_version_id=version_id,
+        now=now,
+    )
+    assert start == {
+        "autoRetryLimitOverride": 0,
+        "idempotencyToken": authorization["run_token"],
+        "projectName": project["name"],
+        "queuedTimeoutInMinutesOverride": 10,
+        "sourceVersion": version_id,
+        "timeoutInMinutesOverride": 30,
+    }
+
+    policy = build_codebuild_service_policy(release, account_id=account_id)
+    stage = next(
+        statement
+        for statement in policy["Statement"]
+        if statement["Sid"] == "StageExactSourceObjects"
+    )
+    assert stage["Action"] == ["s3:GetObject", "s3:PutObject"]
+    assert len(stage["Resource"]) == 8
+    assert all(resource.endswith(".json.gz") for resource in stage["Resource"])
+    serialized = json.dumps(policy, sort_keys=True)
+    assert "s3:DeleteObject" not in serialized
+    assert "emr-serverless:" not in serialized
+    assert "ec2:" not in serialized
 
 
 def test_release_and_authorization_fail_closed_on_boundary_changes() -> None:

@@ -12,9 +12,28 @@ phases:
         test "$CODEBUILD_SOURCE_VERSION" = "$EXPECTED_SOURCE_VERSION"
         [[ "$RELEASE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
         [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+        [[ "$EXPECTED_STAGING_PLAN_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+        test "$AUTHORIZED_STAGING_PLAN_FINGERPRINT" = "$EXPECTED_STAGING_PLAN_FINGERPRINT"
         test "$(sha256sum Dockerfile | awk '{print $1}')" = "$EXPECTED_DOCKERFILE_SHA256"
         test "$(sha256sum requirements-linux-x86_64.lock | awk '{print $1}')" = "$EXPECTED_REQUIREMENTS_SHA256"
+        test "$(sha256sum requirements-staging-linux-x86_64.lock | awk '{print $1}')" = "$EXPECTED_STAGING_REQUIREMENTS_SHA256"
+        test "$(sha256sum stage_s3_corpus_canary.py | awk '{print $1}')" = "$EXPECTED_STAGING_SCRIPT_SHA256"
+        test "$(sha256sum s3-staging-plan-v0.1.json | awk '{print $1}')" = "$EXPECTED_STAGING_PLAN_SHA256"
+        test "$(sha256sum lumi-emr-serverless-code-v0.1.zip | awk '{print $1}')" = "$EXPECTED_CODE_ARCHIVE_SHA256"
         test "$(sha256sum verify_runtime.py | awk '{print $1}')" = "$EXPECTED_VERIFIER_SHA256"
+        python3 -m venv "$CODEBUILD_SRC_DIR/.lumi-staging-venv"
+        "$CODEBUILD_SRC_DIR/.lumi-staging-venv/bin/python" -m pip install \
+          --disable-pip-version-check --no-cache-dir --require-hashes \
+          -r requirements-staging-linux-x86_64.lock
+        PYTHONPATH="$CODEBUILD_SRC_DIR/lumi-emr-serverless-code-v0.1.zip" \
+          "$CODEBUILD_SRC_DIR/.lumi-staging-venv/bin/python" stage_s3_corpus_canary.py \
+          --plan s3-staging-plan-v0.1.json \
+          --scratch "$CODEBUILD_SRC_DIR/.lumi-source-stage" \
+          --output "$CODEBUILD_SRC_DIR/s3-staging-result-v0.1.json" \
+          --expected-plan-fingerprint "$EXPECTED_STAGING_PLAN_FINGERPRINT" \
+          --workers 2
+        test "$(python3 -c 'import json; print(json.load(open("s3-staging-result-v0.1.json"))["status"])')" = "verified_all_source_objects_staged"
+        rm -rf "$CODEBUILD_SRC_DIR/.lumi-source-stage" "$CODEBUILD_SRC_DIR/.lumi-staging-venv"
         aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_URI"
   build:
     commands:

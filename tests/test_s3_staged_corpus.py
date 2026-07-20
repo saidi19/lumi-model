@@ -15,6 +15,7 @@ from lumi.s3_staged_corpus import (
     build_s3_staging_plan,
     build_staged_object,
     download_staged_source,
+    stage_s3_staging_plan,
     stage_source_file,
     validate_s3_staging_plan,
 )
@@ -163,6 +164,18 @@ def test_local_plan_is_bounded_s3_only_and_non_authorizing() -> None:
         "service": "aws_emr_serverless",
     }
     assert not any(plan["authorization"].values())
+    assert plan["producer"] == {
+        "compute_type": "BUILD_GENERAL1_SMALL",
+        "disk_gb": 64,
+        "direct_source_network_required": True,
+        "launch_authorized": False,
+        "maximum_build_minutes": 30,
+        "maximum_parallel_downloads": 2,
+        "memory_gib": 4,
+        "service": "aws_codebuild_same_image_build",
+        "source_files": 8,
+        "vcpu": 2,
+    }
     assert {entry["source"]["category"] for entry in plan["sources"]} == {
         "books",
         "code",
@@ -211,6 +224,57 @@ def test_stage_reuse_and_s3_only_round_trip_preserve_exact_records(tmp_path: Pat
     assert downloaded.read_bytes() == payload
     observed = [row for _, row in _iter_gzip_records(downloaded)]
     assert observed == records
+
+
+def test_bounded_codebuild_plan_reuses_verified_objects_without_source_fetch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plan = build_s3_staging_plan(CONTRACT, repository_root=ROOT)
+    client = FakeS3()
+    for entry in plan["sources"]:
+        source = entry["source"]
+        staged = entry["object"]
+        client.objects[(staged["bucket"], staged["key"])] = {
+            "body": b"",
+            "head": {
+                "ChecksumSHA256": staged["checksum_sha256_base64"],
+                "ContentLength": staged["bytes"],
+                "ContentType": staged["content_type"],
+                "ETag": f'"{staged["sha256"][:32]}"',
+                "Metadata": {
+                    "lumi-schema-version": "1",
+                    "lumi-source-bytes": str(source["source_bytes"]),
+                    "lumi-source-identity": staged["identity_fingerprint"],
+                    "lumi-source-sha256": source["source_sha256"],
+                },
+                "ServerSideEncryption": staged["server_side_encryption"],
+                "VersionId": f"fixture-{source['ordinal']}",
+            },
+        }
+
+    def unexpected_download(*args: Any, **kwargs: Any) -> Path:
+        raise AssertionError("verified staged objects must skip the upstream download")
+
+    monkeypatch.setattr("lumi.s3_staged_corpus._download_source", unexpected_download)
+    result = stage_s3_staging_plan(
+        plan,
+        tmp_path / "staging",
+        scratch_cap=plan["summary"]["source_bytes"] + 128 * 1024 * 1024,
+        s3_client=client,
+        max_workers=2,
+    )
+
+    assert result["status"] == "verified_all_source_objects_staged"
+    assert result["plan_fingerprint"] == plan["plan_fingerprint"]
+    assert result["summary"] == {
+        "reused_objects": 8,
+        "source_bytes": 1_456_514_440,
+        "source_files": 8,
+        "staged_new_objects": 0,
+    }
+    assert [row["ordinal"] for row in result["results"]] == sorted(
+        row["source"]["ordinal"] for row in plan["sources"]
+    )
 
 
 def test_s3_download_resumes_from_preserved_partial_range(tmp_path: Path) -> None:
@@ -337,6 +401,22 @@ def test_existing_wrong_object_is_never_overwritten(tmp_path: Path) -> None:
         stage_source_file(entry, source_path, s3_client=client)
     assert client.put_calls == 0
     assert client.objects[(staged["bucket"], staged["key"])]["body"] == wrong
+
+
+def test_existing_unversioned_object_is_rejected(tmp_path: Path) -> None:
+    payload, _ = _payload()
+    entry = _entry(payload)
+    source_path = tmp_path / "fixture.json.gz"
+    source_path.write_bytes(payload)
+    client = FakeS3()
+    stage_source_file(entry, source_path, s3_client=client)
+    staged = entry["object"]
+    client.objects[(staged["bucket"], staged["key"])]["head"]["VersionId"] = "null"
+
+    with pytest.raises(ValueError, match="version ID is missing"):
+        stage_source_file(entry, source_path, s3_client=client)
+
+    assert client.put_calls == 1
 
 
 def test_bind_consumer_sources_rejects_identity_or_plan_tampering() -> None:

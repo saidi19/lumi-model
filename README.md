@@ -265,11 +265,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     eight-source plan covers all seven categories and 1,456,514,440 compressed
     bytes. Content-addressed conditional writes, stored SHA-256 checksums,
     wrong-object refusal, interrupted range resume, and a no-HTTP-fallback EMR
-    source path pass 76 corpus-focused tests including real Spark/sequential
-    parity; the complete repository suite passes 236/236. A clean,
-    image-unbound package from commit `9c67a76` is independently hash-verified
-    and durably archived. No source object was uploaded and no paid work is
-    authorized; see
+    source path pass 79 corpus-focused tests including real Spark/sequential
+    parity; the complete repository suite passes 239/239. The eight downloads
+    are now folded into the same bounded 30-minute CodeBuild image build, with
+    two workers and a verified 64GB-disk/4GiB-memory envelope. No source object
+    was uploaded and no paid work is authorized; see
     [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
@@ -374,8 +374,9 @@ The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
 envelope, successful image build, external-egress diagnosis, cleanup, and
 S3-staged next boundary are documented in
 [`docs/distributed-corpus-emr-serverless-v0.1.md`](docs/distributed-corpus-emr-serverless-v0.1.md).
-The immutable S3 source binding, resumable S3-only consumer, 76-test focused
-result, 236-test full-suite result, and unchanged no-cloud/no-training boundary are documented in
+The immutable S3 source binding, bounded same-build producer, resumable S3-only
+consumer, 79-test focused result, 239-test full-suite result, and unchanged
+no-cloud/no-training boundary are documented in
 [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
 
 ## Repository policy
