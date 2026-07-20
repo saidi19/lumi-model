@@ -168,8 +168,13 @@ evidence itself is only 16,750 bytes. See
   digest-pinned Python 3.12 image. Package, authorization, cost, capacity, and
   request gates remain non-authorizing; see
   [`distributed-corpus-emr-serverless-v0.1.md`](distributed-corpus-emr-serverless-v0.1.md).
-- Next: seal the non-authorizing EMR package, then obtain a new exact approval
-  only for one bounded image build and one maximum-30-minute parity canary.
+- Completed safely: the first exact CodeBuild approval was consumed by one
+  build that failed in `PRE_BUILD` before Docker because the S3 source-version
+  variable was wrong. No image or EMR job was created, the conservative compute
+  upper bound is $0.03, and every temporary resource is confirmed deleted.
+- Next: seal the corrected non-authorizing EMR package, then obtain another new
+  exact approval only for one bounded image build and one maximum-30-minute
+  parity canary.
   Distributed production remains a separate later approval after measured
   canary throughput and cost.
 - Materialize only the selected, cleaned shards in private object storage.

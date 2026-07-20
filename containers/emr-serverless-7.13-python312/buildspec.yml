@@ -1,0 +1,44 @@
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  pre_build:
+    commands:
+      - |
+        set -euo pipefail
+        test "$AWS_DEFAULT_REGION" = "us-east-1"
+        test "$CODEBUILD_SOURCE_VERSION" = "$EXPECTED_SOURCE_VERSION"
+        [[ "$RELEASE_FINGERPRINT" =~ ^[0-9a-f]{64}$ ]]
+        [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+        test "$(sha256sum Dockerfile | awk '{print $1}')" = "$EXPECTED_DOCKERFILE_SHA256"
+        test "$(sha256sum requirements-linux-x86_64.lock | awk '{print $1}')" = "$EXPECTED_REQUIREMENTS_SHA256"
+        test "$(sha256sum verify_runtime.py | awk '{print $1}')" = "$EXPECTED_VERIFIER_SHA256"
+        aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY_URI"
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        docker build --pull --no-cache \
+          --label "ai.lumi.release=$RELEASE_FINGERPRINT" \
+          --label "ai.lumi.source=$SOURCE_COMMIT" \
+          --tag "$REPOSITORY_URI:$IMAGE_TAG" .
+        test "$(docker image inspect --format '{{.Config.User}}' "$REPOSITORY_URI:$IMAGE_TAG")" = "hadoop:hadoop"
+        IMAGE_BYTES="$(docker image inspect --format '{{.Size}}' "$REPOSITORY_URI:$IMAGE_TAG")"
+        test "$IMAGE_BYTES" -gt 0
+        test "$IMAGE_BYTES" -le 10737418240
+        docker run --rm --entrypoint /opt/lumi/python312/bin/python \
+          "$REPOSITORY_URI:$IMAGE_TAG" /opt/lumi/verify_runtime.py
+  post_build:
+    commands:
+      - |
+        set -euo pipefail
+        docker push "$REPOSITORY_URI:$IMAGE_TAG"
+        IMAGE_DIGEST="$(aws ecr describe-images --repository-name "$REPOSITORY_NAME" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageDigest' --output text)"
+        IMAGE_BYTES="$(aws ecr describe-images --repository-name "$REPOSITORY_NAME" --image-ids imageTag="$IMAGE_TAG" --query 'imageDetails[0].imageSizeInBytes' --output text)"
+        [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+        test "$IMAGE_BYTES" -gt 0
+        test "$IMAGE_BYTES" -le 10737418240
+        printf '{"image_bytes":%s,"image_digest":"%s","image_tag":"%s","release_fingerprint":"%s"}\n' \
+          "$IMAGE_BYTES" "$IMAGE_DIGEST" "$IMAGE_TAG" "$RELEASE_FINGERPRINT"

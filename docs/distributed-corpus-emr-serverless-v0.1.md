@@ -1,8 +1,9 @@
 # Lumi distributed corpus canary on EMR Serverless v0.1
 
-Status: **local Python 3.12 image, release packaging, authorization, request,
-and Spark parity harness pass; no CodeBuild image, EMR application, paid canary,
-production acquisition, GPU compute, or model training is authorized**
+Status: **the first owner-authorized CodeBuild attempt failed safe before Docker
+build because the S3 source-version variable was wrong; no image or EMR job was
+created, all temporary resources are deleted, and the corrected release remains
+locally verified but unauthorized**
 
 ## Scope
 
@@ -87,6 +88,34 @@ authorization cannot enable production acquisition, GPU compute, model
 training, or the 4B run. A built image must be bound to an immutable private-ECR
 digest below 10GB before a job request can be rendered.
 
+## First authorized CodeBuild result
+
+The first exact authorization produced one and only one
+`BUILD_GENERAL1_SMALL` build. AWS spent 323 seconds provisioning the environment,
+downloaded the exact versioned S3 image context, and then failed immediately in
+`PRE_BUILD`: CodeBuild does not define `CODEBUILD_RESOLVED_SOURCE_VERSION` for
+this versioned S3 source. The correct built-in variable is
+`CODEBUILD_SOURCE_VERSION`.
+
+| Result | Verified value |
+|---|---:|
+| Build number | 1 |
+| Docker login/build/push started | false / false / false |
+| ECR images | 0 |
+| EMR applications/jobs | 0 / 0 |
+| Production shards/model training | false / false |
+| Conservative CodeBuild compute upper bound | $0.03 |
+
+The authorization is consumed; no retry occurred. The CodeBuild project and
+log group, both temporary IAM roles, empty ECR repository, and live S3
+authorization object were deleted and independently confirmed absent. The
+machine-readable record is
+[`reports/emr-codebuild-canary-v0.1.json`](../reports/emr-codebuild-canary-v0.1.json).
+
+The corrected buildspec now uses `CODEBUILD_SOURCE_VERSION`, is included inside
+the digest-pinned image context, and is therefore covered by the release
+fingerprint rather than being an untracked launch-time input.
+
 ## Canary pass condition
 
 Workers run the existing quality, provenance, PII/secret, benchmark-exclusion,
@@ -101,11 +130,12 @@ all temporary compute/IAM resources, and leaves production stopped.
 
 ## Next boundary
 
-After the non-authorizing package is sealed, a new owner decision may authorize
-exactly one image build and one canary within the envelope above. Only a passing
-canary can produce a measured production-resume proposal. Resuming acquisition
-toward the 120B floors remains a later, separately priced and separately
-authorized roadmap action.
+After the corrected non-authorizing package is sealed, another new owner
+decision may authorize exactly one image build and one canary within the
+envelope above. The consumed approval cannot be reused. Only a passing canary
+can produce a measured production-resume proposal. Resuming acquisition toward
+the 120B floors remains a later, separately priced and separately authorized
+roadmap action.
 
 Official runtime references:
 
