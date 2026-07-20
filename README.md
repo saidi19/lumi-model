@@ -299,6 +299,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     shard or model training is created, and all temporary compute, IAM, ECR,
     raw, checkpoint, result, and control versions are removed after the
     72-file evidence archive passes independent verification.
+42. the production resume control plane is now implemented locally without
+    launching paid resources. It resumes the verified 237,769,640-token prefix,
+    uses one internet-facing CPU stager and private S3-only EMR input, maps seven
+    category lanes concurrently at 112 vCPU, runs one 128-vCPU global dedup,
+    writes seven categories in parallel, and seals a conservation-checked 120B
+    candidate manifest. Adaptive shortfalls resume at exact category cursors and
+    fail before the 150B/2TB ceilings. Actual billed usage plus active worst-case
+    reservations are held inside a $2,000 total budget. The complete repository
+    suite passes 278/278 and lint is clean. AWS quota and a new exact paid
+    authorization are still required; no production job, GPU, or training is
+    running. See
+    [`docs/production-emr-resume-v0.1.md`](docs/production-emr-resume-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -309,8 +321,9 @@ provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate, and local S3-only source transport
 gate—including the exact real-source Mac canary—are complete. The complete
 source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
-parity canary are also complete. Distributed production resume, a 4B learning
-pilot, and the full 4B/80B pretraining run remain unapproved.
+parity canary are also complete. The distributed production-resume harness is
+locally verified, but its paid run, a 4B learning pilot, and the full 4B/80B
+pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
