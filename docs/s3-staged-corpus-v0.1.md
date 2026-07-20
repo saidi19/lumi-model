@@ -107,17 +107,34 @@ $0, and retaining all 1.4565 GB for a full month would cost about $0.03350.
 The internet-facing producer now runs inside that same CodeBuild ceiling, so
 there is no separate Batch/Fargate compute line item.
 
+## Final same-build package evidence
+
+The corrected package was rebuilt from clean source commit
+`16588aa34f45fdecde1832aabe1c2a64ef0a7300`. Every manifest entry passed an
+independent SHA-256 check before and after copying to durable local storage at
+`s3-staged-emr-canary-v0.2-f6ac38bb85bd4295`. The package remains explicitly
+non-authorizing: it neither uploaded source objects nor started CodeBuild or
+EMR Serverless.
+
+| Package field | Verified value |
+|---|---|
+| Release fingerprint | `f6ac38bb85bd429545f5dea0820e97b4d147d3dbec85ba39631aa3e5daec8437` |
+| Release SHA-256 | `a0659844bbc11afd5bd4abdad9e13f37ec1bb47a74b8d41cbe6d3dbfe4c838f9` |
+| Code archive SHA-256 | `ada6287a863525fd1c21d42699a873266079007f9f6244fd7b512aec782c50b2` |
+| Image context SHA-256 | `04b7909e44bad549b46f986d52cbe3d8c671e2d7b4f18aa4c24d17a4b2d4bcc4` |
+| Staging plan SHA-256 | `1774bc048037a9c75c47a390dceabbfd84b93c5a8c9e8ba1e83a8c6f40be65b2` |
+| Manifest SHA-256 | `5e6d747359f3e7b6fb0b6c8a3f270ade40a01dae6403e70a2ab8ece8b3b1605a` |
+| Package status | `verified_not_authorized` |
+
 ## Next bounded boundary
 
 No cloud retry is implied by this result. Before another paid action:
 
-1. build and independently verify one clean package from the same-build source
-   commit;
-2. obtain a new exact owner authorization—the previous approval is consumed;
-3. stage only the eight pinned objects and independently verify all S3 heads;
-4. run one no-retry EMR parity canary and require exact accepted-ID and
+1. obtain a new exact owner authorization—the previous approval is consumed;
+2. stage only the eight pinned objects and independently verify all S3 heads;
+3. run one no-retry EMR parity canary and require exact accepted-ID and
    rejection-reason parity;
-5. preserve evidence and delete temporary image, roles, application, and raw
+4. preserve evidence and delete temporary image, roles, application, and raw
    canary objects.
 
 Only a passing parity result can unlock a separately approved distributed
