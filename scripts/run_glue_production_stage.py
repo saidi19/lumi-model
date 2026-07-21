@@ -217,14 +217,14 @@ def main() -> None:
     args = getResolvedOptions(sys.argv, list(GLUE_REQUESTED_OPTIONS))
     if not args.get("JOB_RUN_ID"):
         raise RuntimeError("AWS Glue did not inject its reserved JOB_RUN_ID")
+    context = SparkContext.getOrCreate()
+    glue_context = GlueContext(context)
     release = json.loads(Path(SparkFiles.get(args["LUMI_RELEASE_FILE"])).read_text())
     authorization = json.loads(
         Path(SparkFiles.get(args["LUMI_AUTHORIZATION_FILE"])).read_text()
     )
     validate_glue_production_stage_release(release)
     validate_glue_production_stage_authorization(authorization, release)
-    context = SparkContext.getOrCreate()
-    glue_context = GlueContext(context)
     job = Job(glue_context)
     job.init(args["JOB_NAME"], args)
     started = time.monotonic()

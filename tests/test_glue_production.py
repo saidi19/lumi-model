@@ -208,3 +208,12 @@ def test_stage_script_does_not_redeclare_reserved_job_run_id() -> None:
         "LUMI_RELEASE_FILE",
     )
     assert "JOB_RUN_ID" not in requested
+
+
+def test_stage_script_initializes_spark_before_resolving_extra_files() -> None:
+    source = (ROOT / "scripts" / "run_glue_production_stage.py").read_text()
+    context = source.index("context = SparkContext.getOrCreate()")
+    release = source.index('SparkFiles.get(args["LUMI_RELEASE_FILE"])')
+    authorization = source.index('SparkFiles.get(args["LUMI_AUTHORIZATION_FILE"])')
+    assert context < release
+    assert context < authorization
