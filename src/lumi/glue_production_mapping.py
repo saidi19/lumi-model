@@ -34,7 +34,8 @@ CODE_ARCHIVE = "lumi-glue-production-map-code-v0.1.zip"
 JOB_SCRIPT = "run_glue_production_mapping.py"
 PACKAGE_MANIFEST = "manifest.sha256"
 MAPPING_OWNER_APPROVAL_TEXT = (
-    "nah amra to 512 dpu diya korbo and 150b tui abar 100 dpu diya ki kortechis"
+    "I approve one 100-DPU AWS Glue mapping run to the total 150B hard cap, "
+    "maximum 72 hours/$3,168. No dedup, sharding, GPU, or model training."
 )
 
 
@@ -61,19 +62,19 @@ def _non_negative_int(value: Any, label: str) -> int:
 
 def _mapping_contract(contract: Mapping[str, Any]) -> dict[str, Any]:
     expected = {
-        "hard_maximum_dpu": 512,
-        "maximum_runtime_minutes": 720,
-        "number_of_workers": 256,
-        "soft_stop_minutes": 660,
+        "hard_maximum_dpu": 100,
+        "maximum_runtime_minutes": 4_320,
+        "number_of_workers": 100,
+        "soft_stop_minutes": 3_960,
         "target_total_candidate_tokens": 150_000_000_000,
-        "wave_maximum_chunks": 2_000,
-        "worker_type": "G.2X",
+        "wave_maximum_chunks": 500,
+        "worker_type": "G.1X",
     }
     if contract.get("mapping") != expected:
         raise ValueError("Glue production mapping envelope changed")
     if contract.get("subsequent_phases") != {
         "dedup_maximum_dpu": 512,
-        "mapping_maximum_dpu": 512,
+        "mapping_maximum_dpu": 100,
         "sharding_maximum_dpu": 512,
     }:
         raise ValueError("Glue production phase capacity changed")
@@ -759,16 +760,16 @@ def validate_glue_production_mapping_release(
     ):
         raise ValueError("Glue production mapping release authorizes paid work")
     job = release.get("job", {})
-    if job.get("hard_maximum_dpu") != 512:
+    if job.get("hard_maximum_dpu") != 100:
         raise ValueError("Glue production mapping DPU target changed")
-    if job.get("worker_type") != "G.2X" or job.get("number_of_workers") != 256:
+    if job.get("worker_type") != "G.1X" or job.get("number_of_workers") != 100:
         raise ValueError("Glue production mapping worker shape changed")
-    if job.get("timeout_minutes") != 720 or job.get("soft_stop_minutes") != 660:
+    if job.get("timeout_minutes") != 4_320 or job.get("soft_stop_minutes") != 3_960:
         raise ValueError("Glue production mapping runtime envelope changed")
-    if job.get("wave_maximum_chunks") != 2_000:
+    if job.get("wave_maximum_chunks") != 500:
         raise ValueError("Glue production mapping checkpoint wave changed")
     maximum = (
-        Decimal(512) * Decimal(12) * Decimal("0.44")
+        Decimal(100) * Decimal(72) * Decimal("0.44")
     ).quantize(Decimal("0.000001"))
     if Decimal(str(release.get("limits", {}).get("maximum_compute_usd"))) != maximum:
         raise ValueError("Glue production mapping cost envelope changed")
@@ -823,8 +824,8 @@ def build_glue_production_mapping_authorization(
         "approval_text": MAPPING_OWNER_APPROVAL_TEXT,
         "bounds": {
             "authorized_runs": 1,
-            "hard_maximum_dpu": 512,
-            "maximum_runtime_minutes": 720,
+            "hard_maximum_dpu": 100,
+            "maximum_runtime_minutes": 4_320,
             "maximum_usd": release["limits"]["maximum_compute_usd"],
             "starting_checkpoint_sequence": starting["checkpoint_sequence"],
             "starting_checkpoint_sha256": starting["checkpoint_sha256"],
@@ -896,8 +897,8 @@ def validate_glue_production_mapping_authorization(
         raise ValueError("Glue production mapping authorization requires open work")
     if authorization.get("bounds") != {
         "authorized_runs": 1,
-        "hard_maximum_dpu": 512,
-        "maximum_runtime_minutes": 720,
+        "hard_maximum_dpu": 100,
+        "maximum_runtime_minutes": 4_320,
         "maximum_usd": release["limits"]["maximum_compute_usd"],
         "starting_checkpoint_sequence": starting["checkpoint_sequence"],
         "starting_checkpoint_sha256": starting["checkpoint_sha256"],
@@ -914,7 +915,7 @@ def validate_glue_production_mapping_authorization(
     return {
         "authorization_sha256": authorization["authorization_sha256"],
         "maximum_compute_usd": authorization["bounds"]["maximum_usd"],
-        "status": "authorized_one_512_dpu_mapping_run",
+        "status": "authorized_one_100_dpu_mapping_run",
     }
 
 

@@ -322,6 +322,20 @@ Quotas reports 1,000 for `L-08F3B322`. Therefore a 512-DPU paid launch must wait
 for AWS to align the executor-side capacity; the harness will not silently
 downgrade to 100 DPU.
 
+## Owner-approved 100-DPU execution envelope
+
+Rather than wait indefinitely for AWS to align the hidden executor capacity,
+the owner explicitly superseded the unlaunched 512-DPU proposal with one
+100-DPU mapping run. The data target is unchanged: the verified 237,769,640-token
+prefix plus at most 149,762,230,360 newly mapped tokens, never more than 150B
+total candidate tokens.
+
+The approved job uses 100 `G.1X` workers and checkpoints at most 500 staged
+chunks per immutable wave. It soft-stops at 3,960 minutes and has a 4,320-minute
+hard timeout. At $0.44/DPU-hour, the absolute mapping-compute ceiling is
+$3,168. Deduplication, sharding, GPU compute, and model training are not part of
+this authorization and require separate later decisions.
+
 ## Reproduction commands
 
 ```bash

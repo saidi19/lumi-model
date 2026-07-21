@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind the recorded owner approval to one exact 512-DPU Glue mapping run."""
+"""Bind the recorded owner approval to one exact 100-DPU Glue mapping run."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def main() -> None:
                 "starting_checkpoint_sha256": authorization["bounds"][
                     "starting_checkpoint_sha256"
                 ],
-                "status": "authorized_one_512_dpu_mapping_run",
+                "status": "authorized_one_100_dpu_mapping_run",
             },
             indent=2,
             sort_keys=True,

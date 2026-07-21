@@ -162,18 +162,18 @@ def _release() -> dict[str, object]:
             "additional_python_modules": "fixture",
             "execution_class": "STANDARD",
             "glue_version": "5.1",
-            "hard_maximum_dpu": 512,
+            "hard_maximum_dpu": 100,
             "maximum_concurrent_runs": 1,
-            "number_of_workers": 256,
+            "number_of_workers": 100,
             "python_version": "3.11",
-            "soft_stop_minutes": 660,
-            "timeout_minutes": 720,
-            "wave_maximum_chunks": 2_000,
-            "worker_type": "G.2X",
+            "soft_stop_minutes": 3_960,
+            "timeout_minutes": 4_320,
+            "wave_maximum_chunks": 500,
+            "worker_type": "G.1X",
         },
         "limits": {
             "maximum_category_shortfall_tokens": 100_000_000,
-            "maximum_compute_usd": "2703.360000",
+            "maximum_compute_usd": "3168.000000",
             "maximum_mapped_parquet_bytes": 1_500_000_000_000,
             "target_new_candidate_tokens": 149_762_230_360,
             "target_total_candidate_tokens": 150_000_000_000,
@@ -216,18 +216,18 @@ def _release() -> dict[str, object]:
     return value
 
 
-def test_mapping_release_targets_512_dpu_and_total_150b() -> None:
+def test_mapping_release_targets_100_dpu_and_total_150b() -> None:
     release = _release()
     verified = validate_glue_production_mapping_release(release)
     assert verified["status"] == "verified_not_authorized"
     assert verified["target_total_candidate_tokens"] == 150_000_000_000
-    assert release["job"]["hard_maximum_dpu"] == 512
-    assert release["job"]["number_of_workers"] == 256
-    assert release["job"]["worker_type"] == "G.2X"
-    assert release["limits"]["maximum_compute_usd"] == "2703.360000"
+    assert release["job"]["hard_maximum_dpu"] == 100
+    assert release["job"]["number_of_workers"] == 100
+    assert release["job"]["worker_type"] == "G.1X"
+    assert release["limits"]["maximum_compute_usd"] == "3168.000000"
 
     changed = deepcopy(release)
-    changed["job"]["hard_maximum_dpu"] = 100
+    changed["job"]["hard_maximum_dpu"] = 512
     material = dict(changed)
     material.pop("release_fingerprint")
     changed["release_fingerprint"] = hashlib.sha256(
@@ -242,7 +242,7 @@ def test_mapping_checkpoint_plans_and_commits_a_hard_capped_wave() -> None:
     checkpoint = build_initial_mapping_checkpoint(release)
     assert validate_mapping_checkpoint(checkpoint, release)["status"] == "mapping"
     wave = plan_mapping_wave(checkpoint, release)
-    assert wave["chunk_count"] == 758
+    assert wave["chunk_count"] == 500
     assert len(wave["categories"]) == 7
     results = []
     for row in wave["categories"]:
@@ -303,7 +303,7 @@ def test_mapping_authorization_is_one_run_and_mapping_only() -> None:
     release = _release()
     now = datetime(2026, 7, 21, 12, tzinfo=UTC)
     authorization = build_glue_production_mapping_authorization(release, now=now)
-    assert authorization["bounds"]["hard_maximum_dpu"] == 512
+    assert authorization["bounds"]["hard_maximum_dpu"] == 100
     assert authorization["bounds"]["target_total_candidate_tokens"] == 150_000_000_000
     assert authorization["permissions"]["paid_glue_mapping"] is True
     assert authorization["permissions"]["model_training"] is False
@@ -313,7 +313,7 @@ def test_mapping_authorization_is_one_run_and_mapping_only() -> None:
     )
     assert validate_glue_production_mapping_authorization(
         authorization, release, now=now
-    )["status"] == "authorized_one_512_dpu_mapping_run"
+    )["status"] == "authorized_one_100_dpu_mapping_run"
     with pytest.raises(ValueError, match="not currently valid"):
         validate_glue_production_mapping_authorization(
             authorization, release, now=now + timedelta(hours=25)
@@ -391,7 +391,7 @@ def test_mapping_resume_authorization_binds_exact_open_checkpoint() -> None:
     ]
     assert validate_glue_production_mapping_authorization(
         authorization, release, checkpoint=checkpoint, now=now
-    )["status"] == "authorized_one_512_dpu_mapping_run"
+    )["status"] == "authorized_one_100_dpu_mapping_run"
 
     other = initial
     with pytest.raises(ValueError, match="bounds changed"):

@@ -147,7 +147,7 @@ def test_production_contract_binds_150b_and_four_thousand_dollar_guard() -> None
     assert contract["limits"]["candidate_target_tokens"] == 150_000_000_000
     assert contract["budget"]["hard_total_usd"] == "4000.00"
     assert contract["staging"]["hard_maximum_dpu"] == 100
-    assert contract["subsequent_phases"]["mapping_maximum_dpu"] == 512
+    assert contract["subsequent_phases"]["mapping_maximum_dpu"] == 100
 
 
 def test_stage_release_is_non_authorizing_and_binds_all_sources() -> None:

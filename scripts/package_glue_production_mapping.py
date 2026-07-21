@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the non-authorizing Lumi Glue 512-DPU mapping package."""
+"""Build the non-authorizing Lumi Glue 100-DPU mapping package."""
 
 from __future__ import annotations
 

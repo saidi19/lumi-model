@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload and launch one exactly authorized 512-DPU Glue mapping run."""
+"""Upload and launch one exactly authorized 100-DPU Glue mapping run."""
 
 from __future__ import annotations
 
@@ -328,7 +328,7 @@ def main() -> None:
             Path="/lumi/",
             AssumeRolePolicyDocument=json.dumps(_trust(), separators=(",", ":")),
             Description=(
-                "One authorized Lumi 512-DPU candidate mapping run; no dedup, "
+                "One authorized Lumi 100-DPU candidate mapping run; no dedup, "
                 "sharding, GPU, or model training"
             ),
             Tags=[
@@ -378,7 +378,7 @@ def main() -> None:
     request = {
         "Name": job_name,
         "Description": (
-            "Checkpointed Lumi 150B candidate mapping at 512 DPU; no dedup, "
+            "Checkpointed Lumi 150B candidate mapping at 100 DPU; no dedup, "
             "sharding, GPU, or model training"
         ),
         "Role": role_arn,
@@ -442,7 +442,7 @@ def main() -> None:
         "region": region,
         "release_fingerprint": fingerprint,
         "role_arn": role_arn,
-        "status": "launched_one_authorized_512_dpu_mapping_run",
+        "status": "launched_one_authorized_100_dpu_mapping_run",
         "uploaded": uploaded,
     }
     args.evidence_directory.mkdir(parents=True, exist_ok=True)

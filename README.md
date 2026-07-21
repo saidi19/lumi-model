@@ -366,6 +366,12 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     still rejects requests over 100 DPU, so no 100-DPU production fallback or
     paid mapping run has been started. See
     [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+48. after AWS continued enforcing a live 100-DPU ceiling, the owner explicitly
+    replaced the unlaunched 512-DPU proposal with one 100-DPU production mapping
+    run. The current envelope is 100 x `G.1X`, an unchanged 150B total-token hard
+    stop, 500-chunk immutable checkpoints, a 3,960-minute soft stop, a
+    4,320-minute hard timeout, and a $3,168 maximum. Deduplication, sharding,
+    GPU compute, and model training remain separately unauthorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
