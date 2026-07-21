@@ -248,6 +248,53 @@ shuffle, adaptive category floors, shard publication, retry policy, and a hard
 budget stop still require a production harness and a separate owner-approved
 launch proposal.
 
+## Verified production staging result
+
+The owner later authorized the bounded 150B candidate-acquisition workflow.
+Live Glue allocation proved that this account's ETL executor ceiling is 100 DPU,
+despite the Service Quotas catalog exposing a separate 1,000-DPU task quota.
+The production contract therefore binds staging, mapping, deduplication, and
+sharding to at most 100 DPU and retains a $4,000 end-to-end acquisition guard.
+
+Three startup attempts failed closed while establishing that live envelope. The
+256-DPU attempt was rejected before execution; a 100-DPU attempt exposed an
+unnecessary eager `tokenizers` import; and the next exposed a `SparkFiles`
+lookup before `SparkContext` initialization. Both runtime defects now have
+local regression gates, including an exact archive import smoke without site
+packages and the same Spark initialization order used by the successful canary.
+
+Source commit `2a01004ea4fcf021155d975bf35794d24328d4f5` produced
+release `ff11ed9ef6457c57722a200e97c7c4400eed6444a87b7a7a8f043947a2e8e0df`.
+The one bounded 100-DPU run
+`jr_e7c7d9f62197086eee7665fd012fd1b7e2b32e26f5b48a98049db871640fa006`
+then staged the complete pinned source inventory.
+
+| Production staging result | Verified value |
+|---|---:|
+| Job state | `SUCCEEDED` |
+| Worker envelope | 100 x `G.1X` / 100 DPU |
+| Execution time | 474 seconds |
+| DPU seconds | 47,419 |
+| Successful-run compute | $5.795656 |
+| All production attempts | 58,039 DPU-seconds / $7.093656 |
+| Pinned source files | 758 / 758 |
+| Source rows | 168,682,770 |
+| Immutable zstd chunks | 14,658 |
+| Staged compressed bytes | 500,163,871,471 |
+| Staged uncompressed bytes | 1,916,352,637,159 |
+| Model training started | false |
+
+The immutable driver result has SHA-256
+`3a267489759d4c96fd86a5bce18e09543872ca20628a304c75dee8cccbdc6289`.
+An independent 64-worker read-only audit downloaded all 758 manifests and
+verified every one of the 14,658 chunk objects against its pinned S3 VersionId,
+content length, SHA-256 checksum, AES-256 encryption, source digest, and line
+interval metadata. The audit report passes with SHA-256
+`613bce3b47f2d1ff3cc74bb71c0956ee3637ad5faab10a15f633f5e2c8507ac3`.
+This seals source staging only; it does not claim 150B candidate tokens and does
+not authorize or start model training. Adaptive candidate mapping is the next
+production phase.
+
 ## Reproduction commands
 
 ```bash

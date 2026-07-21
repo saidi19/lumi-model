@@ -217,3 +217,68 @@ def test_stage_script_initializes_spark_before_resolving_extra_files() -> None:
     authorization = source.index('SparkFiles.get(args["LUMI_AUTHORIZATION_FILE"])')
     assert context < release
     assert context < authorization
+
+
+def test_stage_result_binds_every_source_and_aggregate() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "verify_glue_production_stage.py",
+        run_name="lumi_glue_production_stage_verifier_test",
+    )
+    validate_stage_result = namespace["validate_stage_result"]
+    release = _release()
+    now = datetime(2026, 7, 21, 12, tzinfo=UTC)
+    authorization = build_glue_production_stage_authorization(release, now=now)
+    prefix = f"{release['output']['staged_prefix']}/{release['release_fingerprint']}"
+    rows = []
+    for source in release["sources"]:
+        manifest_sha = hashlib.sha256(
+            f"manifest-{source['ordinal']}".encode()
+        ).hexdigest()
+        rows.append(
+            {
+                "category": source["category"],
+                "chunk_count": 1,
+                "component": source["component"],
+                "manifest_s3_key": (
+                    f"{prefix}/manifests/{source['source_sha256']}/"
+                    f"{manifest_sha}.json"
+                ),
+                "manifest_sha256": manifest_sha,
+                "manifest_version_id": f"version-{source['ordinal']}",
+                "reused": False,
+                "source_bytes": source["source_bytes"],
+                "source_complete": True,
+                "source_file": source["source_file"],
+                "source_ordinal": source["ordinal"],
+                "source_sha256": source["source_sha256"],
+                "staged_compressed_bytes": 1,
+                "staged_rows": 1,
+                "staged_uncompressed_bytes": 1,
+                "start_after_line": source["start_after_line"],
+            }
+        )
+    result = {
+        "authorization_sha256": authorization["authorization_sha256"],
+        "elapsed_seconds": 10.0,
+        "gate": "lumi_glue_production_stage_result_v0.1",
+        "job_name": "lumi-glue-stage-fixture",
+        "job_run_id": "jr_fixture",
+        "release_fingerprint": release["release_fingerprint"],
+        "schema_version": 1,
+        "source_commit": release["source_commit"],
+        "source_files": len(rows),
+        "sources": rows,
+        "staged_chunks": len(rows),
+        "staged_compressed_bytes": len(rows),
+        "staged_rows": len(rows),
+        "staged_uncompressed_bytes": len(rows),
+        "status": "pass",
+        "training_started": False,
+    }
+    assert validate_stage_result(result, release, authorization)["status"] == (
+        "driver_result_verified"
+    )
+    changed = deepcopy(result)
+    changed["staged_chunks"] += 1
+    with pytest.raises(ValueError, match="aggregate totals changed"):
+        validate_stage_result(changed, release, authorization)

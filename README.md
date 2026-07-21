@@ -348,6 +348,15 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     Production shards remain false and no production acquisition is authorized.
     See
     [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+46. the bounded production staging phase uses the live 100-DPU Glue ETL ceiling
+    to stage all 758 pinned source files in 474 seconds. It publishes 14,658
+    immutable zstd chunks containing 168,682,770 rows and 500,163,871,471
+    compressed bytes. The successful run uses 47,419 DPU-seconds, while all
+    production staging attempts together cost an estimated $7.093656. A
+    separate read-only audit verifies every manifest and chunk VersionId,
+    length, SHA-256, encryption, source digest, and line interval. The driver
+    result and audit report hashes pass; model training remains false. See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -358,10 +367,11 @@ provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate, and local S3-only source transport
 gate—including the exact real-source Mac canary—are complete. The complete
 source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
-parity canary are also complete. The distributed production-resume harness is
-locally verified, and the corrected Glue runtime/parity canary now passes. A
-production-scale backend proposal, its paid run, a 4B learning pilot, and the
-full 4B/80B pretraining run remain unapproved.
+parity canary are also complete. The distributed production-resume harness,
+corrected Glue runtime/parity canary, and complete 758-source production staging
+phase now pass. Adaptive 150B candidate mapping, global deduplication, final
+shard sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain;
+no model training is authorized by the staging result.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
