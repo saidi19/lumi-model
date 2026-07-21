@@ -1,9 +1,9 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **a source-built Python 3.11 Lingua wheel passes its compatibility gate;
-the one follow-up 8-DPU Glue canary then fails safe before data processing on a
-reserved-argument conflict; all temporary compute/IAM/job resources are deleted
-and distributed production remains unauthorized**
+Status: **the source-built Python 3.11 Lingua wheel and one corrected 8-DPU
+Glue canary pass end to end; Spark output matches the sequential reference,
+all temporary compute/IAM/job resources are deleted, and distributed production
+remains unauthorized**
 
 ## Why this migration exists
 
@@ -129,15 +129,17 @@ build exists. Existing immutable corpus-prefix objects were retained.
 
 ## Decision after the first canary
 
-This result does not reject the Spark design; it rejects Glue 5.1 as Lumi's
-runtime because silently downgrading Lingua would change already-sealed language
-filter decisions. The same bounded parity gate is being moved to EMR Serverless
-7.13.0 with a digest-pinned Python 3.12 custom image. See
+At that point the result did not reject the Spark design; it rejected unmodified
+Glue 5.1 as Lumi's runtime because silently downgrading Lingua would change
+already-sealed language-filter decisions. The same bounded parity gate was
+also adapted to EMR Serverless 7.13.0 with a digest-pinned Python 3.12 custom
+image. See
 [`distributed-corpus-emr-serverless-v0.1.md`](distributed-corpus-emr-serverless-v0.1.md).
 
-The old Glue authorization is consumed and cannot authorize EMR, CodeBuild, or
-production acquisition. No production resume is permitted until the replacement
-canary passes and a separate production proposal receives explicit approval.
+The old Glue authorization remains consumed and cannot authorize EMR,
+CodeBuild, or production acquisition. The later CPython 3.11 compatibility
+work and corrected canary below supersede only that historical runtime
+rejection.
 
 ## Python 3.11 compatibility follow-up
 
@@ -196,6 +198,56 @@ still requiring Glue's injected value; the focused Glue/Spark suite passes
 14/14. A paid rerun or production acquisition requires a new explicit owner
 authorization.
 
+## Corrected bounded canary result
+
+A fresh exact owner authorization allowed the fix branch to be pushed and one
+corrected 8-DPU, 30-minute Glue canary, with a $3 outer cap and no production or
+training. No CodeBuild rerun occurred: the job reused the independently
+verified, version-pinned CPython 3.11 wheel. Source commit
+`acef08b74464a13f2a5afc5f87fc2b4531f13045` produced release
+`893cf9dacda660b5cc6ee2d63aac3ca715c32661925764f38b16107f4347c41d`.
+
+The single authorized run
+`jr_bc5437059a2845d091dbd75a9375d0b40f2cae2386bb11cd7336521aa82a9908`
+passed dependency bootstrap, the corrected Glue argument parser, all eight real
+source partitions, immutable-prefix loading, global exact/near deduplication,
+and the independent sequential-reference comparison.
+
+| Corrected Glue result | Verified value |
+|---|---:|
+| Job state | `SUCCEEDED` |
+| Worker envelope | 8 x `G.1X` / 8 DPU |
+| Execution time | 476 seconds |
+| DPU seconds | 3,808 |
+| Estimated Glue compute | $0.465422 |
+| In-script elapsed time | 399.355 seconds |
+| Candidate documents | 13,027 |
+| Candidate tokens | 39,196,478 |
+| Accepted documents | 12,999 |
+| Near-duplicate rejections | 28 |
+| Exact-duplicate rejections | 0 |
+| Spark/sequential parity | pass |
+| Pipeline candidate throughput | 98,149.5 tokens/second |
+| End-to-end candidate throughput | 82,345.5 tokens/second |
+| Production shards written | false |
+
+The 1,144-byte result report independently matches SHA-256
+`3eea9e0fa26e1b326d3e59a5e49596cd1d7e1df66c4bba1bd96c848d6847547e`.
+The local 30.85MB evidence archive has a 13-entry independently verified
+manifest. S3 retains 38 canary-result objects totaling 162,192,937 bytes under
+the non-production control prefix. The temporary checkpoint objects, Glue job,
+IAM role, and all nine exact CloudWatch streams were deleted; live absence
+checks pass.
+
+The measured run proves Glue 5.1 can execute Lumi's pinned language filtering,
+tokenization, resume-anchor, and ordered-dedup semantics. Its end-to-end
+10,293.2 candidate tokens per DPU-second gives a purely linear 256-DPU
+120B-token projection of 12.65 hours. That figure is a capacity reference, not
+a production guarantee or authorization: full-scale duplicate density,
+shuffle, adaptive category floors, shard publication, retry policy, and a hard
+budget stop still require a production harness and a separate owner-approved
+launch proposal.
+
 ## Reproduction commands
 
 ```bash
@@ -212,7 +264,7 @@ PYTHONPATH=src python3 scripts/package_glue_distributed_canary.py \
   --output-directory "$LUMI_DATA/distributed-corpus-v0.1/glue-canary-package"
 ```
 
-The archived Glue package remains reproducible evidence of the attempted gate;
-it must not be relaunched. The replacement keeps the same source bounds,
-ordered-dedup semantics, immutable resume anchors, and no-production-output
-policy while changing only the managed runtime.
+The two failed Glue packages and the successful corrected package are consumed
+evidence and must not be relaunched. The corrected result keeps the same source
+bounds, ordered-dedup semantics, immutable resume anchors, and
+no-production-output policy. It authorizes no production acquisition.

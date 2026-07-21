@@ -336,6 +336,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     reserved-argument fix passes the 14-test focused Glue/Spark suite locally,
     but the consumed authorization permits no retry or production run. See
     [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+45. one separately authorized corrected Glue run uses that exact pinned wheel
+    and source commit `acef08b` on 8 x `G.1X`. It succeeds end to end over
+    eight real source files: 13,027 candidates and 39,196,478 candidate tokens
+    are processed in 399.355 in-script seconds, 12,999 documents are accepted,
+    28 near duplicates are rejected, and Spark accepted IDs plus rejection
+    reasons exactly match the sequential reference. Total execution is 476
+    seconds and 3,808 DPU-seconds, an estimated $0.465422. The report hash and
+    13-entry local evidence manifest pass independently; the temporary
+    checkpoint, job, IAM role, and nine exact log streams are deleted.
+    Production shards remain false and no production acquisition is authorized.
+    See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -347,8 +359,9 @@ local distributed-acquisition parity gate, and local S3-only source transport
 gate—including the exact real-source Mac canary—are complete. The complete
 source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
 parity canary are also complete. The distributed production-resume harness is
-locally verified, but its paid run, a 4B learning pilot, and the full 4B/80B
-pretraining run remain unapproved.
+locally verified, and the corrected Glue runtime/parity canary now passes. A
+production-scale backend proposal, its paid run, a 4B learning pilot, and the
+full 4B/80B pretraining run remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -437,8 +450,8 @@ and fail-closed source-manifest policy are documented in
 [`docs/cccc-owner-decision-v0.1.md`](docs/cccc-owner-decision-v0.1.md).
 The preserved 237.77M-token prefix, immutable resume anchors, ordered parallel
 deduplication proof, real local Spark parity gate, fail-closed limits, the
-historical $0.0374 Glue result, and the verified CPython 3.11 compatibility
-follow-up are documented in
+two historical failed Glue gates, verified CPython 3.11 wheel, and successful
+corrected 8-DPU parity result are documented in
 [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
 envelope, successful image build, external-egress diagnosis, cleanup, and
