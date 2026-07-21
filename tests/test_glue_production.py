@@ -96,14 +96,14 @@ def _release() -> dict[str, object]:
             "execution_class": "STANDARD",
             "glue_version": "5.1",
             "maximum_concurrent_runs": 1,
-            "number_of_workers": 256,
+            "number_of_workers": 100,
             "python_version": "3.11",
             "timeout_minutes": 360,
             "worker_type": "G.1X",
         },
         "limits": {
             "hard_logical_storage_bytes": 2_000_000_000_000,
-            "maximum_compute_usd": "675.840000",
+            "maximum_compute_usd": "264.000000",
             "maximum_source_compressed_bytes": 4_000_000_000,
             "source_files": 758,
             "target_chunk_uncompressed_bytes": 134_217_728,
@@ -144,8 +144,8 @@ def test_production_contract_binds_150b_and_four_thousand_dollar_guard() -> None
     )
     assert contract["limits"]["candidate_target_tokens"] == 150_000_000_000
     assert contract["budget"]["hard_total_usd"] == "4000.00"
-    assert contract["staging"]["hard_maximum_dpu"] == 256
-    assert contract["subsequent_phases"]["mapping_maximum_dpu"] == 512
+    assert contract["staging"]["hard_maximum_dpu"] == 100
+    assert contract["subsequent_phases"]["mapping_maximum_dpu"] == 100
 
 
 def test_stage_release_is_non_authorizing_and_binds_all_sources() -> None:
@@ -153,7 +153,7 @@ def test_stage_release_is_non_authorizing_and_binds_all_sources() -> None:
     verified = validate_glue_production_stage_release(release)
     assert verified["status"] == "verified_not_authorized"
     assert verified["source_files"] == 758
-    assert verified["maximum_compute_usd"] == "675.840000"
+    assert verified["maximum_compute_usd"] == "264.000000"
 
     tampered = deepcopy(release)
     tampered["sources"][0]["start_after_line"] = 0

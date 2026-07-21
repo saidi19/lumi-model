@@ -91,7 +91,7 @@ def _read_contract(path: Path, root: Path) -> dict[str, Any]:
         raise ValueError("Glue production token or storage limits changed")
     staging = contract.get("staging", {})
     if staging != {
-        "hard_maximum_dpu": 256,
+        "hard_maximum_dpu": 100,
         "maximum_runtime_minutes": 360,
         "maximum_source_compressed_bytes": 4_000_000_000,
         "source_files": 758,
@@ -296,7 +296,7 @@ def validate_glue_production_stage_release(release: dict[str, Any]) -> dict[str,
         if int(row.get("start_after_line", -1)) != expected:
             raise ValueError("Glue production stage resume line changed")
     job = release.get("job", {})
-    if job.get("number_of_workers") != 256 or job.get("timeout_minutes") != 360:
+    if job.get("number_of_workers") != 100 or job.get("timeout_minutes") != 360:
         raise ValueError("Glue production stage capacity changed")
     if job.get("worker_type") != "G.1X" or job.get("glue_version") != "5.1":
         raise ValueError("Glue production stage runtime changed")
@@ -329,7 +329,7 @@ def build_glue_production_stage_authorization(
         "approval_text": OWNER_APPROVAL_TEXT,
         "bounds": {
             "authorized_runs": 1,
-            "maximum_dpu": 256,
+            "maximum_dpu": 100,
             "maximum_runtime_minutes": 360,
             "maximum_usd": release["limits"]["maximum_compute_usd"],
             "source_files": 758,
@@ -390,7 +390,7 @@ def validate_glue_production_stage_authorization(
         raise ValueError("Glue production stage authorization permissions changed")
     if authorization.get("bounds") != {
         "authorized_runs": 1,
-        "maximum_dpu": 256,
+        "maximum_dpu": 100,
         "maximum_runtime_minutes": 360,
         "maximum_usd": release["limits"]["maximum_compute_usd"],
         "source_files": 758,
