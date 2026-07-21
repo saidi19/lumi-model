@@ -323,6 +323,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     4B quality, full-model memory, quantization, or speed; vLLM CUDA and GGUF
     remain pending. See
     [`docs/mlx-final-topology-gate-v0.1.md`](docs/mlx-final-topology-gate-v0.1.md).
+44. one bounded Glue compatibility follow-up builds Lumi's exact Lingua 2.2.0
+    CPython 3.11 wheel on Linux. Upstream tests pass 74/74, and all 222,790
+    language-parity records reproduce both sealed decision hashes. The
+    170,336,000-byte manylinux wheel is independently verified and pinned by
+    SHA-256 plus S3 VersionId. The single follow-up 8-DPU Glue run completes
+    custom-module setup, then fails safe before Spark or data processing because
+    the script redeclares Glue's reserved `JOB_RUN_ID`; it uses 493 DPU-seconds,
+    costs an estimated $0.0603, and writes zero release-specific corpus objects.
+    Combined conservative CodeBuild/Glue compute is no more than $0.2203. All
+    temporary projects, jobs, roles, and exact log streams are deleted. The
+    reserved-argument fix passes the 14-test focused Glue/Spark suite locally,
+    but the consumed authorization permits no retry or production run. See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -423,8 +436,9 @@ The pinned CCCC evidence, include/exclude consequences, explicit owner record,
 and fail-closed source-manifest policy are documented in
 [`docs/cccc-owner-decision-v0.1.md`](docs/cccc-owner-decision-v0.1.md).
 The preserved 237.77M-token prefix, immutable resume anchors, ordered parallel
-deduplication proof, real local Spark parity gate, fail-closed limits, and the
-failed-safe $0.0374 Glue result are documented in
+deduplication proof, real local Spark parity gate, fail-closed limits, the
+historical $0.0374 Glue result, and the verified CPython 3.11 compatibility
+follow-up are documented in
 [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
 envelope, successful image build, external-egress diagnosis, cleanup, and

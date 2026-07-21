@@ -1,8 +1,9 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **the owner-authorized bounded Glue canary failed safe before data
-processing because Glue 5.1 is fixed to Python 3.11; all temporary compute and
-IAM resources are deleted and distributed production remains unauthorized**
+Status: **a source-built Python 3.11 Lingua wheel passes its compatibility gate;
+the one follow-up 8-DPU Glue canary then fails safe before data processing on a
+reserved-argument conflict; all temporary compute/IAM/job resources are deleted
+and distributed production remains unauthorized**
 
 ## Why this migration exists
 
@@ -126,7 +127,7 @@ The Glue job and its IAM role now return `EntityNotFound`/`NoSuchEntity`, the
 canary output prefix is empty, and no EMR Serverless application or CodeBuild
 build exists. Existing immutable corpus-prefix objects were retained.
 
-## Decision after the canary
+## Decision after the first canary
 
 This result does not reject the Spark design; it rejects Glue 5.1 as Lumi's
 runtime because silently downgrading Lingua would change already-sealed language
@@ -137,6 +138,63 @@ filter decisions. The same bounded parity gate is being moved to EMR Serverless
 The old Glue authorization is consumed and cannot authorize EMR, CodeBuild, or
 production acquisition. No production resume is permitted until the replacement
 canary passes and a separate production proposal receives explicit approval.
+
+## Python 3.11 compatibility follow-up
+
+A later exact owner authorization allowed one Linux CPython 3.11 CodeBuild and
+one follow-up 8-DPU, 30-minute Glue canary, with a combined $3 maximum and no
+production run. The build used Lumi commit
+`624f253fe0af4f042c6d0b76cf1026443007a9bb`, upstream Lingua commit
+`77e94d1a2a8e49bed873a7c502bcb51ba803ef0f`, Rust 1.94.0, Maturin 1.14.1,
+and Python 3.11.15. The only upstream-source change was the independently
+verified package metadata floor from Python 3.12 to Python 3.11.
+
+| CodeBuild result | Verified value |
+|---|---:|
+| Build ID | `lumi-cb-lingua-cp311-94883c30bde4:ccc87389-27d8-4cf3-aa00-95286e20268c` |
+| State | `SUCCEEDED` |
+| Total wall time | 445.569 seconds |
+| Upstream Python tests | 74 / 74 passed |
+| Parity corpus | 225 files / 222,790 records |
+| Lumi decision SHA-256 | `ab8a64fc03b886535e3b66db92dddde2d5fdea3184d4fd7057f831a2f938884b` |
+| Threshold-0.7 SHA-256 | `3194178d8f08e7af75d8aeb212bb3716de8a02a6bda52e1eea0ffb5d2607be4c` |
+| Wheel | `cp311-cp311-manylinux_2_34_x86_64` |
+| Wheel bytes | 170,336,000 |
+| Wheel SHA-256 | `ae73436bd29491e194c478101b4c4326fe1f13f90d4e313d3720b20f8c88efcf` |
+| Conservative build compute | no more than $0.16 |
+
+The wheel, build report, and parity report were downloaded and independently
+verified. Their content-addressed S3 keys and VersionIds are pinned by follow-up
+release `068ba2d4fcb91f802e2135779aefa3977b5c671d22025ae1a2323ce5178ff024`.
+The temporary CodeBuild project, role, and log group were deleted before the
+Glue job started.
+
+The follow-up Glue run used source commit
+`4b0a7953ae439af53051900fd6984ab0a11aaec5` and run ID
+`jr_efe6a144ab76d145088f9a8ff6af60e3586ac1232454356f3b76789e4f307d67`.
+Glue downloaded the custom wheel and completed its Python-module setup. The
+script then requested the reserved `JOB_RUN_ID` option even though Glue's
+`getResolvedOptions` parser already injects it, producing an argparse conflict
+before `SparkContext`, source download, or corpus processing.
+
+| Follow-up Glue result | Verified value |
+|---|---:|
+| Job state | `FAILED` (failed safe before data processing) |
+| Execution time | 61 seconds |
+| DPU seconds | 493 |
+| Estimated Glue compute | $0.0603 |
+| Release-specific S3 objects written | 0 |
+| Production shards written | false |
+| Model training started | false |
+| Conservative combined compute | no more than $0.2203 |
+
+The complete run metadata and both CloudWatch streams were sealed locally.
+The Glue job, IAM role, and exact log streams were then deleted; live checks
+return no matching job, project, or role. The consumed authorization permits no
+retry. The local fix removes `JOB_RUN_ID` from the requested option list while
+still requiring Glue's injected value; the focused Glue/Spark suite passes
+14/14. A paid rerun or production acquisition requires a new explicit owner
+authorization.
 
 ## Reproduction commands
 
@@ -150,6 +208,7 @@ PYTHONPATH=src python3 scripts/export_distributed_resume_anchors.py \
 
 PYTHONPATH=src python3 scripts/package_glue_distributed_canary.py \
   --anchor-export-directory "$LUMI_DATA/distributed-corpus-v0.1/resume-anchors" \
+  --lingua-wheel-pin "$LUMI_DATA/distributed-corpus-v0.1/lingua-wheel-pin-v0.1.json" \
   --output-directory "$LUMI_DATA/distributed-corpus-v0.1/glue-canary-package"
 ```
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import runpy
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -553,6 +554,20 @@ def test_glue_canary_rejects_unpinned_lingua_wheel() -> None:
     ).hexdigest()
     with pytest.raises(ValueError, match="outside the compatibility prefix"):
         validate_glue_canary_release(release)
+
+
+def test_glue_canary_does_not_redeclare_reserved_job_run_id() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_distributed_canary.py",
+        run_name="lumi_glue_canary_test",
+    )
+    requested = namespace["GLUE_REQUESTED_OPTIONS"]
+    assert requested == (
+        "JOB_NAME",
+        "LUMI_AUTHORIZATION_FILE",
+        "LUMI_RELEASE_FILE",
+    )
+    assert "JOB_RUN_ID" not in requested
 
 
 def test_glue_canary_source_selection_is_all_category_and_byte_bounded() -> None:
