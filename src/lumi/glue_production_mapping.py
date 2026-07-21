@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from collections.abc import Mapping
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_FLOOR, Decimal
 from pathlib import Path
@@ -33,10 +34,12 @@ AUTHORIZATION_FILE = "glue-production-map-authorization-v0.1.json"
 CODE_ARCHIVE = "lumi-glue-production-map-code-v0.1.zip"
 JOB_SCRIPT = "run_glue_production_mapping.py"
 PACKAGE_MANIFEST = "manifest.sha256"
+RECOVERED_CHECKPOINT_FILE = "recovered-map-checkpoint-v0.1.json"
+RECOVERY_EVIDENCE_FILE = "glue-production-map-recovery-v0.1.json"
 MAPPING_OWNER_APPROVAL_TEXT = (
-    "I approve one additional replacement 100-DPU AWS Glue mapping run after the "
-    "staged-manifest digest handoff fix, under the same total 150B, 72-hour/$3,168 "
-    "maximum, with no dedup, sharding, GPU, or model training."
+    "I approve one corrected 100-DPU AWS Glue resume from the verified recoverable "
+    "wave-7 output to the same total 150B hard cap, under the existing 72-hour/"
+    "$3,168 maximum, with no dedup, sharding, GPU, or model training."
 )
 
 
@@ -204,6 +207,225 @@ def _mapping_targets(plan: Mapping[str, Any], total_target: int) -> list[dict[st
     return rows
 
 
+def _allocate_integer_by_weight(
+    total: int, rows: list[tuple[str, int, int]]
+) -> dict[str, int]:
+    """Allocate an integer exactly, using stable largest-remainder rounding."""
+
+    if total <= 0:
+        raise ValueError("Glue target reallocation must be positive")
+    if not rows or any(weight <= 0 for _, weight, _ in rows):
+        raise ValueError("Glue target reallocation has no positive recipient weight")
+    weight_total = sum(weight for _, weight, _ in rows)
+    allocations: dict[str, int] = {}
+    remainders: list[tuple[Decimal, int, str]] = []
+    for name, weight, ordinal in rows:
+        exact = Decimal(total) * Decimal(weight) / Decimal(weight_total)
+        floor = int(exact.to_integral_value(rounding=ROUND_FLOOR))
+        allocations[name] = floor
+        remainders.append((exact - Decimal(floor), ordinal, name))
+    missing = total - sum(allocations.values())
+    for _, _, name in sorted(
+        remainders, key=lambda row: (-row[0], row[1], row[2])
+    )[:missing]:
+        allocations[name] += 1
+    if sum(allocations.values()) != total or any(value <= 0 for value in allocations.values()):
+        raise RuntimeError("Glue target reallocation failed integer conservation")
+    return allocations
+
+
+def _replayed_mapping_targets(
+    checkpoint: Mapping[str, Any], release: Mapping[str, Any]
+) -> tuple[dict[str, int], set[str]]:
+    """Replay and validate durable target-reallocation events."""
+
+    expected = {
+        str(row["category"]): int(row["mapping_target_tokens"])
+        for row in release["categories"]
+    }
+    category_contract = {
+        str(row["category"]): row for row in release["categories"]
+    }
+    events = checkpoint.get("target_reallocations", [])
+    if not isinstance(events, list):
+        raise ValueError("Glue production map target reallocations changed")
+    exhausted: set[str] = set()
+    last_wave = 0
+    for event_index, event in enumerate(events, start=1):
+        if not isinstance(event, Mapping):
+            raise ValueError("Glue production map target reallocation is invalid")
+        if event.get("reallocation_sequence") != event_index:
+            raise ValueError("Glue production map target reallocation sequence changed")
+        if event.get("event_sha256") != _fingerprint(event, "event_sha256"):
+            raise ValueError("Glue production map target reallocation fingerprint changed")
+        wave_sequence = _non_negative_int(
+            event.get("wave_sequence"), "target reallocation wave sequence"
+        )
+        if wave_sequence < 1 or wave_sequence < last_wave or wave_sequence > int(
+            checkpoint["checkpoint_sequence"]
+        ):
+            raise ValueError("Glue production map target reallocation wave changed")
+        last_wave = wave_sequence
+        source = event.get("exhausted_category")
+        if source not in expected or source in exhausted:
+            raise ValueError("Glue production map exhausted category changed")
+        before = _non_negative_int(
+            event.get("exhausted_target_before"), "exhausted target before"
+        )
+        final = _non_negative_int(
+            event.get("exhausted_final_tokens"), "exhausted final tokens"
+        )
+        shortfall = _non_negative_int(
+            event.get("shortfall_tokens"), "exhausted target shortfall"
+        )
+        if before != expected[str(source)] or final >= before or before - final != shortfall:
+            raise ValueError("Glue production map exhausted target accounting changed")
+        contract = category_contract[str(source)]
+        minimum_mapping = max(
+            0,
+            int(contract["clean_floor_tokens"]) - int(contract["accepted_tokens"]),
+        )
+        if final < minimum_mapping:
+            raise ValueError("Glue production map exhausted below its clean floor")
+        recipients = event.get("recipient_adjustments")
+        if not isinstance(recipients, list) or not recipients:
+            raise ValueError("Glue production map target reallocation has no recipients")
+        added = 0
+        seen_recipients: set[str] = set()
+        expected[str(source)] = final
+        for recipient in recipients:
+            if not isinstance(recipient, Mapping):
+                raise ValueError("Glue production map target recipient is invalid")
+            name = recipient.get("category")
+            if (
+                name not in expected
+                or name == source
+                or name in exhausted
+                or name in seen_recipients
+            ):
+                raise ValueError("Glue production map target recipient changed")
+            seen_recipients.add(str(name))
+            target_before = _non_negative_int(
+                recipient.get("target_before"), "recipient target before"
+            )
+            added_tokens = _non_negative_int(
+                recipient.get("added_tokens"), "recipient added tokens"
+            )
+            target_after = _non_negative_int(
+                recipient.get("target_after"), "recipient target after"
+            )
+            if (
+                added_tokens <= 0
+                or target_before != expected[str(name)]
+                or target_after != target_before + added_tokens
+            ):
+                raise ValueError("Glue production map target recipient accounting changed")
+            expected[str(name)] = target_after
+            added += added_tokens
+        if added != shortfall:
+            raise ValueError("Glue production map target reallocation does not conserve tokens")
+        exhausted.add(str(source))
+    original_total = sum(
+        int(row["mapping_target_tokens"]) for row in release["categories"]
+    )
+    if sum(expected.values()) != original_total:
+        raise ValueError("Glue production map target reallocations changed the 150B total")
+    return expected, exhausted
+
+
+def _rebalance_exhausted_categories(
+    categories: dict[str, dict[str, Any]],
+    release: Mapping[str, Any],
+    *,
+    wave_sequence: int,
+    existing_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Close floor-satisfying exhausted categories and preserve the exact target."""
+
+    inventory = {
+        str(row["category"]): int(row["staged_chunks"])
+        for row in release["category_inventory"]
+    }
+    contracts = {
+        str(row["category"]): row for row in release["categories"]
+    }
+    order = [str(row["category"]) for row in release["categories"]]
+    events = [deepcopy(event) for event in existing_events]
+    maximum_shortfall = int(release["limits"]["maximum_category_shortfall_tokens"])
+    while True:
+        exhausted = [
+            name
+            for name in order
+            if not categories[name]["closed"]
+            and int(categories[name]["next_chunk_index"]) == inventory[name]
+        ]
+        if not exhausted:
+            return events
+        name = exhausted[0]
+        row = categories[name]
+        target = int(row["target_tokens"])
+        mapped = int(row["mapped_tokens"])
+        shortfall = target - mapped
+        contract = contracts[name]
+        minimum_mapping = max(
+            0,
+            int(contract["clean_floor_tokens"]) - int(contract["accepted_tokens"]),
+        )
+        if mapped < minimum_mapping:
+            raise ValueError("Glue production map exhausted below its clean floor")
+        row["closed"] = True
+        row["cutoff"] = None
+        if shortfall <= maximum_shortfall:
+            continue
+        recipients = [
+            recipient
+            for recipient in order
+            if recipient != name
+            and not categories[recipient]["closed"]
+            and int(categories[recipient]["next_chunk_index"]) < inventory[recipient]
+        ]
+        if not recipients:
+            raise ValueError("Glue production map has no capacity for exhausted target")
+        weighted = [
+            (
+                recipient,
+                max(
+                    1,
+                    int(categories[recipient]["target_tokens"])
+                    - int(categories[recipient]["mapped_tokens"]),
+                ),
+                int(contracts[recipient]["ordinal"]),
+            )
+            for recipient in recipients
+        ]
+        allocations = _allocate_integer_by_weight(shortfall, weighted)
+        adjustments = []
+        for recipient in recipients:
+            added = allocations[recipient]
+            before = int(categories[recipient]["target_tokens"])
+            categories[recipient]["target_tokens"] = before + added
+            adjustments.append(
+                {
+                    "added_tokens": added,
+                    "category": recipient,
+                    "target_after": before + added,
+                    "target_before": before,
+                }
+            )
+        row["target_tokens"] = mapped
+        event: dict[str, Any] = {
+            "exhausted_category": name,
+            "exhausted_final_tokens": mapped,
+            "exhausted_target_before": target,
+            "reallocation_sequence": len(events) + 1,
+            "recipient_adjustments": adjustments,
+            "shortfall_tokens": shortfall,
+            "wave_sequence": wave_sequence,
+        }
+        event["event_sha256"] = _fingerprint(event, "event_sha256")
+        events.append(event)
+
+
 def _existing_artifact(plan: Mapping[str, Any], name: str) -> dict[str, Any]:
     pin = plan["artifacts"][name]
     key = plan["storage"]["artifacts"][name]
@@ -219,6 +441,154 @@ def _existing_artifact(plan: Mapping[str, Any], name: str) -> dict[str, Any]:
 def _manifest(directory: Path, paths: list[Path]) -> None:
     body = "".join(f"{_sha256_file(path)}  {path.name}\n" for path in paths)
     _write_bytes_atomic(directory / PACKAGE_MANIFEST, body.encode())
+
+
+def _verify_package_manifest(directory: Path) -> None:
+    manifest = directory / PACKAGE_MANIFEST
+    if not manifest.is_file():
+        raise FileNotFoundError(manifest)
+    seen: set[str] = set()
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, name = line.split("  ", 1)
+        _valid_sha256(digest, "Glue package artifact")
+        if name in seen or Path(name).name != name:
+            raise ValueError("Glue package manifest path changed")
+        seen.add(name)
+        path = directory / name
+        if not path.is_file() or _sha256_file(path) != digest:
+            raise ValueError(f"Glue package manifest mismatch: {name}")
+    if not {
+        CODE_ARCHIVE,
+        JOB_SCRIPT,
+        RELEASE_FILE,
+        "initial-map-checkpoint-v0.1.json",
+    }.issubset(seen):
+        raise ValueError("Glue package manifest is missing a required artifact")
+
+
+def _validate_recovery_metadata(
+    recovery: Mapping[str, Any], release: Mapping[str, Any]
+) -> None:
+    expected_keys = {
+        "active_replacement_runs",
+        "failed_job_name",
+        "failed_job_run_id",
+        "failed_release_fingerprint",
+        "failed_release_sha256",
+        "failed_state",
+        "gate",
+        "parent_checkpoint_file_sha256",
+        "parent_checkpoint_sequence",
+        "parent_checkpoint_sha256",
+        "previous_package_manifest_sha256",
+        "recovered_checkpoint_sha256",
+        "recovered_total_candidate_tokens",
+        "recovered_total_mapped_documents",
+        "recovered_total_mapped_tokens",
+        "recovered_wave_file_sha256",
+        "recovered_wave_manifest_sha256",
+        "recovered_wave_sequence",
+        "schema_version",
+        "target_reallocation_event_sha256s",
+        "verified_s3_bytes",
+        "verified_s3_objects",
+    }
+    if set(recovery) != expected_keys:
+        raise ValueError("Glue production mapping recovery shape changed")
+    if (
+        recovery.get("gate") != "lumi_glue_production_map_recovery_v0.1"
+        or recovery.get("schema_version") != SCHEMA_VERSION
+        or recovery.get("failed_state") != "FAILED"
+        or recovery.get("active_replacement_runs") != 0
+    ):
+        raise ValueError("Glue production mapping recovery state changed")
+    failed_release = _valid_sha256(
+        recovery.get("failed_release_fingerprint"), "failed mapping release"
+    )
+    if failed_release == release["release_fingerprint"]:
+        raise ValueError("Glue production mapping recovery did not revise the release")
+    for label in (
+        "failed_release_sha256",
+        "parent_checkpoint_file_sha256",
+        "parent_checkpoint_sha256",
+        "previous_package_manifest_sha256",
+        "recovered_checkpoint_sha256",
+        "recovered_wave_file_sha256",
+        "recovered_wave_manifest_sha256",
+    ):
+        _valid_sha256(recovery.get(label), f"recovery {label}")
+    parent_sequence = _non_negative_int(
+        recovery.get("parent_checkpoint_sequence"), "recovery parent sequence"
+    )
+    wave_sequence = _non_negative_int(
+        recovery.get("recovered_wave_sequence"), "recovery wave sequence"
+    )
+    if wave_sequence != parent_sequence + 1:
+        raise ValueError("Glue production mapping recovered wave sequence changed")
+    mapped_tokens = _non_negative_int(
+        recovery.get("recovered_total_mapped_tokens"), "recovered mapped tokens"
+    )
+    mapped_documents = _non_negative_int(
+        recovery.get("recovered_total_mapped_documents"), "recovered mapped documents"
+    )
+    total_tokens = _non_negative_int(
+        recovery.get("recovered_total_candidate_tokens"), "recovered total tokens"
+    )
+    if mapped_documents < 1 or total_tokens != mapped_tokens + int(
+        release["resume"]["accepted_tokens"]
+    ):
+        raise ValueError("Glue production mapping recovered totals changed")
+    if not 0 < total_tokens < int(release["limits"]["target_total_candidate_tokens"]):
+        raise ValueError("Glue production mapping recovery is outside the 150B boundary")
+    if _non_negative_int(recovery.get("verified_s3_objects"), "recovery S3 objects") < 1:
+        raise ValueError("Glue production mapping recovery has no verified S3 objects")
+    if _non_negative_int(recovery.get("verified_s3_bytes"), "recovery S3 bytes") < 1:
+        raise ValueError("Glue production mapping recovery has no verified S3 bytes")
+    events = recovery.get("target_reallocation_event_sha256s")
+    if not isinstance(events, list) or not events:
+        raise ValueError("Glue production mapping recovery has no target reallocation")
+    for digest in events:
+        _valid_sha256(digest, "recovery target reallocation event")
+    for label in ("failed_job_name", "failed_job_run_id"):
+        value = recovery.get(label)
+        if not isinstance(value, str) or not value or len(value) > 255:
+            raise ValueError(f"Glue production mapping recovery {label} changed")
+
+
+def _validate_checkpoint_release_migration(
+    checkpoint: Mapping[str, Any], release: Mapping[str, Any]
+) -> None:
+    migration = checkpoint.get("release_migration")
+    recovery = release.get("recovery")
+    if migration is None:
+        if recovery is not None:
+            raise ValueError("Glue recovery release requires its migrated checkpoint")
+        return
+    if not isinstance(migration, Mapping) or not isinstance(recovery, Mapping):
+        raise ValueError("Glue checkpoint release migration changed")
+    if set(migration) != {
+        "from_checkpoint_sha256",
+        "from_release_fingerprint",
+        "gate",
+        "migration_sha256",
+        "recovery_metadata_sha256",
+        "schema_version",
+        "to_release_fingerprint",
+    }:
+        raise ValueError("Glue checkpoint release migration shape changed")
+    if (
+        migration.get("gate") != "lumi_glue_production_map_release_migration_v0.1"
+        or migration.get("schema_version") != SCHEMA_VERSION
+        or migration.get("migration_sha256")
+        != _fingerprint(migration, "migration_sha256")
+        or migration.get("from_release_fingerprint")
+        != recovery["failed_release_fingerprint"]
+        or migration.get("from_checkpoint_sha256")
+        != recovery["recovered_checkpoint_sha256"]
+        or migration.get("to_release_fingerprint") != release["release_fingerprint"]
+        or migration.get("recovery_metadata_sha256") != _fingerprint(recovery)
+    ):
+        raise ValueError("Glue checkpoint release migration provenance changed")
 
 
 def build_initial_mapping_checkpoint(release: Mapping[str, Any]) -> dict[str, Any]:
@@ -244,6 +614,7 @@ def build_initial_mapping_checkpoint(release: Mapping[str, Any]) -> dict[str, An
         "release_fingerprint": release["release_fingerprint"],
         "schema_version": SCHEMA_VERSION,
         "status": "mapping",
+        "target_reallocations": [],
         "total_mapped_documents": 0,
         "total_mapped_tokens": 0,
     }
@@ -266,6 +637,7 @@ def validate_mapping_checkpoint(
         checkpoint, "checkpoint_sha256"
     ):
         raise ValueError("Glue production map checkpoint fingerprint changed")
+    _validate_checkpoint_release_migration(checkpoint, release)
     sequence = _non_negative_int(
         checkpoint.get("checkpoint_sequence"), "map checkpoint sequence"
     )
@@ -278,6 +650,9 @@ def validate_mapping_checkpoint(
     if not isinstance(outputs, list) or len(outputs) != sequence:
         raise ValueError("Glue production map output ledger changed")
     expected = {row["category"]: row for row in release["categories"]}
+    expected_targets, reallocated_exhausted = _replayed_mapping_targets(
+        checkpoint, release
+    )
     available_chunks = {
         row["category"]: int(row["staged_chunks"])
         for row in release["category_inventory"]
@@ -288,12 +663,16 @@ def validate_mapping_checkpoint(
     documents = 0
     tokens = 0
     all_closed = True
+    seen_categories: set[str] = set()
     for row in categories:
         if not isinstance(row, Mapping) or row.get("category") not in expected:
             raise ValueError("Glue production map category is invalid")
         name = str(row["category"])
+        if name in seen_categories:
+            raise ValueError("Glue production map repeats a category")
+        seen_categories.add(name)
         target = _non_negative_int(row.get("target_tokens"), "map category target")
-        if target != int(expected[name]["mapping_target_tokens"]):
+        if target != expected_targets[name]:
             raise ValueError("Glue production map category target changed")
         mapped_tokens = _non_negative_int(row.get("mapped_tokens"), "mapped tokens")
         mapped_documents = _non_negative_int(
@@ -316,6 +695,12 @@ def validate_mapping_checkpoint(
             cutoff = row.get("cutoff")
             if cutoff is not None and not isinstance(cutoff, Mapping):
                 raise ValueError("Glue production map cutoff is invalid")
+            if name in reallocated_exhausted and (
+                mapped_tokens != target
+                or next_chunk != available_chunks[name]
+                or cutoff is not None
+            ):
+                raise ValueError("Glue production map exhausted closure changed")
         else:
             all_closed = False
             if row.get("cutoff") is not None:
@@ -324,6 +709,12 @@ def validate_mapping_checkpoint(
                 raise ValueError("Glue production map exhausted a category before closure")
         tokens += mapped_tokens
         documents += mapped_documents
+    if seen_categories != set(expected):
+        raise ValueError("Glue production map category inventory changed")
+    if sum(int(row["target_tokens"]) for row in categories) != int(
+        release["limits"]["target_new_candidate_tokens"]
+    ):
+        raise ValueError("Glue production map target total changed")
     if tokens != checkpoint.get("total_mapped_tokens"):
         raise ValueError("Glue production map token conservation failed")
     if documents != checkpoint.get("total_mapped_documents"):
@@ -532,6 +923,12 @@ def advance_mapping_checkpoint(
     }
     if not isinstance(output["manifest_s3_key"], str):
         raise ValueError("Glue production map wave manifest key is missing")
+    target_reallocations = _rebalance_exhausted_categories(
+        by_name,
+        release,
+        wave_sequence=expected["wave_sequence"],
+        existing_events=list(current.get("target_reallocations", [])),
+    )
     categories = [by_name[row["category"]] for row in release["categories"]]
     all_closed = all(row["closed"] for row in categories)
     result = {
@@ -542,6 +939,7 @@ def advance_mapping_checkpoint(
         "outputs": [*current["outputs"], output],
         "previous_checkpoint_sha256": current["checkpoint_sha256"],
         "status": "ready_for_global_dedup" if all_closed else "mapping",
+        "target_reallocations": target_reallocations,
         "total_mapped_documents": int(current["total_mapped_documents"])
         + wave_documents,
         "total_mapped_tokens": int(current["total_mapped_tokens"]) + wave_tokens,
@@ -742,6 +1140,215 @@ def build_glue_production_mapping_package(
     return release
 
 
+def build_glue_production_mapping_recovery_package(
+    *,
+    previous_package: Path,
+    parent_checkpoint_path: Path,
+    recovered_wave_manifest_path: Path,
+    failure_evidence_path: Path,
+    repository_root: Path,
+    source_commit: str,
+    output_directory: Path,
+) -> dict[str, Any]:
+    """Recover one verified unpublished wave into a revised adaptive release."""
+
+    root = repository_root.resolve()
+    commit = _valid_commit(source_commit)
+    previous_package = previous_package.resolve()
+    _verify_package_manifest(previous_package)
+    previous_release_path = previous_package / RELEASE_FILE
+    previous_release = _read_json(previous_release_path)
+    validate_glue_production_mapping_release(previous_release)
+    if commit == previous_release["source_commit"]:
+        raise ValueError("Glue recovery package must bind the revised source commit")
+
+    parent = _read_json(parent_checkpoint_path)
+    validate_mapping_checkpoint(parent, previous_release)
+    wave = _read_json(recovered_wave_manifest_path)
+    failure = _read_json(failure_evidence_path)
+    if (
+        failure.get("schema_version") != SCHEMA_VERSION
+        or failure.get("gate")
+        != "lumi_glue_production_mapping_failure_evidence_v0.1"
+        or failure.get("state") != "FAILED"
+        or failure.get("active_replacement_runs") != 0
+    ):
+        raise ValueError("Glue production mapping failure evidence changed")
+    durable = failure.get("last_durable_checkpoint")
+    recoverable = failure.get("recoverable_wave_7")
+    if not isinstance(durable, Mapping) or not isinstance(recoverable, Mapping):
+        raise ValueError("Glue production mapping recovery evidence is incomplete")
+    if durable.get("sequence") != parent["checkpoint_sequence"] or durable.get(
+        "checkpoint_sha256"
+    ) != parent["checkpoint_sha256"]:
+        raise ValueError("Glue recovery parent checkpoint changed")
+    if durable.get("local_file_sha256") != _sha256_file(parent_checkpoint_path):
+        raise ValueError("Glue recovery parent checkpoint file changed")
+    for name in (
+        "newly_mapped_tokens",
+        "documents",
+        "parquet_bytes",
+    ):
+        expected = {
+            "newly_mapped_tokens": parent["total_mapped_tokens"],
+            "documents": parent["total_mapped_documents"],
+            "parquet_bytes": parent["mapped_parquet_bytes"],
+        }[name]
+        if durable.get(name) != expected:
+            raise ValueError(f"Glue recovery parent changed {name}")
+    if recoverable.get("local_file_sha256") != _sha256_file(
+        recovered_wave_manifest_path
+    ):
+        raise ValueError("Glue recovery wave manifest file changed")
+    for name in ("manifest_sha256", "candidate_tokens", "candidate_documents", "parquet_bytes"):
+        if recoverable.get(name) != wave.get(name):
+            raise ValueError(f"Glue recovery wave changed {name}")
+    object_count = sum(int(row["object_count"]) for row in wave["categories"])
+    if (
+        recoverable.get("verified_s3_positive_objects") != object_count
+        or recoverable.get("verified_s3_bytes") != wave["parquet_bytes"]
+    ):
+        raise ValueError("Glue recovery S3 verification changed")
+    if wave.get("parent_checkpoint_sha256") != parent["checkpoint_sha256"]:
+        raise ValueError("Glue recovery wave targets another checkpoint")
+
+    legacy_recovered = advance_mapping_checkpoint(parent, previous_release, wave)
+    if legacy_recovered["checkpoint_sequence"] != int(parent["checkpoint_sequence"]) + 1:
+        raise RuntimeError("Glue recovery did not advance exactly one wave")
+    if not legacy_recovered.get("target_reallocations"):
+        raise ValueError("Glue recovery wave did not require target reallocation")
+    failure_category = failure.get("failure", {}).get("category")
+    event_categories = {
+        row["exhausted_category"] for row in legacy_recovered["target_reallocations"]
+    }
+    if failure_category not in event_categories:
+        raise ValueError("Glue recovery did not resolve the failed category")
+
+    output_directory.mkdir(parents=True, exist_ok=True)
+    code_path = output_directory / CODE_ARCHIVE
+    implementation = _zip_code(root, code_path)
+    source_script = root / "scripts" / JOB_SCRIPT
+    packaged_script = output_directory / JOB_SCRIPT
+    _write_bytes_atomic(packaged_script, source_script.read_bytes())
+    implementation[str(source_script.relative_to(root))] = _sha256_file(source_script)
+
+    release = deepcopy(previous_release)
+    release.pop("release_fingerprint", None)
+    release["source_commit"] = commit
+    release["implementation"] = implementation
+    release["decision"] = {
+        **release["decision"],
+        "paid_glue_mapping": "not_authorized",
+        "status": "adaptive_recovery_package_ready_waiting_for_exact_authorization",
+    }
+    bucket = str(release["storage"]["bucket"])
+    namespace = str(release["storage"]["namespace"])
+    bootstrap = f"{namespace}/control/distributed/glue-production/mapping/bootstrap"
+    code_sha = _sha256_file(code_path)
+    script_sha = _sha256_file(source_script)
+    release["artifacts"]["code_archive"] = _artifact(
+        bucket=bucket,
+        key=f"{bootstrap}/code/{code_sha}.zip",
+        sha256=code_sha,
+        size=code_path.stat().st_size,
+        state="upload_required_before_authorized_launch",
+        package_file=code_path.name,
+    )
+    release["artifacts"]["job_script"] = _artifact(
+        bucket=bucket,
+        key=f"{bootstrap}/jobs/{script_sha}.py",
+        sha256=script_sha,
+        size=source_script.stat().st_size,
+        state="upload_required_before_authorized_launch",
+        package_file=packaged_script.name,
+    )
+    recovery: dict[str, Any] = {
+        "active_replacement_runs": 0,
+        "failed_job_name": str(failure["job_name"]),
+        "failed_job_run_id": str(failure["job_run_id"]),
+        "failed_release_fingerprint": previous_release["release_fingerprint"],
+        "failed_release_sha256": _sha256_file(previous_release_path),
+        "failed_state": "FAILED",
+        "gate": "lumi_glue_production_map_recovery_v0.1",
+        "parent_checkpoint_file_sha256": _sha256_file(parent_checkpoint_path),
+        "parent_checkpoint_sequence": parent["checkpoint_sequence"],
+        "parent_checkpoint_sha256": parent["checkpoint_sha256"],
+        "previous_package_manifest_sha256": _sha256_file(
+            previous_package / PACKAGE_MANIFEST
+        ),
+        "recovered_checkpoint_sha256": legacy_recovered["checkpoint_sha256"],
+        "recovered_total_candidate_tokens": int(previous_release["resume"]["accepted_tokens"])
+        + int(legacy_recovered["total_mapped_tokens"]),
+        "recovered_total_mapped_documents": legacy_recovered["total_mapped_documents"],
+        "recovered_total_mapped_tokens": legacy_recovered["total_mapped_tokens"],
+        "recovered_wave_file_sha256": _sha256_file(recovered_wave_manifest_path),
+        "recovered_wave_manifest_sha256": wave["manifest_sha256"],
+        "recovered_wave_sequence": wave["wave_sequence"],
+        "schema_version": SCHEMA_VERSION,
+        "target_reallocation_event_sha256s": [
+            row["event_sha256"] for row in legacy_recovered["target_reallocations"]
+        ],
+        "verified_s3_bytes": recoverable["verified_s3_bytes"],
+        "verified_s3_objects": recoverable["verified_s3_positive_objects"],
+    }
+    release["recovery"] = recovery
+    release["release_fingerprint"] = _fingerprint(release, "release_fingerprint")
+    validate_glue_production_mapping_release(release)
+
+    migrated = deepcopy(legacy_recovered)
+    migrated["release_fingerprint"] = release["release_fingerprint"]
+    migration: dict[str, Any] = {
+        "from_checkpoint_sha256": legacy_recovered["checkpoint_sha256"],
+        "from_release_fingerprint": previous_release["release_fingerprint"],
+        "gate": "lumi_glue_production_map_release_migration_v0.1",
+        "recovery_metadata_sha256": _fingerprint(recovery),
+        "schema_version": SCHEMA_VERSION,
+        "to_release_fingerprint": release["release_fingerprint"],
+    }
+    migration["migration_sha256"] = _fingerprint(migration, "migration_sha256")
+    migrated["release_migration"] = migration
+    migrated.pop("checkpoint_sha256", None)
+    migrated["checkpoint_sha256"] = _fingerprint(migrated, "checkpoint_sha256")
+    validate_mapping_checkpoint(migrated, release)
+
+    release_path = output_directory / RELEASE_FILE
+    checkpoint_path = output_directory / RECOVERED_CHECKPOINT_FILE
+    recovery_path = output_directory / RECOVERY_EVIDENCE_FILE
+    _write_bytes_atomic(
+        release_path, (json.dumps(release, indent=2, sort_keys=True) + "\n").encode()
+    )
+    _write_bytes_atomic(
+        checkpoint_path, (json.dumps(migrated, indent=2, sort_keys=True) + "\n").encode()
+    )
+    recovery_evidence = {
+        "checkpoint_sha256": migrated["checkpoint_sha256"],
+        "gate": "lumi_glue_production_map_recovery_package_v0.1",
+        "legacy_recovered_checkpoint_sha256": legacy_recovered["checkpoint_sha256"],
+        "recovery": recovery,
+        "release_fingerprint": release["release_fingerprint"],
+        "schema_version": SCHEMA_VERSION,
+        "source_commit": commit,
+        "status": "verified_recovery_package_not_authorized",
+        "target_total_candidate_tokens": release["limits"][
+            "target_total_candidate_tokens"
+        ],
+        "training_started": False,
+    }
+    _write_bytes_atomic(
+        recovery_path,
+        (json.dumps(recovery_evidence, indent=2, sort_keys=True) + "\n").encode(),
+    )
+    _manifest(
+        output_directory,
+        [code_path, checkpoint_path, recovery_path, release_path, packaged_script],
+    )
+    return {
+        "checkpoint": migrated,
+        "recovery": recovery_evidence,
+        "release": release,
+    }
+
+
 def validate_glue_production_mapping_release(
     release: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -797,6 +1404,11 @@ def validate_glue_production_mapping_release(
         release["stage"]["staged_compressed_bytes"]
     ) != 2_000_000_000_000:
         raise ValueError("Glue production mapping storage envelope changed")
+    recovery = release.get("recovery")
+    if recovery is not None:
+        if not isinstance(recovery, Mapping):
+            raise ValueError("Glue production mapping recovery changed")
+        _validate_recovery_metadata(recovery, release)
     _validate_lingua_wheel_pin(dict(release.get("lingua_compatibility", {})))
     return {
         "maximum_compute_usd": str(maximum),

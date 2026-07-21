@@ -13,9 +13,12 @@ import pytest
 
 from lumi.emr_production_staging import split_gzip_source
 from lumi.glue_production_mapping import (
+    RECOVERED_CHECKPOINT_FILE,
+    RELEASE_FILE,
     _mapping_targets,
     advance_mapping_checkpoint,
     build_glue_production_mapping_authorization,
+    build_glue_production_mapping_recovery_package,
     build_initial_mapping_checkpoint,
     plan_mapping_wave,
     validate_glue_production_mapping_authorization,
@@ -25,6 +28,14 @@ from lumi.glue_production_mapping import (
 from lumi.production_corpus import _canonical_json_bytes
 
 ROOT = Path(__file__).parents[1]
+
+
+def _refingerprint_release(release: dict[str, object]) -> None:
+    material = dict(release)
+    material.pop("release_fingerprint", None)
+    release["release_fingerprint"] = hashlib.sha256(
+        json.dumps(material, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
 
 
 def _wheel_pin() -> dict[str, object]:
@@ -301,6 +312,200 @@ def test_mapping_checkpoint_plans_and_commits_a_hard_capped_wave() -> None:
     changed["categories"][0]["candidate_tokens"] += 2
     with pytest.raises(ValueError, match="fingerprint changed"):
         advance_mapping_checkpoint(checkpoint, release, changed)
+
+
+def _open_web_exhaustion_fixture(
+    *,
+    open_web_tokens: int,
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    release = _release()
+    for row in release["category_inventory"]:
+        if row["category"] == "open_web":
+            row["staged_chunks"] = 1
+    _refingerprint_release(release)
+    validate_glue_production_mapping_release(release)
+    checkpoint = build_initial_mapping_checkpoint(release)
+    wave = plan_mapping_wave(checkpoint, release)
+    assert next(row for row in wave["categories"] if row["category"] == "open_web")[
+        "end_chunk_index"
+    ] == 1
+    results = []
+    for row in wave["categories"]:
+        selected_tokens = (
+            open_web_tokens if row["category"] == "open_web" else 1
+        )
+        results.append(
+            {
+                "available_documents": 1,
+                "available_tokens": selected_tokens,
+                "candidate_documents": 1,
+                "candidate_tokens": selected_tokens,
+                "category": row["category"],
+                "closed": False,
+                "cutoff": None,
+                "end_chunk_index": row["end_chunk_index"],
+                "object_count": 1,
+                "objects_sha256": "8" * 64,
+                "parquet_bytes": 1,
+                "parquet_s3_uri": (
+                    "s3://lumi-corpus-prod-fixture/lumi-corpus/v0.1/transient/"
+                    f"mapped/{release['release_fingerprint']}/run/{row['category']}"
+                ),
+                "start_chunk_index": row["start_chunk_index"],
+            }
+        )
+    manifest: dict[str, object] = {
+        "candidate_documents": len(results),
+        "candidate_tokens": sum(int(row["candidate_tokens"]) for row in results),
+        "categories": results,
+        "gate": "lumi_glue_production_map_wave_result_v0.1",
+        "manifest_s3_key": "lumi-corpus/v0.1/control/map-runs/wave-1.json",
+        "parent_checkpoint_sha256": checkpoint["checkpoint_sha256"],
+        "parquet_bytes": len(results),
+        "release_fingerprint": release["release_fingerprint"],
+        "schema_version": 1,
+        "wave_plan_sha256": wave["wave_sha256"],
+        "wave_sequence": 1,
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(manifest)
+    ).hexdigest()
+    return release, checkpoint, manifest
+
+
+def test_mapping_reallocates_a_floor_satisfying_exhausted_category() -> None:
+    release, checkpoint, manifest = _open_web_exhaustion_fixture(
+        open_web_tokens=13_000_000_000
+    )
+    committed = advance_mapping_checkpoint(checkpoint, release, manifest)
+    assert committed["status"] == "mapping"
+    assert len(committed["target_reallocations"]) == 1
+    event = committed["target_reallocations"][0]
+    assert event["exhausted_category"] == "open_web"
+    assert event["shortfall_tokens"] == 2_005_956_042
+    assert sum(row["added_tokens"] for row in event["recipient_adjustments"]) == event[
+        "shortfall_tokens"
+    ]
+    open_web = next(
+        row for row in committed["categories"] if row["category"] == "open_web"
+    )
+    assert open_web == {
+        "category": "open_web",
+        "closed": True,
+        "cutoff": None,
+        "mapped_documents": 1,
+        "mapped_tokens": 13_000_000_000,
+        "next_chunk_index": 1,
+        "target_tokens": 13_000_000_000,
+    }
+    assert sum(row["target_tokens"] for row in committed["categories"]) == release[
+        "limits"
+    ]["target_new_candidate_tokens"]
+    assert "open_web" not in {
+        row["category"] for row in plan_mapping_wave(committed, release)["categories"]
+    }
+
+    tampered = deepcopy(committed)
+    tampered["target_reallocations"][0]["shortfall_tokens"] += 1
+    material = dict(tampered)
+    material.pop("checkpoint_sha256")
+    tampered["checkpoint_sha256"] = hashlib.sha256(
+        _canonical_json_bytes(material)
+    ).hexdigest()
+    with pytest.raises(ValueError, match="reallocation fingerprint changed"):
+        validate_mapping_checkpoint(tampered, release)
+
+
+def test_mapping_refuses_exhaustion_below_the_clean_floor() -> None:
+    release, checkpoint, manifest = _open_web_exhaustion_fixture(
+        open_web_tokens=11_000_000_000
+    )
+    with pytest.raises(ValueError, match="exhausted below its clean floor"):
+        advance_mapping_checkpoint(checkpoint, release, manifest)
+
+
+def test_mapping_recovery_package_migrates_one_verified_wave(tmp_path: Path) -> None:
+    release, checkpoint, manifest = _open_web_exhaustion_fixture(
+        open_web_tokens=13_000_000_000
+    )
+    previous_package = tmp_path / "previous"
+    previous_package.mkdir()
+    release_path = previous_package / RELEASE_FILE
+    release_path.write_text(json.dumps(release, indent=2, sort_keys=True) + "\n")
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint_path.write_text(json.dumps(checkpoint, indent=2, sort_keys=True) + "\n")
+    package_checkpoint = previous_package / "initial-map-checkpoint-v0.1.json"
+    package_checkpoint.write_bytes(checkpoint_path.read_bytes())
+    (previous_package / "lumi-glue-production-map-code-v0.1.zip").write_bytes(b"zip")
+    (previous_package / "run_glue_production_mapping.py").write_text("# fixture\n")
+    packaged = [
+        release_path,
+        package_checkpoint,
+        previous_package / "lumi-glue-production-map-code-v0.1.zip",
+        previous_package / "run_glue_production_mapping.py",
+    ]
+    (previous_package / "manifest.sha256").write_text(
+        "".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n"
+            for path in packaged
+        )
+    )
+    wave_path = tmp_path / "wave.json"
+    wave_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+    failure = {
+        "active_replacement_runs": 0,
+        "failure": {"category": "open_web"},
+        "gate": "lumi_glue_production_mapping_failure_evidence_v0.1",
+        "job_name": "fixture-failed-job",
+        "job_run_id": "jr_fixture",
+        "last_durable_checkpoint": {
+            "checkpoint_sha256": checkpoint["checkpoint_sha256"],
+            "documents": checkpoint["total_mapped_documents"],
+            "local_file_sha256": hashlib.sha256(checkpoint_path.read_bytes()).hexdigest(),
+            "newly_mapped_tokens": checkpoint["total_mapped_tokens"],
+            "parquet_bytes": checkpoint["mapped_parquet_bytes"],
+            "sequence": checkpoint["checkpoint_sequence"],
+        },
+        "recoverable_wave_7": {
+            "candidate_documents": manifest["candidate_documents"],
+            "candidate_tokens": manifest["candidate_tokens"],
+            "local_file_sha256": hashlib.sha256(wave_path.read_bytes()).hexdigest(),
+            "manifest_sha256": manifest["manifest_sha256"],
+            "parquet_bytes": manifest["parquet_bytes"],
+            "verified_s3_bytes": manifest["parquet_bytes"],
+            "verified_s3_positive_objects": sum(
+                row["object_count"] for row in manifest["categories"]
+            ),
+        },
+        "schema_version": 1,
+        "state": "FAILED",
+    }
+    failure_path = tmp_path / "failure.json"
+    failure_path.write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n")
+    output = tmp_path / "recovery"
+    package = build_glue_production_mapping_recovery_package(
+        previous_package=previous_package,
+        parent_checkpoint_path=checkpoint_path,
+        recovered_wave_manifest_path=wave_path,
+        failure_evidence_path=failure_path,
+        repository_root=ROOT,
+        source_commit="2" * 40,
+        output_directory=output,
+    )
+    recovered_release = package["release"]
+    recovered_checkpoint = package["checkpoint"]
+    assert recovered_release["release_fingerprint"] != release["release_fingerprint"]
+    assert recovered_checkpoint["checkpoint_sequence"] == 1
+    assert recovered_checkpoint["release_migration"]["from_release_fingerprint"] == release[
+        "release_fingerprint"
+    ]
+    assert recovered_checkpoint["total_mapped_tokens"] == manifest["candidate_tokens"]
+    assert validate_mapping_checkpoint(recovered_checkpoint, recovered_release)[
+        "status"
+    ] == "mapping"
+    with pytest.raises(ValueError, match="requires its migrated checkpoint"):
+        build_initial_mapping_checkpoint(recovered_release)
+    assert (output / RECOVERED_CHECKPOINT_FILE).is_file()
 
 
 def test_mapping_authorization_is_one_run_and_mapping_only() -> None:
