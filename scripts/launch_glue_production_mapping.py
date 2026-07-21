@@ -92,6 +92,33 @@ def _verify_package(package: Path) -> None:
             raise ValueError(f"Glue mapping package manifest mismatch: {name}")
 
 
+def _release_artifact_keys(
+    release: Mapping[str, Any], *, bucket: str
+) -> dict[str, list[str]]:
+    artifacts = release["artifacts"]
+    prefix = f"s3://{bucket}/"
+
+    def key(name: str) -> str:
+        uri = str(artifacts[name]["s3_uri"])
+        if not uri.startswith(prefix) or uri == prefix:
+            raise ValueError(f"mapping artifact is outside the release bucket: {name}")
+        return uri[len(prefix) :]
+
+    extra_files = [
+        key(name)
+        for name in (
+            "benchmark_registry",
+            "frozen_tokenizer",
+            "training_exclusion_ledger",
+        )
+    ]
+    dependencies = [key("lingua_cp311_wheel")]
+    return {
+        "exact_reads": [*extra_files, *dependencies],
+        "extra_files": extra_files,
+    }
+
+
 def _policy(
     *,
     account: str,
@@ -257,14 +284,7 @@ def main() -> None:
     script_key = str(release["artifacts"]["job_script"]["s3_uri"]).split(
         f"s3://{bucket}/", 1
     )[1]
-    exact_artifact_keys = [
-        str(release["artifacts"][name]["s3_uri"]).split(f"s3://{bucket}/", 1)[1]
-        for name in (
-            "benchmark_registry",
-            "frozen_tokenizer",
-            "training_exclusion_ledger",
-        )
-    ]
+    artifact_keys = _release_artifact_keys(release, bucket=bucket)
     staged_prefix = next(iter(release["staged_sources"]))["manifest_s3_key"].split(
         "/manifests/", 1
     )[0]
@@ -322,7 +342,7 @@ def main() -> None:
         code_key,
         release_key,
         script_key,
-        *exact_artifact_keys,
+        *artifact_keys["exact_reads"],
     ]
     role_was_created = False
     try:
@@ -368,7 +388,7 @@ def main() -> None:
         f"s3://{bucket}/{release_key}",
         f"s3://{bucket}/{authorization_key}",
         f"s3://{bucket}/{checkpoint_key}",
-        *[f"s3://{bucket}/{key}" for key in exact_artifact_keys],
+        *[f"s3://{bucket}/{key}" for key in artifact_keys["extra_files"]],
     ]
     non_overridable = {
         "--LUMI_AUTHORIZATION_FILE": Path(authorization_key).name,

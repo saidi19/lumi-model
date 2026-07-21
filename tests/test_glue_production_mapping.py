@@ -424,3 +424,43 @@ def test_mapping_launcher_waits_for_new_role_and_keys_retry_job_by_authorization
     assert 'authorization_short = str(authorization["authorization_sha256"])[:8]' in source
     assert "-{authorization_short}" in source
     assert "if role_was_created:\n        time.sleep(60)" in source
+
+
+def test_mapping_launcher_grants_wheel_read_without_adding_it_as_an_extra_file() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "launch_glue_production_mapping.py",
+        run_name="lumi_glue_production_mapping_launcher_test",
+    )
+    release = _release()
+    bucket = release["storage"]["bucket"]
+    artifact_prefix = f"s3://{bucket}/lumi-corpus/v0.1/control/test-artifacts"
+    for name in (
+        "benchmark_registry",
+        "frozen_tokenizer",
+        "training_exclusion_ledger",
+        "lingua_cp311_wheel",
+    ):
+        release["artifacts"][name] = {"s3_uri": f"{artifact_prefix}/{name}"}
+
+    artifact_keys = namespace["_release_artifact_keys"](release, bucket=bucket)
+    wheel_key = "lumi-corpus/v0.1/control/test-artifacts/lingua_cp311_wheel"
+    assert wheel_key in artifact_keys["exact_reads"]
+    assert wheel_key not in artifact_keys["extra_files"]
+
+    policy = namespace["_policy"](
+        account="123456789012",
+        region="us-east-1",
+        bucket=bucket,
+        exact_read_keys=artifact_keys["exact_reads"],
+        staged_prefix="lumi-corpus/v0.1/transient/staged",
+        checkpoint_prefix="lumi-corpus/v0.1/control/checkpoints",
+        mapped_prefix="lumi-corpus/v0.1/transient/mapped",
+        result_prefix="lumi-corpus/v0.1/control/results",
+        temp_prefix="lumi-corpus/v0.1/control/temp",
+    )
+    exact_reads = next(
+        statement
+        for statement in policy["Statement"]
+        if statement["Sid"] == "ReadExactMappingBootstrap"
+    )
+    assert f"arn:aws:s3:::{bucket}/{wheel_key}" in exact_reads["Resource"]

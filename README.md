@@ -378,7 +378,14 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     no mapping or model training started, and the exact failed-start evidence is
     sealed locally. The launcher now waits 60 seconds after creating a role and
     gives each separately authorized retry a distinct job identity; a
-    replacement run remains unlaunched pending fresh owner approval.
+    replacement run then passed role assumption.
+50. that separately authorized replacement failed closed during dependency
+    bootstrap, before mapping, because the launcher omitted the pinned Lingua
+    CPython 3.11 wheel from the role's exact S3-read list. It used 3,676
+    DPU-seconds—approximately $0.449289 at $0.44/DPU-hour—and produced no mapped
+    candidates or model-training work. The failure is sealed locally. The
+    launcher now grants the wheel exact read access without duplicating it in
+    `--extra-files`, with a regression test; no further paid run is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation

@@ -347,7 +347,24 @@ created. The launch record and failure report are sealed under release
 The launcher now waits 60 seconds whenever it creates a fresh role and includes
 the exact authorization hash in the Glue job name. This keeps replacement
 attempts auditable and avoids reusing a job whose one-run authorization was
-already consumed. No replacement run is authorized by this fix itself.
+already consumed.
+
+The separately authorized replacement proved that the propagation fix works:
+Glue assumed the new role and entered dependency bootstrap. It then failed
+closed before mapping because the launcher's exact-read policy omitted the
+already pinned Lingua CPython 3.11 wheel used by
+`--additional-python-modules`. Run
+`jr_44baee3465335b556b319ae0046a52258618bf166bd62a5e2bc5cd612d8211d4`
+reported 36 execution seconds and 3,676 DPU-seconds, approximately $0.449289 at
+$0.44/DPU-hour. No candidate mapping, deduplication, sharding, GPU compute, or
+model training started. The launch record and failure report are sealed under
+release `5b36827ff7526551f62bf982311164d09d06a0dcbdad764c85efc04c0cf3b15c`.
+
+The launcher now derives two explicit artifact sets: all pinned objects receive
+exact `GetObject`/`GetObjectVersion` permission, while only Spark runtime files
+enter `--extra-files`. A regression test proves the wheel is readable without
+being downloaded twice. This code correction authorizes no additional paid
+run; another attempt requires a new exact owner approval.
 
 ## Reproduction commands
 
