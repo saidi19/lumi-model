@@ -203,8 +203,6 @@ def _args() -> argparse.Namespace:
 
 
 def main() -> None:
-    import boto3
-
     args = _args()
     package = args.package.resolve()
     _verify_package(package)
@@ -248,6 +246,8 @@ def main() -> None:
     if not args.execute:
         print(json.dumps({**plan, "status": "dry_run_not_launched"}, indent=2, sort_keys=True))
         return
+
+    import boto3
 
     session = boto3.Session(region_name=region)
     sts = session.client("sts")
