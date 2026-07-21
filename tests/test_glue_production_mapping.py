@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import gzip
 import hashlib
+import io
 import json
 import runpy
 from copy import deepcopy
@@ -9,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from lumi.emr_production_staging import split_gzip_source
 from lumi.glue_production_mapping import (
     _mapping_targets,
     advance_mapping_checkpoint,
@@ -19,6 +22,7 @@ from lumi.glue_production_mapping import (
     validate_glue_production_mapping_release,
     validate_mapping_checkpoint,
 )
+from lumi.production_corpus import _canonical_json_bytes
 
 ROOT = Path(__file__).parents[1]
 
@@ -417,6 +421,81 @@ def test_mapping_script_uses_reserved_job_run_id_and_initializes_spark_first() -
     context = source.index("context = SparkContext.getOrCreate()")
     release = source.index('SparkFiles.get(args["LUMI_RELEASE_FILE"])')
     assert context < release
+
+
+def test_mapping_script_reattaches_verified_staged_manifest_digest(tmp_path: Path) -> None:
+    source_path = tmp_path / "fixture.json.gz"
+    with gzip.open(source_path, "wb") as handle:
+        handle.write(json.dumps({"text": "verified staged document"}).encode() + b"\n")
+    source_sha256 = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    manifest = split_gzip_source(
+        source_path,
+        tmp_path / "chunks",
+        source_file=source_path.name,
+        source_sha256=source_sha256,
+        start_after_line=0,
+        target_uncompressed_bytes=1024,
+    )
+    bucket = "fixture-bucket"
+    prefix = "lumi-corpus/v0.1/transient/glue-production/raw/release"
+    remote = {
+        **manifest,
+        "chunks": [
+            {
+                **chunk,
+                "s3_key": f"{prefix}/chunks/{source_sha256}/{chunk['sha256']}.jsonl.zst",
+                "version_id": "chunk-version",
+            }
+            for chunk in manifest["chunks"]
+        ],
+    }
+    remote.pop("manifest_sha256", None)
+    body = _canonical_json_bytes(remote)
+    digest = hashlib.sha256(body).hexdigest()
+    manifest_key = f"{prefix}/manifests/{source_sha256}/{digest}.json"
+    release = {
+        "categories": [{"category": "science_and_education"}],
+        "category_inventory": [
+            {
+                "category": "science_and_education",
+                "staged_chunks": len(remote["chunks"]),
+            }
+        ],
+        "source_schedule": [
+            {
+                "category": "science_and_education",
+                "ordinal": 0,
+                "source_file": source_path.name,
+                "source_sha256": source_sha256,
+            }
+        ],
+        "staged_sources": [
+            {
+                "manifest_s3_key": manifest_key,
+                "manifest_sha256": digest,
+                "manifest_version_id": "manifest-version",
+                "source_ordinal": 0,
+                "start_after_line": 0,
+            }
+        ],
+        "storage": {"bucket": bucket},
+    }
+
+    class FakeS3:
+        def get_object(self, **request: object) -> dict[str, io.BytesIO]:
+            assert request == {
+                "Bucket": bucket,
+                "Key": manifest_key,
+                "VersionId": "manifest-version",
+            }
+            return {"Body": io.BytesIO(body)}
+
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_production_mapping.py",
+        run_name="lumi_glue_production_mapping_digest_test",
+    )
+    queues = namespace["_load_stage_queues"](release, s3_client=FakeS3())
+    assert len(queues["science_and_education"]) == len(remote["chunks"])
 
 
 def test_mapping_launcher_waits_for_new_role_and_keys_retry_job_by_authorization() -> None:

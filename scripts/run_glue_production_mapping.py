@@ -127,6 +127,7 @@ def _load_stage_queues(
         manifest = json.loads(body)
         if not isinstance(manifest, dict):
             raise ValueError("Glue production staged manifest is not an object")
+        manifest["manifest_sha256"] = staged["manifest_sha256"]
         manifest["s3_key"] = key
         manifest["version_id"] = staged.get("manifest_version_id")
         prefix = key.split("/manifests/", 1)[0]

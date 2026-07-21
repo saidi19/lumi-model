@@ -386,6 +386,14 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     candidates or model-training work. The failure is sealed locally. The
     launcher now grants the wheel exact read access without duplicating it in
     `--extra-files`, with a regression test; no further paid run is authorized.
+51. the next separately authorized attempt passed IAM propagation, installed
+    the exact pinned Lingua wheel, and initialized Spark, proving both previous
+    startup fixes. It then failed closed before mapping because the runner did
+    not reattach the already verified staged-manifest digest to the validator
+    wrapper. It used 7,521 DPU-seconds—approximately $0.919233—and wrote zero
+    checkpoint, candidate, or run-manifest objects. The exact attempt is sealed
+    locally. The digest handoff now has a behavioral regression test; another
+    paid run requires another exact owner approval.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation

@@ -366,6 +366,27 @@ enter `--extra-files`. A regression test proves the wheel is readable without
 being downloaded twice. This code correction authorizes no additional paid
 run; another attempt requires a new exact owner approval.
 
+The next separately authorized attempt confirmed both startup corrections in
+the live service: Glue assumed the role, downloaded and installed the exact
+pinned Lingua wheel, initialized Spark, and began allocating executors. It then
+failed closed before candidate mapping while reading the first sealed staged
+manifest. The runner had already hashed the downloaded JSON body and matched it
+to the release's `manifest_sha256`, but failed to reattach that verified digest
+to the wrapper expected by `validate_published_staged_source`.
+
+Run `jr_5c049a89c20401e315668ed47d21a66717d5a200504ffa334fe5c40b3d92a5fd`
+reported 75 execution seconds and 7,521 DPU-seconds, approximately $0.919233 at
+$0.44/DPU-hour. Read-only S3 checks found zero checkpoint objects, zero mapped
+candidate objects, and zero run-manifest objects for release
+`5a07f3a2db3a9264e08fa1e3e8914c2f277a736848b97b3b24f499022fcee5a0`.
+No deduplication, sharding, GPU compute, or model training started.
+
+The runner now reattaches only the release-pinned digest after independently
+hashing the downloaded body. A behavioral regression test reproduces the exact
+stored-manifest shape, including the absent embedded digest, and verifies queue
+loading succeeds. The consumed run and package are hash-sealed locally. This
+fix does not authorize another paid run.
+
 ## Reproduction commands
 
 ```bash
