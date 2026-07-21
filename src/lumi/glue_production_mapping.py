@@ -34,8 +34,9 @@ CODE_ARCHIVE = "lumi-glue-production-map-code-v0.1.zip"
 JOB_SCRIPT = "run_glue_production_mapping.py"
 PACKAGE_MANIFEST = "manifest.sha256"
 MAPPING_OWNER_APPROVAL_TEXT = (
-    "I approve one 100-DPU AWS Glue mapping run to the total 150B hard cap, "
-    "maximum 72 hours/$3,168. No dedup, sharding, GPU, or model training."
+    "I approve one replacement 100-DPU AWS Glue mapping run after the zero-second "
+    "IAM propagation failure, under the same total 150B, 72-hour/$3,168 maximum, "
+    "with no dedup, sharding, GPU, or model training."
 )
 
 
