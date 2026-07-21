@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,7 +26,8 @@ from .production_corpus import (
 )
 
 CANARY_APPROVAL_TEXT = (
-    "I approve the bounded Lumi AWS Glue distributed corpus canary only."
+    "I approve one bounded CodeBuild Linux cp311 wheel build and one 8-DPU, "
+    "30-minute Glue canary only, combined maximum $3. No production run."
 )
 CANARY_RELEASE_SCHEMA_VERSION = 1
 CANARY_AUTHORIZATION_SCHEMA_VERSION = 1
@@ -33,6 +35,9 @@ PACKAGE_MANIFEST = "manifest.sha256"
 RELEASE_FILE = "glue-canary-release-v0.1.json"
 CODE_ARCHIVE = "lumi-glue-code-v0.1.zip"
 JOB_SCRIPT = "run_glue_distributed_canary.py"
+LINGUA_WHEEL_FILENAME = (
+    "lingua_language_detector-2.2.0-cp311-cp311-manylinux_2_34_x86_64.whl"
+)
 
 
 def _valid_commit(value: Any) -> str:
@@ -43,6 +48,120 @@ def _valid_commit(value: Any) -> str:
     ):
         raise ValueError("Glue canary source commit must be a full Git SHA-1")
     return value
+
+
+def _valid_sha256(value: Any, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+def _validate_lingua_wheel_pin(pin: Any) -> dict[str, Any]:
+    if not isinstance(pin, dict) or set(pin) != {
+        "codebuild",
+        "gate",
+        "schema_version",
+        "wheel",
+    }:
+        raise ValueError("Lingua wheel pin shape changed")
+    if pin.get("schema_version") != 1:
+        raise ValueError("unsupported Lingua wheel pin schema")
+    if pin.get("gate") != "lumi_lingua_glue_cp311_wheel_pin_v0.1":
+        raise ValueError("unexpected Lingua wheel pin gate")
+
+    wheel = pin.get("wheel")
+    if not isinstance(wheel, dict) or set(wheel) != {
+        "bytes",
+        "s3_uri",
+        "sha256",
+        "version_id",
+    }:
+        raise ValueError("Lingua wheel artifact shape changed")
+    wheel_sha256 = _valid_sha256(wheel.get("sha256"), "Lingua wheel hash")
+    wheel_bytes = wheel.get("bytes")
+    if not isinstance(wheel_bytes, int) or not 0 < wheel_bytes <= 250_000_000:
+        raise ValueError("Lingua wheel byte size is invalid")
+    wheel_uri = wheel.get("s3_uri")
+    if not isinstance(wheel_uri, str):
+        raise ValueError("Lingua wheel S3 URI is invalid")
+    uri_match = re.fullmatch(
+        r"s3://[a-z0-9.-]+/lumi-corpus/v0\.1/control/distributed/"
+        r"glue-cp311/([0-9a-f]{12})/codebuild/output/"
+        + re.escape(LINGUA_WHEEL_FILENAME),
+        wheel_uri,
+    )
+    if uri_match is None:
+        raise ValueError("Lingua wheel S3 URI is outside the compatibility prefix")
+    wheel_version_id = wheel.get("version_id")
+    if (
+        not isinstance(wheel_version_id, str)
+        or not wheel_version_id
+        or len(wheel_version_id) > 1024
+    ):
+        raise ValueError("Lingua wheel S3 VersionId is invalid")
+
+    codebuild = pin.get("codebuild")
+    expected_codebuild_keys = {
+        "build_id",
+        "build_report_s3_uri",
+        "build_report_sha256",
+        "build_report_version_id",
+        "build_status",
+        "parity_report_s3_uri",
+        "parity_report_sha256",
+        "parity_report_version_id",
+        "source_archive_sha256",
+        "source_commit",
+        "source_version",
+    }
+    if not isinstance(codebuild, dict) or set(codebuild) != expected_codebuild_keys:
+        raise ValueError("Lingua CodeBuild provenance shape changed")
+    if codebuild.get("build_status") != "SUCCEEDED":
+        raise ValueError("Lingua CodeBuild did not succeed")
+    source_archive_sha256 = _valid_sha256(
+        codebuild.get("source_archive_sha256"),
+        "Lingua source archive hash",
+    )
+    if uri_match.group(1) != source_archive_sha256[:12]:
+        raise ValueError("Lingua wheel prefix does not match its source archive")
+    build_id = codebuild.get("build_id")
+    expected_project = f"lumi-cb-lingua-cp311-{source_archive_sha256[:12]}"
+    if not isinstance(build_id, str) or not build_id.startswith(f"{expected_project}:"):
+        raise ValueError("Lingua CodeBuild ID changed")
+    _valid_commit(codebuild.get("source_commit"))
+    source_version = codebuild.get("source_version")
+    if not isinstance(source_version, str) or not source_version or len(source_version) > 1024:
+        raise ValueError("Lingua CodeBuild source version is invalid")
+    _valid_sha256(codebuild.get("build_report_sha256"), "Lingua build report hash")
+    _valid_sha256(codebuild.get("parity_report_sha256"), "Lingua parity report hash")
+    output_prefix = wheel_uri.rsplit("/", 1)[0]
+    if codebuild.get("build_report_s3_uri") != (
+        f"{output_prefix}/lingua-glue-cp311-build-v0.1.json"
+    ):
+        raise ValueError("Lingua build report S3 URI changed")
+    if codebuild.get("parity_report_s3_uri") != (
+        f"{output_prefix}/lingua-glue-cp311-parity-v0.1.json"
+    ):
+        raise ValueError("Lingua parity report S3 URI changed")
+    for label in ("build_report_version_id", "parity_report_version_id"):
+        version_id = codebuild.get(label)
+        if not isinstance(version_id, str) or not version_id or len(version_id) > 1024:
+            raise ValueError(f"Lingua {label} is invalid")
+    return {
+        "source_archive_sha256": source_archive_sha256,
+        "wheel_bytes": wheel_bytes,
+        "wheel_sha256": wheel_sha256,
+        "wheel_uri": wheel_uri,
+        "wheel_version_id": wheel_version_id,
+    }
+
+
+def _additional_python_modules(wheel_uri: str) -> str:
+    return f"tokenizers==0.22.2,datasketch==2.0.0,{wheel_uri}"
 
 
 def _write_bytes_atomic(path: Path, value: bytes) -> None:
@@ -157,6 +276,7 @@ def build_glue_canary_package(
     repository_root: Path,
     source_commit: str,
     anchor_export_directory: Path,
+    lingua_wheel_pin_path: Path,
     output_directory: Path,
 ) -> dict[str, Any]:
     """Create the deterministic, non-authorizing Glue canary package."""
@@ -171,6 +291,8 @@ def build_glue_canary_package(
     if plan["decision"]["paid_glue_canary"] != "not_authorized":
         raise ValueError("Glue canary package unexpectedly authorizes paid compute")
     contract = _read_json(contract_path)
+    lingua_wheel_pin = _read_json(lingua_wheel_pin_path)
+    lingua_wheel = _validate_lingua_wheel_pin(lingua_wheel_pin)
     paths = {
         name: root / pin["path"] for name, pin in plan["inputs"].items()
     }
@@ -263,6 +385,10 @@ def build_glue_canary_package(
             state="upload_required_before_authorized_launch",
             package_file=packaged_job_script.name,
         ),
+        "lingua_cp311_wheel": {
+            **lingua_wheel_pin["wheel"],
+            "state": "existing_verified_codebuild_object",
+        },
         "resume_anchors": _artifact(
             bucket=bucket,
             key=f"{bootstrap_prefix}/anchors/{anchor_pin['sha256']}.jsonl.gz",
@@ -302,10 +428,10 @@ def build_glue_canary_package(
         "filters": _read_json(paths["filter_policy"])["filters"],
         "gate": "lumi_distributed_glue_canary_release_v0.1",
         "implementation": implementation,
+        "lingua_compatibility": lingua_wheel_pin,
         "job": {
-            "additional_python_modules": (
-                "tokenizers==0.22.2,datasketch==2.0.0,"
-                "lingua-language-detector==2.2.0"
+            "additional_python_modules": _additional_python_modules(
+                lingua_wheel["wheel_uri"]
             ),
             "auto_scaling": False,
             "execution_class": "STANDARD",
@@ -376,10 +502,19 @@ def validate_glue_canary_release(release: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Glue canary release must not authorize paid compute or training")
     if release.get("output", {}).get("write_production_shards") is not False:
         raise ValueError("Glue canary release may not write production shards")
+    lingua_wheel = _validate_lingua_wheel_pin(release.get("lingua_compatibility"))
+    expected_wheel_artifact = {
+        "bytes": lingua_wheel["wheel_bytes"],
+        "s3_uri": lingua_wheel["wheel_uri"],
+        "sha256": lingua_wheel["wheel_sha256"],
+        "state": "existing_verified_codebuild_object",
+        "version_id": lingua_wheel["wheel_version_id"],
+    }
+    if release.get("artifacts", {}).get("lingua_cp311_wheel") != expected_wheel_artifact:
+        raise ValueError("Glue canary Lingua wheel artifact changed")
     if release.get("job") != {
-        "additional_python_modules": (
-            "tokenizers==0.22.2,datasketch==2.0.0,"
-            "lingua-language-detector==2.2.0"
+        "additional_python_modules": _additional_python_modules(
+            lingua_wheel["wheel_uri"]
         ),
         "auto_scaling": False,
         "execution_class": "STANDARD",

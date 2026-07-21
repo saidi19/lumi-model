@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "configs" / "distributed-production-corpus-v0.1.json",
     )
     parser.add_argument("--anchor-export-directory", type=Path, required=True)
+    parser.add_argument("--lingua-wheel-pin", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--source-commit")
     return parser.parse_args()
@@ -46,6 +47,7 @@ def main() -> None:
         repository_root=ROOT,
         source_commit=_source_commit(args.source_commit),
         anchor_export_directory=args.anchor_export_directory,
+        lingua_wheel_pin_path=args.lingua_wheel_pin,
         output_directory=args.output_directory,
     )
     verified = verify_glue_canary_package(args.output_directory)
