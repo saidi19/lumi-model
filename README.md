@@ -372,6 +372,13 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     stop, 500-chunk immutable checkpoints, a 3,960-minute soft stop, a
     4,320-minute hard timeout, and a $3,168 maximum. Deduplication, sharding,
     GPU compute, and model training remain separately unauthorized.
+49. the first authorized 100-DPU start failed closed after zero execution
+    seconds with no reported DPU-seconds because the newly created IAM role had
+    not yet propagated to the Glue executor. The live trust policy is correct,
+    no mapping or model training started, and the exact failed-start evidence is
+    sealed locally. The launcher now waits 60 seconds after creating a role and
+    gives each separately authorized retry a distinct job identity; a
+    replacement run remains unlaunched pending fresh owner approval.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation

@@ -243,6 +243,7 @@ def main() -> None:
     fingerprint = str(release["release_fingerprint"])
     short = fingerprint[:12]
     checkpoint_short = str(checkpoint["checkpoint_sha256"])[:8]
+    authorization_short = str(authorization["authorization_sha256"])[:8]
     bootstrap = (
         f"{release['storage']['namespace']}/control/distributed/"
         "glue-production/mapping/bootstrap"
@@ -272,7 +273,7 @@ def main() -> None:
     result_prefix = f"{release['output']['result_prefix']}/{fingerprint}"
     temp_prefix = f"{release['output']['temp_prefix']}/{fingerprint}"
     role_name = f"lumi-glue-map-{short}-{checkpoint_short}"
-    job_name = f"lumi-glue-map-{short}-{checkpoint_short}"
+    job_name = f"lumi-glue-map-{short}-{checkpoint_short}-{authorization_short}"
     plan = {
         "authorization_key": authorization_key,
         "bucket": bucket,
@@ -281,6 +282,7 @@ def main() -> None:
         "job_name": job_name,
         "maximum_compute_usd": release["limits"]["maximum_compute_usd"],
         "number_of_workers": release["job"]["number_of_workers"],
+        "new_role_propagation_wait_seconds": 60,
         "release_key": release_key,
         "role_name": role_name,
         "starting_checkpoint_sequence": checkpoint["checkpoint_sequence"],
@@ -322,6 +324,7 @@ def main() -> None:
         script_key,
         *exact_artifact_keys,
     ]
+    role_was_created = False
     try:
         role = iam.create_role(
             RoleName=role_name,
@@ -337,6 +340,7 @@ def main() -> None:
                 {"Key": "Release", "Value": short},
             ],
         )["Role"]
+        role_was_created = True
     except iam.exceptions.EntityAlreadyExistsException:
         role = iam.get_role(RoleName=role_name)["Role"]
     iam.put_role_policy(
@@ -357,6 +361,8 @@ def main() -> None:
             separators=(",", ":"),
         ),
     )
+    if role_was_created:
+        time.sleep(60)
     role_arn = str(role["Arn"])
     extra_files = [
         f"s3://{bucket}/{release_key}",

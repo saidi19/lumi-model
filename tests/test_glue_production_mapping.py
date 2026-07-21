@@ -417,3 +417,10 @@ def test_mapping_script_uses_reserved_job_run_id_and_initializes_spark_first() -
     context = source.index("context = SparkContext.getOrCreate()")
     release = source.index('SparkFiles.get(args["LUMI_RELEASE_FILE"])')
     assert context < release
+
+
+def test_mapping_launcher_waits_for_new_role_and_keys_retry_job_by_authorization() -> None:
+    source = (ROOT / "scripts" / "launch_glue_production_mapping.py").read_text()
+    assert 'authorization_short = str(authorization["authorization_sha256"])[:8]' in source
+    assert "-{authorization_short}" in source
+    assert "if role_was_created:\n        time.sleep(60)" in source

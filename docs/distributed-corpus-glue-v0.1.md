@@ -336,6 +336,19 @@ hard timeout. At $0.44/DPU-hour, the absolute mapping-compute ceiling is
 $3,168. Deduplication, sharding, GPU compute, and model training are not part of
 this authorization and require separate later decisions.
 
+The first authorized start reached `FAILED` after zero execution seconds with
+no `DPUSeconds`. Glue reported that the new IAM role lacked assume-role
+permission, while a read-back immediately confirmed the correct
+`glue.amazonaws.com` trust policy. The timestamps and zero-runtime state are
+consistent with IAM propagation delay; no mapping output or model training was
+created. The launch record and failure report are sealed under release
+`3f26da617278f25bfd8a2cd19644d3ef501d4ba77e685a13b203cb2b284cc72a`.
+
+The launcher now waits 60 seconds whenever it creates a fresh role and includes
+the exact authorization hash in the Glue job name. This keeps replacement
+attempts auditable and avoids reusing a job whose one-run authorization was
+already consumed. No replacement run is authorized by this fix itself.
+
 ## Reproduction commands
 
 ```bash
