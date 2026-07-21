@@ -26,8 +26,7 @@ from .production_corpus import (
 )
 
 CANARY_APPROVAL_TEXT = (
-    "I approve one bounded CodeBuild Linux cp311 wheel build and one 8-DPU, "
-    "30-minute Glue canary only, combined maximum $3. No production run."
+    "I approve push and one corrected 8-DPU, 30-minute/$3 Glue canary."
 )
 CANARY_RELEASE_SCHEMA_VERSION = 1
 CANARY_AUTHORIZATION_SCHEMA_VERSION = 1
