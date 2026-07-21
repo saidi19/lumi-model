@@ -24,9 +24,10 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from tokenizers import Tokenizer
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
 
 from .data_pipeline import (
     PII_DETECTOR_VERSION,

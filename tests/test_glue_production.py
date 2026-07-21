@@ -11,6 +11,7 @@ import pytest
 
 from lumi.glue_production import (
     OWNER_APPROVAL_TEXT,
+    STAGE_RUNTIME_IMPORT_SMOKE,
     _read_contract,
     build_glue_production_stage_authorization,
     validate_glue_production_stage_authorization,
@@ -120,6 +121,7 @@ def _release() -> dict[str, object]:
             "source_next_line": 38_848,
             "source_ordinal": 0,
         },
+        "runtime_import_smoke": dict(STAGE_RUNTIME_IMPORT_SMOKE),
         "schema_version": 1,
         "source_commit": "1" * 40,
         "source_inventory": {
@@ -154,6 +156,16 @@ def test_stage_release_is_non_authorizing_and_binds_all_sources() -> None:
     assert verified["status"] == "verified_not_authorized"
     assert verified["source_files"] == 758
     assert verified["maximum_compute_usd"] == "264.000000"
+
+    smoke_tampered = deepcopy(release)
+    smoke_tampered["runtime_import_smoke"]["status"] = "fail"
+    material = dict(smoke_tampered)
+    material.pop("release_fingerprint")
+    smoke_tampered["release_fingerprint"] = hashlib.sha256(
+        json.dumps(material, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="archive import smoke changed"):
+        validate_glue_production_stage_release(smoke_tampered)
 
     tampered = deepcopy(release)
     tampered["sources"][0]["start_after_line"] = 0

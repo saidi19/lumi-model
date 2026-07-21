@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -38,11 +40,43 @@ OWNER_APPROVAL_TEXT = (
     "bhalo kichu and time maintain korle para nai chill mama credit to free "
     "amar to shes kora lagbe 25k abar nite"
 )
+STAGE_RUNTIME_IMPORT_SMOKE = {
+    "mode": "python_-S_no_site_packages",
+    "modules": [
+        "lumi.glue_production",
+        "lumi.emr_production_staging",
+        "lumi.production_corpus._download_source",
+    ],
+    "status": "pass",
+}
 
 
 def _fingerprint(value: dict[str, Any], *excluded: str) -> str:
     material = {key: row for key, row in value.items() if key not in set(excluded)}
     return hashlib.sha256(_canonical_json_bytes(material)).hexdigest()
+
+
+def _validate_stage_archive_imports(code_path: Path) -> dict[str, Any]:
+    """Prove the staging path imports without optional ML site packages."""
+
+    smoke = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "import lumi.glue_production\n"
+        "import lumi.emr_production_staging\n"
+        "from lumi.production_corpus import _download_source\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", smoke, str(code_path.resolve())],
+        cwd=code_path.parent,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise ValueError(f"Glue production stage archive import smoke failed: {details}")
+    return dict(STAGE_RUNTIME_IMPORT_SMOKE)
 
 
 def _read_contract(path: Path, root: Path) -> dict[str, Any]:
@@ -147,6 +181,7 @@ def build_glue_production_stage_package(
     output_directory.mkdir(parents=True, exist_ok=True)
     code_path = output_directory / CODE_ARCHIVE
     implementation = _zip_code(root, code_path)
+    runtime_import_smoke = _validate_stage_archive_imports(code_path)
     source_script = root / "scripts" / JOB_SCRIPT
     packaged_script = output_directory / JOB_SCRIPT
     _write_bytes_atomic(packaged_script, source_script.read_bytes())
@@ -229,6 +264,7 @@ def build_glue_production_stage_package(
             "source_next_line": resume_line,
             "source_ordinal": resume_ordinal,
         },
+        "runtime_import_smoke": runtime_import_smoke,
         "schema_version": SCHEMA_VERSION,
         "source_commit": commit,
         "source_inventory": dict(emr_plan["source_inventory"]),
@@ -300,6 +336,8 @@ def validate_glue_production_stage_release(release: dict[str, Any]) -> dict[str,
         raise ValueError("Glue production stage capacity changed")
     if job.get("worker_type") != "G.1X" or job.get("glue_version") != "5.1":
         raise ValueError("Glue production stage runtime changed")
+    if release.get("runtime_import_smoke") != STAGE_RUNTIME_IMPORT_SMOKE:
+        raise ValueError("Glue production stage archive import smoke changed")
     maximum = (
         Decimal(job["number_of_workers"])
         * Decimal(job["timeout_minutes"])
