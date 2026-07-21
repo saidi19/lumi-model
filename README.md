@@ -323,6 +323,90 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     4B quality, full-model memory, quantization, or speed; vLLM CUDA and GGUF
     remain pending. See
     [`docs/mlx-final-topology-gate-v0.1.md`](docs/mlx-final-topology-gate-v0.1.md).
+44. one bounded Glue compatibility follow-up builds Lumi's exact Lingua 2.2.0
+    CPython 3.11 wheel on Linux. Upstream tests pass 74/74, and all 222,790
+    language-parity records reproduce both sealed decision hashes. The
+    170,336,000-byte manylinux wheel is independently verified and pinned by
+    SHA-256 plus S3 VersionId. The single follow-up 8-DPU Glue run completes
+    custom-module setup, then fails safe before Spark or data processing because
+    the script redeclares Glue's reserved `JOB_RUN_ID`; it uses 493 DPU-seconds,
+    costs an estimated $0.0603, and writes zero release-specific corpus objects.
+    Combined conservative CodeBuild/Glue compute is no more than $0.2203. All
+    temporary projects, jobs, roles, and exact log streams are deleted. The
+    reserved-argument fix passes the 14-test focused Glue/Spark suite locally,
+    but the consumed authorization permits no retry or production run. See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+45. one separately authorized corrected Glue run uses that exact pinned wheel
+    and source commit `acef08b` on 8 x `G.1X`. It succeeds end to end over
+    eight real source files: 13,027 candidates and 39,196,478 candidate tokens
+    are processed in 399.355 in-script seconds, 12,999 documents are accepted,
+    28 near duplicates are rejected, and Spark accepted IDs plus rejection
+    reasons exactly match the sequential reference. Total execution is 476
+    seconds and 3,808 DPU-seconds, an estimated $0.465422. The report hash and
+    13-entry local evidence manifest pass independently; the temporary
+    checkpoint, job, IAM role, and nine exact log streams are deleted.
+    Production shards remain false and no production acquisition is authorized.
+    See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+46. the bounded production staging phase uses the live 100-DPU Glue ETL ceiling
+    to stage all 758 pinned source files in 474 seconds. It publishes 14,658
+    immutable zstd chunks containing 168,682,770 rows and 500,163,871,471
+    compressed bytes. The successful run uses 47,419 DPU-seconds, while all
+    production staging attempts together cost an estimated $7.093656. A
+    separate read-only audit verifies every manifest and chunk VersionId,
+    length, SHA-256, encryption, source digest, and line interval. The driver
+    result and audit report hashes pass; model training remains false. See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+47. the next production mapping gate is fixed at 512 DPU and a hard
+    150,000,000,000 total candidate-token ceiling. The unlaunched harness uses
+    256 x `G.2X`, immutable 2,000-chunk waves, exact checkpoint-bound resume,
+    a 660-minute soft stop, a 720-minute timeout, and a $2,703.36 maximum Glue
+    compute envelope. Local package and launcher dry-runs pass without creating
+    a cloud job. AWS Service Quotas reports 1,000 DPU, but Glue's live executor
+    still rejects requests over 100 DPU, so no 100-DPU production fallback or
+    paid mapping run has been started. See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+48. after AWS continued enforcing a live 100-DPU ceiling, the owner explicitly
+    replaced the unlaunched 512-DPU proposal with one 100-DPU production mapping
+    run. The current envelope is 100 x `G.1X`, an unchanged 150B total-token hard
+    stop, 500-chunk immutable checkpoints, a 3,960-minute soft stop, a
+    4,320-minute hard timeout, and a $3,168 maximum. Deduplication, sharding,
+    GPU compute, and model training remain separately unauthorized.
+49. the first authorized 100-DPU start failed closed after zero execution
+    seconds with no reported DPU-seconds because the newly created IAM role had
+    not yet propagated to the Glue executor. The live trust policy is correct,
+    no mapping or model training started, and the exact failed-start evidence is
+    sealed locally. The launcher now waits 60 seconds after creating a role and
+    gives each separately authorized retry a distinct job identity; a
+    replacement run then passed role assumption.
+50. that separately authorized replacement failed closed during dependency
+    bootstrap, before mapping, because the launcher omitted the pinned Lingua
+    CPython 3.11 wheel from the role's exact S3-read list. It used 3,676
+    DPU-seconds—approximately $0.449289 at $0.44/DPU-hour—and produced no mapped
+    candidates or model-training work. The failure is sealed locally. The
+    launcher now grants the wheel exact read access without duplicating it in
+    `--extra-files`, with a regression test; no further paid run is authorized.
+51. the next separately authorized attempt passed IAM propagation, installed
+    the exact pinned Lingua wheel, and initialized Spark, proving both previous
+    startup fixes. It then failed closed before mapping because the runner did
+    not reattach the already verified staged-manifest digest to the validator
+    wrapper. It used 7,521 DPU-seconds—approximately $0.919233—and wrote zero
+    checkpoint, candidate, or run-manifest objects. The exact attempt is sealed
+    locally. The digest handoff now has a behavioral regression test; another
+    paid run requires another exact owner approval.
+52. the owner-authorized 100-DPU mapping execution now passes after a
+    checkpoint-preserving correction. Waves 1--7 were recovered exactly once
+    from the first data-producing run, and the corrected continuation completed
+    Waves 8--12 with Glue state `SUCCEEDED`. The sealed pool contains
+    149,999,976,054 total candidate tokens across 89,481,434 mapped documents
+    and 629,842,275,871 Parquet bytes. All seven categories are closed; the
+    23,946-token difference from 150B is the bounded document-boundary
+    shortfall. The final checkpoint
+    `90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b`
+    independently replays from sequence 11, and the final report and Wave-12
+    object inventory match. No model training started. The consumed job and
+    dedicated IAM role are deleted; global deduplication remains the next
+    separately authorized production phase.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -333,9 +417,12 @@ provider pricing, live bounded I/O canary, preserved production prefix, and
 local distributed-acquisition parity gate, and local S3-only source transport
 gate—including the exact real-source Mac canary—are complete. The complete
 source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
-parity canary are also complete. The distributed production-resume harness is
-locally verified, but its paid run, a 4B learning pilot, and the full 4B/80B
-pretraining run remain unapproved.
+parity canary are also complete. The distributed production-resume harness,
+corrected Glue runtime/parity canary, and complete 758-source production staging
+phase now pass. Adaptive candidate mapping also passes with a sealed
+149,999,976,054-token pool. Global deduplication, final 80B selection and shard
+sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain; no
+model training is authorized by the mapping result.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -423,8 +510,9 @@ The pinned CCCC evidence, include/exclude consequences, explicit owner record,
 and fail-closed source-manifest policy are documented in
 [`docs/cccc-owner-decision-v0.1.md`](docs/cccc-owner-decision-v0.1.md).
 The preserved 237.77M-token prefix, immutable resume anchors, ordered parallel
-deduplication proof, real local Spark parity gate, fail-closed limits, and the
-failed-safe $0.0374 Glue result are documented in
+deduplication proof, real local Spark parity gate, fail-closed limits, the
+two historical failed Glue gates, verified CPython 3.11 wheel, and successful
+corrected 8-DPU parity result are documented in
 [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 The digest-pinned Python 3.12 replacement, exact EMR Serverless capacity/cost
 envelope, successful image build, external-egress diagnosis, cleanup, and

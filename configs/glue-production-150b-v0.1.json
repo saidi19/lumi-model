@@ -1,0 +1,68 @@
+{
+  "authorization": {
+    "full_4b_training": false,
+    "model_training": false,
+    "paid_glue_dedup": false,
+    "paid_glue_mapping": false,
+    "paid_glue_sharding": false,
+    "paid_glue_staging": false,
+    "paid_gpu_compute": false,
+    "production_candidate_acquisition": true
+  },
+  "budget": {
+    "hard_total_usd": "4000.00",
+    "maximum_glue_compute_usd": "3600.00",
+    "maximum_s3_logs_requests_usd": "200.00",
+    "reserve_usd": "200.00"
+  },
+  "gate": "lumi_glue_production_150b_plan_v0.1",
+  "inputs": {
+    "emr_resume_contract": {
+      "path": "configs/emr-production-resume-v0.1.json",
+      "sha256": "91cd33fbf1ce2d4f04ce54989a5f3dfd9a33bf304b37286d2c44ebffdfc17664"
+    },
+    "glue_pricing": {
+      "path": "configs/aws-glue-us-east-1-pricing-v0.1.json",
+      "sha256": "578de46e4053c69eb65288ce32f9e3844681b23df60b4d86b8392448a4e926a3"
+    }
+  },
+  "limits": {
+    "candidate_target_tokens": 150000000000,
+    "clean_category_floor_tokens": 120000000000,
+    "clean_shard_target_tokens": 100000000,
+    "final_training_tokens": 80000000000,
+    "hard_logical_storage_bytes": 2000000000000,
+    "maximum_category_overshoot_tokens": 100000000
+  },
+  "region": "us-east-1",
+  "runtime": {
+    "glue_version": "5.1",
+    "python_version": "3.11",
+    "service": "aws_glue",
+    "spark_version": "3.5.6",
+    "worker_type": "G.1X"
+  },
+  "schema_version": 1,
+  "staging": {
+    "hard_maximum_dpu": 100,
+    "maximum_runtime_minutes": 360,
+    "maximum_source_compressed_bytes": 4000000000,
+    "source_files": 758,
+    "target_chunk_uncompressed_bytes": 134217728
+  },
+  "mapping": {
+    "hard_maximum_dpu": 100,
+    "maximum_runtime_minutes": 4320,
+    "number_of_workers": 100,
+    "soft_stop_minutes": 3960,
+    "target_total_candidate_tokens": 150000000000,
+    "wave_maximum_chunks": 500,
+    "worker_type": "G.1X"
+  },
+  "subsequent_phases": {
+    "dedup_maximum_dpu": 512,
+    "mapping_maximum_dpu": 100,
+    "sharding_maximum_dpu": 512
+  },
+  "version": "0.1"
+}

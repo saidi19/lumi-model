@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import runpy
 import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -408,8 +409,49 @@ def _synthetic_glue_release() -> dict[str, object]:
         "government_legal_and_patents",
         "science_and_education",
     )
+    wheel_uri = (
+        "s3://lumi-corpus-prod-test/lumi-corpus/v0.1/control/distributed/"
+        "glue-cp311/bbbbbbbbbbbb/codebuild/output/"
+        "lingua_language_detector-2.2.0-cp311-cp311-manylinux_2_34_x86_64.whl"
+    )
+    wheel_pin = {
+        "codebuild": {
+            "build_id": "lumi-cb-lingua-cp311-bbbbbbbbbbbb:build-id",
+            "build_report_s3_uri": (
+                "s3://lumi-corpus-prod-test/lumi-corpus/v0.1/control/distributed/"
+                "glue-cp311/bbbbbbbbbbbb/codebuild/output/"
+                "lingua-glue-cp311-build-v0.1.json"
+            ),
+            "build_report_sha256": "d" * 64,
+            "build_report_version_id": "build-report-version",
+            "build_status": "SUCCEEDED",
+            "parity_report_s3_uri": (
+                "s3://lumi-corpus-prod-test/lumi-corpus/v0.1/control/distributed/"
+                "glue-cp311/bbbbbbbbbbbb/codebuild/output/"
+                "lingua-glue-cp311-parity-v0.1.json"
+            ),
+            "parity_report_sha256": "e" * 64,
+            "parity_report_version_id": "parity-report-version",
+            "source_archive_sha256": "b" * 64,
+            "source_commit": "f" * 40,
+            "source_version": "pinned-version-id",
+        },
+        "gate": "lumi_lingua_glue_cp311_wheel_pin_v0.1",
+        "schema_version": 1,
+        "wheel": {
+            "bytes": 1_000,
+            "s3_uri": wheel_uri,
+            "sha256": "c" * 64,
+            "version_id": "wheel-version",
+        },
+    }
     release: dict[str, object] = {
-        "artifacts": {},
+        "artifacts": {
+            "lingua_cp311_wheel": {
+                **wheel_pin["wheel"],
+                "state": "existing_verified_codebuild_object",
+            }
+        },
         "authorization": {
             "full_4b_training": False,
             "model_training": False,
@@ -427,10 +469,10 @@ def _synthetic_glue_release() -> dict[str, object]:
             "source_files": 8,
         },
         "gate": "lumi_distributed_glue_canary_release_v0.1",
+        "lingua_compatibility": wheel_pin,
         "job": {
             "additional_python_modules": (
-                "tokenizers==0.22.2,datasketch==2.0.0,"
-                "lingua-language-detector==2.2.0"
+                f"tokenizers==0.22.2,datasketch==2.0.0,{wheel_uri}"
             ),
             "auto_scaling": False,
             "execution_class": "STANDARD",
@@ -497,6 +539,37 @@ def test_glue_canary_needs_separate_exact_owner_authorization() -> None:
         validate_glue_canary_authorization(authorization, release, now=now)
 
 
+def test_glue_canary_rejects_unpinned_lingua_wheel() -> None:
+    release = _synthetic_glue_release()
+    release["lingua_compatibility"]["wheel"]["s3_uri"] = (
+        "s3://unbounded-bucket/lingua.whl"
+    )
+    material = {
+        key: value
+        for key, value in release.items()
+        if key not in {"decision", "release_fingerprint"}
+    }
+    release["release_fingerprint"] = hashlib.sha256(
+        json.dumps(material, separators=(",", ":"), sort_keys=True).encode()
+    ).hexdigest()
+    with pytest.raises(ValueError, match="outside the compatibility prefix"):
+        validate_glue_canary_release(release)
+
+
+def test_glue_canary_does_not_redeclare_reserved_job_run_id() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_distributed_canary.py",
+        run_name="lumi_glue_canary_test",
+    )
+    requested = namespace["GLUE_REQUESTED_OPTIONS"]
+    assert requested == (
+        "JOB_NAME",
+        "LUMI_AUTHORIZATION_FILE",
+        "LUMI_RELEASE_FILE",
+    )
+    assert "JOB_RUN_ID" not in requested
+
+
 def test_glue_canary_source_selection_is_all_category_and_byte_bounded() -> None:
     manifest = json.loads((ROOT / "configs" / "common-pile-source-files-v0.1.json").read_text())
     mixture = json.loads((ROOT / "configs" / "data-mix-v0.1.json").read_text())
@@ -525,6 +598,7 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
         candidate_spark_schema,
         dedup_anchor_spark_schema,
         select_ordered_token_prefix,
+        select_ordered_token_prefix_at_most,
         spark_deduplicate_candidates,
     )
 
@@ -659,6 +733,20 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
                 maximum_overshoot_tokens=1,
                 partitions=3,
             )
+        at_most = select_ordered_token_prefix_at_most(
+            prefix_frame,
+            maximum_tokens=10,
+            partitions=3,
+        )
+        assert at_most["selected_tokens"] == 7
+        assert at_most["shortfall_tokens"] == 3
+        assert [
+            row["document_id"]
+            for row in at_most["selected"]
+            .orderBy("source_ordinal", "source_line", "segment_index", "document_id")
+            .collect()
+        ] == ["prefix-0", "prefix-1"]
+        at_most["selected"].unpersist()
         shards = assign_ordered_token_shards(
             prefix_frame,
             target_tokens=10,

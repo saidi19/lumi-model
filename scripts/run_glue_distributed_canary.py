@@ -14,6 +14,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+# AWS Glue's getResolvedOptions parser injects JOB_RUN_ID as a reserved
+# Job.id_params() value. Requesting it again creates an argparse conflict.
+GLUE_REQUESTED_OPTIONS = (
+    "JOB_NAME",
+    "LUMI_AUTHORIZATION_FILE",
+    "LUMI_RELEASE_FILE",
+)
+
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
@@ -203,13 +211,10 @@ def main() -> None:
 
     args = getResolvedOptions(
         sys.argv,
-        [
-            "JOB_NAME",
-            "JOB_RUN_ID",
-            "LUMI_AUTHORIZATION_FILE",
-            "LUMI_RELEASE_FILE",
-        ],
+        list(GLUE_REQUESTED_OPTIONS),
     )
+    if not args.get("JOB_RUN_ID"):
+        raise RuntimeError("AWS Glue did not inject its reserved JOB_RUN_ID")
     context = SparkContext.getOrCreate()
     glue_context = GlueContext(context)
     spark = glue_context.spark_session

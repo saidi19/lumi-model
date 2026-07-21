@@ -1,0 +1,20 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - python3.11 --version
+      - curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.94.0
+      - $HOME/.cargo/bin/rustc --version
+  build:
+    commands:
+      - PATH="$HOME/.cargo/bin:$PATH" PYTHONPATH=src python3.11 scripts/build_lingua_glue_cp311.py --config configs/lingua-glue-cp311-v0.1.json --output-directory build-output
+  post_build:
+    commands:
+      - aws s3 cp build-output/ "s3://${LUMI_OUTPUT_BUCKET}/${LUMI_OUTPUT_PREFIX}/" --recursive --only-show-errors
+
+artifacts:
+  files:
+    - build-output/**/*

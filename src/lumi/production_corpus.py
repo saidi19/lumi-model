@@ -16,10 +16,11 @@ from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
-from tokenizers import Tokenizer
+if TYPE_CHECKING:
+    from tokenizers import Tokenizer
 
 from .aws_s3_canary import AwsCli
 from .aws_s3_production import _put_immutable_object
@@ -1270,6 +1271,8 @@ def _run_production_acquisition_locked(
         )
     )
     provenance = _component_provenance(inventory)
+    from tokenizers import Tokenizer
+
     tokenizer = Tokenizer.from_file(str(tokenizer_path))
     if tokenizer.get_vocab_size() != 65_536:
         raise ValueError("production tokenizer vocabulary size changed")
