@@ -394,6 +394,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     checkpoint, candidate, or run-manifest objects. The exact attempt is sealed
     locally. The digest handoff now has a behavioral regression test; another
     paid run requires another exact owner approval.
+52. the owner-authorized 100-DPU mapping execution now passes after a
+    checkpoint-preserving correction. Waves 1--7 were recovered exactly once
+    from the first data-producing run, and the corrected continuation completed
+    Waves 8--12 with Glue state `SUCCEEDED`. The sealed pool contains
+    149,999,976,054 total candidate tokens across 89,481,434 mapped documents
+    and 629,842,275,871 Parquet bytes. All seven categories are closed; the
+    23,946-token difference from 150B is the bounded document-boundary
+    shortfall. The final checkpoint
+    `90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b`
+    independently replays from sequence 11, and the final report and Wave-12
+    object inventory match. No model training started. The consumed job and
+    dedicated IAM role are deleted; global deduplication remains the next
+    separately authorized production phase.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -406,9 +419,10 @@ gate—including the exact real-source Mac canary—are complete. The complete
 source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
 parity canary are also complete. The distributed production-resume harness,
 corrected Glue runtime/parity canary, and complete 758-source production staging
-phase now pass. Adaptive 150B candidate mapping, global deduplication, final
-shard sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain;
-no model training is authorized by the staging result.
+phase now pass. Adaptive candidate mapping also passes with a sealed
+149,999,976,054-token pool. Global deduplication, final 80B selection and shard
+sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain; no
+model training is authorized by the mapping result.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

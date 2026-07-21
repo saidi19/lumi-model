@@ -387,6 +387,52 @@ stored-manifest shape, including the absent embedded digest, and verifies queue
 loading succeeds. The consumed run and package are hash-sealed locally. This
 fix does not authorize another paid run.
 
+## Verified 150B candidate-mapping result
+
+The next owner-authorized 100-DPU run mapped and durably checkpointed Waves
+1--7, then failed after checkpoint publication when an exhausted-category
+closure invariant was evaluated before its deterministic target reallocation.
+No completed output was discarded. A fail-closed recovery audit verified every
+published object, migrated exact checkpoint sequence 7 to corrected release
+`b7a11166a1ecf1b67e55a7962ce24c26e4f97e97f8da0786d7c6be7768998041`,
+and bound the continuation to recovered checkpoint
+`8f801a0b2d0e61a6301a0068579b69d37dd1e58e3616bebe3df531dcb92c1b82`.
+The recovered Wave-7 ledger entry and its 504 objects occur exactly once in the
+final twelve-wave chain.
+
+The separately authorized corrected continuation processed Waves 8--12 and
+finished with Glue state `SUCCEEDED`. Independent local validation replayed the
+sequence-11 to sequence-12 transition, recomputed the canonical checkpoint and
+manifest hashes, matched the Wave-12 S3 inventory, and checked the final report
+against the authorization and release.
+
+| Final mapping result | Verified value |
+|---|---:|
+| Final checkpoint status | `ready_for_global_dedup` |
+| Final checkpoint sequence | 12 |
+| Final checkpoint SHA-256 | `90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b` |
+| Pre-existing accepted prefix | 237,769,640 tokens |
+| Newly mapped candidates | 149,762,206,414 tokens |
+| Total candidate pool | 149,999,976,054 tokens |
+| Document-boundary shortfall from 150B | 23,946 tokens |
+| Mapped documents | 89,481,434 |
+| Mapped Parquet storage | 629,842,275,871 bytes |
+| Categories closed | 7 / 7 |
+| Model training started | false |
+
+The data-producing failed run and successful continuation used 2,161,503
+DPU-seconds in total, approximately $264.1837 at the pinned $0.44/DPU-hour
+rate. Including the two earlier nonzero startup failures documented above gives
+2,172,700 DPU-seconds, approximately $265.5522, across all mapping attempts.
+The final continuation itself used 767,595 DPU-seconds. Its consumed Glue job
+definition and dedicated IAM role were deleted after the final evidence archive
+passed; the immutable S3 candidates, checkpoints, and manifests remain.
+
+This result seals candidate mapping only. Global exact/near deduplication,
+quality selection into the final 80B mixture, held-out extraction, training
+shards, and any GPU/model training remain separate gates and are not authorized
+by this result.
+
 ## Reproduction commands
 
 ```bash
