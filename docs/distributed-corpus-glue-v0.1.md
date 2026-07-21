@@ -253,8 +253,11 @@ launch proposal.
 The owner later authorized the bounded 150B candidate-acquisition workflow.
 Live Glue allocation proved that this account's ETL executor ceiling is 100 DPU,
 despite the Service Quotas catalog exposing a separate 1,000-DPU task quota.
-The production contract therefore binds staging, mapping, deduplication, and
-sharding to at most 100 DPU and retains a $4,000 end-to-end acquisition guard.
+Production staging therefore used 100 DPU. The owner subsequently fixed the
+candidate-mapping target at 512 DPU rather than accepting a slow 100-DPU
+production fallback. The $4,000 end-to-end acquisition guard remains unchanged;
+the 512-DPU mapping launch stays blocked until Glue's enforced capacity is
+raised to match the account's displayed quota.
 
 Three startup attempts failed closed while establishing that live envelope. The
 256-DPU attempt was rejected before execution; a 100-DPU attempt exposed an
@@ -294,6 +297,30 @@ interval metadata. The audit report passes with SHA-256
 This seals source staging only; it does not claim 150B candidate tokens and does
 not authorize or start model training. Adaptive candidate mapping is the next
 production phase.
+
+## Prepared 512-DPU / 150B mapping gate
+
+The unlaunched mapping harness binds 256 `G.2X` workers to exactly 512 DPU. Its
+hard target is 150,000,000,000 total candidate tokens: the verified
+237,769,640-token prefix plus at most 149,762,230,360 newly mapped tokens. A
+document-boundary prefix selector can finish slightly below a category target,
+but it can never cross the 150B aggregate ceiling.
+
+Work is split into immutable waves of at most 2,000 staged chunks. Every
+completed wave publishes a hash-bound manifest and checkpoint. A continuation
+authorization must bind the exact latest open checkpoint, so a safe stop or
+failure does not silently return to step zero. The job soft-stops at 660 minutes
+and has a 720-minute hard timeout. At the pinned $0.44/DPU-hour rate, the
+12-hour compute ceiling is $2,703.36; no mapping, deduplication, sharding, GPU,
+or model-training job has been launched by this preparation.
+
+The local package, authorization, and launcher dry-run all report 512 DPU,
+256 `G.2X` workers, and the exact 150B hard stop. A 256-DPU staging probe remains
+the live counter-evidence: Glue rejected it before execution with `Exceeded
+maximum concurrent compute capacity for your account: 100`, even though Service
+Quotas reports 1,000 for `L-08F3B322`. Therefore a 512-DPU paid launch must wait
+for AWS to align the executor-side capacity; the harness will not silently
+downgrade to 100 DPU.
 
 ## Reproduction commands
 

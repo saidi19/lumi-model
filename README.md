@@ -357,6 +357,15 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     length, SHA-256, encryption, source digest, and line interval. The driver
     result and audit report hashes pass; model training remains false. See
     [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
+47. the next production mapping gate is fixed at 512 DPU and a hard
+    150,000,000,000 total candidate-token ceiling. The unlaunched harness uses
+    256 x `G.2X`, immutable 2,000-chunk waves, exact checkpoint-bound resume,
+    a 660-minute soft stop, a 720-minute timeout, and a $2,703.36 maximum Glue
+    compute envelope. Local package and launcher dry-runs pass without creating
+    a cloud job. AWS Service Quotas reports 1,000 DPU, but Glue's live executor
+    still rejects requests over 100 DPU, so no 100-DPU production fallback or
+    paid mapping run has been started. See
+    [`docs/distributed-corpus-glue-v0.1.md`](docs/distributed-corpus-glue-v0.1.md).
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation

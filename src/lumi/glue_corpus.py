@@ -256,6 +256,117 @@ def select_ordered_token_prefix(
     }
 
 
+def select_ordered_token_prefix_at_most(
+    candidates: Any,
+    *,
+    maximum_tokens: int,
+    partitions: int | None = None,
+) -> dict[str, Any]:
+    """Select the largest canonical document prefix that never exceeds a cap.
+
+    Production mapping uses this variant for the final wave in each category.
+    Unlike :func:`select_ordered_token_prefix`, it drops the first document
+    that would cross the cap, so the aggregate 150B ceiling remains hard.
+    """
+
+    from pyspark.sql import functions as F
+
+    if not isinstance(maximum_tokens, int) or isinstance(maximum_tokens, bool):
+        raise ValueError("ordered at-most token cap must be an integer")
+    if maximum_tokens <= 0:
+        raise ValueError("ordered at-most token cap must be positive")
+    required = {
+        "document_id",
+        "segment_index",
+        "source_line",
+        "source_ordinal",
+        "token_count",
+    }
+    if not required.issubset(candidates.columns):
+        raise ValueError("ordered at-most input schema is missing required columns")
+    if partitions is None:
+        partitions = int(candidates.sparkSession.conf.get("spark.sql.shuffle.partitions"))
+    if not isinstance(partitions, int) or isinstance(partitions, bool) or partitions < 1:
+        raise ValueError("ordered at-most partition count must be positive")
+    order = ["source_ordinal", "source_line", "segment_index", "document_id"]
+    ordered = (
+        candidates.repartitionByRange(partitions, *[F.col(name) for name in order])
+        .sortWithinPartitions(*[F.col(name).asc() for name in order])
+        .persist()
+    )
+
+    def summarize(index: int, rows: Any) -> Any:
+        documents = 0
+        tokens = 0
+        for row in rows:
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("ordered at-most row has no tokens")
+            documents += 1
+            tokens += token_count
+        yield index, documents, tokens
+
+    summaries = sorted(ordered.rdd.mapPartitionsWithIndex(summarize).collect())
+    available_documents = sum(int(row[1]) for row in summaries)
+    available_tokens = sum(int(row[2]) for row in summaries)
+    if available_documents == 0 or available_tokens == 0:
+        ordered.unpersist()
+        raise ValueError("ordered at-most input is empty")
+    if available_tokens < maximum_tokens:
+        ordered.unpersist()
+        raise ValueError("ordered at-most input does not reach its closing cap")
+
+    before_tokens = 0
+    cutoff_partition = summaries[-1][0]
+    for partition, _, tokens in summaries:
+        if before_tokens + int(tokens) >= maximum_tokens:
+            cutoff_partition = int(partition)
+            break
+        before_tokens += int(tokens)
+    cutoff_budget = maximum_tokens - before_tokens
+
+    def select(index: int, rows: Any) -> Any:
+        if index < cutoff_partition:
+            yield from rows
+            return
+        if index > cutoff_partition:
+            return
+        selected_tokens = 0
+        for row in rows:
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("ordered at-most row has no tokens")
+            if selected_tokens + token_count > cutoff_budget:
+                break
+            yield row
+            selected_tokens += token_count
+
+    selected = candidates.sparkSession.createDataFrame(
+        ordered.rdd.mapPartitionsWithIndex(select), schema=candidates.schema
+    ).persist()
+    totals = selected.agg(
+        F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
+    ).first()
+    selected_documents = int(totals["documents"] or 0)
+    selected_tokens = int(totals["tokens"] or 0)
+    if selected_tokens > maximum_tokens:
+        selected.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("ordered at-most prefix exceeded its hard cap")
+    last = selected.orderBy(*[F.col(name).desc() for name in order]).first()
+    cutoff = None if last is None else {name: last[name] for name in order}
+    ordered.unpersist()
+    return {
+        "available_documents": available_documents,
+        "available_tokens": available_tokens,
+        "cutoff": cutoff,
+        "selected": selected,
+        "selected_documents": selected_documents,
+        "selected_tokens": selected_tokens,
+        "shortfall_tokens": maximum_tokens - selected_tokens,
+    }
+
+
 def assign_ordered_token_shards(
     candidates: Any,
     *,

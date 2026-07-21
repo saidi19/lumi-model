@@ -598,6 +598,7 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
         candidate_spark_schema,
         dedup_anchor_spark_schema,
         select_ordered_token_prefix,
+        select_ordered_token_prefix_at_most,
         spark_deduplicate_candidates,
     )
 
@@ -732,6 +733,20 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
                 maximum_overshoot_tokens=1,
                 partitions=3,
             )
+        at_most = select_ordered_token_prefix_at_most(
+            prefix_frame,
+            maximum_tokens=10,
+            partitions=3,
+        )
+        assert at_most["selected_tokens"] == 7
+        assert at_most["shortfall_tokens"] == 3
+        assert [
+            row["document_id"]
+            for row in at_most["selected"]
+            .orderBy("source_ordinal", "source_line", "segment_index", "document_id")
+            .collect()
+        ] == ["prefix-0", "prefix-1"]
+        at_most["selected"].unpersist()
         shards = assign_ordered_token_shards(
             prefix_frame,
             target_tokens=10,
