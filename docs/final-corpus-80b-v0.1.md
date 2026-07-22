@@ -284,19 +284,72 @@ and its five-entry `manifest.sha256` file hashes to
 `45f6abbb997bcadc231ce6a464772bb033bb26667a28d869547f493e766c776e`.
 All five replacement files, every ZIP member, the exact source binding, release
 validator, dedup-result binding, plan binding, and generated approval text pass
-independent integrity checks. It creates no authorization and has not been
-uploaded or launched.
+independent integrity checks. The package itself created no authorization; it
+was later bound to the fresh single-use authorization and successful production
+run recorded below.
 
 After the normalized-member correction, all 18 focused final-corpus tests
 (one environment-dependent skip), all 343 collected repository tests (three
 environment-dependent skips), and repository-wide Ruff pass.
 
+## Successful production materialization
+
+The fresh authorization SHA-256
+`064fccf72df4f1489c3998fe7c613bc7f75f494028bec2a8b462212d140ad4b1`
+was consumed exactly once by Glue run
+`jr_fd32da9a73c98b3bff419c2cb7165e2591972b1578512fc6b4764b05caaf0144`.
+The 100-DPU Glue 5.1 job completed on attempt zero in 2,527 execution seconds,
+using 252,774 DPU-seconds. At the pinned `$0.44` per DPU-hour rate, compute was
+approximately `$30.894600`, well below the 12-hour/`$528` boundary.
+
+All seven immutable category checkpoints sealed successfully:
+
+| Category | Final documents | Packed tokens | Manifest shards |
+| --- | ---: | ---: | ---: |
+| Science and education | 2,850,104 | 24,000,002,963 | 51 |
+| Code | 13,155,027 | 16,000,001,896 | 32 |
+| Reference | 10,459,423 | 12,000,000,149 | 24 |
+| Questions and discussion | 14,430,872 | 12,000,000,381 | 24 |
+| Open web | 3,983,935 | 8,000,000,365 | 16 |
+| Books | 184,378 | 4,000,008,765 | 8 |
+| Government, legal, and patents | 753,898 | 4,000,000,215 | 8 |
+| **Total** | **45,817,637** | **80,000,014,734** | **163** |
+
+Every category stays below its 131,072-token document-boundary overshoot cap;
+the combined overshoot is 14,734 tokens. The trainer consumption limit remains
+exactly `80,000,000,000`. Manifest
+sequences are contiguous from 0 through 162. Packed output occupies
+`160,000,029,468` bytes, exactly two bytes per uint16 token. Selected Parquet
+plus packed output occupies `503,157,241,754` bytes, below the 750GB cap.
+
+Independent post-run verification downloaded the sealed result, standalone
+selection result, shard manifest, and all seven checkpoints. Every local file
+matches its S3 metadata SHA-256. The production validators pass exact release,
+authorization, plan, dedup-result, runtime, category, baseline, output-cap, and
+document/token/byte conservation bindings. All seven selected S3 inventories
+match their sealed object counts, bytes, and canonical inventory hashes. The
+163-object packed S3 inventory exactly matches the manifest at
+`160,000,029,468` bytes and canonical inventory SHA-256
+`b83a6cd0576126a0b860191cd2bc7c5adb3f85001b737ac99283ff709578b10c`.
+The canonical sealed production result SHA-256 is
+`c5b1c6aa1fbc7173bac8ba91bd7cdee55d12c2be28725598f7d7a2798a484869`.
+
+After evidence was sealed, the consumed Glue job and bounded IAM role were
+deleted and independently confirmed absent. S3 corpus and result objects remain
+preserved. The compact repository record is
+`reports/glue-final-corpus-production-result-v0.1.json`; the 15-file external
+evidence manifest hashes to
+`810716bccae1be3e041717ae51f89e314b76372d80dcdcd97411c5a2c976db3c`.
+Post-run focused tests pass 13/13, the full repository suite passes 343/343,
+and repository-wide Ruff passes.
+
 ## Next boundary
 
-The fresh replacement package is ready, but the failed authorization cannot be
-reused. The next possible action is a new exact owner approval for one 100-DPU
-production selection-and-sharding run under the same 12-hour/`$528` envelope.
-After any future successful run, its result, all seven checkpoints, 163-shard
-manifest, S3 inventories, and hashes must be independently verified before the
-consumed Glue job/role are removed. The 4B pilot and full 4B/80B training remain
-later, independent approval gates.
+Final 80B corpus materialization and sealing are complete. The next roadmap
+boundary is a bounded 4B multi-GPU learning pilot using this exact tokenizer,
+architecture, optimizer decision, isolated-attention path, and sealed corpus.
+The pilot must first prove distributed loading, throughput, memory, checkpoint
+resume, held-out improvement, and failure recovery. It requires a new explicit
+owner approval and does not authorize full 4B/80B pretraining. Full pretraining,
+instruction tuning, alignment, quantization, API hosting, and deployment remain
+later independent gates.

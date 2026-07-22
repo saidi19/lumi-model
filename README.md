@@ -514,46 +514,33 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     selected `7,026,092` tokens across all seven categories, passed partition
     parity, packed 28 content-addressed uint16 objects, and independently
     matched every input/output inventory and result hash. The consumed Glue job
-    and IAM role are deleted. Production selection, GPU work, and model training
-    remain separately gated and unauthorized.
-61. the exact production final-80B selection/sharding harness was sealed at
-    source commit `3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. It independently
-    inventories all 2,772 accepted objects before reading rows, deterministically
-    selects all seven category targets, writes one immutable checkpoint per
-    category, preserves and rehashes the three baseline shards, and requires a
-    163-entry content-addressed uint16 manifest with exact document/token/byte
-    conservation. The first production attempt failed closed before data
-    processing when Glue rejected a static `spark.speculation` mutation; it
-    published zero production/result objects, stopped billing, and left no
-    corrupt corpus. The fix moves every static setting into Glue's startup
-    `--conf` and verifies it read-only. The corrected non-authorizing release
-    fingerprint is
-    `1397391b580ae7cd5843c393146b387dcaa997d64998e13caf6fd67379210b27`;
-    its five-file package manifest hashes to
-    `12fc7c470193d228ea36fff78ca60e307ea014dddb5974ea5ffc9d708d0ea242`.
-    The corrected canary projects about 168 minutes/`$123.140111` linearly or
-    504 minutes/`$369.420211` with the sealed 3x safety factor. The actual hard
-    boundary remains one 100-DPU run, 12 hours, `$528`, zero retries, 750GB new
-    output, no GPU, and no model training. The separately authorized corrected
-    run was then consumed exactly once. It failed closed before candidate
-    selection after 83 execution seconds and 8,380 DPU-seconds (estimated
-    `$1.024222`) because a hash-verified tar member used the semantically
-    equivalent leading-`./` path form. It published no selected corpus or
-    result; only two immutable baseline copies exist and both hashes pass.
-    Billing stopped, and the consumed Glue job and IAM role are deleted. The
-    local correction safely normalizes exactly one tar member while rejecting
-    absolute, parent-traversal, missing, and ambiguous paths. Eighteen focused
-    final-corpus tests, all 343 collected repository tests with three
-    environment-dependent skips, Ruff, evidence hashes, and package integrity
-    pass. The consumed authorization is not reusable; no replacement run, GPU
-    work, or model training is authorized. A fresh non-authorizing replacement
-    package is now sealed from source commit
-    `555f80f8396eaa323da3d86430b33aa81b4e01f9`, with release fingerprint
-    `62c0285b84661ae49e80d2972c072df7b16f625c3b1f8750e0406a4b34b4d551`
-    and five-file manifest SHA-256
-    `45f6abbb997bcadc231ce6a464772bb033bb26667a28d869547f493e766c776e`.
-    Its hashes, ZIP members, release/source/plan/dedup bindings, validator, and
-    generated approval text pass; it has not been uploaded or launched.
+    and IAM role are deleted. The later production selection run described next
+    is now complete; GPU work and model training remain separately gated.
+61. final 80B production selection and sharding are complete. The corrected
+    package from source commit
+    `555f80f8396eaa323da3d86430b33aa81b4e01f9`, release fingerprint
+    `62c0285b84661ae49e80d2972c072df7b16f625c3b1f8750e0406a4b34b4d551`,
+    and plan
+    `a647579f612b45e23142a1bc8113e6754af67c5432ca3c9513e02d6ee2e302d0`
+    was bound to one fresh owner authorization and consumed exactly once by
+    Glue run
+    `jr_fd32da9a73c98b3bff419c2cb7165e2591972b1578512fc6b4764b05caaf0144`.
+    The 100-DPU attempt-zero run completed in 2,527 execution seconds using
+    252,774 DPU-seconds, approximately `$30.894600` at `$0.44` per DPU-hour.
+    All seven category checkpoints sealed, yielding 45,817,637 documents and
+    `80,000,014,734` packed tokens across 163 contiguous content-addressed
+    uint16 shards. The 14,734-token document-boundary overshoot is within the
+    fixed cap, while trainer consumption remains exactly 80B tokens. Packed
+    output is `160,000,029,468` bytes, exactly two bytes per token; selected
+    Parquet plus packed output is `503,157,241,754` bytes, below the 750GB cap.
+    Independent validators and S3 inventories pass every release,
+    authorization, plan, dedup, baseline, category, document/token/byte,
+    manifest, runtime, and output-cap binding. The sealed result SHA-256 is
+    `c5b1c6aa1fbc7173bac8ba91bd7cdee55d12c2be28725598f7d7a2798a484869`.
+    The consumed Glue job and bounded IAM role are deleted and confirmed
+    absent; S3 corpus/results remain preserved. No GPU or model training was
+    started. See `reports/glue-final-corpus-production-result-v0.1.json` and
+    `docs/final-corpus-80b-v0.1.md`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -581,15 +568,14 @@ memory-safe reads and a bounded, fully instrumented stop-bucket policy. The
 final production run passed with 42,436,764 candidate pairs under the 50M cap,
 12 oversized stop buckets, 492 pair-budget stop buckets, and four bounded
 exact-only uncovered documents. Final 80B production mixture materialization
-and shard sealing, a 4B learning pilot, and the full 4B/80B pretraining run
-remain. The
+and 163-shard sealing now pass with `80,000,014,734` packed tokens and an exact
+80B trainer boundary. A bounded 4B multi-GPU learning pilot and the full
+4B/80B pretraining run remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
-local final-80B selection/shard contract and bounded paid Glue canary now pass.
-The most recent exact production materialization authorization was consumed by
-a fail-closed baseline archive path mismatch. Its safe correction and fresh
-non-authorizing replacement package pass locally, but a new exact approval is
-still required. Production materialization and all model training remain
-incomplete.
+local final-80B selection/shard contract, bounded paid Glue canary, production
+materialization, remote inventories, and post-run evidence now pass. The
+consumed Glue job and IAM role are gone; S3 corpus/results remain preserved.
+All model training remains separately gated and incomplete.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
