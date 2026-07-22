@@ -342,6 +342,16 @@ def main() -> None:
         maximum_rounds=int(caps["maximum_rounds"]),
         maximum_lsh_bucket_documents=int(caps["maximum_lsh_bucket_documents"]),
         maximum_candidate_pairs=int(caps["maximum_candidate_pairs"]),
+        oversized_lsh_bucket_policy=str(caps["oversized_lsh_bucket_policy"]),
+        maximum_oversized_lsh_buckets=int(
+            caps["maximum_oversized_lsh_buckets"]
+        ),
+        maximum_oversized_lsh_memberships=int(
+            caps["maximum_oversized_lsh_memberships"]
+        ),
+        maximum_documents_without_usable_lsh_buckets=int(
+            caps["maximum_documents_without_usable_lsh_buckets"]
+        ),
     )
     accepted_ids = dedup["accepted_ids"].persist(StorageLevel.DISK_ONLY)
     s3 = boto3.client("s3", region_name=str(release["region"]))

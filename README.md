@@ -456,6 +456,29 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     and confirms the production prefix is empty. All 48 durable evidence hashes
     pass; the consumed Glue job and IAM role are deleted. Production global
     dedup, sharding, GPU work, and model training remain separately gated.
+57. the first separately authorized 100-DPU production dedup failed safe while
+    Spark validated the complete mapped input. A vectorized Parquet reader tried
+    to reserve a 128,668,776-byte contiguous binary/text buffer and exhausted an
+    executor heap. The 186-second run used 18,625 DPU-seconds (approximately
+    $2.276389), and all checkpoint, production-output, and final-result prefixes
+    remained empty. Direct inspection of the exact offending Parquet object
+    found a valid 3,676-document file, not corrupted data. The merged memory-safe
+    path reads only narrow dedup columns, disables the vectorized reader, limits
+    input partitions to 64MiB, and reloads wide payloads only after selection.
+58. the next separately authorized memory-safe run passed that heap boundary and
+    then failed closed before the candidate-pair join: one LSH bucket contained
+    19,150 documents, above the sealed 10,000-document limit. Expanding that
+    bucket naively would produce 183,351,675 pairs and violate the 50M pair cap.
+    The 336-second run used 33,610 DPU-seconds (approximately $4.107889), wrote
+    only 398 partial Spark-checkpoint objects (76,284 bytes), and published zero
+    deduplicated or final-result objects. The local correction treats bounded
+    oversized buckets as stop buckets while retaining exact dedup and all other
+    LSH bands. It permits at most 64 stop buckets and 1,000,000 memberships,
+    requires every document to retain at least one usable band, records the
+    observed maximum and stop-bucket telemetry, and keeps the 50M pair cap. The
+    parity, adversarial, result-contract, full 317-test, and Ruff gates pass. Both
+    consumed jobs and IAM roles are gone; no paid retry, sharding, GPU work, or
+    model training is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -474,10 +497,14 @@ locally verified. Two paid dedup canaries failed safe: the first on an
 over-strict AWS Spark build suffix check and the second on a wide-row top-K
 executor heap exhaustion. Both causes were corrected, and the final bounded
 checkpoint-bound canary now passes with independently verified output.
-Production global dedup, final 80B selection and shard sealing, a 4B learning
-pilot, and the full 4B/80B pretraining run remain. No model training is
-authorized by this preparation. The completed 150M and 1B pilot checkpoints are
-not production-quality models.
+Two production attempts then failed safe: the first exposed a separate
+full-input Parquet heap path, and the second proved that fix before exposing a
+19,150-document LSH hot bucket. Both are now addressed locally by narrow
+memory-safe reads and a bounded, fully instrumented stop-bucket policy; no
+production result was published. A newly authorized production global dedup,
+final 80B selection and shard sealing, a 4B learning pilot, and the full 4B/80B
+pretraining run remain. No model training is authorized by this preparation.
+The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
 

@@ -606,6 +606,53 @@ structural global-dedup path. It does not authorize or claim completion of the
 100-DPU production dedup, final 80B selection, training-shard publication, GPU
 work, or model training.
 
+## Consumed production attempts and bounded hot-bucket correction
+
+The first separately authorized 100-DPU production run
+`jr_4bbe6d4c8f1bcba7527495d4a151ab3cdc750881b7bd6ea29f4b2438f38c4466`
+failed while validating the full mapped input. Spark's vectorized Parquet reader
+attempted to reserve a 128,668,776-byte contiguous binary/text buffer and
+exhausted an executor Java heap. The 186-second run consumed 18,625 DPU-seconds,
+an estimated $2.276389 at $0.44/DPU-hour, and wrote no checkpoint, production,
+or final-result object. Direct narrow-column inspection of the exact input
+object found 3,676 valid documents; its largest text payload was 130,985 bytes
+and largest token payload was 63,702 bytes. The evidence therefore identifies a
+wide-read memory defect, not mapped-data corruption.
+
+The merged memory-safe runtime projects only schema, identity, source-order,
+content-hash, MinHash, and LSH columns during global dedup. It disables the
+vectorized Parquet reader, uses 64MiB input partitions and a batch size of 64,
+and joins wide payloads only after accepted IDs have been selected. An exact
+offending-object local Spark test passes that path.
+
+The separately authorized corrected run
+`jr_8f1402e02ebc4b86767b49c50c498ef62b2f77e7ed487b618d8c778c43b02b06`
+passed the previous heap boundary. It then failed closed before constructing an
+LSH candidate-pair join because one bucket held 19,150 documents, above the
+sealed 10,000-document safety limit. A complete self-join of that bucket would
+produce 183,351,675 pairs, already above the independent 50M candidate-pair
+cap. The 336-second run consumed 33,610 DPU-seconds, an estimated $4.107889,
+and wrote only 398 partial Spark-checkpoint objects totaling 76,284 bytes. Both
+the production-output and immutable final-result prefixes remained empty.
+
+The local correction uses an explicit `drop_as_stop_bucket` policy. Exact-hash
+dedup remains independent and unchanged. Oversized LSH buckets are excluded
+from the near-duplicate candidate join, while every non-hot band remains active.
+The release contract permits at most 64 stop buckets and 1,000,000 total hot
+memberships, requires zero documents with no remaining usable LSH bucket, and
+retains the 50M candidate-pair cap. The result must report the true maximum
+bucket size, hot-bucket count, hot memberships, and uncovered-document count;
+the result validator refuses inconsistent or over-cap telemetry.
+
+A local Spark regression injects one six-document hot band, proves the true
+near duplicate is still discovered through a non-hot band, and matches accepted
+IDs and rejection reasons against the independent sequential implementation.
+An adversarial case where every band is hot fails closed because the documents
+would lose all near-dedup coverage. Production release/result contract tests,
+the full 317-test suite, and Ruff pass. The consumed jobs and dedicated IAM
+roles are deleted. This correction does not authorize another paid run,
+sharding, GPU work, or model training.
+
 ## Reproduction commands
 
 ```bash

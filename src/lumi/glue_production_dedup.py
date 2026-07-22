@@ -742,8 +742,12 @@ def build_glue_production_global_dedup_package(
         },
         "deduplication": {
             "maximum_candidate_pairs": 50_000_000,
+            "maximum_documents_without_usable_lsh_buckets": 0,
             "maximum_lsh_bucket_documents": 10_000,
+            "maximum_oversized_lsh_buckets": 64,
+            "maximum_oversized_lsh_memberships": 1_000_000,
             "maximum_rounds": 256,
+            "oversized_lsh_bucket_policy": "drop_as_stop_bucket",
         },
         "gate": "lumi_glue_production_global_dedup_release_v0.1",
         "implementation": implementation,
@@ -855,6 +859,16 @@ def validate_glue_production_global_dedup_release(
         raise ValueError("Glue global-dedup category-floor total changed")
     if limits.get("final_training_tokens") != 80_000_000_000:
         raise ValueError("Glue global-dedup final 80B target changed")
+    if release.get("deduplication") != {
+        "maximum_candidate_pairs": 50_000_000,
+        "maximum_documents_without_usable_lsh_buckets": 0,
+        "maximum_lsh_bucket_documents": 10_000,
+        "maximum_oversized_lsh_buckets": 64,
+        "maximum_oversized_lsh_memberships": 1_000_000,
+        "maximum_rounds": 256,
+        "oversized_lsh_bucket_policy": "drop_as_stop_bucket",
+    }:
+        raise ValueError("Glue global-dedup stop-bucket contract changed")
     maximum_output = _positive_int(
         limits.get("maximum_new_output_bytes"), "dedup output storage cap"
     )
@@ -1126,6 +1140,40 @@ def validate_glue_global_dedup_result(
         metrics["candidate_documents"]
     ):
         raise ValueError("Glue global-dedup result does not conserve documents")
+    for name in (
+        "documents_without_usable_lsh_buckets",
+        "maximum_lsh_bucket_documents_observed",
+        "oversized_lsh_buckets",
+        "oversized_lsh_memberships",
+    ):
+        _non_negative_int(metrics.get(name), f"dedup metric {name}")
+    stop_contract = release["deduplication"]
+    if int(metrics["oversized_lsh_buckets"]) > int(
+        stop_contract["maximum_oversized_lsh_buckets"]
+    ):
+        raise ValueError("Glue global-dedup result exceeds its stop-bucket count cap")
+    if int(metrics["oversized_lsh_memberships"]) > int(
+        stop_contract["maximum_oversized_lsh_memberships"]
+    ):
+        raise ValueError("Glue global-dedup result exceeds its stop-bucket membership cap")
+    if int(metrics["documents_without_usable_lsh_buckets"]) > int(
+        stop_contract["maximum_documents_without_usable_lsh_buckets"]
+    ):
+        raise ValueError("Glue global-dedup result leaves documents without LSH coverage")
+    maximum_bucket_documents = int(metrics["maximum_lsh_bucket_documents_observed"])
+    if int(metrics["candidate_documents"]) > 0 and maximum_bucket_documents < 1:
+        raise ValueError("Glue global-dedup result has no observed LSH bucket maximum")
+    if int(metrics["oversized_lsh_buckets"]) == 0:
+        if maximum_bucket_documents > int(
+            stop_contract["maximum_lsh_bucket_documents"]
+        ):
+            raise ValueError(
+                "Glue global-dedup result has inconsistent stop-bucket metrics"
+            )
+    elif maximum_bucket_documents <= int(
+        stop_contract["maximum_lsh_bucket_documents"]
+    ):
+        raise ValueError("Glue global-dedup result has inconsistent stop-bucket maximum")
     token = str(expected_common["job_token"])
     if mode == "canary":
         if result.get("gate") != (
