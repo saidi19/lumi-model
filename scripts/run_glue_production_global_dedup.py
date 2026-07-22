@@ -9,6 +9,7 @@ import hashlib
 import importlib.metadata
 import json
 import platform
+import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -116,7 +117,7 @@ def _verified_spark_file(artifact: Mapping[str, Any], uri: str) -> Path:
     return path
 
 
-def _runtime(spark: Any) -> dict[str, Any]:
+def _runtime(spark: Any, *, expected_spark_version: str) -> dict[str, Any]:
     if platform.python_version_tuple()[:2] != ("3", "11"):
         raise RuntimeError(
             f"Glue global dedup requires Python 3.11, got {platform.python_version()}"
@@ -124,12 +125,19 @@ def _runtime(spark: Any) -> dict[str, Any]:
     versions = {"datasketch": importlib.metadata.version("datasketch")}
     if versions != {"datasketch": "2.0.0"}:
         raise RuntimeError(f"Glue global-dedup dependencies changed: {versions}")
-    if spark.version != "3.5.6":
-        raise RuntimeError(f"Glue global-dedup Spark changed: {spark.version}")
+    spark_version = str(spark.version)
+    expected_pattern = rf"{re.escape(expected_spark_version)}(?:-amzn-[1-9][0-9]*)?"
+    if re.fullmatch(expected_pattern, spark_version) is None:
+        raise RuntimeError(
+            "Glue global-dedup Spark changed: "
+            f"expected {expected_spark_version} or its AWS build suffix, got "
+            f"{spark_version}"
+        )
     return {
         "datasketch": versions["datasketch"],
         "python": platform.python_version(),
-        "spark": spark.version,
+        "spark": spark_version,
+        "spark_base": expected_spark_version,
     }
 
 
@@ -186,7 +194,10 @@ def main() -> None:
     if input_index["input_index_sha256"] != release["input_index_sha256"]:
         raise ValueError("Glue global-dedup input index differs from release")
 
-    runtime = _runtime(spark)
+    runtime = _runtime(
+        spark,
+        expected_spark_version=str(release["runtime"]["spark_version"]),
+    )
     anchor_artifact = release["artifacts"]["initial_anchors"]
     anchor_path = _verified_spark_file(
         anchor_artifact, str(anchor_artifact["s3_uri"])
