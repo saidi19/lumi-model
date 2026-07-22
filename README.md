@@ -496,6 +496,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     checks pass; S3 corpus objects remain intact. This seals the 120B
     deduplicated candidate floor pool; it is not yet the final 80B training mix,
     training shards, or a trained model.
+60. the local-only final-corpus gate now binds that verified dedup result, the
+    immutable 237,769,640-token prefix, frozen tokenizer, benchmark registry,
+    permanent 35,889-entry training-exclusion ledger, and exact 80B category
+    targets. It deterministically hash-ranks the already filtered/deduplicated
+    candidates, permits only a bounded final-document overshoot, fixes the
+    trainer consumption limit at exactly 80B tokens, and validates a 163-entry
+    content-addressed uint16 shard manifest. Focused tests and Ruff pass. The
+    gate authorizes no Glue run, GPU, sharding publication, or model training;
+    the next paid boundary is a separately approved 8-DPU/30-minute Glue
+    selection-and-sharding canary.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -522,9 +532,12 @@ full-input Parquet heap path, and the second proved that fix before exposing a
 memory-safe reads and a bounded, fully instrumented stop-bucket policy. The
 final production run passed with 42,436,764 candidate pairs under the 50M cap,
 12 oversized stop buckets, 492 pair-budget stop buckets, and four bounded
-exact-only uncovered documents. Final held-out extraction, 80B mixture
-selection and shard sealing, a 4B learning pilot, and the full 4B/80B pretraining
-run remain. No model training is authorized by this preparation.
+exact-only uncovered documents. Final 80B mixture materialization and shard
+sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain. The
+permanent held-out exclusion ledger was already applied during mapping; the
+local final-80B selection/shard contract is now complete, while its paid Glue
+canary and production materialization remain unapproved. No model training is
+authorized by this preparation.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -624,6 +637,10 @@ The immutable S3 source binding, bounded same-build producer, resumable S3-only
 consumer, 79-test focused result, 239-test full-suite result, and unchanged
 no-cloud/no-training boundary are documented in
 [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
+The verified 120B input binding, permanent-heldout-safe deterministic 80B
+selection, category-boundary limits, and content-addressed packed-shard contract
+are documented in
+[`docs/final-corpus-80b-v0.1.md`](docs/final-corpus-80b-v0.1.md).
 
 ## Repository policy
 
