@@ -444,6 +444,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     top-K output excludes the wide text column and preserves the same ordered
     sample. The full suite passes 314/314 tests and Ruff. No retry or production
     dedup is authorized.
+56. the fresh checkpoint-bound fixed-memory canary then succeeds on the single
+    authorized 8-DPU run. It processes the deterministic 100,000-document,
+    1,111,552,230-token sample in 189 seconds and uses 1,515 DPU-seconds
+    (approximately $0.185167 at $0.44/DPU-hour). The result accepts 99,996
+    documents and rejects four near duplicates, with zero exact-duplicate
+    rejections. Independent local verification downloads all 36 Parquet
+    objects, proves accepted/rejected ID uniqueness, disjointness, and complete
+    document conservation, matches both inventory digests and result SHA-256
+    `9527fd70202016db1f19a459120ca83849b83e676f9cc2bf939a843709dfee26`,
+    and confirms the production prefix is empty. All 48 durable evidence hashes
+    pass; the consumed Glue job and IAM role are deleted. Production global
+    dedup, sharding, GPU work, and model training remain separately gated.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -460,11 +472,12 @@ phase now pass. Adaptive candidate mapping also passes with a sealed
 149,999,976,054-token pool, and its checkpoint-bound global-dedup package is
 locally verified. Two paid dedup canaries failed safe: the first on an
 over-strict AWS Spark build suffix check and the second on a wide-row top-K
-executor heap exhaustion. Both causes are corrected and locally verified, but
-another exact canary, production global dedup, final 80B selection and shard
-sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain. No
-model training is authorized by this preparation. The completed 150M and 1B
-pilot checkpoints are not production-quality models.
+executor heap exhaustion. Both causes were corrected, and the final bounded
+checkpoint-bound canary now passes with independently verified output.
+Production global dedup, final 80B selection and shard sealing, a 4B learning
+pilot, and the full 4B/80B pretraining run remain. No model training is
+authorized by this preparation. The completed 150M and 1B pilot checkpoints are
+not production-quality models.
 
 ## Quick start
 

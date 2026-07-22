@@ -1,9 +1,8 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **the 150B candidate map is sealed; the first checkpoint-bound
-global-dedup canary failed closed before data processing on an over-strict AWS
-Spark build suffix check, and its local correction is verified; no retry,
-production dedup, sharding, GPU, or model training is authorized**
+Status: **the 150B candidate map is sealed and the checkpoint-bound
+global-dedup structural canary passes after two fail-closed corrections;
+production dedup, sharding, GPU, and model training remain unauthorized**
 
 ## Why this migration exists
 
@@ -548,6 +547,64 @@ and least-privilege role are deleted, the four bounded output namespaces remain
 empty, and the durable failure manifest verifies every archived evidence file.
 The full tree passes 314/314 tests and Ruff lint. This fix authorizes no paid
 retry, production dedup, sharding, GPU work, or model training.
+
+## Verified fixed-memory global-dedup canary
+
+A fresh exact owner authorization bound one final canary attempt to map
+checkpoint
+`90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b`,
+input index
+`2cd4537a86d6e48e2fa079c1088fef167d856229e208a45284fab216f207d266`,
+and fixed release
+`9cdb276a119758ef65b181294eb3d369cfaa6da6d18be688ef22712a9ecbf9a6`.
+The exact source commit was
+`487742309eca4d340aff0e926e834730d53bddb2`; it is contained in merged main.
+Replay preflight found no existing deterministic job, role, or bounded output
+object before launch.
+
+The single 8-DPU run
+`jr_636f897f5c6ee18d599b5c38d89a708e0c0706fe83620b509e360bd1178fca19`
+completed successfully. Glue 5.1 ran Spark `3.5.6-amzn-1`, Python 3.11.15,
+and Datasketch 2.0.0. The narrow-key top-K plus broadcast left-semi join avoided
+the previous wide-row executor heap failure and preserved the deterministic
+100,000-document cap.
+
+| Fixed-memory canary evidence | Verified value |
+|---|---:|
+| Glue state | `SUCCEEDED` |
+| Worker envelope | 8 x `G.1X` / 8 DPU |
+| Timeout / automatic retries | 30 minutes / 0 |
+| Execution time | 189 seconds |
+| DPU-seconds | 1,515 |
+| Estimated compute at $0.44/DPU-hour | $0.185167 |
+| Candidate documents | 100,000 |
+| Candidate tokens | 1,111,552,230 |
+| Immutable anchor documents | 38,349 |
+| Accepted documents | 99,996 |
+| Near-duplicate rejections | 4 |
+| Exact-duplicate rejections | 0 |
+| LSH candidate pairs / near edges | 16 / 4 |
+| Production-output objects | 0 |
+
+Independent local verification downloaded every output Parquet object and
+validated the release and authorization contracts. The 99,996 accepted and 4
+rejected document IDs are individually unique, mutually disjoint, and conserve
+all 100,000 canary inputs. The 35 accepted-ID objects total 6,422,420 bytes and
+match inventory SHA-256
+`5124a27fdd9b18ec5d3b4d67e206541c701f843391b6782076c3dd1c09a400e2`;
+the one rejected-ID object is 1,685 bytes and matches
+`806f97a178c17840184be211d037dea7476c2001f4fac331bff69eb66f09cdde`.
+The immutable 1,569-byte result matches SHA-256
+`9527fd70202016db1f19a459120ca83849b83e676f9cc2bf939a843709dfee26`.
+
+The local evidence archive contains 48 hash-verified entries (about 7.2MiB);
+its manifest SHA-256 is
+`6f43a030fe2298254b99a837eb9add16d66083ee55822203a01556ba682c38da`.
+After the archive was sealed, the consumed Glue job and least-privilege IAM role
+were deleted and live absence checks passed. This proves only the bounded
+structural global-dedup path. It does not authorize or claim completion of the
+100-DPU production dedup, final 80B selection, training-shard publication, GPU
+work, or model training.
 
 ## Reproduction commands
 
