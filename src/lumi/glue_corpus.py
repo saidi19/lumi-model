@@ -15,6 +15,17 @@ from .distributed_corpus import (
     MinHashCodec,
 )
 
+DEDUP_CANDIDATE_COLUMNS = (
+    "schema_version",
+    "document_id",
+    "source_ordinal",
+    "source_line",
+    "segment_index",
+    "content_sha256",
+    "minhash_signature",
+    "lsh_buckets",
+)
+
 
 def _lsh_bucket_type() -> Any:
     from pyspark.sql import types as T
@@ -60,6 +71,19 @@ def candidate_spark_schema() -> Any:
             T.StructField("transformations_json", T.StringType(), nullable=False),
         ]
     )
+
+
+def dedup_candidate_spark_schema() -> Any:
+    """Return the narrow candidate schema used by the global dedup graph."""
+
+    from pyspark.sql import types as T
+
+    fields = {
+        field.name: field
+        for field in candidate_spark_schema().fields
+        if field.name in DEDUP_CANDIDATE_COLUMNS
+    }
+    return T.StructType([fields[name] for name in DEDUP_CANDIDATE_COLUMNS])
 
 
 def dedup_anchor_spark_schema() -> Any:
@@ -517,10 +541,12 @@ def spark_deduplicate_candidates(
 
     spark = candidates.sparkSession
     spark.sparkContext.setCheckpointDir(checkpoint_uri)
-    candidate_required = {field.name for field in candidate_spark_schema().fields}
-    if set(candidates.columns) != candidate_required:
-        missing = sorted(candidate_required - set(candidates.columns))
-        extra = sorted(set(candidates.columns) - candidate_required)
+    candidate_columns = set(candidates.columns)
+    full_candidate_columns = {field.name for field in candidate_spark_schema().fields}
+    dedup_candidate_columns = set(DEDUP_CANDIDATE_COLUMNS)
+    if candidate_columns not in (full_candidate_columns, dedup_candidate_columns):
+        missing = sorted(dedup_candidate_columns - candidate_columns)
+        extra = sorted(candidate_columns - full_candidate_columns)
         raise ValueError(
             f"distributed Spark candidate schema changed: missing={missing} extra={extra}"
         )

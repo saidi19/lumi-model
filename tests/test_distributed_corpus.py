@@ -594,9 +594,11 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
     from pyspark.sql import SparkSession
 
     from lumi.glue_corpus import (
+        DEDUP_CANDIDATE_COLUMNS,
         assign_ordered_token_shards,
         candidate_spark_schema,
         dedup_anchor_spark_schema,
+        dedup_candidate_spark_schema,
         select_ordered_token_prefix,
         select_ordered_token_prefix_at_most,
         spark_deduplicate_candidates,
@@ -682,6 +684,29 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
             for row in repeated["accepted_ids"].select("document_id").collect()
         } == spark_accepted
         assert repeated["metrics"] == result["metrics"]
+
+        assert [field.name for field in dedup_candidate_spark_schema().fields] == list(
+            DEDUP_CANDIDATE_COLUMNS
+        )
+        narrow_frame = candidate_frame.select(*DEDUP_CANDIDATE_COLUMNS)
+        narrow = spark_deduplicate_candidates(
+            narrow_frame,
+            codec=codec,
+            checkpoint_uri=(tmp_path / "narrow").as_uri(),
+            anchors=anchor_frame,
+            allow_local_checkpoint=True,
+            maximum_lsh_bucket_documents=100,
+            maximum_candidate_pairs=1_000,
+        )
+        assert {
+            row["document_id"]
+            for row in narrow["accepted_ids"].select("document_id").collect()
+        } == spark_accepted
+        assert set(narrow["accepted"].columns) == {
+            *DEDUP_CANDIDATE_COLUMNS,
+            "dedup_round",
+        }
+        assert narrow["metrics"] == result["metrics"]
 
         prefix_candidates = []
         for ordinal, tokens in enumerate((3, 4, 5, 2, 6, 1)):

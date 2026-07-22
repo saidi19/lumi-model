@@ -348,6 +348,10 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
     assert "spark_deduplicate_candidates" in source
     assert "maximum_candidate_pairs" in source
     assert "errorifexists" in source
+    assert "StorageLevel.DISK_ONLY" in source
+    assert "candidates = candidates.persist()" not in source
+    assert "selected_payload = candidates.join(" in source
+    assert 'spark.sql.parquet.enableVectorizedReader", "false"' in source
     context = source.index("context = SparkContext.getOrCreate()")
     release = source.index('SparkFiles.get(args["LUMI_RELEASE_FILE"])')
     assert context < release
@@ -363,6 +367,190 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
         "LUMI_MAP_RELEASE_FILE",
         "LUMI_RELEASE_FILE",
     )
+
+
+def test_runtime_projects_wide_payload_away_until_final_selection() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_production_global_dedup.py",
+        run_name="lumi_glue_global_dedup_memory_projection_test",
+    )
+    operations: list[tuple[object, ...]] = []
+
+    class Frame:
+        def __init__(self, label: str) -> None:
+            self.label = label
+
+        def select(self, *columns: str) -> Frame:
+            operations.append(("select", self.label, *columns))
+            return Frame(f"{self.label}-selected")
+
+        def join(self, other: object, *args: str) -> Frame:
+            operations.append(("join", self.label, other, *args))
+            return Frame(f"{self.label}-joined")
+
+    dedup_columns = (
+        "schema_version",
+        "document_id",
+        "source_ordinal",
+        "source_line",
+        "segment_index",
+        "content_sha256",
+        "minhash_signature",
+        "lsh_buckets",
+    )
+    candidates = Frame("candidates")
+    accepted_ids = Frame("accepted-ids")
+    narrow = namespace["_narrow_dedup_candidates"](
+        candidates, columns=dedup_columns
+    )
+    selection = namespace["_accepted_selection_candidates"](
+        candidates, accepted_ids
+    )
+
+    assert narrow.label == "candidates-selected"
+    assert selection.label == "candidates-selected-joined"
+    assert operations[0] == ("select", "candidates", *dedup_columns)
+    assert "text" not in operations[0]
+    assert "token_bytes" not in operations[0]
+    assert operations[1] == (
+        "select",
+        "candidates",
+        *namespace["PRODUCTION_SELECTION_COLUMNS"],
+    )
+    assert "text" not in operations[1]
+    assert "token_bytes" not in operations[1]
+    assert operations[2] == (
+        "select",
+        "accepted-ids",
+        "document_id",
+        "dedup_round",
+    )
+    assert operations[3][0:2] == ("join", "candidates-selected")
+    assert operations[3][-2:] == ("document_id", "inner")
+
+
+def test_runtime_enforces_memory_safe_parquet_configuration() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_production_global_dedup.py",
+        run_name="lumi_glue_global_dedup_memory_config_test",
+    )
+
+    class Conf:
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {}
+
+        def set(self, name: str, value: str) -> None:
+            self.values[name] = value
+
+        def get(self, name: str) -> str:
+            return self.values[name]
+
+    class Spark:
+        def __init__(self) -> None:
+            self.conf = Conf()
+
+    spark = Spark()
+    actual = namespace["_configure_memory_safe_parquet_reader"](spark)
+    assert actual == dict(namespace["MEMORY_SAFE_PARQUET_CONFIG"])
+    assert actual["spark.sql.parquet.enableVectorizedReader"] == "false"
+    assert actual["spark.sql.parquet.columnarReaderBatchSize"] == "64"
+    assert actual["spark.sql.files.maxPartitionBytes"] == str(64 * 1024 * 1024)
+
+
+def test_memory_safe_projection_streams_long_text_only_after_selection(
+    tmp_path: Path,
+) -> None:
+    pytest.importorskip("pyspark")
+    from pyspark.sql import SparkSession
+    from pyspark.sql import functions as F
+
+    from lumi.glue_corpus import DEDUP_CANDIDATE_COLUMNS, candidate_spark_schema
+
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_production_global_dedup.py",
+        run_name="lumi_glue_global_dedup_long_payload_test",
+    )
+    spark = (
+        SparkSession.builder.master("local[2]")
+        .appName("lumi-glue-global-dedup-long-payload-test")
+        .config("spark.ui.enabled", "false")
+        .config("spark.sql.shuffle.partitions", "2")
+        .getOrCreate()
+    )
+    try:
+        spark.sparkContext.setLogLevel("ERROR")
+        payload_bytes = 8 * 1024 * 1024
+        row = {
+            "schema_version": 1,
+            "document_id": "long-payload-document",
+            "source_ordinal": 1,
+            "source_line": 1,
+            "segment_index": 0,
+            "category": "science_and_education",
+            "component": "test",
+            "dataset_id": "test/long-payload",
+            "dataset_revision": "fixture",
+            "source_file": "fixture.jsonl",
+            "source_sha256": "a" * 64,
+            "content_sha256": "b" * 64,
+            "minhash_signature": b"m" * 16,
+            "lsh_buckets": [{"band": 0, "bucket": b"bucket"}],
+            "text": "x" * payload_bytes,
+            "text_utf8_bytes": payload_bytes,
+            "token_bytes": b"t" * payload_bytes,
+            "token_count": 1,
+            "provenance_json": "{}",
+            "quality_json": "{}",
+            "transformations_json": "[]",
+        }
+        input_path = tmp_path / "wide-input"
+        spark.createDataFrame([row], schema=candidate_spark_schema()).write.parquet(
+            str(input_path)
+        )
+
+        config = namespace["_configure_memory_safe_parquet_reader"](spark)
+        assert config["spark.sql.parquet.enableVectorizedReader"] == "false"
+        candidates = spark.read.schema(candidate_spark_schema()).parquet(str(input_path))
+        totals = candidates.select("token_count").agg(
+            F.count(F.lit(1)).alias("documents"),
+            F.sum("token_count").alias("tokens"),
+        ).first()
+        assert (int(totals["documents"]), int(totals["tokens"])) == (1, 1)
+
+        narrow = namespace["_narrow_dedup_candidates"](
+            candidates,
+            columns=DEDUP_CANDIDATE_COLUMNS,
+        )
+        assert tuple(narrow.columns) == DEDUP_CANDIDATE_COLUMNS
+        assert "text" not in narrow.columns
+        assert "token_bytes" not in narrow.columns
+
+        accepted_ids = spark.createDataFrame(
+            [("long-payload-document", 0)],
+            "document_id string, dedup_round int",
+        )
+        selected = namespace["_accepted_selection_candidates"](
+            candidates, accepted_ids
+        )
+        selected_payload = candidates.join(
+            selected.select("document_id", "dedup_round"),
+            "document_id",
+            "inner",
+        )
+        output_path = tmp_path / "selected-output"
+        selected_payload.write.parquet(str(output_path))
+        output = spark.read.parquet(str(output_path)).select(
+            F.length("text").alias("text_bytes"),
+            F.length("token_bytes").alias("token_bytes"),
+            "dedup_round",
+        ).first()
+        assert (output["text_bytes"], output["token_bytes"], output["dedup_round"]) == (
+            payload_bytes,
+            payload_bytes,
+            0,
+        )
+    finally:
+        spark.stop()
 
 
 def test_canary_orders_only_narrow_keys_before_rejoining_wide_rows() -> None:
