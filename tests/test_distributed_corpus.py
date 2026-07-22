@@ -608,6 +608,43 @@ def test_pair_budget_stop_plan_is_minimal_and_fail_closed() -> None:
         _plan_pair_budget_stop_buckets([(2, 1)], 2)
 
 
+def test_uncovered_lsh_policy_is_explicit_bounded_and_auditable() -> None:
+    from lumi.glue_corpus import _resolve_uncovered_lsh_policy
+
+    assert _resolve_uncovered_lsh_policy(
+        candidate_documents=3,
+        anchor_documents=1,
+        policy="keep_exact_only",
+        maximum_documents=16,
+    ) == {
+        "anchor_documents_without_usable_lsh_buckets": 1,
+        "candidate_documents_without_usable_lsh_buckets": 3,
+        "documents_without_usable_lsh_buckets": 4,
+        "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
+    }
+    with pytest.raises(RuntimeError, match="forbidden by policy: 4"):
+        _resolve_uncovered_lsh_policy(
+            candidate_documents=3,
+            anchor_documents=1,
+            policy="fail",
+            maximum_documents=16,
+        )
+    with pytest.raises(RuntimeError, match="exceed their cap: 17"):
+        _resolve_uncovered_lsh_policy(
+            candidate_documents=17,
+            anchor_documents=0,
+            policy="keep_exact_only",
+            maximum_documents=16,
+        )
+    with pytest.raises(ValueError, match="unsupported"):
+        _resolve_uncovered_lsh_policy(
+            candidate_documents=0,
+            anchor_documents=0,
+            policy="silently_drop",
+            maximum_documents=16,
+        )
+
+
 def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Path) -> None:
     pytest.importorskip("pyspark")
     from pyspark.sql import SparkSession
@@ -837,7 +874,13 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
             )
 
         uncovered_candidates = [
-            _candidate(codec, f"uncovered-{ordinal}", 30 + ordinal, "text", 200 + ordinal)
+            _candidate(
+                codec,
+                f"uncovered-{ordinal}",
+                30 + ordinal,
+                "duplicate" if ordinal < 2 else f"unique-{ordinal}",
+                200 + ordinal,
+            )
             for ordinal in range(5)
         ]
         for row in uncovered_candidates:
@@ -852,22 +895,49 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
             [candidate_to_spark_row(row) for row in uncovered_candidates],
             schema=candidate_spark_schema(),
         )
-        with pytest.raises(RuntimeError, match="without usable LSH buckets"):
-            spark_deduplicate_candidates(
-                uncovered_frame,
-                codec=codec,
-                checkpoint_uri=(tmp_path / "uncovered-stop-buckets").as_uri(),
-                anchors=anchor_frame,
-                allow_local_checkpoint=True,
-                maximum_lsh_bucket_documents=4,
-                maximum_candidate_pairs=1_000,
-                oversized_lsh_bucket_policy="drop_as_stop_bucket",
-                maximum_oversized_lsh_buckets=len(codec.hashranges),
-                maximum_oversized_lsh_memberships=(
-                    len(codec.hashranges) * len(uncovered_candidates)
-                ),
-                maximum_documents_without_usable_lsh_buckets=0,
-            )
+        uncovered_exact_only = spark_deduplicate_candidates(
+            uncovered_frame,
+            codec=codec,
+            checkpoint_uri=(tmp_path / "uncovered-stop-buckets").as_uri(),
+            anchors=anchor_frame,
+            allow_local_checkpoint=True,
+            maximum_lsh_bucket_documents=4,
+            maximum_candidate_pairs=1_000,
+            oversized_lsh_bucket_policy="drop_as_stop_bucket",
+            maximum_oversized_lsh_buckets=len(codec.hashranges),
+            maximum_oversized_lsh_memberships=(
+                len(codec.hashranges) * len(uncovered_candidates)
+            ),
+            documents_without_usable_lsh_buckets_policy="keep_exact_only",
+            maximum_documents_without_usable_lsh_buckets=len(uncovered_candidates),
+        )
+        uncovered_reference = deduplicate_candidates(
+            uncovered_candidates, codec, anchors=[anchor]
+        )
+        assert {
+            row["document_id"]
+            for row in uncovered_exact_only["accepted_ids"]
+            .select("document_id")
+            .collect()
+        } == set(uncovered_reference.accepted_document_ids)
+        assert (
+            uncovered_exact_only["metrics"][
+                "candidate_documents_without_usable_lsh_buckets"
+            ]
+            == len(uncovered_candidates)
+        )
+        assert (
+            uncovered_exact_only["metrics"][
+                "anchor_documents_without_usable_lsh_buckets"
+            ]
+            == 0
+        )
+        assert (
+            uncovered_exact_only["metrics"][
+                "documents_without_usable_lsh_buckets_policy"
+            ]
+            == "keep_exact_only"
+        )
 
         with pytest.raises(RuntimeError, match="without usable LSH buckets"):
             spark_deduplicate_candidates(

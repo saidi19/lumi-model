@@ -742,7 +742,8 @@ def build_glue_production_global_dedup_package(
         },
         "deduplication": {
             "maximum_candidate_pairs": 50_000_000,
-            "maximum_documents_without_usable_lsh_buckets": 0,
+            "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
+            "maximum_documents_without_usable_lsh_buckets": 16,
             "maximum_lsh_bucket_documents": 10_000,
             "maximum_oversized_lsh_buckets": 64,
             "maximum_oversized_lsh_memberships": 1_000_000,
@@ -864,7 +865,8 @@ def validate_glue_production_global_dedup_release(
         raise ValueError("Glue global-dedup final 80B target changed")
     if release.get("deduplication") != {
         "maximum_candidate_pairs": 50_000_000,
-        "maximum_documents_without_usable_lsh_buckets": 0,
+        "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
+        "maximum_documents_without_usable_lsh_buckets": 16,
         "maximum_lsh_bucket_documents": 10_000,
         "maximum_oversized_lsh_buckets": 64,
         "maximum_oversized_lsh_memberships": 1_000_000,
@@ -1135,7 +1137,10 @@ def validate_glue_global_dedup_result(
         raise ValueError("Glue global-dedup metrics are missing")
     for name in (
         "accepted_documents",
+        "anchor_documents",
+        "anchor_documents_without_usable_lsh_buckets",
         "candidate_documents",
+        "candidate_documents_without_usable_lsh_buckets",
         "exact_rejected_documents",
         "near_rejected_documents",
     ):
@@ -1162,6 +1167,20 @@ def validate_glue_global_dedup_result(
     ):
         _non_negative_int(metrics.get(name), f"dedup metric {name}")
     stop_contract = release["deduplication"]
+    if metrics.get("documents_without_usable_lsh_buckets_policy") != stop_contract[
+        "documents_without_usable_lsh_buckets_policy"
+    ]:
+        raise ValueError("Glue global-dedup result changed its uncovered-LSH policy")
+    if int(metrics["documents_without_usable_lsh_buckets"]) != int(
+        metrics["candidate_documents_without_usable_lsh_buckets"]
+    ) + int(metrics["anchor_documents_without_usable_lsh_buckets"]):
+        raise ValueError("Glue global-dedup result has inconsistent uncovered-LSH counts")
+    if int(metrics["candidate_documents_without_usable_lsh_buckets"]) > int(
+        metrics["candidate_documents"]
+    ) or int(metrics["anchor_documents_without_usable_lsh_buckets"]) > int(
+        metrics["anchor_documents"]
+    ):
+        raise ValueError("Glue global-dedup result has impossible uncovered-LSH counts")
     if int(metrics["oversized_lsh_buckets"]) > int(
         stop_contract["maximum_oversized_lsh_buckets"]
     ):

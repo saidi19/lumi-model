@@ -267,7 +267,8 @@ def test_package_is_hash_bound_and_does_not_authorize_paid_work(tmp_path: Path) 
     assert release["jobs"]["production"]["maximum_compute_usd"] == "1056.000000"
     assert release["deduplication"] == {
         "maximum_candidate_pairs": 50_000_000,
-        "maximum_documents_without_usable_lsh_buckets": 0,
+        "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
+        "maximum_documents_without_usable_lsh_buckets": 16,
         "maximum_lsh_bucket_documents": 10_000,
         "maximum_oversized_lsh_buckets": 64,
         "maximum_oversized_lsh_memberships": 1_000_000,
@@ -363,6 +364,7 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
     assert "maximum_oversized_lsh_memberships" in source
     assert "pair_budget_lsh_bucket_policy" in source
     assert "maximum_pair_budget_lsh_memberships" in source
+    assert "documents_without_usable_lsh_buckets_policy" in source
     assert "errorifexists" in source
     assert "StorageLevel.DISK_ONLY" in source
     assert "candidates = candidates.persist()" not in source
@@ -696,8 +698,12 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         "authorization_sha256": canary_auth["authorization_sha256"],
         "deduplication": {
             "accepted_documents": 100,
+            "anchor_documents": release["resume"]["accepted_documents"],
+            "anchor_documents_without_usable_lsh_buckets": 0,
             "candidate_documents": 100,
+            "candidate_documents_without_usable_lsh_buckets": 0,
             "documents_without_usable_lsh_buckets": 0,
+            "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
             "exact_rejected_documents": 0,
             "lsh_bucket_memberships": 900,
             "lsh_candidate_pairs": 0,
@@ -778,8 +784,12 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         "categories": categories,
         "deduplication": {
             "accepted_documents": release["map"]["input_documents"],
+            "anchor_documents": release["resume"]["accepted_documents"],
+            "anchor_documents_without_usable_lsh_buckets": 0,
             "candidate_documents": release["map"]["input_documents"],
+            "candidate_documents_without_usable_lsh_buckets": 0,
             "documents_without_usable_lsh_buckets": 0,
+            "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
             "exact_rejected_documents": 0,
             "lsh_bucket_memberships": 9 * release["map"]["input_documents"],
             "lsh_candidate_pairs": 0,
@@ -836,9 +846,34 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
             excessive_stop_buckets, release, production_auth
         )
     uncovered = deepcopy(stop_bucket_result)
-    uncovered["deduplication"]["documents_without_usable_lsh_buckets"] = 1
+    uncovered["deduplication"].update(
+        {
+            "candidate_documents_without_usable_lsh_buckets": 4,
+            "documents_without_usable_lsh_buckets": 4,
+        }
+    )
+    assert validate_glue_global_dedup_result(
+        uncovered, release, production_auth
+    ) == uncovered
+    inconsistent_uncovered = deepcopy(uncovered)
+    inconsistent_uncovered["deduplication"][
+        "documents_without_usable_lsh_buckets"
+    ] = 5
+    with pytest.raises(ValueError, match="inconsistent uncovered-LSH counts"):
+        validate_glue_global_dedup_result(
+            inconsistent_uncovered, release, production_auth
+        )
+    excessive_uncovered = deepcopy(uncovered)
+    excessive_uncovered["deduplication"].update(
+        {
+            "candidate_documents_without_usable_lsh_buckets": 17,
+            "documents_without_usable_lsh_buckets": 17,
+        }
+    )
     with pytest.raises(ValueError, match="without LSH coverage"):
-        validate_glue_global_dedup_result(uncovered, release, production_auth)
+        validate_glue_global_dedup_result(
+            excessive_uncovered, release, production_auth
+        )
     pair_budget_result = deepcopy(production)
     pair_budget_result["deduplication"].update(
         {

@@ -221,6 +221,45 @@ def _plan_pair_budget_stop_buckets(
     )
 
 
+def _resolve_uncovered_lsh_policy(
+    *,
+    candidate_documents: int,
+    anchor_documents: int,
+    policy: str,
+    maximum_documents: int,
+) -> dict[str, int | str]:
+    """Resolve the bounded exact-only fallback for stopped LSH routes."""
+
+    for value, label in (
+        (candidate_documents, "candidate uncovered-LSH documents"),
+        (anchor_documents, "anchor uncovered-LSH documents"),
+        (maximum_documents, "uncovered-LSH document cap"),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{label} must be a non-negative integer")
+    if policy not in {"fail", "keep_exact_only"}:
+        raise ValueError(
+            "unsupported distributed documents-without-usable-LSH-buckets policy"
+        )
+    total = candidate_documents + anchor_documents
+    if total and policy == "fail":
+        raise RuntimeError(
+            "distributed documents without usable LSH buckets are forbidden by "
+            f"policy: {total}"
+        )
+    if total > maximum_documents:
+        raise RuntimeError(
+            "distributed documents without usable LSH buckets exceed their cap: "
+            f"{total}"
+        )
+    return {
+        "anchor_documents_without_usable_lsh_buckets": anchor_documents,
+        "candidate_documents_without_usable_lsh_buckets": candidate_documents,
+        "documents_without_usable_lsh_buckets": total,
+        "documents_without_usable_lsh_buckets_policy": policy,
+    }
+
+
 def select_ordered_token_prefix(
     candidates: Any,
     *,
@@ -593,6 +632,7 @@ def spark_deduplicate_candidates(
     pair_budget_lsh_bucket_policy: str = "fail",
     maximum_pair_budget_lsh_buckets: int = 0,
     maximum_pair_budget_lsh_memberships: int = 0,
+    documents_without_usable_lsh_buckets_policy: str = "fail",
     maximum_documents_without_usable_lsh_buckets: int = 0,
 ) -> dict[str, Any]:
     """Apply exact and source-order-equivalent dedup to a Spark DataFrame.
@@ -636,6 +676,12 @@ def spark_deduplicate_candidates(
     ):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"distributed {label} must be a non-negative integer")
+    _resolve_uncovered_lsh_policy(
+        candidate_documents=0,
+        anchor_documents=0,
+        policy=documents_without_usable_lsh_buckets_policy,
+        maximum_documents=maximum_documents_without_usable_lsh_buckets,
+    )
 
     spark = candidates.sparkSession
     spark.sparkContext.setCheckpointDir(checkpoint_uri)
@@ -934,20 +980,26 @@ def spark_deduplicate_candidates(
     else:
         usable_exploded = exploded
     usable_document_ids = usable_exploded.select("document_id").distinct()
-    documents_without_usable_lsh_buckets = (
-        nodes.select("document_id")
+    uncovered_frame = (
+        nodes.select("document_id", "node_kind")
         .join(usable_document_ids, "document_id", "left_anti")
-        .count()
+        .persist(StorageLevel.DISK_ONLY)
     )
-    if (
-        documents_without_usable_lsh_buckets
-        > maximum_documents_without_usable_lsh_buckets
-    ):
-        release_lsh_frames(usable=usable_exploded)
-        raise RuntimeError(
-            "distributed documents without usable LSH buckets exceed their cap: "
-            f"{documents_without_usable_lsh_buckets}"
+    uncovered_rows = uncovered_frame.groupBy("node_kind").count().collect()
+    uncovered_by_kind = {
+        str(row["node_kind"]): int(row["count"]) for row in uncovered_rows
+    }
+    uncovered_frame.unpersist()
+    try:
+        uncovered_lsh_metrics = _resolve_uncovered_lsh_policy(
+            candidate_documents=uncovered_by_kind.get("candidate", 0),
+            anchor_documents=uncovered_by_kind.get("anchor", 0),
+            policy=documents_without_usable_lsh_buckets_policy,
+            maximum_documents=maximum_documents_without_usable_lsh_buckets,
         )
+    except RuntimeError:
+        release_lsh_frames(usable=usable_exploded)
+        raise
 
     left = usable_exploded.alias("left")
     right = usable_exploded.alias("right")
@@ -1163,9 +1215,7 @@ def spark_deduplicate_candidates(
         "pair_budget_lsh_pair_upper_bound_removed": (
             pair_budget_lsh_pair_upper_bound_removed
         ),
-        "documents_without_usable_lsh_buckets": (
-            documents_without_usable_lsh_buckets
-        ),
+        **uncovered_lsh_metrics,
         "prefix_rejected_documents": prefix_rejected.count(),
         "rounds": rounds,
     }
