@@ -18,6 +18,7 @@ from lumi.final_corpus import (
 from lumi.glue_final_corpus_production import (
     CATEGORY_CHECKPOINT_GATE,
     RESULT_GATE,
+    _validate_canary_report,
     build_glue_final_corpus_production_authorization,
     build_glue_final_corpus_production_job_definition,
     build_glue_final_corpus_production_package,
@@ -33,7 +34,7 @@ from lumi.glue_final_corpus_production import (
 from lumi.glue_runtime import FINAL_CORPUS_SPARK_CONFIG, glue_conf_argument
 
 ROOT = Path(__file__).resolve().parents[1]
-CANARY_SOURCE_COMMIT = "af601ed449ba31230120990a8bff275f8da8668e"
+CANARY_SOURCE_COMMIT = "32594a2931f6ee5be266d1b2d494c7eabead6d78"
 SOURCE_COMMIT = "c" * 40
 
 
@@ -246,15 +247,15 @@ def test_package_is_non_authorizing_manifested_and_calibrated(
     release, _, directory = package
     validated = validate_glue_final_corpus_production_release(release)
     assert validated == {
-        "conservative_runtime_minutes": 375,
-        "conservative_usd": "274.880100",
+        "conservative_runtime_minutes": 504,
+        "conservative_usd": "369.420211",
         "maximum_usd": "528.000000",
         "release_fingerprint": release["release_fingerprint"],
         "status": "verified_not_authorized",
     }
     assert all(value is False for value in release["authorization"].values())
-    assert release["cost_model"]["ideal_linear_runtime_minutes_at_100_dpu"] == 125
-    assert release["cost_model"]["ideal_linear_usd"] == "91.626700"
+    assert release["cost_model"]["ideal_linear_runtime_minutes_at_100_dpu"] == 168
+    assert release["cost_model"]["ideal_linear_usd"] == "123.140111"
     assert release["cost_model"]["estimated_maximum_output_bytes"] == 512_395_734_963
     assert release["categories"][0]["first_new_shard_sequence"] == 3
     assert release["categories"][-1]["last_new_shard_sequence"] == 162
@@ -267,6 +268,23 @@ def test_package_is_non_authorizing_manifested_and_calibrated(
         "run_glue_final_corpus_production.py",
         "verified-final-corpus-canary-result-v0.1.json",
     }
+
+
+def test_canary_runtime_evidence_is_bounded_and_cost_consistent() -> None:
+    report = json.loads(
+        (ROOT / "reports" / "glue-final-corpus-canary-result-v0.1.json").read_text()
+    )
+    assert _validate_canary_report(report)["job"]["dpu_seconds"] == 2536.0
+
+    changed = copy.deepcopy(report)
+    changed["job"]["dpu_seconds"] = 8 * 30 * 60 + 1
+    with pytest.raises(ValueError, match="compute evidence"):
+        _validate_canary_report(changed)
+
+    changed = copy.deepcopy(report)
+    changed["job"]["estimated_compute_usd_at_0_44_per_dpu_hour"] = "0.000001"
+    with pytest.raises(ValueError, match="cost evidence"):
+        _validate_canary_report(changed)
 
 
 def test_exact_approval_and_job_definition_are_fail_closed(

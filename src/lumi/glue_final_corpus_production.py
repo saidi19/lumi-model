@@ -198,15 +198,31 @@ def _validate_canary_report(report: Mapping[str, Any]) -> dict[str, Any]:
     job = report.get("job")
     if not isinstance(job, Mapping) or (
         job.get("attempt"),
-        job.get("dpu_seconds"),
-        job.get("execution_time_seconds"),
         job.get("glue_version"),
         job.get("number_of_workers"),
         job.get("state"),
         job.get("timeout_minutes"),
         job.get("worker_type"),
-    ) != (0, 1887.0, 235, "5.1", 8, "SUCCEEDED", 30, "G.1X"):
+    ) != (0, "5.1", 8, "SUCCEEDED", 30, "G.1X"):
         raise ValueError("final-corpus canary job evidence changed")
+    dpu_seconds = job.get("dpu_seconds")
+    execution_seconds = job.get("execution_time_seconds")
+    if (
+        not isinstance(dpu_seconds, (int, float))
+        or isinstance(dpu_seconds, bool)
+        or not 0 < float(dpu_seconds) <= 8 * 30 * 60
+        or not isinstance(execution_seconds, int)
+        or isinstance(execution_seconds, bool)
+        or not 0 < execution_seconds <= 30 * 60
+    ):
+        raise ValueError("final-corpus canary compute evidence left its bound")
+    expected_cost = (
+        Decimal(str(dpu_seconds)) / Decimal(3600) * Decimal("0.44")
+    ).quantize(Decimal("0.000001"))
+    if job.get("estimated_compute_usd_at_0_44_per_dpu_hour") != format(
+        expected_cost, "f"
+    ) or expected_cost > Decimal("1.760000"):
+        raise ValueError("final-corpus canary cost evidence changed")
     input_inventory = report.get("input_inventory")
     if input_inventory != {
         "documents": 68_671_669,
@@ -631,12 +647,26 @@ def validate_glue_final_corpus_production_release(
         "run_prefix": "lumi-corpus/v0.1/final-80b/production/runs",
     }:
         raise ValueError("Glue final-corpus production output boundary changed")
+    reported_cost_model = release.get("cost_model")
+    if not isinstance(reported_cost_model, Mapping):
+        raise ValueError("Glue final-corpus production cost model is missing")
+    calibration_dpu_seconds = reported_cost_model.get(
+        "calibration_canary_dpu_seconds"
+    )
+    if (
+        not isinstance(calibration_dpu_seconds, int)
+        or isinstance(calibration_dpu_seconds, bool)
+        or not 0 < calibration_dpu_seconds <= 8 * 30 * 60
+        or reported_cost_model.get("calibration_canary_input_tokens")
+        != 301_453_386
+    ):
+        raise ValueError("Glue final-corpus production calibration changed")
     cost = _derive_cost_model(
         report={
             "calibration": {
                 "input_tokens": 301_453_386,
             },
-            "job": {"dpu_seconds": 1887.0},
+            "job": {"dpu_seconds": calibration_dpu_seconds},
             "output": {
                 "selected_bytes": 31_041_302,
                 "selected_tokens": 7_026_092,
@@ -649,7 +679,7 @@ def validate_glue_final_corpus_production_release(
         price=Decimal("0.44"),
         safety_multiplier=Decimal("3.000000"),
     )
-    if release.get("cost_model") != cost:
+    if reported_cost_model != cost:
         raise ValueError("Glue final-corpus production cost projection changed")
     if int(cost["estimated_maximum_output_bytes"]) > int(
         limits["maximum_new_output_bytes"]
