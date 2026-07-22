@@ -365,6 +365,70 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
     )
 
 
+def test_canary_orders_only_narrow_keys_before_rejoining_wide_rows() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_production_global_dedup.py",
+        run_name="lumi_glue_global_dedup_canary_selection_test",
+    )
+    operations: list[tuple[object, ...]] = []
+
+    class Column:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def asc(self) -> tuple[str, str]:
+            return ("asc", self.name)
+
+    class Functions:
+        @staticmethod
+        def col(name: str) -> Column:
+            return Column(name)
+
+        @staticmethod
+        def broadcast(frame: object) -> object:
+            operations.append(("broadcast", frame))
+            return frame
+
+    class Keys:
+        def orderBy(self, *columns: object) -> Keys:
+            operations.append(("orderBy", *columns))
+            return self
+
+        def limit(self, maximum: int) -> Keys:
+            operations.append(("limit", maximum))
+            return self
+
+    class Candidates:
+        def select(self, *columns: str) -> Keys:
+            operations.append(("select", *columns))
+            return Keys()
+
+        def join(self, other: object, *, on: list[str], how: str) -> str:
+            operations.append(("join", other, tuple(on), how))
+            return "bounded-candidates"
+
+    order = namespace["CANARY_ORDER_COLUMNS"]
+    result = namespace["_bounded_canary_candidates"](
+        Candidates(), maximum_documents=100_000, functions=Functions
+    )
+
+    assert result == "bounded-candidates"
+    assert operations[0] == ("select", *order)
+    assert operations[1] == (
+        "orderBy",
+        *(("asc", name) for name in order),
+    )
+    assert operations[2] == ("limit", 100_000)
+    assert operations[3][0] == "broadcast"
+    assert operations[4][0] == "join"
+    assert operations[4][2:] == (tuple(order), "left_semi")
+
+    with pytest.raises(ValueError, match="document cap must be positive"):
+        namespace["_bounded_canary_candidates"](
+            Candidates(), maximum_documents=0, functions=Functions
+        )
+
+
 def test_runtime_accepts_the_pinned_aws_spark_build_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

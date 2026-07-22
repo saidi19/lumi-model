@@ -430,6 +430,20 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     `-amzn-N` suffix and rejects base-version or vendor drift. A corrected paid
     retry requires a new exact owner authorization. The complete suite passes
     313/313 tests and Ruff lint.
+55. the separately authorized corrected 8-DPU canary passed the pinned AWS
+    runtime, loaded the immutable resume anchors, and read its single bounded
+    Parquet input, but failed closed while constructing the deterministic
+    100,000-document sample. Spark's `TakeOrderedAndProject` retained complete
+    wide candidate rows—including text and token payloads—on one executor and
+    exhausted its Java heap. The run used 1,703 DPU-seconds (about $0.208144 at
+    $0.44/DPU-hour); all checkpoint, canary, result, and production prefixes
+    remain empty. Its job and dedicated IAM role are deleted and its sealed
+    evidence is archived. The local correction now sorts and limits only the
+    four narrow source-order keys, then broadcast-left-semi-joins those keys
+    back to the wide candidates. A local Spark physical-plan smoke confirms the
+    top-K output excludes the wide text column and preserves the same ordered
+    sample. The full suite passes 314/314 tests and Ruff. No retry or production
+    dedup is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -444,11 +458,13 @@ parity canary are also complete. The distributed production-resume harness,
 corrected Glue runtime/parity canary, and complete 758-source production staging
 phase now pass. Adaptive candidate mapping also passes with a sealed
 149,999,976,054-token pool, and its checkpoint-bound global-dedup package is
-locally verified. The first paid dedup canary failed safe on an over-strict AWS
-Spark build suffix check; a corrected canary, production global dedup, final
-80B selection and shard sealing, a 4B learning pilot, and the full 4B/80B
-pretraining run remain. No model training is authorized by this preparation.
-The completed 150M and 1B pilot checkpoints are not production-quality models.
+locally verified. Two paid dedup canaries failed safe: the first on an
+over-strict AWS Spark build suffix check and the second on a wide-row top-K
+executor heap exhaustion. Both causes are corrected and locally verified, but
+another exact canary, production global dedup, final 80B selection and shard
+sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain. No
+model training is authorized by this preparation. The completed 150M and 1B
+pilot checkpoints are not production-quality models.
 
 ## Quick start
 
