@@ -150,6 +150,77 @@ def _estimated_jaccard_udf(codec: MinHashCodec) -> Any:
     return estimated_jaccard
 
 
+def _plan_pair_budget_stop_buckets(
+    histogram: list[tuple[int, int]], required_pair_reduction: int
+) -> dict[str, int | None]:
+    """Plan a deterministic high-collision bucket cutoff from a tiny histogram."""
+
+    if (
+        not isinstance(required_pair_reduction, int)
+        or isinstance(required_pair_reduction, bool)
+        or required_pair_reduction < 0
+    ):
+        raise ValueError("pair-budget reduction must be a non-negative integer")
+    if required_pair_reduction == 0:
+        return {
+            "boundary_bucket_documents": None,
+            "boundary_buckets_available": 0,
+            "boundary_buckets_selected": 0,
+            "pair_upper_bound_removed": 0,
+            "stop_buckets": 0,
+            "stop_memberships": 0,
+        }
+
+    normalized: list[tuple[int, int]] = []
+    seen_document_counts: set[int] = set()
+    for bucket_documents, bucket_count in histogram:
+        if (
+            not isinstance(bucket_documents, int)
+            or isinstance(bucket_documents, bool)
+            or bucket_documents < 2
+        ):
+            raise ValueError("pair-budget histogram contains an invalid bucket size")
+        if (
+            not isinstance(bucket_count, int)
+            or isinstance(bucket_count, bool)
+            or bucket_count < 1
+        ):
+            raise ValueError("pair-budget histogram contains an invalid bucket count")
+        if bucket_documents in seen_document_counts:
+            raise ValueError("pair-budget histogram contains duplicate bucket sizes")
+        seen_document_counts.add(bucket_documents)
+        normalized.append((bucket_documents, bucket_count))
+
+    remaining = required_pair_reduction
+    removed = 0
+    selected_buckets = 0
+    selected_memberships = 0
+    for bucket_documents, bucket_count in sorted(normalized, reverse=True):
+        contribution = bucket_documents * (bucket_documents - 1) // 2
+        selected_here = min(
+            bucket_count,
+            (remaining + contribution - 1) // contribution,
+        )
+        selected_contribution = selected_here * contribution
+        removed += selected_contribution
+        selected_buckets += selected_here
+        selected_memberships += selected_here * bucket_documents
+        remaining -= selected_contribution
+        if remaining <= 0:
+            return {
+                "boundary_bucket_documents": bucket_documents,
+                "boundary_buckets_available": bucket_count,
+                "boundary_buckets_selected": selected_here,
+                "pair_upper_bound_removed": removed,
+                "stop_buckets": selected_buckets,
+                "stop_memberships": selected_memberships,
+            }
+
+    raise RuntimeError(
+        "distributed LSH pair-budget stop buckets cannot satisfy the candidate-pair cap"
+    )
+
+
 def select_ordered_token_prefix(
     candidates: Any,
     *,
@@ -519,6 +590,9 @@ def spark_deduplicate_candidates(
     oversized_lsh_bucket_policy: str = "fail",
     maximum_oversized_lsh_buckets: int = 0,
     maximum_oversized_lsh_memberships: int = 0,
+    pair_budget_lsh_bucket_policy: str = "fail",
+    maximum_pair_budget_lsh_buckets: int = 0,
+    maximum_pair_budget_lsh_memberships: int = 0,
     maximum_documents_without_usable_lsh_buckets: int = 0,
 ) -> dict[str, Any]:
     """Apply exact and source-order-equivalent dedup to a Spark DataFrame.
@@ -545,9 +619,16 @@ def spark_deduplicate_candidates(
         raise ValueError("distributed candidate-pair cap must be positive")
     if oversized_lsh_bucket_policy not in {"fail", "drop_as_stop_bucket"}:
         raise ValueError("unsupported distributed oversized-LSH-bucket policy")
+    if pair_budget_lsh_bucket_policy not in {"fail", "drop_as_stop_bucket"}:
+        raise ValueError("unsupported distributed pair-budget-LSH-bucket policy")
     for value, label in (
         (maximum_oversized_lsh_buckets, "oversized LSH bucket count cap"),
         (maximum_oversized_lsh_memberships, "oversized LSH membership cap"),
+        (maximum_pair_budget_lsh_buckets, "pair-budget LSH bucket count cap"),
+        (
+            maximum_pair_budget_lsh_memberships,
+            "pair-budget LSH membership cap",
+        ),
         (
             maximum_documents_without_usable_lsh_buckets,
             "documents-without-usable-LSH-buckets cap",
@@ -664,8 +745,16 @@ def spark_deduplicate_candidates(
         )
         .persist(StorageLevel.DISK_ONLY)
     )
-    bucket_counts = exploded.groupBy("band", "bucket").count().persist(
-        StorageLevel.DISK_ONLY
+    bucket_counts = (
+        exploded.groupBy("band", "bucket")
+        .count()
+        .withColumn(
+            "pair_upper_bound",
+            F.floor(
+                (F.col("count") * (F.col("count") - F.lit(1))) / F.lit(2)
+            ).cast("long"),
+        )
+        .persist(StorageLevel.DISK_ONLY)
     )
     oversized_buckets = bucket_counts.where(
         F.col("count") > maximum_lsh_bucket_documents
@@ -678,6 +767,13 @@ def spark_deduplicate_candidates(
         F.sum(
             F.when(oversized_condition, F.col("count")).otherwise(F.lit(0))
         ).alias("oversized_memberships"),
+        F.sum(
+            F.when(oversized_condition, F.col("pair_upper_bound")).otherwise(
+                F.lit(0)
+            )
+        ).alias("oversized_pair_upper_bound"),
+        F.sum("count").alias("memberships"),
+        F.sum("pair_upper_bound").alias("pair_upper_bound"),
         F.max("count").alias("maximum_documents"),
     ).first()
     oversized_bucket_count = int(bucket_summary["oversized_buckets"] or 0)
@@ -687,12 +783,32 @@ def spark_deduplicate_candidates(
     maximum_lsh_bucket_documents_observed = int(
         bucket_summary["maximum_documents"] or 0
     )
+    lsh_bucket_memberships = int(bucket_summary["memberships"] or 0)
+    lsh_pair_upper_bound_before_stop_buckets = int(
+        bucket_summary["pair_upper_bound"] or 0
+    )
+    oversized_lsh_pair_upper_bound_removed = int(
+        bucket_summary["oversized_pair_upper_bound"] or 0
+    )
+    pair_upper_bound_after_oversized = (
+        lsh_pair_upper_bound_before_stop_buckets
+        - oversized_lsh_pair_upper_bound_removed
+    )
+    required_pair_reduction = max(
+        0, pair_upper_bound_after_oversized - maximum_candidate_pairs
+    )
+    pair_budget_buckets = None
+    stop_buckets = None
 
     def release_lsh_frames(*, usable: Any = None, pairs: Any = None) -> None:
         if pairs is not None:
             pairs.unpersist()
         if usable is not None and usable is not exploded:
             usable.unpersist()
+        if stop_buckets is not None:
+            stop_buckets.unpersist()
+        if pair_budget_buckets is not None:
+            pair_budget_buckets.unpersist()
         oversized_buckets.unpersist()
         bucket_counts.unpersist()
         exploded.unpersist()
@@ -716,10 +832,100 @@ def spark_deduplicate_candidates(
             f"{oversized_lsh_memberships}"
         )
 
-    if oversized_bucket_count:
+    pair_budget_plan = _plan_pair_budget_stop_buckets([], 0)
+    if required_pair_reduction:
+        if pair_budget_lsh_bucket_policy == "fail":
+            release_lsh_frames()
+            raise RuntimeError(
+                "distributed LSH pair upper bound exceeds the fail-closed cap: "
+                f"{pair_upper_bound_after_oversized}"
+            )
+        histogram_rows = (
+            bucket_counts.where(
+                (F.col("count") <= maximum_lsh_bucket_documents)
+                & (F.col("count") >= F.lit(2))
+            )
+            .groupBy(F.col("count").alias("bucket_documents"))
+            .agg(F.count(F.lit(1)).alias("bucket_count"))
+            .collect()
+        )
+        pair_budget_plan = _plan_pair_budget_stop_buckets(
+            [
+                (int(row["bucket_documents"]), int(row["bucket_count"]))
+                for row in histogram_rows
+            ],
+            required_pair_reduction,
+        )
+        pair_budget_lsh_bucket_count = int(pair_budget_plan["stop_buckets"])
+        pair_budget_lsh_memberships = int(pair_budget_plan["stop_memberships"])
+        if pair_budget_lsh_bucket_count > maximum_pair_budget_lsh_buckets:
+            release_lsh_frames()
+            raise RuntimeError(
+                "distributed pair-budget LSH bucket count exceeds its stop-bucket cap: "
+                f"{pair_budget_lsh_bucket_count}"
+            )
+        if pair_budget_lsh_memberships > maximum_pair_budget_lsh_memberships:
+            release_lsh_frames()
+            raise RuntimeError(
+                "distributed pair-budget LSH memberships exceed their stop-bucket cap: "
+                f"{pair_budget_lsh_memberships}"
+            )
+        boundary_documents = int(pair_budget_plan["boundary_bucket_documents"])
+        boundary_available = int(pair_budget_plan["boundary_buckets_available"])
+        boundary_selected = int(pair_budget_plan["boundary_buckets_selected"])
+        above_boundary = bucket_counts.where(
+            (F.col("count") <= maximum_lsh_bucket_documents)
+            & (F.col("count") > boundary_documents)
+        )
+        boundary = bucket_counts.where(F.col("count") == boundary_documents)
+        if boundary_selected < boundary_available:
+            boundary = boundary.orderBy(F.col("band").asc(), F.col("bucket").asc()).limit(
+                boundary_selected
+            )
+        pair_budget_buckets = above_boundary.unionByName(boundary).persist(
+            StorageLevel.DISK_ONLY
+        )
+        selected_summary = pair_budget_buckets.agg(
+            F.count(F.lit(1)).alias("buckets"),
+            F.sum("count").alias("memberships"),
+            F.sum("pair_upper_bound").alias("pair_upper_bound"),
+        ).first()
+        if (
+            int(selected_summary["buckets"] or 0) != pair_budget_lsh_bucket_count
+            or int(selected_summary["memberships"] or 0)
+            != pair_budget_lsh_memberships
+            or int(selected_summary["pair_upper_bound"] or 0)
+            != int(pair_budget_plan["pair_upper_bound_removed"])
+        ):
+            release_lsh_frames()
+            raise RuntimeError("distributed pair-budget stop-bucket plan changed")
+
+    pair_budget_lsh_bucket_count = int(pair_budget_plan["stop_buckets"])
+    pair_budget_lsh_memberships = int(pair_budget_plan["stop_memberships"])
+    pair_budget_lsh_pair_upper_bound_removed = int(
+        pair_budget_plan["pair_upper_bound_removed"]
+    )
+    lsh_pair_upper_bound_after_stop_buckets = (
+        pair_upper_bound_after_oversized
+        - pair_budget_lsh_pair_upper_bound_removed
+    )
+    if lsh_pair_upper_bound_after_stop_buckets > maximum_candidate_pairs:
+        release_lsh_frames()
+        raise RuntimeError("distributed LSH pair-budget stop plan did not reach its cap")
+
+    if oversized_bucket_count or pair_budget_lsh_bucket_count:
+        stop_frames = []
+        if oversized_bucket_count:
+            stop_frames.append(oversized_buckets.select("band", "bucket"))
+        if pair_budget_lsh_bucket_count:
+            stop_frames.append(pair_budget_buckets.select("band", "bucket"))
+        stop_buckets = stop_frames[0]
+        for frame in stop_frames[1:]:
+            stop_buckets = stop_buckets.unionByName(frame)
+        stop_buckets = stop_buckets.persist(StorageLevel.DISK_ONLY)
         usable_exploded = (
             exploded.join(
-                oversized_buckets.select("band", "bucket"),
+                stop_buckets,
                 ["band", "bucket"],
                 "left_anti",
             )
@@ -935,6 +1141,13 @@ def spark_deduplicate_candidates(
         "exact_rejected_documents": exact_rejected.count(),
         "exact_duplicate_edges": exact_edges.count(),
         "lsh_candidate_pairs": possible_pair_count,
+        "lsh_bucket_memberships": lsh_bucket_memberships,
+        "lsh_pair_upper_bound_after_stop_buckets": (
+            lsh_pair_upper_bound_after_stop_buckets
+        ),
+        "lsh_pair_upper_bound_before_stop_buckets": (
+            lsh_pair_upper_bound_before_stop_buckets
+        ),
         "maximum_lsh_bucket_documents_observed": (
             maximum_lsh_bucket_documents_observed
         ),
@@ -942,6 +1155,14 @@ def spark_deduplicate_candidates(
         "near_rejected_documents": near_rejected_ids.count(),
         "oversized_lsh_buckets": oversized_bucket_count,
         "oversized_lsh_memberships": oversized_lsh_memberships,
+        "oversized_lsh_pair_upper_bound_removed": (
+            oversized_lsh_pair_upper_bound_removed
+        ),
+        "pair_budget_lsh_buckets": pair_budget_lsh_bucket_count,
+        "pair_budget_lsh_memberships": pair_budget_lsh_memberships,
+        "pair_budget_lsh_pair_upper_bound_removed": (
+            pair_budget_lsh_pair_upper_bound_removed
+        ),
         "documents_without_usable_lsh_buckets": (
             documents_without_usable_lsh_buckets
         ),

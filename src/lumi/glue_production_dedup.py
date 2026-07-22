@@ -746,8 +746,11 @@ def build_glue_production_global_dedup_package(
             "maximum_lsh_bucket_documents": 10_000,
             "maximum_oversized_lsh_buckets": 64,
             "maximum_oversized_lsh_memberships": 1_000_000,
+            "maximum_pair_budget_lsh_buckets": 5_000_000,
+            "maximum_pair_budget_lsh_memberships": 100_000_000,
             "maximum_rounds": 256,
             "oversized_lsh_bucket_policy": "drop_as_stop_bucket",
+            "pair_budget_lsh_bucket_policy": "drop_as_stop_bucket",
         },
         "gate": "lumi_glue_production_global_dedup_release_v0.1",
         "implementation": implementation,
@@ -865,8 +868,11 @@ def validate_glue_production_global_dedup_release(
         "maximum_lsh_bucket_documents": 10_000,
         "maximum_oversized_lsh_buckets": 64,
         "maximum_oversized_lsh_memberships": 1_000_000,
+        "maximum_pair_budget_lsh_buckets": 5_000_000,
+        "maximum_pair_budget_lsh_memberships": 100_000_000,
         "maximum_rounds": 256,
         "oversized_lsh_bucket_policy": "drop_as_stop_bucket",
+        "pair_budget_lsh_bucket_policy": "drop_as_stop_bucket",
     }:
         raise ValueError("Glue global-dedup stop-bucket contract changed")
     maximum_output = _positive_int(
@@ -1142,9 +1148,17 @@ def validate_glue_global_dedup_result(
         raise ValueError("Glue global-dedup result does not conserve documents")
     for name in (
         "documents_without_usable_lsh_buckets",
+        "lsh_bucket_memberships",
+        "lsh_candidate_pairs",
+        "lsh_pair_upper_bound_after_stop_buckets",
+        "lsh_pair_upper_bound_before_stop_buckets",
         "maximum_lsh_bucket_documents_observed",
         "oversized_lsh_buckets",
         "oversized_lsh_memberships",
+        "oversized_lsh_pair_upper_bound_removed",
+        "pair_budget_lsh_buckets",
+        "pair_budget_lsh_memberships",
+        "pair_budget_lsh_pair_upper_bound_removed",
     ):
         _non_negative_int(metrics.get(name), f"dedup metric {name}")
     stop_contract = release["deduplication"]
@@ -1156,6 +1170,14 @@ def validate_glue_global_dedup_result(
         stop_contract["maximum_oversized_lsh_memberships"]
     ):
         raise ValueError("Glue global-dedup result exceeds its stop-bucket membership cap")
+    if int(metrics["pair_budget_lsh_buckets"]) > int(
+        stop_contract["maximum_pair_budget_lsh_buckets"]
+    ):
+        raise ValueError("Glue global-dedup result exceeds its pair-budget bucket cap")
+    if int(metrics["pair_budget_lsh_memberships"]) > int(
+        stop_contract["maximum_pair_budget_lsh_memberships"]
+    ):
+        raise ValueError("Glue global-dedup result exceeds its pair-budget membership cap")
     if int(metrics["documents_without_usable_lsh_buckets"]) > int(
         stop_contract["maximum_documents_without_usable_lsh_buckets"]
     ):
@@ -1174,6 +1196,29 @@ def validate_glue_global_dedup_result(
         stop_contract["maximum_lsh_bucket_documents"]
     ):
         raise ValueError("Glue global-dedup result has inconsistent stop-bucket maximum")
+    pair_upper_before = int(metrics["lsh_pair_upper_bound_before_stop_buckets"])
+    pair_upper_after = int(metrics["lsh_pair_upper_bound_after_stop_buckets"])
+    removed_pair_upper = int(
+        metrics["oversized_lsh_pair_upper_bound_removed"]
+    ) + int(metrics["pair_budget_lsh_pair_upper_bound_removed"])
+    if pair_upper_before != pair_upper_after + removed_pair_upper:
+        raise ValueError("Glue global-dedup result has inconsistent pair-budget accounting")
+    if pair_upper_after > int(stop_contract["maximum_candidate_pairs"]):
+        raise ValueError("Glue global-dedup result exceeds its pair upper-bound cap")
+    if int(metrics["lsh_candidate_pairs"]) > pair_upper_after:
+        raise ValueError("Glue global-dedup result exceeds its measured pair upper bound")
+    if (
+        int(metrics["oversized_lsh_memberships"])
+        + int(metrics["pair_budget_lsh_memberships"])
+        > int(metrics["lsh_bucket_memberships"])
+    ):
+        raise ValueError("Glue global-dedup result has inconsistent LSH memberships")
+    for prefix in ("oversized", "pair_budget"):
+        bucket_count = int(metrics[f"{prefix}_lsh_buckets"])
+        memberships = int(metrics[f"{prefix}_lsh_memberships"])
+        removed = int(metrics[f"{prefix}_lsh_pair_upper_bound_removed"])
+        if (bucket_count == 0) != (memberships == 0 and removed == 0):
+            raise ValueError("Glue global-dedup result has inconsistent stop-bucket telemetry")
     token = str(expected_common["job_token"])
     if mode == "canary":
         if result.get("gate") != (
