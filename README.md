@@ -503,9 +503,14 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     candidates, permits only a bounded final-document overshoot, fixes the
     trainer consumption limit at exactly 80B tokens, and validates a 163-entry
     content-addressed uint16 shard manifest. Focused tests and Ruff pass. The
-    gate authorizes no Glue run, GPU, sharding publication, or model training;
-    the next paid boundary is a separately approved 8-DPU/30-minute Glue
-    selection-and-sharding canary.
+    accompanying fail-closed canary harness verifies the complete accepted
+    S3 inventory, reads one bounded Parquet object per category, checks
+    deterministic selection across two Spark partition counts, packs tiny
+    uint16 shards, and conserves documents, tokens, bytes, and output prefixes.
+    Its launcher defaults to dry-run and keeps bootstrap arguments
+    non-overridable. The gate authorizes no Glue run, GPU, production shard
+    publication, or model training; the next paid boundary is a separately
+    approved 8-DPU/30-minute Glue selection-and-sharding canary.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -536,8 +541,8 @@ exact-only uncovered documents. Final 80B mixture materialization and shard
 sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
 local final-80B selection/shard contract is now complete, while its paid Glue
-canary and production materialization remain unapproved. No model training is
-authorized by this preparation.
+canary package/launcher is prepared locally and remains unapproved. Production
+materialization and all model training also remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

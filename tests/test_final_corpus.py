@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from lumi.final_corpus import (
+    assign_hash_ranked_token_shards,
     build_final_corpus_plan,
     final_selection_rank,
     final_selection_result_fingerprint,
@@ -280,6 +281,29 @@ def test_local_spark_hash_selection_matches_python_rank() -> None:
             ).collect()
             observed.append([row["document_id"] for row in selected_rows])
             assert selection["selected_tokens"] == expected_tokens
+            shards = assign_hash_ranked_token_shards(
+                selection["selected"],
+                target_tokens=6,
+                maximum_overshoot_tokens=6,
+                start_sequence=3,
+                partitions=partitions,
+            )
+            shard_rows = shards["assigned"].orderBy(
+                "_lumi_selection_rank",
+                "content_sha256",
+                "document_id",
+                "source_ordinal",
+                "source_line",
+                "segment_index",
+            ).collect()
+            expected_sequences = []
+            running = 0
+            for row in selected_rows:
+                expected_sequences.append(3 + running // 6)
+                running += int(row["token_count"])
+            assert [row["shard_sequence"] for row in shard_rows] == expected_sequences
+            assert shards["tokens"] == expected_tokens
+            shards["assigned"].unpersist()
             selection["selected"].unpersist()
         assert observed == [expected_ids, expected_ids]
     finally:

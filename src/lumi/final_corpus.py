@@ -529,6 +529,23 @@ def select_hash_ranked_token_prefix(
     rank_column = "_lumi_selection_rank"
     if rank_column in candidates.columns:
         raise ValueError("final selection input already contains the private rank column")
+    invalid = candidates.where(
+        F.col("category").isNull()
+        | (F.length("category") == 0)
+        | F.col("component").isNull()
+        | (F.length("component") == 0)
+        | F.col("document_id").isNull()
+        | (F.length("document_id") == 0)
+        | F.col("content_sha256").isNull()
+        | (~F.col("content_sha256").rlike("^[0-9a-f]{64}$"))
+        | F.col("token_count").isNull()
+        | (F.col("token_count") <= 0)
+    ).limit(1)
+    if invalid.collect():
+        raise ValueError("final selection input contains an invalid row")
+    categories = candidates.select("category").distinct().limit(2).collect()
+    if len(categories) != 1:
+        raise ValueError("final selection input must contain exactly one category")
     material = F.concat_ws(
         "\0",
         F.lit(seed),
@@ -623,6 +640,128 @@ def select_hash_ranked_token_prefix(
         "selected": selected,
         "selected_documents": selected_documents,
         "selected_tokens": selected_tokens,
+    }
+
+
+def assign_hash_ranked_token_shards(
+    candidates: Any,
+    *,
+    target_tokens: int,
+    maximum_overshoot_tokens: int,
+    start_sequence: int = 0,
+    partitions: int | None = None,
+) -> dict[str, Any]:
+    """Assign deterministic shard sequences in final-selection rank order."""
+
+    from pyspark.sql import functions as F
+    from pyspark.sql import types as T
+
+    target = _positive_int(target_tokens, "final shard target")
+    overshoot_cap = _positive_int(
+        maximum_overshoot_tokens,
+        "final shard overshoot cap",
+        allow_zero=True,
+    )
+    start = _positive_int(
+        start_sequence,
+        "final shard start sequence",
+        allow_zero=True,
+    )
+    order = [
+        "_lumi_selection_rank",
+        "content_sha256",
+        "document_id",
+        "source_ordinal",
+        "source_line",
+        "segment_index",
+    ]
+    required = {*order, "token_count"}
+    if not required.issubset(candidates.columns):
+        raise ValueError("final shard input schema is missing required columns")
+    if "shard_sequence" in candidates.columns:
+        raise ValueError("final shard input already contains a shard sequence")
+    if partitions is None:
+        partitions = int(candidates.sparkSession.conf.get("spark.sql.shuffle.partitions"))
+    if not isinstance(partitions, int) or isinstance(partitions, bool) or partitions < 1:
+        raise ValueError("final shard partition count must be positive")
+
+    ordered = (
+        candidates.repartitionByRange(partitions, *[F.col(name) for name in order])
+        .sortWithinPartitions(*[F.col(name).asc() for name in order])
+        .persist()
+    )
+
+    def summarize(index: int, rows: Any) -> Any:
+        documents = 0
+        tokens = 0
+        for row in rows:
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("final shard row has no tokens")
+            documents += 1
+            tokens += token_count
+        yield index, documents, tokens
+
+    summaries = sorted(ordered.rdd.mapPartitionsWithIndex(summarize).collect())
+    total_documents = sum(int(row[1]) for row in summaries)
+    total_tokens = sum(int(row[2]) for row in summaries)
+    if total_documents == 0 or total_tokens == 0:
+        ordered.unpersist()
+        raise ValueError("final shard input is empty")
+    offsets: dict[int, int] = {}
+    running = 0
+    for index, _, tokens in summaries:
+        offsets[int(index)] = running
+        running += int(tokens)
+
+    def assign(index: int, rows: Any) -> Any:
+        cumulative = offsets[index]
+        for row in rows:
+            token_count = int(row["token_count"])
+            if token_count <= 0:
+                raise ValueError("final shard row has no tokens")
+            sequence = start + cumulative // target
+            yield (*tuple(row), sequence)
+            cumulative += token_count
+
+    schema = T.StructType(
+        [*candidates.schema.fields, T.StructField("shard_sequence", T.LongType(), False)]
+    )
+    assigned = candidates.sparkSession.createDataFrame(
+        ordered.rdd.mapPartitionsWithIndex(assign), schema=schema
+    ).persist()
+    totals = assigned.agg(
+        F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
+    ).first()
+    if int(totals["documents"] or 0) != total_documents or int(
+        totals["tokens"] or 0
+    ) != total_tokens:
+        assigned.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("final shard assignment does not conserve its input")
+    shard_totals = assigned.groupBy("shard_sequence").agg(
+        F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
+    )
+    maximum = shard_totals.agg(F.max("tokens").alias("tokens")).first()
+    if int(maximum["tokens"] or 0) > target + overshoot_cap:
+        assigned.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("final shard assignment exceeded its overshoot cap")
+    minimum_sequence = int(shard_totals.agg(F.min("shard_sequence")).first()[0])
+    maximum_sequence = int(shard_totals.agg(F.max("shard_sequence")).first()[0])
+    shard_count = int(shard_totals.count())
+    if minimum_sequence != start or shard_count != maximum_sequence - start + 1:
+        assigned.unpersist()
+        ordered.unpersist()
+        raise RuntimeError("final shard assignment sequence is not contiguous")
+    ordered.unpersist()
+    return {
+        "assigned": assigned,
+        "documents": total_documents,
+        "first_sequence": minimum_sequence,
+        "last_sequence": maximum_sequence,
+        "shard_count": shard_count,
+        "tokens": total_tokens,
     }
 
 

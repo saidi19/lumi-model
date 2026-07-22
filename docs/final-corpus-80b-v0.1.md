@@ -1,8 +1,9 @@
 # Lumi Final 80B Corpus Gate v0.1
 
-Status: **the deterministic, non-authorizing 120B-to-80B selection and shard
-contract passes local validation. No Glue selection, shard publication, GPU, or
-model training has been launched or authorized.**
+Status: **the deterministic, non-authorizing 120B-to-80B selection/shard
+contract and its bounded Glue canary harness pass local validation. No Glue
+selection, shard publication, GPU, or model training has been launched or
+authorized.**
 
 ## Why this gate exists
 
@@ -110,12 +111,47 @@ The planning status is
 contract tests have passed, but an AWS Glue canary is a separately approved
 paid action.
 
+## Prepared bounded canary
+
+`configs/glue-final-corpus-canary-v0.1.json` fixes a single structural canary
+to 8 G.1X workers, 30 minutes, and `$1.76` maximum Glue compute. The package is
+non-authorizing and the launcher is dry-run unless `--execute` is supplied with
+a still-valid exact authorization artifact.
+
+The canary is deliberately much smaller than production. It:
+
+- independently matches the complete 2,772-object accepted-candidate S3
+  inventory before reading any row;
+- chooses exactly one deterministic Parquet object from every category and
+  rejects more than 100,000 candidate documents per category;
+- selects approximately 1M tokens per category twice, using 16 and 23 Spark
+  partitions, and requires identical selected hashes, counts, and cutoffs;
+- writes the bounded selected Parquet, assigns deterministic approximately
+  250K-token shard sequences, and publishes content-addressed uint16 objects;
+- checks exact document/token/byte conservation, runtime pins, immutable
+  baseline-object heads, bounded S3 paths, and a 1GB output ceiling;
+- grants its one-purpose Glue role access only to the exact bootstrap and
+  baseline objects, the accepted-candidate prefix, and its authorization-bound
+  canary/result/temp prefixes.
+
+The implementation is in `src/lumi/glue_final_corpus.py`; package,
+authorization, launch, and Glue runtime entry points are under `scripts/`. The
+launcher atomically consumes each authorization with an immutable S3 launch
+claim, refuses an authorization/job that already has a run, uses zero Glue job
+retries, and cannot authorize production selection, GPU work, or training.
+
+Local Spark execution remains an optional environment test because this Codex
+sandbox cannot bind the loopback socket needed by the local JVM. The pure
+contract, package, authorization, IAM-boundary, result-conservation, tamper,
+and lint tests pass locally; the real Spark path is what the bounded canary must
+prove before production materialization.
+
 ## Next boundary
 
 The next roadmap action is one bounded 8-DPU Glue selection-and-sharding
 canary, at most 30 minutes and `$1.76`, after a fresh owner approval. It must
 prove real Parquet schema compatibility, deterministic results across
-partition counts, checkpoint/resume behavior, packed-byte parity, and cleanup.
+partition counts, immutable/idempotent writes, packed-byte parity, and cleanup.
 
 Only after that can a separately approved production selection/shard run be
 prepared. A 4B pilot and the full 4B/80B training remain later, independent
