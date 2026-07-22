@@ -420,6 +420,16 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     $1.76; a later 100-DPU/24-hour production dedup would require a new exact
     approval and is capped at $1,056. Full verification passes 312 tests and
     Ruff. No paid dedup, sharding, GPU, or model training was started.
+54. the first exact 8-DPU global-dedup canary was consumed and failed closed
+    before reading anchors or candidates. Glue 5.1 reported its Spark build as
+    `3.5.6-amzn-1`, while the runtime contract required the literal `3.5.6`.
+    The run used 671 DPU-seconds (about $0.082011 at $0.44/DPU-hour); independent
+    S3 checks found zero checkpoint, canary, result, or production objects. Its
+    job and dedicated IAM role are deleted. The local correction accepts only
+    the release-pinned Spark base version with an optional numeric AWS
+    `-amzn-N` suffix and rejects base-version or vendor drift. A corrected paid
+    retry requires a new exact owner authorization. The complete suite passes
+    313/313 tests and Ruff lint.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -434,9 +444,10 @@ parity canary are also complete. The distributed production-resume harness,
 corrected Glue runtime/parity canary, and complete 758-source production staging
 phase now pass. Adaptive candidate mapping also passes with a sealed
 149,999,976,054-token pool, and its checkpoint-bound global-dedup package is
-locally verified. The paid dedup canary, production global dedup, final 80B
-selection and shard sealing, a 4B learning pilot, and the full 4B/80B
-pretraining run remain; no model training is authorized by this preparation.
+locally verified. The first paid dedup canary failed safe on an over-strict AWS
+Spark build suffix check; a corrected canary, production global dedup, final
+80B selection and shard sealing, a 4B learning pilot, and the full 4B/80B
+pretraining run remain. No model training is authorized by this preparation.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

@@ -365,6 +365,43 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
     )
 
 
+def test_runtime_accepts_the_pinned_aws_spark_build_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_production_global_dedup.py",
+        run_name="lumi_glue_global_dedup_runtime_test",
+    )
+    monkeypatch.setattr(
+        namespace["platform"], "python_version_tuple", lambda: ("3", "11", "9")
+    )
+    monkeypatch.setattr(namespace["platform"], "python_version", lambda: "3.11.9")
+    monkeypatch.setattr(
+        namespace["importlib"].metadata,
+        "version",
+        lambda package: "2.0.0" if package == "datasketch" else "unexpected",
+    )
+
+    class Spark:
+        def __init__(self, version: str) -> None:
+            self.version = version
+
+    runtime = namespace["_runtime"](
+        Spark("3.5.6-amzn-1"), expected_spark_version="3.5.6"
+    )
+    assert runtime["spark"] == "3.5.6-amzn-1"
+    assert runtime["spark_base"] == "3.5.6"
+
+    with pytest.raises(RuntimeError, match="Spark changed"):
+        namespace["_runtime"](
+            Spark("3.5.7-amzn-1"), expected_spark_version="3.5.6"
+        )
+    with pytest.raises(RuntimeError, match="Spark changed"):
+        namespace["_runtime"](
+            Spark("3.5.6-other-1"), expected_spark_version="3.5.6"
+        )
+
+
 def test_result_contract_separates_canary_from_production(tmp_path: Path) -> None:
     release, _, _, _ = _package_fixture(tmp_path)
     now = datetime.now(UTC)

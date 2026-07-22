@@ -1,8 +1,9 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **the 150B candidate map is sealed and the checkpoint-bound Glue
-global-dedup package passes local and actual-evidence verification; no dedup
-canary, production dedup, sharding, GPU, or model training is authorized**
+Status: **the 150B candidate map is sealed; the first checkpoint-bound
+global-dedup canary failed closed before data processing on an over-strict AWS
+Spark build suffix check, and its local correction is verified; no retry,
+production dedup, sharding, GPU, or model training is authorized**
 
 ## Why this migration exists
 
@@ -459,7 +460,7 @@ or modified inputs fail before a paid job can be rendered.
 | Total candidate tokens | 149,999,976,054 |
 | Mapped Parquet bytes | 629,842,275,871 |
 | Dedup-output envelope after 100GB reserve | 769,993,852,658 bytes |
-| Local verification | 312 tests passed; Ruff clean |
+| Original package verification | 312 tests passed; Ruff clean |
 
 Canary and production permission are deliberately separate. The first possible
 paid action is one exact **8-DPU, 30-minute structural canary** with a hard Glue
@@ -469,6 +470,42 @@ global-dedup run**, whose conservative Glue-compute maximum is **$1,056**.
 Neither envelope authorizes mapping, shard writing, GPU work, 4B training, or
 the 80B-token training run. Failed jobs have zero automatic retries; a new run
 requires a new exact authorization.
+
+## Consumed first global-dedup canary
+
+The first exact canary authorization targeted checkpoint
+`90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b`,
+input index
+`2cd4537a86d6e48e2fa079c1088fef167d856229e208a45284fab216f207d266`,
+and release
+`fe8104126590fd74c98785eeb2788f6d9c71512f8c81a3ab100cb77a15234fe7`.
+The single 8-DPU run
+`jr_e93f11027c25a09d97e166df089fb1c85b33ab096d41fa07f619085a48d0a3b3`
+failed during the runtime contract before anchor loading, candidate reads,
+deduplication, or output publication. AWS Glue 5.1 exposed
+`spark.version == "3.5.6-amzn-1"`; the sealed script required exact string
+`"3.5.6"` even though the upstream Spark base version matched.
+
+| Consumed canary evidence | Verified value |
+|---|---:|
+| Glue state | `FAILED` |
+| Execution time | 83 seconds |
+| DPU-seconds | 671 |
+| Estimated compute at $0.44/DPU-hour | $0.082011 |
+| Checkpoint-prefix objects | 0 |
+| Canary-output objects | 0 |
+| Result objects | 0 |
+| Production-output objects | 0 |
+| Automatic or manual retry | none |
+
+The corrected local runtime contract still pins the release's exact base
+version, accepts only an optional numeric AWS `-amzn-N` build suffix, records
+both the base and full runtime version, and rejects a different Spark base or
+vendor suffix. Regression coverage includes the observed AWS value plus both
+rejection paths. The consumed Glue job and least-privilege IAM role are deleted,
+and the hash-sealed attempt evidence is archived locally. This correction does
+not authorize another paid canary. The corrected tree passes 313/313 tests and
+Ruff lint.
 
 ## Reproduction commands
 
