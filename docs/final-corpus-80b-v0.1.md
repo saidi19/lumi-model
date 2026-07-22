@@ -1,9 +1,10 @@
 # Lumi Final 80B Corpus Gate v0.1
 
-Status: **the deterministic, non-authorizing 120B-to-80B selection/shard
-contract and its bounded Glue canary harness pass local validation. No Glue
-selection, shard publication, GPU, or model training has been launched or
-authorized.**
+Status: **the deterministic 120B-to-80B selection/shard contract passes local
+validation, and its separately authorized bounded Glue canary completed and
+passed independent verification. The consumed Glue job and IAM role are
+deleted. Production selection, GPU work, and model training remain unlaunched
+and unauthorized.**
 
 ## Why this gate exists
 
@@ -106,10 +107,10 @@ tests cover exact 120B-to-80B accounting, authorization/input tampering,
 cross-runtime rank stability, category overshoot, S3 boundaries, shard byte
 conservation, duplicate objects, and optional local Spark partition parity.
 
-The planning status is
-`ready_for_bounded_glue_canary_approval`. This wording is deliberate: local
-contract tests have passed, but an AWS Glue canary is a separately approved
-paid action.
+The planning artifact originally stopped at
+`ready_for_bounded_glue_canary_approval`. The exact bounded canary subsequently
+received separate owner approval and passed; that does not authorize the
+production materialization run.
 
 ## Prepared bounded canary
 
@@ -143,16 +144,41 @@ retries, and cannot authorize production selection, GPU work, or training.
 Local Spark execution remains an optional environment test because this Codex
 sandbox cannot bind the loopback socket needed by the local JVM. The pure
 contract, package, authorization, IAM-boundary, result-conservation, tamper,
-and lint tests pass locally; the real Spark path is what the bounded canary must
-prove before production materialization.
+and lint tests pass locally. The bounded AWS canary supplied the required real
+Spark execution proof before production materialization.
+
+## Verified AWS canary result
+
+The one owner-authorized run used release
+`eb2ac594a0719c9f03806290d0ea109d68756dfbf2a9fb3e5119218a97a2bfb2`
+and authorization
+`9036630123cf74bda8ea2cc07b3c8c7607b08fa7bdcca05deec69d1f64ea220e`.
+Glue run
+`jr_5e8e8b1b2e904819fb760dd1d0218eed5ab9604970163a047114b05a5ec0dbb4`
+finished `SUCCEEDED` in 235 execution seconds, consumed 1,887 DPU-seconds, and
+cost an estimated `$0.230633` at `$0.44` per DPU-hour. It stayed inside the
+8-worker, 30-minute, `$1.76` envelope with zero retries.
+
+The run independently matched the complete input inventory of 2,772 objects,
+`507,737,434,761` bytes, `68,671,669` documents, and `119,762,267,075`
+tokens. Across all seven categories it selected 3,803 documents and
+`7,026,092` tokens, produced seven selected Parquet objects plus 28 packed
+uint16 objects, and passed 16-versus-23-partition parity in every category.
+Selected output occupied `31,041,302` bytes; packed output occupied
+`14,052,184` bytes, exactly two bytes per selected token.
+
+The canonical result SHA-256 is
+`171974e1fc329b0ede47c2759d7f85a44f2561e68d7322ee6c97966ccaad49ac`.
+The release, authorization, input, plan, baseline heads, result conservation,
+content-addressed output inventories, and local evidence hashes all pass. The
+consumed Glue job and dedicated IAM role were then deleted. The compact sealed
+record is `reports/glue-final-corpus-canary-result-v0.1.json`; generated S3
+payloads remain outside Git.
 
 ## Next boundary
 
-The next roadmap action is one bounded 8-DPU Glue selection-and-sharding
-canary, at most 30 minutes and `$1.76`, after a fresh owner approval. It must
-prove real Parquet schema compatibility, deterministic results across
-partition counts, immutable/idempotent writes, packed-byte parity, and cleanup.
-
-Only after that can a separately approved production selection/shard run be
-prepared. A 4B pilot and the full 4B/80B training remain later, independent
+The bounded canary gate is complete. The next roadmap action is to prepare the
+exact production 80B selection-and-sharding package, estimate its measured
+Glue envelope from this canary, and stop for a separate owner approval before
+launch. A 4B pilot and the full 4B/80B training remain later, independent
 approval gates.

@@ -496,7 +496,7 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     checks pass; S3 corpus objects remain intact. This seals the 120B
     deduplicated candidate floor pool; it is not yet the final 80B training mix,
     training shards, or a trained model.
-60. the local-only final-corpus gate now binds that verified dedup result, the
+60. the final-corpus gate binds that verified dedup result, the
     immutable 237,769,640-token prefix, frozen tokenizer, benchmark registry,
     permanent 35,889-entry training-exclusion ledger, and exact 80B category
     targets. It deterministically hash-ranks the already filtered/deduplicated
@@ -508,9 +508,13 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     deterministic selection across two Spark partition counts, packs tiny
     uint16 shards, and conserves documents, tokens, bytes, and output prefixes.
     Its launcher defaults to dry-run and keeps bootstrap arguments
-    non-overridable. The gate authorizes no Glue run, GPU, production shard
-    publication, or model training; the next paid boundary is a separately
-    approved 8-DPU/30-minute Glue selection-and-sharding canary.
+    non-overridable. The separately owner-authorized 8-DPU canary then passed
+    in 235 execution seconds using 1,887 DPU-seconds (approximately
+    `$0.230633`). It selected `7,026,092` tokens across all seven categories,
+    passed partition parity, packed 28 content-addressed uint16 objects, and
+    independently matched every input/output inventory and result hash. The
+    consumed Glue job and IAM role are deleted. Production selection, GPU work,
+    and model training remain separately gated and unauthorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -537,12 +541,12 @@ full-input Parquet heap path, and the second proved that fix before exposing a
 memory-safe reads and a bounded, fully instrumented stop-bucket policy. The
 final production run passed with 42,436,764 candidate pairs under the 50M cap,
 12 oversized stop buckets, 492 pair-budget stop buckets, and four bounded
-exact-only uncovered documents. Final 80B mixture materialization and shard
-sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain. The
+exact-only uncovered documents. Final 80B production mixture materialization
+and shard sealing, a 4B learning pilot, and the full 4B/80B pretraining run
+remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
-local final-80B selection/shard contract is now complete, while its paid Glue
-canary package/launcher is prepared locally and remains unapproved. Production
-materialization and all model training also remain unapproved.
+local final-80B selection/shard contract and bounded paid Glue canary now pass.
+Production materialization and all model training remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
@@ -643,8 +647,8 @@ consumer, 79-test focused result, 239-test full-suite result, and unchanged
 no-cloud/no-training boundary are documented in
 [`docs/s3-staged-corpus-v0.1.md`](docs/s3-staged-corpus-v0.1.md).
 The verified 120B input binding, permanent-heldout-safe deterministic 80B
-selection, category-boundary limits, and content-addressed packed-shard contract
-are documented in
+selection, category-boundary limits, content-addressed packed-shard contract,
+and independently verified bounded Glue canary are documented in
 [`docs/final-corpus-80b-v0.1.md`](docs/final-corpus-80b-v0.1.md).
 
 ## Repository policy
