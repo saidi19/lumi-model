@@ -267,12 +267,16 @@ def test_package_is_hash_bound_and_does_not_authorize_paid_work(tmp_path: Path) 
     assert release["jobs"]["production"]["maximum_compute_usd"] == "1056.000000"
     assert release["deduplication"] == {
         "maximum_candidate_pairs": 50_000_000,
-        "maximum_documents_without_usable_lsh_buckets": 0,
+        "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
+        "maximum_documents_without_usable_lsh_buckets": 16,
         "maximum_lsh_bucket_documents": 10_000,
         "maximum_oversized_lsh_buckets": 64,
         "maximum_oversized_lsh_memberships": 1_000_000,
+        "maximum_pair_budget_lsh_buckets": 5_000_000,
+        "maximum_pair_budget_lsh_memberships": 100_000_000,
         "maximum_rounds": 256,
         "oversized_lsh_bucket_policy": "drop_as_stop_bucket",
+        "pair_budget_lsh_bucket_policy": "drop_as_stop_bucket",
     }
     assert (package / RELEASE_FILE).is_file()
     assert (package / INPUT_INDEX_FILE).is_file()
@@ -358,6 +362,9 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
     assert "maximum_candidate_pairs" in source
     assert "oversized_lsh_bucket_policy" in source
     assert "maximum_oversized_lsh_memberships" in source
+    assert "pair_budget_lsh_bucket_policy" in source
+    assert "maximum_pair_budget_lsh_memberships" in source
+    assert "documents_without_usable_lsh_buckets_policy" in source
     assert "errorifexists" in source
     assert "StorageLevel.DISK_ONLY" in source
     assert "candidates = candidates.persist()" not in source
@@ -691,13 +698,25 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         "authorization_sha256": canary_auth["authorization_sha256"],
         "deduplication": {
             "accepted_documents": 100,
+            "anchor_documents": release["resume"]["accepted_documents"],
+            "anchor_documents_without_usable_lsh_buckets": 0,
             "candidate_documents": 100,
+            "candidate_documents_without_usable_lsh_buckets": 0,
             "documents_without_usable_lsh_buckets": 0,
+            "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
             "exact_rejected_documents": 0,
+            "lsh_bucket_memberships": 900,
+            "lsh_candidate_pairs": 0,
+            "lsh_pair_upper_bound_after_stop_buckets": 0,
+            "lsh_pair_upper_bound_before_stop_buckets": 0,
             "maximum_lsh_bucket_documents_observed": 1,
             "near_rejected_documents": 0,
             "oversized_lsh_buckets": 0,
             "oversized_lsh_memberships": 0,
+            "oversized_lsh_pair_upper_bound_removed": 0,
+            "pair_budget_lsh_buckets": 0,
+            "pair_budget_lsh_memberships": 0,
+            "pair_budget_lsh_pair_upper_bound_removed": 0,
         },
         "gate": "lumi_glue_production_global_dedup_canary_result_v0.1",
         "input_documents": 100,
@@ -765,13 +784,25 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         "categories": categories,
         "deduplication": {
             "accepted_documents": release["map"]["input_documents"],
+            "anchor_documents": release["resume"]["accepted_documents"],
+            "anchor_documents_without_usable_lsh_buckets": 0,
             "candidate_documents": release["map"]["input_documents"],
+            "candidate_documents_without_usable_lsh_buckets": 0,
             "documents_without_usable_lsh_buckets": 0,
+            "documents_without_usable_lsh_buckets_policy": "keep_exact_only",
             "exact_rejected_documents": 0,
+            "lsh_bucket_memberships": 9 * release["map"]["input_documents"],
+            "lsh_candidate_pairs": 0,
+            "lsh_pair_upper_bound_after_stop_buckets": 0,
+            "lsh_pair_upper_bound_before_stop_buckets": 0,
             "maximum_lsh_bucket_documents_observed": 1,
             "near_rejected_documents": 0,
             "oversized_lsh_buckets": 0,
             "oversized_lsh_memberships": 0,
+            "oversized_lsh_pair_upper_bound_removed": 0,
+            "pair_budget_lsh_buckets": 0,
+            "pair_budget_lsh_memberships": 0,
+            "pair_budget_lsh_pair_upper_bound_removed": 0,
         },
         "gate": "lumi_glue_production_global_dedup_result_v0.1",
         "input_index_sha256": release["input_index_sha256"],
@@ -794,11 +825,15 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         production, release, production_auth
     ) == production
     stop_bucket_result = deepcopy(production)
+    oversized_pair_upper = 19_150 * 19_149 // 2
     stop_bucket_result["deduplication"].update(
         {
+            "lsh_bucket_memberships": 19_150,
+            "lsh_pair_upper_bound_before_stop_buckets": oversized_pair_upper,
             "maximum_lsh_bucket_documents_observed": 19_150,
             "oversized_lsh_buckets": 1,
             "oversized_lsh_memberships": 19_150,
+            "oversized_lsh_pair_upper_bound_removed": oversized_pair_upper,
         }
     )
     assert validate_glue_global_dedup_result(
@@ -811,9 +846,58 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
             excessive_stop_buckets, release, production_auth
         )
     uncovered = deepcopy(stop_bucket_result)
-    uncovered["deduplication"]["documents_without_usable_lsh_buckets"] = 1
+    uncovered["deduplication"].update(
+        {
+            "candidate_documents_without_usable_lsh_buckets": 4,
+            "documents_without_usable_lsh_buckets": 4,
+        }
+    )
+    assert validate_glue_global_dedup_result(
+        uncovered, release, production_auth
+    ) == uncovered
+    inconsistent_uncovered = deepcopy(uncovered)
+    inconsistent_uncovered["deduplication"][
+        "documents_without_usable_lsh_buckets"
+    ] = 5
+    with pytest.raises(ValueError, match="inconsistent uncovered-LSH counts"):
+        validate_glue_global_dedup_result(
+            inconsistent_uncovered, release, production_auth
+        )
+    excessive_uncovered = deepcopy(uncovered)
+    excessive_uncovered["deduplication"].update(
+        {
+            "candidate_documents_without_usable_lsh_buckets": 17,
+            "documents_without_usable_lsh_buckets": 17,
+        }
+    )
     with pytest.raises(ValueError, match="without LSH coverage"):
-        validate_glue_global_dedup_result(uncovered, release, production_auth)
+        validate_glue_global_dedup_result(
+            excessive_uncovered, release, production_auth
+        )
+    pair_budget_result = deepcopy(production)
+    pair_budget_result["deduplication"].update(
+        {
+            "lsh_bucket_memberships": 1_000,
+            "lsh_candidate_pairs": 10,
+            "lsh_pair_upper_bound_after_stop_buckets": 40,
+            "lsh_pair_upper_bound_before_stop_buckets": 140,
+            "maximum_lsh_bucket_documents_observed": 20,
+            "pair_budget_lsh_buckets": 1,
+            "pair_budget_lsh_memberships": 20,
+            "pair_budget_lsh_pair_upper_bound_removed": 100,
+        }
+    )
+    assert validate_glue_global_dedup_result(
+        pair_budget_result, release, production_auth
+    ) == pair_budget_result
+    inconsistent_pair_budget = deepcopy(pair_budget_result)
+    inconsistent_pair_budget["deduplication"][
+        "lsh_pair_upper_bound_after_stop_buckets"
+    ] = 41
+    with pytest.raises(ValueError, match="pair-budget accounting"):
+        validate_glue_global_dedup_result(
+            inconsistent_pair_budget, release, production_auth
+        )
     changed = deepcopy(production)
     changed["categories"][0]["final_tokens"] -= 1
     with pytest.raises(ValueError, match="token conservation"):

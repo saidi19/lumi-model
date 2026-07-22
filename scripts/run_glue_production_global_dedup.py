@@ -349,6 +349,18 @@ def main() -> None:
         maximum_oversized_lsh_memberships=int(
             caps["maximum_oversized_lsh_memberships"]
         ),
+        pair_budget_lsh_bucket_policy=str(
+            caps["pair_budget_lsh_bucket_policy"]
+        ),
+        maximum_pair_budget_lsh_buckets=int(
+            caps["maximum_pair_budget_lsh_buckets"]
+        ),
+        maximum_pair_budget_lsh_memberships=int(
+            caps["maximum_pair_budget_lsh_memberships"]
+        ),
+        documents_without_usable_lsh_buckets_policy=str(
+            caps["documents_without_usable_lsh_buckets_policy"]
+        ),
         maximum_documents_without_usable_lsh_buckets=int(
             caps["maximum_documents_without_usable_lsh_buckets"]
         ),

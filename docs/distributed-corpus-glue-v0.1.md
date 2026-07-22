@@ -1,8 +1,8 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **the 150B candidate map is sealed and the checkpoint-bound
-global-dedup structural canary passes after two fail-closed corrections;
-production dedup, sharding, GPU, and model training remain unauthorized**
+Status: **the 150B candidate map and 120B production global-dedup floor pool are
+sealed and independently verified; final 80B selection, sharding, GPU, and model
+training remain separately gated and unauthorized**
 
 ## Why this migration exists
 
@@ -652,6 +652,64 @@ would lose all near-dedup coverage. Production release/result contract tests,
 the full 317-test suite, and Ruff pass. The consumed jobs and dedicated IAM
 roles are deleted. This correction does not authorize another paid run,
 sharding, GPU work, or model training.
+
+## Verified production global-dedup result
+
+The final, separately authorized 100-DPU run
+`jr_4980937909ed42907c36a02f2b4f763c594ad2a2293a41ce72bf8d4da6b45345`
+completed successfully at source commit
+`a7aa0d2b2868bd58e54db47fecd280183c9a469c`, release
+`2efbadc7360971e33e86c52e787c15fc15045a75fed65f5e16eaafbdfa3a4bb5`,
+authorization
+`e83391e490c29918625129965a5e4836946d3074085e8108ecdf790c31717746`,
+and exact mapping checkpoint
+`90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b`.
+
+| Verified production result | Value |
+|---|---:|
+| Glue state | `SUCCEEDED` |
+| Execution | 3,580 seconds / 358,041 DPU-seconds |
+| Estimated Glue compute | $43.760567 at $0.44/DPU-hour |
+| Mapped candidate documents | 89,481,434 |
+| Accepted candidate documents | 87,823,604 |
+| Exact / near rejected documents | 155 / 1,657,675 |
+| Candidate pairs | 42,436,764 / 50,000,000 cap |
+| Selected candidate pool | 119,762,267,075 tokens / 68,671,669 documents |
+| Immutable accepted prefix | 237,769,640 tokens / 38,349 documents |
+| Final floor pool | 120,000,036,715 tokens / 68,710,018 documents |
+| Category deficit | 0 tokens; all seven floors pass |
+| Accepted Parquet inventory | 2,772 objects / 507,737,434,761 bytes |
+| Rejected-ID inventory | 198 objects / 104,815,124 bytes |
+
+Exact-hash dedup found 245 edges; bounded near dedup found 18,522,221 edges
+across 14 convergence rounds. Twelve oversized and 492 pair-budget LSH buckets
+were excluded from the near-duplicate join while retaining exact dedup. Four
+candidate documents had no usable LSH bucket after that bounded policy, stayed
+under the sealed cap of 16, and were retained under the explicit
+`keep_exact_only` policy. There were zero uncovered anchors and no category
+deficit.
+
+The packaged official result validator passes. The 18-file execution package
+manifest passes. Independent AWS object listings exactly reproduce the accepted
+inventory SHA-256
+`edfc524e9d83628c3a135eb2490345d3a7176e26b8be31e449cc9079cc6348d8`
+and rejected inventory SHA-256
+`0e4f16d0696fabebf591b984f664bd547a617972614956362258cb2f995f3495`.
+The downloaded result SHA-256 is
+`dbfbf9fe258ec97d5bd844c165157d41d328d0571cbbada5fd4d67750c46b742`;
+the local verification archive manifest is
+`a6d890c9023d7af8cffd618f4a878d99cfa0b10e93880e87875b88e3655d2c5c`.
+
+After the archive was sealed, the consumed Glue job and its dedicated IAM role
+were deleted. Independent `GetJob` and `GetRole` absence checks returned
+`EntityNotFoundException` and `NoSuchEntity`; the S3 corpus objects were
+deliberately preserved.
+
+This result seals a deduplicated 120B category-floor pool, not the final 80B
+training corpus. Permanently held-out evaluation extraction, quality/risk
+selection into the final 80B mixture, tokenized training-shard publication, a
+short multi-GPU 4B pilot, and the full 4B/80B run remain separate gates. This
+run performed no sharding, GPU work, or model training.
 
 ## Reproduction commands
 
