@@ -1,0 +1,57 @@
+{
+  "authorization": {
+    "full_4b_training": false,
+    "model_training": false,
+    "paid_glue_dedup": false,
+    "paid_glue_mapping": false,
+    "paid_glue_sharding": false,
+    "paid_gpu_compute": false
+  },
+  "gate": "lumi_glue_production_global_dedup_plan_v0.1",
+  "inputs": {
+    "emr_resume_contract": {
+      "path": "configs/emr-production-resume-v0.1.json",
+      "sha256": "91cd33fbf1ce2d4f04ce54989a5f3dfd9a33bf304b37286d2c44ebffdfc17664"
+    },
+    "glue_150b_contract": {
+      "path": "configs/glue-production-150b-v0.1.json",
+      "sha256": "61d48053d08d58f7d7c923a01cc342fd3647f10702c89aecdb2d9cb7766b25ea"
+    },
+    "glue_pricing": {
+      "path": "configs/aws-glue-us-east-1-pricing-v0.1.json",
+      "sha256": "578de46e4053c69eb65288ce32f9e3844681b23df60b4d86b8392448a4e926a3"
+    }
+  },
+  "jobs": {
+    "canary": {
+      "hard_maximum_dpu": 8,
+      "maximum_candidate_documents": 100000,
+      "maximum_compute_usd": "1.760000",
+      "maximum_input_uris": 1,
+      "maximum_runtime_minutes": 30
+    },
+    "production": {
+      "hard_maximum_dpu": 100,
+      "maximum_compute_usd": "1056.000000",
+      "maximum_runtime_minutes": 1440
+    },
+    "worker_type": "G.1X"
+  },
+  "limits": {
+    "candidate_hard_maximum_tokens": 150000000000,
+    "candidate_total_floor_tokens": 120000000000,
+    "clean_category_floor_tokens": 120000000000,
+    "clean_shard_target_tokens": 100000000,
+    "final_training_tokens": 80000000000,
+    "hard_logical_storage_bytes": 2000000000000,
+    "maximum_category_overshoot_tokens": 100000000
+  },
+  "region": "us-east-1",
+  "runtime": {
+    "additional_python_modules": "datasketch==2.0.0",
+    "glue_version": "5.1",
+    "python_version": "3.11",
+    "spark_version": "3.5.6"
+  },
+  "schema_version": 1
+}

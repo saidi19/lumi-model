@@ -407,6 +407,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     object inventory match. No model training started. The consumed job and
     dedicated IAM role are deleted; global deduplication remains the next
     separately authorized production phase.
+53. the local-only Glue global-dedup adapter now binds that exact sequence-12
+    checkpoint to all 12 immutable wave manifests and 56 bounded Parquet input
+    locations. It conserves 89,481,434 documents, 149,762,206,414 newly mapped
+    tokens, 629,842,275,871 Parquet bytes, and the 237,769,640-token accepted
+    prefix; the sealed input-index SHA-256 is
+    `2cd4537a86d6e48e2fa079c1088fef167d856229e208a45284fab216f207d266`.
+    Historical Waves 1--7 and corrected Waves 8--12 are migration-aware and
+    cannot be omitted, reordered, duplicated, or moved outside their exact S3
+    namespaces. Canary and production authorizations are separate: the next
+    possible paid action is an 8-DPU/30-minute structural canary capped at
+    $1.76; a later 100-DPU/24-hour production dedup would require a new exact
+    approval and is capped at $1,056. Full verification passes 312 tests and
+    Ruff. No paid dedup, sharding, GPU, or model training was started.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -420,9 +433,10 @@ source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
 parity canary are also complete. The distributed production-resume harness,
 corrected Glue runtime/parity canary, and complete 758-source production staging
 phase now pass. Adaptive candidate mapping also passes with a sealed
-149,999,976,054-token pool. Global deduplication, final 80B selection and shard
-sealing, a 4B learning pilot, and the full 4B/80B pretraining run remain; no
-model training is authorized by the mapping result.
+149,999,976,054-token pool, and its checkpoint-bound global-dedup package is
+locally verified. The paid dedup canary, production global dedup, final 80B
+selection and shard sealing, a 4B learning pilot, and the full 4B/80B
+pretraining run remain; no model training is authorized by this preparation.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

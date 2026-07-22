@@ -1,9 +1,8 @@
 # Lumi distributed corpus acquisition on AWS Glue v0.1
 
-Status: **the source-built Python 3.11 Lingua wheel and one corrected 8-DPU
-Glue canary pass end to end; Spark output matches the sequential reference,
-all temporary compute/IAM/job resources are deleted, and distributed production
-remains unauthorized**
+Status: **the 150B candidate map is sealed and the checkpoint-bound Glue
+global-dedup package passes local and actual-evidence verification; no dedup
+canary, production dedup, sharding, GPU, or model training is authorized**
 
 ## Why this migration exists
 
@@ -432,6 +431,44 @@ This result seals candidate mapping only. Global exact/near deduplication,
 quality selection into the final 80B mixture, held-out extraction, training
 shards, and any GPU/model training remain separate gates and are not authorized
 by this result.
+
+## Prepared checkpoint-bound global-dedup gate
+
+The next roadmap phase now has a local-only Glue package and runtime contract.
+It does not reread raw internet sources or remap the corpus. It binds the exact
+final map checkpoint to all twelve immutable wave manifests, flattens only the
+verified Parquet outputs, and reuses Lumi's existing source-order exact/MinHash
+Spark deduplication core plus the 38,349 immutable accepted-prefix anchors.
+
+The adapter explicitly supports the verified release migration: Waves 1--7
+belong to release `c31baae5eab5...`, while Waves 8--12 belong to corrected
+release `b7a11166a1ec...`. Every manifest canonical hash, S3 namespace,
+category total, object-inventory digest, document count, token count, and byte
+count must match the final checkpoint. Missing, reordered, repeated, escaped,
+or modified inputs fail before a paid job can be rendered.
+
+| Prepared dedup boundary | Verified value |
+|---|---:|
+| Final map checkpoint | `90ccdacf5b8bff23c87061ec68bbce0d0994f811cdfdccaf3abd09d0d01be59b` |
+| Dedup input-index SHA-256 | `2cd4537a86d6e48e2fa079c1088fef167d856229e208a45284fab216f207d266` |
+| Immutable wave manifests | 12 |
+| Parquet input locations | 56 |
+| Mapped documents | 89,481,434 |
+| Mapped candidate tokens | 149,762,206,414 |
+| Accepted-prefix tokens | 237,769,640 |
+| Total candidate tokens | 149,999,976,054 |
+| Mapped Parquet bytes | 629,842,275,871 |
+| Dedup-output envelope after 100GB reserve | 769,993,852,658 bytes |
+| Local verification | 312 tests passed; Ruff clean |
+
+Canary and production permission are deliberately separate. The first possible
+paid action is one exact **8-DPU, 30-minute structural canary** with a hard Glue
+compute maximum of **$1.76**. Only after that result passes and is independently
+sealed may the owner separately approve one **100-DPU, 24-hour production
+global-dedup run**, whose conservative Glue-compute maximum is **$1,056**.
+Neither envelope authorizes mapping, shard writing, GPU work, 4B training, or
+the 80B-token training run. Failed jobs have zero automatic retries; a new run
+requires a new exact authorization.
 
 ## Reproduction commands
 
