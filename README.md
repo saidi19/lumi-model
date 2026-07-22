@@ -546,7 +546,14 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     final-corpus tests, all 343 collected repository tests with three
     environment-dependent skips, Ruff, evidence hashes, and package integrity
     pass. The consumed authorization is not reusable; no replacement run, GPU
-    work, or model training is authorized.
+    work, or model training is authorized. A fresh non-authorizing replacement
+    package is now sealed from source commit
+    `555f80f8396eaa323da3d86430b33aa81b4e01f9`, with release fingerprint
+    `62c0285b84661ae49e80d2972c072df7b16f625c3b1f8750e0406a4b34b4d551`
+    and five-file manifest SHA-256
+    `45f6abbb997bcadc231ce6a464772bb033bb26667a28d869547f493e766c776e`.
+    Its hashes, ZIP members, release/source/plan/dedup bindings, validator, and
+    generated approval text pass; it has not been uploaded or launched.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -579,9 +586,10 @@ remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
 local final-80B selection/shard contract and bounded paid Glue canary now pass.
 The most recent exact production materialization authorization was consumed by
-a fail-closed baseline archive path mismatch. Its safe local correction passes,
-but a fresh replacement package and new exact approval are still required.
-Production materialization and all model training remain incomplete.
+a fail-closed baseline archive path mismatch. Its safe correction and fresh
+non-authorizing replacement package pass locally, but a new exact approval is
+still required. Production materialization and all model training remain
+incomplete.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

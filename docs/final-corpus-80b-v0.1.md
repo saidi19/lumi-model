@@ -223,7 +223,7 @@ accepts a harmless leading `./`, rejects absolute paths and parent traversal,
 and rejects missing or ambiguous normalized matches. The consumed authorization
 cannot be reused, and no replacement run has been inferred or launched.
 
-## Consumed production package
+## Production package boundary
 
 `configs/glue-final-corpus-production-v0.1.json` and
 `src/lumi/glue_final_corpus_production.py` now define the production-only
@@ -270,22 +270,33 @@ and refuses any job that already ran. The package described below was later
 authorized and consumed by the fail-safe attempt above; that authorization is
 not reusable.
 
-The reproducible local package is bound to source commit
+The consumed reproducible package was bound to source commit
 `3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. Its release fingerprint is
 `1397391b580ae7cd5843c393146b387dcaa997d64998e13caf6fd67379210b27`, and
 its five-entry `manifest.sha256` file hashes to
 `12fc7c470193d228ea36fff78ca60e307ea014dddb5974ea5ffc9d708d0ea242`.
-All five package files and every ZIP member pass independent integrity checks.
+
+After the failure diagnosis and safe normalized-member correction, a fresh
+non-authorizing replacement package was sealed from source commit
+`555f80f8396eaa323da3d86430b33aa81b4e01f9`. Its release fingerprint is
+`62c0285b84661ae49e80d2972c072df7b16f625c3b1f8750e0406a4b34b4d551`,
+and its five-entry `manifest.sha256` file hashes to
+`45f6abbb997bcadc231ce6a464772bb033bb26667a28d869547f493e766c776e`.
+All five replacement files, every ZIP member, the exact source binding, release
+validator, dedup-result binding, plan binding, and generated approval text pass
+independent integrity checks. It creates no authorization and has not been
+uploaded or launched.
+
 After the normalized-member correction, all 18 focused final-corpus tests
 (one environment-dependent skip), all 343 collected repository tests (three
 environment-dependent skips), and repository-wide Ruff pass.
 
 ## Next boundary
 
-The immediate boundary is local only: commit the normalized-member correction,
-seal and independently verify a fresh non-authorizing package, then request a
-new exact owner approval. The failed authorization cannot be reused. After any
-future successful run, its result, all seven checkpoints, 163-shard manifest,
-S3 inventories, and hashes must be independently verified before the consumed
-Glue job/role are removed. The 4B pilot and full 4B/80B training remain later,
-independent approval gates.
+The fresh replacement package is ready, but the failed authorization cannot be
+reused. The next possible action is a new exact owner approval for one 100-DPU
+production selection-and-sharding run under the same 12-hour/`$528` envelope.
+After any future successful run, its result, all seven checkpoints, 163-shard
+manifest, S3 inventories, and hashes must be independently verified before the
+consumed Glue job/role are removed. The 4B pilot and full 4B/80B training remain
+later, independent approval gates.
