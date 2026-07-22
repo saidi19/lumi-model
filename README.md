@@ -479,6 +479,23 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     parity, adversarial, result-contract, full 317-test, and Ruff gates pass. Both
     consumed jobs and IAM roles are gone; no paid retry, sharding, GPU work, or
     model training is authorized.
+59. the final owner-authorized 100-DPU production global-dedup run succeeded at
+    exact source commit `a7aa0d2b2868bd58e54db47fecd280183c9a469c` and release
+    `2efbadc7360971e33e86c52e787c15fc15045a75fed65f5e16eaafbdfa3a4bb5`.
+    Run `jr_4980937909ed42907c36a02f2b4f763c594ad2a2293a41ce72bf8d4da6b45345`
+    completed in 3,580 seconds and consumed 358,041 DPU-seconds, approximately
+    $43.760567 at $0.44/DPU-hour. It globally deduplicated 89,481,434 mapped
+    candidates, accepted 87,823,604, rejected 155 exact and 1,657,675 near
+    duplicates, and selected 119,762,267,075 candidate tokens. Together with
+    the immutable 237,769,640-token prefix, all seven category floors pass at
+    120,000,036,715 tokens and 68,710,018 documents with zero deficit. The
+    official result validator, complete 18-file package manifest, result SHA-256
+    `dbfbf9fe258ec97d5bd844c165157d41d328d0571cbbada5fd4d67750c46b742`,
+    and independently recomputed accepted/rejected S3 inventory hashes all pass.
+    The consumed Glue job and dedicated IAM role are deleted and live absence
+    checks pass; S3 corpus objects remain intact. This seals the 120B
+    deduplicated candidate floor pool; it is not yet the final 80B training mix,
+    training shards, or a trained model.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -492,18 +509,22 @@ source file manifest, fail-closed CCCC decision, and bounded S3-staged EMR
 parity canary are also complete. The distributed production-resume harness,
 corrected Glue runtime/parity canary, and complete 758-source production staging
 phase now pass. Adaptive candidate mapping also passes with a sealed
-149,999,976,054-token pool, and its checkpoint-bound global-dedup package is
-locally verified. Two paid dedup canaries failed safe: the first on an
+149,999,976,054-token pool. Its checkpoint-bound global-dedup package and final
+100-DPU production execution now pass, yielding a hash-verified
+120,000,036,715-token deduplicated floor pool. Two paid dedup canaries failed
+safe: the first on an
 over-strict AWS Spark build suffix check and the second on a wide-row top-K
 executor heap exhaustion. Both causes were corrected, and the final bounded
 checkpoint-bound canary now passes with independently verified output.
-Two production attempts then failed safe: the first exposed a separate
+Two earlier production attempts failed safe: the first exposed a separate
 full-input Parquet heap path, and the second proved that fix before exposing a
 19,150-document LSH hot bucket. Both are now addressed locally by narrow
-memory-safe reads and a bounded, fully instrumented stop-bucket policy; no
-production result was published. A newly authorized production global dedup,
-final 80B selection and shard sealing, a 4B learning pilot, and the full 4B/80B
-pretraining run remain. No model training is authorized by this preparation.
+memory-safe reads and a bounded, fully instrumented stop-bucket policy. The
+final production run passed with 42,436,764 candidate pairs under the 50M cap,
+12 oversized stop buckets, 492 pair-budget stop buckets, and four bounded
+exact-only uncovered documents. Final held-out extraction, 80B mixture
+selection and shard sealing, a 4B learning pilot, and the full 4B/80B pretraining
+run remain. No model training is authorized by this preparation.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
