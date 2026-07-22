@@ -1,11 +1,12 @@
 # Lumi Final 80B Corpus Gate v0.1
 
-Status: **the deterministic 120B-to-80B selection/shard contract passes local
-validation, and its separately authorized bounded Glue canary completed and
-passed independent verification. The consumed Glue job and IAM role are
-deleted. The exact production package is now commit-bound, locally verified,
-and deliberately non-authorizing. Production selection, GPU work, and model
-training remain unlaunched and unauthorized.**
+Status: **the deterministic 120B-to-80B selection/shard contract and bounded
+Glue canary pass. The latest exact production authorization was consumed once,
+then failed closed before candidate selection on a harmless leading `./` in a
+hash-verified baseline tar member. It cost an estimated `$1.024222`, published
+no selected corpus or result, and its Glue job and IAM role are deleted. A
+safe normalized-member correction passes locally; no replacement run, GPU
+work, or model training is authorized.**
 
 ## Why this gate exists
 
@@ -195,7 +196,34 @@ Glue's startup `--conf`, and verifies the live values read-only. The corrected
 canary above exercised that exact path before a replacement production package
 was sealed. The failed authorization is not reusable.
 
-## Prepared production package
+## Fail-safe corrected production attempt
+
+The subsequently authorized package was consumed exactly once by Glue run
+`jr_ec1f3851e12eaced7cefb83af5eb1485b8485b90bc00fc8e5e8b1d41758c7258`.
+It stopped after 83 execution seconds and 8,380 DPU-seconds, an estimated
+`$1.024222` at `$0.44` per DPU-hour, before candidate selection began.
+
+The pinned archive was intact, but its partial baseline member was named
+`./partial-current-shard/tokens.uint16.bin`; the contract named the equivalent
+`partial-current-shard/tokens.uint16.bin`. Python's exact `TarFile.getmember`
+lookup therefore raised `KeyError`. Independent extraction verified the member
+payload SHA-256 as
+`029ab78f2546ac6b45f1f82024129c1b70998fcd5de5571dba5718a1e282b48a`,
+exactly matching the contract. This was a path-lookup mismatch, not corpus
+corruption.
+
+The result and temporary prefixes are empty, there are zero category
+checkpoints and zero selected objects, and the only two run-prefix objects are
+hash-verified immutable baseline copies. Billing stopped and live absence
+checks confirm the consumed Glue job and IAM role are gone. The sealed compact
+record is `reports/glue-final-corpus-production-attempt-v0.1.json`.
+
+The local correction resolves exactly one normalized POSIX tar member. It
+accepts a harmless leading `./`, rejects absolute paths and parent traversal,
+and rejects missing or ambiguous normalized matches. The consumed authorization
+cannot be reused, and no replacement run has been inferred or launched.
+
+## Production package boundary
 
 `configs/glue-final-corpus-production-v0.1.json` and
 `src/lumi/glue_final_corpus_production.py` now define the production-only
@@ -238,24 +266,37 @@ validation all pass.
 The launcher is dry-run by default. Its one-purpose IAM policy can read only
 the accepted prefix and exact bootstrap/baseline objects, can write only the
 authorization-derived run/temp/result prefixes, uses an immutable launch claim,
-and refuses any job that already ran. No authorization artifact was created and
-no AWS API was called while preparing the corrected package.
+and refuses any job that already ran. The package described below was later
+authorized and consumed by the fail-safe attempt above; that authorization is
+not reusable.
 
-The reproducible local package is bound to source commit
+The consumed reproducible package was bound to source commit
 `3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. Its release fingerprint is
 `1397391b580ae7cd5843c393146b387dcaa997d64998e13caf6fd67379210b27`, and
 its five-entry `manifest.sha256` file hashes to
 `12fc7c470193d228ea36fff78ca60e307ea014dddb5974ea5ffc9d708d0ea242`.
-All five package files and every ZIP member pass independent integrity checks.
-The 12 focused production/runtime tests, all 341 collected repository tests
-(three environment-dependent skips), and repository-wide Ruff pass.
+
+After the failure diagnosis and safe normalized-member correction, a fresh
+non-authorizing replacement package was sealed from source commit
+`555f80f8396eaa323da3d86430b33aa81b4e01f9`. Its release fingerprint is
+`62c0285b84661ae49e80d2972c072df7b16f625c3b1f8750e0406a4b34b4d551`,
+and its five-entry `manifest.sha256` file hashes to
+`45f6abbb997bcadc231ce6a464772bb033bb26667a28d869547f493e766c776e`.
+All five replacement files, every ZIP member, the exact source binding, release
+validator, dedup-result binding, plan binding, and generated approval text pass
+independent integrity checks. It creates no authorization and has not been
+uploaded or launched.
+
+After the normalized-member correction, all 18 focused final-corpus tests
+(one environment-dependent skip), all 343 collected repository tests (three
+environment-dependent skips), and repository-wide Ruff pass.
 
 ## Next boundary
 
-The production package gate is complete. The next possible action is one
-separately owner-approved 100-DPU production selection-and-sharding run under
-the exact 12-hour/`$528` envelope above. No approval has been inferred from
-earlier canary or dedup runs. After a successful run, its result, all seven
-checkpoints, 163-shard manifest, S3 inventories, and hashes must be independently
-verified before the consumed Glue job/role are removed. The 4B pilot and full
-4B/80B training remain later, independent approval gates.
+The fresh replacement package is ready, but the failed authorization cannot be
+reused. The next possible action is a new exact owner approval for one 100-DPU
+production selection-and-sharding run under the same 12-hour/`$528` envelope.
+After any future successful run, its result, all seven checkpoints, 163-shard
+manifest, S3 inventories, and hashes must be independently verified before the
+consumed Glue job/role are removed. The 4B pilot and full 4B/80B training remain
+later, independent approval gates.
