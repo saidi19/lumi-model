@@ -516,7 +516,7 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     matched every input/output inventory and result hash. The consumed Glue job
     and IAM role are deleted. Production selection, GPU work, and model training
     remain separately gated and unauthorized.
-61. the exact production final-80B selection/sharding harness is now sealed at
+61. the exact production final-80B selection/sharding harness was sealed at
     source commit `3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. It independently
     inventories all 2,772 accepted objects before reading rows, deterministically
     selects all seven category targets, writes one immutable checkpoint per
@@ -534,10 +534,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     The corrected canary projects about 168 minutes/`$123.140111` linearly or
     504 minutes/`$369.420211` with the sealed 3x safety factor. The actual hard
     boundary remains one 100-DPU run, 12 hours, `$528`, zero retries, 750GB new
-    output, no GPU, and no model training. Twelve focused tests, all 341
-    collected repository tests with three environment-dependent skips, Ruff,
-    package hashes, and ZIP integrity pass. No authorization artifact, AWS
-    upload, or corrected production run was created.
+    output, no GPU, and no model training. The separately authorized corrected
+    run was then consumed exactly once. It failed closed before candidate
+    selection after 83 execution seconds and 8,380 DPU-seconds (estimated
+    `$1.024222`) because a hash-verified tar member used the semantically
+    equivalent leading-`./` path form. It published no selected corpus or
+    result; only two immutable baseline copies exist and both hashes pass.
+    Billing stopped, and the consumed Glue job and IAM role are deleted. The
+    local correction safely normalizes exactly one tar member while rejecting
+    absolute, parent-traversal, missing, and ambiguous paths. Eighteen focused
+    final-corpus tests, all 343 collected repository tests with three
+    environment-dependent skips, Ruff, evidence hashes, and package integrity
+    pass. The consumed authorization is not reusable; no replacement run, GPU
+    work, or model training is authorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -569,9 +578,10 @@ and shard sealing, a 4B learning pilot, and the full 4B/80B pretraining run
 remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
 local final-80B selection/shard contract and bounded paid Glue canary now pass.
-The exact production materialization package also passes locally and waits for
-one separate owner approval. Production materialization and all model training
-remain unapproved.
+The most recent exact production materialization authorization was consumed by
+a fail-closed baseline archive path mismatch. Its safe local correction passes,
+but a fresh replacement package and new exact approval are still required.
+Production materialization and all model training remain incomplete.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start

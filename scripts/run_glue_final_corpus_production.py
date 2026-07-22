@@ -11,7 +11,7 @@ import shutil
 import tarfile
 import tempfile
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
@@ -46,6 +46,13 @@ def _sha256_file(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def _normalized_tar_member_name(value: object) -> str:
+    path = PurePosixPath(str(value))
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("Glue final-corpus baseline archive member is unsafe")
+    return "/".join(part for part in path.parts if part not in ("", "."))
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -360,7 +367,19 @@ def _materialize_partial_baseline(
         with archive_path.open("rb") as source, tar_path.open("wb") as destination:
             zstandard.ZstdDecompressor().copy_stream(source, destination)
         with tarfile.open(tar_path, mode="r:") as archive_handle:
-            member = archive_handle.getmember(str(partial["member"]))
+            expected_member = _normalized_tar_member_name(partial["member"])
+            if not expected_member:
+                raise ValueError("Glue final-corpus baseline member is empty")
+            matches = [
+                candidate
+                for candidate in archive_handle.getmembers()
+                if _normalized_tar_member_name(candidate.name) == expected_member
+            ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "Glue final-corpus baseline archive member is missing or ambiguous"
+                )
+            member = matches[0]
             if not member.isfile() or member.size != int(partial["bytes"]):
                 raise ValueError("Glue final-corpus baseline archive member changed")
             source = archive_handle.extractfile(member)

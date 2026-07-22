@@ -430,7 +430,7 @@ def test_runtime_materializes_verified_partial_baseline(tmp_path: Path) -> None:
     token_sha = hashlib.sha256(token_bytes).hexdigest()
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w:") as handle:
-        info = tarfile.TarInfo("partial-current-shard/tokens.uint16.bin")
+        info = tarfile.TarInfo("./partial-current-shard/tokens.uint16.bin")
         info.size = len(token_bytes)
         handle.addfile(info, io.BytesIO(token_bytes))
     archive_bytes = zstandard.ZstdCompressor().compress(tar_buffer.getvalue())
@@ -480,3 +480,46 @@ def test_runtime_materializes_verified_partial_baseline(tmp_path: Path) -> None:
     assert s3.uploaded[
         ("destination", f"lumi/final/packed/science_and_education/{token_sha}.uint16.bin")
     ] == token_bytes
+
+
+def test_runtime_rejects_unsafe_tar_member_names() -> None:
+    namespace = runpy.run_path(
+        ROOT / "scripts" / "run_glue_final_corpus_production.py",
+        run_name="lumi_glue_final_corpus_production_tar_name_test",
+    )
+    normalize = namespace["_normalized_tar_member_name"]
+    assert normalize("partial-current-shard/tokens.uint16.bin") == (
+        "partial-current-shard/tokens.uint16.bin"
+    )
+    assert normalize("./partial-current-shard/tokens.uint16.bin") == (
+        "partial-current-shard/tokens.uint16.bin"
+    )
+    with pytest.raises(ValueError, match="unsafe"):
+        normalize("../partial-current-shard/tokens.uint16.bin")
+    with pytest.raises(ValueError, match="unsafe"):
+        normalize("/partial-current-shard/tokens.uint16.bin")
+
+
+def test_failed_production_attempt_report_is_fail_closed() -> None:
+    report = json.loads(
+        (
+            ROOT
+            / "reports"
+            / "glue-final-corpus-production-attempt-v0.1.json"
+        ).read_text()
+    )
+    assert report["status"] == "failed_closed_before_candidate_selection"
+    assert report["compute"] == {
+        "dpu_seconds": 8380,
+        "estimated_usd_at_0_44_per_dpu_hour": "1.024222",
+        "execution_seconds": 83,
+    }
+    assert report["output"]["result_prefix_empty"] is True
+    assert report["output"]["category_checkpoints"] == 0
+    assert report["output"]["corrupt_objects_detected"] is False
+    assert report["decision"]["replacement_run"] == "not_authorized"
+    assert report["cleanup"] == {
+        "billing_resource_active": False,
+        "job": "deleted_and_live_absence_verified",
+        "role": "deleted_and_live_absence_verified",
+    }
