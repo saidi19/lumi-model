@@ -3,8 +3,9 @@
 Status: **the deterministic 120B-to-80B selection/shard contract passes local
 validation, and its separately authorized bounded Glue canary completed and
 passed independent verification. The consumed Glue job and IAM role are
-deleted. Production selection, GPU work, and model training remain unlaunched
-and unauthorized.**
+deleted. The exact production package is now commit-bound, locally verified,
+and deliberately non-authorizing. Production selection, GPU work, and model
+training remain unlaunched and unauthorized.**
 
 ## Why this gate exists
 
@@ -175,10 +176,67 @@ consumed Glue job and dedicated IAM role were then deleted. The compact sealed
 record is `reports/glue-final-corpus-canary-result-v0.1.json`; generated S3
 payloads remain outside Git.
 
+## Prepared production package
+
+`configs/glue-final-corpus-production-v0.1.json` and
+`src/lumi/glue_final_corpus_production.py` now define the production-only
+selection/sharding boundary proven by the canary. The package remains
+non-authorizing until a separate exact owner approval creates a short-lived
+authorization artifact. Its fixed envelope is:
+
+- one Glue 5.1 job in `us-east-1`, 100 G.1X workers, zero retries, and one
+  concurrent run;
+- a 12-hour hard timeout and `$528.000000` maximum Glue compute at the pinned
+  `$0.44` per DPU-hour rate;
+- the exact 2,772-object, `507,737,434,761`-byte accepted-candidate inventory;
+- 1,600 deterministic selection partitions, seven immutable category
+  checkpoints, 160 new approximately 500M-token shards, and exactly 163 final
+  manifest entries after the three preserved baseline shards;
+- a `750,000,000,000`-byte hard ceiling on newly materialized selected
+  Parquet, copied/materialized baseline shards, and packed uint16 shards;
+- no GPU permission and no model-training permission.
+
+The canary calibration processed `301,453,386` input tokens in 1,887
+DPU-seconds. Linear projection for the full accepted pool is 749,673
+DPU-seconds, approximately 125 minutes on 100 DPU and `$91.626700`. The sealed
+planning rule applies a 3x safety factor: 2,249,019 DPU-seconds, approximately
+375 minutes and `$274.880100`. These are measured projections, not guarantees;
+the 12-hour/`$528` boundary remains the actual fail-closed limit. Projected
+maximum new output is `512,395,734,963` bytes, below the 750GB cap.
+
+Before any row is selected, the runtime independently inventories every input
+object, validates the exact release, plan, canary report, authorization, Python
+3.11 and Spark 3.5.6 bindings, and assigns every input object to exactly one
+category. It then hash-ranks and selects each category, writes an immutable
+selected inventory, packs content-addressed uint16 shards, and seals a category
+checkpoint before advancing. The two existing full baseline shards are
+downloaded and rehashed before immutable publication; the partial baseline is
+extracted from its hash-pinned archive member and independently rehashed.
+Final publication is allowed only after selection-result, shard-manifest,
+document/token/byte conservation, baseline, category, runtime, and output-cap
+validation all pass.
+
+The launcher is dry-run by default. Its one-purpose IAM policy can read only
+the accepted prefix and exact bootstrap/baseline objects, can write only the
+authorization-derived run/temp/result prefixes, uses an immutable launch claim,
+and refuses any job that already ran. No authorization artifact was created and
+no AWS API was called while preparing this package.
+
+The reproducible local package is bound to source commit
+`227721d452e2baa9dc1e59311eb2d203b14f3561`. Its release fingerprint is
+`b2c5758ec846f3f9f4b75dba20c28c52125cee5753fadf75352c7546a8525a5d`, and
+its five-entry `manifest.sha256` file hashes to
+`43f7a914a2c7a120fed79f43573c260fa345de8a988670cbe66a547f9091bcf2`.
+All five package files and every ZIP member pass independent integrity checks.
+The five focused production tests, all 323 collected non-socket repository
+tests (three environment-dependent skips), and repository-wide Ruff pass.
+
 ## Next boundary
 
-The bounded canary gate is complete. The next roadmap action is to prepare the
-exact production 80B selection-and-sharding package, estimate its measured
-Glue envelope from this canary, and stop for a separate owner approval before
-launch. A 4B pilot and the full 4B/80B training remain later, independent
-approval gates.
+The production package gate is complete. The next possible action is one
+separately owner-approved 100-DPU production selection-and-sharding run under
+the exact 12-hour/`$528` envelope above. No approval has been inferred from
+earlier canary or dedup runs. After a successful run, its result, all seven
+checkpoints, 163-shard manifest, S3 inventories, and hashes must be independently
+verified before the consumed Glue job/role are removed. The 4B pilot and full
+4B/80B training remain later, independent approval gates.

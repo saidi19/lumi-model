@@ -515,6 +515,22 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     independently matched every input/output inventory and result hash. The
     consumed Glue job and IAM role are deleted. Production selection, GPU work,
     and model training remain separately gated and unauthorized.
+61. the exact production final-80B selection/sharding harness is now sealed at
+    source commit `227721d452e2baa9dc1e59311eb2d203b14f3561`. It independently
+    inventories all 2,772 accepted objects before reading rows, deterministically
+    selects all seven category targets, writes one immutable checkpoint per
+    category, preserves and rehashes the three baseline shards, and requires a
+    163-entry content-addressed uint16 manifest with exact document/token/byte
+    conservation. The non-authorizing release fingerprint is
+    `b2c5758ec846f3f9f4b75dba20c28c52125cee5753fadf75352c7546a8525a5d`;
+    its five-file package manifest hashes to
+    `43f7a914a2c7a120fed79f43573c260fa345de8a988670cbe66a547f9091bcf2`.
+    The real canary projects about 125 minutes/`$91.626700` linearly or 375
+    minutes/`$274.880100` with the sealed 3x safety factor. The actual hard
+    boundary remains one 100-DPU run, 12 hours, `$528`, zero retries, 750GB new
+    output, no GPU, and no model training. Five focused tests, the full
+    non-socket suite, Ruff, package hashes, and ZIP integrity pass. No
+    authorization artifact, AWS upload, or production run was created.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -546,7 +562,9 @@ and shard sealing, a 4B learning pilot, and the full 4B/80B pretraining run
 remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
 local final-80B selection/shard contract and bounded paid Glue canary now pass.
-Production materialization and all model training remain unapproved.
+The exact production materialization package also passes locally and waits for
+one separate owner approval. Production materialization and all model training
+remain unapproved.
 The completed 150M and 1B pilot checkpoints are not production-quality models.
 
 ## Quick start
