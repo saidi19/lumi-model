@@ -31,6 +31,21 @@ CANARY_ORDER_COLUMNS = (
     "document_id",
 )
 
+PRODUCTION_SELECTION_COLUMNS = (
+    "document_id",
+    "source_ordinal",
+    "source_line",
+    "segment_index",
+    "category",
+    "token_count",
+)
+
+MEMORY_SAFE_PARQUET_CONFIG = (
+    ("spark.sql.parquet.enableVectorizedReader", "false"),
+    ("spark.sql.parquet.columnarReaderBatchSize", "64"),
+    ("spark.sql.files.maxPartitionBytes", str(64 * 1024 * 1024)),
+)
+
 
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
@@ -169,17 +184,48 @@ def _bounded_canary_candidates(
     )
 
 
+def _configure_memory_safe_parquet_reader(spark: Any) -> dict[str, str]:
+    """Prevent wide text/binary rows from exhausting a Glue executor heap."""
+
+    for name, value in MEMORY_SAFE_PARQUET_CONFIG:
+        spark.conf.set(name, value)
+    actual = {name: str(spark.conf.get(name)) for name, _ in MEMORY_SAFE_PARQUET_CONFIG}
+    expected = dict(MEMORY_SAFE_PARQUET_CONFIG)
+    if actual != expected:
+        raise RuntimeError(
+            f"Glue global-dedup memory-safe Parquet config changed: {actual}"
+        )
+    return actual
+
+
+def _narrow_dedup_candidates(candidates: Any, *, columns: tuple[str, ...]) -> Any:
+    """Project away text and token payloads before any cache or dedup action."""
+
+    return candidates.select(*columns)
+
+
+def _accepted_selection_candidates(candidates: Any, accepted_ids: Any) -> Any:
+    """Join accepted IDs to only the metadata needed for ordered selection."""
+
+    return candidates.select(*PRODUCTION_SELECTION_COLUMNS).join(
+        accepted_ids.select("document_id", "dedup_round"),
+        "document_id",
+        "inner",
+    )
+
+
 def main() -> None:
     import boto3
     from awsglue.context import GlueContext
     from awsglue.job import Job
     from awsglue.utils import getResolvedOptions
-    from pyspark import SparkContext, SparkFiles
+    from pyspark import SparkContext, SparkFiles, StorageLevel
     from pyspark.sql import functions as F
 
     from lumi.distributed_baseline import anchor_from_json
     from lumi.distributed_corpus import MinHashCodec
     from lumi.glue_corpus import (
+        DEDUP_CANDIDATE_COLUMNS,
         candidate_spark_schema,
         dedup_anchor_spark_schema,
         select_ordered_token_prefix,
@@ -197,6 +243,7 @@ def main() -> None:
     context = SparkContext.getOrCreate()
     glue = GlueContext(context)
     spark = glue.spark_session
+    parquet_runtime = _configure_memory_safe_parquet_reader(spark)
     job = Job(glue)
     job.init(args["JOB_NAME"], args)
     release_path = Path(SparkFiles.get(args["LUMI_RELEASE_FILE"]))
@@ -222,10 +269,13 @@ def main() -> None:
     if input_index["input_index_sha256"] != release["input_index_sha256"]:
         raise ValueError("Glue global-dedup input index differs from release")
 
-    runtime = _runtime(
-        spark,
-        expected_spark_version=str(release["runtime"]["spark_version"]),
-    )
+    runtime = {
+        **_runtime(
+            spark,
+            expected_spark_version=str(release["runtime"]["spark_version"]),
+        ),
+        "parquet_reader": parquet_runtime,
+    }
     anchor_artifact = release["artifacts"]["initial_anchors"]
     anchor_path = _verified_spark_file(
         anchor_artifact, str(anchor_artifact["s3_uri"])
@@ -257,8 +307,7 @@ def main() -> None:
             ),
             functions=F,
         )
-    candidates = candidates.persist()
-    totals = candidates.agg(
+    totals = candidates.select("token_count").agg(
         F.count(F.lit(1)).alias("documents"), F.sum("token_count").alias("tokens")
     ).first()
     candidate_documents = int(totals["documents"] or 0)
@@ -281,8 +330,12 @@ def main() -> None:
         f"{release['input_index_sha256']}/{token}"
     )
     caps = release["deduplication"]
-    dedup = spark_deduplicate_candidates(
+    dedup_candidates = _narrow_dedup_candidates(
         candidates,
+        columns=DEDUP_CANDIDATE_COLUMNS,
+    ).persist(StorageLevel.DISK_ONLY)
+    dedup = spark_deduplicate_candidates(
+        dedup_candidates,
         codec=codec,
         checkpoint_uri=checkpoint_uri,
         anchors=anchor_frame,
@@ -290,14 +343,14 @@ def main() -> None:
         maximum_lsh_bucket_documents=int(caps["maximum_lsh_bucket_documents"]),
         maximum_candidate_pairs=int(caps["maximum_candidate_pairs"]),
     )
-    accepted = dedup["accepted"].persist()
+    accepted_ids = dedup["accepted_ids"].persist(StorageLevel.DISK_ONLY)
     s3 = boto3.client("s3", region_name=str(release["region"]))
 
     if mode == "canary":
         prefix = f"{release['output']['canary_prefix']}/{token}"
         accepted_key = f"{prefix}/accepted-ids"
         rejected_key = f"{prefix}/rejected-ids"
-        accepted.select("document_id", "dedup_round").write.mode(
+        accepted_ids.select("document_id", "dedup_round").write.mode(
             "errorifexists"
         ).parquet(f"s3://{bucket}/{accepted_key}")
         dedup["rejected_ids"].write.mode("errorifexists").parquet(
@@ -333,6 +386,9 @@ def main() -> None:
             "status": "pass_structural_canary",
         }
     else:
+        accepted = _accepted_selection_candidates(
+            candidates, accepted_ids
+        ).persist(StorageLevel.DISK_ONLY)
         selected_frames = []
         category_results = []
         partitions = max(1, int(spark.conf.get("spark.sql.shuffle.partitions")))
@@ -387,7 +443,12 @@ def main() -> None:
         prefix = f"{release['output']['production_prefix']}/{token}"
         accepted_key = f"{prefix}/accepted-candidates"
         rejected_key = f"{prefix}/rejected-ids"
-        selected_all.write.mode("errorifexists").partitionBy("category").parquet(
+        selected_payload = candidates.join(
+            selected_all.select("document_id", "dedup_round"),
+            "document_id",
+            "inner",
+        )
+        selected_payload.write.mode("errorifexists").partitionBy("category").parquet(
             f"s3://{bucket}/{accepted_key}"
         )
         dedup["rejected_ids"].write.mode("errorifexists").parquet(
@@ -432,13 +493,14 @@ def main() -> None:
         selected_all.unpersist()
         for selected, _ in selected_frames:
             selected.unpersist()
+        accepted.unpersist()
 
     result_key = f"{release['output']['result_prefix']}/{token}/result.json"
     validate_glue_global_dedup_result(report, release, authorization)
     _put_immutable(report, bucket=bucket, key=result_key, s3_client=s3)
     print(json.dumps({**report, "result_key": result_key}, indent=2, sort_keys=True))
-    accepted.unpersist()
-    candidates.unpersist()
+    accepted_ids.unpersist()
+    dedup_candidates.unpersist()
     anchor_frame.unpersist()
     job.commit()
 
