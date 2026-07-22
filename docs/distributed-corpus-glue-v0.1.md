@@ -507,6 +507,48 @@ and the hash-sealed attempt evidence is archived locally. This correction does
 not authorize another paid canary. The corrected tree passes 313/313 tests and
 Ruff lint.
 
+## Consumed corrected global-dedup canary
+
+The separately authorized corrected package used release fingerprint
+`69649ed40b753a80694c660417b9316546f944c3b578055db094dc1a6afd4482`
+and run
+`jr_de1baf41cc7054a06354468611fb133e3d99d719d9c80d0672ed0ab5111481d0`.
+It accepted Glue's pinned `3.5.6-amzn-1` runtime, loaded the immutable resume
+anchors, and read the single bounded candidate input. It then failed while
+materializing the deterministic 100,000-document canary prefix. The query
+applied `orderBy(...).limit(100000)` to the complete candidate schema, so
+Spark's `TakeOrderedAndProject` retained wide text, token, provenance, and
+MinHash payloads on one executor. Four attempts reported
+`java.lang.OutOfMemoryError: Java heap space`; the later shuffle-fetch failures
+were consequences of those executor deaths.
+
+| Corrected canary evidence | Verified value |
+|---|---:|
+| Glue state | `FAILED` |
+| Execution time | 212 seconds |
+| DPU-seconds | 1,703 |
+| Estimated compute at $0.44/DPU-hour | $0.208144 |
+| Candidate rows available before the cap | 249,831 |
+| Authorized canary document cap | 100,000 |
+| Checkpoint-prefix objects | 0 |
+| Canary-output objects | 0 |
+| Result objects | 0 |
+| Production-output objects | 0 |
+| Automatic or manual retry | none |
+
+The failure is a canary sampling implementation defect, not evidence of source
+or mapped-Parquet corruption. The local correction projects only
+`source_ordinal`, `source_line`, `segment_index`, and `document_id` before the
+ordered limit, broadcasts those narrow keys, and left-semi-joins them back to
+the original candidate frame. A local Spark 3.5.6 physical-plan smoke confirms
+that `TakeOrderedAndProject` outputs only those four keys and the final join is
+a `BroadcastHashJoin LeftSemi`; the same deterministic first documents are
+selected while wide text stays outside the top-K heap. The consumed Glue job
+and least-privilege role are deleted, the four bounded output namespaces remain
+empty, and the durable failure manifest verifies every archived evidence file.
+The full tree passes 314/314 tests and Ruff lint. This fix authorizes no paid
+retry, production dedup, sharding, GPU work, or model training.
+
 ## Reproduction commands
 
 ```bash

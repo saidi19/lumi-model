@@ -24,6 +24,13 @@ GLUE_REQUESTED_OPTIONS = (
     "LUMI_RELEASE_FILE",
 )
 
+CANARY_ORDER_COLUMNS = (
+    "source_ordinal",
+    "source_line",
+    "segment_index",
+    "document_id",
+)
+
 
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
@@ -141,6 +148,27 @@ def _runtime(spark: Any, *, expected_spark_version: str) -> dict[str, Any]:
     }
 
 
+def _bounded_canary_candidates(
+    candidates: Any, *, maximum_documents: int, functions: Any
+) -> Any:
+    """Select the deterministic canary prefix without sorting wide document rows."""
+
+    if maximum_documents <= 0:
+        raise ValueError("Glue global-dedup canary document cap must be positive")
+    keys = (
+        candidates.select(*CANARY_ORDER_COLUMNS)
+        .orderBy(
+            *[functions.col(name).asc() for name in CANARY_ORDER_COLUMNS]
+        )
+        .limit(maximum_documents)
+    )
+    return candidates.join(
+        functions.broadcast(keys),
+        on=list(CANARY_ORDER_COLUMNS),
+        how="left_semi",
+    )
+
+
 def main() -> None:
     import boto3
     from awsglue.context import GlueContext
@@ -222,9 +250,12 @@ def main() -> None:
         raise RuntimeError("Glue global dedup has no Parquet inputs")
     candidates = spark.read.schema(candidate_spark_schema()).parquet(*candidate_uris)
     if mode == "canary":
-        order = ["source_ordinal", "source_line", "segment_index", "document_id"]
-        candidates = candidates.orderBy(*[F.col(name).asc() for name in order]).limit(
-            int(release["jobs"]["canary"]["maximum_candidate_documents"])
+        candidates = _bounded_canary_candidates(
+            candidates,
+            maximum_documents=int(
+                release["jobs"]["canary"]["maximum_candidate_documents"]
+            ),
+            functions=F,
         )
     candidates = candidates.persist()
     totals = candidates.agg(
