@@ -150,15 +150,19 @@ Spark execution proof before production materialization.
 
 ## Verified AWS canary result
 
-The one owner-authorized run used release
-`eb2ac594a0719c9f03806290d0ea109d68756dfbf2a9fb3e5119218a97a2bfb2`
+The corrected owner-authorized run used release
+`792a8a604244282655ad5f1f9db69bf39b2ca885c477e2a8a8492eb4f1419de2`
 and authorization
-`9036630123cf74bda8ea2cc07b3c8c7607b08fa7bdcca05deec69d1f64ea220e`.
+`34278ac482691fc9feab90be5c200c0f0c3d60fd2869cb2fd97667e8b61ba8ac`.
 Glue run
-`jr_5e8e8b1b2e904819fb760dd1d0218eed5ab9604970163a047114b05a5ec0dbb4`
-finished `SUCCEEDED` in 235 execution seconds, consumed 1,887 DPU-seconds, and
-cost an estimated `$0.230633` at `$0.44` per DPU-hour. It stayed inside the
+`jr_d21c36b266cefc068da3bdc575779d8adb69ed447f69bd131ed4570e531ea193`
+finished `SUCCEEDED` in 317 execution seconds, consumed 2,536 DPU-seconds, and
+cost an estimated `$0.309956` at `$0.44` per DPU-hour. It stayed inside the
 8-worker, 30-minute, `$1.76` envelope with zero retries.
+
+The run also verified Spark `3.5.6-amzn-1` and every static setting, including
+`spark.speculation=false`, after Glue supplied them at Spark startup. No live
+Spark configuration mutation was required.
 
 The run independently matched the complete input inventory of 2,772 objects,
 `507,737,434,761` bytes, `68,671,669` documents, and `119,762,267,075`
@@ -169,12 +173,27 @@ Selected output occupied `31,041,302` bytes; packed output occupied
 `14,052,184` bytes, exactly two bytes per selected token.
 
 The canonical result SHA-256 is
-`171974e1fc329b0ede47c2759d7f85a44f2561e68d7322ee6c97966ccaad49ac`.
+`e5da85af1b58c00f58de395e5041aaf5881d236570d4c7a1df49861babc17eff`.
 The release, authorization, input, plan, baseline heads, result conservation,
 content-addressed output inventories, and local evidence hashes all pass. The
 consumed Glue job and dedicated IAM role were then deleted. The compact sealed
 record is `reports/glue-final-corpus-canary-result-v0.1.json`; generated S3
 payloads remain outside Git.
+
+## Fail-safe historical production attempt
+
+The earlier production package was authorized and consumed once. Glue stopped
+after 51 execution seconds and 5,153 DPU-seconds because its production-only
+entry point attempted to change static `spark.speculation` through
+`SparkSession.conf` after Spark startup. AWS reported `CANNOT_MODIFY_CONFIG`
+before input processing began. The run prefix and result prefix remained empty,
+billing stopped, and independent evidence records no corrupt or partial
+production output.
+
+The permanent correction centralizes all static Spark settings, passes them via
+Glue's startup `--conf`, and verifies the live values read-only. The corrected
+canary above exercised that exact path before a replacement production package
+was sealed. The failed authorization is not reusable.
 
 ## Prepared production package
 
@@ -196,11 +215,11 @@ authorization artifact. Its fixed envelope is:
   Parquet, copied/materialized baseline shards, and packed uint16 shards;
 - no GPU permission and no model-training permission.
 
-The canary calibration processed `301,453,386` input tokens in 1,887
-DPU-seconds. Linear projection for the full accepted pool is 749,673
-DPU-seconds, approximately 125 minutes on 100 DPU and `$91.626700`. The sealed
-planning rule applies a 3x safety factor: 2,249,019 DPU-seconds, approximately
-375 minutes and `$274.880100`. These are measured projections, not guarantees;
+The corrected canary calibration processed `301,453,386` input tokens in 2,536
+DPU-seconds. Linear projection for the full accepted pool is 1,007,510
+DPU-seconds, approximately 168 minutes on 100 DPU and `$123.140111`. The sealed
+planning rule applies a 3x safety factor: 3,022,529 DPU-seconds, approximately
+504 minutes and `$369.420211`. These are measured projections, not guarantees;
 the 12-hour/`$528` boundary remains the actual fail-closed limit. Projected
 maximum new output is `512,395,734,963` bytes, below the 750GB cap.
 
@@ -220,16 +239,16 @@ The launcher is dry-run by default. Its one-purpose IAM policy can read only
 the accepted prefix and exact bootstrap/baseline objects, can write only the
 authorization-derived run/temp/result prefixes, uses an immutable launch claim,
 and refuses any job that already ran. No authorization artifact was created and
-no AWS API was called while preparing this package.
+no AWS API was called while preparing the corrected package.
 
 The reproducible local package is bound to source commit
-`227721d452e2baa9dc1e59311eb2d203b14f3561`. Its release fingerprint is
-`b2c5758ec846f3f9f4b75dba20c28c52125cee5753fadf75352c7546a8525a5d`, and
+`3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. Its release fingerprint is
+`1397391b580ae7cd5843c393146b387dcaa997d64998e13caf6fd67379210b27`, and
 its five-entry `manifest.sha256` file hashes to
-`43f7a914a2c7a120fed79f43573c260fa345de8a988670cbe66a547f9091bcf2`.
+`12fc7c470193d228ea36fff78ca60e307ea014dddb5974ea5ffc9d708d0ea242`.
 All five package files and every ZIP member pass independent integrity checks.
-The five focused production tests, all 323 collected non-socket repository
-tests (three environment-dependent skips), and repository-wide Ruff pass.
+The 12 focused production/runtime tests, all 341 collected repository tests
+(three environment-dependent skips), and repository-wide Ruff pass.
 
 ## Next boundary
 

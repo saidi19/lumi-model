@@ -508,29 +508,36 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     deterministic selection across two Spark partition counts, packs tiny
     uint16 shards, and conserves documents, tokens, bytes, and output prefixes.
     Its launcher defaults to dry-run and keeps bootstrap arguments
-    non-overridable. The separately owner-authorized 8-DPU canary then passed
-    in 235 execution seconds using 1,887 DPU-seconds (approximately
-    `$0.230633`). It selected `7,026,092` tokens across all seven categories,
-    passed partition parity, packed 28 content-addressed uint16 objects, and
-    independently matched every input/output inventory and result hash. The
-    consumed Glue job and IAM role are deleted. Production selection, GPU work,
-    and model training remain separately gated and unauthorized.
+    non-overridable. The corrected, separately owner-authorized 8-DPU canary
+    passed in 317 execution seconds using 2,536 DPU-seconds (approximately
+    `$0.309956`). It verified the startup-only Spark configuration read-only,
+    selected `7,026,092` tokens across all seven categories, passed partition
+    parity, packed 28 content-addressed uint16 objects, and independently
+    matched every input/output inventory and result hash. The consumed Glue job
+    and IAM role are deleted. Production selection, GPU work, and model training
+    remain separately gated and unauthorized.
 61. the exact production final-80B selection/sharding harness is now sealed at
-    source commit `227721d452e2baa9dc1e59311eb2d203b14f3561`. It independently
+    source commit `3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. It independently
     inventories all 2,772 accepted objects before reading rows, deterministically
     selects all seven category targets, writes one immutable checkpoint per
     category, preserves and rehashes the three baseline shards, and requires a
     163-entry content-addressed uint16 manifest with exact document/token/byte
-    conservation. The non-authorizing release fingerprint is
-    `b2c5758ec846f3f9f4b75dba20c28c52125cee5753fadf75352c7546a8525a5d`;
+    conservation. The first production attempt failed closed before data
+    processing when Glue rejected a static `spark.speculation` mutation; it
+    published zero production/result objects, stopped billing, and left no
+    corrupt corpus. The fix moves every static setting into Glue's startup
+    `--conf` and verifies it read-only. The corrected non-authorizing release
+    fingerprint is
+    `1397391b580ae7cd5843c393146b387dcaa997d64998e13caf6fd67379210b27`;
     its five-file package manifest hashes to
-    `43f7a914a2c7a120fed79f43573c260fa345de8a988670cbe66a547f9091bcf2`.
-    The real canary projects about 125 minutes/`$91.626700` linearly or 375
-    minutes/`$274.880100` with the sealed 3x safety factor. The actual hard
+    `12fc7c470193d228ea36fff78ca60e307ea014dddb5974ea5ffc9d708d0ea242`.
+    The corrected canary projects about 168 minutes/`$123.140111` linearly or
+    504 minutes/`$369.420211` with the sealed 3x safety factor. The actual hard
     boundary remains one 100-DPU run, 12 hours, `$528`, zero retries, 750GB new
-    output, no GPU, and no model training. Five focused tests, the full
-    non-socket suite, Ruff, package hashes, and ZIP integrity pass. No
-    authorization artifact, AWS upload, or production run was created.
+    output, no GPU, and no model training. Twelve focused tests, all 341
+    collected repository tests with three environment-dependent skips, Ruff,
+    package hashes, and ZIP integrity pass. No authorization artifact, AWS
+    upload, or corrected production run was created.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
