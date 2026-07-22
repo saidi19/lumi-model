@@ -13,6 +13,7 @@ from typing import Any
 
 from .final_corpus import build_final_corpus_plan, final_corpus_plan_fingerprint
 from .glue_canary import _artifact, _valid_commit, _write_bytes_atomic, _zip_code
+from .glue_runtime import FINAL_CORPUS_SPARK_CONFIG, glue_conf_argument
 from .production_corpus import _canonical_json_bytes, _read_json, _sha256_file
 
 SCHEMA_VERSION = 1
@@ -811,6 +812,7 @@ def build_glue_final_corpus_canary_job_definition(
             "--LUMI_FINAL_PLAN_FILE": basenames[1],
             "--LUMI_RELEASE_FILE": basenames[0],
             "--TempDir": temp_uri,
+            "--conf": glue_conf_argument(FINAL_CORPUS_SPARK_CONFIG),
             "--enable-auto-scaling": "false",
             "--extra-files": ",".join(files),
             "--extra-py-files": release["artifacts"]["code_archive"]["s3_uri"],

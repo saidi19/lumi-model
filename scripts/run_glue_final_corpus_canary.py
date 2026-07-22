@@ -30,13 +30,6 @@ ORDER_COLUMNS = (
     "segment_index",
 )
 
-MEMORY_SAFE_PARQUET_CONFIG = (
-    ("spark.sql.parquet.enableVectorizedReader", "false"),
-    ("spark.sql.parquet.columnarReaderBatchSize", "64"),
-    ("spark.sql.files.maxPartitionBytes", str(64 * 1024 * 1024)),
-)
-
-
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
 
@@ -175,15 +168,6 @@ def _category_object_uris(
     return output
 
 
-def _configure_spark(spark: Any) -> dict[str, str]:
-    for name, value in MEMORY_SAFE_PARQUET_CONFIG:
-        spark.conf.set(name, value)
-    actual = {name: str(spark.conf.get(name)) for name, _ in MEMORY_SAFE_PARQUET_CONFIG}
-    if actual != dict(MEMORY_SAFE_PARQUET_CONFIG):
-        raise RuntimeError("Glue final-corpus Parquet configuration changed")
-    return actual
-
-
 def _selection_digest(frame: Any) -> str:
     digest = hashlib.sha256()
     for row in frame.select(*ORDER_COLUMNS, "token_count").orderBy(
@@ -299,12 +283,16 @@ def main() -> None:
         validate_glue_final_corpus_canary_release,
         validate_glue_final_corpus_canary_result,
     )
+    from lumi.glue_runtime import (
+        FINAL_CORPUS_SPARK_CONFIG,
+        verify_spark_configuration,
+    )
 
     args = getResolvedOptions(__import__("sys").argv, list(GLUE_REQUESTED_OPTIONS))
     context = SparkContext.getOrCreate()
     glue = GlueContext(context)
     spark = glue.spark_session
-    parquet_runtime = _configure_spark(spark)
+    parquet_runtime = verify_spark_configuration(spark, FINAL_CORPUS_SPARK_CONFIG)
     job = Job(glue)
     job.init(args["JOB_NAME"], args)
     release_path = Path(SparkFiles.get(args["LUMI_RELEASE_FILE"]))

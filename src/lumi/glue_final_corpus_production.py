@@ -20,6 +20,7 @@ from .final_corpus import (
 )
 from .glue_canary import _artifact, _valid_commit, _write_bytes_atomic, _zip_code
 from .glue_final_corpus import _baseline_release
+from .glue_runtime import FINAL_CORPUS_SPARK_CONFIG, glue_conf_argument
 from .production_corpus import _canonical_json_bytes, _read_json, _sha256_file
 
 SCHEMA_VERSION = 1
@@ -1066,6 +1067,7 @@ def build_glue_final_corpus_production_job_definition(
             "--TempDir": (
                 f"s3://{bucket}/{namespace}/control/glue-production/temp/{token}/"
             ),
+            "--conf": glue_conf_argument(FINAL_CORPUS_SPARK_CONFIG),
             "--additional-python-modules": release["runtime"][
                 "additional_python_modules"
             ],

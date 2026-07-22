@@ -20,6 +20,7 @@ from lumi.glue_final_corpus import (
     validate_glue_final_corpus_canary_release,
     validate_glue_final_corpus_canary_result,
 )
+from lumi.glue_runtime import FINAL_CORPUS_SPARK_CONFIG, glue_conf_argument
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_COMMIT = "b" * 40
@@ -176,6 +177,9 @@ def test_exact_approval_is_required_and_job_is_bounded(release: dict) -> None:
     assert definition["ExecutionProperty"] == {"MaxConcurrentRuns": 1}
     assert "--LUMI_AUTHORIZATION_FILE" not in definition["DefaultArguments"]
     assert definition["NonOverridableArguments"]["--enable-auto-scaling"] == "false"
+    assert definition["NonOverridableArguments"]["--conf"] == glue_conf_argument(
+        FINAL_CORPUS_SPARK_CONFIG
+    )
     assert definition["NonOverridableArguments"]["--TempDir"].endswith("/")
 
 

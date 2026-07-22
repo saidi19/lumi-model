@@ -30,6 +30,7 @@ from lumi.glue_final_corpus_production import (
     validate_glue_final_corpus_production_release,
     validate_glue_final_corpus_production_result,
 )
+from lumi.glue_runtime import FINAL_CORPUS_SPARK_CONFIG, glue_conf_argument
 
 ROOT = Path(__file__).resolve().parents[1]
 CANARY_SOURCE_COMMIT = "af601ed449ba31230120990a8bff275f8da8668e"
@@ -296,6 +297,8 @@ def test_exact_approval_and_job_definition_are_fail_closed(
     assert definition["ExecutionProperty"] == {"MaxConcurrentRuns": 1}
     immutable = definition["NonOverridableArguments"]
     assert immutable["--enable-auto-scaling"] == "false"
+    assert immutable["--conf"] == glue_conf_argument(FINAL_CORPUS_SPARK_CONFIG)
+    assert "spark.speculation=false" in immutable["--conf"]
     assert immutable["--additional-python-modules"] == "zstandard==0.25.0"
     assert "--LUMI_AUTHORIZATION_FILE" not in definition["DefaultArguments"]
 
