@@ -708,6 +708,106 @@ def test_local_spark_dedup_matches_independent_sequential_reference(tmp_path: Pa
         }
         assert narrow["metrics"] == result["metrics"]
 
+        stop_bucket_candidates = [
+            _candidate(codec, "stop-near-a", 20, "stop near a", 101),
+            _candidate(codec, "stop-near-b", 21, "stop near b", 101),
+            _candidate(codec, "stop-independent-c", 22, "stop independent c", 102),
+            _candidate(codec, "stop-independent-d", 23, "stop independent d", 103),
+            _candidate(codec, "stop-independent-e", 24, "stop independent e", 104),
+            _candidate(codec, "stop-independent-f", 25, "stop independent f", 105),
+        ]
+        for row in stop_bucket_candidates:
+            final_bucket = row["lsh_buckets"][-1]
+            row["lsh_buckets"] = [
+                *row["lsh_buckets"][:-1],
+                {
+                    "band": final_bucket["band"],
+                    "bucket": b"\xff" * len(final_bucket["bucket"]),
+                },
+            ]
+        stop_bucket_frame = spark.createDataFrame(
+            [candidate_to_spark_row(row) for row in stop_bucket_candidates],
+            schema=candidate_spark_schema(),
+        )
+        stop_bucket = spark_deduplicate_candidates(
+            stop_bucket_frame,
+            codec=codec,
+            checkpoint_uri=(tmp_path / "stop-bucket").as_uri(),
+            anchors=anchor_frame,
+            allow_local_checkpoint=True,
+            maximum_lsh_bucket_documents=4,
+            maximum_candidate_pairs=1_000,
+            oversized_lsh_bucket_policy="drop_as_stop_bucket",
+            maximum_oversized_lsh_buckets=1,
+            maximum_oversized_lsh_memberships=6,
+            maximum_documents_without_usable_lsh_buckets=0,
+        )
+        stop_reference = deduplicate_candidates(
+            stop_bucket_candidates, codec, anchors=[anchor]
+        )
+        assert {
+            row["document_id"]
+            for row in stop_bucket["accepted_ids"].select("document_id").collect()
+        } == set(stop_reference.accepted_document_ids)
+        stop_rejections = {
+            row["document_id"]: "exact_duplicate"
+            for row in stop_bucket["exact_rejected"].select("document_id").collect()
+        }
+        stop_rejections.update(
+            {
+                row["document_id"]: "near_duplicate"
+                for row in stop_bucket["near_rejected"].select("document_id").collect()
+            }
+        )
+        assert stop_rejections == stop_reference.rejection_reasons
+        assert stop_bucket["metrics"]["oversized_lsh_buckets"] == 1
+        assert stop_bucket["metrics"]["oversized_lsh_memberships"] == 6
+        assert stop_bucket["metrics"]["maximum_lsh_bucket_documents_observed"] == 6
+        assert stop_bucket["metrics"]["documents_without_usable_lsh_buckets"] == 0
+
+        with pytest.raises(ValueError, match="unsupported.*policy"):
+            spark_deduplicate_candidates(
+                stop_bucket_frame,
+                codec=codec,
+                checkpoint_uri=(tmp_path / "invalid-stop-policy").as_uri(),
+                anchors=anchor_frame,
+                allow_local_checkpoint=True,
+                oversized_lsh_bucket_policy="silently_ignore",
+            )
+
+        uncovered_candidates = [
+            _candidate(codec, f"uncovered-{ordinal}", 30 + ordinal, "text", 200 + ordinal)
+            for ordinal in range(5)
+        ]
+        for row in uncovered_candidates:
+            row["lsh_buckets"] = [
+                {
+                    "band": bucket["band"],
+                    "bucket": bytes([bucket["band"] + 1]) * len(bucket["bucket"]),
+                }
+                for bucket in row["lsh_buckets"]
+            ]
+        uncovered_frame = spark.createDataFrame(
+            [candidate_to_spark_row(row) for row in uncovered_candidates],
+            schema=candidate_spark_schema(),
+        )
+        with pytest.raises(RuntimeError, match="without usable LSH buckets"):
+            spark_deduplicate_candidates(
+                uncovered_frame,
+                codec=codec,
+                checkpoint_uri=(tmp_path / "uncovered-stop-buckets").as_uri(),
+                anchors=anchor_frame,
+                allow_local_checkpoint=True,
+                maximum_lsh_bucket_documents=4,
+                maximum_candidate_pairs=1_000,
+                oversized_lsh_bucket_policy="drop_as_stop_bucket",
+                maximum_oversized_lsh_buckets=len(codec.hashranges),
+                maximum_oversized_lsh_memberships=(
+                    len(codec.hashranges) * len(uncovered_candidates)
+                ),
+                maximum_documents_without_usable_lsh_buckets=0,
+            )
+
         prefix_candidates = []
         for ordinal, tokens in enumerate((3, 4, 5, 2, 6, 1)):
             row = _candidate(

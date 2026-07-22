@@ -265,6 +265,15 @@ def test_package_is_hash_bound_and_does_not_authorize_paid_work(tmp_path: Path) 
     assert release["jobs"]["canary"]["number_of_workers"] == 8
     assert release["jobs"]["production"]["number_of_workers"] == 100
     assert release["jobs"]["production"]["maximum_compute_usd"] == "1056.000000"
+    assert release["deduplication"] == {
+        "maximum_candidate_pairs": 50_000_000,
+        "maximum_documents_without_usable_lsh_buckets": 0,
+        "maximum_lsh_bucket_documents": 10_000,
+        "maximum_oversized_lsh_buckets": 64,
+        "maximum_oversized_lsh_memberships": 1_000_000,
+        "maximum_rounds": 256,
+        "oversized_lsh_bucket_policy": "drop_as_stop_bucket",
+    }
     assert (package / RELEASE_FILE).is_file()
     assert (package / INPUT_INDEX_FILE).is_file()
     assert (package / MAP_RELEASE_FILE).is_file()
@@ -347,6 +356,8 @@ def test_runtime_reuses_the_proven_dedup_core_and_initializes_spark_first() -> N
     source = (ROOT / "scripts" / "run_glue_production_global_dedup.py").read_text()
     assert "spark_deduplicate_candidates" in source
     assert "maximum_candidate_pairs" in source
+    assert "oversized_lsh_bucket_policy" in source
+    assert "maximum_oversized_lsh_memberships" in source
     assert "errorifexists" in source
     assert "StorageLevel.DISK_ONLY" in source
     assert "candidates = candidates.persist()" not in source
@@ -681,8 +692,12 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         "deduplication": {
             "accepted_documents": 100,
             "candidate_documents": 100,
+            "documents_without_usable_lsh_buckets": 0,
             "exact_rejected_documents": 0,
+            "maximum_lsh_bucket_documents_observed": 1,
             "near_rejected_documents": 0,
+            "oversized_lsh_buckets": 0,
+            "oversized_lsh_memberships": 0,
         },
         "gate": "lumi_glue_production_global_dedup_canary_result_v0.1",
         "input_documents": 100,
@@ -751,8 +766,12 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
         "deduplication": {
             "accepted_documents": release["map"]["input_documents"],
             "candidate_documents": release["map"]["input_documents"],
+            "documents_without_usable_lsh_buckets": 0,
             "exact_rejected_documents": 0,
+            "maximum_lsh_bucket_documents_observed": 1,
             "near_rejected_documents": 0,
+            "oversized_lsh_buckets": 0,
+            "oversized_lsh_memberships": 0,
         },
         "gate": "lumi_glue_production_global_dedup_result_v0.1",
         "input_index_sha256": release["input_index_sha256"],
@@ -774,6 +793,27 @@ def test_result_contract_separates_canary_from_production(tmp_path: Path) -> Non
     assert validate_glue_global_dedup_result(
         production, release, production_auth
     ) == production
+    stop_bucket_result = deepcopy(production)
+    stop_bucket_result["deduplication"].update(
+        {
+            "maximum_lsh_bucket_documents_observed": 19_150,
+            "oversized_lsh_buckets": 1,
+            "oversized_lsh_memberships": 19_150,
+        }
+    )
+    assert validate_glue_global_dedup_result(
+        stop_bucket_result, release, production_auth
+    ) == stop_bucket_result
+    excessive_stop_buckets = deepcopy(stop_bucket_result)
+    excessive_stop_buckets["deduplication"]["oversized_lsh_buckets"] = 65
+    with pytest.raises(ValueError, match="stop-bucket count cap"):
+        validate_glue_global_dedup_result(
+            excessive_stop_buckets, release, production_auth
+        )
+    uncovered = deepcopy(stop_bucket_result)
+    uncovered["deduplication"]["documents_without_usable_lsh_buckets"] = 1
+    with pytest.raises(ValueError, match="without LSH coverage"):
+        validate_glue_global_dedup_result(uncovered, release, production_auth)
     changed = deepcopy(production)
     changed["categories"][0]["final_tokens"] -= 1
     with pytest.raises(ValueError, match="token conservation"):

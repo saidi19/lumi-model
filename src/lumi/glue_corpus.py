@@ -1,7 +1,7 @@
 """Lazy PySpark adapter for Lumi's distributed corpus deduplication.
 
 Nothing in this module launches AWS resources.  The functions operate on an
-already-created Spark session and fail closed on oversized LSH buckets,
+already-created Spark session and fail closed on unbounded LSH work,
 non-convergent duplicate graphs, or schema drift.
 """
 
@@ -516,6 +516,10 @@ def spark_deduplicate_candidates(
     maximum_rounds: int = 256,
     maximum_lsh_bucket_documents: int = 10_000,
     maximum_candidate_pairs: int = 50_000_000,
+    oversized_lsh_bucket_policy: str = "fail",
+    maximum_oversized_lsh_buckets: int = 0,
+    maximum_oversized_lsh_memberships: int = 0,
+    maximum_documents_without_usable_lsh_buckets: int = 0,
 ) -> dict[str, Any]:
     """Apply exact and source-order-equivalent dedup to a Spark DataFrame.
 
@@ -526,6 +530,7 @@ def spark_deduplicate_candidates(
     publication.
     """
 
+    from pyspark import StorageLevel
     from pyspark.sql import functions as F
 
     if not checkpoint_uri.startswith("s3://") and not (
@@ -538,6 +543,18 @@ def spark_deduplicate_candidates(
         raise ValueError("distributed LSH bucket cap must be at least two")
     if maximum_candidate_pairs < 1:
         raise ValueError("distributed candidate-pair cap must be positive")
+    if oversized_lsh_bucket_policy not in {"fail", "drop_as_stop_bucket"}:
+        raise ValueError("unsupported distributed oversized-LSH-bucket policy")
+    for value, label in (
+        (maximum_oversized_lsh_buckets, "oversized LSH bucket count cap"),
+        (maximum_oversized_lsh_memberships, "oversized LSH membership cap"),
+        (
+            maximum_documents_without_usable_lsh_buckets,
+            "documents-without-usable-LSH-buckets cap",
+        ),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"distributed {label} must be a non-negative integer")
 
     spark = candidates.sparkSession
     spark.sparkContext.setCheckpointDir(checkpoint_uri)
@@ -645,24 +662,89 @@ def spark_deduplicate_candidates(
             F.col("lsh.band").alias("band"),
             F.col("lsh.bucket").alias("bucket"),
         )
-        .persist()
+        .persist(StorageLevel.DISK_ONLY)
     )
-    oversized = (
-        exploded.groupBy("band", "bucket")
-        .count()
-        .where(F.col("count") > maximum_lsh_bucket_documents)
-        .orderBy(F.col("count").desc())
-        .limit(1)
-        .collect()
+    bucket_counts = exploded.groupBy("band", "bucket").count().persist(
+        StorageLevel.DISK_ONLY
     )
-    if oversized:
+    oversized_buckets = bucket_counts.where(
+        F.col("count") > maximum_lsh_bucket_documents
+    ).persist(StorageLevel.DISK_ONLY)
+    oversized_condition = F.col("count") > maximum_lsh_bucket_documents
+    bucket_summary = bucket_counts.agg(
+        F.sum(F.when(oversized_condition, F.lit(1)).otherwise(F.lit(0))).alias(
+            "oversized_buckets"
+        ),
+        F.sum(
+            F.when(oversized_condition, F.col("count")).otherwise(F.lit(0))
+        ).alias("oversized_memberships"),
+        F.max("count").alias("maximum_documents"),
+    ).first()
+    oversized_bucket_count = int(bucket_summary["oversized_buckets"] or 0)
+    oversized_lsh_memberships = int(
+        bucket_summary["oversized_memberships"] or 0
+    )
+    maximum_lsh_bucket_documents_observed = int(
+        bucket_summary["maximum_documents"] or 0
+    )
+
+    def release_lsh_frames(*, usable: Any = None, pairs: Any = None) -> None:
+        if pairs is not None:
+            pairs.unpersist()
+        if usable is not None and usable is not exploded:
+            usable.unpersist()
+        oversized_buckets.unpersist()
+        bucket_counts.unpersist()
+        exploded.unpersist()
+
+    if oversized_bucket_count and oversized_lsh_bucket_policy == "fail":
+        release_lsh_frames()
         raise RuntimeError(
             "distributed LSH bucket exceeds the fail-closed candidate-pair cap: "
-            f"{oversized[0]['count']}"
+            f"{maximum_lsh_bucket_documents_observed}"
+        )
+    if oversized_bucket_count > maximum_oversized_lsh_buckets:
+        release_lsh_frames()
+        raise RuntimeError(
+            "distributed oversized LSH bucket count exceeds its stop-bucket cap: "
+            f"{oversized_bucket_count}"
+        )
+    if oversized_lsh_memberships > maximum_oversized_lsh_memberships:
+        release_lsh_frames()
+        raise RuntimeError(
+            "distributed oversized LSH memberships exceed their stop-bucket cap: "
+            f"{oversized_lsh_memberships}"
         )
 
-    left = exploded.alias("left")
-    right = exploded.alias("right")
+    if oversized_bucket_count:
+        usable_exploded = (
+            exploded.join(
+                oversized_buckets.select("band", "bucket"),
+                ["band", "bucket"],
+                "left_anti",
+            )
+            .persist(StorageLevel.DISK_ONLY)
+        )
+    else:
+        usable_exploded = exploded
+    usable_document_ids = usable_exploded.select("document_id").distinct()
+    documents_without_usable_lsh_buckets = (
+        nodes.select("document_id")
+        .join(usable_document_ids, "document_id", "left_anti")
+        .count()
+    )
+    if (
+        documents_without_usable_lsh_buckets
+        > maximum_documents_without_usable_lsh_buckets
+    ):
+        release_lsh_frames(usable=usable_exploded)
+        raise RuntimeError(
+            "distributed documents without usable LSH buckets exceed their cap: "
+            f"{documents_without_usable_lsh_buckets}"
+        )
+
+    left = usable_exploded.alias("left")
+    right = usable_exploded.alias("right")
     possible_edges = (
         left.join(
             right,
@@ -680,10 +762,11 @@ def spark_deduplicate_candidates(
             F.col("right.minhash_signature").alias("later_signature"),
         )
         .dropDuplicates(["earlier_id", "later_id"])
-        .persist()
+        .persist(StorageLevel.DISK_ONLY)
     )
     possible_pair_count = possible_edges.count()
     if possible_pair_count > maximum_candidate_pairs:
+        release_lsh_frames(usable=usable_exploded, pairs=possible_edges)
         raise RuntimeError(
             "distributed LSH candidate pairs exceed the fail-closed cap: "
             f"{possible_pair_count}"
@@ -852,8 +935,16 @@ def spark_deduplicate_candidates(
         "exact_rejected_documents": exact_rejected.count(),
         "exact_duplicate_edges": exact_edges.count(),
         "lsh_candidate_pairs": possible_pair_count,
+        "maximum_lsh_bucket_documents_observed": (
+            maximum_lsh_bucket_documents_observed
+        ),
         "near_duplicate_edges": near_edges.count(),
         "near_rejected_documents": near_rejected_ids.count(),
+        "oversized_lsh_buckets": oversized_bucket_count,
+        "oversized_lsh_memberships": oversized_lsh_memberships,
+        "documents_without_usable_lsh_buckets": (
+            documents_without_usable_lsh_buckets
+        ),
         "prefix_rejected_documents": prefix_rejected.count(),
         "rounds": rounds,
     }
@@ -864,13 +955,12 @@ def spark_deduplicate_candidates(
         != metrics["candidate_documents"]
     ):
         raise RuntimeError("distributed dedup document conservation invariant failed")
-    exploded.unpersist()
+    release_lsh_frames(usable=usable_exploded, pairs=possible_edges)
     exact_edges.unpersist()
     near_edges.unpersist()
     conflicts.unpersist()
     prefix_rejected.unpersist()
     all_rejected_ids.unpersist()
-    possible_edges.unpersist()
     nodes.unpersist()
     return {
         "accepted": accepted,
