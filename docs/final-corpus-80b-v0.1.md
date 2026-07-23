@@ -1,12 +1,12 @@
 # Lumi Final 80B Corpus Gate v0.1
 
-Status: **the marker-aware 120B-to-80B selection/shard contract and its bounded
-8-DPU Glue canary pass. Every canary shard starts with token ID 3 (`<|doc|>`),
-all 3,797 selected documents have exactly one marker, and all 28 shard hashes
-pass independent byte-level verification. The older 80B materialization is
-retained only as historical selection evidence because its packed bytes contain
-no document markers; the trainer now rejects it. No corrected production
-repack, GPU work, or model training is authorized.**
+Status: **the corrected marker-aware production corpus is sealed and
+independently verified. It contains 45,768,283 documents, exactly 45,768,283
+token-ID-3 (`<|doc|>`) markers, 79,954,240,081 content tokens, and
+80,000,008,364 packed tokens across 160 content-addressed uint16 shards. The
+trainer consumption boundary remains exactly 80B tokens. The older 163-shard
+markerless materialization remains quarantined. No GPU work or model training
+was authorized.**
 
 ## Why this gate exists
 
@@ -279,13 +279,84 @@ and refuses any job that already ran. The historical packages described below
 were consumed under the older markerless contract; their authorizations are not
 reusable.
 
-The marker-aware non-authorizing production package is now sealed from source
+The marker-aware production package was sealed from source
 commit `bdd656e14cee6b995f3e5196933285b4f54897b9`. Its release fingerprint is
 `e097ae33ed91a1b998843bebe2452a205b252fcb6e1ef774dce481f9ad02d50d`,
 and its five-entry `manifest.sha256` file hashes to
 `7fc45e2159a2619323426a8bedf15cd107a7e0a3c43f14d3c56a8fca0f6b13d8`.
-All production, GPU, and model-training authorization flags are false. The
-package has not been uploaded, authorized, or consumed.
+The package itself cannot authorize paid work. It was later bound to the fresh
+single-use owner authorization and successful production run below; GPU and
+model-training authorization remained false.
+
+## Verified corrected marker-aware production materialization
+
+Authorization
+`6475dda549a1a8382bb6f777b7ddca3fe315c1a2822be6ed4609918e60cccc08`
+bound exactly one 100-DPU Glue run to source commit
+`bdd656e14cee6b995f3e5196933285b4f54897b9`, release
+`e097ae33ed91a1b998843bebe2452a205b252fcb6e1ef774dce481f9ad02d50d`,
+plan `aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470`,
+and dedup result
+`dbfbf9fe258ec97d5bd844c165157d41d328d0571cbbada5fd4d67750c46b742`.
+Glue run
+`jr_73c74effa6f50bf6faec901078e47bb93563d270d72625de0f13a86ee8f731e3`
+finished `SUCCEEDED` on attempt zero in 2,745 execution seconds using 274,571
+DPU-seconds. At `$0.44` per DPU-hour, compute was approximately `$33.558678`,
+well below the 12-hour/`$528` boundary.
+
+All seven immutable category checkpoints sealed:
+
+| Category | Documents / markers | Content tokens | Packed tokens | Shards |
+| --- | ---: | ---: | ---: | ---: |
+| Science and education | 2,839,568 | 23,997,163,839 | 24,000,003,407 | 48 |
+| Code | 13,144,364 | 15,986,856,201 | 16,000,000,565 | 32 |
+| Reference | 10,450,031 | 11,989,550,626 | 12,000,000,657 | 24 |
+| Questions and discussion | 14,414,153 | 11,985,586,706 | 12,000,000,859 | 24 |
+| Open web | 3,982,032 | 7,996,018,342 | 8,000,000,374 | 16 |
+| Books | 184,370 | 3,999,816,243 | 4,000,000,613 | 8 |
+| Government, legal, and patents | 753,765 | 3,999,248,124 | 4,000,001,889 | 8 |
+| **Total** | **45,768,283** | **79,954,240,081** | **80,000,008,364** | **160** |
+
+The 8,364-token document-boundary overshoot is within the fixed cap. Packed
+output is `160,000,016,728` bytes, exactly two bytes per token. The 7,478
+selected Parquet objects occupy `343,924,248,990` bytes; selected plus packed
+output occupies `503,924,265,718` bytes, below the 750GB cap.
+
+Independent local verification:
+
+- ran the production result and all seven category validators against the exact
+  release, authorization, plan, and dedup binding;
+- matched all seven selected S3 inventories by object count, bytes, and
+  canonical inventory SHA-256;
+- matched every one of the 160 packed S3 keys, sizes, SHA-256 metadata, and S3
+  checksums against the sealed manifest;
+- range-read every shard and confirmed its first uint16 token is ID 3
+  (`03 00` little-endian);
+- proved aggregate and per-shard
+  `tokens = content_tokens + document_markers`, with one marker per document;
+- matched all seven checkpoint JSON objects and all three final-result JSON
+  objects to S3 metadata and checksums; and
+- verified the exact 80,000,000,000-token trainer boundary and output cap.
+
+The canonical sealed result SHA-256 is
+`0423e29b05e0c31ce73bf6066a00b3ce198eb442cf7143dfc953d4d5b2688e52`;
+the selection-result SHA-256 is
+`b017a6fec5c6ca1685c5dcd883d8afc48d36fd18cac07d573514ad77307253ee`.
+The 33-file external evidence manifest hashes to
+`25a5848f22b71241e1e502a0a5414f696056e82d885d795606b5139d0fab7a28`.
+After evidence was sealed, the consumed Glue job and bounded IAM role were
+deleted and confirmed absent. S3 corpus and result objects remain preserved.
+The compact repository record is
+`reports/glue-final-corpus-marker-aware-production-result-v0.1.json`.
+
+Post-run focused tests pass with 24 passed, one environment skip, and the known
+Mac two-process Gloo test deselected. The near-full suite passes with 356
+passed, three environment skips, and that same one deselection; Ruff is clean.
+Running the deselected test separately reached no test assertion because
+PyTorch repeatedly failed reverse DNS for the localhost IPv6 address and hit
+its 120-second subprocess timeout. The corrected-manifest exact-tail case
+therefore remains an explicit Linux production-preflight check rather than
+being misreported as a local pass.
 
 ### Historical markerless package provenance
 
@@ -373,17 +444,15 @@ and repository-wide Ruff passes.
 
 ## Next boundary
 
-The marker-aware canary is complete, but the corrected full 80B corpus repack
-is not. The immediate next boundary is one separately authorized 100-DPU Glue
-production selection/sharding run against plan
-`aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470`.
-It must produce 160 fresh marker-aware shards and pass complete S3 inventory,
-hash, document/content-token/marker/byte, category, and trainer-boundary
-verification before any GPU pilot resumes.
+The corrected 80B corpus data gate is complete. The immediate free/local step
+is to rebind the production preflight and bounded learning-pilot fixture from
+the quarantined markerless manifest to this exact corrected result and
+160-shard manifest, then rerun their contract, exact-tail, checkpoint/resume,
+and trainer-readability tests.
 
-After that seal, the roadmap returns to the bounded 4B multi-GPU learning pilot
-using this exact tokenizer, architecture, optimizer decision,
-isolated-attention path, and corrected corpus. The pilot and full 4B/80B
+After that preflight passes, the roadmap returns to the bounded 4B multi-GPU
+learning pilot using this exact tokenizer, architecture, optimizer decision,
+isolated-attention path, and corrected corpus. The paid pilot and full 4B/80B
 pretraining each require separate owner approval. Instruction tuning,
 alignment, quantization, API hosting, and deployment remain later independent
 gates.

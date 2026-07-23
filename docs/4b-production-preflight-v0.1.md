@@ -1,9 +1,10 @@
 # Lumi-4B Production Training Preflight v0.1
 
-Status: **the sealed final-80B corpus is trainer-readable, the exact-tail and
-checkpoint-handoff paths pass, and the planning-only 8-GPU configuration is
-sealed. No multi-GPU learning pilot or full model training was authorized or
-started.**
+Status: **the preflight implementation and exact-tail/checkpoint-handoff paths
+pass, but this historical preflight is bound to the quarantined 163-shard
+markerless corpus. The corrected 160-shard marker-aware corpus is now sealed
+and must be rebound and reverified before any GPU pilot. No multi-GPU learning
+pilot or full model training was authorized or started by this gate.**
 
 ## Scope
 
