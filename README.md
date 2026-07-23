@@ -565,8 +565,8 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     clean, and real-manifest planning fingerprint
     `42d742ecec2f63079522098118a2ba3be079ce59c1c0e651d6a3c84b92caacbe`.
     This remains useful infrastructure evidence, but the markerless manifest
-    is no longer accepted. A corrected 160-shard manifest must pass the same
-    preflight before the H100 learning pilot or full 4B/80B training.
+    is no longer accepted. The corrected 160-shard binding and rerun are
+    recorded in item 65.
 63. the bounded Lumi-4B learning-pilot harness now supports equivalent 4x and
     8x 80GB H100 topologies without changing the 256-sequence global batch,
     80-step schedule, or exact 83,886,080-token boundary. It trains fresh
@@ -606,6 +606,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     absent; S3 corpus/results remain preserved. No GPU work or model training
     was authorized. See
     `reports/glue-final-corpus-marker-aware-production-result-v0.1.json`.
+65. the production preflight and bounded H100 learning-pilot fixture are
+    rebound to the corrected marker-aware corpus at code commit
+    `f745a93b1399afdd07cf4021a07715ff78d8d3c2`. The real 160-shard manifest
+    passes with an exact 80B trainer boundary and 8,364 trailing tokens. The
+    pilot stages only the first 167,772,160 bytes of shard zero, sealed as
+    83,886,080 tokens, 20,480 sequences, and 9,885 document markers with
+    SHA-256
+    `f27566d2d8ee7f234a03918ca6a3f6c94f03cd44ec58a7e77cce4c39ef58eed0`.
+    Focused production/pilot tests pass 17/17, the IPv4 two-process exact-tail
+    check passes locally, all non-Spark repository tests pass, and Ruff is
+    clean. No GPU or paid training was launched. The next gate is the
+    separately authorized bounded 4x/8x H100 learning pilot.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -636,12 +648,14 @@ exact-only uncovered documents. The historical 163-shard markerless seal
 remains quarantined and rejected by the trainer. Its corrected marker-aware
 replacement is now sealed at 80,000,008,364 packed tokens in 160 shards, with
 45,768,283/45,768,283 document-marker parity and all S3 checksums independently
-verified. The next gate is to rebind and rerun the free production preflight
-against this corrected manifest, then run the already-designed bounded 4x/8x
-H100 learning pilot only after fresh owner approval. The permanent held-out
-exclusion ledger remains applied. Full 4B/80B training, instruction tuning, and
-deployment remain separately gated and incomplete. The completed 150M and 1B
-pilot checkpoints are not production-quality models.
+verified. The free production preflight and 83,886,080-token learning-pilot
+fixture are now rebound and reverified against that corrected manifest; only a
+hash-pinned 167,772,160-byte range is staged from the first shard. The next
+gate is the already-designed bounded 4x/8x H100 learning pilot, only after fresh
+owner approval. The permanent held-out exclusion ledger remains applied. Full
+4B/80B training, instruction tuning, and deployment remain separately gated
+and incomplete. The completed 150M and 1B pilot checkpoints are not
+production-quality models.
 
 ## Quick start
 
@@ -744,9 +758,9 @@ The verified 120B input binding, permanent-heldout-safe deterministic 80B
 selection, category-boundary limits, content-addressed packed-shard contract,
 and independently verified bounded Glue canary are documented in
 [`docs/final-corpus-80b-v0.1.md`](docs/final-corpus-80b-v0.1.md).
-The logical final-corpus trainer adapter, exact 80B tail handling, portable
-checkpoint handoff, planning candidates, and independently verified Lambda A10
-engineering gate are documented in
+The marker-aware logical final-corpus trainer adapter, exact 80B tail handling,
+portable checkpoint handoff, planning candidates, and independently verified
+local/Lambda engineering gates are documented in
 [`docs/4b-production-preflight-v0.1.md`](docs/4b-production-preflight-v0.1.md).
 The exact 4x/8x H100 learning workload, cumulative retry cap, milestone-safe
 resume flow, held-out gate, and remaining launch boundary are documented in

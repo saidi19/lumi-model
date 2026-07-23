@@ -1,11 +1,10 @@
 # Lumi-4B Multi-GPU Learning Pilot v0.1
 
 Status: **the provider-independent 4x/8x H100 harness is implemented and
-locally verified, but its historical corpus binding points to the quarantined
-markerless manifest. The corrected 160-shard marker-aware corpus is sealed;
-the harness and fixture must be rebound and reverified before a paid pilot. No
-successful paid pilot, full 4B training, or 80B-token training run has been
-completed by this gate.**
+locally verified against the corrected 160-shard marker-aware corpus. The exact
+83,886,080-token fixture is sealed from a hash-pinned byte range containing
+9,885 document markers. No successful paid pilot, full 4B training, or
+80B-token training run has been completed by this gate.**
 
 ## Purpose
 
@@ -37,11 +36,11 @@ The planning-only contract is
   `643e8da652577f802d959740d66a7e6bafc5b065aa45010c2d7e0340ed9509be`;
 - 4,002,376,704 model parameters;
 - final-corpus manifest SHA-256
-  `c81837652075237de281989513a8301bdd2f78a0c764fdac028ccbe6802b5a24`;
+  `6de45464af33d44e1261a023ccb7d50f86346a4126bb2fa060530a91213483e9`;
 - final plan
-  `a647579f612b45e23142a1bc8113e6754af67c5432ca3c9513e02d6ee2e302d0`;
+  `aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470`;
 - selection result
-  `8d9c2eff0f34c63d4e9a32536c56e6503151b8af440f24c4497fec4ca953fa2e`;
+  `b017a6fec5c6ca1685c5dcd883d8afc48d36fd18cac07d573514ad77307253ee`;
 - the exact content-addressed first final shard and an 83,886,080-token,
   20,480-sequence prefix fixture;
 - held-out manifest SHA-256
@@ -51,8 +50,13 @@ The planning-only contract is
   every 10 steps, and a hard stop at 83,886,080 cumulative tokens.
 
 The fixture is a real immutable slice of the final corpus, not generated text.
-It comes from `science_and_education` shard sequence zero. That makes this a
-bounded learning/throughput/resume gate rather than a full-mixture quality
+It comes from `science_and_education` shard sequence zero. The full shard is
+1,000,036,984 bytes, but staging requests only bytes `0-167772159`. That exact
+167,772,160-byte prefix hashes to
+`f27566d2d8ee7f234a03918ca6a3f6c94f03cd44ec58a7e77cce4c39ef58eed0`
+and contains 9,885 token-ID-3 document markers. Range staging avoids downloading
+the unused remainder while remaining bound to the full shard identity. This is
+a bounded learning/throughput/resume gate rather than a full-mixture quality
 evaluation. The broad frozen held-out set remains unchanged and prevents the
 gate from passing on training loss alone.
 
@@ -137,22 +141,28 @@ The final sealer requires:
 
 ## Local verification
 
-The new contract, authorization, runtime, export, and topology tests pass:
-`18 passed`. Ruff passes for the complete repository. The near-full local suite
-passes with `354 passed, 3 skipped, 1 deselected`. The single deliberate
-deselection is the pre-existing two-process Gloo test: when run separately on
-this Mac it times out while the local resolver repeatedly fails reverse
-resolution of the localhost IPv6 address. The exact full suite is intentionally
-rerun on the Linux H100 host before planning or authorization, and no paid
-training can begin unless that remote preflight passes.
+The accepted rebind is implemented at
+`f745a93b1399afdd07cf4021a07715ff78d8d3c2`. The real production manifest,
+S3-range prefix, generated fixture, and trainer memory map all pass independent
+hash and shape checks. The fixture contains exactly 20,480 sequences,
+83,886,080 tokens, and 9,885 document markers; its manifest SHA-256 is
+`d4cf263f86958929717c6be1695678aa6146378466e9c10b5f0be0bad32d523d`.
+
+Focused production/pilot tests pass 17/17. The former macOS Gloo timeout is
+resolved by assigning an explicit IPv4 rendezvous port, so exact-tail execution
+now passes locally. Every non-Spark repository test passes and repository-wide
+Ruff is clean. Three unrelated local Spark tests are excluded because this Mac
+has Java 25 only, while the installed PySpark/Hadoop build requires an older
+compatible JDK. The complete Linux suite remains mandatory on the H100 host
+before planning or authorization.
 
 ## Remaining boundary
 
 The harness can now be committed and reviewed without GPU capacity. When a
 matching 4x or 8x 80GB H100 instance is available, the remaining sequence is:
 
-1. clone the exact source commit and stage the pinned corpus slice, held-out
-   artifact, and tokenizer;
+1. clone the reviewed exact source commit and stage the pinned 167,772,160-byte
+   corpus range, held-out artifact, and tokenizer;
 2. install the pinned CUDA runtime and run the complete Linux preflight;
 3. write and review the immutable hardware-specific plan;
 4. obtain a fresh exact owner authorization;

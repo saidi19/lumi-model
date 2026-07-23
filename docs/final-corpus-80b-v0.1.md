@@ -444,15 +444,14 @@ and repository-wide Ruff passes.
 
 ## Next boundary
 
-The corrected 80B corpus data gate is complete. The immediate free/local step
-is to rebind the production preflight and bounded learning-pilot fixture from
-the quarantined markerless manifest to this exact corrected result and
-160-shard manifest, then rerun their contract, exact-tail, checkpoint/resume,
-and trainer-readability tests.
+The corrected 80B corpus data gate is complete. The production preflight and
+bounded learning-pilot fixture are now rebound from the quarantined markerless
+manifest to this exact corrected result and 160-shard manifest. Their
+real-manifest contract, byte-range fixture, exact-tail, checkpoint/resume, and
+trainer-readability tests pass locally.
 
-After that preflight passes, the roadmap returns to the bounded 4B multi-GPU
-learning pilot using this exact tokenizer, architecture, optimizer decision,
-isolated-attention path, and corrected corpus. The paid pilot and full 4B/80B
-pretraining each require separate owner approval. Instruction tuning,
-alignment, quantization, API hosting, and deployment remain later independent
-gates.
+The roadmap now returns to the bounded 4B multi-GPU H100 learning pilot using
+this exact tokenizer, architecture, optimizer decision, isolated-attention
+path, and corrected corpus. The paid pilot and full 4B/80B pretraining each
+require separate owner approval. Instruction tuning, alignment, quantization,
+API hosting, and deployment remain later independent gates.
