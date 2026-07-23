@@ -29,6 +29,8 @@ ORDER_COLUMNS = (
     "source_line",
     "segment_index",
 )
+DOC_TOKEN_ID = 3
+DOC_TOKEN_BYTES = DOC_TOKEN_ID.to_bytes(2, "little")
 
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
@@ -209,9 +211,15 @@ def _seal_token_partitions(rows: Any, config: Mapping[str, Any]) -> Any:
                     raise RuntimeError("final-corpus packed rows are not strictly ordered")
                 previous = order
                 token_count = int(row["token_count"])
+                content_token_count = int(row["content_token_count"])
                 token_bytes = bytes(row["token_bytes"])
-                if token_count <= 0 or len(token_bytes) != token_count * 2:
+                if (
+                    content_token_count <= 0
+                    or token_count != content_token_count + 1
+                    or len(token_bytes) != content_token_count * 2
+                ):
                     raise ValueError("final-corpus candidate token payload changed")
+                handle.write(DOC_TOKEN_BYTES)
                 handle.write(token_bytes)
                 documents += 1
                 tokens += token_count
@@ -232,6 +240,8 @@ def _seal_token_partitions(rows: Any, config: Mapping[str, Any]) -> Any:
             s3_client=s3,
         )
         yield {
+            "content_tokens": tokens - documents,
+            "document_markers": documents,
             "documents": documents,
             "object_bytes": path.stat().st_size,
             "object_sha256": digest,
@@ -342,6 +352,7 @@ def main() -> None:
     token = glue_final_corpus_canary_job_token(authorization)
     run_prefix = f"{release['output']['canary_prefix']}/{token}"
     category_reports = []
+    total_content_tokens = 0
     total_documents = 0
     total_tokens = 0
     output_bytes = 0
@@ -353,25 +364,30 @@ def main() -> None:
     overshoot = int(release["limits"]["maximum_document_boundary_overshoot_tokens"])
     for category_row in release["categories"]:
         category = str(category_row["category"])
-        frame = (
+        content_frame = (
             spark.read.schema(physical_schema)
             .parquet(*category_uris[category])
             .withColumn("category", F.lit(category))
             .select(*[field.name for field in schema.fields])
             .persist(StorageLevel.DISK_ONLY)
         )
-        totals = frame.agg(
+        totals = content_frame.agg(
             F.count(F.lit(1)).alias("documents"),
             F.sum("token_count").alias("tokens"),
         ).first()
         available_documents = int(totals["documents"] or 0)
-        available_tokens = int(totals["tokens"] or 0)
+        available_content_tokens = int(totals["tokens"] or 0)
+        available_tokens = available_content_tokens + available_documents
         if available_documents == 0 or available_tokens < target:
             raise RuntimeError(f"Glue final-corpus canary input is too small: {category}")
         if available_documents > int(
             release["limits"]["maximum_candidate_documents_per_category"]
         ):
             raise RuntimeError(f"Glue final-corpus canary document cap exceeded: {category}")
+        frame = (
+            content_frame.withColumn("content_token_count", F.col("token_count"))
+            .withColumn("token_count", F.col("token_count") + F.lit(1))
+        )
 
         first = select_hash_ranked_token_prefix(
             frame,
@@ -451,12 +467,15 @@ def main() -> None:
         category_reports.append(
             {
                 "available_documents": available_documents,
+                "available_content_tokens": available_content_tokens,
                 "available_tokens": available_tokens,
                 "category": category,
                 "cutoff": first["cutoff"],
                 "packed_shards": packed,
                 "partition_parity": "pass",
                 "selected_documents": int(first["selected_documents"]),
+                "selected_content_tokens": int(first["selected_tokens"])
+                - int(first["selected_documents"]),
                 "selected_inventory": {
                     **selected_inventory,
                     "s3_uri": f"s3://{bucket}/{selected_key}",
@@ -466,12 +485,15 @@ def main() -> None:
             }
         )
         total_documents += int(first["selected_documents"])
+        total_content_tokens += int(first["selected_tokens"]) - int(
+            first["selected_documents"]
+        )
         total_tokens += int(first["selected_tokens"])
         output_bytes += int(selected_inventory["object_bytes"]) + sum(
             int(row["object_bytes"]) for row in packed
         )
         selected.unpersist()
-        frame.unpersist()
+        content_frame.unpersist()
 
     report = {
         "accepted_input_inventory": dict(release["input"]["accepted_candidates"]),
@@ -490,7 +512,9 @@ def main() -> None:
         "release_fingerprint": release["release_fingerprint"],
         "runtime": runtime,
         "schema_version": 1,
+        "selected_content_tokens": total_content_tokens,
         "selected_documents": total_documents,
+        "selected_document_markers": total_documents,
         "selected_tokens": total_tokens,
         "selection_seed_sha256": release["input"]["selection_seed_sha256"],
         "status": "pass_selection_sharding_canary",

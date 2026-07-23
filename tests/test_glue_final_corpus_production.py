@@ -46,6 +46,11 @@ def package(tmp_path_factory: pytest.TempPathFactory) -> tuple[dict, dict, Path]
         repository_root=ROOT,
         source_commit=CANARY_SOURCE_COMMIT,
     )
+    verified_canary = json.loads(
+        (ROOT / "reports" / "glue-final-corpus-canary-result-v0.1.json").read_text()
+    )
+    if verified_canary.get("plan_fingerprint") != plan["plan_fingerprint"]:
+        pytest.skip("marker-aware production packaging awaits a new verified canary")
     plan_path = directory / "plan.json"
     plan_path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
     output = directory / "package"
