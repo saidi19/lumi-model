@@ -69,14 +69,14 @@ def prepare_learning_pilot_fixture(
     *,
     contract_path: str | Path,
     final_manifest_path: str | Path,
-    source_shard_path: str | Path,
+    source_prefix_path: str | Path,
     output: str | Path,
 ) -> dict[str, Any]:
-    """Extract the exact sequence-aligned pilot prefix from final shard zero."""
+    """Validate and seal the exact sequence-aligned byte-range pilot prefix."""
 
     contract_path = Path(contract_path).resolve()
     final_manifest_path = Path(final_manifest_path).resolve()
-    source_shard_path = Path(source_shard_path).resolve()
+    source_prefix_path = Path(source_prefix_path).resolve()
     output = Path(output).resolve()
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
     _validate_contract(contract)
@@ -110,10 +110,11 @@ def prepare_learning_pilot_fixture(
     }
     if observed_source != expected_source:
         raise ValueError("learning-pilot source shard changed")
-    if source_shard_path.stat().st_size != source_contract["bytes"]:
-        raise ValueError("learning-pilot source shard byte size changed")
-    if _sha256(source_shard_path) != source_contract["sha256"]:
-        raise ValueError("learning-pilot source shard SHA-256 changed")
+    prefix_contract = corpus["fixture_prefix"]
+    if source_prefix_path.stat().st_size != prefix_contract["bytes"]:
+        raise ValueError("learning-pilot source prefix byte size changed")
+    if _sha256(source_prefix_path) != prefix_contract["sha256"]:
+        raise ValueError("learning-pilot source prefix SHA-256 changed")
 
     manifest_path = output / "manifest.json"
     report_path = output / "fixture-report.json"
@@ -132,12 +133,12 @@ def prepare_learning_pilot_fixture(
 
     output_shard = output / "shard-00000.bin"
     output_bytes = corpus["fixture_tokens"] * 2
-    if output_bytes > source_contract["bytes"]:
-        raise ValueError("learning-pilot fixture exceeds source shard zero")
+    if output_bytes != prefix_contract["bytes"]:
+        raise ValueError("learning-pilot fixture and source prefix sizes differ")
     document_markers = 0
     digest = hashlib.sha256()
     with (
-        source_shard_path.open("rb") as source_handle,
+        source_prefix_path.open("rb") as source_handle,
         output_shard.open("wb") as output_handle,
     ):
         remaining = output_bytes
@@ -159,6 +160,10 @@ def prepare_learning_pilot_fixture(
         os.fsync(output_handle.fileno())
     if document_markers < 1:
         raise RuntimeError("learning-pilot fixture contains no document markers")
+    if document_markers != prefix_contract["document_markers"]:
+        raise RuntimeError("learning-pilot source prefix marker count changed")
+    if digest.hexdigest() != prefix_contract["sha256"]:
+        raise RuntimeError("learning-pilot fixture prefix digest changed")
 
     provenance = {
         "final_manifest_sha256": corpus["final_manifest_sha256"],
@@ -170,6 +175,12 @@ def prepare_learning_pilot_fixture(
         "source_shard_sha256": source_contract["sha256"],
         "source_shard_s3_uri": source_contract["s3_uri"],
         "source_shard_tokens": source_contract["tokens"],
+        "source_prefix_bytes": prefix_contract["bytes"],
+        "source_prefix_document_markers": prefix_contract["document_markers"],
+        "source_prefix_range_end": prefix_contract["range_end"],
+        "source_prefix_range_start": prefix_contract["range_start"],
+        "source_prefix_sha256": prefix_contract["sha256"],
+        "source_prefix_tokens": prefix_contract["tokens"],
         "start_token": 0,
     }
     build_specification = {
@@ -231,6 +242,7 @@ def prepare_learning_pilot_fixture(
         "sequences": corpus["fixture_sequences"],
         "source_shard_category": corpus["source_shard"]["category"],
         "source_manifest_sha256": corpus["final_manifest_sha256"],
+        "source_prefix_sha256": corpus["fixture_prefix"]["sha256"],
         "source_shard_sha256": corpus["source_shard"]["sha256"],
         "status": "pass",
         "tokens": corpus["fixture_tokens"],
@@ -276,6 +288,24 @@ def _validate_contract(contract: dict[str, Any]) -> dict[str, Any]:
     corpus = contract.get("corpus", {})
     if corpus.get("fixture_tokens") != PAID_LEARNING_PILOT_MAX_TOKENS:
         raise ValueError("Lumi-4B learning-pilot token cap changed")
+    prefix = corpus.get("fixture_prefix")
+    if not isinstance(prefix, dict):
+        raise ValueError("Lumi-4B learning-pilot source prefix is missing")
+    if prefix.get("tokens") != corpus.get("fixture_tokens"):
+        raise ValueError("Lumi-4B learning-pilot source-prefix token count changed")
+    if prefix.get("bytes") != prefix.get("tokens") * 2:
+        raise ValueError("Lumi-4B learning-pilot source-prefix byte count changed")
+    if prefix.get("range_start") != 0 or prefix.get("range_end") != prefix.get("bytes") - 1:
+        raise ValueError("Lumi-4B learning-pilot source-prefix byte range changed")
+    if not isinstance(prefix.get("document_markers"), int) or prefix["document_markers"] < 1:
+        raise ValueError("Lumi-4B learning-pilot source prefix has no markers")
+    prefix_sha256 = prefix.get("sha256")
+    if (
+        not isinstance(prefix_sha256, str)
+        or len(prefix_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in prefix_sha256)
+    ):
+        raise ValueError("Lumi-4B learning-pilot source-prefix SHA-256 is invalid")
     topologies = run.get("topologies")
     if not isinstance(topologies, list) or len(topologies) != 2:
         raise ValueError("Lumi-4B learning-pilot topologies changed")
@@ -347,6 +377,12 @@ def plan_4b_learning_pilot(
         "source_shard_sha256": corpus["source_shard"]["sha256"],
         "source_shard_s3_uri": corpus["source_shard"]["s3_uri"],
         "source_shard_tokens": corpus["source_shard"]["tokens"],
+        "source_prefix_bytes": corpus["fixture_prefix"]["bytes"],
+        "source_prefix_document_markers": corpus["fixture_prefix"]["document_markers"],
+        "source_prefix_range_end": corpus["fixture_prefix"]["range_end"],
+        "source_prefix_range_start": corpus["fixture_prefix"]["range_start"],
+        "source_prefix_sha256": corpus["fixture_prefix"]["sha256"],
+        "source_prefix_tokens": corpus["fixture_prefix"]["tokens"],
         "start_token": 0,
     }
     if provenance != expected_provenance:
