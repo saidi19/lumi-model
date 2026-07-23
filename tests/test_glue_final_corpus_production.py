@@ -34,7 +34,7 @@ from lumi.glue_final_corpus_production import (
 from lumi.glue_runtime import FINAL_CORPUS_SPARK_CONFIG, glue_conf_argument
 
 ROOT = Path(__file__).resolve().parents[1]
-CANARY_SOURCE_COMMIT = "32594a2931f6ee5be266d1b2d494c7eabead6d78"
+CANARY_SOURCE_COMMIT = "fad0b9d9340f58586ae9c5320fd66a2a5fe0c9e1"
 SOURCE_COMMIT = "c" * 40
 
 
@@ -83,6 +83,7 @@ def _checkpoint(release: dict, authorization: dict, category_index: int) -> dict
     shard_count = int(planned["new_packed_shards"])
     selected_tokens = int(planned["requested_candidate_tokens"]) + 1
     selected_documents = shard_count * 10
+    selected_content_tokens = selected_tokens - selected_documents
     token_parts = _split_total(selected_tokens, shard_count)
     document_parts = _split_total(selected_documents, shard_count)
     token = glue_final_corpus_production_job_token(authorization)
@@ -96,6 +97,8 @@ def _checkpoint(release: dict, authorization: dict, category_index: int) -> dict
         packed.append(
             {
                 "category": category,
+                "content_tokens": tokens - documents,
+                "document_markers": documents,
                 "documents": documents,
                 "object_bytes": tokens * 2,
                 "object_sha256": digest,
@@ -110,6 +113,9 @@ def _checkpoint(release: dict, authorization: dict, category_index: int) -> dict
     selected_bytes = 1_000_000 + category_index
     checkpoint = {
         "authorization_sha256": authorization["authorization_sha256"],
+        "available_candidate_content_tokens": planned[
+            "available_candidate_content_tokens"
+        ],
         "available_candidate_documents": planned["available_candidate_documents"],
         "available_candidate_tokens": planned["available_candidate_tokens"],
         "category": category,
@@ -128,6 +134,7 @@ def _checkpoint(release: dict, authorization: dict, category_index: int) -> dict
         "plan_fingerprint": release["input"]["plan_fingerprint"],
         "release_fingerprint": release["release_fingerprint"],
         "schema_version": 1,
+        "selected_candidate_content_tokens": selected_content_tokens,
         "selected_candidate_documents": selected_documents,
         "selected_candidate_tokens": selected_tokens,
         "selected_inventory": {
@@ -161,13 +168,22 @@ def _production_result(release: dict, plan: dict, authorization: dict) -> dict:
                 "available_candidate_documents": planned[
                     "available_candidate_documents"
                 ],
+                "available_candidate_content_tokens": planned[
+                    "available_candidate_content_tokens"
+                ],
                 "available_candidate_tokens": planned["available_candidate_tokens"],
                 "category": planned["category"],
                 "cutoff": checkpoint["cutoff"],
                 "final_documents": int(planned["baseline_documents"])
                 + int(checkpoint["selected_candidate_documents"]),
+                "final_content_tokens": checkpoint[
+                    "selected_candidate_content_tokens"
+                ],
                 "final_tokens": int(planned["baseline_tokens"])
                 + int(checkpoint["selected_candidate_tokens"]),
+                "selected_candidate_content_tokens": checkpoint[
+                    "selected_candidate_content_tokens"
+                ],
                 "selected_candidate_documents": checkpoint[
                     "selected_candidate_documents"
                 ],
@@ -182,6 +198,9 @@ def _production_result(release: dict, plan: dict, authorization: dict) -> dict:
         "final_documents": sum(
             int(row["final_documents"]) for row in selected_categories
         ),
+        "final_content_tokens": sum(
+            int(row["final_content_tokens"]) for row in selected_categories
+        ),
         "final_tokens": sum(int(row["final_tokens"]) for row in selected_categories),
         "gate": "lumi_final_corpus_80b_selection_result_v0.1",
         "plan_fingerprint": release["input"]["plan_fingerprint"],
@@ -193,31 +212,21 @@ def _production_result(release: dict, plan: dict, authorization: dict) -> dict:
     selection["result_sha256"] = final_selection_result_fingerprint(selection)
 
     token = glue_final_corpus_production_job_token(authorization)
-    prefix = f"{release['output']['run_prefix']}/{token}/packed"
-    baseline = [*release["baseline"]["sealed_shards"], release["baseline"]["partial"]]
     shards = []
-    for sequence, row in enumerate(baseline):
-        digest = str(row["sha256"])
-        shards.append(
-            {
-                "category": "science_and_education",
-                "documents": int(row["documents"]),
-                "object_bytes": int(row["bytes"]),
-                "object_sha256": digest,
-                "s3_uri": (
-                    f"s3://{release['storage']['bucket']}/{prefix}/"
-                    f"science_and_education/{digest}.uint16.bin"
-                ),
-                "sequence": sequence,
-                "tokens": int(row["tokens"]),
-            }
-        )
     for checkpoint in checkpoints:
         shards.extend(checkpoint["packed_shards"])
     shards.sort(key=lambda row: int(row["sequence"]))
     manifest = {
+        "content_tokens": sum(int(row["content_tokens"]) for row in shards),
+        "document_markers": sum(int(row["document_markers"]) for row in shards),
         "documents": sum(int(row["documents"]) for row in shards),
         "gate": "lumi_final_corpus_80b_shard_manifest_v0.1",
+        "packing": {
+            "doc_token": "<|doc|>",
+            "doc_token_id": 3,
+            "markers_per_document": 1,
+            "token_accounting": "content_plus_one_document_marker",
+        },
         "plan_fingerprint": release["input"]["plan_fingerprint"],
         "schema_version": 1,
         "selection_result_sha256": selection["result_sha256"],
@@ -229,8 +238,7 @@ def _production_result(release: dict, plan: dict, authorization: dict) -> dict:
     result = {
         "authorization_sha256": authorization["authorization_sha256"],
         "category_checkpoints": checkpoints,
-        "data_output_bytes": sum(int(row["output_bytes"]) for row in checkpoints)
-        + sum(int(row["bytes"]) for row in baseline),
+        "data_output_bytes": sum(int(row["output_bytes"]) for row in checkpoints),
         "dedup_result_sha256": release["input"]["dedup_result_sha256"],
         "gate": RESULT_GATE,
         "job_token": token,
@@ -252,18 +260,18 @@ def test_package_is_non_authorizing_manifested_and_calibrated(
     release, _, directory = package
     validated = validate_glue_final_corpus_production_release(release)
     assert validated == {
-        "conservative_runtime_minutes": 504,
-        "conservative_usd": "369.420211",
+        "conservative_runtime_minutes": 458,
+        "conservative_usd": "335.478978",
         "maximum_usd": "528.000000",
         "release_fingerprint": release["release_fingerprint"],
         "status": "verified_not_authorized",
     }
     assert all(value is False for value in release["authorization"].values())
-    assert release["cost_model"]["ideal_linear_runtime_minutes_at_100_dpu"] == 168
-    assert release["cost_model"]["ideal_linear_usd"] == "123.140111"
-    assert release["cost_model"]["estimated_maximum_output_bytes"] == 512_395_734_963
-    assert release["categories"][0]["first_new_shard_sequence"] == 3
-    assert release["categories"][-1]["last_new_shard_sequence"] == 162
+    assert release["cost_model"]["ideal_linear_runtime_minutes_at_100_dpu"] == 153
+    assert release["cost_model"]["ideal_linear_usd"] == "111.826367"
+    assert release["cost_model"]["estimated_maximum_output_bytes"] == 513_342_209_894
+    assert release["categories"][0]["first_new_shard_sequence"] == 0
+    assert release["categories"][-1]["last_new_shard_sequence"] == 159
     rows = (directory / "manifest.sha256").read_text().splitlines()
     assert len(rows) == 5
     assert {row.split("  ", 1)[1] for row in rows} == {
@@ -279,7 +287,7 @@ def test_canary_runtime_evidence_is_bounded_and_cost_consistent() -> None:
     report = json.loads(
         (ROOT / "reports" / "glue-final-corpus-canary-result-v0.1.json").read_text()
     )
-    assert _validate_canary_report(report)["job"]["dpu_seconds"] == 2536.0
+    assert _validate_canary_report(report)["job"]["dpu_seconds"] == 2303.0
 
     changed = copy.deepcopy(report)
     changed["job"]["dpu_seconds"] = 8 * 30 * 60 + 1
@@ -339,7 +347,14 @@ def test_category_checkpoints_and_final_result_conserve_all_tokens(
     changed["packed_shards"][0]["tokens"] += 1
     changed["packed_shards"][0]["object_bytes"] += 2
     changed["checkpoint_sha256"] = category_checkpoint_fingerprint(changed)
-    with pytest.raises(ValueError, match="conservation"):
+    with pytest.raises(ValueError, match="marker accounting"):
+        validate_glue_final_corpus_category_checkpoint(
+            changed, release, authorization
+        )
+    changed = copy.deepcopy(checkpoint)
+    changed["packed_shards"][0]["document_markers"] += 1
+    changed["checkpoint_sha256"] = category_checkpoint_fingerprint(changed)
+    with pytest.raises(ValueError, match="marker accounting"):
         validate_glue_final_corpus_category_checkpoint(
             changed, release, authorization
         )
@@ -349,18 +364,15 @@ def test_category_checkpoints_and_final_result_conserve_all_tokens(
         result, release, authorization, plan
     )
     assert validated["selection_result"]["final_tokens"] == 80_000_000_007
-    assert len(validated["shard_manifest"]["shards"]) == 163
+    assert len(validated["shard_manifest"]["shards"]) == 160
+    assert validated["shard_manifest"]["document_markers"] == (
+        validated["selection_result"]["final_documents"]
+    )
 
     changed_result = copy.deepcopy(result)
-    changed_result["shard_manifest"]["shards"][0]["object_sha256"] = "f" * 64
-    changed_result["shard_manifest"]["shards"][0]["s3_uri"] = (
-        changed_result["shard_manifest"]["shards"][0]["s3_uri"].rsplit("/", 1)[0]
-        + "/"
-        + "f" * 64
-        + ".uint16.bin"
-    )
+    changed_result["shard_manifest"]["packing"]["doc_token_id"] = 4
     changed_result["result_sha256"] = production_result_fingerprint(changed_result)
-    with pytest.raises(ValueError, match="baseline materialization"):
+    with pytest.raises(ValueError, match="document-marker packing"):
         validate_glue_final_corpus_production_result(
             changed_result, release, authorization, plan
         )

@@ -1,12 +1,12 @@
 # Lumi Final 80B Corpus Gate v0.1
 
-Status: **the deterministic 120B-to-80B selection/shard contract and bounded
-Glue canary pass. The latest exact production authorization was consumed once,
-then failed closed before candidate selection on a harmless leading `./` in a
-hash-verified baseline tar member. It cost an estimated `$1.024222`, published
-no selected corpus or result, and its Glue job and IAM role are deleted. A
-safe normalized-member correction passes locally; no replacement run, GPU
-work, or model training is authorized.**
+Status: **the marker-aware 120B-to-80B selection/shard contract and its bounded
+8-DPU Glue canary pass. Every canary shard starts with token ID 3 (`<|doc|>`),
+all 3,797 selected documents have exactly one marker, and all 28 shard hashes
+pass independent byte-level verification. The older 80B materialization is
+retained only as historical selection evidence because its packed bytes contain
+no document markers; the trainer now rejects it. No corrected production
+repack, GPU work, or model training is authorized.**
 
 ## Why this gate exists
 
@@ -34,7 +34,9 @@ The contract in `configs/final-corpus-80b-v0.1.json` pins:
 - accepted-candidate inventory: `68,671,669` documents,
   `119,762,267,075` tokens, 2,772 Parquet objects, and
   `507,737,434,761` bytes;
-- immutable prefix: `38,349` documents and `237,769,640` tokens;
+- historical immutable prefix: `38,349` documents and `237,769,640` content
+  tokens, retained only as a deduplication anchor and excluded from the
+  marker-aware training stream;
 - frozen 65K tokenizer SHA-256
   `1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee`;
 - the exact data-mix, filter policy, benchmark registry, and permanent
@@ -46,16 +48,16 @@ authorization, input-index, and map-checkpoint hashes from that run.
 
 ## Final mixture
 
-| Category | Final target | Preserved prefix | New selection target |
-|---|---:|---:|---:|
-| Science and education | 24B | 237,769,640 | 23,762,230,360 |
-| Code | 16B | 0 | 16B |
-| Reference | 12B | 0 | 12B |
-| Questions and discussion | 12B | 0 | 12B |
-| Open web | 8B | 0 | 8B |
-| Books | 4B | 0 | 4B |
-| Government, legal, and patents | 4B | 0 | 4B |
-| **Total** | **80B** | **237,769,640** | **79,762,230,360** |
+| Category | Final target | Marker-aware selection target |
+|---|---:|---:|
+| Science and education | 24B | 24B |
+| Code | 16B | 16B |
+| Reference | 12B | 12B |
+| Questions and discussion | 12B | 12B |
+| Open web | 8B | 8B |
+| Books | 4B | 4B |
+| Government, legal, and patents | 4B | 4B |
+| **Total** | **80B** | **80B** |
 
 ## Deterministic selection
 
@@ -86,12 +88,15 @@ and a canonical result fingerprint.
 
 The output namespace is fixed to
 `s3://lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/final-80b/`.
-The plan keeps the three existing prefix artifacts and expects 160 new
-approximately 500M-token uint16 shards, for 163 manifest entries in total.
+The plan treats the three old prefix artifacts as deduplication anchors only
+and expects 160 fresh approximately 500M-token uint16 shards. The marker-aware
+manifest therefore has exactly 160 entries; no old markerless shard is copied.
 
 The shard validator requires:
 
 - contiguous shard sequence numbers and unique object keys/hashes;
+- one token ID 3 (`<|doc|>`) before every document, with
+  `tokens = content_tokens + documents`;
 - exact per-category and aggregate document/token conservation;
 - exactly two bytes per token;
 - no shard above 500M tokens plus the document-boundary cap;
@@ -151,14 +156,14 @@ Spark execution proof before production materialization.
 
 ## Verified AWS canary result
 
-The corrected owner-authorized run used release
-`792a8a604244282655ad5f1f9db69bf39b2ca885c477e2a8a8492eb4f1419de2`
+The marker-aware owner-authorized run used release
+`ef29436069e65fb5a0ff9d37fbe82c6298dc76ac5ea557f647dc8dcafb1b985f`
 and authorization
-`34278ac482691fc9feab90be5c200c0f0c3d60fd2869cb2fd97667e8b61ba8ac`.
+`6f7fe1316a6d72dbe9fa4bb255aea764e1be3452d07cbb7164334f79b5e5accb`.
 Glue run
-`jr_d21c36b266cefc068da3bdc575779d8adb69ed447f69bd131ed4570e531ea193`
-finished `SUCCEEDED` in 317 execution seconds, consumed 2,536 DPU-seconds, and
-cost an estimated `$0.309956` at `$0.44` per DPU-hour. It stayed inside the
+`jr_f4b069bdf6436bc796317ca9d3930ac4e311c9d7a72936d5e2aa58b803f77674`
+finished `SUCCEEDED` in 287 execution seconds, consumed 2,303 DPU-seconds, and
+cost an estimated `$0.281478` at `$0.44` per DPU-hour. It stayed inside the
 8-worker, 30-minute, `$1.76` envelope with zero retries.
 
 The run also verified Spark `3.5.6-amzn-1` and every static setting, including
@@ -167,19 +172,23 @@ Spark configuration mutation was required.
 
 The run independently matched the complete input inventory of 2,772 objects,
 `507,737,434,761` bytes, `68,671,669` documents, and `119,762,267,075`
-tokens. Across all seven categories it selected 3,803 documents and
-`7,026,092` tokens, produced seven selected Parquet objects plus 28 packed
-uint16 objects, and passed 16-versus-23-partition parity in every category.
-Selected output occupied `31,041,302` bytes; packed output occupied
-`14,052,184` bytes, exactly two bytes per selected token.
+content tokens. Across all seven categories it selected 3,797 documents,
+`7,023,704` content tokens, and 3,797 document markers, for `7,027,501`
+packed tokens. It produced seven selected Parquet objects plus 28 packed
+uint16 objects and passed 16-versus-23-partition parity in every category.
+Selected output occupied `31,038,392` bytes; packed output occupied
+`14,055,002` bytes, exactly two bytes per packed token.
 
 The canonical result SHA-256 is
-`e5da85af1b58c00f58de395e5041aaf5881d236570d4c7a1df49861babc17eff`.
+`900589aa54c7d8b4b273bb64ed3f7b8870b73e5b502b888967d5faf9885ea5ae`.
 The release, authorization, input, plan, baseline heads, result conservation,
-content-addressed output inventories, and local evidence hashes all pass. The
-consumed Glue job and dedicated IAM role were then deleted. The compact sealed
+content-addressed output inventories, and local evidence hashes all pass.
+Independent local inspection downloaded every packed object, recomputed all
+28 SHA-256 digests, confirmed that every shard begins with token ID 3, and
+counted exactly one ID 3 per selected document. The consumed Glue job and
+dedicated IAM role were then deleted and confirmed absent. The compact sealed
 record is `reports/glue-final-corpus-canary-result-v0.1.json`; generated S3
-payloads remain outside Git.
+audit payloads remain outside Git.
 
 ## Fail-safe historical production attempt
 
@@ -223,7 +232,7 @@ accepts a harmless leading `./`, rejects absolute paths and parent traversal,
 and rejects missing or ambiguous normalized matches. The consumed authorization
 cannot be reused, and no replacement run has been inferred or launched.
 
-## Production package boundary
+## Corrected marker-aware production package boundary
 
 `configs/glue-final-corpus-production-v0.1.json` and
 `src/lumi/glue_final_corpus_production.py` now define the production-only
@@ -237,38 +246,40 @@ authorization artifact. Its fixed envelope is:
   `$0.44` per DPU-hour rate;
 - the exact 2,772-object, `507,737,434,761`-byte accepted-candidate inventory;
 - 1,600 deterministic selection partitions, seven immutable category
-  checkpoints, 160 new approximately 500M-token shards, and exactly 163 final
-  manifest entries after the three preserved baseline shards;
+  checkpoints, and exactly 160 fresh approximately 500M-token marker-aware
+  manifest entries;
 - a `750,000,000,000`-byte hard ceiling on newly materialized selected
-  Parquet, copied/materialized baseline shards, and packed uint16 shards;
+  Parquet and packed uint16 shards;
 - no GPU permission and no model-training permission.
 
-The corrected canary calibration processed `301,453,386` input tokens in 2,536
-DPU-seconds. Linear projection for the full accepted pool is 1,007,510
-DPU-seconds, approximately 168 minutes on 100 DPU and `$123.140111`. The sealed
-planning rule applies a 3x safety factor: 3,022,529 DPU-seconds, approximately
-504 minutes and `$369.420211`. These are measured projections, not guarantees;
-the 12-hour/`$528` boundary remains the actual fail-closed limit. Projected
-maximum new output is `512,395,734,963` bytes, below the 750GB cap.
+The marker-aware canary calibration processed `301,453,386` input content
+tokens in 2,303 DPU-seconds. Linear projection for the full accepted pool is
+914,943 DPU-seconds, approximately 153 minutes on 100 DPU and `$111.826367`.
+The sealed planning rule applies a 3x safety factor: 2,744,828 DPU-seconds,
+approximately 458 minutes and `$335.478978`. These are measured projections,
+not guarantees; the 12-hour/`$528` boundary remains the actual fail-closed
+limit. Projected maximum new output is `513,342,209,894` bytes, below the
+750GB cap.
 
 Before any row is selected, the runtime independently inventories every input
-object, validates the exact release, plan, canary report, authorization, Python
-3.11 and Spark 3.5.6 bindings, and assigns every input object to exactly one
-category. It then hash-ranks and selects each category, writes an immutable
-selected inventory, packs content-addressed uint16 shards, and seals a category
-checkpoint before advancing. The two existing full baseline shards are
-downloaded and rehashed before immutable publication; the partial baseline is
-extracted from its hash-pinned archive member and independently rehashed.
+object, validates the exact release, plan, marker-aware canary report,
+authorization, Python 3.11 and Spark 3.5.6 bindings, and assigns every input
+object to exactly one category. It then hash-ranks and selects each category,
+prepends token ID 3 to every document, writes an immutable selected inventory,
+packs content-addressed uint16 shards, and seals a category checkpoint before
+advancing. No historical baseline shard is copied into the training stream.
 Final publication is allowed only after selection-result, shard-manifest,
-document/token/byte conservation, baseline, category, runtime, and output-cap
-validation all pass.
+document/content-token/marker/byte conservation, category, runtime, and
+output-cap validation all pass.
 
 The launcher is dry-run by default. Its one-purpose IAM policy can read only
-the accepted prefix and exact bootstrap/baseline objects, can write only the
+the accepted prefix and exact bootstrap objects, can write only the
 authorization-derived run/temp/result prefixes, uses an immutable launch claim,
-and refuses any job that already ran. The package described below was later
-authorized and consumed by the fail-safe attempt above; that authorization is
-not reusable.
+and refuses any job that already ran. The historical packages described below
+were consumed under the older markerless contract; their authorizations are not
+reusable. No marker-aware production package has been authorized or consumed.
+
+### Historical markerless package provenance
 
 The consumed reproducible package was bound to source commit
 `3a5012995a19f076b8048b9b4a3c96b5fcac2ee5`. Its release fingerprint is
@@ -292,9 +303,16 @@ After the normalized-member correction, all 18 focused final-corpus tests
 (one environment-dependent skip), all 343 collected repository tests (three
 environment-dependent skips), and repository-wide Ruff pass.
 
-## Successful production materialization
+## Historical markerless production materialization
 
-The fresh authorization SHA-256
+The run below successfully proved deterministic 80B selection, distributed
+sharding, checkpointing, and S3 sealing under the older contract. A later
+byte-level audit found that all packed shards contain zero `<|doc|>` markers
+because the mapper stored content-only `token_bytes` and the old packer copied
+those bytes verbatim. These 163 shards are therefore quarantined and are not
+training-ready. The production trainer now rejects their manifest.
+
+The historical authorization SHA-256
 `064fccf72df4f1489c3998fe7c613bc7f75f494028bec2a8b462212d140ad4b1`
 was consumed exactly once by Glue run
 `jr_fd32da9a73c98b3bff419c2cb7165e2591972b1578512fc6b4764b05caaf0144`.
@@ -322,7 +340,8 @@ sequences are contiguous from 0 through 162. Packed output occupies
 `160,000,029,468` bytes, exactly two bytes per uint16 token. Selected Parquet
 plus packed output occupies `503,157,241,754` bytes, below the 750GB cap.
 
-Independent post-run verification downloaded the sealed result, standalone
+Independent post-run verification under the older markerless contract
+downloaded the sealed result, standalone
 selection result, shard manifest, and all seven checkpoints. Every local file
 matches its S3 metadata SHA-256. The production validators pass exact release,
 authorization, plan, dedup-result, runtime, category, baseline, output-cap, and
@@ -336,7 +355,8 @@ The canonical sealed production result SHA-256 is
 
 After evidence was sealed, the consumed Glue job and bounded IAM role were
 deleted and independently confirmed absent. S3 corpus and result objects remain
-preserved. The compact repository record is
+preserved as historical evidence, not as accepted training input. The compact
+repository record is
 `reports/glue-final-corpus-production-result-v0.1.json`; the 15-file external
 evidence manifest hashes to
 `810716bccae1be3e041717ae51f89e314b76372d80dcdcd97411c5a2c976db3c`.
@@ -345,11 +365,17 @@ and repository-wide Ruff passes.
 
 ## Next boundary
 
-Final 80B corpus materialization and sealing are complete. The next roadmap
-boundary is a bounded 4B multi-GPU learning pilot using this exact tokenizer,
-architecture, optimizer decision, isolated-attention path, and sealed corpus.
-The pilot must first prove distributed loading, throughput, memory, checkpoint
-resume, held-out improvement, and failure recovery. It requires a new explicit
-owner approval and does not authorize full 4B/80B pretraining. Full pretraining,
-instruction tuning, alignment, quantization, API hosting, and deployment remain
-later independent gates.
+The marker-aware canary is complete, but the corrected full 80B corpus repack
+is not. The immediate next boundary is one separately authorized 100-DPU Glue
+production selection/sharding run against plan
+`aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470`.
+It must produce 160 fresh marker-aware shards and pass complete S3 inventory,
+hash, document/content-token/marker/byte, category, and trainer-boundary
+verification before any GPU pilot resumes.
+
+After that seal, the roadmap returns to the bounded 4B multi-GPU learning pilot
+using this exact tokenizer, architecture, optimizer decision,
+isolated-attention path, and corrected corpus. The pilot and full 4B/80B
+pretraining each require separate owner approval. Instruction tuning,
+alignment, quantization, API hosting, and deployment remain later independent
+gates.

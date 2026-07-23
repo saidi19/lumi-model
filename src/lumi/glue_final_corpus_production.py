@@ -104,7 +104,7 @@ def _read_contract(path: Path, root: Path) -> dict[str, Any]:
         raise ValueError("Glue final-corpus production job envelope changed")
     if contract.get("limits") != {
         "expected_new_packed_shards": 160,
-        "expected_total_packed_shards": 163,
+        "expected_total_packed_shards": 160,
         "maximum_category_checkpoints": 7,
         "maximum_input_bytes": 507_737_434_761,
         "maximum_input_objects": 2_772,
@@ -188,11 +188,23 @@ def _validate_canary_report(report: Mapping[str, Any]) -> dict[str, Any]:
         "status": "consumed_job_and_role_removed",
     }:
         raise ValueError("final-corpus canary cleanup is incomplete")
+    if report.get("packing") != {
+        "baseline_policy": "dedup_anchor_only",
+        "doc_token": "<|doc|>",
+        "doc_token_id": 3,
+        "include_document_marker": True,
+        "token_accounting": "content_plus_one_document_marker",
+    }:
+        raise ValueError("final-corpus canary packing contract changed")
     calibration = report.get("calibration")
     if calibration != {
         "input_documents": 173_380,
-        "input_tokens": 301_453_386,
-        "selected_tokens": 7_026_092,
+        "input_content_tokens": 301_453_386,
+        "input_document_markers": 173_380,
+        "input_tokens": 301_626_766,
+        "selected_content_tokens": 7_023_704,
+        "selected_document_markers": 3_797,
+        "selected_tokens": 7_027_501,
     }:
         raise ValueError("final-corpus canary calibration changed")
     job = report.get("job")
@@ -236,13 +248,15 @@ def _validate_canary_report(report: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("final-corpus canary input inventory changed")
     output = report.get("output")
     if output != {
-        "output_bytes": 45_093_486,
-        "packed_bytes": 14_052_184,
+        "output_bytes": 45_093_394,
+        "packed_bytes": 14_055_002,
         "packed_objects": 28,
-        "selected_bytes": 31_041_302,
-        "selected_documents": 3_803,
+        "selected_bytes": 31_038_392,
+        "selected_content_tokens": 7_023_704,
+        "selected_document_markers": 3_797,
+        "selected_documents": 3_797,
         "selected_objects": 7,
-        "selected_tokens": 7_026_092,
+        "selected_tokens": 7_027_501,
     }:
         raise ValueError("final-corpus canary output evidence changed")
     categories = report.get("categories")
@@ -250,7 +264,21 @@ def _validate_canary_report(report: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("final-corpus canary category evidence changed")
     if any(row.get("partition_parity") != "pass" for row in categories):
         raise ValueError("final-corpus canary partition parity failed")
-    if sum(int(row["selected_tokens"]) for row in categories) != 7_026_092:
+    if any(
+        int(row["selected_tokens"])
+        != int(row["selected_content_tokens"])
+        + int(row["selected_document_markers"])
+        or int(row["selected_document_markers"]) != int(row["selected_documents"])
+        for row in categories
+    ):
+        raise ValueError("final-corpus canary marker accounting changed")
+    if (
+        sum(int(row["selected_content_tokens"]) for row in categories)
+        != 7_023_704
+        or sum(int(row["selected_document_markers"]) for row in categories)
+        != 3_797
+        or sum(int(row["selected_tokens"]) for row in categories) != 7_027_501
+    ):
         raise ValueError("final-corpus canary category accounting changed")
     return dict(report)
 
@@ -270,7 +298,9 @@ def _derive_cost_model(
     safety_multiplier: Decimal,
 ) -> dict[str, Any]:
     canary_dpu_seconds = Decimal(str(report["job"]["dpu_seconds"]))
-    canary_input_tokens = Decimal(int(report["calibration"]["input_tokens"]))
+    canary_input_tokens = Decimal(
+        int(report["calibration"]["input_content_tokens"])
+    )
     ideal_dpu_seconds_decimal = (
         canary_dpu_seconds * Decimal(input_tokens) / canary_input_tokens
     )
@@ -478,6 +508,7 @@ def build_glue_final_corpus_production_package(
             "result_prefix": f"{namespace}/production/results",
             "run_prefix": f"{namespace}/production/runs",
         },
+        "packing": dict(supplied_plan["packing"]),
         "region": contract["region"],
         "runtime": dict(contract["runtime"]),
         "schema_version": SCHEMA_VERSION,
@@ -606,7 +637,15 @@ def validate_glue_final_corpus_production_release(
         raise ValueError("Glue final-corpus production categories changed")
     if [int(row.get("ordinal", -1)) for row in categories] != list(range(7)):
         raise ValueError("Glue final-corpus production category order changed")
-    expected_sequence = 3
+    if release.get("packing") != {
+        "baseline_policy": "dedup_anchor_only",
+        "doc_token": "<|doc|>",
+        "doc_token_id": 3,
+        "include_document_marker": True,
+        "token_accounting": "content_plus_one_document_marker",
+    }:
+        raise ValueError("Glue final-corpus production packing changed")
+    expected_sequence = 0
     candidate_maximum = 0
     for row in categories:
         count = int(row.get("new_packed_shards", -1))
@@ -616,14 +655,14 @@ def validate_glue_final_corpus_production_release(
             raise ValueError("Glue final-corpus production shard end changed")
         expected_sequence += count
         candidate_maximum += int(row["maximum_selected_candidate_tokens"])
-    if expected_sequence != 163 or sum(
+    if expected_sequence != 160 or sum(
         int(row["target_final_tokens"]) for row in categories
     ) != 80_000_000_000:
         raise ValueError("Glue final-corpus production shard/category totals changed")
     limits = release.get("limits")
     if not isinstance(limits, Mapping) or limits != {
         "expected_new_packed_shards": 160,
-        "expected_total_packed_shards": 163,
+        "expected_total_packed_shards": 160,
         "maximum_category_checkpoints": 7,
         "maximum_document_boundary_overshoot_tokens": 131_072,
         "maximum_final_selected_tokens": 80_000_917_504,
@@ -664,12 +703,12 @@ def validate_glue_final_corpus_production_release(
     cost = _derive_cost_model(
         report={
             "calibration": {
-                "input_tokens": 301_453_386,
+                "input_content_tokens": 301_453_386,
             },
             "job": {"dpu_seconds": calibration_dpu_seconds},
             "output": {
-                "selected_bytes": 31_041_302,
-                "selected_tokens": 7_026_092,
+                "selected_bytes": 31_038_392,
+                "selected_tokens": 7_027_501,
             },
         },
         input_tokens=int(accepted["tokens"]),
@@ -879,9 +918,15 @@ def validate_glue_final_corpus_category_checkpoint(
     selected_documents = _positive_int(
         checkpoint.get("selected_candidate_documents"), "checkpoint documents"
     )
+    selected_content_tokens = _positive_int(
+        checkpoint.get("selected_candidate_content_tokens"),
+        "checkpoint content tokens",
+    )
     selected_tokens = _positive_int(
         checkpoint.get("selected_candidate_tokens"), "checkpoint tokens"
     )
+    if selected_tokens != selected_content_tokens + selected_documents:
+        raise ValueError("Glue final-corpus checkpoint marker accounting changed")
     if not int(planned["requested_candidate_tokens"]) <= selected_tokens <= int(
         planned["maximum_selected_candidate_tokens"]
     ):
@@ -894,6 +939,10 @@ def validate_glue_final_corpus_category_checkpoint(
         planned["available_candidate_tokens"]
     ):
         raise ValueError("Glue final-corpus category checkpoint input changed")
+    if int(checkpoint.get("available_candidate_content_tokens", -1)) != int(
+        planned["available_candidate_content_tokens"]
+    ):
+        raise ValueError("Glue final-corpus checkpoint available content changed")
     cutoff = checkpoint.get("cutoff")
     if not isinstance(cutoff, Mapping):
         raise ValueError("Glue final-corpus category checkpoint cutoff is missing")
@@ -919,6 +968,8 @@ def validate_glue_final_corpus_category_checkpoint(
     ):
         raise ValueError("Glue final-corpus category shard count changed")
     shard_tokens = 0
+    shard_content_tokens = 0
+    shard_document_markers = 0
     shard_documents = 0
     packed_bytes = 0
     first = int(planned["first_new_shard_sequence"])
@@ -929,6 +980,14 @@ def validate_glue_final_corpus_category_checkpoint(
             raise ValueError("Glue final-corpus category shard sequence changed")
         tokens = _positive_int(shard.get("tokens"), "category shard tokens")
         documents = _positive_int(shard.get("documents"), "category shard documents")
+        content_tokens = _positive_int(
+            shard.get("content_tokens"), "category shard content tokens"
+        )
+        document_markers = _positive_int(
+            shard.get("document_markers"), "category shard document markers"
+        )
+        if document_markers != documents or tokens != content_tokens + document_markers:
+            raise ValueError("Glue final-corpus shard marker accounting changed")
         object_bytes = _positive_int(shard.get("object_bytes"), "category shard bytes")
         if object_bytes != tokens * 2 or tokens > 500_131_072:
             raise ValueError("Glue final-corpus category shard bounds changed")
@@ -942,10 +1001,17 @@ def validate_glue_final_corpus_category_checkpoint(
         if not str(shard["s3_uri"]).endswith(f"/{digest}.uint16.bin"):
             raise ValueError("Glue final-corpus category shard is not content-addressed")
         shard_tokens += tokens
+        shard_content_tokens += content_tokens
+        shard_document_markers += document_markers
         shard_documents += documents
         packed_bytes += object_bytes
     if shard_tokens != selected_tokens or shard_documents != selected_documents:
         raise ValueError("Glue final-corpus category shard conservation failed")
+    if (
+        shard_content_tokens != selected_content_tokens
+        or shard_document_markers != selected_documents
+    ):
+        raise ValueError("Glue final-corpus category marker conservation failed")
     if int(checkpoint.get("output_bytes", -1)) != selected_bytes + packed_bytes:
         raise ValueError("Glue final-corpus category output accounting changed")
     return dict(checkpoint)
@@ -1006,21 +1072,7 @@ def validate_glue_final_corpus_production_result(
         raise ValueError("Glue final-corpus production sealed outputs are missing")
     validate_final_selection_result(selection, plan)
     validate_final_shard_manifest(shards, plan, selection)
-    baseline = [*release["baseline"]["sealed_shards"], release["baseline"]["partial"]]
-    for sequence, expected in enumerate(baseline):
-        observed_shard = shards["shards"][sequence]
-        expected_sha = expected["sha256"]
-        if (
-            observed_shard.get("category") != "science_and_education"
-            or int(observed_shard.get("documents", -1)) != int(expected["documents"])
-            or int(observed_shard.get("tokens", -1)) != int(expected["tokens"])
-            or observed_shard.get("object_sha256") != expected_sha
-        ):
-            raise ValueError("Glue final-corpus production baseline materialization changed")
-    baseline_bytes = sum(int(row["bytes"]) for row in baseline)
-    if int(result.get("data_output_bytes", -1)) != (
-        checkpoint_output_bytes + baseline_bytes
-    ):
+    if int(result.get("data_output_bytes", -1)) != checkpoint_output_bytes:
         raise ValueError("Glue final-corpus production output-byte accounting changed")
     if int(result["data_output_bytes"]) > int(
         release["limits"]["maximum_new_output_bytes"]

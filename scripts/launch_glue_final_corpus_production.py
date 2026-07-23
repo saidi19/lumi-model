@@ -310,18 +310,10 @@ def main() -> None:
     accepted_prefix = _s3_key(
         str(release["input"]["accepted_candidates"]["s3_uri"]), bucket=bucket
     ).rstrip("/")
-    baseline_keys = [
-        _s3_key(str(row["s3_uri"]), bucket=bucket)
-        for row in release["baseline"]["sealed_shards"]
-    ]
-    baseline_keys.append(
-        _s3_key(str(release["baseline"]["archive"]["s3_uri"]), bucket=bucket)
-    )
     exact_read_keys = [
         release_key,
         authorization_key,
         *artifact_keys.values(),
-        *baseline_keys,
     ]
     run_prefix = f"{release['output']['run_prefix']}/{token}"
     result_prefix = f"{release['output']['result_prefix']}/{token}"
