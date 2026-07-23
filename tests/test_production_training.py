@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 from array import array
@@ -33,6 +34,12 @@ def _bytes(values: list[int]) -> bytes:
     if sys.byteorder != "little":
         result.byteswap()
     return result.tobytes()
+
+
+def _free_ipv4_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as handle:
+        handle.bind(("127.0.0.1", 0))
+        return int(handle.getsockname()[1])
 
 
 def _final_fixture(tmp_path: Path, *, sequence_count: int = 5) -> tuple[Path, Path, list[int]]:
@@ -248,12 +255,16 @@ def test_final_corpus_exact_tail_runs_once_without_epoch_wrap(tmp_path: Path) ->
     output = tmp_path / "run"
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": str(root / "src")}
+    master_port = _free_ipv4_port()
     subprocess.run(
         [
             sys.executable,
             "-m",
             "torch.distributed.run",
-            "--standalone",
+            "--master-addr=127.0.0.1",
+            f"--master-port={master_port}",
+            "--nnodes=1",
+            "--node-rank=0",
             "--nproc-per-node=2",
             str(root / "scripts" / "train_distributed.py"),
             "--manifest",
@@ -302,7 +313,6 @@ def test_final_corpus_exact_tail_runs_once_without_epoch_wrap(tmp_path: Path) ->
 
 
 def test_markerless_production_corpus_is_rejected_before_preflight() -> None:
-    root = Path(__file__).resolve().parents[1]
     artifact = Path(
         "/Users/afnan/Documents/Flowaistudio/lumi-artifacts/final-corpus-80b-v0.1/"
         "555f80f8396e-glue-production-run/evidence/results/shard-manifest.json"
@@ -310,12 +320,34 @@ def test_markerless_production_corpus_is_rejected_before_preflight() -> None:
     if not artifact.is_file():
         pytest.skip("verified final corpus evidence is not mounted")
     with pytest.raises(ValueError, match="document-marker packing"):
-        build_production_training_preflight_plan(
-            contract_path=root / "configs/4b-production-preflight-v0.1.json",
-            manifest_path=artifact,
-            model_config_path=root / "configs/lumi-4b-v0.2.json",
-            source_commit="e" * 40,
+        validate_final_corpus_training_manifest(
+            artifact,
+            sequence_length=4096,
+            vocab_size=65_536,
+            doc_token_id=3,
         )
+
+
+def test_corrected_marker_aware_corpus_passes_production_preflight() -> None:
+    root = Path(__file__).resolve().parents[1]
+    artifact = Path(
+        "/Users/afnan/Documents/Flowaistudio/lumi-artifacts/final-corpus-80b-v0.1/"
+        "bdd656e14cee-marker-production-run/evidence/results/shard-manifest.json"
+    )
+    if not artifact.is_file():
+        pytest.skip("verified marker-aware corpus evidence is not mounted")
+
+    plan = build_production_training_preflight_plan(
+        contract_path=root / "configs/4b-production-preflight-v0.1.json",
+        manifest_path=artifact,
+        model_config_path=root / "configs/lumi-4b-v0.2.json",
+        source_commit="e" * 40,
+    )
+
+    assert plan["corpus"]["documents"] == 45_768_283
+    assert plan["corpus"]["tokens"] == 80_000_000_000
+    assert plan["corpus"]["trailing_tokens_not_consumed"] == 8_364
+    assert plan["corpus"]["shards"] == 160
 
 
 def test_account_segment_plan_is_credit_and_checkpoint_bounded() -> None:

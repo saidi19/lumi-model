@@ -89,10 +89,27 @@ def test_learning_pilot_contract_keeps_equal_4_and_8_gpu_token_geometry() -> Non
         * run["resume_through_step"]
         == PAID_LEARNING_PILOT_MAX_TOKENS
     )
+    assert contract["corpus"]["fixture_prefix"] == {
+        "bytes": 167_772_160,
+        "document_markers": 9_885,
+        "range_end": 167_772_159,
+        "range_start": 0,
+        "sha256": "f27566d2d8ee7f234a03918ca6a3f6c94f03cd44ec58a7e77cce4c39ef58eed0",
+        "tokens": 83_886_080,
+    }
+    assert (
+        contract["corpus"]["source_shard"]["bytes"]
+        > contract["corpus"]["fixture_prefix"]["bytes"]
+    )
 
     changed = copy.deepcopy(contract)
     changed["run"]["topologies"][0]["gradient_accumulation_steps"] = 32
     with pytest.raises(ValueError, match="topology geometry"):
+        _validate_contract(changed)
+
+    changed = copy.deepcopy(contract)
+    changed["corpus"]["fixture_prefix"]["range_end"] -= 1
+    with pytest.raises(ValueError, match="byte range"):
         _validate_contract(changed)
 
 
@@ -118,6 +135,9 @@ def test_learning_pilot_staging_enters_the_pinned_repo() -> None:
         '"$python_bin" scripts/prepare_4b_learning_pilot_data.py'
     )
     assert cd_repo < prepare_fixture
+    assert '--range "0-$prefix_range_end"' in script
+    assert '--max-filesize "$prefix_bytes"' in script
+    assert '--source-prefix "$source_prefix"' in script
 
 
 def test_learning_pilot_fixture_is_exact_hash_bound_prefix(
@@ -126,8 +146,10 @@ def test_learning_pilot_fixture_is_exact_hash_bound_prefix(
 ) -> None:
     source_values = [3, 11, 12, 13, 3, 21, 22, 23, 3, 31]
     source_bytes = _uint16_bytes(source_values)
-    source_path = tmp_path / "source.bin"
-    source_path.write_bytes(source_bytes)
+    source_prefix_values = source_values[:8]
+    source_prefix_bytes = _uint16_bytes(source_prefix_values)
+    source_prefix_path = tmp_path / "source-prefix.bin"
+    source_prefix_path.write_bytes(source_prefix_bytes)
     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
     source_contract = {
         "bytes": len(source_bytes),
@@ -137,12 +159,21 @@ def test_learning_pilot_fixture_is_exact_hash_bound_prefix(
         "s3_uri": "s3://fixture-bucket/source.bin",
         "tokens": len(source_values),
     }
+    prefix_contract = {
+        "bytes": len(source_prefix_bytes),
+        "document_markers": source_prefix_values.count(3),
+        "range_end": len(source_prefix_bytes) - 1,
+        "range_start": 0,
+        "sha256": hashlib.sha256(source_prefix_bytes).hexdigest(),
+        "tokens": len(source_prefix_values),
+    }
     contract = {
         "corpus": {
             "doc_token_id": 3,
             "final_manifest_sha256": "a" * 64,
             "final_plan_fingerprint": "b" * 64,
             "final_selection_result_sha256": "c" * 64,
+            "fixture_prefix": prefix_contract,
             "fixture_sequences": 2,
             "fixture_tokens": 8,
             "sequence_length": 4,
@@ -165,23 +196,33 @@ def test_learning_pilot_fixture_is_exact_hash_bound_prefix(
     report = prepare_learning_pilot_fixture(
         contract_path=contract_path,
         final_manifest_path=final_manifest_path,
-        source_shard_path=source_path,
+        source_prefix_path=source_prefix_path,
         output=output,
     )
 
-    assert (output / "shard-00000.bin").read_bytes() == _uint16_bytes(source_values[:8])
+    assert (output / "shard-00000.bin").read_bytes() == source_prefix_bytes
     assert report["document_markers"] == 2
+    assert report["source_prefix_sha256"] == prefix_contract["sha256"]
     assert report["source_shard_category"] == "fixture"
     assert report["tokens"] == 8
     assert (
         prepare_learning_pilot_fixture(
             contract_path=contract_path,
             final_manifest_path=final_manifest_path,
-            source_shard_path=source_path,
+            source_prefix_path=source_prefix_path,
             output=output,
         )
         == report
     )
+
+    source_prefix_path.write_bytes(source_prefix_bytes[:-2] + b"\x00\x00")
+    with pytest.raises(ValueError, match="source prefix SHA-256 changed"):
+        prepare_learning_pilot_fixture(
+            contract_path=contract_path,
+            final_manifest_path=final_manifest_path,
+            source_prefix_path=source_prefix_path,
+            output=tmp_path / "tampered-fixture",
+        )
 
 
 @pytest.mark.parametrize(
