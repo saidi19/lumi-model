@@ -82,6 +82,14 @@ LOCAL_PREFLIGHT_MAX_STEPS = 8
 LOCAL_PREFLIGHT_MAX_TOKENS = 2_000_000
 LOCAL_PREFLIGHT_MAX_WORLD_SIZE = 2
 PAID_SMOKE_MAX_STEPS = 1_000
+PAID_LEARNING_PILOT_MAX_STEPS = 80
+PAID_LEARNING_PILOT_MAX_TOKENS = 83_886_080
+PAID_LEARNING_PILOT_WORLD_SIZES = {4, 8}
+PAID_LEARNING_PILOT_MAX_RUNTIME_MINUTES = {4: 480, 8: 240}
+PAID_LEARNING_PILOT_RUN_KIND = "lumi_4b_learning_pilot_v0.1"
+PAID_LEARNING_PILOT_OWNER_ACKNOWLEDGEMENT = (
+    "I approve this bounded paid Lumi-4B learning pilot through the recorded step."
+)
 
 
 def _validate_source_commit(source_commit: str | None) -> str | None:
@@ -697,13 +705,18 @@ def _validate_paid_authorization(
     context: DistributedContext,
     strategy: str,
     steps: int,
+    target_tokens: int | None = None,
 ) -> dict[str, Any]:
     authorization = json.loads(path.read_text(encoding="utf-8"))
     if authorization.get("schema_version") != DISTRIBUTED_AUTHORIZATION_SCHEMA_VERSION:
         raise ValueError("unsupported distributed launch authorization")
     if authorization.get("status") != "owner_approved":
         raise ValueError("distributed launch is not owner-approved")
-    if authorization.get("run_kind") != "lumi_distributed_smoke_v0.1":
+    run_kind = authorization.get("run_kind")
+    if run_kind not in {
+        "lumi_distributed_smoke_v0.1",
+        PAID_LEARNING_PILOT_RUN_KIND,
+    }:
         raise ValueError("authorization targets a different run kind")
     if authorization.get("run_fingerprint") != run_fingerprint:
         raise ValueError("authorization does not match the distributed run")
@@ -717,16 +730,52 @@ def _validate_paid_authorization(
     if authorization.get("strategy") != strategy:
         raise ValueError("authorization strategy changed")
     approved_step = authorization.get("approved_through_step")
-    if not isinstance(approved_step, int) or not steps <= approved_step <= PAID_SMOKE_MAX_STEPS:
-        raise ValueError("authorization step boundary is invalid")
     if authorization.get("paid_gpu") is not True:
         raise ValueError("paid CUDA launch must be explicit")
     if authorization.get("full_4b_training") is not False:
-        raise ValueError("the smoke authorization cannot approve full 4B training")
+        raise ValueError("the bounded authorization cannot approve full 4B training")
+
+    if run_kind == "lumi_distributed_smoke_v0.1":
+        if not isinstance(approved_step, int) or not (
+            steps <= approved_step <= PAID_SMOKE_MAX_STEPS
+        ):
+            raise ValueError("authorization step boundary is invalid")
+        if authorization.get("owner_acknowledgement") != (
+            "I approve this paid Lumi distributed smoke run through the recorded step."
+        ):
+            raise ValueError("authorization acknowledgement changed")
+        return authorization
+
+    if context.world_size not in PAID_LEARNING_PILOT_WORLD_SIZES:
+        raise ValueError("learning-pilot authorization requires four or eight GPUs")
+    if strategy != "fsdp_full_shard":
+        raise ValueError("learning-pilot authorization requires FSDP full sharding")
+    if approved_step != PAID_LEARNING_PILOT_MAX_STEPS or steps > approved_step:
+        raise ValueError("learning-pilot step boundary is invalid")
+    approved_tokens = authorization.get("approved_token_cap")
+    if approved_tokens != PAID_LEARNING_PILOT_MAX_TOKENS:
+        raise ValueError("learning-pilot token boundary changed")
+    if target_tokens is None or not 0 < target_tokens <= approved_tokens:
+        raise ValueError("learning-pilot target tokens exceed authorization")
     if authorization.get("owner_acknowledgement") != (
-        "I approve this paid Lumi distributed smoke run through the recorded step."
+        PAID_LEARNING_PILOT_OWNER_ACKNOWLEDGEMENT
     ):
-        raise ValueError("authorization acknowledgement changed")
+        raise ValueError("learning-pilot authorization acknowledgement changed")
+    max_runtime = authorization.get("max_runtime_minutes")
+    max_allowed_runtime = PAID_LEARNING_PILOT_MAX_RUNTIME_MINUTES[context.world_size]
+    if not isinstance(max_runtime, int) or isinstance(max_runtime, bool) or not (
+        30 <= max_runtime <= max_allowed_runtime
+    ):
+        raise ValueError("learning-pilot runtime cap is invalid")
+    hourly_rate = authorization.get("hourly_rate_usd")
+    if not isinstance(hourly_rate, (int, float)) or isinstance(hourly_rate, bool):
+        raise ValueError("learning-pilot hourly rate is invalid")
+    if not 0 < float(hourly_rate) <= 60:
+        raise ValueError("learning-pilot hourly rate is unsafe")
+    if not str(authorization.get("provider", "")).strip():
+        raise ValueError("learning-pilot provider is missing")
+    if not str(authorization.get("instance_type", "")).strip():
+        raise ValueError("learning-pilot instance type is missing")
     return authorization
 
 
@@ -751,6 +800,7 @@ def _validate_execution_scope(
             context=context,
             strategy=strategy,
             steps=steps,
+            target_tokens=target_tokens,
         )
 
     parameters = parameter_breakdown(config).total

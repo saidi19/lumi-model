@@ -554,6 +554,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     `42d742ecec2f63079522098118a2ba3be079ce59c1c0e651d6a3c84b92caacbe`.
     This is not a throughput or quality result: the separately authorized
     8xH100 learning pilot and full 4B/80B training remain unstarted.
+63. the bounded Lumi-4B learning-pilot harness now supports equivalent 4x and
+    8x 80GB H100 topologies without changing the 256-sequence global batch,
+    80-step schedule, or exact 83,886,080-token boundary. It trains fresh
+    through step 10, seals that milestone, resumes through step 80, evaluates
+    both checkpoints on the frozen 4,999,168-token held-out set, records every
+    GPU, and verifies loss movement, checkpoint integrity, portable export,
+    runtime, cost, and evidence hashes. Retry runtime is cumulative and cannot
+    reset the owner cap; milestone markers prevent a resumed run from
+    overwriting step-10 evidence. The hardware gate accepts only homogeneous
+    compute-capability-9.0 80GB H100s. Focused tests pass (`18 passed`), the
+    near-full local suite passes (`354 passed, 3 skipped, 1 deselected`), and
+    Ruff is clean. This is still planning-only: no H100 instance or paid pilot
+    was launched, and full 4B/80B training remains unauthorized.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -698,6 +711,9 @@ The logical final-corpus trainer adapter, exact 80B tail handling, portable
 checkpoint handoff, planning candidates, and independently verified Lambda A10
 engineering gate are documented in
 [`docs/4b-production-preflight-v0.1.md`](docs/4b-production-preflight-v0.1.md).
+The exact 4x/8x H100 learning workload, cumulative retry cap, milestone-safe
+resume flow, held-out gate, and remaining launch boundary are documented in
+[`docs/4b-learning-pilot-v0.1.md`](docs/4b-learning-pilot-v0.1.md).
 
 ## Repository policy
 
