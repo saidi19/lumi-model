@@ -30,6 +30,10 @@ _PUBLIC_ATTRIBUTES = {
     "create_scaling_data_contract": (".scaling_data", "create_scaling_data_contract"),
     "evaluate_checkpoint": (".checkpoint_evaluation", "evaluate_checkpoint"),
     "parameter_breakdown": (".parameter_count", "parameter_breakdown"),
+    "plan_4b_80b_production": (
+        ".production_pretraining",
+        "plan_4b_80b_production",
+    ),
     "train_distributed_packed": (".distributed_training", "train_distributed_packed"),
     "train_packed_pilot": (".pilot_training", "train_packed_pilot"),
     "validate_final_corpus_training_manifest": (

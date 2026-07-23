@@ -1,0 +1,106 @@
+{
+  "approval": {
+    "full_4b_training": false,
+    "paid_gpu": false
+  },
+  "budget": {
+    "available_credit_usd_per_segment": 7500,
+    "credit_reserve_usd_per_segment": 500,
+    "hourly_rate_usd": 31.92,
+    "instance_type": "gpu_8x_h100_sxm5",
+    "maximum_cost_usd_per_segment": 7000,
+    "provider": "Lambda Cloud",
+    "provider_runtime_cap_hours": 168,
+    "runtime_reserve_hours": 8,
+    "throughput_safety_factor": 0.8
+  },
+  "checkpoint_handoff": {
+    "format": "dcp-model_rank-local-optimizer-v0.1",
+    "hash_every_file": true,
+    "require_exact_run_fingerprint": true,
+    "require_same_world_size": true
+  },
+  "corpus": {
+    "available_tokens": 80000008364,
+    "doc_token_id": 3,
+    "documents": 45768283,
+    "manifest_sha256": "6de45464af33d44e1261a023ccb7d50f86346a4126bb2fa060530a91213483e9",
+    "object_bytes": 160000016728,
+    "plan_fingerprint": "aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470",
+    "selection_result_sha256": "b017a6fec5c6ca1685c5dcd883d8afc48d36fd18cac07d573514ad77307253ee",
+    "sequence_length": 4096,
+    "shards": 160,
+    "training_token_limit": 80000000000,
+    "vocab_size": 65536
+  },
+  "evaluation": {
+    "batch_size": 2,
+    "heldout_manifest_sha256": "c5022ce7ba9ed41dd9cdf1777639278c5ed111ef679e09d9fbc12e36fd6260dd",
+    "heldout_sequences": 2441,
+    "heldout_tokens": 4999168,
+    "milestone_steps": [
+      1000,
+      5000,
+      10000,
+      20000,
+      40000,
+      60000,
+      76294
+    ]
+  },
+  "hardware": {
+    "compute_capability": [
+      9,
+      0
+    ],
+    "gpu_model_contains": "H100",
+    "minimum_free_disk_bytes": 500000000000,
+    "minimum_host_memory_bytes": 128000000000,
+    "minimum_memory_bytes_per_gpu": 80000000000,
+    "world_size": 8
+  },
+  "model": {
+    "config": "configs/lumi-4b-v0.2.json",
+    "config_sha256": "643e8da652577f802d959740d66a7e6bafc5b065aa45010c2d7e0340ed9509be",
+    "parameters": 4002376704
+  },
+  "pilot_evidence": {
+    "median_tokens_per_second": 71935.43151677848,
+    "report": "reports/4b-learning-pilot-result-v0.1.json",
+    "report_sha256": "d7c4ce9db462219bb4feab4dee43f46fe158f99190eb6d3b35d77216519d5130",
+    "run_fingerprint": "c79c8a5e5a681aa61a26439d5a2aa39798cdc3884b626550cd8ff96ac7ac6eb9",
+    "source_commit": "7ae753b12f0a84d9598f12e7f9edf0f5d00f138c",
+    "status": "pass"
+  },
+  "run": {
+    "attention_implementation": "flash_attention_2",
+    "checkpoint_steps": 250,
+    "document_isolation": true,
+    "global_sequences_per_step": 256,
+    "gradient_accumulation_steps": 32,
+    "gradient_checkpointing": true,
+    "gradient_sync_mode": "last_microbatch",
+    "keep_checkpoints": 2,
+    "learning_rate": 0.0002,
+    "lr_schedule": "cosine",
+    "max_grad_norm": 1.0,
+    "maximum_steps": 76294,
+    "min_learning_rate_ratio": 0.1,
+    "optimizer_profile": "legacy",
+    "per_rank_batch_size": 1,
+    "precision": "bf16",
+    "schedule_steps": 76294,
+    "seed": 7,
+    "strategy": "fsdp_full_shard",
+    "torch_compile": false,
+    "warmup_steps": 1000,
+    "weight_decay": 0.1,
+    "world_size": 8
+  },
+  "schema_version": 1,
+  "software": {
+    "flash_attention_version": "2.8.3",
+    "torch_version": "2.7.0+cu126"
+  },
+  "status": "planning_only"
+}
