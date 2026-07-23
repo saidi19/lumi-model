@@ -636,6 +636,15 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     Authorization retained `full_4b_training=false`; no full 4B/80B run began.
     See `reports/4b-learning-pilot-result-v0.1.json` and
     `docs/4b-learning-pilot-v0.1.md`.
+67. the planning-only Lumi-4B/80B production contract now binds the corrected
+    160-shard corpus, fresh residual-scaled initialization, the measured
+    8xH100 topology, a 76,294-step cosine schedule, exact 991,232-token final
+    step, 250-step checkpoints, frozen evaluation milestones, and three
+    conservative checkpoint-aligned operator segments. At the verified pilot
+    median the training-only projection is 308.92 hours / `$9,860.69`; with a
+    0.8 throughput safety factor it is 386.15 hours / `$12,325.87`. Repository
+    and segment templates remain `paid_gpu=false`; no instance or full
+    training was authorized. See `docs/4b-80b-production-run-v0.1.md`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -783,6 +792,10 @@ local/Lambda engineering gates are documented in
 The exact 4x/8x H100 learning workload, cumulative retry cap, milestone-safe
 resume flow, held-out gate, and remaining launch boundary are documented in
 [`docs/4b-learning-pilot-v0.1.md`](docs/4b-learning-pilot-v0.1.md).
+The exact full-run schedule, fresh-start decision, conservative three-segment
+budget, checkpoint handoff, and separate owner-authorization boundary are
+documented in
+[`docs/4b-80b-production-run-v0.1.md`](docs/4b-80b-production-run-v0.1.md).
 
 ## Repository policy
 

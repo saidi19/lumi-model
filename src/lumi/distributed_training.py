@@ -14,6 +14,7 @@ import os
 import shutil
 import time
 import uuid
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
@@ -90,6 +91,18 @@ PAID_LEARNING_PILOT_RUN_KIND = "lumi_4b_learning_pilot_v0.1"
 PAID_LEARNING_PILOT_OWNER_ACKNOWLEDGEMENT = (
     "I approve this bounded paid Lumi-4B learning pilot through the recorded step."
 )
+PAID_4B_PRODUCTION_RUN_KIND = "lumi_4b_80b_pretraining_v0.1"
+PAID_4B_PRODUCTION_WORLD_SIZE = 8
+PAID_4B_PRODUCTION_MAX_STEPS = 76_294
+PAID_4B_PRODUCTION_TOKEN_CAP = 80_000_000_000
+PAID_4B_PRODUCTION_CHECKPOINT_STEPS = 250
+PAID_4B_PRODUCTION_MAX_RUNTIME_MINUTES = 10_080
+PAID_4B_PRODUCTION_MAX_COST_USD = 7_000
+PAID_4B_PRODUCTION_FLASH_ATTENTION_VERSION = "2.8.3"
+PAID_4B_PRODUCTION_OWNER_ACKNOWLEDGEMENT = (
+    "I approve this paid Lumi-4B/80B production segment through the recorded "
+    "step and token cap."
+)
 
 
 def _validate_source_commit(source_commit: str | None) -> str | None:
@@ -101,6 +114,28 @@ def _validate_source_commit(source_commit: str | None) -> str | None:
     ):
         raise ValueError("source commit must be a full 40-character Git SHA-1")
     return normalized
+
+
+def _validate_production_cuda_runtime(context: DistributedContext) -> None:
+    """Fail closed unless this rank is on the measured 80GB H100 runtime."""
+
+    if context.device.type != "cuda" or context.backend != "nccl":
+        raise ValueError("production runtime requires CUDA/NCCL")
+    capability = torch.cuda.get_device_capability(context.device)
+    if capability != (9, 0):
+        raise RuntimeError("production runtime requires H100 compute capability 9.0")
+    name = torch.cuda.get_device_name(context.device)
+    if "h100" not in name.lower():
+        raise RuntimeError("production runtime requires homogeneous H100 GPUs")
+    total_memory = torch.cuda.get_device_properties(context.device).total_memory
+    if not 80_000_000_000 <= total_memory <= 90_000_000_000:
+        raise RuntimeError("production runtime requires 80GB H100 GPUs")
+    try:
+        import flash_attn
+    except ImportError as error:
+        raise RuntimeError("production runtime requires FlashAttention") from error
+    if flash_attn.__version__ != PAID_4B_PRODUCTION_FLASH_ATTENTION_VERSION:
+        raise RuntimeError("production FlashAttention version changed")
 
 
 def build_distributed_run_identity(
@@ -117,6 +152,7 @@ def build_distributed_run_identity(
     weight_decay: float,
     max_grad_norm: float,
     keep_checkpoints: int | None,
+    checkpoint_steps: int | None = None,
     seed: int,
     gradient_checkpointing: bool,
     lr_schedule: str,
@@ -178,6 +214,14 @@ def build_distributed_run_identity(
         "seed": seed,
         "torch_version": torch.__version__ if torch_version is None else torch_version,
     }
+    if checkpoint_steps is not None:
+        if (
+            not isinstance(checkpoint_steps, int)
+            or isinstance(checkpoint_steps, bool)
+            or checkpoint_steps < 1
+        ):
+            raise ValueError("identity checkpoint steps must be positive")
+        identity["distributed"]["checkpoint_steps"] = checkpoint_steps
     if normalized_commit is not None:
         identity["source_commit"] = normalized_commit
     return identity
@@ -706,6 +750,7 @@ def _validate_paid_authorization(
     strategy: str,
     steps: int,
     target_tokens: int | None = None,
+    global_tokens_per_step: int | None = None,
 ) -> dict[str, Any]:
     authorization = json.loads(path.read_text(encoding="utf-8"))
     if authorization.get("schema_version") != DISTRIBUTED_AUTHORIZATION_SCHEMA_VERSION:
@@ -716,6 +761,7 @@ def _validate_paid_authorization(
     if run_kind not in {
         "lumi_distributed_smoke_v0.1",
         PAID_LEARNING_PILOT_RUN_KIND,
+        PAID_4B_PRODUCTION_RUN_KIND,
     }:
         raise ValueError("authorization targets a different run kind")
     if authorization.get("run_fingerprint") != run_fingerprint:
@@ -732,10 +778,10 @@ def _validate_paid_authorization(
     approved_step = authorization.get("approved_through_step")
     if authorization.get("paid_gpu") is not True:
         raise ValueError("paid CUDA launch must be explicit")
-    if authorization.get("full_4b_training") is not False:
-        raise ValueError("the bounded authorization cannot approve full 4B training")
 
     if run_kind == "lumi_distributed_smoke_v0.1":
+        if authorization.get("full_4b_training") is not False:
+            raise ValueError("the bounded authorization cannot approve full 4B training")
         if not isinstance(approved_step, int) or not (
             steps <= approved_step <= PAID_SMOKE_MAX_STEPS
         ):
@@ -746,36 +792,140 @@ def _validate_paid_authorization(
             raise ValueError("authorization acknowledgement changed")
         return authorization
 
-    if context.world_size not in PAID_LEARNING_PILOT_WORLD_SIZES:
-        raise ValueError("learning-pilot authorization requires four or eight GPUs")
+    if run_kind == PAID_LEARNING_PILOT_RUN_KIND:
+        if authorization.get("full_4b_training") is not False:
+            raise ValueError("the bounded authorization cannot approve full 4B training")
+        if context.world_size not in PAID_LEARNING_PILOT_WORLD_SIZES:
+            raise ValueError("learning-pilot authorization requires four or eight GPUs")
+        if strategy != "fsdp_full_shard":
+            raise ValueError("learning-pilot authorization requires FSDP full sharding")
+        if approved_step != PAID_LEARNING_PILOT_MAX_STEPS or steps > approved_step:
+            raise ValueError("learning-pilot step boundary is invalid")
+        approved_tokens = authorization.get("approved_token_cap")
+        if approved_tokens != PAID_LEARNING_PILOT_MAX_TOKENS:
+            raise ValueError("learning-pilot token boundary changed")
+        if target_tokens is None or not 0 < target_tokens <= approved_tokens:
+            raise ValueError("learning-pilot target tokens exceed authorization")
+        if authorization.get("owner_acknowledgement") != (
+            PAID_LEARNING_PILOT_OWNER_ACKNOWLEDGEMENT
+        ):
+            raise ValueError("learning-pilot authorization acknowledgement changed")
+        max_runtime = authorization.get("max_runtime_minutes")
+        max_allowed_runtime = PAID_LEARNING_PILOT_MAX_RUNTIME_MINUTES[context.world_size]
+        if not isinstance(max_runtime, int) or isinstance(max_runtime, bool) or not (
+            30 <= max_runtime <= max_allowed_runtime
+        ):
+            raise ValueError("learning-pilot runtime cap is invalid")
+        hourly_rate = authorization.get("hourly_rate_usd")
+        if not isinstance(hourly_rate, (int, float)) or isinstance(hourly_rate, bool):
+            raise ValueError("learning-pilot hourly rate is invalid")
+        if not 0 < float(hourly_rate) <= 60:
+            raise ValueError("learning-pilot hourly rate is unsafe")
+        if not str(authorization.get("provider", "")).strip():
+            raise ValueError("learning-pilot provider is missing")
+        if not str(authorization.get("instance_type", "")).strip():
+            raise ValueError("learning-pilot instance type is missing")
+        return authorization
+
+    if authorization.get("full_4b_training") is not True:
+        raise ValueError("production authorization must explicitly approve full 4B training")
+    if context.world_size != PAID_4B_PRODUCTION_WORLD_SIZE:
+        raise ValueError("production authorization requires exactly eight GPUs")
     if strategy != "fsdp_full_shard":
-        raise ValueError("learning-pilot authorization requires FSDP full sharding")
-    if approved_step != PAID_LEARNING_PILOT_MAX_STEPS or steps > approved_step:
-        raise ValueError("learning-pilot step boundary is invalid")
+        raise ValueError("production authorization requires FSDP full sharding")
+    _validate_production_cuda_runtime(context)
+    if (
+        not isinstance(approved_step, int)
+        or isinstance(approved_step, bool)
+        or approved_step != steps
+        or not 1 <= approved_step <= PAID_4B_PRODUCTION_MAX_STEPS
+    ):
+        raise ValueError("production authorization step boundary is invalid")
+    if (
+        approved_step != PAID_4B_PRODUCTION_MAX_STEPS
+        and approved_step % PAID_4B_PRODUCTION_CHECKPOINT_STEPS
+    ):
+        raise ValueError("production authorization must stop at a checkpoint boundary")
+    if (
+        not isinstance(global_tokens_per_step, int)
+        or isinstance(global_tokens_per_step, bool)
+        or global_tokens_per_step <= 0
+    ):
+        raise ValueError("production authorization requires global token geometry")
+    expected_target_tokens = min(
+        approved_step * global_tokens_per_step,
+        PAID_4B_PRODUCTION_TOKEN_CAP,
+    )
     approved_tokens = authorization.get("approved_token_cap")
-    if approved_tokens != PAID_LEARNING_PILOT_MAX_TOKENS:
-        raise ValueError("learning-pilot token boundary changed")
-    if target_tokens is None or not 0 < target_tokens <= approved_tokens:
-        raise ValueError("learning-pilot target tokens exceed authorization")
+    if (
+        target_tokens != expected_target_tokens
+        or approved_tokens != expected_target_tokens
+    ):
+        raise ValueError("production authorization token boundary changed")
+    if authorization.get("total_token_cap") != PAID_4B_PRODUCTION_TOKEN_CAP:
+        raise ValueError("production authorization total token cap changed")
+
+    approved_from_step = authorization.get("approved_from_step")
+    if (
+        not isinstance(approved_from_step, int)
+        or isinstance(approved_from_step, bool)
+        or not 0 <= approved_from_step < approved_step
+    ):
+        raise ValueError("production authorization start step is invalid")
+    if (
+        approved_from_step
+        and approved_from_step % PAID_4B_PRODUCTION_CHECKPOINT_STEPS
+    ):
+        raise ValueError("production authorization must start at a checkpoint boundary")
+    expected_from_tokens = min(
+        approved_from_step * global_tokens_per_step,
+        PAID_4B_PRODUCTION_TOKEN_CAP,
+    )
+    if authorization.get("approved_from_tokens") != expected_from_tokens:
+        raise ValueError("production authorization start token cursor changed")
+
+    segment_index = authorization.get("segment_index")
+    segment_count = authorization.get("segment_count")
+    if (
+        not isinstance(segment_index, int)
+        or isinstance(segment_index, bool)
+        or not isinstance(segment_count, int)
+        or isinstance(segment_count, bool)
+        or not 1 <= segment_index <= segment_count <= 10
+    ):
+        raise ValueError("production authorization segment identity is invalid")
     if authorization.get("owner_acknowledgement") != (
-        PAID_LEARNING_PILOT_OWNER_ACKNOWLEDGEMENT
+        PAID_4B_PRODUCTION_OWNER_ACKNOWLEDGEMENT
     ):
-        raise ValueError("learning-pilot authorization acknowledgement changed")
+        raise ValueError("production authorization acknowledgement changed")
+    for field in ("production_contract_sha256", "production_plan_sha256"):
+        digest = authorization.get(field)
+        if not isinstance(digest, str) or len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise ValueError(f"production authorization {field} is invalid")
+
     max_runtime = authorization.get("max_runtime_minutes")
-    max_allowed_runtime = PAID_LEARNING_PILOT_MAX_RUNTIME_MINUTES[context.world_size]
     if not isinstance(max_runtime, int) or isinstance(max_runtime, bool) or not (
-        30 <= max_runtime <= max_allowed_runtime
+        30 <= max_runtime <= PAID_4B_PRODUCTION_MAX_RUNTIME_MINUTES
     ):
-        raise ValueError("learning-pilot runtime cap is invalid")
+        raise ValueError("production authorization runtime cap is invalid")
     hourly_rate = authorization.get("hourly_rate_usd")
     if not isinstance(hourly_rate, (int, float)) or isinstance(hourly_rate, bool):
-        raise ValueError("learning-pilot hourly rate is invalid")
+        raise ValueError("production authorization hourly rate is invalid")
     if not 0 < float(hourly_rate) <= 60:
-        raise ValueError("learning-pilot hourly rate is unsafe")
+        raise ValueError("production authorization hourly rate is unsafe")
+    max_cost = authorization.get("max_cost_usd")
+    if not isinstance(max_cost, (int, float)) or isinstance(max_cost, bool):
+        raise ValueError("production authorization cost cap is invalid")
+    if not 0 < float(max_cost) <= PAID_4B_PRODUCTION_MAX_COST_USD:
+        raise ValueError("production authorization cost cap is unsafe")
+    if float(hourly_rate) * max_runtime / 60 > float(max_cost):
+        raise ValueError("production authorization runtime exceeds its cost cap")
     if not str(authorization.get("provider", "")).strip():
-        raise ValueError("learning-pilot provider is missing")
+        raise ValueError("production authorization provider is missing")
     if not str(authorization.get("instance_type", "")).strip():
-        raise ValueError("learning-pilot instance type is missing")
+        raise ValueError("production authorization instance type is missing")
     return authorization
 
 
@@ -789,6 +939,7 @@ def _validate_execution_scope(
     strategy: str,
     steps: int,
     target_tokens: int,
+    global_tokens_per_step: int | None = None,
 ) -> dict[str, Any]:
     if authorization_path is not None:
         if context.device.type != "cuda" or context.backend != "nccl":
@@ -801,6 +952,7 @@ def _validate_execution_scope(
             strategy=strategy,
             steps=steps,
             target_tokens=target_tokens,
+            global_tokens_per_step=global_tokens_per_step,
         )
 
     parameters = parameter_breakdown(config).total
@@ -821,6 +973,41 @@ def _validate_execution_scope(
         "token_cap": LOCAL_PREFLIGHT_MAX_TOKENS,
         "world_size_cap": LOCAL_PREFLIGHT_MAX_WORLD_SIZE,
     }
+
+
+def _validate_authorized_resume_boundary(
+    authorization: Mapping[str, Any],
+    state: Mapping[str, Any],
+    *,
+    global_tokens_per_step: int,
+) -> None:
+    """Bind a paid production segment to its imported or recovered checkpoint."""
+
+    if authorization.get("run_kind") != PAID_4B_PRODUCTION_RUN_KIND:
+        return
+    step = state.get("step")
+    tokens = state.get("tokens_seen")
+    if (
+        not isinstance(step, int)
+        or isinstance(step, bool)
+        or not isinstance(tokens, int)
+        or isinstance(tokens, bool)
+    ):
+        raise ValueError("production resume state has invalid cursors")
+    if not authorization["approved_from_step"] <= step <= authorization[
+        "approved_through_step"
+    ]:
+        raise ValueError("production resume step is outside the authorized segment")
+    if not authorization["approved_from_tokens"] <= tokens <= authorization[
+        "approved_token_cap"
+    ]:
+        raise ValueError("production resume tokens are outside the authorized segment")
+    expected_tokens = min(
+        step * global_tokens_per_step,
+        PAID_4B_PRODUCTION_TOKEN_CAP,
+    )
+    if tokens != expected_tokens:
+        raise ValueError("production resume token cursor does not match its step")
 
 
 def _reduce_mean(value: float, context: DistributedContext) -> float:
@@ -1085,6 +1272,13 @@ def train_distributed_packed(
     config_path = Path(config_path)
     output = Path(output)
     authorization = None if authorization_path is None else Path(authorization_path)
+    identity_checkpoint_steps = None
+    if authorization is not None:
+        unvalidated_authorization = json.loads(
+            authorization.read_text(encoding="utf-8")
+        )
+        if unvalidated_authorization.get("run_kind") == PAID_4B_PRODUCTION_RUN_KIND:
+            identity_checkpoint_steps = checkpoint_steps
     final_root = None if final_corpus_root is None else Path(final_corpus_root)
     manifest, manifest_sha256 = _collective_validate_packed_manifest(
         manifest_path,
@@ -1119,6 +1313,7 @@ def train_distributed_packed(
         weight_decay=weight_decay,
         max_grad_norm=max_grad_norm,
         keep_checkpoints=keep_checkpoints,
+        checkpoint_steps=identity_checkpoint_steps,
         seed=seed,
         gradient_checkpointing=gradient_checkpointing,
         lr_schedule=lr_schedule,
@@ -1152,6 +1347,7 @@ def train_distributed_packed(
         strategy=strategy,
         steps=steps,
         target_tokens=target_tokens,
+        global_tokens_per_step=global_tokens_per_step,
     )
     run_specification = {
         **run_identity,
@@ -1172,6 +1368,11 @@ def train_distributed_packed(
         run_fingerprint=run_fingerprint,
         run_specification=run_specification,
         resume=resume,
+    )
+    _validate_authorized_resume_boundary(
+        scope,
+        state,
+        global_tokens_per_step=global_tokens_per_step,
     )
 
     torch.manual_seed(seed)
