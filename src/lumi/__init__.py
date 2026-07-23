@@ -9,6 +9,7 @@ from typing import Any
 _PUBLIC_ATTRIBUTES = {
     "DistributedContext": (".distributed_training", "DistributedContext"),
     "EpochPermutationPlanner": (".distributed_training", "EpochPermutationPlanner"),
+    "FinalCorpusTokenDataset": (".production_training", "FinalCorpusTokenDataset"),
     "LumiConfig": (".configuration_lumi", "LumiConfig"),
     "LumiForCausalLM": (".modeling_lumi", "LumiForCausalLM"),
     "LumiModel": (".modeling_lumi", "LumiModel"),
@@ -16,9 +17,14 @@ _PUBLIC_ATTRIBUTES = {
     "PackedTokenDataset": (".packed_data", "PackedTokenDataset"),
     "ParameterBreakdown": (".parameter_count", "ParameterBreakdown"),
     "build_document_causal_mask": (".modeling_lumi", "build_document_causal_mask"),
+    "build_account_segment_plan": (".production_training", "build_account_segment_plan"),
     "build_heldout_evaluation": (".evaluation_data", "build_heldout_evaluation"),
     "build_packed_dataset": (".packed_data", "build_packed_dataset"),
     "build_packed_document_metadata": (".modeling_lumi", "build_packed_document_metadata"),
+    "build_production_training_preflight_plan": (
+        ".production_training",
+        "build_production_training_preflight_plan",
+    ),
     "build_scaling_packed_dataset": (".scaling_data", "build_scaling_packed_dataset"),
     "build_scaling_source_index": (".scaling_data", "build_scaling_source_index"),
     "create_scaling_data_contract": (".scaling_data", "create_scaling_data_contract"),
@@ -26,6 +32,10 @@ _PUBLIC_ATTRIBUTES = {
     "parameter_breakdown": (".parameter_count", "parameter_breakdown"),
     "train_distributed_packed": (".distributed_training", "train_distributed_packed"),
     "train_packed_pilot": (".pilot_training", "train_packed_pilot"),
+    "validate_final_corpus_training_manifest": (
+        ".production_training",
+        "validate_final_corpus_training_manifest",
+    ),
     "validate_heldout_manifest": (".evaluation_data", "validate_heldout_manifest"),
     "validate_packed_manifest": (".packed_data", "validate_packed_manifest"),
     "validate_scaling_packed_manifest": (
