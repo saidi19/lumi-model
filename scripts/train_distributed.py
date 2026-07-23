@@ -56,6 +56,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-seconds", type=int, default=1_800)
     parser.add_argument("--authorization", type=Path)
     parser.add_argument("--source-commit")
+    parser.add_argument("--final-corpus-root", type=Path)
+    parser.add_argument("--final-corpus-sequence-length", type=int, default=4096)
+    parser.add_argument("--final-corpus-vocab-size", type=int, default=65_536)
+    parser.add_argument("--final-corpus-doc-token-id", type=int, default=3)
     parser.add_argument("--skip-final-model-digest", action="store_true")
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
@@ -98,6 +102,10 @@ def main() -> None:
             torch_compile=args.torch_compile,
             source_commit=args.source_commit,
             authorization_path=args.authorization,
+            final_corpus_root=args.final_corpus_root,
+            final_corpus_sequence_length=args.final_corpus_sequence_length,
+            final_corpus_vocab_size=args.final_corpus_vocab_size,
+            final_corpus_doc_token_id=args.final_corpus_doc_token_id,
             resume=args.resume,
         )
     finally:

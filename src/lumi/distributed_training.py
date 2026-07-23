@@ -8,6 +8,7 @@ distributed path can use rank-aware data assignment and sharded checkpoints.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -60,6 +61,11 @@ from .pilot_training import (
     _utc_now,
     _write_json_atomic,
     scheduled_learning_rate,
+)
+from .production_training import (
+    FINAL_CORPUS_SHARD_MANIFEST_GATE,
+    FinalCorpusTokenDataset,
+    validate_final_corpus_training_manifest,
 )
 
 DISTRIBUTED_TRAINING_SCHEMA_VERSION = 1
@@ -491,13 +497,16 @@ def _wrap_model(
     if strategy == "ddp":
         model.to(context.device)
         device_ids = [context.local_rank] if context.device.type == "cuda" else None
-        return DistributedDataParallel(
-            model,
-            device_ids=device_ids,
-            find_unused_parameters=False,
-            forward_sync_buffers=False,
-            gradient_as_bucket_view=True,
-        )
+        ddp_options: dict[str, Any] = {
+            "device_ids": device_ids,
+            "find_unused_parameters": False,
+            "gradient_as_bucket_view": True,
+        }
+        if "forward_sync_buffers" in inspect.signature(DistributedDataParallel).parameters:
+            ddp_options["forward_sync_buffers"] = False
+        else:
+            ddp_options["broadcast_buffers"] = False
+        return DistributedDataParallel(model, **ddp_options)
 
     mixed_precision = None
     if precision == "bf16":
@@ -770,6 +779,12 @@ def _reduce_mean(value: float, context: DistributedContext) -> float:
     return float(tensor.item() / context.world_size)
 
 
+def _reduce_sum(value: float, context: DistributedContext) -> float:
+    tensor = torch.tensor(value, device=context.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    return float(tensor.item())
+
+
 def _reduce_max(value: float | int, context: DistributedContext) -> float:
     tensor = torch.tensor(float(value), device=context.device, dtype=torch.float64)
     dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
@@ -779,16 +794,36 @@ def _reduce_max(value: float | int, context: DistributedContext) -> float:
 def _collective_validate_packed_manifest(
     manifest_path: Path,
     context: DistributedContext,
+    *,
+    final_corpus_root: Path | None = None,
+    final_corpus_sequence_length: int = 4096,
+    final_corpus_vocab_size: int = 65_536,
+    final_corpus_doc_token_id: int = 3,
 ) -> tuple[dict[str, Any], str]:
     """Validate local corpus visibility and hash each node's copy once."""
 
     manifest: dict[str, Any] | None = None
     local_result: dict[str, Any]
     try:
-        manifest = validate_packed_manifest(
-            manifest_path,
-            verify_hashes=context.local_rank == 0,
-        )
+        unvalidated = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if unvalidated.get("gate") == FINAL_CORPUS_SHARD_MANIFEST_GATE:
+            if final_corpus_root is None:
+                raise ValueError("the final corpus manifest requires --final-corpus-root")
+            manifest = validate_final_corpus_training_manifest(
+                manifest_path,
+                shard_root=final_corpus_root,
+                sequence_length=final_corpus_sequence_length,
+                vocab_size=final_corpus_vocab_size,
+                doc_token_id=final_corpus_doc_token_id,
+                verify_hashes=context.local_rank == 0,
+            )
+        else:
+            if final_corpus_root is not None:
+                raise ValueError("--final-corpus-root requires a sealed final corpus manifest")
+            manifest = validate_packed_manifest(
+                manifest_path,
+                verify_hashes=context.local_rank == 0,
+            )
         local_result = {
             "build_fingerprint": manifest["build_fingerprint"],
             "error": None,
@@ -945,6 +980,10 @@ def train_distributed_packed(
     torch_compile: bool = False,
     source_commit: str | None = None,
     authorization_path: str | Path | None = None,
+    final_corpus_root: str | Path | None = None,
+    final_corpus_sequence_length: int = 4096,
+    final_corpus_vocab_size: int = 65_536,
+    final_corpus_doc_token_id: int = 3,
 ) -> dict[str, Any]:
     """Train Lumi with DDP or FSDP and exact global-cursor resume."""
 
@@ -996,9 +1035,14 @@ def train_distributed_packed(
     config_path = Path(config_path)
     output = Path(output)
     authorization = None if authorization_path is None else Path(authorization_path)
+    final_root = None if final_corpus_root is None else Path(final_corpus_root)
     manifest, manifest_sha256 = _collective_validate_packed_manifest(
         manifest_path,
         context,
+        final_corpus_root=final_root,
+        final_corpus_sequence_length=final_corpus_sequence_length,
+        final_corpus_vocab_size=final_corpus_vocab_size,
+        final_corpus_doc_token_id=final_corpus_doc_token_id,
     )
     config_bytes = config_path.read_bytes()
     config = LumiConfig(**json.loads(config_bytes))
@@ -1010,6 +1054,7 @@ def train_distributed_packed(
         raise ValueError("model and distributed dataset document-token IDs differ")
     if sequence_length > config.max_position_embeddings:
         raise ValueError("distributed sequence length exceeds the model maximum")
+    final_corpus = manifest.get("gate") == "lumi_4b_final_corpus_adapter_v0.1"
 
     run_identity = build_distributed_run_identity(
         config_bytes=config_bytes,
@@ -1045,6 +1090,9 @@ def train_distributed_packed(
         * gradient_accumulation_steps
         * sequence_length
     )
+    target_tokens = steps * global_tokens_per_step
+    if final_corpus:
+        target_tokens = min(target_tokens, int(manifest["statistics"]["tokens"]))
     scope = _validate_execution_scope(
         authorization_path=authorization,
         config=config,
@@ -1053,7 +1101,7 @@ def train_distributed_packed(
         source_commit=source_commit,
         strategy=strategy,
         steps=steps,
-        target_tokens=steps * global_tokens_per_step,
+        target_tokens=target_tokens,
     )
     run_specification = {
         **run_identity,
@@ -1064,6 +1112,7 @@ def train_distributed_packed(
         },
         "locations": {
             "config_path": str(config_path.resolve()),
+            "final_corpus_root": None if final_root is None else str(final_root.resolve()),
             "manifest_path": str(manifest_path.resolve()),
         },
     }
@@ -1109,9 +1158,31 @@ def train_distributed_packed(
             optimizer=optimizer,
         )
 
-    dataset = PackedTokenDataset(manifest_path, verify_hashes=False)
+    if final_corpus:
+        assert final_root is not None
+        dataset: torch.utils.data.Dataset[torch.Tensor] = FinalCorpusTokenDataset(
+            manifest_path,
+            final_root,
+            sequence_length=final_corpus_sequence_length,
+            vocab_size=final_corpus_vocab_size,
+            doc_token_id=final_corpus_doc_token_id,
+            verify_hashes=False,
+        )
+    else:
+        dataset = PackedTokenDataset(manifest_path, verify_hashes=False)
     if len(dataset) < context.world_size * per_rank_batch_size:
         raise ValueError("distributed dataset cannot fill one global microbatch")
+    if final_corpus and per_rank_batch_size != 1:
+        raise ValueError("final-corpus exact-tail training requires per-rank batch size 1")
+    nominal_sequences_per_step = (
+        context.world_size * per_rank_batch_size * gradient_accumulation_steps
+    )
+    if final_corpus:
+        maximum_steps = (len(dataset) + nominal_sequences_per_step - 1) // (
+            nominal_sequences_per_step
+        )
+        if steps > maximum_steps:
+            raise ValueError("requested steps exceed the exact final-corpus token boundary")
     distributed_model.train()
     sequence_planner = EpochPermutationPlanner(dataset_length=len(dataset), seed=seed)
     metrics_path = output / DISTRIBUTED_METRICS_FILENAME
@@ -1131,18 +1202,49 @@ def train_distributed_packed(
         optimizer.zero_grad(set_to_none=True)
         accumulated_local_loss = 0.0
         step_cursor = int(state["sequence_cursor"])
+        if final_corpus and step_cursor >= len(dataset):
+            raise ValueError("final-corpus cursor reached the exact token boundary early")
+        active_sequences_this_step = nominal_sequences_per_step
+        accumulations_this_step = gradient_accumulation_steps
+        if final_corpus:
+            active_sequences_this_step = min(
+                len(dataset) - step_cursor,
+                nominal_sequences_per_step,
+            )
+            accumulations_this_step = (
+                active_sequences_this_step + context.world_size - 1
+            ) // context.world_size
         _synchronize(context.device)
         if context.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(context.device)
         started = time.perf_counter()
 
-        for accumulation_index in range(gradient_accumulation_steps):
-            indices, step_cursor = sequence_planner.rank_batch(
-                cursor=step_cursor,
-                per_rank_batch_size=per_rank_batch_size,
-                rank=context.rank,
-                world_size=context.world_size,
-            )
+        for accumulation_index in range(accumulations_this_step):
+            rank_is_active = True
+            if final_corpus:
+                remaining_for_microbatch = (
+                    active_sequences_this_step - accumulation_index * context.world_size
+                )
+                active_ranks = min(context.world_size, remaining_for_microbatch)
+                global_indices, step_cursor = sequence_planner.global_indices(
+                    cursor=step_cursor,
+                    count=active_ranks,
+                )
+                rank_is_active = context.rank < active_ranks
+                indices = [global_indices[context.rank] if rank_is_active else 0]
+                loss_scale = (
+                    context.world_size / active_sequences_this_step
+                    if rank_is_active
+                    else 0.0
+                )
+            else:
+                indices, step_cursor = sequence_planner.rank_batch(
+                    cursor=step_cursor,
+                    per_rank_batch_size=per_rank_batch_size,
+                    rank=context.rank,
+                    world_size=context.world_size,
+                )
+                loss_scale = 1.0 / gradient_accumulation_steps
             cpu_batch = torch.stack([dataset[index] for index in indices])
             if context.device.type == "cuda":
                 cpu_batch = cpu_batch.pin_memory()
@@ -1167,7 +1269,7 @@ def train_distributed_packed(
                 }
             should_defer_sync = (
                 gradient_sync_mode == "last_microbatch"
-                and accumulation_index < gradient_accumulation_steps - 1
+                and accumulation_index < accumulations_this_step - 1
             )
             synchronization = distributed_model.no_sync() if should_defer_sync else nullcontext()
             with synchronization:
@@ -1175,8 +1277,9 @@ def train_distributed_packed(
                     loss = distributed_model(input_ids=batch, labels=batch, **model_kwargs).loss
                 if loss is None or not torch.isfinite(loss):
                     raise RuntimeError(f"non-finite distributed loss at step {state['step'] + 1}")
-                (loss / gradient_accumulation_steps).backward()
-            accumulated_local_loss += float(loss.detach())
+                (loss * loss_scale).backward()
+            if rank_is_active:
+                accumulated_local_loss += float(loss.detach())
 
         if strategy == "fsdp_full_shard":
             gradient_norm = distributed_model.clip_grad_norm_(max_grad_norm)
@@ -1190,11 +1293,17 @@ def train_distributed_packed(
         optimizer.step()
         _synchronize(context.device)
         elapsed = _reduce_max(max(time.perf_counter() - started, 1e-9), context)
-        global_loss = _reduce_mean(
-            accumulated_local_loss / gradient_accumulation_steps,
-            context,
-        )
+        if final_corpus:
+            global_loss = _reduce_sum(accumulated_local_loss, context) / (
+                active_sequences_this_step
+            )
+        else:
+            global_loss = _reduce_mean(
+                accumulated_local_loss / gradient_accumulation_steps,
+                context,
+            )
         global_gradient_norm = _reduce_max(float(gradient_norm), context)
+        actual_global_tokens = active_sequences_this_step * sequence_length
 
         state["step"] += 1
         state["sequence_cursor"] = step_cursor
@@ -1208,7 +1317,7 @@ def train_distributed_packed(
             "backend": context.backend,
             "device": context.device.type,
             "elapsed_seconds": elapsed,
-            "global_tokens_per_step": global_tokens_per_step,
+            "global_tokens_per_step": actual_global_tokens,
             "gradient_norm": global_gradient_norm,
             "learning_rate": step_learning_rate,
             "loss": global_loss,
@@ -1224,7 +1333,7 @@ def train_distributed_packed(
             ),
             "step": state["step"],
             "strategy": strategy,
-            "tokens_per_second": global_tokens_per_step / elapsed,
+            "tokens_per_second": actual_global_tokens / elapsed,
             "tokens_seen": state["tokens_seen"],
             "world_size": context.world_size,
         }
@@ -1235,7 +1344,11 @@ def train_distributed_packed(
                 flush=True,
             )
 
-        should_checkpoint = state["step"] % checkpoint_steps == 0 or state["step"] == steps
+        should_checkpoint = (
+            state["step"] % checkpoint_steps == 0
+            or state["step"] == steps
+            or (final_corpus and step_cursor == len(dataset))
+        )
         if should_checkpoint:
             _synchronize(context.device)
             checkpoint_started = time.perf_counter()
