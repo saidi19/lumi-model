@@ -108,6 +108,18 @@ def test_learning_pilot_setup_is_pinned_to_80gb_h100() -> None:
     assert "free_disk < 300_000_000_000" in script
 
 
+def test_learning_pilot_staging_enters_the_pinned_repo() -> None:
+    script = (
+        ROOT / "scripts" / "stage_4b_learning_pilot_remote.sh"
+    ).read_text(encoding="utf-8")
+
+    cd_repo = script.index('cd "$repo"')
+    prepare_fixture = script.index(
+        '"$python_bin" scripts/prepare_4b_learning_pilot_data.py'
+    )
+    assert cd_repo < prepare_fixture
+
+
 def test_learning_pilot_fixture_is_exact_hash_bound_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
