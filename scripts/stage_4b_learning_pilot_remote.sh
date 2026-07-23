@@ -14,6 +14,7 @@ fixture="$data/training-fixture"
 
 mkdir -p "$data"
 exec > >(tee -a "$workspace/staging.log") 2>&1
+cd "$repo"
 if [[ -f "$workspace/staging.complete" ]]; then
   "$python_bin" - "$heldout_manifest" "$tokenizer" "$fixture/manifest.json" <<'PY'
 import json

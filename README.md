@@ -501,7 +501,7 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     permanent 35,889-entry training-exclusion ledger, and exact 80B category
     targets. It deterministically hash-ranks the already filtered/deduplicated
     candidates, permits only a bounded final-document overshoot, fixes the
-    trainer consumption limit at exactly 80B tokens, and validates a 163-entry
+    trainer consumption limit at exactly 80B tokens, and validates a 160-entry
     content-addressed uint16 shard manifest. Focused tests and Ruff pass. The
     accompanying fail-closed canary harness verifies the complete accepted
     S3 inventory, reads one bounded Parquet object per category, checks
@@ -509,14 +509,20 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     uint16 shards, and conserves documents, tokens, bytes, and output prefixes.
     Its launcher defaults to dry-run and keeps bootstrap arguments
     non-overridable. The corrected, separately owner-authorized 8-DPU canary
-    passed in 317 execution seconds using 2,536 DPU-seconds (approximately
-    `$0.309956`). It verified the startup-only Spark configuration read-only,
-    selected `7,026,092` tokens across all seven categories, passed partition
-    parity, packed 28 content-addressed uint16 objects, and independently
-    matched every input/output inventory and result hash. The consumed Glue job
-    and IAM role are deleted. The later production selection run described next
-    is now complete; GPU work and model training remain separately gated.
-61. final 80B production selection and sharding are complete. The corrected
+    passed in 287 execution seconds using 2,303 DPU-seconds (approximately
+    `$0.281478`). It selected 3,797 documents, `7,023,704` content tokens, and
+    exactly 3,797 token-ID-3 document markers across all seven categories,
+    passed partition parity, and packed 28 content-addressed uint16 objects.
+    Independent verification downloaded all 28 objects, matched every SHA-256
+    and byte count, and confirmed every shard begins with `<|doc|>`. The
+    consumed Glue job and IAM role are deleted. The then-non-authorizing
+    production package was sealed at source commit
+    `bdd656e14cee6b995f3e5196933285b4f54897b9`, release
+    `e097ae33ed91a1b998843bebe2452a205b252fcb6e1ef774dce481f9ad02d50d`;
+    it was later bound to a fresh owner authorization and consumed by the
+    corrected production run recorded in item 64.
+61. the historical final 80B production selection and sharding run completed
+    under the older markerless contract. The corrected
     package from source commit
     `555f80f8396eaa323da3d86430b33aa81b4e01f9`, release fingerprint
     `62c0285b84661ae49e80d2972c072df7b16f625c3b1f8750e0406a4b34b4d551`,
@@ -537,12 +543,18 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     authorization, plan, dedup, baseline, category, document/token/byte,
     manifest, runtime, and output-cap binding. The sealed result SHA-256 is
     `c5b1c6aa1fbc7173bac8ba91bd7cdee55d12c2be28725598f7d7a2798a484869`.
-    The consumed Glue job and bounded IAM role are deleted and confirmed
-    absent; S3 corpus/results remain preserved. No GPU or model training was
-    started. See `reports/glue-final-corpus-production-result-v0.1.json` and
+    A later byte-level audit found zero `<|doc|>` markers in those packed
+    shards, so the old 163-object manifest is quarantined as historical
+    selection evidence and the trainer now rejects it. The consumed Glue job
+    and bounded IAM role are deleted and confirmed absent; S3 corpus/results
+    remain preserved. The corrected marker-aware plan is
+    `aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470`
+    and its fresh separately approved 160-shard production repack is recorded
+    in item 64.
+    See `reports/glue-final-corpus-production-result-v0.1.json` and
     `docs/final-corpus-80b-v0.1.md`.
-62. the production-training preflight now binds the exact 4B v0.2 model and
-    sealed final-corpus manifest to a resumable logical uint16 data adapter.
+62. the production-training preflight historically bound the exact 4B v0.2
+    model and old final-corpus manifest to a resumable logical uint16 adapter.
     It verifies all 163 physical shards while allowing 4,096-token sequences
     to cross shard boundaries, stops exactly at 80,000,000,000 trainer tokens,
     and handles the non-divisible final 8-GPU microbatch without dropping or
@@ -552,8 +564,9 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     Lambda A10 engineering gate with 346 tests passed, four skipped, Ruff
     clean, and real-manifest planning fingerprint
     `42d742ecec2f63079522098118a2ba3be079ce59c1c0e651d6a3c84b92caacbe`.
-    This is not a throughput or quality result: the separately authorized
-    8xH100 learning pilot and full 4B/80B training remain unstarted.
+    This remains useful infrastructure evidence, but the markerless manifest
+    is no longer accepted. A corrected 160-shard manifest must pass the same
+    preflight before the H100 learning pilot or full 4B/80B training.
 63. the bounded Lumi-4B learning-pilot harness now supports equivalent 4x and
     8x 80GB H100 topologies without changing the 256-sequence global batch,
     80-step schedule, or exact 83,886,080-token boundary. It trains fresh
@@ -565,8 +578,34 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     overwriting step-10 evidence. The hardware gate accepts only homogeneous
     compute-capability-9.0 80GB H100s. Focused tests pass (`18 passed`), the
     near-full local suite passes (`354 passed, 3 skipped, 1 deselected`), and
-    Ruff is clean. This is still planning-only: no H100 instance or paid pilot
-    was launched, and full 4B/80B training remains unauthorized.
+    Ruff is clean. A 4xH100 instance was later launched, but the pre-training
+    shard audit found the missing document markers and the instance was
+    terminated before any optimizer step. The corrected paid pilot and full
+    4B/80B training remain unauthorized.
+64. the corrected marker-aware final-80B production run is complete and
+    independently verified. Exact source commit
+    `bdd656e14cee6b995f3e5196933285b4f54897b9`, release
+    `e097ae33ed91a1b998843bebe2452a205b252fcb6e1ef774dce481f9ad02d50d`,
+    plan
+    `aab292a514b2a7a046a3e4f0daf2fb75bb6f899ff86798bdfac729a145bc9470`,
+    and authorization
+    `6475dda549a1a8382bb6f777b7ddca3fe315c1a2822be6ed4609918e60cccc08`
+    were consumed exactly once by attempt-zero Glue run
+    `jr_73c74effa6f50bf6faec901078e47bb93563d270d72625de0f13a86ee8f731e3`.
+    The 100-DPU job succeeded in 2,745 execution seconds using 274,571
+    DPU-seconds, approximately `$33.558678` at `$0.44` per DPU-hour. All seven
+    checkpoints sealed 45,768,283 documents, 79,954,240,081 content tokens,
+    exactly 45,768,283 token-ID-3 document markers, and 80,000,008,364 packed
+    tokens in 160 contiguous content-addressed uint16 shards. The exact trainer
+    boundary remains 80,000,000,000 tokens. Independent verification matched
+    all 7,478 selected-object inventories, all 160 packed S3 sizes and
+    checksums, all ten checkpoint/result JSON checksums, and the first
+    `<|doc|>` token in every shard. The sealed result SHA-256 is
+    `0423e29b05e0c31ce73bf6066a00b3ce198eb442cf7143dfc953d4d5b2688e52`.
+    The consumed Glue job and bounded IAM role are deleted and confirmed
+    absent; S3 corpus/results remain preserved. No GPU work or model training
+    was authorized. See
+    `reports/glue-final-corpus-marker-aware-production-result-v0.1.json`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -593,18 +632,16 @@ full-input Parquet heap path, and the second proved that fix before exposing a
 memory-safe reads and a bounded, fully instrumented stop-bucket policy. The
 final production run passed with 42,436,764 candidate pairs under the 50M cap,
 12 oversized stop buckets, 492 pair-budget stop buckets, and four bounded
-exact-only uncovered documents. Final 80B production mixture materialization
-and 163-shard sealing now pass with `80,000,014,734` packed tokens and an exact
-80B trainer boundary. The final-corpus trainer adapter, exact-tail distributed
-logic, checkpoint handoff, and planning-only 8-GPU preflight also pass. A
-bounded 4B multi-GPU learning pilot and the full
-4B/80B pretraining run remain. The
-permanent held-out exclusion ledger was already applied during mapping; the
-local final-80B selection/shard contract, bounded paid Glue canary, production
-materialization, remote inventories, and post-run evidence now pass. The
-consumed Glue job and IAM role are gone; S3 corpus/results remain preserved.
-All model training remains separately gated and incomplete.
-The completed 150M and 1B pilot checkpoints are not production-quality models.
+exact-only uncovered documents. The historical 163-shard markerless seal
+remains quarantined and rejected by the trainer. Its corrected marker-aware
+replacement is now sealed at 80,000,008,364 packed tokens in 160 shards, with
+45,768,283/45,768,283 document-marker parity and all S3 checksums independently
+verified. The next gate is to rebind and rerun the free production preflight
+against this corrected manifest, then run the already-designed bounded 4x/8x
+H100 learning pilot only after fresh owner approval. The permanent held-out
+exclusion ledger remains applied. Full 4B/80B training, instruction tuning, and
+deployment remain separately gated and incomplete. The completed 150M and 1B
+pilot checkpoints are not production-quality models.
 
 ## Quick start
 

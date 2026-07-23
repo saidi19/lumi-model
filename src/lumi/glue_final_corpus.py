@@ -298,6 +298,7 @@ def build_glue_final_corpus_canary_package(
             "canary_prefix": f"{namespace}/control/glue-canary/runs",
             "result_prefix": f"{namespace}/control/glue-canary/results",
         },
+        "packing": dict(supplied_plan["packing"]),
         "region": contract["region"],
         "runtime": dict(contract["runtime"]),
         "schema_version": SCHEMA_VERSION,
@@ -364,6 +365,14 @@ def validate_glue_final_corpus_canary_release(
         "spark_version": "3.5.6",
     }:
         raise ValueError("Glue final-corpus canary release runtime changed")
+    if release.get("packing") != {
+        "baseline_policy": "dedup_anchor_only",
+        "doc_token": "<|doc|>",
+        "doc_token_id": 3,
+        "include_document_marker": True,
+        "token_accounting": "content_plus_one_document_marker",
+    }:
+        raise ValueError("Glue final-corpus canary packing changed")
     storage = release.get("storage")
     if not isinstance(storage, Mapping) or storage.get("namespace") != (
         "lumi-corpus/v0.1/final-80b"
@@ -646,6 +655,7 @@ def validate_glue_final_corpus_canary_result(
     expected_categories = {str(row["category"]): row for row in release["categories"]}
     observed: set[str] = set()
     total_documents = 0
+    total_content_tokens = 0
     total_tokens = 0
     total_output_bytes = 0
     token_target = int(release["limits"]["selected_target_tokens_per_category"])
@@ -668,12 +678,22 @@ def validate_glue_final_corpus_canary_result(
         available_tokens = _positive_int(
             row.get("available_tokens"), "canary available tokens"
         )
+        available_content_tokens = _positive_int(
+            row.get("available_content_tokens"), "canary available content tokens"
+        )
+        if available_tokens != available_content_tokens + available_documents:
+            raise ValueError("Glue final-corpus canary available marker accounting changed")
         selected_documents = _positive_int(
             row.get("selected_documents"), "canary selected documents"
         )
         selected_tokens = _positive_int(
             row.get("selected_tokens"), "canary selected tokens"
         )
+        selected_content_tokens = _positive_int(
+            row.get("selected_content_tokens"), "canary selected content tokens"
+        )
+        if selected_tokens != selected_content_tokens + selected_documents:
+            raise ValueError("Glue final-corpus canary selected marker accounting changed")
         if selected_documents > available_documents or selected_tokens > available_tokens:
             raise ValueError("Glue final-corpus canary selected unavailable input")
         if not token_target <= selected_tokens <= token_target + boundary:
@@ -700,12 +720,22 @@ def validate_glue_final_corpus_canary_result(
         if not isinstance(shards, list) or not shards:
             raise ValueError("Glue final-corpus canary packed shards are missing")
         shard_tokens = 0
+        shard_content_tokens = 0
+        shard_document_markers = 0
         shard_documents = 0
         for sequence, shard in enumerate(shards):
             if not isinstance(shard, Mapping) or int(shard.get("sequence", -1)) != sequence:
                 raise ValueError("Glue final-corpus canary shard sequence changed")
             tokens = _positive_int(shard.get("tokens"), "canary packed tokens")
             documents = _positive_int(shard.get("documents"), "canary packed documents")
+            content_tokens = _positive_int(
+                shard.get("content_tokens"), "canary packed content tokens"
+            )
+            document_markers = _positive_int(
+                shard.get("document_markers"), "canary packed document markers"
+            )
+            if document_markers != documents or tokens != content_tokens + documents:
+                raise ValueError("Glue final-corpus canary shard marker accounting changed")
             object_bytes = _positive_int(shard.get("object_bytes"), "canary packed bytes")
             if object_bytes != tokens * 2 or tokens > shard_target + boundary:
                 raise ValueError("Glue final-corpus packed-shard bounds changed")
@@ -725,11 +755,19 @@ def validate_glue_final_corpus_canary_result(
             token_hashes.add(digest)
             token_uris.add(uri)
             shard_tokens += tokens
+            shard_content_tokens += content_tokens
+            shard_document_markers += document_markers
             shard_documents += documents
             total_output_bytes += object_bytes
         if shard_tokens != selected_tokens or shard_documents != selected_documents:
             raise ValueError("Glue final-corpus canary shard conservation failed")
+        if (
+            shard_content_tokens != selected_content_tokens
+            or shard_document_markers != selected_documents
+        ):
+            raise ValueError("Glue final-corpus canary marker conservation failed")
         total_documents += selected_documents
+        total_content_tokens += selected_content_tokens
         total_tokens += selected_tokens
     if observed != set(expected_categories):
         raise ValueError("Glue final-corpus canary category set changed")
@@ -737,6 +775,11 @@ def validate_glue_final_corpus_canary_result(
         result.get("selected_tokens", -1)
     ) != total_tokens:
         raise ValueError("Glue final-corpus canary aggregate conservation failed")
+    if (
+        int(result.get("selected_content_tokens", -1)) != total_content_tokens
+        or int(result.get("selected_document_markers", -1)) != total_documents
+    ):
+        raise ValueError("Glue final-corpus canary aggregate marker accounting changed")
     if int(result.get("output_bytes", -1)) != total_output_bytes:
         raise ValueError("Glue final-corpus canary output-byte accounting changed")
     if total_output_bytes > int(release["limits"]["maximum_new_output_bytes"]):

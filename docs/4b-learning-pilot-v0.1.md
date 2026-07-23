@@ -1,8 +1,11 @@
 # Lumi-4B Multi-GPU Learning Pilot v0.1
 
 Status: **the provider-independent 4x/8x H100 harness is implemented and
-locally verified. No H100 instance, paid pilot, full 4B training, or 80B-token
-training run has been started by this gate.**
+locally verified, but its historical corpus binding points to the quarantined
+markerless manifest. The corrected 160-shard marker-aware corpus is sealed;
+the harness and fixture must be rebound and reverified before a paid pilot. No
+successful paid pilot, full 4B training, or 80B-token training run has been
+completed by this gate.**
 
 ## Purpose
 

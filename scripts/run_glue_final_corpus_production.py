@@ -31,6 +31,8 @@ ORDER_COLUMNS = (
     "source_line",
     "segment_index",
 )
+DOC_TOKEN_ID = 3
+DOC_TOKEN_BYTES = DOC_TOKEN_ID.to_bytes(2, "little")
 
 def _canonical_json_bytes(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
@@ -242,9 +244,15 @@ def _seal_token_partitions(rows: Any, config: Mapping[str, Any]) -> Any:
                     raise RuntimeError("final-corpus packed rows are not strictly ordered")
                 previous = order
                 token_count = int(row["token_count"])
+                content_token_count = int(row["content_token_count"])
                 token_bytes = bytes(row["token_bytes"])
-                if token_count <= 0 or len(token_bytes) != token_count * 2:
+                if (
+                    content_token_count <= 0
+                    or token_count != content_token_count + 1
+                    or len(token_bytes) != content_token_count * 2
+                ):
                     raise ValueError("final-corpus candidate token payload changed")
+                handle.write(DOC_TOKEN_BYTES)
                 handle.write(token_bytes)
                 documents += 1
                 tokens += token_count
@@ -264,6 +272,8 @@ def _seal_token_partitions(rows: Any, config: Mapping[str, Any]) -> Any:
         )
         yield {
             "category": str(config["category"]),
+            "content_tokens": tokens - documents,
+            "document_markers": documents,
             "documents": documents,
             "object_bytes": path.stat().st_size,
             "object_sha256": digest,
@@ -489,30 +499,6 @@ def main() -> None:
     result_prefix = f"{release['output']['result_prefix']}/{token}"
 
     baseline_shards = []
-    for sequence, row in enumerate(release["baseline"]["sealed_shards"]):
-        baseline_shards.append(
-            _copy_baseline_object(
-                s3,
-                bucket=bucket,
-                source_uri=str(row["s3_uri"]),
-                output_prefix=packed_prefix,
-                sequence=sequence,
-                category=str(row["category"]),
-                documents=int(row["documents"]),
-                tokens=int(row["tokens"]),
-                digest=str(row["sha256"]),
-                expected_bytes=int(row["bytes"]),
-            )
-        )
-    baseline_shards.append(
-        _materialize_partial_baseline(
-            s3,
-            bucket=bucket,
-            archive=release["baseline"]["archive"],
-            partial=release["baseline"]["partial"],
-            output_prefix=packed_prefix,
-        )
-    )
 
     schema = candidate_spark_schema()
     physical_schema = T.StructType(
@@ -523,23 +509,34 @@ def main() -> None:
     new_shards = []
     for category_row in release["categories"]:
         category = str(category_row["category"])
-        frame = (
+        content_frame = (
             spark.read.schema(physical_schema)
             .parquet(*category_uris[category])
             .withColumn("category", F.lit(category))
             .select(*[field.name for field in schema.fields])
             .persist(StorageLevel.DISK_ONLY)
         )
-        totals = frame.agg(
+        totals = content_frame.agg(
             F.count(F.lit(1)).alias("documents"),
             F.sum("token_count").alias("tokens"),
         ).first()
         available_documents = int(totals["documents"] or 0)
-        available_tokens = int(totals["tokens"] or 0)
+        available_content_tokens = int(totals["tokens"] or 0)
+        available_tokens = available_content_tokens + available_documents
         if available_documents != int(category_row["available_candidate_documents"]):
             raise RuntimeError(f"final-corpus available documents changed: {category}")
+        if available_content_tokens != int(
+            category_row["available_candidate_content_tokens"]
+        ):
+            raise RuntimeError(
+                f"final-corpus available content tokens changed: {category}"
+            )
         if available_tokens != int(category_row["available_candidate_tokens"]):
             raise RuntimeError(f"final-corpus available tokens changed: {category}")
+        frame = (
+            content_frame.withColumn("content_token_count", F.col("token_count"))
+            .withColumn("token_count", F.col("token_count") + F.lit(1))
+        )
 
         selection = select_hash_ranked_token_prefix(
             frame,
@@ -598,6 +595,7 @@ def main() -> None:
         checkpoint = {
             "authorization_sha256": authorization["authorization_sha256"],
             "available_candidate_documents": available_documents,
+            "available_candidate_content_tokens": available_content_tokens,
             "available_candidate_tokens": available_tokens,
             "category": category,
             "cutoff": selection["cutoff"],
@@ -610,6 +608,8 @@ def main() -> None:
             "release_fingerprint": release["release_fingerprint"],
             "schema_version": 1,
             "selected_candidate_documents": int(selection["selected_documents"]),
+            "selected_candidate_content_tokens": int(selection["selected_tokens"])
+            - int(selection["selected_documents"]),
             "selected_candidate_tokens": int(selection["selected_tokens"]),
             "selected_inventory": {
                 **selected_inventory,
@@ -628,14 +628,19 @@ def main() -> None:
         selected_categories.append(
             {
                 "available_candidate_documents": available_documents,
+                "available_candidate_content_tokens": available_content_tokens,
                 "available_candidate_tokens": available_tokens,
                 "category": category,
                 "cutoff": selection["cutoff"],
                 "final_documents": int(category_row["baseline_documents"])
                 + int(selection["selected_documents"]),
+                "final_content_tokens": int(selection["selected_tokens"])
+                - int(selection["selected_documents"]),
                 "final_tokens": int(category_row["baseline_tokens"])
                 + int(selection["selected_tokens"]),
                 "selected_candidate_documents": int(selection["selected_documents"]),
+                "selected_candidate_content_tokens": int(selection["selected_tokens"])
+                - int(selection["selected_documents"]),
                 "selected_candidate_tokens": int(selection["selected_tokens"]),
                 "selected_inventory": checkpoint["selected_inventory"],
                 "selection_sha256": selection_sha,
@@ -643,12 +648,15 @@ def main() -> None:
         )
         new_shards.extend(packed)
         selected.unpersist()
-        frame.unpersist()
+        content_frame.unpersist()
 
     selection_result = {
         "categories": selected_categories,
         "dedup_result_sha256": release["input"]["dedup_result_sha256"],
         "final_documents": sum(int(row["final_documents"]) for row in selected_categories),
+        "final_content_tokens": sum(
+            int(row["final_content_tokens"]) for row in selected_categories
+        ),
         "final_tokens": sum(int(row["final_tokens"]) for row in selected_categories),
         "gate": SELECTION_RESULT_GATE,
         "plan_fingerprint": release["input"]["plan_fingerprint"],
@@ -665,7 +673,17 @@ def main() -> None:
     )
     shard_manifest = {
         "documents": sum(int(row["documents"]) for row in all_shards),
+        "content_tokens": sum(int(row["content_tokens"]) for row in all_shards),
+        "document_markers": sum(
+            int(row["document_markers"]) for row in all_shards
+        ),
         "gate": SHARD_MANIFEST_GATE,
+        "packing": {
+            "doc_token": "<|doc|>",
+            "doc_token_id": DOC_TOKEN_ID,
+            "markers_per_document": 1,
+            "token_accounting": "content_plus_one_document_marker",
+        },
         "plan_fingerprint": release["input"]["plan_fingerprint"],
         "schema_version": 1,
         "selection_result_sha256": selection_result["result_sha256"],

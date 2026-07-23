@@ -38,6 +38,9 @@ def _selection_result(plan: dict) -> dict:
         categories.append(
             {
                 "available_candidate_documents": row["available_candidate_documents"],
+                "available_candidate_content_tokens": row[
+                    "available_candidate_content_tokens"
+                ],
                 "available_candidate_tokens": row["available_candidate_tokens"],
                 "category": row["category"],
                 "cutoff": {
@@ -49,8 +52,11 @@ def _selection_result(plan: dict) -> dict:
                     "source_ordinal": index - 1,
                 },
                 "final_documents": int(row["baseline_documents"]) + selected_documents,
+                "final_content_tokens": selected_tokens - selected_documents,
                 "final_tokens": int(row["baseline_tokens"]) + selected_tokens,
                 "selected_candidate_documents": selected_documents,
+                "selected_candidate_content_tokens": selected_tokens
+                - selected_documents,
                 "selected_candidate_tokens": selected_tokens,
                 "selected_inventory": {
                     "object_bytes": 1000 + index,
@@ -67,6 +73,9 @@ def _selection_result(plan: dict) -> dict:
         "categories": categories,
         "dedup_result_sha256": plan["inputs"]["dedup_result"]["canonical_sha256"],
         "final_documents": sum(int(row["final_documents"]) for row in categories),
+        "final_content_tokens": sum(
+            int(row["final_content_tokens"]) for row in categories
+        ),
         "final_tokens": sum(int(row["final_tokens"]) for row in categories),
         "gate": "lumi_final_corpus_80b_selection_result_v0.1",
         "plan_fingerprint": plan["plan_fingerprint"],
@@ -102,6 +111,8 @@ def _shard_manifest(plan: dict, result: dict) -> dict:
             shards.append(
                 {
                     "category": category,
+                    "content_tokens": tokens - documents,
+                    "document_markers": documents,
                     "documents": documents,
                     "object_bytes": tokens * 2,
                     "object_sha256": f"{sequence + 1:064x}",
@@ -115,8 +126,16 @@ def _shard_manifest(plan: dict, result: dict) -> dict:
             )
             sequence += 1
     return {
+        "content_tokens": result["final_content_tokens"],
+        "document_markers": result["final_documents"],
         "documents": result["final_documents"],
         "gate": "lumi_final_corpus_80b_shard_manifest_v0.1",
+        "packing": {
+            "doc_token": "<|doc|>",
+            "doc_token_id": 3,
+            "markers_per_document": 1,
+            "token_accounting": "content_plus_one_document_marker",
+        },
         "plan_fingerprint": plan["plan_fingerprint"],
         "schema_version": 1,
         "selection_result_sha256": result["result_sha256"],
@@ -136,11 +155,12 @@ def test_verified_plan_binds_120b_pool_to_exact_80b_mix() -> None:
         "dbfbf9fe258ec97d5bd844c165157d41d328d0571cbbada5fd4d67750c46b742"
     )
     assert sum(row["target_final_tokens"] for row in plan["categories"]) == 80_000_000_000
-    assert sum(row["baseline_tokens"] for row in plan["categories"]) == 237_769_640
+    assert sum(row["baseline_tokens"] for row in plan["categories"]) == 0
     science = plan["categories"][0]
-    assert science["requested_candidate_tokens"] == 23_762_230_360
+    assert science["requested_candidate_tokens"] == 24_000_000_000
     assert plan["output"]["expected_new_packed_shards"] == 160
-    assert plan["output"]["expected_total_packed_shards"] == 163
+    assert plan["output"]["expected_total_packed_shards"] == 160
+    assert plan["packing"]["doc_token_id"] == 3
     assert all(value is False for value in plan["authorization"].values())
 
 
@@ -189,12 +209,16 @@ def test_selection_result_and_shard_manifest_fail_closed() -> None:
     too_many["categories"][0]["selected_candidate_tokens"] = (
         plan["categories"][0]["maximum_selected_candidate_tokens"] + 1
     )
+    too_many["categories"][0]["selected_candidate_content_tokens"] = (
+        too_many["categories"][0]["selected_candidate_tokens"]
+        - too_many["categories"][0]["selected_candidate_documents"]
+    )
     too_many["result_sha256"] = final_selection_result_fingerprint(too_many)
     with pytest.raises(ValueError, match="overshoot cap"):
         validate_final_selection_result(too_many, plan)
 
     manifest = _shard_manifest(plan, result)
-    assert len(manifest["shards"]) == 163
+    assert len(manifest["shards"]) == 160
     assert validate_final_shard_manifest(manifest, plan, result)["tokens"] == (
         result["final_tokens"]
     )
