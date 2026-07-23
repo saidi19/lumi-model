@@ -618,6 +618,24 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     check passes locally, all non-Spark repository tests pass, and Ruff is
     clean. No GPU or paid training was launched. The next gate is the
     separately authorized bounded 4x/8x H100 learning pilot.
+66. the separately owner-authorized 8xH100 Lumi-4B learning pilot passed.
+    Exact source commit
+    `7ae753b12f0a84d9598f12e7f9edf0f5d00f138c` and run
+    `c79c8a5e5a681aa61a26439d5a2aa39798cdc3884b626550cd8ff96ac7ac6eb9`
+    trained the 4,002,376,704-parameter model fresh through step 10 and resumed
+    exactly through the step-80 / 83,886,080-token hard stop on eight 80GB
+    H100s. Median training throughput was `71,935.432` tokens/second; the first
+    ten loss mean fell from `12.856966` to a final-ten mean of `7.141212`.
+    Frozen held-out loss improved from `9.605866` at step 10 to `8.046854` at
+    step 80. The complete 46GB distributed checkpoint and all sealed evidence
+    pass independent SHA-256 verification. Lambda billed 2.85 lifecycle hours
+    and `$90.90`, including setup, evaluation, download, and teardown; the
+    instance is terminated and the dashboard reports no running instances.
+    This proves bounded learning and production-path engineering readiness, not
+    useful generation quality: 83.9M tokens are far too few for a 4B model.
+    Authorization retained `full_4b_training=false`; no full 4B/80B run began.
+    See `reports/4b-learning-pilot-result-v0.1.json` and
+    `docs/4b-learning-pilot-v0.1.md`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation

@@ -1,10 +1,9 @@
 # Lumi-4B Multi-GPU Learning Pilot v0.1
 
-Status: **the provider-independent 4x/8x H100 harness is implemented and
-locally verified against the corrected 160-shard marker-aware corpus. The exact
-83,886,080-token fixture is sealed from a hash-pinned byte range containing
-9,885 document markers. No successful paid pilot, full 4B training, or
-80B-token training run has been completed by this gate.**
+Status: **the authorized 8xH100 pilot passed at the exact step-80 /
+83,886,080-token hard stop. Its sealed evidence and complete distributed
+checkpoint are independently verified, the Lambda instance is terminated, and
+no full 4B/80B training was authorized or started.**
 
 ## Purpose
 
@@ -26,6 +25,54 @@ two-GPU CUDA smoke and single-A10 engineering preflight could not:
 Passing this pilot is evidence for engineering readiness and learning. It is
 not permission to start full 4B/80B pretraining and it is not a quality claim
 against another model.
+
+## Verified 8xH100 outcome
+
+The owner-authorized Lambda run used exact source commit
+`7ae753b12f0a84d9598f12e7f9edf0f5d00f138c` and run fingerprint
+`c79c8a5e5a681aa61a26439d5a2aa39798cdc3884b626550cd8ff96ac7ac6eb9`.
+It trained the 4,002,376,704-parameter model fresh through step 10, resumed the
+matching distributed checkpoint, and stopped exactly at step 80 with
+83,886,080 tokens consumed and sequence cursor 20,480. There is no step 81.
+The authorization records `full_4b_training=false`.
+
+| Verified measurement | Result |
+| --- | ---: |
+| World size | 8x NVIDIA H100 80GB HBM3 |
+| Strategy / precision | FSDP full shard / BF16 |
+| Document isolation | FlashAttention 2, `position_reset_varlen_v0.1` |
+| Median training throughput | 71,935.432 tokens/s |
+| First ten training-loss mean | 12.856966 |
+| Last ten training-loss mean | 7.141212 |
+| Final step loss / best loss | 7.115641 / 7.078655 |
+| Maximum recorded training allocation | 18,948,996,608 bytes |
+
+The frozen held-out set contains 2,441 sequences and 4,999,168 input tokens:
+
+| Frozen held-out checkpoint | Loss | Perplexity | Throughput |
+| --- | ---: | ---: | ---: |
+| Step 10 | 9.605866 | 14,851.647 | 41,912.0 tokens/s |
+| Step 80 | 8.046854 | 3,123.950 | 40,749.3 tokens/s |
+
+Held-out loss improved by `1.559012`, and the final ten-step training-loss mean
+is lower than the first ten-step mean. Those two independent conditions establish
+bounded learning. At only about 0.021 training tokens per parameter, generation
+remains repetitive; this checkpoint is not a usable base or chat model and is not
+a quality benchmark.
+
+The canonical runner recorded 3,341 seconds and a `$29.6235` compute estimate
+at `$31.92`/hour. Lambda's final usage record includes staging, setup,
+evaluation, the 46GB checkpoint download, and teardown: `2.85` billed hours and
+`$90.90` total instance spend. The provider dashboard then showed
+`No running instances`.
+
+The downloaded archive verifies all 35 sealed evidence entries and all 18
+distributed-checkpoint entries. Its evidence manifest SHA-256 is
+`78e7f8d3a579a47c833cfce04e301d770d05ddc7d384e954b2c2a32106ef73ec`;
+the step-80 checkpoint manifest is
+`84ade92bf21f3dc9c2de93d5b2b05ff8470ed7793b88d04b47871e82d6f5eb74`;
+and the canonical full-model digest is
+`4285581ccf006b96c9c3f9214e3e5a84147eb729562d7df0c73bee735329658f`.
 
 ## Immutable workload
 
@@ -139,7 +186,7 @@ The final sealer requires:
 - cumulative runtime inside the owner cap; and
 - a hash inventory for every retained evidence file.
 
-## Local verification
+## Verification history
 
 The accepted rebind is implemented at
 `f745a93b1399afdd07cf4021a07715ff78d8d3c2`. The real production manifest,
@@ -156,18 +203,21 @@ has Java 25 only, while the installed PySpark/Hadoop build requires an older
 compatible JDK. The complete Linux suite remains mandatory on the H100 host
 before planning or authorization.
 
+Before the paid run, the exact H100 source commit passed the complete Linux
+preflight and repository-wide Ruff check. After the run, both downloaded
+manifests passed independent SHA-256 verification and the authorization,
+source, topology, step, token, cursor, evaluation, and model-digest invariants
+were rechecked locally.
+
 ## Remaining boundary
 
-The harness can now be committed and reviewed without GPU capacity. When a
-matching 4x or 8x 80GB H100 instance is available, the remaining sequence is:
+This gate is complete. It establishes the real 4B model's H100 execution,
+document-isolated attention, FSDP checkpoint/resume, frozen evaluation,
+throughput, and failure-safe hard stop. It does not establish useful generation
+quality because 83.9M tokens are intentionally tiny relative to four billion
+parameters.
 
-1. clone the reviewed exact source commit and stage the pinned 167,772,160-byte
-   corpus range, held-out artifact, and tokenizer;
-2. install the pinned CUDA runtime and run the complete Linux preflight;
-3. write and review the immutable hardware-specific plan;
-4. obtain a fresh exact owner authorization;
-5. launch the bounded `tmux` runner;
-6. download and independently verify the sealed evidence; and
-7. terminate the instance promptly.
-
-Full 4B/80B pretraining remains a separate decision after this measured result.
+The next paid stage is the separately planned full 4B/80B pretraining run. It
+requires a new owner-approved topology, budget, provider/account handoff plan,
+checkpoint cadence, and exact authorization. No such run is implied or
+authorized by this result.
