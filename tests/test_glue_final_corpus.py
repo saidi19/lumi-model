@@ -4,6 +4,8 @@ import copy
 import hashlib
 import json
 import runpy
+import sys
+import types
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -58,6 +60,7 @@ def _result(release: dict, authorization: dict) -> dict:
     prefix = release["output"]["canary_prefix"]
     categories = []
     output_bytes = 0
+    total_content_tokens = 0
     total_documents = 0
     total_tokens = 0
     for category_index, category_row in enumerate(release["categories"]):
@@ -72,6 +75,8 @@ def _result(release: dict, authorization: dict) -> dict:
             digest = hashlib.sha256(f"{category}:{sequence}".encode()).hexdigest()
             shards.append(
                 {
+                    "content_tokens": tokens - 25,
+                    "document_markers": 25,
                     "documents": 25,
                     "object_bytes": tokens * 2,
                     "object_sha256": digest,
@@ -86,12 +91,14 @@ def _result(release: dict, authorization: dict) -> dict:
         categories.append(
             {
                 "available_documents": 1000,
+                "available_content_tokens": 9_999_000,
                 "available_tokens": 10_000_000,
                 "category": category,
                 "cutoff": {"_lumi_selection_rank": f"{category_index + 1:064x}"},
                 "packed_shards": shards,
                 "partition_parity": "pass",
                 "selected_documents": selected_documents,
+                "selected_content_tokens": selected_tokens - selected_documents,
                 "selected_inventory": {
                     "object_bytes": inventory_bytes,
                     "object_count": 1,
@@ -104,6 +111,7 @@ def _result(release: dict, authorization: dict) -> dict:
         )
         output_bytes += inventory_bytes + selected_tokens * 2
         total_documents += selected_documents
+        total_content_tokens += selected_tokens - selected_documents
         total_tokens += selected_tokens
     return {
         "accepted_input_inventory": copy.deepcopy(
@@ -124,7 +132,9 @@ def _result(release: dict, authorization: dict) -> dict:
         "release_fingerprint": release["release_fingerprint"],
         "runtime": {"python": "3.11.15", "spark": "3.5.6-amzn-1"},
         "schema_version": 1,
+        "selected_content_tokens": total_content_tokens,
         "selected_documents": total_documents,
+        "selected_document_markers": total_documents,
         "selected_tokens": total_tokens,
         "selection_seed_sha256": release["input"]["selection_seed_sha256"],
         "status": "pass_selection_sharding_canary",
@@ -201,6 +211,56 @@ def test_canary_result_conserves_selection_and_packed_bytes(release: dict) -> No
     ][0]["packed_shards"][0]["object_sha256"]
     with pytest.raises(ValueError, match="repeats a packed object"):
         validate_glue_final_corpus_canary_result(changed, release, authorization)
+
+
+def test_canary_runtime_prepends_one_document_marker_per_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    script = "run_glue_final_corpus_canary.py"
+    uploaded: list[bytes] = []
+
+    class FakeS3:
+        def put_object(self, **request: object) -> dict:
+            body = request["Body"]
+            assert hasattr(body, "read")
+            uploaded.append(body.read())
+            return {"VersionId": "version-1"}
+
+    fake_s3 = FakeS3()
+    monkeypatch.setitem(
+        sys.modules,
+        "boto3",
+        types.SimpleNamespace(client=lambda *args, **kwargs: fake_s3),
+    )
+    namespace = runpy.run_path(
+        ROOT / "scripts" / script,
+        run_name=f"lumi_marker_runtime_{script}",
+    )
+    rows = [
+        (
+            (0, "rank", "content", "document", 0, 1, 0),
+            {
+                "content_token_count": 2,
+                "token_bytes": b"\x0b\x00\x0c\x00",
+                "token_count": 3,
+            },
+        )
+    ]
+    result = list(
+        namespace["_seal_token_partitions"](
+            iter(rows),
+            {
+                "bucket": "fixture",
+                "category": "code",
+                "prefix": "final",
+                "region": "us-east-1",
+            },
+        )
+    )
+    assert uploaded == [b"\x03\x00\x0b\x00\x0c\x00"]
+    assert result[0]["content_tokens"] == 2
+    assert result[0]["document_markers"] == result[0]["documents"] == 1
+    assert result[0]["tokens"] == 3
 
 
 def test_release_and_authorization_fail_closed_on_tampering(release: dict) -> None:

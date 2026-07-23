@@ -240,11 +240,21 @@ def build_final_corpus_plan(
     selection = contract.get("selection")
     if not isinstance(selection, Mapping):
         raise ValueError("final-corpus selection policy is missing")
-    if selection.get("algorithm") != "sha256_hash_ranked_document_boundary_v0.1":
+    if selection.get("algorithm") != "sha256_hash_ranked_marker_aware_v0.2":
         raise ValueError("final-corpus selection algorithm changed")
-    if selection.get("preserve_immutable_prefix") is not True:
-        raise ValueError("final-corpus immutable prefix must be retained")
+    if selection.get("preserve_immutable_prefix") is not False:
+        raise ValueError("markerless baseline must not enter the final training stream")
     selection_seed = _valid_sha256(selection.get("seed_sha256"), "selection seed")
+    packing = contract.get("packing")
+    expected_packing = {
+        "baseline_policy": "dedup_anchor_only",
+        "doc_token": "<|doc|>",
+        "doc_token_id": 3,
+        "include_document_marker": True,
+        "token_accounting": "content_plus_one_document_marker",
+    }
+    if packing != expected_packing:
+        raise ValueError("final-corpus document-marker packing contract changed")
 
     if data_mix.get("version") != "0.1" or data_mix.get("status") != "candidate":
         raise ValueError("final-corpus data mix changed")
@@ -320,8 +330,8 @@ def build_final_corpus_plan(
         raise ValueError("accepted candidate byte count changed")
 
     category_plan = []
-    baseline_tokens_seen = 0
-    baseline_documents_seen = 0
+    anchor_tokens_seen = 0
+    anchor_documents_seen = 0
     accepted_tokens_seen = 0
     accepted_documents_seen = 0
     final_floor_tokens = 0
@@ -351,19 +361,19 @@ def build_final_corpus_plan(
         baseline_documents = final_documents - selected_documents
         if baseline_tokens < 0 or baseline_documents < 0:
             raise ValueError("dedup category baseline accounting is negative")
-        requested_candidate_tokens = target - baseline_tokens
-        if requested_candidate_tokens <= 0:
-            raise ValueError("verified baseline unexpectedly exceeds a final category target")
-        if selected_tokens < requested_candidate_tokens:
+        available_packed_tokens = selected_tokens + selected_documents
+        requested_candidate_tokens = target
+        if available_packed_tokens < requested_candidate_tokens:
             raise ValueError("deduplicated category cannot satisfy its final target")
         if final_tokens < floor or int(row.get("deficit_tokens", -1)) != 0:
             raise ValueError("deduplicated category floor is incomplete")
         category_plan.append(
             {
                 "available_candidate_documents": selected_documents,
-                "available_candidate_tokens": selected_tokens,
-                "baseline_documents": baseline_documents,
-                "baseline_tokens": baseline_tokens,
+                "available_candidate_content_tokens": selected_tokens,
+                "available_candidate_tokens": available_packed_tokens,
+                "baseline_documents": 0,
+                "baseline_tokens": 0,
                 "category": category,
                 "maximum_selected_candidate_tokens": (
                     requested_candidate_tokens + overshoot_cap
@@ -374,16 +384,16 @@ def build_final_corpus_plan(
                 "target_final_tokens": target,
             }
         )
-        baseline_tokens_seen += baseline_tokens
-        baseline_documents_seen += baseline_documents
+        anchor_tokens_seen += baseline_tokens
+        anchor_documents_seen += baseline_documents
         accepted_tokens_seen += selected_tokens
         accepted_documents_seen += selected_documents
         final_floor_tokens += floor
         new_packed_shards += math.ceil(requested_candidate_tokens / packed_target)
 
-    if baseline_tokens_seen != baseline_tokens_total:
+    if anchor_tokens_seen != baseline_tokens_total:
         raise ValueError("category baseline tokens do not match the verified prefix")
-    if baseline_documents_seen != baseline_documents_total:
+    if anchor_documents_seen != baseline_documents_total:
         raise ValueError("category baseline documents do not match the verified prefix")
     if accepted_tokens_seen != accepted_tokens or accepted_documents_seen != accepted_documents:
         raise ValueError("dedup accepted-candidate totals do not match category accounting")
@@ -396,7 +406,7 @@ def build_final_corpus_plan(
         raise ValueError("verified baseline sealed-shard set changed")
     if not isinstance(partial, Mapping) or int(partial.get("accepted_tokens", -1)) <= 0:
         raise ValueError("verified baseline partial shard is missing")
-    preserved_baseline_shards = len(baseline_shards) + 1
+    preserved_baseline_shards = 0
 
     output = contract.get("output")
     if not isinstance(output, Mapping):
@@ -473,6 +483,7 @@ def build_final_corpus_plan(
             "expected_total_packed_shards": new_packed_shards + preserved_baseline_shards,
             "preserved_baseline_shards": preserved_baseline_shards,
         },
+        "packing": dict(packing),
         "production": dict(contract["production"]),
         "schema_version": SCHEMA_VERSION,
         "selection": {
@@ -794,6 +805,7 @@ def validate_final_selection_result(
         raise ValueError("final selection category results are missing")
     expected = {str(row["category"]): row for row in plan["categories"]}
     observed: dict[str, Mapping[str, Any]] = {}
+    total_content_tokens = 0
     total_documents = 0
     total_tokens = 0
     for row in rows:
@@ -810,6 +822,12 @@ def validate_final_selection_result(
         selected_documents = _positive_int(
             row.get("selected_candidate_documents"), "selected candidate documents"
         )
+        selected_content_tokens = _positive_int(
+            row.get("selected_candidate_content_tokens"),
+            "selected candidate content tokens",
+        )
+        if selected_tokens != selected_content_tokens + selected_documents:
+            raise ValueError("final selection document-marker accounting failed")
         if selected_tokens < int(planned["requested_candidate_tokens"]):
             raise ValueError("final selection category stopped below target")
         if selected_tokens > int(planned["maximum_selected_candidate_tokens"]):
@@ -820,6 +838,10 @@ def validate_final_selection_result(
             planned["available_candidate_tokens"]
         ):
             raise ValueError("final selection available tokens changed")
+        if int(row.get("available_candidate_content_tokens", -1)) != int(
+            planned["available_candidate_content_tokens"]
+        ):
+            raise ValueError("final selection available content tokens changed")
         if int(row.get("available_candidate_documents", -1)) != int(
             planned["available_candidate_documents"]
         ):
@@ -828,6 +850,8 @@ def validate_final_selection_result(
         final_documents = int(planned["baseline_documents"]) + selected_documents
         if int(row.get("final_tokens", -1)) != final_tokens:
             raise ValueError("final selection category token conservation failed")
+        if int(row.get("final_content_tokens", -1)) != selected_content_tokens:
+            raise ValueError("final selection category content-token conservation failed")
         if int(row.get("final_documents", -1)) != final_documents:
             raise ValueError("final selection category document conservation failed")
         if final_tokens < int(planned["target_final_tokens"]):
@@ -864,12 +888,15 @@ def validate_final_selection_result(
             namespace=str(plan["output"]["namespace"]),
             label="selection inventory",
         )
+        total_content_tokens += selected_content_tokens
         total_documents += final_documents
         total_tokens += final_tokens
     if set(observed) != set(expected):
         raise ValueError("final selection is missing one or more categories")
     if int(result.get("final_documents", -1)) != total_documents:
         raise ValueError("final selection total document conservation failed")
+    if int(result.get("final_content_tokens", -1)) != total_content_tokens:
+        raise ValueError("final selection total content-token conservation failed")
     if int(result.get("final_tokens", -1)) != total_tokens:
         raise ValueError("final selection total token conservation failed")
     if total_tokens < int(plan["limits"]["final_training_tokens"]):
@@ -900,6 +927,13 @@ def validate_final_shard_manifest(
         raise ValueError("final shard manifest selection binding changed")
     if manifest.get("training_token_limit") != plan["limits"]["training_token_limit"]:
         raise ValueError("final shard training token limit changed")
+    if manifest.get("packing") != {
+        "doc_token": "<|doc|>",
+        "doc_token_id": 3,
+        "markers_per_document": 1,
+        "token_accounting": "content_plus_one_document_marker",
+    }:
+        raise ValueError("final shard document-marker packing changed")
     shards = manifest.get("shards")
     if not isinstance(shards, list) or not shards:
         raise ValueError("final shard manifest contains no shards")
@@ -913,6 +947,8 @@ def validate_final_shard_manifest(
     object_keys: set[str] = set()
     object_hashes: set[str] = set()
     total_tokens = 0
+    total_content_tokens = 0
+    total_document_markers = 0
     total_documents = 0
     maximum_tokens = int(plan["limits"]["packed_shard_target_tokens"]) + int(
         plan["limits"]["maximum_document_boundary_overshoot_tokens_per_category"]
@@ -927,6 +963,14 @@ def validate_final_shard_manifest(
             raise ValueError("final shard category is invalid")
         tokens = _positive_int(shard.get("tokens"), "final shard tokens")
         documents = _positive_int(shard.get("documents"), "final shard documents")
+        content_tokens = _positive_int(
+            shard.get("content_tokens"), "final shard content tokens"
+        )
+        document_markers = _positive_int(
+            shard.get("document_markers"), "final shard document markers"
+        )
+        if document_markers != documents or tokens != content_tokens + document_markers:
+            raise ValueError("final shard document-marker accounting failed")
         if tokens > maximum_tokens:
             raise ValueError("final shard exceeds its document-boundary overshoot cap")
         if _positive_int(shard.get("object_bytes"), "final shard bytes") != tokens * 2:
@@ -944,6 +988,8 @@ def validate_final_shard_manifest(
         object_hashes.add(digest)
         category_tokens[category] += tokens
         total_tokens += tokens
+        total_content_tokens += content_tokens
+        total_document_markers += document_markers
         total_documents += documents
     if category_tokens != expected_categories:
         raise ValueError("final shard category token conservation failed")
@@ -951,8 +997,17 @@ def validate_final_shard_manifest(
         raise ValueError("final shard total token conservation failed")
     if total_documents != int(selection_result["final_documents"]):
         raise ValueError("final shard total document conservation failed")
+    if total_content_tokens != int(selection_result["final_content_tokens"]):
+        raise ValueError("final shard total content-token conservation failed")
+    if total_document_markers != total_documents:
+        raise ValueError("final shard total document markers changed")
     if int(manifest.get("tokens", -1)) != total_tokens or int(
         manifest.get("documents", -1)
     ) != total_documents:
         raise ValueError("final shard manifest totals changed")
+    if (
+        int(manifest.get("content_tokens", -1)) != total_content_tokens
+        or int(manifest.get("document_markers", -1)) != total_document_markers
+    ):
+        raise ValueError("final shard manifest marker totals changed")
     return dict(manifest)

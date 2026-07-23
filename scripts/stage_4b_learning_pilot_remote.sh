@@ -9,7 +9,7 @@ heldout_manifest="${LUMI_LEARNING_PILOT_HELDOUT_MANIFEST:?set held-out manifest 
 tokenizer="${LUMI_LEARNING_PILOT_TOKENIZER:?set tokenizer path}"
 python_bin="$repo/.venv/bin/python"
 data="$workspace/data"
-source_shard="$data/source-shard-00000.uint16.bin"
+source_prefix="$data/source-prefix-00000.uint16.bin"
 fixture="$data/training-fixture"
 
 mkdir -p "$data"
@@ -36,17 +36,31 @@ PY
 fi
 
 echo "staging_started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-if [[ ! -f "$source_shard" ]]; then
+read -r prefix_bytes prefix_range_end < <(
+  "$python_bin" - <<'PY'
+import json
+from pathlib import Path
+
+contract = json.loads(
+    Path("configs/4b-learning-pilot-v0.1.json").read_text(encoding="utf-8")
+)
+prefix = contract["corpus"]["fixture_prefix"]
+print(prefix["bytes"], prefix["range_end"])
+PY
+)
+if [[ ! -f "$source_prefix" ]]; then
   curl --fail --location --retry 5 --retry-all-errors \
     --continue-at - \
-    --output "$source_shard.partial" \
+    --range "0-$prefix_range_end" \
+    --max-filesize "$prefix_bytes" \
+    --output "$source_prefix.partial" \
     "$source_url"
-  mv "$source_shard.partial" "$source_shard"
+  mv "$source_prefix.partial" "$source_prefix"
 fi
 "$python_bin" scripts/prepare_4b_learning_pilot_data.py \
   --contract configs/4b-learning-pilot-v0.1.json \
   --final-manifest "$final_manifest" \
-  --source-shard "$source_shard" \
+  --source-prefix "$source_prefix" \
   --output "$fixture"
 "$python_bin" - "$heldout_manifest" "$tokenizer" <<'PY'
 import hashlib
@@ -64,6 +78,6 @@ for item in heldout["tokenizer"]["files"]:
     if hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
         raise SystemExit(f"tokenizer artifact hash changed: {item['name']}")
 PY
-rm -f "$source_shard"
+rm -f "$source_prefix"
 echo "staging_completed_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 touch "$workspace/staging.complete"

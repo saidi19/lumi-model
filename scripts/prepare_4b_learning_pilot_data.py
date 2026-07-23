@@ -14,7 +14,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--contract", type=Path, required=True)
     parser.add_argument("--final-manifest", type=Path, required=True)
-    parser.add_argument("--source-shard", type=Path, required=True)
+    parser.add_argument("--source-prefix", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -24,7 +24,7 @@ def main() -> None:
     report = prepare_learning_pilot_fixture(
         contract_path=args.contract,
         final_manifest_path=args.final_manifest,
-        source_shard_path=args.source_shard,
+        source_prefix_path=args.source_prefix,
         output=args.output,
     )
     print(json.dumps(report, sort_keys=True))

@@ -139,6 +139,13 @@ def validate_final_corpus_training_manifest(
         raise ValueError("unexpected final corpus manifest gate")
     if manifest.get("status") != "sealed":
         raise ValueError("final corpus manifest is not sealed")
+    if manifest.get("packing") != {
+        "doc_token": "<|doc|>",
+        "doc_token_id": doc_token_id,
+        "markers_per_document": 1,
+        "token_accounting": "content_plus_one_document_marker",
+    }:
+        raise ValueError("final corpus document-marker packing changed")
 
     plan_fingerprint = _valid_sha256(
         manifest.get("plan_fingerprint"), "final corpus plan fingerprint"
@@ -183,6 +190,8 @@ def validate_final_corpus_training_manifest(
     object_uris: set[str] = set()
     shard_rows: list[dict[str, Any]] = []
     observed_tokens = 0
+    observed_content_tokens = 0
+    observed_document_markers = 0
     observed_documents = 0
     observed_bytes = 0
     for sequence, shard in enumerate(shards):
@@ -190,6 +199,17 @@ def validate_final_corpus_training_manifest(
             raise ValueError("final corpus shard sequence is not contiguous")
         shard_tokens = _positive_int(shard.get("tokens"), "final shard tokens")
         shard_documents = _positive_int(shard.get("documents"), "final shard documents")
+        shard_content_tokens = _positive_int(
+            shard.get("content_tokens"), "final shard content tokens"
+        )
+        shard_document_markers = _positive_int(
+            shard.get("document_markers"), "final shard document markers"
+        )
+        if (
+            shard_document_markers != shard_documents
+            or shard_tokens != shard_content_tokens + shard_document_markers
+        ):
+            raise ValueError("final shard document-marker accounting failed")
         shard_bytes = _positive_int(shard.get("object_bytes"), "final shard bytes")
         if shard_bytes != shard_tokens * TOKEN_BYTES:
             raise ValueError("final shard uint16 byte conservation failed")
@@ -223,10 +243,18 @@ def validate_final_corpus_training_manifest(
             }
         )
         observed_tokens += shard_tokens
+        observed_content_tokens += shard_content_tokens
+        observed_document_markers += shard_document_markers
         observed_documents += shard_documents
         observed_bytes += shard_bytes
     if observed_tokens != tokens or observed_documents != documents:
         raise ValueError("final corpus shard totals do not match the manifest")
+    if (
+        observed_content_tokens != int(manifest.get("content_tokens", -1))
+        or observed_document_markers != int(manifest.get("document_markers", -1))
+        or observed_document_markers != documents
+    ):
+        raise ValueError("final corpus document-marker totals do not match the manifest")
 
     identity_material = {
         "doc_token_id": doc_token_id,
@@ -257,6 +285,8 @@ def validate_final_corpus_training_manifest(
         },
         "statistics": {
             "available_tokens": tokens,
+            "content_tokens": observed_content_tokens,
+            "document_markers": observed_document_markers,
             "documents": documents,
             "object_bytes": observed_bytes,
             "sequences": training_token_limit // sequence_length,
