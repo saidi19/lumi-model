@@ -541,6 +541,19 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     absent; S3 corpus/results remain preserved. No GPU or model training was
     started. See `reports/glue-final-corpus-production-result-v0.1.json` and
     `docs/final-corpus-80b-v0.1.md`.
+62. the production-training preflight now binds the exact 4B v0.2 model and
+    sealed final-corpus manifest to a resumable logical uint16 data adapter.
+    It verifies all 163 physical shards while allowing 4,096-token sequences
+    to cross shard boundaries, stops exactly at 80,000,000,000 trainer tokens,
+    and handles the non-divisible final 8-GPU microbatch without dropping or
+    repeating data. Portable checkpoint handoffs hash every file and bind the
+    source commit, run fingerprint, world size, step, and token cursor. Exact
+    source commit `78ce5953e0023c0ee8347fba38c9c0bd25646fcf` passed the full
+    Lambda A10 engineering gate with 346 tests passed, four skipped, Ruff
+    clean, and real-manifest planning fingerprint
+    `42d742ecec2f63079522098118a2ba3be079ce59c1c0e651d6a3c84b92caacbe`.
+    This is not a throughput or quality result: the separately authorized
+    8xH100 learning pilot and full 4B/80B training remain unstarted.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -569,7 +582,9 @@ final production run passed with 42,436,764 candidate pairs under the 50M cap,
 12 oversized stop buckets, 492 pair-budget stop buckets, and four bounded
 exact-only uncovered documents. Final 80B production mixture materialization
 and 163-shard sealing now pass with `80,000,014,734` packed tokens and an exact
-80B trainer boundary. A bounded 4B multi-GPU learning pilot and the full
+80B trainer boundary. The final-corpus trainer adapter, exact-tail distributed
+logic, checkpoint handoff, and planning-only 8-GPU preflight also pass. A
+bounded 4B multi-GPU learning pilot and the full
 4B/80B pretraining run remain. The
 permanent held-out exclusion ledger was already applied during mapping; the
 local final-80B selection/shard contract, bounded paid Glue canary, production
@@ -679,6 +694,10 @@ The verified 120B input binding, permanent-heldout-safe deterministic 80B
 selection, category-boundary limits, content-addressed packed-shard contract,
 and independently verified bounded Glue canary are documented in
 [`docs/final-corpus-80b-v0.1.md`](docs/final-corpus-80b-v0.1.md).
+The logical final-corpus trainer adapter, exact 80B tail handling, portable
+checkpoint handoff, planning candidates, and independently verified Lambda A10
+engineering gate are documented in
+[`docs/4b-production-preflight-v0.1.md`](docs/4b-production-preflight-v0.1.md).
 
 ## Repository policy
 
