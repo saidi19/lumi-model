@@ -516,7 +516,11 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     Independent verification downloaded all 28 objects, matched every SHA-256
     and byte count, and confirmed every shard begins with `<|doc|>`. The
     consumed Glue job and IAM role are deleted. Corrected production
-    materialization remains separately gated.
+    materialization remains separately gated. Its local-only non-authorizing
+    package is sealed at source commit
+    `bdd656e14cee6b995f3e5196933285b4f54897b9`, release
+    `e097ae33ed91a1b998843bebe2452a205b252fcb6e1ef774dce481f9ad02d50d`;
+    it has not been uploaded or consumed.
 61. the historical final 80B production selection and sharding run completed
     under the older markerless contract. The corrected
     package from source commit

@@ -277,7 +277,15 @@ the accepted prefix and exact bootstrap objects, can write only the
 authorization-derived run/temp/result prefixes, uses an immutable launch claim,
 and refuses any job that already ran. The historical packages described below
 were consumed under the older markerless contract; their authorizations are not
-reusable. No marker-aware production package has been authorized or consumed.
+reusable.
+
+The marker-aware non-authorizing production package is now sealed from source
+commit `bdd656e14cee6b995f3e5196933285b4f54897b9`. Its release fingerprint is
+`e097ae33ed91a1b998843bebe2452a205b252fcb6e1ef774dce481f9ad02d50d`,
+and its five-entry `manifest.sha256` file hashes to
+`7fc45e2159a2619323426a8bedf15cd107a7e0a3c43f14d3c56a8fca0f6b13d8`.
+All production, GPU, and model-training authorization flags are false. The
+package has not been uploaded, authorized, or consumed.
 
 ### Historical markerless package provenance
 
