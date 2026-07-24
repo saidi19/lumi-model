@@ -10,7 +10,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -243,7 +242,9 @@ def main() -> None:
         start_new_session=True,
     )
     results: list[dict[str, Any]] = []
-    started = time.monotonic()
+    instance_boot = datetime.fromisoformat(
+        authorization["instance_boot_utc"]
+    ).astimezone(UTC)
     try:
         for profile in plan["profiles"]:
             label = profile["label"]
@@ -376,7 +377,9 @@ def main() -> None:
                 flush=True,
             )
 
-        runtime_minutes = (time.monotonic() - started) / 60
+        runtime_minutes = (
+            datetime.now(UTC) - instance_boot
+        ).total_seconds() / 60
         decision = decide_pre_segment2_screen(
             contract=contract,
             results=results,

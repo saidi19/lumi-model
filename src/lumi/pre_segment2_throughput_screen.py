@@ -374,6 +374,13 @@ def decide_pre_segment2_screen(
     """Select a provisional winner without authorizing Segment 2."""
 
     validated = validate_gate_contract(contract)
+    observed_cost_usd = (
+        observed_runtime_minutes / 60 * SCREEN_HOURLY_RATE_USD
+    )
+    if observed_runtime_minutes > PAID_SEGMENT2_SCREEN_MAX_RUNTIME_MINUTES:
+        raise ValueError("throughput-screen runtime cap was exceeded")
+    if observed_cost_usd > PAID_SEGMENT2_SCREEN_MAX_COST_USD:
+        raise ValueError("throughput-screen cost cap was exceeded")
     by_label = {str(result["label"]): result for result in results}
     if set(by_label) != set(REQUIRED_PROFILE_LABELS):
         raise ValueError("throughput-screen result matrix is incomplete")
@@ -450,9 +457,7 @@ def decide_pre_segment2_screen(
     decision = {
         "comparisons_to_baseline": comparisons,
         "final_checkpoint_bound_verification_required": True,
-        "observed_cost_usd": (
-            observed_runtime_minutes / 60 * SCREEN_HOURLY_RATE_USD
-        ),
+        "observed_cost_usd": observed_cost_usd,
         "observed_runtime_minutes": observed_runtime_minutes,
         "production_training_authorized": False,
         "reason": (
