@@ -626,6 +626,11 @@ def write_owner_authorization(
     segments = plan["segments"]
     if not 1 <= segment_index <= len(segments):
         raise ValueError("production segment index is outside the plan")
+    if segment_index > 1:
+        raise PermissionError(
+            "Segment 2/3 requires the post-Segment-1 throughput gate and a "
+            "new checkpoint-bound continuation plan"
+        )
     segment = segments[segment_index - 1]
     template = segment["authorization_template"]
     budget = plan["budget"]

@@ -107,7 +107,7 @@ def test_owner_artifact_is_one_exact_hash_bound_segment(
     authorization = write_owner_authorization(
         plan_path=plan_path,
         output=authorization_path,
-        segment_index=2,
+        segment_index=1,
         provider="Lambda Cloud",
         instance_type="gpu_8x_h100_sxm5",
         hourly_rate_usd=31.92,
@@ -117,8 +117,8 @@ def test_owner_artifact_is_one_exact_hash_bound_segment(
 
     assert authorization["paid_gpu"] is True
     assert authorization["full_4b_training"] is True
-    assert authorization["approved_from_step"] == 31_500
-    assert authorization["approved_through_step"] == 63_000
+    assert authorization["approved_from_step"] == 0
+    assert authorization["approved_through_step"] == 31_500
     assert validate_owner_authorization(
         plan_path=plan_path,
         authorization_path=authorization_path,
@@ -131,6 +131,26 @@ def test_owner_artifact_is_one_exact_hash_bound_segment(
         validate_owner_authorization(
             plan_path=plan_path,
             authorization_path=authorization_path,
+        )
+
+
+def test_old_plan_refuses_segment_two_before_throughput_gated_continuation(
+    tmp_path: Path,
+    production_plan: dict,
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(production_plan), encoding="utf-8")
+
+    with pytest.raises(PermissionError, match="throughput gate"):
+        write_owner_authorization(
+            plan_path=plan_path,
+            output=tmp_path / "authorization.json",
+            segment_index=2,
+            provider="Lambda Cloud",
+            instance_type="gpu_8x_h100_sxm5",
+            hourly_rate_usd=31.92,
+            max_runtime_minutes=10_080,
+            max_cost_usd=7_000,
         )
 
 

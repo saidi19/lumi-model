@@ -300,6 +300,58 @@ class EpochPermutationPlanner:
         return global_indices[start : start + per_rank_batch_size], next_cursor
 
 
+@dataclass(frozen=True)
+class FinalCorpusMicrobatch:
+    """One rank's exact contribution to a possibly partial final microbatch."""
+
+    active_global_sequences: int
+    active_local_sequences: int
+    global_offset: int
+
+    @property
+    def rank_is_active(self) -> bool:
+        return self.active_local_sequences > 0
+
+
+def final_corpus_microbatch_plan(
+    *,
+    active_sequences_this_step: int,
+    accumulation_index: int,
+    per_rank_batch_size: int,
+    rank: int,
+    world_size: int,
+) -> FinalCorpusMicrobatch:
+    """Allocate an exact corpus tail without duplicating any real sequence.
+
+    Full production steps are unaffected.  On the final partial step, ranks may
+    receive fewer than ``per_rank_batch_size`` sequences while every rank still
+    participates in the distributed backward pass.
+    """
+
+    if active_sequences_this_step < 1:
+        raise ValueError("active final-corpus sequences must be positive")
+    if accumulation_index < 0:
+        raise ValueError("accumulation index cannot be negative")
+    if per_rank_batch_size < 1 or world_size < 1:
+        raise ValueError("batch size and world size must be positive")
+    if rank < 0 or rank >= world_size:
+        raise ValueError("rank must be inside the distributed world")
+
+    global_microbatch = per_rank_batch_size * world_size
+    consumed_before = accumulation_index * global_microbatch
+    remaining = active_sequences_this_step - consumed_before
+    if remaining <= 0:
+        raise ValueError("accumulation index is outside the active final-corpus step")
+    active_global = min(global_microbatch, remaining)
+    rank_start = rank * per_rank_batch_size
+    active_local = max(0, min(per_rank_batch_size, active_global - rank_start))
+    return FinalCorpusMicrobatch(
+        active_global_sequences=active_global,
+        active_local_sequences=active_local,
+        global_offset=rank_start,
+    )
+
+
 def _environment_integer(name: str) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -1423,8 +1475,6 @@ def train_distributed_packed(
         dataset = PackedTokenDataset(manifest_path, verify_hashes=False)
     if len(dataset) < context.world_size * per_rank_batch_size:
         raise ValueError("distributed dataset cannot fill one global microbatch")
-    if final_corpus and per_rank_batch_size != 1:
-        raise ValueError("final-corpus exact-tail training requires per-rank batch size 1")
     nominal_sequences_per_step = (
         context.world_size * per_rank_batch_size * gradient_accumulation_steps
     )
@@ -1463,8 +1513,10 @@ def train_distributed_packed(
                 nominal_sequences_per_step,
             )
             accumulations_this_step = (
-                active_sequences_this_step + context.world_size - 1
-            ) // context.world_size
+                active_sequences_this_step
+                + context.world_size * per_rank_batch_size
+                - 1
+            ) // (context.world_size * per_rank_batch_size)
         _synchronize(context.device)
         if context.device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(context.device)
@@ -1472,19 +1524,32 @@ def train_distributed_packed(
 
         for accumulation_index in range(accumulations_this_step):
             rank_is_active = True
+            active_local_sequences = per_rank_batch_size
             if final_corpus:
-                remaining_for_microbatch = (
-                    active_sequences_this_step - accumulation_index * context.world_size
+                microbatch = final_corpus_microbatch_plan(
+                    active_sequences_this_step=active_sequences_this_step,
+                    accumulation_index=accumulation_index,
+                    per_rank_batch_size=per_rank_batch_size,
+                    rank=context.rank,
+                    world_size=context.world_size,
                 )
-                active_ranks = min(context.world_size, remaining_for_microbatch)
                 global_indices, step_cursor = sequence_planner.global_indices(
                     cursor=step_cursor,
-                    count=active_ranks,
+                    count=microbatch.active_global_sequences,
                 )
-                rank_is_active = context.rank < active_ranks
-                indices = [global_indices[context.rank] if rank_is_active else 0]
+                active_local_sequences = microbatch.active_local_sequences
+                rank_is_active = microbatch.rank_is_active
+                if rank_is_active:
+                    start = microbatch.global_offset
+                    indices = global_indices[start : start + active_local_sequences]
+                else:
+                    # Inactive ranks must still enter FSDP collectives. Their
+                    # zero loss scale ensures this dummy row contributes no gradient.
+                    indices = [global_indices[0]]
                 loss_scale = (
-                    context.world_size / active_sequences_this_step
+                    context.world_size
+                    * active_local_sequences
+                    / active_sequences_this_step
                     if rank_is_active
                     else 0.0
                 )
@@ -1530,7 +1595,9 @@ def train_distributed_packed(
                     raise RuntimeError(f"non-finite distributed loss at step {state['step'] + 1}")
                 (loss * loss_scale).backward()
             if rank_is_active:
-                accumulated_local_loss += float(loss.detach())
+                accumulated_local_loss += float(loss.detach()) * (
+                    active_local_sequences if final_corpus else 1
+                )
 
         if strategy == "fsdp_full_shard":
             gradient_norm = distributed_model.clip_grad_norm_(max_grad_norm)

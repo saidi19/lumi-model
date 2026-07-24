@@ -645,6 +645,17 @@ tokenizer, data, and deployment portability before any expensive GPU run:
     0.8 throughput safety factor it is 386.15 hours / `$12,325.87`. Repository
     and segment templates remain `paid_gpu=false`; no instance or full
     training was authorized. See `docs/4b-80b-production-run-v0.1.md`.
+68. the planning-only post-Segment-1 throughput gate now prevents the original
+    Segment-2/3 templates from being authorized directly. It pins one exact
+    step-31,500 checkpoint and compares five execution profiles while
+    preserving the 256-sequence global batch, optimizer/LR schedule, corpus
+    cursor, BF16 full-shard FSDP, and document isolation. Promotion requires at
+    least 15% median and 10% p10 throughput gain, safe loss, checkpoint/resume,
+    and 4GB HBM reserve. The distributed exact-tail allocator now supports
+    per-rank batches above one without repeating corpus sequences. The gate is
+    capped at 120 minutes / `$63.84`, remains `paid_gpu=false`, and requires a
+    new checkpoint-bound continuation plan before Segment 2. No GPU work is
+    authorized by this change. See `docs/4b-80b-production-run-v0.1.md`.
 
 The 4B configuration is a candidate until all deployment gates pass. The 1B
 design, hash-ranked held-out-excluding artifact, A100 gates, document-isolation
@@ -793,7 +804,8 @@ The exact 4x/8x H100 learning workload, cumulative retry cap, milestone-safe
 resume flow, held-out gate, and remaining launch boundary are documented in
 [`docs/4b-learning-pilot-v0.1.md`](docs/4b-learning-pilot-v0.1.md).
 The exact full-run schedule, fresh-start decision, conservative three-segment
-budget, checkpoint handoff, and separate owner-authorization boundary are
+budget, checkpoint handoff, post-Segment-1 throughput gate, and separate
+owner-authorization boundary are
 documented in
 [`docs/4b-80b-production-run-v0.1.md`](docs/4b-80b-production-run-v0.1.md).
 

@@ -1,0 +1,87 @@
+{
+  "approval": {
+    "paid_gpu": false,
+    "production_training": false
+  },
+  "benchmark": {
+    "global_sequences_per_step": 256,
+    "measured_steps_per_candidate": 24,
+    "sequence_length": 4096,
+    "warmup_steps_per_candidate": 8
+  },
+  "budget": {
+    "hourly_rate_usd": 31.92,
+    "maximum_cost_usd": 63.84,
+    "maximum_runtime_minutes": 120
+  },
+  "decision": {
+    "maximum_heldout_loss_regression_fraction": 0.005,
+    "maximum_peak_memory_bytes": 76000000000,
+    "maximum_training_loss_regression_fraction": 0.01,
+    "minimum_baseline_p10_tokens_per_second": 65000,
+    "minimum_p10_throughput_gain_fraction": 0.1,
+    "minimum_throughput_gain_fraction": 0.15
+  },
+  "hardware": {
+    "gpu_model_contains": "H100",
+    "world_size": 8
+  },
+  "profiles": [
+    {
+      "gradient_accumulation_steps": 32,
+      "gradient_checkpointing": true,
+      "label": "baseline_b1_gc",
+      "per_rank_batch_size": 1,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": false
+    },
+    {
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": true,
+      "label": "batch2_gc",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": false
+    },
+    {
+      "gradient_accumulation_steps": 32,
+      "gradient_checkpointing": false,
+      "label": "batch1_no_gc",
+      "per_rank_batch_size": 1,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": false
+    },
+    {
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": false,
+      "label": "batch2_no_gc",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": false
+    },
+    {
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": false,
+      "label": "batch2_no_gc_compile",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": true
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "checkpoint_format": "dcp-model_rank-local-optimizer-v0.1",
+    "corpus_manifest_sha256": "6de45464af33d44e1261a023ccb7d50f86346a4126bb2fa060530a91213483e9",
+    "model_config_sha256": "643e8da652577f802d959740d66a7e6bafc5b065aa45010c2d7e0340ed9509be",
+    "run_fingerprint": "479393eac19eba72e9c00f4d4c14d0d1aa7a71bf92d563692778ad3d23030620",
+    "segment_1_stop_step": 31500,
+    "segment_1_stop_tokens": 33030144000,
+    "source_commit": "1f162717f1995644bce9fe75c66cab1408e895c4"
+  },
+  "status": "planning_only"
+}

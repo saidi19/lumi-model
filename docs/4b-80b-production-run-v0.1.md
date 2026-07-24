@@ -79,6 +79,45 @@ The 1,000-step warmup is about 1.31% of the full horizon, close to the
 previously tested 1B schedule's warmup fraction, while keeping a simple exact
 boundary. It is not copied from the intentionally short pilot schedule.
 
+## Mandatory post-Segment-1 throughput gate
+
+The 80-step H100 pilot proved correctness, learning, checkpoint/resume, and a
+safe baseline throughput. It did **not** exhaust production-performance
+options. In particular, the baseline uses only about 25GB-28GB of each 80GB
+H100 while gradient checkpointing, 32 microsteps, eager execution, and
+full-shard communication trade speed for safety.
+
+Segment 1 keeps its exact sealed execution profile. Changing it in-place would
+invalidate its source-commit/run-fingerprint binding and make checkpoint
+recovery ambiguous. Before Segment 2, however, the sealed step-31,500
+checkpoint must pass the planning-only contract
+`configs/4b-segment2-throughput-gate-v0.1.json`. The gate compares:
+
+| Profile | Per-rank batch | Accumulation | Activation checkpointing | Compile |
+| --- | ---: | ---: | --- | --- |
+| Baseline | 1 | 32 | on | off |
+| Batch 2 | 2 | 16 | on | off |
+| No checkpointing | 1 | 32 | off | off |
+| Batch 2, no checkpointing | 2 | 16 | off | off |
+| Batch 2, no checkpointing, compiled | 2 | 16 | off | on |
+
+Every profile preserves the eight-GPU world, 256-sequence global batch, BF16,
+full-shard FSDP, corpus order, optimizer/LR schedule, FlashAttention document
+isolation, and exact checkpoint cursor. The generalized exact-tail allocator
+supports per-rank batches above one without duplicating any real final-corpus
+sequence; it must still pass the bounded H100 resume canary before promotion.
+
+The benchmark is capped at 120 minutes / `$63.84`. A candidate is promoted
+only with at least 15% median and 10% p10 throughput gain, no material
+training/held-out loss regression, complete checkpoint/resume, no non-finite
+metrics, and at least 4GB HBM reserve under the 80GB device boundary. Otherwise
+the baseline remains selected.
+
+The original Segment-2/3 authorization path now fails closed. The gate result
+must bind one exact Segment-1 checkpoint, and a new continuation plan must bind
+the selected execution profile before any Segment-2 owner authorization.
+Neither this contract nor its evaluator can launch a GPU or resume production.
+
 ## Checkpoints, evaluation, and resume
 
 A complete distributed checkpoint is written every 250 steps and at the exact

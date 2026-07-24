@@ -23,6 +23,7 @@ from lumi.distributed_training import (
     _write_checksum_manifest,
     build_distributed_run_identity,
     distributed_batch_indices,
+    final_corpus_microbatch_plan,
     verify_distributed_checkpoint,
 )
 
@@ -73,6 +74,63 @@ def test_epoch_permutation_planner_caches_and_crosses_epoch_exactly() -> None:
     expected_first_epoch = torch.randperm(5, generator=torch.Generator().manual_seed(11)).tolist()
     expected_second_epoch = torch.randperm(5, generator=torch.Generator().manual_seed(12)).tolist()
     assert first == expected_first_epoch[3:] + expected_second_epoch[:2]
+
+
+@pytest.mark.parametrize("per_rank_batch_size", [1, 2, 4])
+def test_final_corpus_microbatch_plan_consumes_exact_tail(
+    per_rank_batch_size: int,
+) -> None:
+    active_sequences = 242
+    world_size = 8
+    global_microbatch = per_rank_batch_size * world_size
+    accumulations = (active_sequences + global_microbatch - 1) // global_microbatch
+
+    observed = 0
+    for accumulation_index in range(accumulations):
+        plans = [
+            final_corpus_microbatch_plan(
+                active_sequences_this_step=active_sequences,
+                accumulation_index=accumulation_index,
+                per_rank_batch_size=per_rank_batch_size,
+                rank=rank,
+                world_size=world_size,
+            )
+            for rank in range(world_size)
+        ]
+        assert len({plan.active_global_sequences for plan in plans}) == 1
+        assert sum(plan.active_local_sequences for plan in plans) == plans[
+            0
+        ].active_global_sequences
+        observed += plans[0].active_global_sequences
+
+    assert observed == active_sequences
+
+
+def test_final_corpus_microbatch_plan_batch_two_assigns_last_two_once() -> None:
+    plans = [
+        final_corpus_microbatch_plan(
+            active_sequences_this_step=242,
+            accumulation_index=15,
+            per_rank_batch_size=2,
+            rank=rank,
+            world_size=8,
+        )
+        for rank in range(8)
+    ]
+
+    assert [plan.active_local_sequences for plan in plans] == [2, 0, 0, 0, 0, 0, 0, 0]
+    assert all(plan.active_global_sequences == 2 for plan in plans)
+
+
+def test_final_corpus_microbatch_plan_rejects_out_of_range_accumulation() -> None:
+    with pytest.raises(ValueError, match="outside"):
+        final_corpus_microbatch_plan(
+            active_sequences_this_step=2,
+            accumulation_index=1,
+            per_rank_batch_size=2,
+            rank=0,
+            world_size=8,
+        )
 
 
 def test_local_preflight_scope_allows_only_tiny_cpu_work() -> None:

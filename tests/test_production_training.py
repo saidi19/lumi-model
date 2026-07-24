@@ -226,7 +226,15 @@ def test_checkpoint_handoff_is_hash_bound_and_portable(tmp_path: Path) -> None:
         verify_checkpoint_handoff(checkpoint, handoff_path)
 
 
-def test_final_corpus_exact_tail_runs_once_without_epoch_wrap(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("per_rank_batch_size", "gradient_accumulation_steps"),
+    [(1, 2), (2, 1)],
+)
+def test_final_corpus_exact_tail_runs_once_without_epoch_wrap(
+    tmp_path: Path,
+    per_rank_batch_size: int,
+    gradient_accumulation_steps: int,
+) -> None:
     manifest_path, staged, _ = _final_fixture(tmp_path, sequence_count=7)
     config = {
         "attention_bias": False,
@@ -285,8 +293,10 @@ def test_final_corpus_exact_tail_runs_once_without_epoch_wrap(tmp_path: Path) ->
             "2",
             "--strategy",
             "ddp",
+            "--per-rank-batch-size",
+            str(per_rank_batch_size),
             "--gradient-accumulation-steps",
-            "2",
+            str(gradient_accumulation_steps),
             "--checkpoint-steps",
             "1",
             "--device",
