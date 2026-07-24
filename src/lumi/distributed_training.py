@@ -91,6 +91,27 @@ PAID_LEARNING_PILOT_RUN_KIND = "lumi_4b_learning_pilot_v0.1"
 PAID_LEARNING_PILOT_OWNER_ACKNOWLEDGEMENT = (
     "I approve this bounded paid Lumi-4B learning pilot through the recorded step."
 )
+PAID_SEGMENT2_SCREEN_RUN_KIND = "lumi_4b_pre_segment2_throughput_screen_v0.1"
+PAID_SEGMENT2_SCREEN_WORLD_SIZE = 8
+PAID_SEGMENT2_SCREEN_MAX_STEPS = 33
+PAID_SEGMENT2_SCREEN_TOKENS_PER_STEP = 1_048_576
+PAID_SEGMENT2_SCREEN_TOKEN_CAP = (
+    PAID_SEGMENT2_SCREEN_MAX_STEPS * PAID_SEGMENT2_SCREEN_TOKENS_PER_STEP
+)
+PAID_SEGMENT2_SCREEN_CANDIDATES = 5
+PAID_SEGMENT2_SCREEN_AGGREGATE_TOKEN_CAP = (
+    PAID_SEGMENT2_SCREEN_CANDIDATES * PAID_SEGMENT2_SCREEN_TOKEN_CAP
+)
+PAID_SEGMENT2_SCREEN_MAX_RUNTIME_MINUTES = 120
+PAID_SEGMENT2_SCREEN_MAX_COST_USD = 63.84
+PAID_SEGMENT2_SCREEN_OWNER_ACKNOWLEDGEMENT = (
+    "I approve one bounded Lumi pre-Segment-2 8xH100 throughput A/B on Lambda "
+    "instance 209.20.157.52, maximum 120 minutes/$63.84. It may read and transfer "
+    "only the bounded training prefix, held-out data, and tokenizer from my running "
+    "Segment-1 instance without modifying or restarting Segment-1. No Segment-2 "
+    "production training or full model training. I understand a short final "
+    "checkpoint-bound verification remains after Segment-1 completes."
+)
 PAID_4B_PRODUCTION_RUN_KIND = "lumi_4b_80b_pretraining_v0.1"
 PAID_4B_PRODUCTION_WORLD_SIZE = 8
 PAID_4B_PRODUCTION_MAX_STEPS = 76_294
@@ -813,10 +834,14 @@ def _validate_paid_authorization(
     if run_kind not in {
         "lumi_distributed_smoke_v0.1",
         PAID_LEARNING_PILOT_RUN_KIND,
+        PAID_SEGMENT2_SCREEN_RUN_KIND,
         PAID_4B_PRODUCTION_RUN_KIND,
     }:
         raise ValueError("authorization targets a different run kind")
-    if authorization.get("run_fingerprint") != run_fingerprint:
+    if (
+        run_kind != PAID_SEGMENT2_SCREEN_RUN_KIND
+        and authorization.get("run_fingerprint") != run_fingerprint
+    ):
         raise ValueError("authorization does not match the distributed run")
     normalized_commit = _validate_source_commit(source_commit)
     if normalized_commit is None:
@@ -877,6 +902,85 @@ def _validate_paid_authorization(
             raise ValueError("learning-pilot provider is missing")
         if not str(authorization.get("instance_type", "")).strip():
             raise ValueError("learning-pilot instance type is missing")
+        return authorization
+
+    if run_kind == PAID_SEGMENT2_SCREEN_RUN_KIND:
+        if authorization.get("full_4b_training") is not False:
+            raise ValueError("the throughput screen cannot approve full 4B training")
+        if context.world_size != PAID_SEGMENT2_SCREEN_WORLD_SIZE:
+            raise ValueError("throughput-screen authorization requires eight GPUs")
+        if strategy != "fsdp_full_shard":
+            raise ValueError("throughput-screen authorization requires FSDP full sharding")
+        if (
+            approved_step != PAID_SEGMENT2_SCREEN_MAX_STEPS
+            or steps > approved_step
+        ):
+            raise ValueError("throughput-screen step boundary is invalid")
+        if global_tokens_per_step != PAID_SEGMENT2_SCREEN_TOKENS_PER_STEP:
+            raise ValueError("throughput-screen global token geometry changed")
+        if (
+            authorization.get("approved_token_cap")
+            != PAID_SEGMENT2_SCREEN_TOKEN_CAP
+            or target_tokens is None
+            or not 0 < target_tokens <= PAID_SEGMENT2_SCREEN_TOKEN_CAP
+        ):
+            raise ValueError("throughput-screen token boundary changed")
+        if (
+            authorization.get("aggregate_candidate_count")
+            != PAID_SEGMENT2_SCREEN_CANDIDATES
+            or authorization.get("aggregate_token_cap")
+            != PAID_SEGMENT2_SCREEN_AGGREGATE_TOKEN_CAP
+        ):
+            raise ValueError("throughput-screen aggregate boundary changed")
+        fingerprints = authorization.get("allowed_run_fingerprints")
+        if (
+            not isinstance(fingerprints, dict)
+            or len(fingerprints) != PAID_SEGMENT2_SCREEN_CANDIDATES
+            or run_fingerprint not in fingerprints.values()
+            or any(
+                not isinstance(label, str)
+                or not label
+                or not isinstance(value, str)
+                or len(value) != 64
+                for label, value in fingerprints.items()
+            )
+        ):
+            raise ValueError("throughput-screen fingerprint matrix changed")
+        if authorization.get("owner_acknowledgement") != (
+            PAID_SEGMENT2_SCREEN_OWNER_ACKNOWLEDGEMENT
+        ):
+            raise ValueError("throughput-screen acknowledgement changed")
+        if authorization.get("instance_ip") != "209.20.157.52":
+            raise ValueError("throughput-screen instance changed")
+        if authorization.get("segment_1_access") != {
+            "checkpoint_transfer": False,
+            "modify_or_restart": False,
+            "read_only_inputs": [
+                "bounded_training_prefix",
+                "heldout_data",
+                "tokenizer",
+            ],
+        }:
+            raise ValueError("throughput-screen Segment-1 access changed")
+        max_runtime = authorization.get("max_runtime_minutes")
+        if max_runtime != PAID_SEGMENT2_SCREEN_MAX_RUNTIME_MINUTES:
+            raise ValueError("throughput-screen runtime cap changed")
+        hourly_rate = authorization.get("hourly_rate_usd")
+        max_cost = authorization.get("max_cost_usd")
+        if (
+            not isinstance(hourly_rate, (int, float))
+            or isinstance(hourly_rate, bool)
+            or float(hourly_rate) != 31.92
+            or not isinstance(max_cost, (int, float))
+            or isinstance(max_cost, bool)
+            or float(max_cost) != PAID_SEGMENT2_SCREEN_MAX_COST_USD
+            or float(hourly_rate) * max_runtime / 60 > float(max_cost)
+        ):
+            raise ValueError("throughput-screen cost boundary changed")
+        if authorization.get("provider") != "Lambda Cloud":
+            raise ValueError("throughput-screen provider changed")
+        if authorization.get("instance_type") != "gpu_8x_h100_sxm5":
+            raise ValueError("throughput-screen instance type changed")
         return authorization
 
     if authorization.get("full_4b_training") is not True:
