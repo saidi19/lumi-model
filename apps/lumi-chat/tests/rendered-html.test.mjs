@@ -30,10 +30,10 @@ test("server-renders the Lumi staging workspace", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
   assert.match(html, /<title>Lumi — AI workspace<\/title>/i);
-  assert.match(html, /Build beside the model/);
-  assert.match(html, /This is not the final model/);
-  assert.match(html, /Readiness/);
-  assert.match(html, /Private staging/);
+  assert.match(html, /What can I help you with/);
+  assert.match(html, /final model is still training/i);
+  assert.match(html, /Release readiness/);
+  assert.match(html, /Private workspace/);
   assert.doesNotMatch(html, /Your site is taking shape|SkeletonPreview/);
 });
 

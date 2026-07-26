@@ -34,34 +34,64 @@ type RuntimeStatus = {
   ready: boolean;
 };
 
+type IconName =
+  | "arrow"
+  | "chat"
+  | "check"
+  | "close"
+  | "grid"
+  | "menu"
+  | "plus"
+  | "stop"
+  | "trash";
+
 const STORAGE_KEY = "lumi-chat-history-v0.1";
 const ACTIVE_KEY = "lumi-chat-active-v0.1";
 
 const GATES = [
   {
-    detail: "Segmented 80B run is active; this product branch is isolated.",
+    detail: "The segmented 80B run is active and isolated from this product workspace.",
     label: "Base pretraining",
     state: "active",
   },
   {
-    detail: "License, provenance, PII, secrets, duplicate and leakage filters.",
+    detail: "License, provenance, PII, secret, duplicate and leakage filters are defined.",
     label: "SFT data contract",
-    state: "ready",
+    state: "prepared",
   },
   {
-    detail: "Frozen adapters remain checkpoint-bound before final scoring.",
-    label: "Benchmark harness",
-    state: "ready",
+    detail: "Frozen benchmark adapters are ready for the final checkpoint.",
+    label: "Evaluation harness",
+    state: "prepared",
   },
   {
     detail: "Six owned probes cover injection, privacy and safe behavior.",
     label: "Safety suite",
-    state: "ready",
+    state: "prepared",
   },
   {
-    detail: "Blocked until base, SFT, benchmark and safety hashes are sealed.",
+    detail: "Serving remains locked until every required artifact is hash-bound.",
     label: "Public serving",
     state: "blocked",
+  },
+] as const;
+
+const STARTER_PROMPTS = [
+  {
+    label: "Think clearly",
+    prompt: "Compare two product ideas and show the trade-offs.",
+  },
+  {
+    label: "Write & edit",
+    prompt: "Draft a concise launch email for a new AI product.",
+  },
+  {
+    label: "Build with code",
+    prompt: "Show a safe typed API retry helper.",
+  },
+  {
+    label: "বাংলায় বলো",
+    prompt: "সহজ ভাষায় নিউরাল নেটওয়ার্ক বোঝাও।",
   },
 ] as const;
 
@@ -85,54 +115,32 @@ function formatAge(timestamp: number): string {
 
 function LumiMark({ compact = false }: { compact?: boolean }) {
   return (
-    <div className={`lumi-mark${compact ? " compact" : ""}`} aria-hidden="true">
-      <span className="orbit orbit-one" />
-      <span className="orbit orbit-two" />
-      <span className="mark-core">L</span>
-    </div>
+    <span className={`lumi-mark${compact ? " compact" : ""}`} aria-hidden="true">
+      L
+    </span>
   );
 }
 
-function Icon({
-  name,
-  size = 18,
-}: {
-  name: "arrow" | "chat" | "check" | "grid" | "plus" | "stop" | "trash";
-  size?: number;
-}) {
-  const paths = {
-    arrow: <path d="m5 12 7-7 7 7M12 5v14" />,
-    chat: <path d="M20 15a4 4 0 0 1-4 4H8l-4 3V7a4 4 0 0 1 4-4h8a4 4 0 0 1 4 4z" />,
-    check: <path d="m5 12 4 4L19 6" />,
-    grid: (
-      <>
-        <rect x="3" y="3" width="7" height="7" rx="2" />
-        <rect x="14" y="3" width="7" height="7" rx="2" />
-        <rect x="3" y="14" width="7" height="7" rx="2" />
-        <rect x="14" y="14" width="7" height="7" rx="2" />
-      </>
-    ),
-    plus: <path d="M12 5v14M5 12h14" />,
-    stop: <rect x="7" y="7" width="10" height="10" rx="2" />,
-    trash: (
-      <>
-        <path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" />
-        <path d="M10 11v5M14 11v5" />
-      </>
-    ),
+function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
+  const glyphs: Record<IconName, string> = {
+    arrow: "↑",
+    chat: "◌",
+    check: "✓",
+    close: "×",
+    grid: "◇",
+    menu: "☰",
+    plus: "+",
+    stop: "■",
+    trash: "×",
   };
   return (
-    <svg
+    <span
       aria-hidden="true"
-      fill="none"
-      height={size}
-      viewBox="0 0 24 24"
-      width={size}
+      className={`ui-icon icon-${name}`}
+      style={{ fontSize: `${size}px` }}
     >
-      <g stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.7">
-        {paths[name]}
-      </g>
-    </svg>
+      {glyphs[name]}
+    </span>
   );
 }
 
@@ -143,6 +151,7 @@ export function LumiStudio() {
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [view, setView] = useState<View>("chat");
   const abortRef = useRef<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -186,6 +195,22 @@ export function LumiStudio() {
       );
   }, []);
 
+  useEffect(() => {
+    function handleShortcut(event: globalThis.KeyboardEvent) {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        abortRef.current?.abort();
+        setActiveId(null);
+        setInput("");
+        setView("chat");
+        setSidebarOpen(false);
+        requestAnimationFrame(() => textareaRef.current?.focus());
+      }
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
+
   const active = useMemo(
     () => conversations.find((item) => item.id === activeId) ?? null,
     [activeId, conversations],
@@ -199,10 +224,11 @@ export function LumiStudio() {
   }, [active?.messages]);
 
   function newConversation() {
-    if (abortRef.current) abortRef.current.abort();
+    abortRef.current?.abort();
     setActiveId(null);
     setInput("");
     setView("chat");
+    setSidebarOpen(false);
     requestAnimationFrame(() => textareaRef.current?.focus());
   }
 
@@ -212,7 +238,17 @@ export function LumiStudio() {
     if (activeId === id) setActiveId(remaining[0]?.id ?? null);
   }
 
-  function updateMessage(conversationId: string, messageId: string, patch: Partial<Message>) {
+  function openConversation(id: string) {
+    setActiveId(id);
+    setView("chat");
+    setSidebarOpen(false);
+  }
+
+  function updateMessage(
+    conversationId: string,
+    messageId: string,
+    patch: Partial<Message>,
+  ) {
     setConversations((current) =>
       current.map((conversation) =>
         conversation.id === conversationId
@@ -247,7 +283,9 @@ export function LumiStudio() {
           const data = line.slice(6);
           if (data === "[DONE]") return;
           const payload = JSON.parse(data);
-          if (payload.error) throw new Error(payload.error.message ?? "Generation failed.");
+          if (payload.error) {
+            throw new Error(payload.error.message ?? "Generation failed.");
+          }
           const text = payload.choices?.[0]?.delta?.content;
           if (typeof text === "string") onText(text);
         }
@@ -355,29 +393,49 @@ export function LumiStudio() {
   }
 
   return (
-    <div className="studio-shell">
+    <div className={`studio-shell${sidebarOpen ? " sidebar-open" : ""}`}>
+      <button
+        aria-label="Close conversations"
+        className="sidebar-scrim"
+        onClick={() => setSidebarOpen(false)}
+        type="button"
+      />
+
       <aside className="sidebar">
-        <div className="brand">
-          <LumiMark compact />
-          <div>
-            <strong>Lumi</strong>
-            <span>Afnan Technologies</span>
+        <div className="brand-row">
+          <div className="brand">
+            <LumiMark compact />
+            <div>
+              <strong>Lumi</strong>
+              <span>Private workspace</span>
+            </div>
           </div>
+          <button
+            aria-label="Close conversations"
+            className="sidebar-close"
+            onClick={() => setSidebarOpen(false)}
+            type="button"
+          >
+            <Icon name="close" size={23} />
+          </button>
         </div>
 
         <button className="new-chat" onClick={newConversation} type="button">
-          <Icon name="plus" />
-          <span>New conversation</span>
-          <kbd>⌘K</kbd>
+          <Icon name="plus" size={20} />
+          <span>New chat</span>
+          <kbd>⌘ K</kbd>
         </button>
 
-        <div className="sidebar-label">
-          <span>Conversations</span>
+        <div className="sidebar-heading">
+          <span>Recent</span>
           <span>{conversations.length}</span>
         </div>
         <nav className="conversation-list" aria-label="Saved conversations">
           {conversations.length === 0 ? (
-            <p className="empty-history">Your local conversations will appear here.</p>
+            <div className="empty-history">
+              <span>◌</span>
+              <p>Your conversations will stay here on this device.</p>
+            </div>
           ) : (
             conversations.map((conversation) => (
               <div
@@ -386,13 +444,10 @@ export function LumiStudio() {
               >
                 <button
                   className="conversation-open"
-                  onClick={() => {
-                    setActiveId(conversation.id);
-                    setView("chat");
-                  }}
+                  onClick={() => openConversation(conversation.id)}
                   type="button"
                 >
-                  <Icon name="chat" size={15} />
+                  <Icon name="chat" size={17} />
                   <span>{conversation.title}</span>
                   <time>{formatAge(conversation.updatedAt)}</time>
                 </button>
@@ -402,21 +457,49 @@ export function LumiStudio() {
                   onClick={() => deleteConversation(conversation.id)}
                   type="button"
                 >
-                  <Icon name="trash" size={14} />
+                  <Icon name="trash" size={18} />
                 </button>
               </div>
             ))
           )}
         </nav>
 
-        <div className="sidebar-footer">
-          <div className={`runtime-pulse ${runtime?.mode ?? "staging"}`} />
+        <div className="sidebar-nav">
+          <button
+            className={view === "chat" ? "active" : ""}
+            onClick={() => {
+              setView("chat");
+              setSidebarOpen(false);
+            }}
+            type="button"
+          >
+            <Icon name="chat" size={18} />
+            <span>Chat</span>
+          </button>
+          <button
+            className={view === "readiness" ? "active" : ""}
+            onClick={() => {
+              setView("readiness");
+              setSidebarOpen(false);
+            }}
+            type="button"
+          >
+            <Icon name="grid" size={18} />
+            <span>Release readiness</span>
+            <em>0/5</em>
+          </button>
+        </div>
+
+        <div className="runtime-card">
+          <div className={`runtime-dot ${runtime?.mode ?? "staging"}`} />
           <div>
-            <strong>{runtime?.mode === "connected" ? "Model connected" : "Staging mode"}</strong>
+            <strong>
+              {runtime?.mode === "connected" ? "Model connected" : "Staging preview"}
+            </strong>
             <span>
               {runtime?.mode === "connected"
                 ? runtime.model
-                : "No final checkpoint attached"}
+                : "Final checkpoint not attached"}
             </span>
           </div>
         </div>
@@ -424,32 +507,37 @@ export function LumiStudio() {
 
       <main className="workspace">
         <header className="workspace-header">
-          <div className="model-identity">
-            <span className="model-kicker">LUMI L1</span>
-            <strong>{runtime?.model ?? "lumi-4b-instruct"}</strong>
-            <span className="model-state">Base training</span>
+          <div className="header-left">
+            <button
+              aria-label="Open conversations"
+              className="mobile-menu"
+              onClick={() => setSidebarOpen(true)}
+              type="button"
+            >
+              <Icon name="menu" size={20} />
+            </button>
+            <div className="model-selector">
+              <LumiMark compact />
+              <div>
+                <strong>Lumi L1</strong>
+                <span>{runtime?.model ?? "lumi-4b-instruct"}</span>
+              </div>
+              <span className="selector-caret">⌄</span>
+            </div>
           </div>
-          <nav className="view-switcher" aria-label="Workspace view">
+          <div className="header-actions">
+            <span className="training-pill">
+              <i />
+              Base training
+            </span>
             <button
-              className={view === "chat" ? "active" : ""}
-              onClick={() => setView("chat")}
+              className="readiness-shortcut"
+              onClick={() => setView(view === "readiness" ? "chat" : "readiness")}
               type="button"
             >
-              <Icon name="chat" size={16} />
-              Chat
+              <Icon name={view === "readiness" ? "chat" : "grid"} size={18} />
+              {view === "readiness" ? "Back to chat" : "Readiness"}
             </button>
-            <button
-              className={view === "readiness" ? "active" : ""}
-              onClick={() => setView("readiness")}
-              type="button"
-            >
-              <Icon name="grid" size={15} />
-              Readiness
-            </button>
-          </nav>
-          <div className="header-status">
-            <span />
-            Private staging
           </div>
         </header>
 
@@ -459,30 +547,14 @@ export function LumiStudio() {
               {!active || active.messages.length === 0 ? (
                 <div className="welcome">
                   <LumiMark />
-                  <div className="welcome-copy">
-                    <span className="eyebrow">PRODUCT SHELL READY</span>
-                    <h1>Build beside the model.</h1>
-                    <p>
-                      The interface, history, streaming and deployment contract are ready
-                      to test while Lumi L1 finishes learning.
-                    </p>
-                  </div>
-                  <div className="training-notice">
-                    <span className="notice-icon">i</span>
-                    <div>
-                      <strong>This is not the final model.</strong>
-                      <p>
-                        Until the sealed 80B checkpoint completes SFT and safety gates,
-                        replies come from an explicit staging stream.
-                      </p>
-                    </div>
-                  </div>
+                  <span className="welcome-kicker">LUMI L1 · PRIVATE PREVIEW</span>
+                  <h1>What can I help you with?</h1>
+                  <p>
+                    Chat naturally in English or বাংলা. The final model is still
+                    training, so replies here are clearly marked staging previews.
+                  </p>
                   <div className="prompt-grid">
-                    {[
-                      ["Explain clearly", "Why does the sky appear blue?"],
-                      ["Write code", "Show a safe Python retry helper."],
-                      ["বাংলায় বলো", "সহজ ভাষায় নিউরাল নেটওয়ার্ক বোঝাও।"],
-                    ].map(([label, prompt]) => (
+                    {STARTER_PROMPTS.map(({ label, prompt }) => (
                       <button
                         key={label}
                         onClick={() => {
@@ -493,12 +565,13 @@ export function LumiStudio() {
                       >
                         <span>{label}</span>
                         <p>{prompt}</p>
+                        <b aria-hidden="true">↗</b>
                       </button>
                     ))}
                   </div>
                 </div>
               ) : (
-                <div className="messages">
+                <div className="messages" aria-live="polite">
                   {active.messages.map((message) => (
                     <article className={`message ${message.role}`} key={message.id}>
                       <div className="message-avatar">
@@ -507,7 +580,7 @@ export function LumiStudio() {
                       <div className="message-body">
                         <div className="message-heading">
                           <strong>{message.role === "assistant" ? "Lumi" : "You"}</strong>
-                          {message.pending ? <span>streaming</span> : null}
+                          {message.pending ? <span>writing</span> : null}
                         </div>
                         <p>
                           {message.content}
@@ -528,7 +601,7 @@ export function LumiStudio() {
                   maxLength={65_536}
                   onChange={(event) => setInput(event.target.value)}
                   onKeyDown={onComposerKeyDown}
-                  placeholder="Message Lumi…"
+                  placeholder="Message Lumi"
                   ref={textareaRef}
                   rows={1}
                   value={input}
@@ -536,7 +609,7 @@ export function LumiStudio() {
                 <div className="composer-footer">
                   <div className="composer-mode">
                     <span />
-                    {runtime?.mode === "connected" ? "Model stream" : "Staging stream"}
+                    {runtime?.mode === "connected" ? "Live model" : "Staging preview"}
                   </div>
                   <button
                     aria-label={running ? "Stop generation" : "Send message"}
@@ -545,91 +618,92 @@ export function LumiStudio() {
                     onClick={running ? stopGeneration : undefined}
                     type={running ? "button" : "submit"}
                   >
-                    <Icon name={running ? "stop" : "arrow"} size={18} />
+                    <Icon name={running ? "stop" : "arrow"} size={19} />
                   </button>
                 </div>
               </form>
               <p className="composer-note">
-                History stays in this browser. Lumi may make mistakes after launch.
+                <span>History stays on this device</span>
+                <i>•</i>
+                <span>Enter to send · Shift + Enter for a new line</span>
               </p>
             </div>
           </section>
         ) : (
           <section className="readiness-view">
-            <div className="readiness-hero">
-              <div>
-                <span className="eyebrow">RELEASE CONTROL</span>
-                <h1>Nothing ships on hope.</h1>
-                <p>
-                  Every model, data, benchmark and safety artifact must be sealed by
-                  hash before serving can unlock.
-                </p>
-              </div>
-              <div className="readiness-score">
-                <strong>0/5</strong>
-                <span>production gates passed</span>
-              </div>
-            </div>
-
-            <div className="gate-grid">
-              {GATES.map((gate, index) => (
-                <article className={`gate-card ${gate.state}`} key={gate.label}>
-                  <div className="gate-number">{String(index + 1).padStart(2, "0")}</div>
-                  <div className="gate-copy">
-                    <div>
-                      <h2>{gate.label}</h2>
-                      <span>{gate.state}</span>
-                    </div>
-                    <p>{gate.detail}</p>
-                  </div>
-                  {gate.state === "ready" ? (
-                    <div className="gate-check">
-                      <Icon name="check" size={15} />
-                    </div>
-                  ) : null}
-                </article>
-              ))}
-            </div>
-
-            <div className="readiness-bottom">
-              <article className="contract-card">
-                <span className="eyebrow">SERVING CONTRACT</span>
-                <h2>Fail-closed by default</h2>
-                <p>
-                  Public inference remains disabled until the 80B base checkpoint,
-                  filtered SFT set, SFT checkpoint, benchmark report, safety report
-                  and tokenizer manifest all have exact SHA-256 bindings.
-                </p>
-                <div className="contract-path">
-                  configs/lumi-4b-serving-contract-v0.1.json
+            <div className="readiness-container">
+              <div className="readiness-hero">
+                <div>
+                  <span className="section-kicker">RELEASE CONTROL</span>
+                  <h1>Ready only when the evidence is.</h1>
+                  <p>
+                    Lumi stays private until the base model, SFT, benchmarks and
+                    safety evidence are sealed to exact artifact hashes.
+                  </p>
                 </div>
-              </article>
-              <article className="suite-card">
-                <div className="suite-heading">
+                <div className="readiness-summary">
+                  <strong>0%</strong>
+                  <span>production unlocked</span>
                   <div>
-                    <span className="eyebrow">OWNED SAFETY CASES</span>
-                    <h2>6 probes ready</h2>
+                    <i />
                   </div>
-                  <strong>v0.1</strong>
+                  <small>3 foundations prepared</small>
                 </div>
-                <ul>
-                  {[
-                    "Prompt injection",
-                    "Privacy & secrets",
-                    "Harmful requests",
-                    "Calibration",
-                    "Bengali safety",
-                    "Over-refusal",
-                  ].map((item) => (
-                    <li key={item}>
-                      <span>
-                        <Icon name="check" size={13} />
-                      </span>
-                      {item}
-                    </li>
-                  ))}
-                </ul>
-              </article>
+              </div>
+
+              <div className="gate-grid">
+                {GATES.map((gate, index) => (
+                  <article className={`gate-card ${gate.state}`} key={gate.label}>
+                    <div className="gate-top">
+                      <span>{String(index + 1).padStart(2, "0")}</span>
+                      <em>{gate.state}</em>
+                    </div>
+                    <h2>{gate.label}</h2>
+                    <p>{gate.detail}</p>
+                    {gate.state === "prepared" ? (
+                      <div className="gate-check">
+                        <Icon name="check" size={15} />
+                      </div>
+                    ) : null}
+                  </article>
+                ))}
+              </div>
+
+              <div className="readiness-bottom">
+                <article className="contract-card">
+                  <span className="section-kicker">SERVING CONTRACT</span>
+                  <h2>Fail-closed by default</h2>
+                  <p>
+                    Public inference cannot unlock without exact bindings for the 80B
+                    base, filtered SFT data, instruct checkpoint, tokenizer, benchmark
+                    report and safety report.
+                  </p>
+                  <code>configs/lumi-4b-serving-contract-v0.1.json</code>
+                </article>
+                <article className="suite-card">
+                  <div>
+                    <span className="section-kicker">OWNED SAFETY SUITE</span>
+                    <strong>6 probes</strong>
+                  </div>
+                  <ul>
+                    {[
+                      "Prompt injection",
+                      "Privacy & secrets",
+                      "Harmful requests",
+                      "Calibration",
+                      "Bengali safety",
+                      "Over-refusal",
+                    ].map((item) => (
+                      <li key={item}>
+                        <span>
+                          <Icon name="check" size={13} />
+                        </span>
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
+                </article>
+              </div>
             </div>
           </section>
         )}
