@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -20,6 +20,7 @@ from lumi.segment2_checkpoint_verification import (
     decide_checkpoint_gate,
     validate_checkpoint_gate_bundle,
 )
+from scripts import run_4b_segment2_checkpoint_gate as checkpoint_gate_runner
 
 
 def _source_checkpoint(root: Path) -> Path:
@@ -108,12 +109,50 @@ def test_checkpoint_gate_bundle_binds_exact_source_and_profiles(
         profile["optimizer_profile"] == "legacy"
         for profile in plan["profiles"]
     )
+    assert plan["evaluation"]["tokenizer_root_path"] == str(tmp_path)
     assert all(
         "optimizer_profile" not in profile["run_identity"]["optimizer"]
         for profile in plan["profiles"]
     )
     assert authorization["full_4b_training"] is False
     assert authorization["scope"]["checkpoint_modification"] is False
+
+
+def test_checkpoint_gate_evaluation_uses_bound_tokenizer_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plan, _ = _bundle(tmp_path)
+    commands: list[list[str]] = []
+
+    def fake_run_logged(
+        command: list[str],
+        *,
+        cwd: Path,
+        log_path: Path,
+        deadline: datetime,
+    ) -> None:
+        del cwd, log_path, deadline
+        commands.append(command)
+
+    monkeypatch.setattr(checkpoint_gate_runner, "_run_logged", fake_run_logged)
+    checkpoint = tmp_path / "disposable-checkpoint"
+    checkpoint.mkdir()
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+
+    checkpoint_gate_runner._evaluate_candidate(
+        python=Path("/python"),
+        repo=tmp_path,
+        plan=plan,
+        checkpoint=checkpoint,
+        candidate=candidate,
+        deadline=datetime.now(UTC) + timedelta(minutes=1),
+    )
+
+    evaluation_command = commands[1]
+    tokenizer_index = evaluation_command.index("--tokenizer") + 1
+    assert evaluation_command[tokenizer_index] == str(tmp_path)
 
 
 def test_checkpoint_gate_rejects_source_optimizer_change(tmp_path: Path) -> None:

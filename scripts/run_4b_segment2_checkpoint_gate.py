@@ -230,7 +230,7 @@ def _evaluate_candidate(
                 "--manifest",
                 plan["evaluation"]["heldout_manifest_path"],
                 "--tokenizer",
-                plan["evaluation"]["tokenizer_path"],
+                plan["evaluation"]["tokenizer_root_path"],
                 "--output",
                 str(evaluation),
                 "--attention-implementation",

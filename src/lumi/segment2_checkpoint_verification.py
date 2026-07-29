@@ -234,6 +234,7 @@ def build_checkpoint_gate_bundle(
             "plan_path": str(evaluation_plan_path),
             "plan_sha256": _sha256_file(evaluation_plan_path),
             "tokenizer_path": str(tokenizer_path),
+            "tokenizer_root_path": str(tokenizer_path.parent),
             "tokenizer_sha256": _sha256_file(tokenizer_path),
         },
         "gate": CHECKPOINT_GATE,
@@ -387,6 +388,15 @@ def validate_checkpoint_gate_bundle(
         )
     } | {"read_only": True}:
         raise ValueError("checkpoint-gate source binding changed")
+    evaluation = plan.get("evaluation")
+    if not isinstance(evaluation, Mapping):
+        raise ValueError("checkpoint-gate evaluation binding is missing")
+    tokenizer_path = Path(str(evaluation.get("tokenizer_path", ""))).resolve()
+    tokenizer_root_path = Path(
+        str(evaluation.get("tokenizer_root_path", ""))
+    ).resolve()
+    if tokenizer_root_path != tokenizer_path.parent:
+        raise ValueError("checkpoint-gate tokenizer root changed")
 
 
 def _finite_positive(value: object, label: str) -> float:
