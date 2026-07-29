@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-corpus-doc-token-id", type=int, default=3)
     parser.add_argument("--skip-final-model-digest", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--resume-from-checkpoint", type=Path)
     return parser.parse_args()
 
 
@@ -107,6 +108,7 @@ def main() -> None:
             final_corpus_vocab_size=args.final_corpus_vocab_size,
             final_corpus_doc_token_id=args.final_corpus_doc_token_id,
             resume=args.resume,
+            resume_from_checkpoint=args.resume_from_checkpoint,
         )
     finally:
         destroy_distributed()

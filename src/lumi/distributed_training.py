@@ -112,6 +112,29 @@ PAID_SEGMENT2_SCREEN_OWNER_ACKNOWLEDGEMENT = (
     "production training or full model training. I understand a short final "
     "checkpoint-bound verification remains after Segment-1 completes."
 )
+PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND = (
+    "lumi_4b_pre_segment2_checkpoint_gate_v0.1"
+)
+PAID_SEGMENT2_CHECKPOINT_GATE_WORLD_SIZE = 8
+PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP = 31_500
+PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_TOKENS = 33_030_144_000
+PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_SEQUENCE_CURSOR = 8_064_000
+PAID_SEGMENT2_CHECKPOINT_GATE_MAX_STEPS = 31_524
+PAID_SEGMENT2_CHECKPOINT_GATE_TOKENS_PER_STEP = 1_048_576
+PAID_SEGMENT2_CHECKPOINT_GATE_MAX_RUNTIME_MINUTES = 60
+PAID_SEGMENT2_CHECKPOINT_GATE_MAX_COST_USD = 31.92
+PAID_SEGMENT2_CHECKPOINT_GATE_PROFILES = {
+    "baseline_b1_gc",
+    "batch2_no_gc",
+}
+PAID_SEGMENT2_CHECKPOINT_GATE_OWNER_ACKNOWLEDGEMENT = (
+    "I approve one bounded exact-checkpoint Lumi pre-Segment-2 batch2_no_gc "
+    "verification on existing instance 209.20.157.24, maximum 60 minutes/$31.92. "
+    "It may run only disposable bounded verification steps from the sealed "
+    "Segment-1 checkpoint to compare baseline versus batch2_no_gc and verify loss, "
+    "resume, throughput, and HBM safety. No Segment-2 production/full training, "
+    "checkpoint modification, off-instance export, new instance, or termination."
+)
 PAID_4B_PRODUCTION_RUN_KIND = "lumi_4b_80b_pretraining_v0.1"
 PAID_4B_PRODUCTION_WORLD_SIZE = 8
 PAID_4B_PRODUCTION_MAX_STEPS = 76_294
@@ -548,6 +571,20 @@ def verify_distributed_checkpoint(checkpoint: str | Path) -> dict[str, Any]:
     return state
 
 
+def distributed_checkpoint_binding(checkpoint: str | Path) -> dict[str, Any]:
+    """Verify and identify one immutable distributed checkpoint."""
+
+    checkpoint = Path(checkpoint)
+    state = verify_distributed_checkpoint(checkpoint)
+    return {
+        "manifest_sha256": _sha256_file(checkpoint / "manifest.sha256"),
+        "run_fingerprint": state["run_fingerprint"],
+        "sequence_cursor": state["sequence_cursor"],
+        "step": state["step"],
+        "tokens": state["tokens_seen"],
+    }
+
+
 def _discover_latest_checkpoint(
     output: Path, *, run_fingerprint: str
 ) -> tuple[Path, dict[str, Any]] | None:
@@ -741,8 +778,10 @@ def _restore_distributed_checkpoint(
     checkpoint: Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    checkpoint_verified: bool = False,
 ) -> None:
-    verify_distributed_checkpoint(checkpoint)
+    if not checkpoint_verified:
+        verify_distributed_checkpoint(checkpoint)
     model_state = get_model_state_dict(model)
     dcp.load({"model": model_state}, checkpoint_id=checkpoint / "model")
     incompatible = set_model_state_dict(model, model_state)
@@ -834,12 +873,17 @@ def _validate_paid_authorization(
     if run_kind not in {
         "lumi_distributed_smoke_v0.1",
         PAID_LEARNING_PILOT_RUN_KIND,
+        PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
         PAID_SEGMENT2_SCREEN_RUN_KIND,
         PAID_4B_PRODUCTION_RUN_KIND,
     }:
         raise ValueError("authorization targets a different run kind")
     if (
-        run_kind != PAID_SEGMENT2_SCREEN_RUN_KIND
+        run_kind
+        not in {
+            PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+            PAID_SEGMENT2_SCREEN_RUN_KIND,
+        }
         and authorization.get("run_fingerprint") != run_fingerprint
     ):
         raise ValueError("authorization does not match the distributed run")
@@ -981,6 +1025,114 @@ def _validate_paid_authorization(
             raise ValueError("throughput-screen provider changed")
         if authorization.get("instance_type") != "gpu_8x_h100_sxm5":
             raise ValueError("throughput-screen instance type changed")
+        return authorization
+
+    if run_kind == PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND:
+        if authorization.get("full_4b_training") is not False:
+            raise ValueError("the checkpoint gate cannot approve full 4B training")
+        if context.world_size != PAID_SEGMENT2_CHECKPOINT_GATE_WORLD_SIZE:
+            raise ValueError("checkpoint-gate authorization requires eight GPUs")
+        if strategy != "fsdp_full_shard":
+            raise ValueError("checkpoint-gate authorization requires FSDP full sharding")
+        _validate_production_cuda_runtime(context)
+        if (
+            not isinstance(approved_step, int)
+            or isinstance(approved_step, bool)
+            or not PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP
+            < steps
+            <= approved_step
+            == PAID_SEGMENT2_CHECKPOINT_GATE_MAX_STEPS
+        ):
+            raise ValueError("checkpoint-gate step boundary is invalid")
+        if global_tokens_per_step != PAID_SEGMENT2_CHECKPOINT_GATE_TOKENS_PER_STEP:
+            raise ValueError("checkpoint-gate global token geometry changed")
+        expected_target_tokens = (
+            steps * PAID_SEGMENT2_CHECKPOINT_GATE_TOKENS_PER_STEP
+        )
+        if target_tokens != expected_target_tokens:
+            raise ValueError("checkpoint-gate token cursor changed")
+        if authorization.get("approved_from_step") != (
+            PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP
+        ):
+            raise ValueError("checkpoint-gate source step changed")
+        if authorization.get("approved_from_tokens") != (
+            PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_TOKENS
+        ):
+            raise ValueError("checkpoint-gate source tokens changed")
+        if authorization.get("approved_through_tokens") != (
+            PAID_SEGMENT2_CHECKPOINT_GATE_MAX_STEPS
+            * PAID_SEGMENT2_CHECKPOINT_GATE_TOKENS_PER_STEP
+        ):
+            raise ValueError("checkpoint-gate terminal token cap changed")
+        fingerprints = authorization.get("allowed_run_fingerprints")
+        if (
+            not isinstance(fingerprints, dict)
+            or set(fingerprints) != PAID_SEGMENT2_CHECKPOINT_GATE_PROFILES
+            or run_fingerprint not in fingerprints.values()
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in value
+                )
+                for value in fingerprints.values()
+            )
+        ):
+            raise ValueError("checkpoint-gate fingerprint matrix changed")
+        source = authorization.get("source_checkpoint")
+        if not isinstance(source, dict) or source != {
+            "manifest_sha256": source.get("manifest_sha256"),
+            "read_only": True,
+            "run_fingerprint": source.get("run_fingerprint"),
+            "sequence_cursor": PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_SEQUENCE_CURSOR,
+            "step": PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP,
+            "tokens": PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_TOKENS,
+        }:
+            raise ValueError("checkpoint-gate source binding changed")
+        for field in ("manifest_sha256", "run_fingerprint"):
+            digest = source.get(field)
+            if (
+                not isinstance(digest, str)
+                or len(digest) != 64
+                or any(character not in "0123456789abcdef" for character in digest)
+            ):
+                raise ValueError(f"checkpoint-gate source {field} is invalid")
+        if authorization.get("owner_acknowledgement") != (
+            PAID_SEGMENT2_CHECKPOINT_GATE_OWNER_ACKNOWLEDGEMENT
+        ):
+            raise ValueError("checkpoint-gate acknowledgement changed")
+        if authorization.get("instance_ip") != "209.20.157.24":
+            raise ValueError("checkpoint-gate instance changed")
+        if authorization.get("scope") != {
+            "checkpoint_modification": False,
+            "new_instance": False,
+            "off_instance_export": False,
+            "production_training": False,
+            "termination": False,
+        }:
+            raise ValueError("checkpoint-gate scope changed")
+        if authorization.get("max_runtime_minutes") != (
+            PAID_SEGMENT2_CHECKPOINT_GATE_MAX_RUNTIME_MINUTES
+        ):
+            raise ValueError("checkpoint-gate runtime cap changed")
+        if float(authorization.get("hourly_rate_usd", -1)) != 31.92:
+            raise ValueError("checkpoint-gate hourly rate changed")
+        if float(authorization.get("max_cost_usd", -1)) != (
+            PAID_SEGMENT2_CHECKPOINT_GATE_MAX_COST_USD
+        ):
+            raise ValueError("checkpoint-gate cost cap changed")
+        if (
+            float(authorization["hourly_rate_usd"])
+            * authorization["max_runtime_minutes"]
+            / 60
+            > float(authorization["max_cost_usd"])
+        ):
+            raise ValueError("checkpoint-gate runtime exceeds its cost cap")
+        if authorization.get("provider") != "Lambda Cloud":
+            raise ValueError("checkpoint-gate provider changed")
+        if authorization.get("instance_type") != "gpu_8x_h100_sxm5":
+            raise ValueError("checkpoint-gate instance type changed")
         return authorization
 
     if authorization.get("full_4b_training") is not True:
@@ -1139,7 +1291,32 @@ def _validate_authorized_resume_boundary(
 ) -> None:
     """Bind a paid production segment to its imported or recovered checkpoint."""
 
-    if authorization.get("run_kind") != PAID_4B_PRODUCTION_RUN_KIND:
+    run_kind = authorization.get("run_kind")
+    if run_kind == PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND:
+        step = state.get("step")
+        tokens = state.get("tokens_seen")
+        sequence_cursor = state.get("sequence_cursor")
+        if (
+            not isinstance(step, int)
+            or isinstance(step, bool)
+            or not isinstance(tokens, int)
+            or isinstance(tokens, bool)
+            or not isinstance(sequence_cursor, int)
+            or isinstance(sequence_cursor, bool)
+        ):
+            raise ValueError("checkpoint-gate resume state has invalid cursors")
+        if not (
+            PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP
+            <= step
+            <= PAID_SEGMENT2_CHECKPOINT_GATE_MAX_STEPS
+        ):
+            raise ValueError("checkpoint-gate resume step is outside its boundary")
+        if tokens != step * global_tokens_per_step:
+            raise ValueError("checkpoint-gate token cursor does not match its step")
+        if sequence_cursor * 4096 != tokens:
+            raise ValueError("checkpoint-gate sequence cursor does not match its tokens")
+        return
+    if run_kind != PAID_4B_PRODUCTION_RUN_KIND:
         return
     step = state.get("step")
     tokens = state.get("tokens_seen")
@@ -1292,6 +1469,7 @@ def _setup_output(
     run_fingerprint: str,
     run_specification: dict[str, Any],
     resume: bool,
+    initial_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     state_path = output / DISTRIBUTED_TRAINING_STATE_FILENAME
     metrics_path = output / DISTRIBUTED_METRICS_FILENAME
@@ -1301,6 +1479,10 @@ def _setup_output(
             raise NotADirectoryError(output)
         output.mkdir(parents=True, exist_ok=True)
         if state_path.exists():
+            if initial_state is not None:
+                raise FileExistsError(
+                    "checkpoint import requires an empty disposable output"
+                )
             if not resume:
                 raise FileExistsError(f"distributed state exists; pass --resume: {state_path}")
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1309,20 +1491,39 @@ def _setup_output(
         else:
             if any(output.iterdir()):
                 raise FileExistsError(f"distributed output is not empty: {output}")
-            state = {
-                "best_loss": None,
-                "created_at": _utc_now(),
-                "last_loss": None,
-                "latest_checkpoint": None,
-                "run_fingerprint": run_fingerprint,
-                "run_specification": run_specification,
-                "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
-                "sequence_cursor": 0,
-                "status": "active",
-                "step": 0,
-                "tokens_seen": 0,
-                "updated_at": _utc_now(),
-            }
+            if initial_state is None:
+                state = {
+                    "best_loss": None,
+                    "created_at": _utc_now(),
+                    "last_loss": None,
+                    "latest_checkpoint": None,
+                    "run_fingerprint": run_fingerprint,
+                    "run_specification": run_specification,
+                    "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
+                    "sequence_cursor": 0,
+                    "status": "active",
+                    "step": 0,
+                    "tokens_seen": 0,
+                    "updated_at": _utc_now(),
+                }
+            else:
+                state = {
+                    "best_loss": initial_state.get("best_loss"),
+                    "created_at": _utc_now(),
+                    "imported_source_checkpoint": initial_state[
+                        "imported_source_checkpoint"
+                    ],
+                    "last_loss": initial_state.get("last_loss"),
+                    "latest_checkpoint": None,
+                    "run_fingerprint": run_fingerprint,
+                    "run_specification": run_specification,
+                    "schema_version": DISTRIBUTED_TRAINING_SCHEMA_VERSION,
+                    "sequence_cursor": initial_state["sequence_cursor"],
+                    "status": "active",
+                    "step": initial_state["step"],
+                    "tokens_seen": initial_state["tokens_seen"],
+                    "updated_at": _utc_now(),
+                }
             _write_json_atomic(state_path, state)
 
         recovered = _discover_latest_checkpoint(output, run_fingerprint=run_fingerprint)
@@ -1360,6 +1561,7 @@ def train_distributed_packed(
     keep_checkpoints: int | None = None,
     seed: int = 7,
     resume: bool = False,
+    resume_from_checkpoint: str | Path | None = None,
     gradient_checkpointing: bool = False,
     lr_schedule: str = "constant",
     warmup_steps: int = 0,
@@ -1392,6 +1594,8 @@ def train_distributed_packed(
         raise ValueError(f"gradient sync mode must be one of {sorted(GRADIENT_SYNC_MODES)}")
     if steps < 1 or per_rank_batch_size < 1 or gradient_accumulation_steps < 1:
         raise ValueError("steps and batch sizes must be positive")
+    if resume and resume_from_checkpoint is not None:
+        raise ValueError("use either --resume or --resume-from-checkpoint, not both")
     if checkpoint_steps < 1:
         raise ValueError("checkpoint steps must be positive")
     if keep_checkpoints is not None and keep_checkpoints < 1:
@@ -1433,7 +1637,10 @@ def train_distributed_packed(
         unvalidated_authorization = json.loads(
             authorization.read_text(encoding="utf-8")
         )
-        if unvalidated_authorization.get("run_kind") == PAID_4B_PRODUCTION_RUN_KIND:
+        if unvalidated_authorization.get("run_kind") in {
+            PAID_4B_PRODUCTION_RUN_KIND,
+            PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+        }:
             identity_checkpoint_steps = checkpoint_steps
     final_root = None if final_corpus_root is None else Path(final_corpus_root)
     manifest, manifest_sha256 = _collective_validate_packed_manifest(
@@ -1505,6 +1712,51 @@ def train_distributed_packed(
         target_tokens=target_tokens,
         global_tokens_per_step=global_tokens_per_step,
     )
+    imported_source: dict[str, Any] | None = None
+    source_checkpoint_path = (
+        None
+        if resume_from_checkpoint is None
+        else Path(resume_from_checkpoint).resolve()
+    )
+    if source_checkpoint_path is not None:
+        if scope.get("run_kind") != PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND:
+            raise PermissionError(
+                "external checkpoint import is limited to the bounded checkpoint gate"
+            )
+        output_resolved = output.resolve()
+        if (
+            source_checkpoint_path.is_relative_to(output_resolved)
+            or output_resolved.is_relative_to(source_checkpoint_path)
+        ):
+            raise ValueError(
+                "checkpoint-gate source and disposable output must not overlap"
+            )
+
+        def inspect_source() -> dict[str, Any]:
+            source_state = verify_distributed_checkpoint(source_checkpoint_path)
+            binding = {
+                "manifest_sha256": _sha256_file(
+                    source_checkpoint_path / "manifest.sha256"
+                ),
+                "run_fingerprint": source_state["run_fingerprint"],
+                "sequence_cursor": source_state["sequence_cursor"],
+                "step": source_state["step"],
+                "tokens": source_state["tokens_seen"],
+            }
+            if binding | {"read_only": True} != scope["source_checkpoint"]:
+                raise ValueError(
+                    "checkpoint-gate source does not match the owner authorization"
+                )
+            return {
+                "best_loss": source_state.get("best_loss"),
+                "binding": binding,
+                "last_loss": source_state.get("last_loss"),
+                "sequence_cursor": source_state["sequence_cursor"],
+                "step": source_state["step"],
+                "tokens_seen": source_state["tokens_seen"],
+            }
+
+        imported_source = _rank_zero_object(context, inspect_source)
     run_specification = {
         **run_identity,
         "authorization": scope,
@@ -1516,14 +1768,30 @@ def train_distributed_packed(
             "config_path": str(config_path.resolve()),
             "final_corpus_root": None if final_root is None else str(final_root.resolve()),
             "manifest_path": str(manifest_path.resolve()),
+            "resume_from_checkpoint": (
+                None
+                if source_checkpoint_path is None
+                else str(source_checkpoint_path)
+            ),
         },
     }
+    initial_state = None
+    if imported_source is not None:
+        initial_state = {
+            "best_loss": imported_source["best_loss"],
+            "imported_source_checkpoint": imported_source["binding"],
+            "last_loss": imported_source["last_loss"],
+            "sequence_cursor": imported_source["sequence_cursor"],
+            "step": imported_source["step"],
+            "tokens_seen": imported_source["tokens_seen"],
+        }
     state = _setup_output(
         context=context,
         output=output,
         run_fingerprint=run_fingerprint,
         run_specification=run_specification,
         resume=resume,
+        initial_state=initial_state,
     )
     _validate_authorized_resume_boundary(
         scope,
@@ -1557,12 +1825,18 @@ def train_distributed_packed(
     torch.manual_seed(seed + 10_000 + context.rank)
     if context.device.type == "cuda":
         torch.cuda.manual_seed_all(seed + 10_000 + context.rank)
+    restore_checkpoint: Path | None = None
     if state["latest_checkpoint"] is not None:
+        restore_checkpoint = output / state["latest_checkpoint"]
+    elif source_checkpoint_path is not None:
+        restore_checkpoint = source_checkpoint_path
+    if restore_checkpoint is not None:
         _restore_distributed_checkpoint(
             context=context,
-            checkpoint=output / state["latest_checkpoint"],
+            checkpoint=restore_checkpoint,
             model=distributed_model,
             optimizer=optimizer,
+            checkpoint_verified=True,
         )
 
     if final_corpus:
