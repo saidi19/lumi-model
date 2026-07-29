@@ -162,7 +162,7 @@ def _train_command(
         "flash_attention_2",
         "--document-isolation",
         "--optimizer-profile",
-        "grouped_adamw_beta2_0.95_v0.1",
+        str(profile["optimizer_profile"]),
         "--precision",
         "bf16",
         "--gradient-sync-mode",

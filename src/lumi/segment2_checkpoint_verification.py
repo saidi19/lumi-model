@@ -22,6 +22,7 @@ from .distributed_training import (
     PAID_SEGMENT2_CHECKPOINT_GATE_TOKENS_PER_STEP,
     build_distributed_run_identity,
     distributed_checkpoint_binding,
+    verify_distributed_checkpoint,
 )
 from .production_training import (
     FINAL_CORPUS_SHARD_MANIFEST_GATE,
@@ -69,18 +70,22 @@ def _sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def checkpoint_gate_profiles() -> list[dict[str, Any]]:
+def checkpoint_gate_profiles(
+    *, optimizer_profile: str = "legacy"
+) -> list[dict[str, Any]]:
     return [
         {
             "gradient_accumulation_steps": 32,
             "gradient_checkpointing": True,
             "label": "baseline_b1_gc",
+            "optimizer_profile": optimizer_profile,
             "per_rank_batch_size": 1,
         },
         {
             "gradient_accumulation_steps": 16,
             "gradient_checkpointing": False,
             "label": "batch2_no_gc",
+            "optimizer_profile": optimizer_profile,
             "per_rank_batch_size": 2,
         },
     ]
@@ -116,7 +121,7 @@ def _run_identity(
         min_learning_rate_ratio=0.1,
         attention_implementation="flash_attention_2",
         document_isolation=True,
-        optimizer_profile="grouped_adamw_beta2_0.95_v0.1",
+        optimizer_profile=profile["optimizer_profile"],
         precision="bf16",
         gradient_sync_mode="last_microbatch",
         torch_compile=False,
@@ -160,6 +165,27 @@ def build_checkpoint_gate_bundle(
     config_bytes = config_path.read_bytes()
     manifest_sha256 = _sha256_file(manifest_path)
     source_binding = distributed_checkpoint_binding(source_checkpoint)
+    source_state = verify_distributed_checkpoint(source_checkpoint)
+    source_optimizer = source_state.get("run_specification", {}).get("optimizer")
+    if not isinstance(source_optimizer, Mapping):
+        raise ValueError("checkpoint gate source optimizer identity is missing")
+    source_optimizer_profile = source_optimizer.get("optimizer_profile", "legacy")
+    if source_optimizer_profile != "legacy":
+        raise ValueError("checkpoint gate source optimizer profile changed")
+    expected_source_optimizer = {
+        "learning_rate": 0.0002,
+        "lr_schedule": "cosine",
+        "max_grad_norm": 1.0,
+        "min_learning_rate_ratio": 0.1,
+        "schedule_steps": 76_294,
+        "warmup_steps": 1000,
+        "weight_decay": 0.1,
+    }
+    if any(
+        source_optimizer.get(field) != value
+        for field, value in expected_source_optimizer.items()
+    ):
+        raise ValueError("checkpoint gate source optimizer contract changed")
     expected_source = {
         "step": PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP,
         "tokens": PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_TOKENS,
@@ -169,7 +195,9 @@ def build_checkpoint_gate_bundle(
 
     profiles: list[dict[str, Any]] = []
     fingerprints: dict[str, str] = {}
-    for raw_profile in checkpoint_gate_profiles():
+    for raw_profile in checkpoint_gate_profiles(
+        optimizer_profile=source_optimizer_profile
+    ):
         identity = _run_identity(
             config_bytes=config_bytes,
             manifest=manifest,
@@ -226,6 +254,7 @@ def build_checkpoint_gate_bundle(
             "path": str(source_checkpoint),
             "read_only": True,
         },
+        "source_optimizer_profile": source_optimizer_profile,
         "source_commit": source_commit,
         "status": "sealed",
         "thresholds": {
@@ -336,6 +365,11 @@ def validate_checkpoint_gate_bundle(
     labels = tuple(profile.get("label") for profile in plan.get("profiles", []))
     if labels != PROFILE_ORDER:
         raise ValueError("checkpoint-gate profile order changed")
+    if plan.get("source_optimizer_profile") != "legacy" or any(
+        profile.get("optimizer_profile") != plan["source_optimizer_profile"]
+        for profile in plan["profiles"]
+    ):
+        raise ValueError("checkpoint-gate optimizer identity changed")
     fingerprints = {
         profile["label"]: profile["run_fingerprint"]
         for profile in plan["profiles"]
@@ -453,6 +487,7 @@ def summarize_candidate(
                 "gradient_accumulation_steps",
                 "gradient_checkpointing",
                 "label",
+                "optimizer_profile",
                 "per_rank_batch_size",
             )
         },

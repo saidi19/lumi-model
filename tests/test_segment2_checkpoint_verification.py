@@ -30,7 +30,18 @@ def _source_checkpoint(root: Path) -> Path:
         "checkpoint_schema_version": DISTRIBUTED_CHECKPOINT_SCHEMA_VERSION,
         "last_loss": 1.85,
         "run_fingerprint": "4" * 64,
-        "run_specification": {"distributed": {"world_size": 8}},
+        "run_specification": {
+            "distributed": {"world_size": 8},
+            "optimizer": {
+                "learning_rate": 0.0002,
+                "lr_schedule": "cosine",
+                "max_grad_norm": 1.0,
+                "min_learning_rate_ratio": 0.1,
+                "schedule_steps": 76_294,
+                "warmup_steps": 1000,
+                "weight_decay": 0.1,
+            },
+        },
         "sequence_cursor": 8_064_000,
         "step": 31_500,
         "tokens_seen": 33_030_144_000,
@@ -92,8 +103,45 @@ def test_checkpoint_gate_bundle_binds_exact_source_and_profiles(
         "batch2_no_gc",
     )
     assert plan["source_checkpoint"]["step"] == 31_500
+    assert plan["source_optimizer_profile"] == "legacy"
+    assert all(
+        profile["optimizer_profile"] == "legacy"
+        for profile in plan["profiles"]
+    )
+    assert all(
+        "optimizer_profile" not in profile["run_identity"]["optimizer"]
+        for profile in plan["profiles"]
+    )
     assert authorization["full_4b_training"] is False
     assert authorization["scope"]["checkpoint_modification"] is False
+
+
+def test_checkpoint_gate_rejects_source_optimizer_change(tmp_path: Path) -> None:
+    checkpoint = _source_checkpoint(tmp_path)
+    state_path = checkpoint / "distributed-training-state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["run_specification"]["optimizer"]["optimizer_profile"] = (
+        "grouped_adamw_beta2_0.95_v0.1"
+    )
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    _write_checksum_manifest(checkpoint)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"build_fingerprint": "b" * 64}), encoding="utf-8")
+    for name in ("heldout", "tokenizer", "config", "evaluation"):
+        (tmp_path / f"{name}.json").write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="source optimizer profile changed"):
+        build_checkpoint_gate_bundle(
+            source_checkpoint=checkpoint,
+            manifest_path=manifest,
+            heldout_manifest_path=tmp_path / "heldout.json",
+            tokenizer_path=tmp_path / "tokenizer.json",
+            config_path=tmp_path / "config.json",
+            evaluation_plan_path=tmp_path / "evaluation.json",
+            source_commit="a" * 40,
+            instance_boot_utc="2026-07-23T22:56:00+00:00",
+            approved_at=datetime(2026, 7, 29, 18, 0, tzinfo=UTC),
+        )
 
 
 def test_checkpoint_gate_bundle_rejects_scope_expansion(tmp_path: Path) -> None:
