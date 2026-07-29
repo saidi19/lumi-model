@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 from lumi.segment2_checkpoint_verification import (
@@ -22,6 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--evaluation-plan", type=Path, required=True)
     parser.add_argument("--source-commit", required=True)
     parser.add_argument("--instance-boot-utc", required=True)
+    parser.add_argument("--approved-at")
     parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args()
 
@@ -37,6 +39,11 @@ def main() -> None:
         evaluation_plan_path=args.evaluation_plan,
         source_commit=args.source_commit,
         instance_boot_utc=args.instance_boot_utc,
+        approved_at=(
+            None
+            if args.approved_at is None
+            else datetime.fromisoformat(args.approved_at)
+        ),
     )
     write_checkpoint_gate_bundle(
         plan=plan,

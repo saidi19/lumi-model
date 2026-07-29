@@ -273,7 +273,7 @@ def main() -> None:
     workspace = args.workspace.resolve()
     workspace.mkdir(parents=True, exist_ok=False)
     repo = args.repo.resolve()
-    python = Path(sys.executable).resolve()
+    python = Path(sys.executable)
     torchrun = python.with_name("torchrun")
     source_checkpoint = Path(plan["source_checkpoint"]["path"]).resolve()
     source_manifest = source_checkpoint / "manifest.sha256"
