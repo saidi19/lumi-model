@@ -23,6 +23,10 @@ from .distributed_training import (
     build_distributed_run_identity,
     distributed_checkpoint_binding,
 )
+from .production_training import (
+    FINAL_CORPUS_SHARD_MANIFEST_GATE,
+    validate_final_corpus_training_manifest,
+)
 
 CHECKPOINT_GATE = "lumi_4b_pre_segment2_checkpoint_gate_v0.1"
 SCHEMA_VERSION = 1
@@ -141,7 +145,18 @@ def build_checkpoint_gate_bundle(
     config_path = Path(config_path).resolve()
     evaluation_plan_path = Path(evaluation_plan_path).resolve()
     source_checkpoint = Path(source_checkpoint).resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if raw_manifest.get("gate") == FINAL_CORPUS_SHARD_MANIFEST_GATE:
+        manifest = validate_final_corpus_training_manifest(
+            manifest_path,
+            shard_root=manifest_path.parent / "shards",
+            sequence_length=4096,
+            vocab_size=65_536,
+            doc_token_id=3,
+            verify_hashes=False,
+        )
+    else:
+        manifest = raw_manifest
     config_bytes = config_path.read_bytes()
     manifest_sha256 = _sha256_file(manifest_path)
     source_binding = distributed_checkpoint_binding(source_checkpoint)
