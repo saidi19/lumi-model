@@ -147,6 +147,20 @@ PAID_4B_PRODUCTION_OWNER_ACKNOWLEDGEMENT = (
     "I approve this paid Lumi-4B/80B production segment through the recorded "
     "step and token cap."
 )
+PAID_4B_SEGMENT2_START_STEP = 31_500
+PAID_4B_SEGMENT2_START_TOKENS = 33_030_144_000
+PAID_4B_SEGMENT2_START_SEQUENCE_CURSOR = 8_064_000
+PAID_4B_SEGMENT2_STOP_STEP = 63_000
+PAID_4B_SEGMENT2_STOP_TOKENS = 66_060_288_000
+PAID_4B_SEGMENT2_INSTANCE_IP = "192.222.52.81"
+PAID_4B_SEGMENT2_S3_BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+PAID_4B_SEGMENT2_PROFILE = {
+    "gradient_accumulation_steps": 16,
+    "gradient_checkpointing": False,
+    "label": "batch2_no_gc",
+    "optimizer_profile": "legacy",
+    "per_rank_batch_size": 2,
+}
 
 
 def _validate_source_commit(source_commit: str | None) -> str | None:
@@ -863,6 +877,10 @@ def _validate_paid_authorization(
     steps: int,
     target_tokens: int | None = None,
     global_tokens_per_step: int | None = None,
+    per_rank_batch_size: int | None = None,
+    gradient_accumulation_steps: int | None = None,
+    gradient_checkpointing: bool | None = None,
+    optimizer_profile: str | None = None,
 ) -> dict[str, Any]:
     authorization = json.loads(path.read_text(encoding="utf-8"))
     if authorization.get("schema_version") != DISTRIBUTED_AUTHORIZATION_SCHEMA_VERSION:
@@ -1202,6 +1220,115 @@ def _validate_paid_authorization(
         or not 1 <= segment_index <= segment_count <= 10
     ):
         raise ValueError("production authorization segment identity is invalid")
+    continuation_source = authorization.get("continuation_source_checkpoint")
+    execution_profile = authorization.get("execution_profile")
+    if segment_index == 1:
+        if continuation_source is not None or execution_profile is not None:
+            raise ValueError("production Segment 1 cannot import a continuation")
+    elif segment_index == 2:
+        expected_authorization_sha256 = _fingerprint(
+            {
+                key: value
+                for key, value in authorization.items()
+                if key != "authorization_sha256"
+            }
+        )
+        if authorization.get("authorization_sha256") != (
+            expected_authorization_sha256
+        ):
+            raise ValueError("production Segment 2 authorization hash changed")
+        if (
+            approved_from_step != PAID_4B_SEGMENT2_START_STEP
+            or approved_step != PAID_4B_SEGMENT2_STOP_STEP
+            or authorization.get("approved_from_tokens")
+            != PAID_4B_SEGMENT2_START_TOKENS
+            or approved_tokens != PAID_4B_SEGMENT2_STOP_TOKENS
+        ):
+            raise ValueError("production Segment 2 boundary changed")
+        if execution_profile != PAID_4B_SEGMENT2_PROFILE:
+            raise ValueError("production Segment 2 execution profile changed")
+        observed_profile = {
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "gradient_checkpointing": gradient_checkpointing,
+            "label": "batch2_no_gc",
+            "optimizer_profile": optimizer_profile,
+            "per_rank_batch_size": per_rank_batch_size,
+        }
+        if observed_profile != PAID_4B_SEGMENT2_PROFILE:
+            raise ValueError("production Segment 2 runtime profile changed")
+        if not isinstance(continuation_source, dict):
+            raise ValueError("production Segment 2 source checkpoint is missing")
+        expected_source_fields = {
+            "read_only": True,
+            "sequence_cursor": PAID_4B_SEGMENT2_START_SEQUENCE_CURSOR,
+            "step": PAID_4B_SEGMENT2_START_STEP,
+            "tokens": PAID_4B_SEGMENT2_START_TOKENS,
+            "world_size": PAID_4B_PRODUCTION_WORLD_SIZE,
+        }
+        if any(
+            continuation_source.get(field) != expected
+            for field, expected in expected_source_fields.items()
+        ):
+            raise ValueError("production Segment 2 source boundary changed")
+        for field in (
+            "gate_report_file_sha256",
+            "handoff_sha256",
+            "import_plan_sha256",
+            "import_verification_sha256",
+            "manifest_sha256",
+            "run_fingerprint",
+        ):
+            digest = continuation_source.get(field)
+            if not isinstance(digest, str) or len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(
+                    f"production Segment 2 source {field} is invalid"
+                )
+        checkpoint_path = continuation_source.get("checkpoint_path")
+        archive_root = continuation_source.get("archive_root")
+        if (
+            not isinstance(checkpoint_path, str)
+            or not checkpoint_path.startswith("/")
+            or not isinstance(archive_root, str)
+            or not archive_root.startswith("/")
+            or not Path(checkpoint_path).is_relative_to(Path(archive_root))
+        ):
+            raise ValueError("production Segment 2 source path is invalid")
+        exact_approval = authorization.get("exact_owner_approval")
+        exact_approval_sha256 = authorization.get("exact_owner_approval_sha256")
+        if (
+            not isinstance(exact_approval, str)
+            or not exact_approval
+            or hashlib.sha256(exact_approval.encode("utf-8")).hexdigest()
+            != exact_approval_sha256
+        ):
+            raise ValueError("production Segment 2 exact owner approval changed")
+        s3_access = authorization.get("s3_corpus_access")
+        if not isinstance(s3_access, dict) or (
+            s3_access.get("bucket"),
+            s3_access.get("bytes"),
+            s3_access.get("credentials_on_instance"),
+            s3_access.get("objects"),
+            s3_access.get("presigned_get_expiry_seconds"),
+        ) != (
+            PAID_4B_SEGMENT2_S3_BUCKET,
+            160_000_016_728,
+            False,
+            160,
+            21_600,
+        ):
+            raise ValueError("production Segment 2 corpus access changed")
+        if (
+            authorization.get("instance_ip") != PAID_4B_SEGMENT2_INSTANCE_IP
+            or authorization.get("instance_type") != "gpu_8x_h100_sxm5"
+            or authorization.get("provider") != "Lambda Cloud"
+        ):
+            raise ValueError("production Segment 2 instance binding changed")
+    else:
+        raise PermissionError(
+            "production Segment 3 requires a new checkpoint-bound continuation plan"
+        )
     if authorization.get("owner_acknowledgement") != (
         PAID_4B_PRODUCTION_OWNER_ACKNOWLEDGEMENT
     ):
@@ -1248,6 +1375,10 @@ def _validate_execution_scope(
     steps: int,
     target_tokens: int,
     global_tokens_per_step: int | None = None,
+    per_rank_batch_size: int | None = None,
+    gradient_accumulation_steps: int | None = None,
+    gradient_checkpointing: bool | None = None,
+    optimizer_profile: str | None = None,
 ) -> dict[str, Any]:
     if authorization_path is not None:
         if context.device.type != "cuda" or context.backend != "nccl":
@@ -1261,6 +1392,10 @@ def _validate_execution_scope(
             steps=steps,
             target_tokens=target_tokens,
             global_tokens_per_step=global_tokens_per_step,
+            per_rank_batch_size=per_rank_batch_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            gradient_checkpointing=gradient_checkpointing,
+            optimizer_profile=optimizer_profile,
         )
 
     parameters = parameter_breakdown(config).total
@@ -1341,6 +1476,13 @@ def _validate_authorized_resume_boundary(
     )
     if tokens != expected_tokens:
         raise ValueError("production resume token cursor does not match its step")
+    sequence_cursor = state.get("sequence_cursor")
+    if (
+        not isinstance(sequence_cursor, int)
+        or isinstance(sequence_cursor, bool)
+        or sequence_cursor * 4096 != tokens
+    ):
+        raise ValueError("production resume sequence cursor does not match its tokens")
 
 
 def _reduce_mean(value: float, context: DistributedContext) -> float:
@@ -1711,6 +1853,10 @@ def train_distributed_packed(
         steps=steps,
         target_tokens=target_tokens,
         global_tokens_per_step=global_tokens_per_step,
+        per_rank_batch_size=per_rank_batch_size,
+        gradient_accumulation_steps=gradient_accumulation_steps,
+        gradient_checkpointing=gradient_checkpointing,
+        optimizer_profile=optimizer_profile,
     )
     imported_source: dict[str, Any] | None = None
     source_checkpoint_path = (
@@ -1719,9 +1865,17 @@ def train_distributed_packed(
         else Path(resume_from_checkpoint).resolve()
     )
     if source_checkpoint_path is not None:
-        if scope.get("run_kind") != PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND:
+        checkpoint_gate_import = (
+            scope.get("run_kind") == PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND
+        )
+        production_continuation_import = (
+            scope.get("run_kind") == PAID_4B_PRODUCTION_RUN_KIND
+            and scope.get("segment_index") == 2
+            and isinstance(scope.get("continuation_source_checkpoint"), dict)
+        )
+        if not checkpoint_gate_import and not production_continuation_import:
             raise PermissionError(
-                "external checkpoint import is limited to the bounded checkpoint gate"
+                "external checkpoint import is not authorized for this run"
             )
         output_resolved = output.resolve()
         if (
@@ -1743,10 +1897,29 @@ def train_distributed_packed(
                 "step": source_state["step"],
                 "tokens": source_state["tokens_seen"],
             }
-            if binding | {"read_only": True} != scope["source_checkpoint"]:
-                raise ValueError(
-                    "checkpoint-gate source does not match the owner authorization"
+            expected_source = (
+                scope["source_checkpoint"]
+                if checkpoint_gate_import
+                else scope["continuation_source_checkpoint"]
+            )
+            expected_binding = {
+                key: expected_source[key]
+                for key in (
+                    "manifest_sha256",
+                    "run_fingerprint",
+                    "sequence_cursor",
+                    "step",
+                    "tokens",
                 )
+            }
+            if binding != expected_binding or expected_source.get("read_only") is not True:
+                raise ValueError(
+                    "source checkpoint does not match the owner authorization"
+                )
+            if production_continuation_import and str(source_checkpoint_path) != (
+                expected_source["checkpoint_path"]
+            ):
+                raise ValueError("production continuation checkpoint path changed")
             return {
                 "best_loss": source_state.get("best_loss"),
                 "binding": binding,
