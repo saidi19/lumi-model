@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
     parser.add_argument(
         "--attention-implementation",
-        choices=("eager", "sdpa", "flash_attention_2"),
+        choices=("eager", "sdpa", "flash_attention_2", "flash_attention_3"),
     )
     parser.add_argument("--document-isolation", action="store_true")
     parser.add_argument(

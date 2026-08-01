@@ -15,7 +15,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 from .configuration_lumi import LumiConfig
 
-FLASH_VARLEN_IMPLEMENTATIONS = {"flash_attention_2"}
+FLASH_VARLEN_IMPLEMENTATIONS = {"flash_attention_2", "flash_attention_3"}
 
 
 class PackedDocumentMetadata(NamedTuple):
@@ -210,6 +210,56 @@ def _lumi_eager_attention_forward(
     return output, weights
 
 
+def _lumi_flash_attention_3_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Any,
+) -> tuple[torch.Tensor, None]:
+    """Hopper FlashAttention-3 varlen backend for packed document isolation."""
+
+    if attention_mask is not None:
+        raise ValueError("FlashAttention-3 varlen does not accept a dense mask")
+    if dropout != 0.0:
+        raise ValueError("Lumi FlashAttention-3 training is pinned to zero attention dropout")
+    required = (
+        "cu_seq_lens_q",
+        "cu_seq_lens_k",
+        "max_length_q",
+        "max_length_k",
+    )
+    if any(kwargs.get(name) is None for name in required):
+        raise ValueError("FlashAttention-3 requires complete varlen metadata")
+    try:
+        from flash_attn_interface import flash_attn_varlen_func
+    except ImportError as error:
+        raise RuntimeError("FlashAttention-3 Hopper extension is unavailable") from error
+
+    batch, query_heads, sequence, head_dim = query.shape
+    key_value_heads = key.shape[1]
+    flat_query = query.transpose(1, 2).contiguous().view(-1, query_heads, head_dim)
+    flat_key = key.transpose(1, 2).contiguous().view(-1, key_value_heads, head_dim)
+    flat_value = value.transpose(1, 2).contiguous().view(-1, key_value_heads, head_dim)
+    output = flash_attn_varlen_func(
+        flat_query,
+        flat_key,
+        flat_value,
+        kwargs["cu_seq_lens_q"],
+        kwargs["cu_seq_lens_k"],
+        kwargs["max_length_q"],
+        kwargs["max_length_k"],
+        softmax_scale=scaling,
+        causal=True,
+    )
+    if isinstance(output, tuple):
+        output = output[0]
+    return output.view(batch, sequence, query_heads, head_dim), None
+
+
 class LumiAttention(nn.Module):
     def __init__(self, config: LumiConfig, layer_idx: int) -> None:
         super().__init__()
@@ -250,8 +300,18 @@ class LumiAttention(nn.Module):
         cosine, sine = self.rotary(value, position_ids)
         query, key = _apply_rotary(query, key, cosine, sine)
 
-        attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, _lumi_eager_attention_forward
+        attention_implementation = getattr(
+            self.config,
+            "_lumi_attention_implementation",
+            self.config._attn_implementation,
+        )
+        attention_interface = (
+            _lumi_flash_attention_3_forward
+            if attention_implementation == "flash_attention_3"
+            else ALL_ATTENTION_FUNCTIONS.get_interface(
+                self.config._attn_implementation,
+                _lumi_eager_attention_forward,
+            )
         )
         output, _ = attention_interface(
             self,
@@ -388,7 +448,12 @@ class LumiModel(LumiPreTrainedModel):
                     f"{(batch, sequence)}, got {tuple(attention_mask.shape)}"
                 )
 
-        flash_varlen = self.config._attn_implementation in FLASH_VARLEN_IMPLEMENTATIONS
+        attention_implementation = getattr(
+            self.config,
+            "_lumi_attention_implementation",
+            self.config._attn_implementation,
+        )
+        flash_varlen = attention_implementation in FLASH_VARLEN_IMPLEMENTATIONS
         if document_isolation:
             if attention_mask is not None:
                 raise ValueError("document-isolated packed attention does not support padding")

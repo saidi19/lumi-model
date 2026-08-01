@@ -76,6 +76,7 @@ DISTRIBUTED_TRAINING_STATE_FILENAME = "distributed-training-state.json"
 DISTRIBUTED_METRICS_FILENAME = "distributed-metrics.jsonl"
 DISTRIBUTED_STRATEGIES = {"ddp", "fsdp_full_shard"}
 DISTRIBUTED_PRECISIONS = {"fp32", "bf16"}
+DISTRIBUTED_ATTENTION_IMPLEMENTATIONS = ATTENTION_IMPLEMENTATIONS | {"flash_attention_3"}
 GRADIENT_SYNC_MODES = {"every_microbatch", "last_microbatch"}
 
 LOCAL_PREFLIGHT_MAX_PARAMETERS = 20_000_000
@@ -111,6 +112,29 @@ PAID_SEGMENT2_SCREEN_OWNER_ACKNOWLEDGEMENT = (
     "Segment-1 instance without modifying or restarting Segment-1. No Segment-2 "
     "production training or full model training. I understand a short final "
     "checkpoint-bound verification remains after Segment-1 completes."
+)
+PAID_PRE_SEGMENT3_SCREEN_RUN_KIND = "lumi_4b_pre_segment3_throughput_screen_v0.1"
+PAID_PRE_SEGMENT3_SCREEN_WORLD_SIZE = 8
+PAID_PRE_SEGMENT3_SCREEN_MAX_STEPS = 17
+PAID_PRE_SEGMENT3_SCREEN_TOKENS_PER_STEP = 1_048_576
+PAID_PRE_SEGMENT3_SCREEN_TOKEN_CAP = (
+    PAID_PRE_SEGMENT3_SCREEN_MAX_STEPS * PAID_PRE_SEGMENT3_SCREEN_TOKENS_PER_STEP
+)
+PAID_PRE_SEGMENT3_SCREEN_CANDIDATES = 5
+PAID_PRE_SEGMENT3_SCREEN_AGGREGATE_TOKEN_CAP = (
+    PAID_PRE_SEGMENT3_SCREEN_CANDIDATES * PAID_PRE_SEGMENT3_SCREEN_TOKEN_CAP
+)
+PAID_PRE_SEGMENT3_SCREEN_MAX_RUNTIME_MINUTES = 120
+PAID_PRE_SEGMENT3_SCREEN_MAX_COST_USD = 63.84
+PAID_PRE_SEGMENT3_SCREEN_INSTANCE_IP = "192.222.55.112"
+PAID_PRE_SEGMENT3_SCREEN_OWNER_APPROVAL = (
+    "I approve one bounded pre-Segment-3 8xH100 throughput A/B on Lambda instance "
+    "ssh ubuntu@192.222.55.112, maximum 120 minutes/$63.84. It may use only the "
+    "sealed Segment-1 checkpoint, tokenizer, and a bounded corpus prefix, and test "
+    "the current baseline, DDP-fit, FA3 document-isolated attention, selective "
+    "torch.compile, and safe combinations. It must not access or modify running "
+    "Segment-2 instance 192.222.52.81, start Segment-3/full training, modify/export "
+    "production checkpoints, create another instance, or terminate either instance."
 )
 PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND = (
     "lumi_4b_pre_segment2_checkpoint_gate_v0.1"
@@ -891,6 +915,7 @@ def _validate_paid_authorization(
     if run_kind not in {
         "lumi_distributed_smoke_v0.1",
         PAID_LEARNING_PILOT_RUN_KIND,
+        PAID_PRE_SEGMENT3_SCREEN_RUN_KIND,
         PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
         PAID_SEGMENT2_SCREEN_RUN_KIND,
         PAID_4B_PRODUCTION_RUN_KIND,
@@ -899,6 +924,7 @@ def _validate_paid_authorization(
     if (
         run_kind
         not in {
+            PAID_PRE_SEGMENT3_SCREEN_RUN_KIND,
             PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
             PAID_SEGMENT2_SCREEN_RUN_KIND,
         }
@@ -912,7 +938,10 @@ def _validate_paid_authorization(
         raise ValueError("authorization source commit changed")
     if authorization.get("world_size") != context.world_size:
         raise ValueError("authorization world size changed")
-    if authorization.get("strategy") != strategy:
+    if (
+        run_kind != PAID_PRE_SEGMENT3_SCREEN_RUN_KIND
+        and authorization.get("strategy") != strategy
+    ):
         raise ValueError("authorization strategy changed")
     approved_step = authorization.get("approved_through_step")
     if authorization.get("paid_gpu") is not True:
@@ -1043,6 +1072,112 @@ def _validate_paid_authorization(
             raise ValueError("throughput-screen provider changed")
         if authorization.get("instance_type") != "gpu_8x_h100_sxm5":
             raise ValueError("throughput-screen instance type changed")
+        return authorization
+
+    if run_kind == PAID_PRE_SEGMENT3_SCREEN_RUN_KIND:
+        if authorization.get("authorization_sha256") != _fingerprint(
+            {
+                key: value
+                for key, value in authorization.items()
+                if key != "authorization_sha256"
+            }
+        ):
+            raise ValueError("pre-Segment-3 authorization hash changed")
+        if authorization.get("full_4b_training") is not False:
+            raise ValueError("the pre-Segment-3 screen cannot approve full training")
+        if authorization.get("production_training") is not False:
+            raise ValueError("the pre-Segment-3 screen cannot approve Segment 3")
+        if context.world_size != PAID_PRE_SEGMENT3_SCREEN_WORLD_SIZE:
+            raise ValueError("pre-Segment-3 screen requires eight GPUs")
+        if strategy not in {"ddp", "fsdp_full_shard"}:
+            raise ValueError("pre-Segment-3 screen strategy changed")
+        if authorization.get("strategy") != "profile_bound":
+            raise ValueError("pre-Segment-3 strategy binding changed")
+        if authorization.get("allowed_strategies") != ["ddp", "fsdp_full_shard"]:
+            raise ValueError("pre-Segment-3 strategy set changed")
+        if (
+            approved_step != PAID_PRE_SEGMENT3_SCREEN_MAX_STEPS
+            or steps > approved_step
+        ):
+            raise ValueError("pre-Segment-3 step boundary changed")
+        if global_tokens_per_step != PAID_PRE_SEGMENT3_SCREEN_TOKENS_PER_STEP:
+            raise ValueError("pre-Segment-3 global token geometry changed")
+        if (
+            authorization.get("approved_token_cap")
+            != PAID_PRE_SEGMENT3_SCREEN_TOKEN_CAP
+            or target_tokens is None
+            or not 0 < target_tokens <= PAID_PRE_SEGMENT3_SCREEN_TOKEN_CAP
+        ):
+            raise ValueError("pre-Segment-3 token boundary changed")
+        if (
+            authorization.get("aggregate_candidate_count")
+            != PAID_PRE_SEGMENT3_SCREEN_CANDIDATES
+            or authorization.get("aggregate_token_cap")
+            != PAID_PRE_SEGMENT3_SCREEN_AGGREGATE_TOKEN_CAP
+        ):
+            raise ValueError("pre-Segment-3 aggregate boundary changed")
+        fingerprints = authorization.get("allowed_run_fingerprints")
+        profiles = authorization.get("allowed_profiles")
+        if (
+            not isinstance(fingerprints, dict)
+            or len(fingerprints) != PAID_PRE_SEGMENT3_SCREEN_CANDIDATES
+            or run_fingerprint not in fingerprints.values()
+            or not isinstance(profiles, dict)
+            or set(profiles) != set(fingerprints)
+        ):
+            raise ValueError("pre-Segment-3 fingerprint matrix changed")
+        matched_labels = [
+            label for label, value in fingerprints.items() if value == run_fingerprint
+        ]
+        if len(matched_labels) != 1:
+            raise ValueError("pre-Segment-3 run fingerprint is ambiguous")
+        matched = profiles[matched_labels[0]]
+        if (
+            not isinstance(matched, dict)
+            or matched.get("run_fingerprint") != run_fingerprint
+            or matched.get("strategy") != strategy
+        ):
+            raise ValueError("pre-Segment-3 profile binding changed")
+        if authorization.get("instance_ip") != PAID_PRE_SEGMENT3_SCREEN_INSTANCE_IP:
+            raise ValueError("pre-Segment-3 instance changed")
+        if authorization.get("scope") != {
+            "inputs": ["bounded_training_prefix", "heldout_data", "tokenizer"],
+            "running_segment_2": {
+                "access": False,
+                "instance_ip": "192.222.52.81",
+                "modify": False,
+            },
+            "sealed_segment_1_checkpoint": {"allowed": True, "used": False},
+        }:
+            raise ValueError("pre-Segment-3 access scope changed")
+        approval = authorization.get("exact_owner_approval")
+        if approval != PAID_PRE_SEGMENT3_SCREEN_OWNER_APPROVAL:
+            raise ValueError("pre-Segment-3 owner approval changed")
+        if authorization.get("exact_owner_approval_sha256") != hashlib.sha256(
+            approval.encode("utf-8")
+        ).hexdigest():
+            raise ValueError("pre-Segment-3 owner approval hash changed")
+        if (
+            authorization.get("max_runtime_minutes")
+            != PAID_PRE_SEGMENT3_SCREEN_MAX_RUNTIME_MINUTES
+            or float(authorization.get("hourly_rate_usd", -1)) != 31.92
+            or float(authorization.get("max_cost_usd", -1))
+            != PAID_PRE_SEGMENT3_SCREEN_MAX_COST_USD
+        ):
+            raise ValueError("pre-Segment-3 budget changed")
+        if (
+            float(authorization["hourly_rate_usd"])
+            * authorization["max_runtime_minutes"]
+            / 60
+            > float(authorization["max_cost_usd"])
+        ):
+            raise ValueError("pre-Segment-3 runtime exceeds its cost cap")
+        if (
+            authorization.get("provider") != "Lambda Cloud"
+            or authorization.get("instance_type") != "gpu_8x_h100_sxm5"
+        ):
+            raise ValueError("pre-Segment-3 provider binding changed")
+        _validate_production_cuda_runtime(context)
         return authorization
 
     if run_kind == PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND:
@@ -1749,7 +1884,7 @@ def train_distributed_packed(
     if optimizer_profile not in OPTIMIZER_PROFILES:
         raise ValueError(f"optimizer profile must be one of {sorted(OPTIMIZER_PROFILES)}")
     if attention_implementation is not None and (
-        attention_implementation not in ATTENTION_IMPLEMENTATIONS
+        attention_implementation not in DISTRIBUTED_ATTENTION_IMPLEMENTATIONS
     ):
         raise ValueError("unsupported attention implementation")
     if context.device.type == "cuda" and precision != "bf16":
@@ -1758,12 +1893,14 @@ def train_distributed_packed(
         not torch.cuda.is_bf16_supported()
     ):
         raise RuntimeError("the selected CUDA device does not support bf16")
-    if attention_implementation == "flash_attention_2" and context.device.type != "cuda":
-        raise ValueError("flash_attention_2 requires CUDA")
-    if document_isolation and context.device.type == "cuda" and (
-        attention_implementation != "flash_attention_2"
+    if attention_implementation in {"flash_attention_2", "flash_attention_3"} and (
+        context.device.type != "cuda"
     ):
-        raise ValueError("CUDA document isolation requires flash_attention_2")
+        raise ValueError("FlashAttention requires CUDA")
+    if document_isolation and context.device.type == "cuda" and (
+        attention_implementation not in {"flash_attention_2", "flash_attention_3"}
+    ):
+        raise ValueError("CUDA document isolation requires FlashAttention varlen")
     if lr_schedule == "cosine":
         if schedule_steps is None or schedule_steps < steps or warmup_steps >= schedule_steps:
             raise ValueError("cosine schedule does not cover the requested steps")
@@ -1795,7 +1932,10 @@ def train_distributed_packed(
     )
     config_bytes = config_path.read_bytes()
     config = LumiConfig(**json.loads(config_bytes))
-    config._attn_implementation = attention_implementation
+    config._lumi_attention_implementation = attention_implementation
+    config._attn_implementation = (
+        "eager" if attention_implementation == "flash_attention_3" else attention_implementation
+    )
     sequence_length = int(manifest["packing"]["sequence_length"])
     if config.vocab_size != manifest["tokenizer"]["vocab_size"]:
         raise ValueError("model and distributed dataset vocabulary sizes differ")

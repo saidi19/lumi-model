@@ -1,0 +1,93 @@
+{
+  "approval": {
+    "exact_owner_approval": "I approve one bounded pre-Segment-3 8xH100 throughput A/B on Lambda instance ssh ubuntu@192.222.55.112, maximum 120 minutes/$63.84. It may use only the sealed Segment-1 checkpoint, tokenizer, and a bounded corpus prefix, and test the current baseline, DDP-fit, FA3 document-isolated attention, selective torch.compile, and safe combinations. It must not access or modify running Segment-2 instance 192.222.52.81, start Segment-3/full training, modify/export production checkpoints, create another instance, or terminate either instance.",
+    "full_4b_training": false,
+    "production_training": false
+  },
+  "benchmark": {
+    "global_sequences_per_step": 256,
+    "measured_steps_per_candidate": 12,
+    "resume_canary_step": 17,
+    "sequence_length": 4096,
+    "warmup_steps_per_candidate": 4
+  },
+  "budget": {
+    "hourly_rate_usd": 31.92,
+    "maximum_cost_usd": 63.84,
+    "maximum_runtime_minutes": 120
+  },
+  "decision": {
+    "maximum_peak_memory_bytes": 76000000000,
+    "maximum_training_loss_regression_fraction": 0.01,
+    "minimum_baseline_p10_tokens_per_second": 95000,
+    "minimum_p10_throughput_gain_fraction": 0.1,
+    "minimum_throughput_gain_fraction": 0.15
+  },
+  "hardware": {
+    "gpu_model_contains": "H100",
+    "instance_ip": "192.222.55.112",
+    "instance_type": "gpu_8x_h100_sxm5",
+    "world_size": 8
+  },
+  "profiles": [
+    {
+      "attention_implementation": "flash_attention_2",
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": false,
+      "label": "baseline_fsdp_fa2",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": false
+    },
+    {
+      "attention_implementation": "flash_attention_2",
+      "gradient_accumulation_steps": 32,
+      "gradient_checkpointing": true,
+      "label": "ddp_b1_gc_fa2",
+      "per_rank_batch_size": 1,
+      "precision": "bf16",
+      "strategy": "ddp",
+      "torch_compile": false
+    },
+    {
+      "attention_implementation": "flash_attention_2",
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": false,
+      "label": "fsdp_b2_fa2_compile",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": true
+    },
+    {
+      "attention_implementation": "flash_attention_3",
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": false,
+      "label": "fsdp_b2_fa3",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": false
+    },
+    {
+      "attention_implementation": "flash_attention_3",
+      "gradient_accumulation_steps": 16,
+      "gradient_checkpointing": false,
+      "label": "fsdp_b2_fa3_compile",
+      "per_rank_batch_size": 2,
+      "precision": "bf16",
+      "strategy": "fsdp_full_shard",
+      "torch_compile": true
+    }
+  ],
+  "schema_version": 1,
+  "source": {
+    "bounded_manifest_sha256": "d4cf263f86958929717c6be1695678aa6146378466e9c10b5f0be0bad32d523d",
+    "corpus_manifest_sha256": "6de45464af33d44e1261a023ccb7d50f86346a4126bb2fa060530a91213483e9",
+    "model_config_sha256": "643e8da652577f802d959740d66a7e6bafc5b065aa45010c2d7e0340ed9509be",
+    "running_segment_2_instance_ip": "192.222.52.81",
+    "sealed_segment_1_handoff": "0ff88eadc9de9d8da8a6e6ba6f9922fcd40a6752f3389531500767f9666d8b10"
+  },
+  "status": "planning_only"
+}
