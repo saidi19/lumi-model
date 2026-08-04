@@ -217,6 +217,26 @@ PAID_4B_SEGMENT2_PROFILE = {
     "optimizer_profile": "legacy",
     "per_rank_batch_size": 2,
 }
+PAID_4B_SEGMENT3_START_STEP = 63_000
+PAID_4B_SEGMENT3_START_TOKENS = 66_060_288_000
+PAID_4B_SEGMENT3_START_SEQUENCE_CURSOR = 16_128_000
+PAID_4B_SEGMENT3_STOP_STEP = 76_294
+PAID_4B_SEGMENT3_STOP_TOKENS = 80_000_000_000
+PAID_4B_SEGMENT3_INSTANCE_IP = "192.222.52.81"
+PAID_4B_SEGMENT3_CORPUS_MANIFEST_SHA256 = (
+    "6de45464af33d44e1261a023ccb7d50f86346a4126bb2fa060530a91213483e9"
+)
+PAID_4B_SEGMENT3_PROFILE = {
+    "attention_implementation": "flash_attention_3",
+    "gradient_accumulation_steps": 16,
+    "gradient_checkpointing": False,
+    "label": "fsdp_b2_fa3_compile",
+    "optimizer_profile": "legacy",
+    "per_rank_batch_size": 2,
+    "precision": "bf16",
+    "strategy": "fsdp_full_shard",
+    "torch_compile": True,
+}
 
 
 def _validate_source_commit(source_commit: str | None) -> str | None:
@@ -937,6 +957,9 @@ def _validate_paid_authorization(
     gradient_accumulation_steps: int | None = None,
     gradient_checkpointing: bool | None = None,
     optimizer_profile: str | None = None,
+    attention_implementation: str | None = None,
+    precision: str | None = None,
+    torch_compile: bool | None = None,
 ) -> dict[str, Any]:
     authorization = json.loads(path.read_text(encoding="utf-8"))
     if authorization.get("schema_version") != DISTRIBUTED_AUTHORIZATION_SCHEMA_VERSION:
@@ -1614,10 +1637,124 @@ def _validate_paid_authorization(
             or authorization.get("provider") != "Lambda Cloud"
         ):
             raise ValueError("production Segment 2 instance binding changed")
-    else:
-        raise PermissionError(
-            "production Segment 3 requires a new checkpoint-bound continuation plan"
+    elif segment_index == 3:
+        expected_authorization_sha256 = _fingerprint(
+            {
+                key: value
+                for key, value in authorization.items()
+                if key != "authorization_sha256"
+            }
         )
+        if authorization.get("authorization_sha256") != (
+            expected_authorization_sha256
+        ):
+            raise ValueError("production Segment 3 authorization hash changed")
+        if (
+            approved_from_step != PAID_4B_SEGMENT3_START_STEP
+            or approved_step != PAID_4B_SEGMENT3_STOP_STEP
+            or authorization.get("approved_from_tokens")
+            != PAID_4B_SEGMENT3_START_TOKENS
+            or approved_tokens != PAID_4B_SEGMENT3_STOP_TOKENS
+        ):
+            raise ValueError("production Segment 3 boundary changed")
+        if execution_profile != PAID_4B_SEGMENT3_PROFILE:
+            raise ValueError("production Segment 3 execution profile changed")
+        observed_profile = {
+            "attention_implementation": attention_implementation,
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "gradient_checkpointing": gradient_checkpointing,
+            "label": "fsdp_b2_fa3_compile",
+            "optimizer_profile": optimizer_profile,
+            "per_rank_batch_size": per_rank_batch_size,
+            "precision": precision,
+            "strategy": strategy,
+            "torch_compile": torch_compile,
+        }
+        if observed_profile != PAID_4B_SEGMENT3_PROFILE:
+            raise ValueError("production Segment 3 runtime profile changed")
+        if not isinstance(continuation_source, dict):
+            raise ValueError("production Segment 3 source checkpoint is missing")
+        expected_source_fields = {
+            "read_only": True,
+            "sequence_cursor": PAID_4B_SEGMENT3_START_SEQUENCE_CURSOR,
+            "step": PAID_4B_SEGMENT3_START_STEP,
+            "tokens": PAID_4B_SEGMENT3_START_TOKENS,
+            "world_size": PAID_4B_PRODUCTION_WORLD_SIZE,
+        }
+        if any(
+            continuation_source.get(field) != expected
+            for field, expected in expected_source_fields.items()
+        ):
+            raise ValueError("production Segment 3 source boundary changed")
+        for field in (
+            "checkpoint_gate_file_sha256",
+            "checkpoint_gate_report_sha256",
+            "handoff_file_sha256",
+            "handoff_sha256",
+            "manifest_sha256",
+            "run_fingerprint",
+        ):
+            digest = continuation_source.get(field)
+            if not isinstance(digest, str) or len(digest) != 64 or any(
+                character not in "0123456789abcdef" for character in digest
+            ):
+                raise ValueError(
+                    f"production Segment 3 source {field} is invalid"
+                )
+        checkpoint_path = continuation_source.get("checkpoint_path")
+        if (
+            not isinstance(checkpoint_path, str)
+            or not checkpoint_path.startswith("/")
+        ):
+            raise ValueError("production Segment 3 source path is invalid")
+        exact_approval = authorization.get("exact_owner_approval")
+        exact_approval_sha256 = authorization.get("exact_owner_approval_sha256")
+        if (
+            not isinstance(exact_approval, str)
+            or not exact_approval
+            or hashlib.sha256(exact_approval.encode("utf-8")).hexdigest()
+            != exact_approval_sha256
+        ):
+            raise ValueError("production Segment 3 exact owner approval changed")
+        if authorization.get("local_reuse") != {
+            "aws_credentials_on_instance": False,
+            "corpus_bytes": 160_000_016_728,
+            "corpus_manifest_sha256": PAID_4B_SEGMENT3_CORPUS_MANIFEST_SHA256,
+            "corpus_objects": 160,
+            "s3_access": False,
+        }:
+            raise ValueError("production Segment 3 local corpus scope changed")
+        if authorization.get("local_input_paths") != {
+            "corpus_manifest": (
+                "/home/ubuntu/lumi-runs/lumi-4b-80b-segment-2/"
+                "data/final-80b/manifest.json"
+            ),
+            "corpus_root": (
+                "/home/ubuntu/lumi-runs/lumi-4b-80b-segment-2/"
+                "data/final-80b/shards"
+            ),
+            "fa3_runtime": (
+                "/home/ubuntu/lumi-segment3-checkpoint-gate/"
+                "fa3-v2.8.3-060c9188/runtime"
+            ),
+            "heldout_manifest": (
+                "/home/ubuntu/lumi-runs/lumi-4b-80b-segment-2/"
+                "data/heldout/manifest.json"
+            ),
+            "tokenizer": (
+                "/home/ubuntu/lumi-runs/lumi-4b-80b-segment-2/"
+                "data/tokenizer.json"
+            ),
+        }:
+            raise ValueError("production Segment 3 local input paths changed")
+        if (
+            authorization.get("instance_ip") != PAID_4B_SEGMENT3_INSTANCE_IP
+            or authorization.get("instance_type") != "gpu_8x_h100_sxm5"
+            or authorization.get("provider") != "Lambda Cloud"
+        ):
+            raise ValueError("production Segment 3 instance binding changed")
+    else:
+        raise PermissionError("unsupported production segment")
     if authorization.get("owner_acknowledgement") != (
         PAID_4B_PRODUCTION_OWNER_ACKNOWLEDGEMENT
     ):
@@ -1668,6 +1805,9 @@ def _validate_execution_scope(
     gradient_accumulation_steps: int | None = None,
     gradient_checkpointing: bool | None = None,
     optimizer_profile: str | None = None,
+    attention_implementation: str | None = None,
+    precision: str | None = None,
+    torch_compile: bool | None = None,
 ) -> dict[str, Any]:
     if authorization_path is not None:
         if context.device.type != "cuda" or context.backend != "nccl":
@@ -1685,6 +1825,9 @@ def _validate_execution_scope(
             gradient_accumulation_steps=gradient_accumulation_steps,
             gradient_checkpointing=gradient_checkpointing,
             optimizer_profile=optimizer_profile,
+            attention_implementation=attention_implementation,
+            precision=precision,
+            torch_compile=torch_compile,
         )
 
     parameters = parameter_breakdown(config).total
@@ -2162,6 +2305,9 @@ def train_distributed_packed(
         gradient_accumulation_steps=gradient_accumulation_steps,
         gradient_checkpointing=gradient_checkpointing,
         optimizer_profile=optimizer_profile,
+        attention_implementation=attention_implementation,
+        precision=precision,
+        torch_compile=torch_compile,
     )
     imported_source: dict[str, Any] | None = None
     source_checkpoint_path = (
@@ -2176,7 +2322,7 @@ def train_distributed_packed(
         }
         production_continuation_import = (
             scope.get("run_kind") == PAID_4B_PRODUCTION_RUN_KIND
-            and scope.get("segment_index") == 2
+            and scope.get("segment_index") in {2, 3}
             and isinstance(scope.get("continuation_source_checkpoint"), dict)
         )
         if not checkpoint_gate_import and not production_continuation_import:
