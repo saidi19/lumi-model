@@ -159,6 +159,38 @@ PAID_SEGMENT2_CHECKPOINT_GATE_OWNER_ACKNOWLEDGEMENT = (
     "resume, throughput, and HBM safety. No Segment-2 production/full training, "
     "checkpoint modification, off-instance export, new instance, or termination."
 )
+PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND = (
+    "lumi_4b_pre_segment3_checkpoint_gate_v0.1"
+)
+PAID_SEGMENT3_CHECKPOINT_GATE_WORLD_SIZE = 8
+PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_STEP = 63_000
+PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_TOKENS = 66_060_288_000
+PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_SEQUENCE_CURSOR = 16_128_000
+PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_RUN_FINGERPRINT = (
+    "697be63c99ad3ef17387570a70ecc3e77ee1bdffe3b5f9806b535c55f8c3af7c"
+)
+PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_MANIFEST_SHA256 = (
+    "3f329c660dee5e381eaa75b0d9b9088bcf87054afdc26f9f8c16c3ab1f7b3344"
+)
+PAID_SEGMENT3_CHECKPOINT_GATE_MAX_STEPS = 63_024
+PAID_SEGMENT3_CHECKPOINT_GATE_TOKENS_PER_STEP = 1_048_576
+PAID_SEGMENT3_CHECKPOINT_GATE_MAX_RUNTIME_MINUTES = 60
+PAID_SEGMENT3_CHECKPOINT_GATE_MAX_COST_USD = 31.92
+PAID_SEGMENT3_CHECKPOINT_GATE_INSTANCE_IP = "192.222.52.81"
+PAID_SEGMENT3_CHECKPOINT_GATE_PROFILES = {
+    "segment2_baseline_fsdp_b2_fa2",
+    "fsdp_b2_fa3_compile",
+}
+PAID_SEGMENT3_CHECKPOINT_GATE_OWNER_APPROVAL_TEMPLATE = (
+    "I approve exactly one bounded Lumi pre-Segment-3 exact-checkpoint "
+    "verification on existing instance 192.222.52.81 using source commit "
+    "{source_commit} and sealed Segment-2 checkpoint manifest "
+    "{source_manifest_sha256}, maximum 60 minutes/$31.92. It may run only "
+    "disposable steps 63,000→63,024 to compare the current Segment-2 baseline "
+    "against fsdp_b2_fa3_compile and verify loss, resume, throughput, FA3 parity, "
+    "and HBM safety. No Segment-3 production/full training, production checkpoint "
+    "modification/export, new instance, or termination."
+)
 PAID_4B_PRODUCTION_RUN_KIND = "lumi_4b_80b_pretraining_v0.1"
 PAID_4B_PRODUCTION_WORLD_SIZE = 8
 PAID_4B_PRODUCTION_MAX_STEPS = 76_294
@@ -917,6 +949,7 @@ def _validate_paid_authorization(
         PAID_LEARNING_PILOT_RUN_KIND,
         PAID_PRE_SEGMENT3_SCREEN_RUN_KIND,
         PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+        PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND,
         PAID_SEGMENT2_SCREEN_RUN_KIND,
         PAID_4B_PRODUCTION_RUN_KIND,
     }:
@@ -926,6 +959,7 @@ def _validate_paid_authorization(
         not in {
             PAID_PRE_SEGMENT3_SCREEN_RUN_KIND,
             PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+            PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND,
             PAID_SEGMENT2_SCREEN_RUN_KIND,
         }
         and authorization.get("run_fingerprint") != run_fingerprint
@@ -1288,6 +1322,126 @@ def _validate_paid_authorization(
             raise ValueError("checkpoint-gate instance type changed")
         return authorization
 
+    if run_kind == PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND:
+        if authorization.get("authorization_sha256") != _fingerprint(
+            {
+                key: value
+                for key, value in authorization.items()
+                if key != "authorization_sha256"
+            }
+        ):
+            raise ValueError("pre-Segment-3 checkpoint authorization hash changed")
+        if authorization.get("full_4b_training") is not False:
+            raise ValueError("the pre-Segment-3 checkpoint gate cannot approve full training")
+        if authorization.get("production_training") is not False:
+            raise ValueError("the pre-Segment-3 checkpoint gate cannot approve Segment 3")
+        if context.world_size != PAID_SEGMENT3_CHECKPOINT_GATE_WORLD_SIZE:
+            raise ValueError("pre-Segment-3 checkpoint gate requires eight GPUs")
+        if strategy != "fsdp_full_shard":
+            raise ValueError("pre-Segment-3 checkpoint gate requires FSDP full sharding")
+        if (
+            per_rank_batch_size != 2
+            or gradient_accumulation_steps != 16
+            or gradient_checkpointing is not False
+            or optimizer_profile != "legacy"
+        ):
+            raise ValueError("pre-Segment-3 checkpoint profile geometry changed")
+        _validate_production_cuda_runtime(context)
+        if (
+            not isinstance(approved_step, int)
+            or isinstance(approved_step, bool)
+            or not PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_STEP
+            < steps
+            <= approved_step
+            == PAID_SEGMENT3_CHECKPOINT_GATE_MAX_STEPS
+        ):
+            raise ValueError("pre-Segment-3 checkpoint step boundary changed")
+        if global_tokens_per_step != PAID_SEGMENT3_CHECKPOINT_GATE_TOKENS_PER_STEP:
+            raise ValueError("pre-Segment-3 checkpoint token geometry changed")
+        if target_tokens != (
+            steps * PAID_SEGMENT3_CHECKPOINT_GATE_TOKENS_PER_STEP
+        ):
+            raise ValueError("pre-Segment-3 checkpoint token cursor changed")
+        if (
+            authorization.get("approved_from_step")
+            != PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_STEP
+            or authorization.get("approved_from_tokens")
+            != PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_TOKENS
+            or authorization.get("approved_through_tokens")
+            != PAID_SEGMENT3_CHECKPOINT_GATE_MAX_STEPS
+            * PAID_SEGMENT3_CHECKPOINT_GATE_TOKENS_PER_STEP
+        ):
+            raise ValueError("pre-Segment-3 checkpoint boundary binding changed")
+        fingerprints = authorization.get("allowed_run_fingerprints")
+        if (
+            not isinstance(fingerprints, dict)
+            or set(fingerprints) != PAID_SEGMENT3_CHECKPOINT_GATE_PROFILES
+            or run_fingerprint not in fingerprints.values()
+            or any(
+                not isinstance(value, str)
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+                for value in fingerprints.values()
+            )
+        ):
+            raise ValueError("pre-Segment-3 checkpoint fingerprint matrix changed")
+        source = authorization.get("source_checkpoint")
+        if source != {
+            "manifest_sha256": PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_MANIFEST_SHA256,
+            "read_only": True,
+            "run_fingerprint": PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_RUN_FINGERPRINT,
+            "sequence_cursor": PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_SEQUENCE_CURSOR,
+            "step": PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_STEP,
+            "tokens": PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_TOKENS,
+        }:
+            raise ValueError("pre-Segment-3 checkpoint source binding changed")
+        expected_approval = PAID_SEGMENT3_CHECKPOINT_GATE_OWNER_APPROVAL_TEMPLATE.format(
+            source_commit=normalized_commit,
+            source_manifest_sha256=(
+                PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_MANIFEST_SHA256
+            ),
+        )
+        if authorization.get("exact_owner_approval") != expected_approval:
+            raise ValueError("pre-Segment-3 checkpoint owner approval changed")
+        if authorization.get("exact_owner_approval_sha256") != hashlib.sha256(
+            expected_approval.encode("utf-8")
+        ).hexdigest():
+            raise ValueError("pre-Segment-3 checkpoint approval hash changed")
+        if authorization.get("instance_ip") != (
+            PAID_SEGMENT3_CHECKPOINT_GATE_INSTANCE_IP
+        ):
+            raise ValueError("pre-Segment-3 checkpoint instance changed")
+        if authorization.get("scope") != {
+            "checkpoint_modification": False,
+            "new_instance": False,
+            "off_instance_export": False,
+            "production_training": False,
+            "segment_3": False,
+            "termination": False,
+        }:
+            raise ValueError("pre-Segment-3 checkpoint scope changed")
+        if (
+            authorization.get("max_runtime_minutes")
+            != PAID_SEGMENT3_CHECKPOINT_GATE_MAX_RUNTIME_MINUTES
+            or float(authorization.get("hourly_rate_usd", -1)) != 31.92
+            or float(authorization.get("max_cost_usd", -1))
+            != PAID_SEGMENT3_CHECKPOINT_GATE_MAX_COST_USD
+        ):
+            raise ValueError("pre-Segment-3 checkpoint budget changed")
+        if (
+            float(authorization["hourly_rate_usd"])
+            * authorization["max_runtime_minutes"]
+            / 60
+            > float(authorization["max_cost_usd"])
+        ):
+            raise ValueError("pre-Segment-3 checkpoint runtime exceeds cost cap")
+        if (
+            authorization.get("provider") != "Lambda Cloud"
+            or authorization.get("instance_type") != "gpu_8x_h100_sxm5"
+        ):
+            raise ValueError("pre-Segment-3 checkpoint provider binding changed")
+        return authorization
+
     if authorization.get("full_4b_training") is not True:
         raise ValueError("production authorization must explicitly approve full 4B training")
     if context.world_size != PAID_4B_PRODUCTION_WORLD_SIZE:
@@ -1562,7 +1716,10 @@ def _validate_authorized_resume_boundary(
     """Bind a paid production segment to its imported or recovered checkpoint."""
 
     run_kind = authorization.get("run_kind")
-    if run_kind == PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND:
+    if run_kind in {
+        PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+        PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND,
+    }:
         step = state.get("step")
         tokens = state.get("tokens_seen")
         sequence_cursor = state.get("sequence_cursor")
@@ -1575,11 +1732,18 @@ def _validate_authorized_resume_boundary(
             or isinstance(sequence_cursor, bool)
         ):
             raise ValueError("checkpoint-gate resume state has invalid cursors")
-        if not (
-            PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP
-            <= step
-            <= PAID_SEGMENT2_CHECKPOINT_GATE_MAX_STEPS
-        ):
+        source_step, maximum_step = (
+            (
+                PAID_SEGMENT3_CHECKPOINT_GATE_SOURCE_STEP,
+                PAID_SEGMENT3_CHECKPOINT_GATE_MAX_STEPS,
+            )
+            if run_kind == PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND
+            else (
+                PAID_SEGMENT2_CHECKPOINT_GATE_SOURCE_STEP,
+                PAID_SEGMENT2_CHECKPOINT_GATE_MAX_STEPS,
+            )
+        )
+        if not source_step <= step <= maximum_step:
             raise ValueError("checkpoint-gate resume step is outside its boundary")
         if tokens != step * global_tokens_per_step:
             raise ValueError("checkpoint-gate token cursor does not match its step")
@@ -1919,6 +2083,7 @@ def train_distributed_packed(
         if unvalidated_authorization.get("run_kind") in {
             PAID_4B_PRODUCTION_RUN_KIND,
             PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+            PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND,
         }:
             identity_checkpoint_steps = checkpoint_steps
     final_root = None if final_corpus_root is None else Path(final_corpus_root)
@@ -2005,9 +2170,10 @@ def train_distributed_packed(
         else Path(resume_from_checkpoint).resolve()
     )
     if source_checkpoint_path is not None:
-        checkpoint_gate_import = (
-            scope.get("run_kind") == PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND
-        )
+        checkpoint_gate_import = scope.get("run_kind") in {
+            PAID_SEGMENT2_CHECKPOINT_GATE_RUN_KIND,
+            PAID_SEGMENT3_CHECKPOINT_GATE_RUN_KIND,
+        }
         production_continuation_import = (
             scope.get("run_kind") == PAID_4B_PRODUCTION_RUN_KIND
             and scope.get("segment_index") == 2
