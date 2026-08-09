@@ -47,6 +47,8 @@ def _record(record_id: str = "record-1") -> dict:
             "dataset_id": "owned-demo",
             "document_id": f"doc-{record_id}",
             "license_id": "cc-by-4.0",
+            "revision": "a" * 40,
+            "source_id": "owned_demo",
             "uri": f"https://example.invalid/{record_id}",
         },
         "split": "train",
@@ -59,6 +61,11 @@ def test_policy_loads_and_task_mix_is_exact() -> None:
     assert isinstance(policy, SFTPolicy)
     assert sum(policy.task_mix.values()) == pytest.approx(1.0)
     assert "coding" in policy.task_mix
+    assert policy.context_window == 4096
+    assert policy.packing_policy == "single_conversation_until_block_diagonal_verified"
+    assert policy.supervised_roles == {"assistant", "tool"}
+    assert policy.source_registry_required is True
+    assert len(policy.source_registry_sha256) == 64
 
 
 def test_record_passes_fail_closed_schema() -> None:
@@ -67,6 +74,20 @@ def test_record_passes_fail_closed_schema() -> None:
     assert decision.reasons == ()
     assert len(decision.normalized_sha256) == 64
     assert len(decision.response_sha256 or "") == 64
+
+
+def test_first_party_record_accepts_hash_revision_and_rights_declaration() -> None:
+    record = _record()
+    record["provenance"]["consent_basis"] = "first_party_rights_declaration"
+    record["source"].update(
+        dataset_id="Afnan-Technologies-Inc/lumi-owned-sft-v0.1",
+        license_id="lumi-owned",
+        revision="a" * 64,
+        source_id="lumi_owned_sft_v0_1",
+    )
+    decision = evaluate_sft_record(record, policy=load_sft_policy(CONFIG))
+    assert decision.accepted is True
+    assert decision.reasons == ()
 
 
 @pytest.mark.parametrize(
@@ -90,6 +111,7 @@ def test_record_passes_fail_closed_schema() -> None:
             lambda item: item["messages"].reverse(),
             "invalid_turn_order",
         ),
+        (lambda item: item["source"].update(revision="main"), "source_revision"),
     ],
 )
 def test_record_rejects_unsafe_or_invalid_content(mutate, reason: str) -> None:
@@ -131,3 +153,24 @@ def test_benchmark_match_is_rejected() -> None:
     )
     assert decision.accepted is False
     assert "benchmark_contamination:heldout-demo" in decision.reasons
+
+
+def test_tool_trajectory_has_strict_model_output_and_result_order() -> None:
+    record = _record()
+    record["task_category"] = "tool_api"
+    record["messages"] = [
+        {"content": "What is the weather?", "role": "user"},
+        {"content": '{"city":"Dhaka"}', "role": "tool"},
+        {"content": '{"temperature_c":30}', "role": "tool_result"},
+        {"content": "It is 30 C in Dhaka.", "role": "assistant"},
+    ]
+    decision = evaluate_sft_record(record, policy=load_sft_policy(CONFIG))
+    assert decision.accepted is True
+
+    record["messages"][1], record["messages"][2] = (
+        record["messages"][2],
+        record["messages"][1],
+    )
+    decision = evaluate_sft_record(record, policy=load_sft_policy(CONFIG))
+    assert decision.accepted is False
+    assert "invalid_turn_order" in decision.reasons

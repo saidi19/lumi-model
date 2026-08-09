@@ -1,0 +1,373 @@
+"""Fail-closed source registry for Lumi supervised fine-tuning data."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+SOURCE_REGISTRY_SCHEMA_VERSION = "lumi.sft.sources.v0.1"
+SOURCE_STATUSES = frozenset(
+    {"blocked", "candidate_eligible", "canary_eligible", "planned", "reviewed"}
+)
+SOURCE_ACCESS = frozenset({"first_party", "gated", "public"})
+SOURCE_ORIGINS = frozenset({"first_party", "human", "mixed", "synthetic"})
+
+_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_ID = re.compile(r"^[a-z0-9][a-z0-9_]{2,79}$")
+_EXTERNAL_REPOSITORY_PREFIXES = (
+    "https://huggingface.co/datasets/",
+    "https://github.com/",
+)
+
+
+def _canonical_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _sha256(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value)).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _required_string(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _string_tuple(value: Any, field: str, *, allow_empty: bool = False) -> tuple[str, ...]:
+    if not isinstance(value, list) or (not value and not allow_empty):
+        raise ValueError(f"{field} must be an array")
+    if any(not isinstance(item, str) or not item for item in value):
+        raise ValueError(f"{field} entries must be non-empty strings")
+    if len(set(value)) != len(value):
+        raise ValueError(f"{field} entries must be unique")
+    return tuple(value)
+
+
+@dataclass(frozen=True)
+class SFTSource:
+    """One immutable candidate source and its current admissibility state."""
+
+    access: str
+    adapter: str
+    blockers: tuple[str, ...]
+    dataset_id: str
+    evidence_urls: tuple[str, ...]
+    languages: frozenset[str]
+    license_id: str
+    origin: str
+    production_blockers: tuple[str, ...]
+    production_eligible: bool
+    repository_url: str | None
+    revision: str | None
+    source_id: str
+    splits: frozenset[str]
+    status: str
+    task_categories: frozenset[str]
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        allowed_licenses: frozenset[str],
+        allowed_languages: frozenset[str],
+        allowed_splits: frozenset[str],
+        allowed_tasks: frozenset[str],
+    ) -> SFTSource:
+        source_id = _required_string(value.get("source_id"), "source_id")
+        if _SOURCE_ID.fullmatch(source_id) is None:
+            raise ValueError(f"invalid source_id: {source_id}")
+        status = _required_string(value.get("status"), f"{source_id}.status")
+        if status not in SOURCE_STATUSES:
+            raise ValueError(f"unsupported source status: {status}")
+        access = _required_string(value.get("access"), f"{source_id}.access")
+        if access not in SOURCE_ACCESS:
+            raise ValueError(f"unsupported source access: {access}")
+        origin = _required_string(value.get("origin"), f"{source_id}.origin")
+        if origin not in SOURCE_ORIGINS:
+            raise ValueError(f"unsupported source origin: {origin}")
+
+        license_id = _required_string(value.get("license_id"), f"{source_id}.license_id")
+        if license_id not in allowed_licenses:
+            raise ValueError(f"source license is not allowed by the SFT policy: {source_id}")
+
+        revision = value.get("revision")
+        revision_pattern = _SHA256 if access == "first_party" else _GIT_SHA
+        revision_name = "SHA-256" if access == "first_party" else "Git SHA"
+        if revision is not None and (
+            not isinstance(revision, str) or revision_pattern.fullmatch(revision) is None
+        ):
+            raise ValueError(f"source revision must be an exact {revision_name}: {source_id}")
+        blockers = _string_tuple(value.get("blockers"), f"{source_id}.blockers", allow_empty=True)
+        production_blockers = _string_tuple(
+            value.get("production_blockers"),
+            f"{source_id}.production_blockers",
+            allow_empty=True,
+        )
+        production_eligible = value.get("production_eligible")
+        if not isinstance(production_eligible, bool):
+            raise ValueError(f"production_eligible must be boolean: {source_id}")
+
+        if status == "canary_eligible":
+            if blockers:
+                raise ValueError(f"canary-eligible source has blockers: {source_id}")
+            if revision is None:
+                raise ValueError(f"canary-eligible source is not revision-pinned: {source_id}")
+            if access != "public":
+                raise ValueError(f"canary-eligible source is not public: {source_id}")
+        elif status == "candidate_eligible":
+            if access != "first_party" or origin not in {"mixed", "synthetic"}:
+                raise ValueError(
+                    f"candidate-eligible source must be first-party AI-assisted: {source_id}"
+                )
+            if blockers:
+                raise ValueError(f"candidate-eligible source has blockers: {source_id}")
+            if revision is None:
+                raise ValueError(
+                    f"candidate-eligible source is not hash-pinned: {source_id}"
+                )
+        elif status == "reviewed":
+            if access != "first_party" or origin != "first_party":
+                raise ValueError(f"reviewed source must be first-party: {source_id}")
+            if blockers:
+                raise ValueError(f"reviewed first-party source has blockers: {source_id}")
+            if revision is None:
+                raise ValueError(f"reviewed first-party source is not hash-pinned: {source_id}")
+        elif not blockers:
+            raise ValueError(f"blocked or planned source must explain its blockers: {source_id}")
+
+        if production_eligible:
+            eligible_status = "reviewed" if access == "first_party" else "canary_eligible"
+            if status != eligible_status or production_blockers:
+                raise ValueError(f"production-eligible source still has blockers: {source_id}")
+        elif not production_blockers:
+            raise ValueError(f"non-production source must list production blockers: {source_id}")
+
+        languages = frozenset(
+            _string_tuple(value.get("languages"), f"{source_id}.languages")
+        )
+        if not languages.issubset(allowed_languages | {"multilingual"}):
+            raise ValueError(f"source contains an unsupported language declaration: {source_id}")
+        splits = frozenset(_string_tuple(value.get("splits"), f"{source_id}.splits"))
+        if not splits:
+            raise ValueError(f"source splits are empty: {source_id}")
+        task_categories = frozenset(
+            _string_tuple(value.get("task_categories"), f"{source_id}.task_categories")
+        )
+        if not task_categories.issubset(allowed_tasks):
+            raise ValueError(f"source contains an unsupported task category: {source_id}")
+
+        evidence_urls = _string_tuple(
+            value.get("evidence_urls"),
+            f"{source_id}.evidence_urls",
+            allow_empty=(
+                access == "first_party"
+                or status in {"candidate_eligible", "planned", "reviewed"}
+            ),
+        )
+        repository_url = value.get("repository_url")
+        if repository_url is not None and (
+            not isinstance(repository_url, str)
+            or not repository_url.startswith(_EXTERNAL_REPOSITORY_PREFIXES)
+        ):
+            raise ValueError(f"source repository URL is not accepted: {source_id}")
+        if access in {"public", "gated"} and repository_url is None:
+            raise ValueError(f"external source repository URL is required: {source_id}")
+
+        return cls(
+            access=access,
+            adapter=_required_string(value.get("adapter"), f"{source_id}.adapter"),
+            blockers=blockers,
+            dataset_id=_required_string(value.get("dataset_id"), f"{source_id}.dataset_id"),
+            evidence_urls=evidence_urls,
+            languages=languages,
+            license_id=license_id,
+            origin=origin,
+            production_blockers=production_blockers,
+            production_eligible=production_eligible,
+            repository_url=repository_url,
+            revision=revision,
+            source_id=source_id,
+            splits=splits,
+            status=status,
+            task_categories=task_categories,
+        )
+
+
+@dataclass(frozen=True)
+class SFTSourceRegistry:
+    """Validated source registry with deterministic record binding checks."""
+
+    observed_at: str
+    registry_sha256: str
+    sources: tuple[SFTSource, ...]
+
+    @property
+    def by_id(self) -> dict[str, SFTSource]:
+        return {source.source_id: source for source in self.sources}
+
+    def record_reasons(
+        self,
+        *,
+        dataset_id: Any,
+        language: Any,
+        license_id: Any,
+        revision: Any,
+        source_id: Any,
+        split: Any,
+        task_category: Any,
+    ) -> tuple[str, ...]:
+        if not isinstance(source_id, str) or source_id not in self.by_id:
+            return ("source_registry_unknown",)
+        source = self.by_id[source_id]
+        reasons: list[str] = []
+        if source.status not in {"candidate_eligible", "canary_eligible", "reviewed"}:
+            reasons.append(f"source_registry_status:{source.status}")
+        if dataset_id != source.dataset_id:
+            reasons.append("source_registry_dataset_id")
+        if revision != source.revision:
+            reasons.append("source_registry_revision")
+        if license_id != source.license_id:
+            reasons.append("source_registry_license")
+        if split not in source.splits:
+            reasons.append("source_registry_split")
+        if task_category not in source.task_categories:
+            reasons.append("source_registry_task_category")
+        if "multilingual" not in source.languages and language not in source.languages:
+            reasons.append("source_registry_language")
+        return tuple(reasons)
+
+
+def load_sft_source_registry(
+    path: str | Path,
+    *,
+    allowed_licenses: frozenset[str],
+    allowed_languages: frozenset[str],
+    allowed_splits: frozenset[str],
+    allowed_tasks: frozenset[str],
+    expected_sha256: str | None = None,
+) -> SFTSourceRegistry:
+    """Load and validate an exact source registry file."""
+
+    registry_path = Path(path)
+    file_sha256 = _file_sha256(registry_path)
+    if expected_sha256 is not None:
+        if _SHA256.fullmatch(expected_sha256) is None:
+            raise ValueError("expected source registry SHA-256 is invalid")
+        if file_sha256 != expected_sha256:
+            raise ValueError("source registry SHA-256 changed")
+
+    with registry_path.open(encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, Mapping):
+        raise ValueError("source registry must be an object")
+    if value.get("schema_version") != SOURCE_REGISTRY_SCHEMA_VERSION:
+        raise ValueError("unsupported SFT source registry schema")
+    authorization = value.get("authorization")
+    expected_authorization = {
+        "bulk_data_download_authorized": False,
+        "paid_gpu_authorized": False,
+        "production_sft_authorized": False,
+        "purpose": "metadata_and_source_admissibility_audit_only",
+    }
+    if authorization != expected_authorization:
+        raise ValueError("source registry authorization boundary changed")
+    observed_at = _required_string(value.get("observed_at"), "observed_at")
+    raw_sources = value.get("sources")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("source registry must contain sources")
+    sources = tuple(
+        SFTSource.from_mapping(
+            raw_source,
+            allowed_licenses=allowed_licenses,
+            allowed_languages=allowed_languages,
+            allowed_splits=allowed_splits,
+            allowed_tasks=allowed_tasks,
+        )
+        for raw_source in raw_sources
+    )
+    source_ids = [source.source_id for source in sources]
+    dataset_ids = [source.dataset_id for source in sources]
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("source_id values must be unique")
+    if len(dataset_ids) != len(set(dataset_ids)):
+        raise ValueError("dataset_id values must be unique")
+    return SFTSourceRegistry(
+        observed_at=observed_at,
+        registry_sha256=file_sha256,
+        sources=sources,
+    )
+
+
+def build_sft_source_readiness_report(
+    registry: SFTSourceRegistry,
+    *,
+    required_tasks: frozenset[str],
+) -> dict[str, Any]:
+    """Build a raw-data-free report for the current source-audit gate."""
+
+    status_counts = Counter(source.status for source in registry.sources)
+    canary_coverage = {
+        task: sorted(
+            source.source_id
+            for source in registry.sources
+            if source.status in {"candidate_eligible", "canary_eligible", "reviewed"}
+            and task in source.task_categories
+        )
+        for task in sorted(required_tasks)
+    }
+    production_coverage = {
+        task: sorted(
+            source.source_id
+            for source in registry.sources
+            if source.production_eligible and task in source.task_categories
+        )
+        for task in sorted(required_tasks)
+    }
+    missing_canary = [task for task, sources in canary_coverage.items() if not sources]
+    missing_production = [task for task, sources in production_coverage.items() if not sources]
+    blockers = [
+        f"canary_source_missing:{task}" for task in missing_canary
+    ] + [f"production_source_missing:{task}" for task in missing_production]
+    report = {
+        "authorization": {
+            "bulk_data_download_authorized": False,
+            "paid_gpu_authorized": False,
+            "production_sft_authorized": False,
+        },
+        "blockers": blockers,
+        "canary_task_coverage": canary_coverage,
+        "metadata_audit_complete": True,
+        "missing_canary_tasks": missing_canary,
+        "missing_production_tasks": missing_production,
+        "observed_at": registry.observed_at,
+        "production_seal_ready": not missing_production,
+        "production_task_coverage": production_coverage,
+        "schema_version": "lumi.sft-source-readiness.v0.1",
+        "source_count": len(registry.sources),
+        "source_registry_sha256": registry.registry_sha256,
+        "source_status_counts": dict(sorted(status_counts.items())),
+    }
+    report["report_sha256"] = _sha256(report)
+    return report

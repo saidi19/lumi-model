@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -14,10 +14,13 @@ from typing import Any, Protocol
 from .data_quality import normalize_for_matching
 
 SFT_SCHEMA_VERSION = "lumi.sft.v0.1"
-SUPPORTED_ROLES = frozenset({"assistant", "developer", "system", "user"})
+SUPPORTED_ROLES = frozenset(
+    {"assistant", "developer", "system", "tool", "tool_result", "user"}
+)
 TRAINING_ONLY_MARKERS = ("<|doc|>", "<|endofdoc|>")
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _EMAIL = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
 _PHONE = re.compile(r"(?<!\d)(?:\+?\d[\s().-]*){10,15}(?!\d)")
 _PRIVATE_KEY = re.compile(r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----")
@@ -35,6 +38,22 @@ class BenchmarkMatcher(Protocol):
     def match(self, text: str) -> tuple[str, str] | None: ...
 
 
+class SourceRegistryMatcher(Protocol):
+    """Subset of the source registry used to bind a candidate record."""
+
+    def record_reasons(
+        self,
+        *,
+        dataset_id: Any,
+        language: Any,
+        license_id: Any,
+        revision: Any,
+        source_id: Any,
+        split: Any,
+        task_category: Any,
+    ) -> tuple[str, ...]: ...
+
+
 @dataclass(frozen=True)
 class SFTPolicy:
     """Validated, immutable filtering policy."""
@@ -43,9 +62,16 @@ class SFTPolicy:
     allowed_licenses: frozenset[str]
     allowed_splits: frozenset[str]
     benchmark_decontamination: Mapping[str, Any]
+    chat_template: str
+    context_window: int
     maximum_message_characters: int
     maximum_messages: int
     minimum_quality_score: float
+    packing_policy: str
+    source_registry_path: str
+    source_registry_required: bool
+    source_registry_sha256: str
+    supervised_roles: frozenset[str]
     task_mix: Mapping[str, float]
 
     @classmethod
@@ -102,14 +128,58 @@ class SFTPolicy:
         if not _valid_sha256(benchmark.get("registry_sha256")):
             raise ValueError("benchmark_decontamination.registry_sha256 is invalid")
 
+        chat_training = value.get("chat_training")
+        if not isinstance(chat_training, Mapping):
+            raise ValueError("chat_training must be an object")
+        if chat_training.get("assistant_only_loss") is not True:
+            raise ValueError("SFT must use assistant-only loss")
+        if chat_training.get("chat_template") != "configs/lumi-4b-chat-template-v0.1.json":
+            raise ValueError("SFT chat template binding changed")
+        if chat_training.get("context_window") != 4096:
+            raise ValueError("SFT context window must remain 4096")
+        if chat_training.get("overlength_policy") != "reject":
+            raise ValueError("overlength SFT records must fail closed")
+        if (
+            chat_training.get("packing_policy")
+            != "single_conversation_until_block_diagonal_verified"
+        ):
+            raise ValueError("SFT packing may not cross conversation boundaries")
+        raw_supervised_roles = chat_training.get("supervised_roles")
+        if not isinstance(raw_supervised_roles, list) or set(raw_supervised_roles) != {
+            "assistant",
+            "tool",
+        }:
+            raise ValueError("SFT supervised roles must be assistant and tool")
+
+        source_registry = value.get("source_registry")
+        if not isinstance(source_registry, Mapping):
+            raise ValueError("source_registry must be an object")
+        if source_registry.get("schema_version") != "lumi.sft.sources.v0.1":
+            raise ValueError("SFT source registry schema changed")
+        if source_registry.get("required_for_filtering_and_seal") is not True:
+            raise ValueError("SFT source registry must be required")
+        source_registry_path = source_registry.get("path")
+        if source_registry_path != "configs/lumi-4b-sft-source-registry-v0.1.json":
+            raise ValueError("SFT source registry path changed")
+        source_registry_sha256 = source_registry.get("sha256")
+        if not _valid_sha256(source_registry_sha256):
+            raise ValueError("SFT source registry SHA-256 is invalid")
+
         return cls(
             allowed_languages=frozenset(allowed_languages),
             allowed_licenses=frozenset(allowed_licenses),
             allowed_splits=frozenset(allowed_splits),
             benchmark_decontamination=dict(benchmark),
+            chat_template=chat_training["chat_template"],
+            context_window=4096,
             maximum_message_characters=maximum_message_characters,
             maximum_messages=maximum_messages,
             minimum_quality_score=float(minimum_quality_score),
+            packing_policy=chat_training["packing_policy"],
+            source_registry_path=source_registry_path,
+            source_registry_required=True,
+            source_registry_sha256=source_registry_sha256,
+            supervised_roles=frozenset(raw_supervised_roles),
             task_mix=task_mix,
         )
 
@@ -162,6 +232,61 @@ def load_sft_policy(path: str | Path) -> SFTPolicy:
     return SFTPolicy.from_mapping(value)
 
 
+def validate_message_sequence(messages: Sequence[Mapping[str, str]]) -> None:
+    """Validate one chat/tool trajectory without inspecting message content."""
+
+    if len(messages) < 2:
+        raise ValueError("message_count_out_of_bounds")
+    state = "prefix_or_user"
+    seen_system = False
+    seen_developer = False
+    for message in messages:
+        if not isinstance(message, Mapping):
+            raise ValueError("invalid_message")
+        role = message.get("role")
+        content = message.get("content")
+        if role not in SUPPORTED_ROLES:
+            raise ValueError("unsupported_role")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("empty_message")
+
+        if state == "prefix_or_user" and role in {"system", "developer"}:
+            if role == "system":
+                if seen_system or seen_developer:
+                    raise ValueError("invalid_turn_order")
+                seen_system = True
+            else:
+                if seen_developer:
+                    raise ValueError("invalid_turn_order")
+                seen_developer = True
+            continue
+
+        if state == "prefix_or_user":
+            if role != "user":
+                raise ValueError("invalid_turn_order")
+            state = "model_output"
+        elif state == "model_output":
+            if role == "assistant":
+                state = "user_or_end"
+            elif role == "tool":
+                state = "tool_result"
+            else:
+                raise ValueError("invalid_turn_order")
+        elif state == "tool_result":
+            if role != "tool_result":
+                raise ValueError("invalid_turn_order")
+            state = "model_output"
+        elif state == "user_or_end":
+            if role != "user":
+                raise ValueError("invalid_turn_order")
+            state = "model_output"
+        else:  # pragma: no cover - state values are closed above
+            raise AssertionError(state)
+
+    if messages[-1].get("role") != "assistant" or state != "user_or_end":
+        raise ValueError("conversation_must_end_with_assistant")
+
+
 def _record_messages(value: Any, policy: SFTPolicy, reasons: list[str]) -> list[dict[str, str]]:
     if not isinstance(value, list):
         reasons.append("invalid_messages")
@@ -188,19 +313,11 @@ def _record_messages(value: Any, policy: SFTPolicy, reasons: list[str]) -> list[
     if len(messages) != len(value):
         return messages
 
-    prefix_complete = False
-    expected = "user"
-    for message in messages:
-        role = message["role"]
-        if not prefix_complete and role in {"system", "developer"}:
-            continue
-        prefix_complete = True
-        if role != expected:
-            reasons.append("invalid_turn_order")
-            break
-        expected = "assistant" if expected == "user" else "user"
-    if not messages or not prefix_complete or messages[-1]["role"] != "assistant":
-        reasons.append("conversation_must_end_with_assistant")
+    if messages:
+        try:
+            validate_message_sequence(messages)
+        except ValueError as error:
+            reasons.append(str(error))
     return messages
 
 
@@ -218,6 +335,7 @@ def evaluate_sft_record(
     *,
     policy: SFTPolicy,
     benchmark_registry: BenchmarkMatcher | None = None,
+    source_registry: SourceRegistryMatcher | None = None,
 ) -> SFTRecordDecision:
     """Evaluate one record without retaining its raw text in the decision."""
 
@@ -248,17 +366,43 @@ def evaluate_sft_record(
         reasons.append("task_category")
 
     source = record.get("source")
+    source_id: Any = None
+    dataset_id: Any = None
+    license_id: Any = None
+    revision: Any = None
     if not isinstance(source, Mapping):
         reasons.append("source")
     else:
-        if not isinstance(source.get("dataset_id"), str) or not source["dataset_id"]:
+        source_id = source.get("source_id")
+        dataset_id = source.get("dataset_id")
+        license_id = source.get("license_id")
+        revision = source.get("revision")
+        if not isinstance(source_id, str) or not source_id:
+            reasons.append("source_id")
+        if not isinstance(dataset_id, str) or not dataset_id:
             reasons.append("source_dataset_id")
         if not isinstance(source.get("document_id"), str) or not source["document_id"]:
             reasons.append("source_document_id")
-        if source.get("license_id") not in policy.allowed_licenses:
+        if license_id not in policy.allowed_licenses:
             reasons.append("license")
+        if not isinstance(revision, str) or (
+            _GIT_SHA.fullmatch(revision) is None and _SHA256.fullmatch(revision) is None
+        ):
+            reasons.append("source_revision")
         if not isinstance(source.get("uri"), str) or not source["uri"]:
             reasons.append("source_uri")
+        if source_registry is not None:
+            reasons.extend(
+                source_registry.record_reasons(
+                    dataset_id=dataset_id,
+                    language=language,
+                    license_id=license_id,
+                    revision=revision,
+                    source_id=source_id,
+                    split=split,
+                    task_category=task_category,
+                )
+            )
 
     provenance = record.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -269,6 +413,7 @@ def evaluate_sft_record(
                 reasons.append(f"provenance_{field}")
         if provenance.get("consent_basis") not in {
             "document_license",
+            "first_party_rights_declaration",
             "public_domain",
             "source_level_open_license",
         }:
@@ -348,6 +493,7 @@ def filter_sft_records(
     *,
     policy: SFTPolicy,
     benchmark_registry: BenchmarkMatcher | None = None,
+    source_registry: SourceRegistryMatcher | None = None,
 ) -> tuple[list[Mapping[str, Any]], dict[str, Any]]:
     """Filter a stream and emit accepted records plus a raw-text-free report."""
 
@@ -362,6 +508,7 @@ def filter_sft_records(
             record,
             policy=policy,
             benchmark_registry=benchmark_registry,
+            source_registry=source_registry,
         )
         reasons = list(decision.reasons)
         if decision.record_id is not None and decision.record_id in seen_ids:
