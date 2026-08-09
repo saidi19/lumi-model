@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import http.client
+import json
 from collections import Counter
 from pathlib import Path
+
+import pytest
 
 from lumi.posttraining_stronger_teacher_ab import (
     CONTINUATION_MAXIMUM_ATTEMPTS,
@@ -30,8 +33,21 @@ CONTINUATION_AUTHORIZATION = (
 )
 
 
+def _plan() -> dict:
+    raw = json.loads(PLAN.read_text(encoding="utf-8"))
+    missing = []
+    for name, binding in raw.get("bindings", {}).items():
+        path = Path(binding["path"])
+        resolved = path if path.is_absolute() else ROOT / path
+        if not resolved.is_file():
+            missing.append(name)
+    if missing:
+        pytest.skip(f"stronger-teacher private bindings are unavailable: {missing}")
+    return load_plan(PLAN, repository_root=ROOT)
+
+
 def test_execution_plan_preserves_exact_authorized_bounds() -> None:
-    plan = load_plan(PLAN, repository_root=ROOT)
+    plan = _plan()
     assert plan["limits"] == EXPECTED_LIMITS
     assert plan["gates"] == EXPECTED_GATES
     assert EXPECTED_FINAL_OUTPUTS == 200
@@ -49,7 +65,7 @@ def test_paired_schedule_is_exact_and_balanced() -> None:
 
 
 def test_prohibited_actions_remain_false() -> None:
-    plan = load_plan(PLAN, repository_root=ROOT)
+    plan = _plan()
     authorization = plan["authorization"]
     assert authorization["external_api_authorized"] is False
     assert authorization["cloud_or_paid_gpu_authorized"] is False
@@ -60,8 +76,10 @@ def test_prohibited_actions_remain_false() -> None:
 
 
 def test_continuation_is_exactly_bound_to_the_sealed_boundary() -> None:
-    plan = load_plan(PLAN, repository_root=ROOT)
+    plan = _plan()
     artifact = artifact_root(plan, ROOT)
+    if not CONTINUATION_AUTHORIZATION.is_file():
+        pytest.skip("stronger-teacher continuation authorization is private")
     authorization = load_continuation_authorization(
         CONTINUATION_AUTHORIZATION,
         artifact=artifact,

@@ -31,6 +31,15 @@ def _load(path: Path) -> dict:
 def _plan() -> dict:
     if not PLAN.is_file():
         pytest.skip("stronger-teacher A/B preflight plan is not materialized")
+    raw = _load(PLAN)
+    missing = []
+    for name, binding in raw.get("bindings", {}).items():
+        path = Path(binding["path"])
+        resolved = path if path.is_absolute() else ROOT / path
+        if not resolved.is_file():
+            missing.append(name)
+    if missing:
+        pytest.skip(f"stronger-teacher private bindings are unavailable: {missing}")
     return load_stronger_teacher_ab_preflight_plan(PLAN, repository_root=ROOT)
 
 

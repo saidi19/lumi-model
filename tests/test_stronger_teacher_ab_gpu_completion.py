@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from lumi import posttraining_stronger_teacher_ab as paired
 from lumi import posttraining_stronger_teacher_ab_gpu_completion as completion
 
@@ -58,6 +60,11 @@ def test_corrected_retry_payload_changes_only_the_response_ceiling() -> None:
 
 
 def test_failure_boundary_is_exact() -> None:
+    private = SOURCE_ARTIFACT / "private"
+    if not (private / "baseline-call-journal.jsonl").is_file() or not (
+        private / "candidate-call-journal.jsonl"
+    ).is_file():
+        pytest.skip("stronger-teacher failure boundary is a private local artifact")
     boundary = completion.current_boundary(
         artifact=SOURCE_ARTIFACT, exact_failure_boundary=True
     )

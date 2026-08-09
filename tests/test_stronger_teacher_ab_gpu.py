@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
+import pytest
+
 from lumi.posttraining_stronger_teacher_ab_gpu import (
     BOUNDARY,
     DOWNLOADS,
@@ -32,8 +34,12 @@ def test_gpu_continuation_is_exactly_bounded() -> None:
 
 
 def test_gpu_continuation_preserves_existing_journal_boundary() -> None:
-    baseline = (ARTIFACT / "private" / "baseline-call-journal.jsonl").read_bytes()
-    candidate = (ARTIFACT / "private" / "candidate-call-journal.jsonl").read_bytes()
+    baseline_path = ARTIFACT / "private" / "baseline-call-journal.jsonl"
+    candidate_path = ARTIFACT / "private" / "candidate-call-journal.jsonl"
+    if not baseline_path.is_file() or not candidate_path.is_file():
+        pytest.skip("stronger-teacher journals are private local artifacts")
+    baseline = baseline_path.read_bytes()
+    candidate = candidate_path.read_bytes()
     assert len(baseline) == BOUNDARY["baseline_journal_bytes"]
     assert hashlib.sha256(baseline).hexdigest() == BOUNDARY[
         "baseline_journal_sha256"
