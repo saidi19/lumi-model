@@ -5,8 +5,36 @@ on:
   pull_request:
 
 jobs:
+  frozen-lint-integrity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff==0.15.1
+      - name: Exact historical lint debt and zero new findings
+        run: python -B scripts/check_frozen_lint_v1.py
+
+  isolated-sft-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Fixed 273 control tests without site packages or ML imports
+        run: python -S -B scripts/run_sft_control_ci_v1.py
+      - name: CI guard regression tests
+        run: >-
+          python -S -B -m unittest -q
+          tests/test_frozen_lint_v1.py tests/test_sft_control_ci_v1.py
+
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -15,5 +43,13 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev,data]'
-      - run: ruff check .
-      - run: pytest
+      - name: General suite (control suites run in their required isolated job)
+        run: >-
+          python -B -m pytest
+          --ignore=tests/test_sft_source_bundle_v1.py
+          --ignore=tests/test_sft_supervisor_v1.py
+          --ignore=tests/test_sft_worker_admission_v1.py
+          --ignore=tests/test_sft_launch_contract_v1.py
+          --ignore=tests/test_process_watchdog_v1.py
+          --ignore=tests/test_sft_guarded_bootstrap_v1.py
+          --ignore=tests/test_sft_ledger_protocol_v1.py
