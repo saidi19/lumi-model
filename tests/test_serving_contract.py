@@ -27,8 +27,10 @@ def test_skeleton_is_valid_but_deliberately_blocked() -> None:
         == FINAL_PRETRAINING_TOKENS
     )
     assert report["ready"] is False
-    assert "gate:base_pretraining_80b" in report["blockers"]
-    assert "artifact:base_checkpoint_manifest_sha256" in report["blockers"]
+    assert "gate:base_pretraining_80b" not in report["blockers"]
+    assert "artifact:base_checkpoint_manifest_sha256" not in report["blockers"]
+    assert "gate:sft_data" in report["blockers"]
+    assert "artifact:sft_checkpoint_manifest_sha256" in report["blockers"]
 
 
 def test_contract_becomes_ready_only_with_all_hashes_and_gates() -> None:

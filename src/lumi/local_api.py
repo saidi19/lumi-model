@@ -430,7 +430,8 @@ def create_server(
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; connect-src 'self'; img-src 'self' data:; "
-                "script-src 'self'; style-src 'self'",
+                "font-src 'self'; script-src 'self'; style-src 'self'; "
+                "style-src-attr 'unsafe-inline'",
             )
             if content_length is not None:
                 self.send_header("Content-Length", str(content_length))
@@ -477,7 +478,16 @@ def create_server(
                 raise APIError("request body is not valid UTF-8 JSON") from error
 
         def _asset(self, name: str) -> None:
-            path = ui_root / name
+            path = (ui_root / name).resolve()
+            if not path.is_relative_to(ui_root.resolve()):
+                self._error(
+                    APIError(
+                        "not found",
+                        status=HTTPStatus.NOT_FOUND,
+                        code="not_found",
+                    )
+                )
+                return
             if not path.is_file():
                 self._error(
                     APIError(
@@ -497,6 +507,14 @@ def create_server(
                 content_length=len(body),
             )
             self.wfile.write(body)
+
+        def _ui_asset_name(self, request_path: str) -> str | None:
+            relative = request_path.removeprefix("/")
+            if relative in {"app.js", "renderer.js", "styles.css"}:
+                return relative
+            if relative.startswith("vendor/katex/"):
+                return relative
+            return None
 
         def _models(self) -> None:
             metadata = engine.model_metadata()
@@ -639,10 +657,8 @@ def create_server(
             try:
                 if path == "/":
                     self._asset("index.html")
-                elif path == "/app.js":
-                    self._asset("app.js")
-                elif path == "/styles.css":
-                    self._asset("styles.css")
+                elif asset_name := self._ui_asset_name(path):
+                    self._asset(asset_name)
                 elif path == "/health":
                     self._json(
                         {

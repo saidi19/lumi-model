@@ -83,7 +83,10 @@ def register_lumi() -> None:
 # Preserve the historical auto-registration behavior in full model environments,
 # while allowing CPU-only data workers to import ``lumi.production_corpus`` without
 # installing PyTorch or Transformers.
-if importlib.util.find_spec("transformers") is not None:
+if (
+    importlib.util.find_spec("transformers") is not None
+    and importlib.util.find_spec("torch") is not None
+):
     register_lumi()
 
 

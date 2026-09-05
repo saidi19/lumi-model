@@ -187,8 +187,11 @@ def test_models_health_and_ui_routes(local_server: str) -> None:
 
     with urlopen(local_server, timeout=3) as response:  # noqa: S310
         html = response.read().decode()
+        content_security_policy = response.headers["Content-Security-Policy"]
     assert "Meet Lumi, locally" in html
     assert "not an instruction-tuned assistant" in html
+    assert "script-src 'self'" in content_security_policy
+    assert "style-src-attr 'unsafe-inline'" in content_security_policy
 
 
 def test_nonstreaming_chat_completion_is_openai_shaped(local_server: str) -> None:
@@ -283,5 +286,25 @@ def test_black_box_local_server_gate_seals_a_report(local_server: str, tmp_path)
     assert report["model"]["id"] == "lumi-test"
     assert report["nonstream"]["text"] == "Hello"
     assert report["stream"]["done"] is True
-    assert set(report["ui"]["assets"]) == {"app.js", "styles.css"}
+    assert set(report["ui"]["assets"]) == {
+        "app.js",
+        "renderer.js",
+        "styles.css",
+        "vendor/katex/katex.min.css",
+        "vendor/katex/katex.min.js",
+    }
     assert json.loads(output.read_text(encoding="utf-8")) == report
+
+
+def test_local_ui_serves_vendored_math_assets_and_blocks_traversal(
+    local_server: str,
+) -> None:
+    with urlopen(  # noqa: S310
+        f"{local_server}/vendor/katex/fonts/KaTeX_Main-Regular.woff2", timeout=3
+    ) as response:
+        assert response.headers.get_content_type() == "font/woff2"
+        assert len(response.read()) > 20_000
+
+    with pytest.raises(HTTPError) as captured:
+        urlopen(f"{local_server}/vendor/katex/../../local_api.py", timeout=3)  # noqa: S310
+    assert captured.value.code == 404

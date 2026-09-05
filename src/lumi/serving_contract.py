@@ -12,6 +12,9 @@ from typing import Any
 SERVING_CONTRACT_SCHEMA_VERSION = "lumi.serving.v0.1"
 FINAL_PRETRAINING_STEP = 76_294
 FINAL_PRETRAINING_TOKENS = 80_000_000_000
+FINAL_SOURCE_COMMIT = "418a113021daddb0ea8e364e2a20c3eabc4ab9bf"
+FINAL_RUN_FINGERPRINT = "578feadb13558d48ad537a9fb843dd9e3c9baf07079d14f32f601c9d3be5f768"
+FINAL_HANDOFF_SHA256 = "8258d67fa0cd53a9b1075c4f5f0c17e14e40fb928ef2a53f36a523f55763de4b"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -43,6 +46,14 @@ def validate_serving_contract(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("base checkpoint step boundary changed")
     if base.get("required_training_tokens") != FINAL_PRETRAINING_TOKENS:
         raise ValueError("base checkpoint token boundary changed")
+    if base.get("binding") != "configs/lumi-4b-final-base-binding-v0.1.json":
+        raise ValueError("base checkpoint binding changed")
+    if base.get("source_commit") != FINAL_SOURCE_COMMIT:
+        raise ValueError("base checkpoint source commit changed")
+    if base.get("run_fingerprint") != FINAL_RUN_FINGERPRINT:
+        raise ValueError("base checkpoint run fingerprint changed")
+    if base.get("handoff_sha256") != FINAL_HANDOFF_SHA256:
+        raise ValueError("base checkpoint handoff changed")
 
     artifacts = value.get("artifacts")
     if not isinstance(artifacts, Mapping):

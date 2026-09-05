@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Run the authorized local-only Qwen teacher canary."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+from lumi.posttraining_first_party_teacher_canary import run_canary
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--repository-root", type=Path, required=True)
+    parser.add_argument("--artifact-root", type=Path, required=True)
+    arguments = parser.parse_args()
+    report = run_canary(
+        plan_path=arguments.plan,
+        repository_root=arguments.repository_root,
+        artifact_root=arguments.artifact_root,
+    )
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "records": report["audit"]["counts"]["records"],
+                "supervised_tokens": report["audit"]["tokens"]["retained_supervised_tokens"],
+                "owner_review_records": report["owner_review"]["records"],
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

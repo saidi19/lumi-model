@@ -1,0 +1,320 @@
+{
+  "authorization": {
+    "bulk_data_acquisition_authorized": false,
+    "dataset_promotion_authorized": false,
+    "external_api_generation_authorized": false,
+    "external_api_spend_authorized": false,
+    "paid_gpu_authorized": false,
+    "production_dataset_seal_authorized": false,
+    "production_sft_authorized": false,
+    "purpose": "local_missing_task_and_language_mix_planning_only"
+  },
+  "bindings": {
+    "ai_assisted_owner_receipt": {
+      "file_sha256": "e541dfd59d30b26aebb90dac810c490b4249197941415e44b4ceeb69877a354d",
+      "internal_sha256": "b8eec12fa34d8007d34c01d6058bfae04dc0637a4cedcbce02adbeb309d427ca",
+      "path": "artifacts/ai-assisted-sft-pilot-v0.3/56ff1a9f093c/attempt-004/owner-review-receipt-v0.3-attempt-002.json"
+    },
+    "aya_bengali_audit": {
+      "file_sha256": "b19b1c86be7f36487d440361c268c2ba592900acc9c460bdf33a57de848fc6f9",
+      "internal_sha256": "7b928859f668d6263b7a2331b4d3c7976f2c93992289ccad0ab364a69f99002e",
+      "path": "evidence/lumi-4b-sft-aya-bengali-source-audit-v0.2.json"
+    },
+    "final_base_binding": {
+      "file_sha256": "1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172",
+      "path": "configs/lumi-4b-final-base-binding-v0.1.json"
+    },
+    "oasst1_repair_audit": {
+      "file_sha256": "4eb26326f26cd8601e64307882e25ba1367b73ccb85cc8ae509583a0bbbaa6f4",
+      "internal_sha256": "22472021420ee8fba53b01e24126e6169956d3987e901d8c7acb700e0555f4b3",
+      "path": "evidence/lumi-4b-sft-oasst1-repair-reaudit-v0.1.json"
+    },
+    "openr1_pii_diagnostic": {
+      "file_sha256": "2e6716d73e59e75752085958de3eb254cf6532d88cedd7fd00923f72f227415b",
+      "internal_sha256": "42d3d88d1d5cf9436d8911571515e310fd7d4a2876a6f460698e3c185da13b54",
+      "path": "evidence/lumi-4b-sft-openr1-pii-pattern-diagnostic-v0.1.json"
+    },
+    "openr1_verified_trace_audit": {
+      "file_sha256": "18401784aa7678630d200ad435307f7784be3aa7c398723942e3f607f65932d5",
+      "internal_sha256": "4d5cdab5179154138650059da9044d19826f6510a6fb749a58bd195637431a8d",
+      "path": "evidence/lumi-4b-sft-openr1-verified-trace-audit-v0.1.json"
+    },
+    "sft_data_contract": {
+      "file_sha256": "9a283d9333d29deb7b516fa45eb4eec50232be9925f4ee4aa3a8f624213b2f06",
+      "path": "configs/lumi-4b-sft-data-contract-v0.1.json"
+    },
+    "source_quality_audit": {
+      "file_sha256": "42855dc4f5d9415fb26d1da5f5eb6b1852fa652b5902be3f1a2f0b835ad886ad",
+      "internal_sha256": "0c8644ae02d6f661e3a0b43d4de07f4ad5029b0b76b2a27bb576743d2c7a37bd",
+      "path": "evidence/lumi-4b-sft-source-quality-audit-v0.1.json"
+    },
+    "source_registry": {
+      "file_sha256": "f73676bbfab84f9c421ff3eb611d8e395c0bdfb50a9fa87f5559d98ac74107c9",
+      "path": "configs/lumi-4b-sft-source-registry-v0.1.json"
+    }
+  },
+  "decision": "build_the_smallest_rights_clear_complete_mix_then_measure_before_training",
+  "diversity_policy": {
+    "maximum_fraction_from_one_source": 0.35,
+    "maximum_fraction_override_authorized": false,
+    "synthetic_provenance_must_remain_explicit": true,
+    "synthetic_records_must_not_be_relabelled_human": true
+  },
+  "external_teacher_policy": {
+    "azure_openai": "disabled_pending_contract_specific_written_clearance",
+    "open_source_teacher_models": "disabled_until_model_and_output_rights_are_reviewed_per_source",
+    "openai_api": "disabled_without_written_contract_exception_for_lumi_training"
+  },
+  "later_stages": [
+    {
+      "accepted_train_supervised_tokens": {
+        "maximum": 150000000,
+        "minimum": 50000000
+      },
+      "name": "first_release_candidate",
+      "start_only_if": "learning_candidate_passes_frozen_quality_safety_language_and_base_retention_gates"
+    },
+    {
+      "accepted_train_supervised_tokens": {
+        "maximum": 500000000,
+        "minimum": 200000000
+      },
+      "name": "optional_quality_expansion",
+      "start_only_if": "measured_marginal_gain_remains_positive_and_separate_owner_authorization_exists"
+    }
+  ],
+  "learning_candidate": {
+    "accepted_train_supervised_tokens": {
+      "maximum": 30000000,
+      "minimum": 10000000
+    },
+    "language_targets": {
+      "banglish": {
+        "fraction": 0.08,
+        "maximum_tokens": 2400000,
+        "minimum_tokens": 800000
+      },
+      "bengali_script": {
+        "fraction": 0.1,
+        "maximum_tokens": 3000000,
+        "minimum_tokens": 1000000
+      },
+      "english": {
+        "fraction": 0.78,
+        "maximum_tokens": 23400000,
+        "minimum_tokens": 7800000
+      },
+      "natural_code_switching": {
+        "fraction": 0.04,
+        "maximum_tokens": 1200000,
+        "minimum_tokens": 400000
+      }
+    },
+    "measurement": {
+      "assistant_and_tool_tokens_only": true,
+      "chat_template_applied_before_counting": true,
+      "padding_tokens_excluded": true,
+      "row_count_is_not_a_token_measurement": true,
+      "validation_tokens_excluded_from_training_target": true
+    },
+    "name": "learning_candidate",
+    "task_targets": {
+      "coding": {
+        "fraction": 0.2,
+        "maximum_tokens": 6000000,
+        "minimum_tokens": 2000000
+      },
+      "conversation": {
+        "fraction": 0.05,
+        "maximum_tokens": 1500000,
+        "minimum_tokens": 500000
+      },
+      "factual_qa": {
+        "fraction": 0.15,
+        "maximum_tokens": 4500000,
+        "minimum_tokens": 1500000
+      },
+      "multilingual_bengali": {
+        "fraction": 0.1,
+        "maximum_tokens": 3000000,
+        "minimum_tokens": 1000000
+      },
+      "reasoning_math_science": {
+        "fraction": 0.22,
+        "maximum_tokens": 6600000,
+        "minimum_tokens": 2200000
+      },
+      "safety_helpfulness": {
+        "fraction": 0.08,
+        "maximum_tokens": 2400000,
+        "minimum_tokens": 800000
+      },
+      "tool_api": {
+        "fraction": 0.08,
+        "maximum_tokens": 2400000,
+        "minimum_tokens": 800000
+      },
+      "writing_summarization": {
+        "fraction": 0.12,
+        "maximum_tokens": 3600000,
+        "minimum_tokens": 1200000
+      }
+    },
+    "validation_policy": {
+      "benchmark_decontaminated": true,
+      "frozen_before_training": true,
+      "minimum_required_task_and_language_coverage": "every_release_task_and_language_mode",
+      "target_fraction_of_accepted_examples": 0.05,
+      "train_validation_exact_and_near_duplicate_exclusion_required": true
+    }
+  },
+  "observed_at": "2026-08-06",
+  "production_gates": [
+    "exact_source_revision_license_and_attribution_evidence",
+    "row_level_origin_and_generation_provenance",
+    "rights_clear_commercial_training_and_deployment",
+    "schema_message_order_and_chat_template_validation",
+    "assistant_and_tool_only_loss_labels",
+    "pii_secret_and_training_marker_filtering_without_global_override",
+    "exact_and_near_deduplication_with_train_validation_isolation",
+    "benchmark_decontamination",
+    "four_k_context_fit_or_explicit_rejection",
+    "task_language_and_source_token_measurement_after_filtering",
+    "deterministic_owner_review_sample",
+    "frozen_validation_safety_and_base_retention_baselines",
+    "production_seal_bound_cpu_loss_and_resume_canary"
+  ],
+  "schema_version": "lumi.sft-missing-mix-proposal.v0.1",
+  "source_lanes": [
+    {
+      "lane_id": "lumi_owned_behavior",
+      "origin": "ai_assisted_with_explicit_lumi_ownership_and_owner_review",
+      "production_eligible": false,
+      "required_evidence": [
+        "final_source_revision_and_content_hash",
+        "explicit_ai_provenance_per_record",
+        "dataset_level_owner_review_receipt",
+        "full_mix_and_frozen_validation_coverage"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "conversation",
+        "multilingual_bengali",
+        "safety_helpfulness",
+        "tool_api"
+      ]
+    },
+    {
+      "lane_id": "openassistant_human_dialogue",
+      "origin": "revision_pinned_public_human",
+      "production_eligible": false,
+      "required_evidence": [
+        "sealed_rank_and_thread_policy",
+        "record_level_language_and_quality_review",
+        "attribution_manifest"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "coding",
+        "conversation",
+        "factual_qa",
+        "writing_summarization"
+      ]
+    },
+    {
+      "lane_id": "aya_reviewed_bengali",
+      "origin": "revision_pinned_public_human",
+      "production_eligible": false,
+      "required_evidence": [
+        "annotator_concentration_policy",
+        "format_artifact_repair",
+        "deduplication_and_stable_row_identity",
+        "instruction_compliance_review_and_attribution"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "factual_qa",
+        "multilingual_bengali",
+        "writing_summarization"
+      ]
+    },
+    {
+      "lane_id": "openr1_verified_reasoning",
+      "origin": "revision_pinned_public_synthetic_with_upstream_problem_provenance",
+      "production_eligible": false,
+      "required_evidence": [
+        "full_set_verified_generation_selection",
+        "four_k_fit_measurement",
+        "upstream_problem_rights_and_attribution",
+        "record_level_quality_review",
+        "unresolved_pii_pattern_resolution_without_global_filter_override"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "reasoning_math_science"
+      ]
+    },
+    {
+      "lane_id": "lumi_verifiable_code",
+      "origin": "first_party_or_rights_clear_code_with_executable_tests",
+      "production_eligible": false,
+      "required_evidence": [
+        "row_level_code_and_prompt_license_mapping",
+        "sandboxed_executable_tests",
+        "benchmark_decontamination",
+        "manual_quality_sample"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "coding"
+      ]
+    },
+    {
+      "lane_id": "lumi_grounded_factual_qa",
+      "origin": "public_domain_or_commercially_compatible_grounded_documents",
+      "production_eligible": false,
+      "required_evidence": [
+        "document_level_rights_and_revision",
+        "answer_grounding_and_citation_trace",
+        "time_sensitive_claim_policy",
+        "benchmark_decontamination"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "factual_qa"
+      ]
+    },
+    {
+      "lane_id": "lumi_rights_clear_writing",
+      "origin": "public_domain_or_commercially_compatible_source_documents",
+      "production_eligible": false,
+      "required_evidence": [
+        "document_level_rights_and_revision",
+        "summary_faithfulness_checks",
+        "style_and_length_diversity",
+        "train_validation_isolation"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "writing_summarization"
+      ]
+    },
+    {
+      "lane_id": "lumi_safety_and_tool_behavior",
+      "origin": "lumi_owned_policy_and_verifiable_tool_execution",
+      "production_eligible": false,
+      "required_evidence": [
+        "policy_version_and_owner_approval",
+        "balanced_safe_help_and_refusal_cases",
+        "tool_result_recomputation",
+        "multilingual_over_refusal_review"
+      ],
+      "state": "proposal_only",
+      "task_categories": [
+        "safety_helpfulness",
+        "tool_api"
+      ]
+    }
+  ],
+  "status": "planning_only_no_data_acquisition_or_training_authorized"
+}

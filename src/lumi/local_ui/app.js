@@ -63,9 +63,13 @@ function messageElement(message, index) {
   const role = document.createElement("p");
   role.className = "message-role";
   role.textContent = message.role === "assistant" ? "Lumi" : "You";
-  const content = document.createElement("p");
+  const content = document.createElement("div");
   content.className = "message-content";
-  content.textContent = message.content;
+  if (window.LumiRenderer) {
+    window.LumiRenderer.renderMessage(content, message.content);
+  } else {
+    content.textContent = message.content;
+  }
 
   body.append(role, content);
   if (message.meta) {

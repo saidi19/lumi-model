@@ -1,0 +1,61 @@
+from __future__ import annotations
+
+import json
+
+from lumi.posttraining_gpt_oss_teacher_dual_field_literal_repair_v11 import (
+    DUAL_FIELD_INSTRUCTION,
+    EXACT_AUTHORIZATION_TEXT,
+    LIMITS,
+    RECORD_ID,
+    REQUIRED_LITERALS,
+    _reference_row_passes,
+    repair_manifest,
+    repair_payload,
+    validate_dual_field_row,
+)
+
+
+def test_repair_is_one_row_and_bounded() -> None:
+    assert RECORD_ID == "lumi-gptoss-writing_summarization-bengali_script-03"
+    assert LIMITS["exact_repair_records"] == 1
+    assert LIMITS["maximum_inference_calls"] == 2
+    assert LIMITS["maximum_runtime_retries"] == 1
+    assert LIMITS["maximum_network_bytes"] == 0
+
+
+def test_manifest_attempts_are_distinct() -> None:
+    manifest = repair_manifest()
+    assert len(manifest["attempts"]) == 2
+    assert len({item["seed"] for item in manifest["attempts"]}) == 2
+    assert len({item["request_sha256"] for item in manifest["attempts"]}) == 2
+
+
+def test_payload_binds_literals_to_both_fields() -> None:
+    payload = repair_payload(1)
+    text = json.dumps(payload["messages"], ensure_ascii=False)
+    assert DUAL_FIELD_INSTRUCTION in text
+    for literal in REQUIRED_LITERALS:
+        assert text.count(literal) >= 2
+    assert payload["chat_template_kwargs"] == {"reasoning_effort": "low"}
+    assert payload["max_tokens"] == 1536
+
+
+def test_reference_row_passes_frozen_and_repair_gates() -> None:
+    assert _reference_row_passes()
+
+
+def test_gate_rejects_literal_missing_from_one_field() -> None:
+    try:
+        validate_dual_field_row([
+            {"role": "user", "content": "14:20-এ API gateway সমস্যা 18 minutes ছিল।"},
+            {"role": "assistant", "content": "API gateway সমস্যা 18 minutes পরে ঠিক হয়েছে।"},
+        ])
+    except ValueError as error:
+        assert "assistant_response missing literal: 14:20" in str(error)
+        return
+    raise AssertionError("one-sided literal omission passed the v0.11 gate")
+
+
+def test_authorization_cannot_resume_full_canary() -> None:
+    assert "cannot satisfy the 16-cell gate" in EXACT_AUTHORIZATION_TEXT
+    assert "No external API, public port, model or runtime download" in EXACT_AUTHORIZATION_TEXT

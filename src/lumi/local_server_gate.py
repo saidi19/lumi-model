@@ -110,7 +110,10 @@ def validate_local_server(
     ui_assets = {}
     for asset_path, allowed_types in (
         ("/app.js", {"application/javascript", "text/javascript"}),
+        ("/renderer.js", {"application/javascript", "text/javascript"}),
         ("/styles.css", {"text/css"}),
+        ("/vendor/katex/katex.min.css", {"text/css"}),
+        ("/vendor/katex/katex.min.js", {"application/javascript", "text/javascript"}),
     ):
         asset_body, asset_type = _get(base_url, asset_path)
         if not asset_body or asset_type not in allowed_types:

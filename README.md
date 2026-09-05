@@ -8,7 +8,99 @@ quantized for Apple Silicon. This repository contains model code, configuration,
 tests, and small smoke-training utilities. It intentionally does **not** contain
 training data, secrets, or model checkpoints.
 
-## Current phase
+## Post-training status
+
+Lumi L1 base pretraining is complete at exact step `76,294` and exactly
+`80,000,000,000` tokens. Its final checkpoint, tokenizer, frozen evaluation,
+handoff, and private S3 backup are now hash-bound by
+`configs/lumi-4b-final-base-binding-v0.1.json`.
+
+The current local-only phase prepares `Lumi-4B-Instruct`: the repository now
+defines a reserved-token-safe 4K chat format, assistant/tool-only SFT labels,
+fail-closed SFT filtering and benchmark decontamination, a revision-pinned
+source registry, and deterministic dataset sealing that refuses every source
+with unresolved promotion blockers. A bounded 72-record CPU-only canary across
+OASST1, Aya Bengali, and OpenR1 has passed schema, contamination, exact 4K
+encoding, and assistant-only label checks. A follow-up representative quality
+and provenance audit completed fail-closed with zero source promotions. The
+OASST1 structural defects were repaired, and its separately authorized
+four-object CPU curation processed all 88,838 pinned rows within the 64 MiB
+network and 128 MiB decoded caps. The strict selector found 1,763 candidates;
+1,745 passed schema, PII/secret, deduplication, benchmark, exact 4K, and frozen
+tokenizer gates, contributing 477,456 supervised tokens. Independent
+verification and its deterministic 32-row owner sample passed; reviewed OASST1
+metadata is registered in immutable candidate registry `v0.3`. Aya's repaired
+1,478-record / 577,453-supervised-token Bengali candidate, attribution manifest,
+and 32/32 owner sample also passed, and its reviewed metadata is registered in
+immutable candidate registry `v0.4`. Both sources remain non-production and the
+active data contract is unchanged. Aya's exact 1,330-train / 148-validation
+split is now privately materialized at 520,269 / 57,184 supervised tokens with
+zero projected exact or MinHash-0.90 prompt/response cross-split overlap.
+OpenR1's full pinned 93,733-row/10-shard source was subsequently acquired and
+curated under its bounded CPU contract. The verified visible-final candidate
+contains 2,656 records / 1,170,745 supervised tokens after 32 malformed-style
+records were quarantined; its deterministic owner sample passed 32/32. A
+separate fail-closed source-rights audit reproduced all 2,656 attribution rows
+across seven upstream problem-source labels, but cleared zero rows because the
+available dataset-level Apache declarations do not document a per-source
+downstream rights chain. OpenR1 therefore remains quarantined and is not
+production-eligible. The rights-clear replacement preflight selected DMath's
+pinned three-object train boundary, and its separately authorized acquisition
+retry recovered the exact object-by-ID JSON root without touching the official
+test split. The isolated fail-closed program verifier passed 6,967 of 7,943
+rows; global schema, PII/secret, exact-deduplication, benchmark, exact
+tokenization, and 0.90 prompt-Jaccard gates leave a private 6,943-record
+candidate with 51,026 supervised tokens (48,480 train / 2,546 validation).
+Abstract and Python solutions are verifier evidence only and never training
+targets. Independent curation verification passes, and the deterministic
+32-row owner sample is now human-owner accepted 32/32 with an independently
+replayed raw-text-free receipt. The exact reviewed DMath candidate is now
+append-only registered as the eleventh `canary_eligible` source in immutable
+registry `v0.5`; all ten predecessor sources and the active production data
+contract remain unchanged. The planning train total is 1,050,680 tokens, still
+8,949,320 short of the 10M floor. A local DeepMind Mathematics adapter preflight
+freezes its exact 30-object source boundary, eight generator modules, disjoint
+SHA-256 seed namespaces, fail-closed runtime audit, and final-answer-only target.
+The separately authorized acquisition/canary stopped at its mandatory
+pre-network dependency gate because the isolated runtime lacks `absl` and
+`six`. Independent replay confirms zero network bytes, zero fetched objects,
+zero generated examples, and zero package installations; a new dependency
+resolution/runtime authorization is required before retrying the 2,000-row
+canary. A subsequent no-install resolution preflight fetched only the exact
+2,458-byte pinned `setup.py` plus two official PyPI metadata objects (11,823
+network bytes total), parsed `install_requires` by AST without executing source,
+and independently verified an exact universal-wheel proposal:
+`absl-py==2.5.0` and `six==1.17.0`, 148,460 wheel bytes total, with `--no-deps`
+and `--require-hashes`. NumPy 2.5.1 and SymPy 1.14.0 already satisfy the pinned
+source. A separately authorized overlay installation then downloaded exactly
+those two wheels and installed them under
+`/private/tmp/lumi-deepmind-runtime-v0.1` using `--no-index --no-deps
+--require-hashes --no-compile`. Independent replay verifies two distributions,
+40 files / 520,097 installed bytes, exact inventory hashes, and fresh-process
+`absl`/`six` imports from inside the overlay. Zero canary records were generated;
+the exact 30-object / 2,000-row canary retry remains a separate gate.
+That earlier public/general diagnostic pool has zero safety coverage
+and sparse coding, factual-QA, and writing coverage. A separate
+Lumi-owned 320-record AI-assisted behavior pilot passes
+deterministic and normal SFT filtering with explicit non-human provenance, and
+its 32-row owner spot-check passed. A separate 320-row safety/tool lane passed
+machine gates, exact tokenizer measurement, and a 40/40 owner spot-check; an
+append-only gate registered it as `candidate_eligible` in immutable successor
+registry `v0.2`. A separate metadata-only punctuation gate now freezes 72
+English/Bengali/Banglish coverage lanes and requires at least 288 actual private
+post-SFT model cases; it is not model-quality evidence. Zero sources are yet
+production-eligible. No sealed production SFT dataset, SFT run, paid GPU, or
+public deployment is implied. See
+`docs/posttraining-readiness-v0.1.md` and `docs/sft-source-curation-v0.1.md` for
+the current boundary and next gate.
+
+The local product preview now renders a safe Markdown subset, fenced/inline
+code, and local KaTeX math without a runtime CDN. Untrusted model text is built
+with DOM text nodes rather than injected HTML; malformed or unsupported math
+falls back to visible source text. This is display-pipeline evidence, not a
+claim about the model's ability to produce correct answers.
+
+## Historical development record
 
 Phase 1 architecture correctness is complete. Phase 2 validates checkpoint,
 tokenizer, data, and deployment portability before any expensive GPU run:

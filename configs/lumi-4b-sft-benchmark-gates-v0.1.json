@@ -1,0 +1,146 @@
+{
+  "authorization": {
+    "data_acquisition_authorized": false,
+    "dataset_seal_authorized": false,
+    "model_inference_authorized": false,
+    "paid_gpu_authorized": false,
+    "production_release_authorized": false,
+    "production_sft_authorized": false,
+    "purpose": "freeze_quality_first_sft_benchmark_schedule_only"
+  },
+  "bindings": {
+    "base_checkpoint": {
+      "path": "configs/lumi-4b-final-base-binding-v0.1.json",
+      "sha256": "1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172"
+    },
+    "basic_capability_gate": {
+      "path": "configs/lumi-4b-basic-capability-gate-v0.1.json",
+      "sha256": "49a69d934826c4a0ff4ffdee1c85ccdb2b2ce2130eb4ee631cc1a1bd76494a6e"
+    },
+    "candidate_mix_reaudit": {
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-v0.2.json",
+      "sha256": "2aa1a14c00e3a7b63bac8700ee3395b937fd561fe714b2a45ec0129bad47c798"
+    },
+    "candidate_mix_reaudit_verification": {
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-verification-v0.2.json",
+      "sha256": "3cbfaeee11cd3b0096da27ca59e3050ae2edce0b88d0a2dfa90206f59cac942c"
+    },
+    "data_scale_gate": {
+      "path": "configs/lumi-4b-sft-data-scale-gate-v0.1.json",
+      "sha256": "d87e59a8f38174c2b405372dafd9ec1e38a52af5a207e837f84e36996455cbc7"
+    },
+    "evaluation_plan": {
+      "path": "configs/lumi-4b-posttraining-eval-v0.1.json",
+      "sha256": "e9ba01229cec305c2c3909696864e3a527d10f46766f2e22d577e3a43f91d48e"
+    },
+    "language_routing_gate": {
+      "path": "configs/lumi-4b-language-routing-gate-v0.1.json",
+      "sha256": "bcb167bdead960cf19acb9b1e8f0e4b8ccd1b6861ca4b816dd9e10a752625cd7"
+    },
+    "punctuation_quality_gate": {
+      "path": "configs/lumi-4b-punctuation-quality-gate-v0.1.json",
+      "sha256": "16b40294c86823cf2069e331cceba76bb7485b3ca7c3b64709814a2656005757"
+    }
+  },
+  "benchmark_lanes": [
+    "base_heldout_loss",
+    "instruction_following",
+    "knowledge_and_reasoning",
+    "math",
+    "code",
+    "truthfulness_and_calibration",
+    "bengali_and_multilingual",
+    "response_language_routing",
+    "greeting_small_talk_and_typo_recovery",
+    "simple_arithmetic_and_calculator_routing",
+    "punctuation_and_protected_span_preservation",
+    "tool_honesty_and_schema_correctness",
+    "safety_privacy_prompt_injection_and_overrefusal",
+    "blinded_human_preference_and_naturalness"
+  ],
+  "decision_policy": {
+    "base_and_candidates_use_identical_frozen_prompts": true,
+    "benchmark_prompts_must_be_frozen_before_first_quality_sft_run": true,
+    "benchmark_prompts_must_never_enter_training_data": true,
+    "five_hundred_million_is_a_quality_ceiling_not_a_mandatory_dose": true,
+    "llm_judge_is_never_the_sole_release_gate": true,
+    "release_selection": "select_the_smallest_supervised_token_stage_that_passes_all_release_gates_and_shows_material_gain_over_the_exact_base_and_previous_stage",
+    "runtime_smoke_is_a_quality_benchmark": false,
+    "stop_conditions": [
+      "required_safety_suite_failure",
+      "base_capability_regression_beyond_frozen_threshold",
+      "bengali_banglish_or_language_routing_regression",
+      "held_out_quality_stalls_or_regresses",
+      "source_or_style_concentration_exceeds_frozen_limit",
+      "benchmark_contamination_or_split_leakage_detected"
+    ]
+  },
+  "gates": [
+    {
+      "accepted_train_supervised_tokens": 0,
+      "gate_id": "base_full_baseline",
+      "kind": "full_quality_benchmark",
+      "required_before": "first_quality_sft_run",
+      "run_on": "exact_sealed_80b_base_checkpoint"
+    },
+    {
+      "accepted_train_supervised_tokens": 10000000,
+      "gate_id": "sealed_dataset_runtime_smoke",
+      "kind": "loss_mask_resume_hbm_and_distributed_parity_only",
+      "required_before": "learning_candidate_training",
+      "run_on": "exact_sealed_learning_candidate_dataset"
+    },
+    {
+      "accepted_train_supervised_tokens": 10000000,
+      "gate_id": "learning_candidate_10m",
+      "kind": "full_quality_benchmark",
+      "promotion_target": "fifty_million_stage",
+      "run_on": "exact_10m_sft_checkpoint"
+    },
+    {
+      "accepted_train_supervised_tokens": 50000000,
+      "gate_id": "first_release_candidate_50m",
+      "kind": "full_quality_benchmark",
+      "promotion_target": "one_hundred_million_stage",
+      "run_on": "exact_50m_sft_checkpoint"
+    },
+    {
+      "accepted_train_supervised_tokens": 100000000,
+      "gate_id": "quality_checkpoint_100m",
+      "kind": "full_quality_benchmark",
+      "promotion_target": "two_hundred_fifty_million_stage",
+      "run_on": "exact_100m_sft_checkpoint"
+    },
+    {
+      "accepted_train_supervised_tokens": 250000000,
+      "gate_id": "quality_checkpoint_250m",
+      "kind": "full_quality_benchmark",
+      "promotion_target": "five_hundred_million_ceiling_if_still_improving",
+      "run_on": "exact_250m_sft_checkpoint"
+    },
+    {
+      "accepted_train_supervised_tokens": 500000000,
+      "gate_id": "quality_ceiling_500m",
+      "kind": "full_quality_benchmark",
+      "promotion_target": "selected_release_final",
+      "run_on": "exact_500m_sft_checkpoint_if_reached"
+    },
+    {
+      "accepted_train_supervised_tokens": null,
+      "gate_id": "selected_release_final",
+      "kind": "full_release_benchmark_safety_red_team_and_serving_canary",
+      "required_before": "public_product_release",
+      "run_on": "smallest_stage_selected_by_frozen_decision_policy"
+    }
+  ],
+  "observed_at": "2026-08-07",
+  "reporting": {
+    "checkpoint_and_dataset_hash_binding_required": true,
+    "private_raw_outputs_required_for_human_review": true,
+    "raw_benchmark_prompts_or_model_outputs_in_git": false,
+    "response_hashes_and_aggregate_scores_required": true,
+    "stage_to_stage_delta_report_required": true
+  },
+  "schema_version": "lumi.sft-benchmark-gates.v0.1",
+  "status": "benchmark_schedule_frozen_planning_only_no_inference_or_sft_authorized"
+}

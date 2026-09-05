@@ -1,0 +1,72 @@
+{
+  "authorization_boundary": {
+    "dataset_or_shard_mutation": false,
+    "full_4b_checkpoint_restore": false,
+    "gpu_use": false,
+    "network_bytes": 0,
+    "production_sft": false,
+    "remote_action": false
+  },
+  "bindings": {
+    "cpu_smoke_report": {
+      "path": "evidence/lumi-4b-sft-cpu-correctness-smoke-v0.1.json",
+      "sha256": "6f38a2d41e8fa83f9170420fe3c75097c7f7566183c07709cb57129c470c6666"
+    },
+    "cpu_smoke_verification": {
+      "path": "evidence/lumi-4b-sft-cpu-correctness-smoke-verification-v0.1.json",
+      "sha256": "42027539d0336e04568fde216c65648a9111a765e78f407e2310e00090fd5096"
+    },
+    "encoded_manifest": {
+      "internal_sha256": "f159cbaeeeb5877078127804a138f65c32bb30e8c6870008a2402472c4a00108",
+      "path": "artifacts/lumi-sft-token-consistent-shards-v0.1/attempt-001/private/encoded/manifest.json",
+      "sha256": "92dc09947ae149d3f4727b125d5ab4251f7fd84f397738b3c43d95a9912e6565"
+    },
+    "implementation": {
+      "path": "src/lumi/posttraining_distributed_sft.py",
+      "sha256": "b747128310ceb83706b2b3d1842025c587b08fda681e6a7daf9e7d6786152f28"
+    },
+    "runner": {
+      "path": "scripts/train_distributed_sft.py",
+      "sha256": "33d9358e359815099c17dda60e1e76e9c522d05043e579756f6c23577cd20315"
+    },
+    "source_checkpoint": {
+      "manifest_sha256": "2aeb1e3352b7b31c3ab16babee514ba69166626c4292ae5ed594e7a42fe3fa91",
+      "path": "artifacts/lumi-sft-cpu-smoke-v0.1/source"
+    }
+  },
+  "limits": {
+    "additional_private_write_bytes": 536870912,
+    "encoded_record_reads": 16,
+    "local_runtime_minutes": 30,
+    "optimizer_steps_per_path": 2,
+    "processes": 2
+  },
+  "outputs": {
+    "reference": "artifacts/lumi-sft-distributed-cpu-preflight-v0.1/ddp-reference",
+    "resumed": "artifacts/lumi-sft-distributed-cpu-preflight-v0.1/ddp-resume",
+    "fsdp_reference": "artifacts/lumi-sft-distributed-cpu-preflight-v0.1/fsdp-reference",
+    "fsdp_resumed": "artifacts/lumi-sft-distributed-cpu-preflight-v0.1/fsdp-resume"
+  },
+  "schema_version": "lumi.sft-distributed-cpu-preflight-plan.v0.1",
+  "status": "authorized_local_cpu_preflight_only",
+  "training": {
+    "attention": "eager",
+    "backend": "gloo",
+    "gradient_accumulation_steps": 1,
+    "gradient_sync_mode": "last_microbatch",
+    "learning_rate": 0.0001,
+    "maximum_gradient_norm": 1.0,
+    "optimizer_profile": "grouped_adamw_beta2_0.95_v0.1",
+    "per_rank_batch_size": 1,
+    "precision": "fp32",
+    "seed": 2027,
+    "strategies": [
+      "ddp",
+      "fsdp_full_shard"
+    ],
+    "target_steps": 2,
+    "warmup_steps": 0,
+    "weight_decay": 0.01,
+    "world_size": 2
+  }
+}

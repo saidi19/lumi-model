@@ -14,9 +14,7 @@ from typing import Any, Protocol
 from .data_quality import normalize_for_matching
 
 SFT_SCHEMA_VERSION = "lumi.sft.v0.1"
-SUPPORTED_ROLES = frozenset(
-    {"assistant", "developer", "system", "tool", "tool_result", "user"}
-)
+SUPPORTED_ROLES = frozenset({"assistant", "developer", "system", "tool", "tool_result", "user"})
 TRAINING_ONLY_MARKERS = ("<|doc|>", "<|endofdoc|>")
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -29,6 +27,177 @@ _TOKEN_ASSIGNMENT = re.compile(
     r"\b(?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*"
     r"['\"]?[A-Za-z0-9_./+=-]{12,}",
     re.IGNORECASE,
+)
+
+_LEGACY_SOURCE_REGISTRY_BINDING = (
+    "configs/lumi-4b-sft-source-registry-v0.1.json",
+    "f73676bbfab84f9c421ff3eb611d8e395c0bdfb50a9fa87f5559d98ac74107c9",
+)
+_PRIVATE_RESEARCH_SOURCE_REGISTRY_BINDING = (
+    "configs/lumi-4b-sft-source-registry-v0.24.json",
+    "a7a2daec58bc08e5a8e11ecff79cea3a5db90d9b423eb6a55cba28559d74a6bb",
+)
+_PRIVATE_RESEARCH_INCLUDED_SOURCE_IDS = (
+    "allenai_prosocial_dialog_safety_candidate",
+    "amazon_massive_bn_bd_tool_canary",
+    "banglabridge_instructions_closure_canary",
+    "banglatlit_auxiliary_closure_canary",
+    "coherelabs_aya_bengali_closure_canary",
+    "coherelabs_aya_dataset",
+    "deepmind_mathematics_dataset",
+    "dmath",
+    "fiscalnote_billsum_writing_candidate",
+    "lumi_ai_assisted_gap_closure_canary_v0_1",
+    "lumi_ai_assisted_gap_closure_scaled_v0_2",
+    "lumi_ai_assisted_sft_v0_3",
+    "lumi_first_party_gpt_oss_teacher_canary_v0_1",
+    "lumi_first_party_multilingual_safety_tool_v0_6",
+    "lumi_first_party_teacher_canary_v0_1",
+    "lumi_safety_tool_sft_v0_1",
+    "nvidia_nemotron_post_training_tool_canary",
+    "nvidia_opencodeinstruct",
+    "openassistant_oasst1",
+    "openassistant_oasst2",
+)
+_PRIVATE_RESEARCH_EXCLUDED_SOURCE_IDS = (
+    "bigcode_self_oss_instruct_50k",
+    "huggingfaceh4_ultrachat_200k",
+    "lumi_ai_assisted_sft_v0_1",
+    "lumi_ai_assisted_sft_v0_2",
+    "lumi_owned_sft_v0_1",
+    "openr1_math_220k",
+    "salesforce_xlam_function_calling_60k",
+)
+_PRIVATE_RESEARCH_AI_SOURCE_CONTRACTS = {
+    "lumi_ai_assisted_gap_closure_canary_v0_1": {
+        "generation_method": "ai_authored_templates_with_local_deterministic_renderer",
+        "generator_id": "openai-codex-current-session",
+        "human_review_completed": False,
+        "human_written_from_scratch": False,
+        "model_assistance_used": True,
+        "owner_review_status": "not_required_for_nonproduction_canary",
+        "runtime_external_model_api_calls": 0,
+        "runtime_model_calls": 0,
+    },
+    "lumi_ai_assisted_gap_closure_scaled_v0_2": {
+        "generation_method": "ai_authored_templates_with_local_deterministic_scaled_renderer",
+        "generator_id": "openai-codex-current-session",
+        "human_review_completed": False,
+        "human_written_from_scratch": False,
+        "model_assistance_used": True,
+        "owner_review_status": "not_required_for_nonproduction_scaled_candidate",
+        "runtime_external_model_api_calls": 0,
+        "runtime_model_calls": 0,
+    },
+}
+_PRIVATE_RESEARCH_MIX_BINDINGS = {
+    "accepted_dataset_sha256": ("1a60f602648f45480dc7827d0cbe686d0e17fb3b28e476dbb7ef21986e4fd37e"),
+    "candidate_mix_report_sha256": (
+        "3fa0502a3d9c064224a1c11fc1c8429c0d5ca13d7dd1be8d42d539a681a92000"
+    ),
+    "candidate_mix_verification_sha256": (
+        "43db682ea4f28577f0d919df6160d9fc7339e56df8469737abc0569201365651"
+    ),
+}
+_PRIVATE_RESEARCH_EVALUATION_SPLIT_PROHIBITIONS = {
+    "deepmind_mathematics_dataset": ("test", "test_extra"),
+    "dmath": ("test",),
+    "fiscalnote_billsum_writing_candidate": ("ca_test", "test"),
+}
+_PRIVATE_RESEARCH_BENCHMARK_CONTRACT = {
+    "anchor_ngram_tokens": 8,
+    "minimum_anchor_matches": 2,
+    "registry": "data/benchmark-signatures-v0.1.jsonl.gz",
+    "registry_sha256": ("be02bdbd7f2c0e807c86cf9678eff86d711aaa34ffdc8e6ebb687a26220ffcbb"),
+}
+_PRIVATE_RESEARCH_PRESERVED_POLICY_SECTIONS = {
+    "allowed_languages": ["bn", "de", "en", "es", "fr", "hi", "multilingual"],
+    "allowed_licenses": [
+        "apache-2.0",
+        "cc-by-4.0",
+        "cc-by-sa-4.0",
+        "cc0-1.0",
+        "lumi-owned",
+        "mit",
+        "odc-by-1.0",
+        "public-domain",
+    ],
+    "allowed_splits": ["train", "validation"],
+    "benchmark_decontamination": _PRIVATE_RESEARCH_BENCHMARK_CONTRACT,
+    "chat_training": {
+        "assistant_only_loss": True,
+        "chat_template": "configs/lumi-4b-chat-template-v0.1.json",
+        "context_window": 4096,
+        "overlength_policy": "reject",
+        "packing_policy": "single_conversation_until_block_diagonal_verified",
+        "supervised_roles": ["assistant", "tool"],
+    },
+    "filters": {
+        "maximum_message_characters": 65_536,
+        "maximum_messages": 64,
+        "minimum_quality_score": 0.75,
+    },
+    "task_mix": {
+        "coding": 0.2,
+        "conversation": 0.05,
+        "factual_qa": 0.15,
+        "multilingual_bengali": 0.1,
+        "reasoning_math_science": 0.22,
+        "safety_helpfulness": 0.08,
+        "tool_api": 0.08,
+        "writing_summarization": 0.12,
+    },
+}
+_PRIVATE_RESEARCH_NOTES = {
+    "ai_generated_records_require_explicit_generator_and_human_review_status": True,
+    "ai_generated_records_require_owner_gate_before_production_promotion": True,
+    "base_binding": "configs/lumi-4b-final-base-binding-v0.1.json",
+    "private_research_machine_gap_rows_require_truthful_machine_provenance": True,
+    "private_research_nonproduction_scope_active": True,
+    "production_eligibility_remains_false_for_all_bound_sources": True,
+    "raw_training_text_in_git": False,
+    "target_tokens": "pending_base_checkpoint_evaluation",
+    "task_mix_status": "planning_target_not_a_dataset_claim",
+}
+_PRIVATE_RESEARCH_AI_PROVENANCE_KEYS = frozenset(
+    {
+        "consent_basis",
+        "content_sha256",
+        "generation_method",
+        "generator_id",
+        "human_written_from_scratch",
+        "model_assistance_used",
+        "runtime_external_model_api_calls",
+        "runtime_model_calls",
+        "transform_sha256",
+    }
+)
+_PRIVATE_RESEARCH_HUMAN_AUTHORSHIP_ALIASES = frozenset(
+    {
+        "fully_human_authored",
+        "human_authored",
+        "human_authorship_claimed",
+        "human_authorship_verified",
+        "human_written",
+    }
+)
+_LEARNING_CANDIDATE_KEYS = frozenset(
+    {
+        "accepted_dataset_sha256",
+        "ai_assisted_source_contracts",
+        "candidate_mix_report_sha256",
+        "candidate_mix_verification_sha256",
+        "excluded_source_ids",
+        "evaluation_split_prohibitions",
+        "external_distribution_allowed",
+        "included_source_ids",
+        "machine_only_gap_rows",
+        "production_dataset_seal_allowed",
+        "production_sft_allowed",
+        "registry_source_count",
+        "scope",
+        "seal_allowed",
+    }
 )
 
 
@@ -73,6 +242,7 @@ class SFTPolicy:
     source_registry_sha256: str
     supervised_roles: frozenset[str]
     task_mix: Mapping[str, float]
+    learning_candidate: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> SFTPolicy:
@@ -99,9 +269,8 @@ class SFTPolicy:
         if not 2 <= maximum_messages <= 256:
             raise ValueError("maximum_messages must be between 2 and 256")
         maximum_message_characters = filters.get("maximum_message_characters")
-        if (
-            isinstance(maximum_message_characters, bool)
-            or not isinstance(maximum_message_characters, int)
+        if isinstance(maximum_message_characters, bool) or not isinstance(
+            maximum_message_characters, int
         ):
             raise ValueError("maximum_message_characters must be an integer")
         if not 32 <= maximum_message_characters <= 1_000_000:
@@ -159,11 +328,32 @@ class SFTPolicy:
         if source_registry.get("required_for_filtering_and_seal") is not True:
             raise ValueError("SFT source registry must be required")
         source_registry_path = source_registry.get("path")
-        if source_registry_path != "configs/lumi-4b-sft-source-registry-v0.1.json":
-            raise ValueError("SFT source registry path changed")
         source_registry_sha256 = source_registry.get("sha256")
         if not _valid_sha256(source_registry_sha256):
             raise ValueError("SFT source registry SHA-256 is invalid")
+        learning_candidate = _validate_learning_candidate(value.get("learning_candidate"))
+        if learning_candidate is not None and any(
+            not _strict_json_equal(value.get(section), expected)
+            for section, expected in _PRIVATE_RESEARCH_PRESERVED_POLICY_SECTIONS.items()
+        ):
+            raise ValueError("private-research preserved policy section changed")
+        source_registry_binding = (source_registry_path, source_registry_sha256)
+        expected_registry_binding = (
+            _LEGACY_SOURCE_REGISTRY_BINDING
+            if learning_candidate is None
+            else _PRIVATE_RESEARCH_SOURCE_REGISTRY_BINDING
+        )
+        if source_registry_binding != expected_registry_binding:
+            raise ValueError("SFT source registry binding changed")
+        if learning_candidate is None:
+            if "contract_revision" in value:
+                raise ValueError("legacy SFT contract revision changed")
+        else:
+            notes = value.get("notes")
+            if value.get("contract_revision") != "v0.2" or not _strict_json_equal(
+                notes, _PRIVATE_RESEARCH_NOTES
+            ):
+                raise ValueError("private-research SFT contract notes changed")
 
         return cls(
             allowed_languages=frozenset(allowed_languages),
@@ -181,6 +371,7 @@ class SFTPolicy:
             source_registry_sha256=source_registry_sha256,
             supervised_roles=frozenset(raw_supervised_roles),
             task_mix=task_mix,
+            learning_candidate=learning_candidate,
         )
 
 
@@ -220,6 +411,111 @@ def _string_set(value: Any, field: str) -> set[str]:
     if len(set(value)) != len(value):
         raise ValueError(f"{field} entries must be unique")
     return set(value)
+
+
+def _strict_json_equal(actual: Any, expected: Any) -> bool:
+    """Compare JSON-like values without Python's bool/int equality aliasing."""
+
+    if isinstance(expected, Mapping):
+        return (
+            isinstance(actual, Mapping)
+            and set(actual) == set(expected)
+            and all(_strict_json_equal(actual[key], value) for key, value in expected.items())
+        )
+    if isinstance(expected, list):
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _strict_json_equal(actual_item, expected_item)
+                for actual_item, expected_item in zip(actual, expected, strict=True)
+            )
+        )
+    if type(expected) is bool:
+        return actual is expected
+    if type(expected) is int:
+        return type(actual) is int and actual == expected
+    if type(expected) is float:
+        return type(actual) is float and actual == expected
+    return type(actual) is type(expected) and actual == expected
+
+
+def _validate_learning_candidate(value: Any) -> Mapping[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != _LEARNING_CANDIDATE_KEYS:
+        raise ValueError("learning_candidate contract keys changed")
+    expected_flags = {
+        "external_distribution_allowed": False,
+        "production_dataset_seal_allowed": False,
+        "production_sft_allowed": False,
+        "registry_source_count": 27,
+        "scope": "private_research_nonproduction",
+        "seal_allowed": True,
+    }
+    if any(
+        not _strict_json_equal(value.get(key), expected) for key, expected in expected_flags.items()
+    ):
+        raise ValueError("learning_candidate scope changed")
+    ai_policy = value.get("machine_only_gap_rows")
+    if not _strict_json_equal(
+        ai_policy,
+        {
+            "allowed": True,
+            "completed_human_review_claim_allowed": False,
+            "human_authorship_claim_allowed": False,
+        },
+    ):
+        raise ValueError("learning_candidate machine-gap policy changed")
+    included = value.get("included_source_ids")
+    excluded = value.get("excluded_source_ids")
+    if (
+        not isinstance(included, list)
+        or tuple(included) != _PRIVATE_RESEARCH_INCLUDED_SOURCE_IDS
+        or not isinstance(excluded, list)
+        or tuple(excluded) != _PRIVATE_RESEARCH_EXCLUDED_SOURCE_IDS
+        or set(included) & set(excluded)
+        or len(included) + len(excluded) != value["registry_source_count"]
+    ):
+        raise ValueError("learning_candidate source partition changed")
+    for key, expected in _PRIVATE_RESEARCH_MIX_BINDINGS.items():
+        if value.get(key) != expected:
+            raise ValueError("learning_candidate candidate-mix binding changed")
+    ai_contracts = value.get("ai_assisted_source_contracts")
+    if not _strict_json_equal(ai_contracts, _PRIVATE_RESEARCH_AI_SOURCE_CONTRACTS):
+        raise ValueError("learning_candidate AI source contract changed")
+    evaluation_prohibitions = value.get("evaluation_split_prohibitions")
+    if (
+        not isinstance(evaluation_prohibitions, Mapping)
+        or {
+            source_id: tuple(splits)
+            for source_id, splits in evaluation_prohibitions.items()
+            if isinstance(splits, list)
+        }
+        != _PRIVATE_RESEARCH_EVALUATION_SPLIT_PROHIBITIONS
+        or len(evaluation_prohibitions) != len(_PRIVATE_RESEARCH_EVALUATION_SPLIT_PROHIBITIONS)
+    ):
+        raise ValueError("learning_candidate evaluation exclusions changed")
+    return {
+        "accepted_dataset_sha256": value["accepted_dataset_sha256"],
+        "ai_assisted_source_contracts": {
+            source_id: dict(contract) for source_id, contract in sorted(ai_contracts.items())
+        },
+        "candidate_mix_report_sha256": value["candidate_mix_report_sha256"],
+        "candidate_mix_verification_sha256": value["candidate_mix_verification_sha256"],
+        "excluded_source_ids": frozenset(excluded),
+        "evaluation_split_prohibitions": {
+            source_id: frozenset(splits) for source_id, splits in evaluation_prohibitions.items()
+        },
+        "external_distribution_allowed": False,
+        "included_source_ids": frozenset(included),
+        "machine_only_gap_rows": dict(ai_policy),
+        "production_dataset_seal_allowed": False,
+        "production_sft_allowed": False,
+        "registry_source_count": 27,
+        "scope": "private_research_nonproduction",
+        "seal_allowed": True,
+    }
 
 
 def load_sft_policy(path: str | Path) -> SFTPolicy:
@@ -356,13 +652,13 @@ def evaluate_sft_record(
         reasons.append("record_id")
         record_id = None
     split = record.get("split")
-    if split not in policy.allowed_splits:
+    if not isinstance(split, str) or split not in policy.allowed_splits:
         reasons.append("split")
     language = record.get("language")
-    if language not in policy.allowed_languages:
+    if not isinstance(language, str) or language not in policy.allowed_languages:
         reasons.append("language")
     task_category = record.get("task_category")
-    if task_category not in policy.task_mix:
+    if not isinstance(task_category, str) or task_category not in policy.task_mix:
         reasons.append("task_category")
 
     source = record.get("source")
@@ -379,11 +675,26 @@ def evaluate_sft_record(
         revision = source.get("revision")
         if not isinstance(source_id, str) or not source_id:
             reasons.append("source_id")
+        if policy.learning_candidate is not None and (
+            not isinstance(source_id, str)
+            or source_id not in policy.learning_candidate["included_source_ids"]
+        ):
+            reasons.append("learning_candidate_source_not_included")
+        if (
+            policy.learning_candidate is not None
+            and isinstance(source_id, str)
+            and isinstance(split, str)
+            and split
+            in policy.learning_candidate["evaluation_split_prohibitions"].get(
+                source_id, frozenset()
+            )
+        ):
+            reasons.append("learning_candidate_evaluation_split_prohibited")
         if not isinstance(dataset_id, str) or not dataset_id:
             reasons.append("source_dataset_id")
         if not isinstance(source.get("document_id"), str) or not source["document_id"]:
             reasons.append("source_document_id")
-        if license_id not in policy.allowed_licenses:
+        if not isinstance(license_id, str) or license_id not in policy.allowed_licenses:
             reasons.append("license")
         if not isinstance(revision, str) or (
             _GIT_SHA.fullmatch(revision) is None and _SHA256.fullmatch(revision) is None
@@ -391,7 +702,18 @@ def evaluate_sft_record(
             reasons.append("source_revision")
         if not isinstance(source.get("uri"), str) or not source["uri"]:
             reasons.append("source_uri")
-        if source_registry is not None:
+        if source_registry is not None and all(
+            isinstance(item, str)
+            for item in (
+                dataset_id,
+                language,
+                license_id,
+                revision,
+                source_id,
+                split,
+                task_category,
+            )
+        ):
             reasons.extend(
                 source_registry.record_reasons(
                     dataset_id=dataset_id,
@@ -403,6 +725,8 @@ def evaluate_sft_record(
                     task_category=task_category,
                 )
             )
+        elif source_registry is not None:
+            reasons.append("source_registry_record_invalid")
 
     provenance = record.get("provenance")
     if not isinstance(provenance, Mapping):
@@ -411,13 +735,51 @@ def evaluate_sft_record(
         for field in ("content_sha256", "transform_sha256"):
             if not _valid_sha256(provenance.get(field)):
                 reasons.append(f"provenance_{field}")
-        if provenance.get("consent_basis") not in {
+        consent_basis = provenance.get("consent_basis")
+        if not isinstance(consent_basis, str) or consent_basis not in {
             "document_license",
             "first_party_rights_declaration",
             "public_domain",
             "source_level_open_license",
         }:
             reasons.append("consent_basis")
+
+    if policy.learning_candidate is not None:
+        ai_contract = (
+            policy.learning_candidate["ai_assisted_source_contracts"].get(source_id)
+            if isinstance(source_id, str)
+            else None
+        )
+        if ai_contract is not None:
+            if not isinstance(provenance, Mapping):
+                reasons.append("learning_candidate_ai_provenance")
+            else:
+                if set(provenance) != _PRIVATE_RESEARCH_AI_PROVENANCE_KEYS:
+                    reasons.append("learning_candidate_ai_provenance_keys")
+                for field in ("generation_method", "generator_id"):
+                    if not _strict_json_equal(provenance.get(field), ai_contract[field]):
+                        reasons.append(f"learning_candidate_ai_provenance:{field}")
+                for field in ("human_written_from_scratch", "model_assistance_used"):
+                    if provenance.get(field) is not ai_contract[field]:
+                        reasons.append(f"learning_candidate_ai_provenance:{field}")
+                for field in (
+                    "runtime_external_model_api_calls",
+                    "runtime_model_calls",
+                ):
+                    if (
+                        type(provenance.get(field)) is not int
+                        or provenance.get(field) != ai_contract[field]
+                    ):
+                        reasons.append(f"learning_candidate_ai_provenance:{field}")
+                if set(provenance) & _PRIVATE_RESEARCH_HUMAN_AUTHORSHIP_ALIASES:
+                    reasons.append("learning_candidate_ai_human_authorship_claim")
+            owner_review = record.get("owner_review")
+            expected_owner_review = {
+                "human_review_completed": ai_contract["human_review_completed"],
+                "status": ai_contract["owner_review_status"],
+            }
+            if not _strict_json_equal(owner_review, expected_owner_review):
+                reasons.append("learning_candidate_ai_owner_review")
 
     quality = record.get("quality")
     if not isinstance(quality, Mapping):

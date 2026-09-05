@@ -115,6 +115,15 @@ def validate_evaluation_plan(value: Mapping[str, Any]) -> dict[str, Any]:
 
     if value.get("schema_version") != EVALUATION_PLAN_SCHEMA_VERSION:
         raise ValueError("unsupported evaluation plan schema")
+    baseline = value.get("base_baseline")
+    if not isinstance(baseline, Mapping):
+        raise ValueError("evaluation plan needs the sealed base baseline")
+    if baseline.get("binding") != "configs/lumi-4b-final-base-binding-v0.1.json":
+        raise ValueError("evaluation base binding changed")
+    if baseline.get("status") != "sealed":
+        raise ValueError("base baseline is not sealed")
+    if _SHA256.fullmatch(str(baseline.get("frozen_evaluation_report_sha256", ""))) is None:
+        raise ValueError("base frozen evaluation SHA-256 is invalid")
     suites = value.get("suites")
     if not isinstance(suites, Mapping) or not suites:
         raise ValueError("evaluation plan suites must be non-empty")

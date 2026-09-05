@@ -34,6 +34,13 @@ def test_plan_and_owned_cases_validate() -> None:
     cases = _load_cases()
     assert len(cases) == 6
     assert {case.suite for case in cases} == set(plan["suites"])
+    language = next(
+        adapter
+        for adapter in plan["benchmark_adapters"]
+        if adapter["id"] == "response-language-routing"
+    )
+    assert language["runner"] == "posttraining_language"
+    assert len(language["plan_sha256"]) == 64
 
 
 def test_response_scoring_retains_only_hash_and_check_results() -> None:

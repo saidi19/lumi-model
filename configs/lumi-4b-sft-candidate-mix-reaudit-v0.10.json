@@ -1,0 +1,119 @@
+{
+  "authorization": {
+    "candidate_registry_change_authorized": false,
+    "dataset_acquisition_authorized": false,
+    "dataset_seal_authorized": false,
+    "external_api_authorized": false,
+    "external_api_spend_authorized": false,
+    "external_distribution_authorized": false,
+    "local_candidate_read_authorized": true,
+    "local_raw_text_free_reaudit_authorized": true,
+    "network_access_authorized": false,
+    "paid_gpu_authorized": false,
+    "production_sft_authorized": false,
+    "purpose": "registry_v0_15_full_local_candidate_mix_reaudit_only",
+    "source_promotion_authorized": false,
+    "unrelated_access_authorized": false
+  },
+  "benchmark_decontamination": {
+    "anchor_ngram_tokens": 8,
+    "minimum_anchor_matches": 2,
+    "registry": "data/benchmark-signatures-v0.3.jsonl.gz",
+    "registry_sha256": "1ffb5e938ab28c2fc876b9efd6c6ed59059f1e85aed2c396c024ae5925a4745e"
+  },
+  "bindings": {
+    "implementation": {
+      "path": "src/lumi/posttraining_candidate_mix_reaudit_v10.py",
+      "sha256": "40030e1082be70bd359044318287913967b76e7d54feda60f5eff74c7060b3d7"
+    },
+    "predecessor_plan": {
+      "path": "configs/lumi-4b-sft-candidate-mix-reaudit-v0.9.json",
+      "sha256": "15900d198513a65300aa19e77e505d030130195df9f4a14e00eab7049e158736"
+    },
+    "predecessor_report": {
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-v0.9.json",
+      "sha256": "ab9d3575ae7de7c10858ef4abb72d667f986e1b514db49601eb044935008cd60"
+    },
+    "predecessor_verification": {
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-verification-v0.9.json",
+      "sha256": "f6d9c813945507e117799d9469ca0ce919234e37afd61c05d0cee6db3e252b61"
+    },
+    "runner": {
+      "path": "scripts/reaudit_sft_candidate_mix_v10.py",
+      "sha256": "ce3aebe6819aad8da916c0c92b6055a062a3897ba6428811df5c665bc2e30c8d"
+    },
+    "source_registry": {
+      "path": "configs/lumi-4b-sft-source-registry-v0.15.json",
+      "sha256": "de81a51f0288b4851ff5ea4ca0598ddcf4936b2bf2c4127ab2b1c0d6deb1a4de"
+    },
+    "teacher_candidate": {
+      "path": "../lumi-artifacts/4b-sft-first-party-teacher-canary-v0.1/e80b7aa7936b/attempt-018/private/canonical-candidate-v0.1.jsonl",
+      "sha256": "fcb0720ea178157ffbd0a2ece6eee647aea8d46fcd9a896251806f14996076e7"
+    },
+    "teacher_promotion_plan": {
+      "path": "configs/lumi-4b-sft-first-party-teacher-source-promotion-v0.1.json",
+      "sha256": "b9bddc02f29a4ac0b7118c05a82a5c241e451d27a9cd35f176d197e4265045dc"
+    },
+    "teacher_promotion_receipt": {
+      "path": "evidence/lumi-4b-sft-first-party-teacher-source-promotion-v0.1.json",
+      "sha256": "1683a001256346afa56501aba5d6d13af0cf84dfa5d1963a2d17c71e568edb5e"
+    },
+    "teacher_promotion_verification": {
+      "path": "evidence/lumi-4b-sft-first-party-teacher-source-promotion-verification-v0.1.json",
+      "sha256": "e23cdc9592cc208537a98f63895d3910af67abfa91160409fe7489b200490a2a"
+    },
+    "test": {
+      "path": "tests/test_candidate_mix_reaudit_v10.py",
+      "sha256": "64a8381d4d81d8eef81ea0d1de0930cec4544cf8e3e590c35cda7347d8c93d30"
+    },
+    "verifier": {
+      "path": "scripts/verify_sft_candidate_mix_reaudit_v10.py",
+      "sha256": "cc78dd569b02e4db5f52f1a54843ae4117404f546d43fa7c017c08f6d94f7d7e"
+    }
+  },
+  "limits": {
+    "maximum_candidate_records_read": 300000,
+    "maximum_network_bytes": 0,
+    "maximum_runtime_minutes": 180
+  },
+  "near_duplicate_policy": {
+    "comparison_unit": "role_tagged_full_conversation",
+    "num_perm": 128,
+    "package_version": "2.0.0",
+    "scheme": "affine32",
+    "seed": 1,
+    "shingle_tokens": 5,
+    "threshold": 0.9
+  },
+  "observed_at": "2026-08-09",
+  "output": {
+    "production_promotion_permitted": false,
+    "raw_training_text_in_outputs": false,
+    "report_path": "evidence/lumi-4b-sft-candidate-mix-reaudit-v0.10.json",
+    "verification_path": "evidence/lumi-4b-sft-candidate-mix-reaudit-verification-v0.10.json"
+  },
+  "schema_version": "lumi.sft-candidate-mix-reaudit-plan.v0.10",
+  "source_addition": {
+    "candidate_binding": "teacher_candidate",
+    "candidate_file_sha256": "fcb0720ea178157ffbd0a2ece6eee647aea8d46fcd9a896251806f14996076e7",
+    "expected_by_split": {
+      "train": {
+        "records": 60,
+        "supervised_tokens": 2002
+      },
+      "validation": {
+        "records": 20,
+        "supervised_tokens": 799
+      }
+    },
+    "expected_pending_owner_review_rows": 0,
+    "language_mode_policy": "teacher_record_id_suffix_v0.1",
+    "promotion_binding": "teacher_promotion_receipt",
+    "registry_status": "candidate_eligible",
+    "revision": "c1c9c2d09f1680c2e18eb2c7570994c141501f40732bd8b2b890015c97a88634",
+    "source_id": "lumi_first_party_teacher_canary_v0_1",
+    "split_location": "top_level",
+    "token_evidence_binding": "teacher_promotion_receipt"
+  },
+  "status": "authorized_registry_v0_15_full_local_reaudit_no_production_action"
+}

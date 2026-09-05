@@ -10,6 +10,7 @@ from pathlib import Path
 
 from lumi.data_quality import BenchmarkRegistry
 from lumi.posttraining_data import filter_sft_records, load_sft_policy
+from lumi.posttraining_sources import load_sft_source_registry
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,10 +57,19 @@ def main() -> None:
 
     policy = load_sft_policy(args.config)
     registry = BenchmarkRegistry(policy.benchmark_decontamination, args.repository_root)
+    source_registry = load_sft_source_registry(
+        args.repository_root / policy.source_registry_path,
+        allowed_licenses=policy.allowed_licenses,
+        allowed_languages=policy.allowed_languages,
+        allowed_splits=policy.allowed_splits,
+        allowed_tasks=frozenset(policy.task_mix),
+        expected_sha256=policy.source_registry_sha256,
+    )
     accepted, report = filter_sft_records(
         _read_jsonl(args.input),
         policy=policy,
         benchmark_registry=registry,
+        source_registry=source_registry,
     )
     if args.accepted_output is not None:
         args.accepted_output.parent.mkdir(parents=True, exist_ok=True)

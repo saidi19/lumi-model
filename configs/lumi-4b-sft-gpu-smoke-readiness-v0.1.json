@@ -1,0 +1,122 @@
+{
+  "schema_version": "lumi.sft-gpu-smoke-readiness-plan.v0.1",
+  "authorization_boundary": {
+    "gpu_authorized": false,
+    "training_authorized": false,
+    "network_authorized": false,
+    "remote_or_instance_action_authorized": false,
+    "inference_authorized": false,
+    "checkpoint_content_read_authorized": false,
+    "dataset_content_read_authorized": false,
+    "production_eligible": false,
+    "production_seal_authorized": false,
+    "promotion_authorized": false
+  },
+  "cpu_plan_sha256": "3d1c158efc4a7fc7fc7d0e72e69a2c13339848b48757d380bcc2b7115bc0bf9b",
+  "bindings": {
+    "final_base": {
+      "path": "configs/lumi-4b-final-base-binding-v0.1.json",
+      "sha256": "1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172"
+    },
+    "distributed_report": {
+      "path": "evidence/lumi-4b-sft-distributed-cpu-preflight-v0.2.json",
+      "sha256": "9ea2175b363a59fad57db2b6f5fbc55350d1cf849473b4d0543531ef2c7d8a9a"
+    },
+    "distributed_verification": {
+      "path": "evidence/lumi-4b-sft-distributed-cpu-preflight-verification-v0.2.json",
+      "sha256": "f019502acb5784686a91897fcfbc26142c00132edc3e589db3f777dc70523713"
+    },
+    "source_registry": {
+      "path": "configs/lumi-4b-sft-source-registry-v0.24.json",
+      "sha256": "a7a2daec58bc08e5a8e11ecff79cea3a5db90d9b423eb6a55cba28559d74a6bb"
+    },
+    "exporter": {
+      "path": "src/lumi/distributed_export.py",
+      "sha256": "0a415616186fb399d006d7cd116dbc3acf849a530a97f1936dfb6a696ab059a3"
+    },
+    "implementation": {
+      "path": "src/lumi/posttraining_gpu_smoke_readiness_v1.py",
+      "sha256": "76ce0086062da1796a11ffd8c31192ea46ba75f3a540c9b2254df883f2981afd"
+    },
+    "runner": {
+      "path": "scripts/check_sft_gpu_smoke_readiness_v1.py",
+      "sha256": "f099a35da7260b7bbb03391655fe53de81759db7713d5530eb02a2a146a341a2"
+    },
+    "tests": {
+      "path": "tests/test_sft_gpu_smoke_readiness_v1.py",
+      "sha256": "77ef66b4b56e234396cc8ef9cb9d189c66453d6c43a007d6f1d8c1d587761659"
+    }
+  },
+  "launch_draft": {
+    "status": "non_executable_research_only_design",
+    "scope": "private_research_nonproduction",
+    "world_size": 8,
+    "strategy": "fsdp_full_shard",
+    "device": "cuda",
+    "backend": "nccl",
+    "precision": "bf16",
+    "attention_implementation": "eager",
+    "record_limit": 8,
+    "per_rank_batch_size": 1,
+    "gradient_accumulation_steps": 1,
+    "context_window": 4096,
+    "target_steps": 2,
+    "learning_rate": 0.00001,
+    "weight_decay": 0.01,
+    "maximum_gradient_norm": 1.0,
+    "lr_schedule": "cosine",
+    "warmup_steps": 0,
+    "minimum_learning_rate_ratio": 0.1,
+    "optimizer_profile": "grouped_adamw_beta2_0.95_v0.1",
+    "checkpoint_steps": 1,
+    "seed": 2027,
+    "pad_to_multiple_of": 8,
+    "gradient_sync_mode": "last_microbatch",
+    "sequence": [
+      {
+        "run": "reference",
+        "from_step": 0,
+        "stop_step": 2,
+        "resume": false
+      },
+      {
+        "run": "resumed",
+        "from_step": 0,
+        "stop_step": 1,
+        "resume": false
+      },
+      {
+        "run": "resumed",
+        "from_step": 1,
+        "stop_step": 2,
+        "resume": true
+      }
+    ],
+    "repeat_prefix_across_epochs": true,
+    "quality_or_representativeness_claim": false,
+    "cross_conversation_packing": false,
+    "retries_after_started_launch": 0,
+    "executable_argv": null,
+    "host": null,
+    "runtime_digest": null,
+    "source_hf_checkpoint": null,
+    "source_hf_checksum_manifest_sha256": null,
+    "relocated_encoded_metadata_sha256": null,
+    "launch_authorization": null,
+    "maximum_combined_runtime_minutes": null,
+    "maximum_cost_usd": null,
+    "maximum_host_ram_bytes": null,
+    "maximum_per_gpu_memory_bytes": null,
+    "maximum_private_write_bytes": null,
+    "maximum_transfer_bytes": null,
+    "maximum_checkpoint_read_bytes": null
+  },
+  "pending_prelaunch_gates": [
+    "final_4b_hf_import_receipt_and_exact_checksum_manifest_unbound",
+    "sft_specific_authorization_and_bounded_launcher_not_integrated",
+    "target_host_runtime_hardware_and_total_resource_caps_unbound",
+    "target_host_content_verified_shard_relocation_receipt_unbound",
+    "cuda_mask_precision_resume_acceptance_and_fault_tests_not_frozen",
+    "separate_exact_gpu_remote_execution_approval_not_granted"
+  ]
+}

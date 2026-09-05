@@ -1,0 +1,204 @@
+{
+  "schema_version": "lumi.sft-rights-clear-closure-preflight-plan.v0.1",
+  "status": "authorized_official_metadata_only_preflight",
+  "observed_at": "2026-08-09",
+  "authorization": {
+    "bulk_dataset_download_authorized": false,
+    "candidate_registry_change_authorized": false,
+    "dataset_seal_authorized": false,
+    "external_api_authorized": false,
+    "external_distribution_authorized": false,
+    "gpu_authorized": false,
+    "official_metadata_lookup_authorized": true,
+    "production_promotion_authorized": false,
+    "sft_training_authorized": false
+  },
+  "limits": {
+    "maximum_metadata_network_bytes": 16777216,
+    "maximum_runtime_minutes": 120,
+    "payload_bytes": 0
+  },
+  "bindings": {
+    "candidate_mix_reaudit": {
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-v0.10.json",
+      "sha256": "bc204200a01450cdb522f9b4890be9f4da3e063ae2f3fdbfcae06c32077a88be"
+    },
+    "implementation": {
+      "path": "src/lumi/posttraining_rights_clear_closure_preflight.py",
+      "sha256": "ace8df3963f121f04227d6da0d8853eaa82e4feda2cfdd9adfd75d5f955276f3"
+    },
+    "runner": {
+      "path": "scripts/check_sft_rights_clear_closure_preflight.py",
+      "sha256": "07f238a66be866374de6d430bfcedd4095ed212325937a26199a5274f771f67d"
+    },
+    "source_registry": {
+      "path": "configs/lumi-4b-sft-source-registry-v0.15.json",
+      "sha256": "de81a51f0288b4851ff5ea4ca0598ddcf4936b2bf2c4127ab2b1c0d6deb1a4de"
+    },
+    "teacher_strategy_reconciliation": {
+      "path": "evidence/lumi-4b-sft-teacher-strategy-reconciliation-v0.1.json",
+      "sha256": "8656a0d852f08832f98ae94df73cee2b623428c908e23c6275db6933864cf926"
+    },
+    "teacher_strategy_reconciliation_verification": {
+      "path": "evidence/lumi-4b-sft-teacher-strategy-reconciliation-verification-v0.1.json",
+      "sha256": "27cdf3ea0f5215eb7b60554663bd4553e6cebb17e2b8226ff4cbc7ecfb0c3833"
+    },
+    "verifier": {
+      "path": "scripts/verify_sft_rights_clear_closure_preflight.py",
+      "sha256": "d8165baf80ae3f4e4ed7825ba70d8dd596baf596f20968e91455fc6d8bf725c2"
+    }
+  },
+  "current_mix": {
+    "accepted_train_supervised_tokens": 7256670,
+    "gap_to_10m_train_supervised_tokens": 2743330,
+    "minimum_task_closure_supervised_tokens": 2966672,
+    "source_cap": 0.35,
+    "task_floor_gaps": {
+      "coding": 0,
+      "conversation": 0,
+      "factual_qa": 100131,
+      "multilingual_bengali": 481837,
+      "reasoning_math_science": 0,
+      "safety_helpfulness": 789105,
+      "tool_api": 790186,
+      "writing_summarization": 805413
+    },
+    "language_floor_gaps": {
+      "banglish": 793248,
+      "bengali_script": 474145,
+      "english": 1081282,
+      "natural_code_switching": 394655
+    }
+  },
+  "sources": [
+    {
+      "source_id": "nvidia_nemotron_post_training_v1",
+      "repository": "nvidia/Nemotron-Post-Training-Dataset-v1",
+      "official_url": "https://huggingface.co/datasets/nvidia/Nemotron-Post-Training-Dataset-v1",
+      "revision": "74e23eb6f830fef4a9e96a92f6f6262214cbb9a8",
+      "declared_license": "cc-by-4.0",
+      "disposition": "eligible_for_bounded_payload_canary",
+      "eligible_splits": [
+        "chat",
+        "tool_calling"
+      ],
+      "target_retained_train_supervised_tokens_ceiling": 1550000,
+      "counts_toward_general_assistant_closure": true,
+      "required_filters": [
+        "retain_only_rows_with_explicit_cc_by_4_0_license",
+        "exclude_empty_or_externally_referenced_prompts",
+        "require_complete_user_assistant_or_tool_result_sequences",
+        "reject_synthetic_tool_results_without_bound_tool_response",
+        "quality_safety_pii_secret_dedup_decontamination_and_4k_fit"
+      ]
+    },
+    {
+      "source_id": "coherelabs_aya_collection_language_split_bengali",
+      "repository": "CohereLabs/aya_collection_language_split",
+      "official_url": "https://huggingface.co/datasets/CohereLabs/aya_collection_language_split",
+      "revision": "a3af2fde4b4cb5b2775830b11244a1a20b5f004f",
+      "declared_license": "apache-2.0",
+      "disposition": "eligible_for_bounded_payload_canary",
+      "eligible_splits": [
+        "bengali/train"
+      ],
+      "target_retained_train_supervised_tokens_ceiling": 1300000,
+      "counts_toward_general_assistant_closure": true,
+      "required_filters": [
+        "reserve_test_and_validation_splits",
+        "preserve_constituent_source_provenance",
+        "exclude_constituents_without_compatible_upstream_rights",
+        "require_natural_bengali_instruction_response_quality",
+        "quality_safety_pii_secret_dedup_decontamination_and_4k_fit"
+      ]
+    },
+    {
+      "source_id": "aplycaebous_banglatlit",
+      "repository": "aplycaebous/BanglaTLit",
+      "official_url": "https://huggingface.co/datasets/aplycaebous/BanglaTLit",
+      "revision": "22cacbaac72bf6ee828f9d6be1e28bfd7a84843f",
+      "declared_license": "mit",
+      "disposition": "eligible_auxiliary_transliteration_canary_only",
+      "eligible_splits": [
+        "BanglaTLit_train.csv"
+      ],
+      "target_retained_train_supervised_tokens_ceiling": 300000,
+      "counts_toward_general_assistant_closure": false,
+      "required_filters": [
+        "reserve_published_test_and_validation_objects",
+        "treat_only_as_transliteration_or_orthography_supervision",
+        "do_not_label_as_general_chat_safety_tool_or_writing_data",
+        "quality_pii_secret_dedup_decontamination_and_4k_fit"
+      ]
+    },
+    {
+      "source_id": "subhajitmahata84_banglabridge_instructions",
+      "repository": "subhajitmahata84/banglabridge-instructions",
+      "official_url": "https://huggingface.co/datasets/subhajitmahata84/banglabridge-instructions",
+      "revision": "b5ace9b2e56702cfd3aa5fe2e8c3870f67f57300",
+      "declared_license": "cc-by-4.0",
+      "disposition": "eligible_small_banglish_quality_anchor_canary",
+      "eligible_splits": [
+        "banglish_finetune.adapted.jsonl"
+      ],
+      "target_retained_train_supervised_tokens_ceiling": 50000,
+      "counts_toward_general_assistant_closure": true,
+      "required_filters": [
+        "reserve_or_rebuild_a_semantically_isolated_validation_split",
+        "verify_original_or_deterministic_template_provenance_per_row",
+        "replace_region_specific_emergency_numbers_before_use",
+        "native_banglish_quality_owner_review",
+        "quality_safety_pii_secret_dedup_decontamination_and_4k_fit"
+      ]
+    }
+  ],
+  "rejected_or_quarantined_sources": [
+    {
+      "repository": "OdiaGenAI/all_combined_bengali_252k",
+      "decision": "ineligible_for_product_sft",
+      "reason": "declared_cc_by_nc_sa_4_0_is_noncommercial"
+    },
+    {
+      "repository": "kamruzzaman-asif/bangla-instruction-dataset",
+      "decision": "ineligible_as_wholesale_compilation",
+      "reason": "aggregate_license_does_not_override_restrictive_upstreams"
+    },
+    {
+      "repository": "istiaqfuad/bangla-english-banglish-pairs",
+      "decision": "quarantined_from_sft_closure",
+      "reason": "contrastive_embedding_format_and_upstream_license_conflict"
+    },
+    {
+      "repository": "mdsajjadullah/banglish-sentiment-2026",
+      "decision": "ineligible_for_general_assistant_closure",
+      "reason": "classification_only_synthetic_text_not_assistant_responses"
+    }
+  ],
+  "family_projection": {
+    "projected_total_train_supervised_tokens_ceiling": 10456670,
+    "nvidia_family": {
+      "current_tokens": 2100077,
+      "additional_ceiling": 1550000,
+      "projected_share": 0.34906686
+    },
+    "coherelabs_aya_family": {
+      "current_tokens": 513379,
+      "additional_ceiling": 1300000,
+      "projected_share": 0.1734184
+    },
+    "banglatlit_family": {
+      "current_tokens": 0,
+      "additional_ceiling": 300000,
+      "projected_share": 0.02868982
+    },
+    "banglabridge_family": {
+      "current_tokens": 0,
+      "additional_ceiling": 50000,
+      "projected_share": 0.00478164
+    }
+  },
+  "output": {
+    "report_path": "evidence/lumi-4b-sft-rights-clear-closure-preflight-v0.1.json",
+    "verification_path": "evidence/lumi-4b-sft-rights-clear-closure-preflight-verification-v0.1.json"
+  }
+}
