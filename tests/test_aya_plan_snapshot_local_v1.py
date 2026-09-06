@@ -104,15 +104,34 @@ class AyaPlanLocalTests(unittest.TestCase):
             self.assertIs(sys.modules[cli.MODULE_NAME], existing)
 
     def test_projection_is_removed_after_a_pytest_failure(self):
-        module = cli.synthetic_module()
-        fake_pytest = Mock()
-        fake_pytest.main.return_value = 1
-        with self.assertRaises(self.io.Stop):
-            cli.run_projected_test(self.io, fake_pytest, module)
-        self.assertNotIn(cli.MODULE_NAME, sys.modules)
-        args = fake_pytest.main.call_args.args[0]
-        for flag in ("--noconftest", "--assert=plain", "no:cacheprovider", "no:faulthandler"):
-            self.assertIn(flag, args)
+        # Full pytest collection may already have loaded the original module.
+        # Exercise the fresh-namespace branch without removing that shared state.
+        for preloaded in (False, True):
+            with self.subTest(preloaded=preloaded), patch.dict(sys.modules):
+                existing = types.ModuleType(cli.MODULE_NAME)
+                if preloaded:
+                    sys.modules[cli.MODULE_NAME] = existing
+                else:
+                    sys.modules.pop(cli.MODULE_NAME, None)
+                before = sys.modules.get(cli.MODULE_NAME)
+                with patch.dict(sys.modules):
+                    sys.modules.pop(cli.MODULE_NAME, None)
+                    module = cli.synthetic_module()
+                    fake_pytest = Mock()
+                    fake_pytest.main.return_value = 1
+                    with self.assertRaises(self.io.Stop):
+                        cli.run_projected_test(self.io, fake_pytest, module)
+                    fake_pytest.main.assert_called_once()
+                    self.assertNotIn(cli.MODULE_NAME, sys.modules)
+                    args = fake_pytest.main.call_args.args[0]
+                    for flag in (
+                        "--noconftest",
+                        "--assert=plain",
+                        "no:cacheprovider",
+                        "no:faulthandler",
+                    ):
+                        self.assertIn(flag, args)
+                self.assertIs(sys.modules.get(cli.MODULE_NAME), before)
 
     def test_cleanup_failure_cannot_publish_success_and_deadline_is_cancelled(self):
         for failure in (OSError("SYNTHETIC_SECRET"), self.io.Stop("input_changed"), None):

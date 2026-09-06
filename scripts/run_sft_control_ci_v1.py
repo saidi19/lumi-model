@@ -29,6 +29,7 @@ SUITES = (
 EXPECTED_TESTS = 273
 TIMEOUT_SECONDS = 120
 MAXIMUM_REPORT_BYTES = 16_384
+MAXIMUM_FAILURE_CASES = 32
 CHILD_MODE = "--fixed-suite-child"
 SCHEMA = "lumi.sft-control-ci.v0.1"
 FORBIDDEN_MODULES = ("site", "torch", "transformers", "tokenizers", "safetensors", "numpy")
@@ -36,6 +37,10 @@ FORBIDDEN_MODULES = ("site", "torch", "transformers", "tokenizers", "safetensors
 
 class ControlCIError(ValueError):
     """Internal callers provide fixed codes, never exception or source text."""
+
+    def __init__(self, code: str, diagnostic: dict | None = None):
+        super().__init__(code)
+        self.diagnostic = diagnostic
 
 
 def require(condition: bool, code: str) -> None:
@@ -66,25 +71,53 @@ class DiscardText:
 class AggregateResult(unittest.TestResult):
     """Keep fixed counters instead of traceback strings, test IDs or reasons."""
 
+    def __init__(self):
+        super().__init__()
+        self.diagnostics = []
+        self.truncated = False
+
+    def _record(self, kind, err=None):
+        if len(self.diagnostics) >= MAXIMUM_FAILURE_CASES:
+            self.truncated = True
+            return
+        category = "none"
+        if err is not None:
+            category = "other"
+            for expected, value in (
+                (AssertionError, "assertion"),
+                ((TimeoutError, subprocess.TimeoutExpired), "timeout"),
+                (OSError, "os_error"),
+            ):
+                if issubclass(err[0], expected):
+                    category = value
+                    break
+        self.diagnostics.append({"test_index": self.testsRun, "kind": kind, "category": category})
+
     def addFailure(self, test, err) -> None:
         self.failures.append(None)
+        self._record("failure", err)
 
     def addError(self, test, err) -> None:
         self.errors.append(None)
+        self._record("error", err)
 
     def addSkip(self, test, reason) -> None:
         self.skipped.append(None)
+        self._record("skip")
 
     def addExpectedFailure(self, test, err) -> None:
         self.expectedFailures.append(None)
+        self._record("expected_failure", err)
 
     def addUnexpectedSuccess(self, test) -> None:
         self.unexpectedSuccesses.append(None)
+        self._record("unexpected_success")
 
     def addSubTest(self, test, subtest, err) -> None:
         if err is not None:
             target = self.failures if issubclass(err[0], test.failureException) else self.errors
             target.append(None)
+            self._record("subtest_failure" if target is self.failures else "subtest_error", err)
 
 
 def counters(result: unittest.TestResult) -> dict:
@@ -100,7 +133,12 @@ def counters(result: unittest.TestResult) -> dict:
 
 def validate_counts(values: dict, expected: int) -> None:
     fields = {
-        "run", "failures", "errors", "skipped", "expected_failures", "unexpected_successes",
+        "run",
+        "failures",
+        "errors",
+        "skipped",
+        "expected_failures",
+        "unexpected_successes",
     }
     require(type(values) is dict and set(values) == fields, "test_counter_schema")
     require(
@@ -156,6 +194,131 @@ def validate_report(raw: bytes) -> dict:
     return expected
 
 
+def validate_failure(raw: bytes) -> dict:
+    """Validate only allowlisted aggregate failure details; never return raw output."""
+    require(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_REPORT_BYTES, "child_failure_invalid")
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "child_failure_invalid")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+        require(
+            type(value) is dict
+            and set(value)
+            == {
+                "schema_version",
+                "status",
+                "failure_code",
+                "diagnostic",
+            },
+            "child_failure_invalid",
+        )
+        require(
+            value["schema_version"] == SCHEMA
+            and value["status"] == "STOP"
+            and value["failure_code"] in {"control_tests_failed", "test_count_changed"},
+            "child_failure_invalid",
+        )
+        detail = value["diagnostic"]
+        require(
+            type(detail) is dict
+            and set(detail)
+            == {
+                "suite",
+                "expected",
+                "counters",
+                "cases",
+                "truncated",
+            },
+            "child_failure_invalid",
+        )
+        suites = dict(SUITES)
+        require(type(detail["suite"]) is str and detail["suite"] in suites, "child_failure_invalid")
+        expected = suites[detail["suite"]]
+        require(
+            type(detail["expected"]) is int and detail["expected"] == expected,
+            "child_failure_invalid",
+        )
+        counts = detail["counters"]
+        require(
+            type(counts) is dict
+            and set(counts)
+            == {
+                "run",
+                "failures",
+                "errors",
+                "skipped",
+                "expected_failures",
+                "unexpected_successes",
+            },
+            "child_failure_invalid",
+        )
+        require(
+            all(type(n) is int and 0 <= n <= 1_000_000 for n in counts.values())
+            and counts["run"] <= expected,
+            "child_failure_invalid",
+        )
+        require(
+            counts["run"] != expected or any(n for key, n in counts.items() if key != "run"),
+            "child_failure_invalid",
+        )
+        require(
+            type(detail["cases"]) is list
+            and len(detail["cases"]) <= MAXIMUM_FAILURE_CASES
+            and type(detail["truncated"]) is bool,
+            "child_failure_invalid",
+        )
+        total_failures = sum(n for key, n in counts.items() if key != "run")
+        require(
+            len(detail["cases"]) == min(total_failures, MAXIMUM_FAILURE_CASES)
+            and detail["truncated"] is (total_failures > MAXIMUM_FAILURE_CASES),
+            "child_failure_invalid",
+        )
+        observed = {key: 0 for key in counts if key != "run"}
+        kind_counter = {
+            "failure": "failures",
+            "subtest_failure": "failures",
+            "error": "errors",
+            "subtest_error": "errors",
+            "skip": "skipped",
+            "expected_failure": "expected_failures",
+            "unexpected_success": "unexpected_successes",
+        }
+        for case in detail["cases"]:
+            require(
+                type(case) is dict and set(case) == {"test_index", "kind", "category"},
+                "child_failure_invalid",
+            )
+            require(
+                type(case["test_index"]) is int and 0 <= case["test_index"] <= counts["run"],
+                "child_failure_invalid",
+            )
+            require(
+                case["kind"]
+                in {
+                    "failure",
+                    "error",
+                    "skip",
+                    "expected_failure",
+                    "unexpected_success",
+                    "subtest_failure",
+                    "subtest_error",
+                }
+                and case["category"] in {"assertion", "os_error", "timeout", "other", "none"},
+                "child_failure_invalid",
+            )
+            observed[kind_counter[case["kind"]]] += 1
+        require(all(observed[key] <= counts[key] for key in observed), "child_failure_invalid")
+        return detail
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        raise ControlCIError("child_failure_invalid") from None
+
+
 def execute_suites(root: Path) -> dict:
     """Child-only fixed selection. The parent supplies the 120-second deadline."""
     require_startup()
@@ -174,7 +337,19 @@ def execute_suites(root: Path) -> dict:
             result = AggregateResult()
             suite.run(result)
         results[relative] = counters(result)
-        validate_counts(results[relative], expected)
+        try:
+            validate_counts(results[relative], expected)
+        except ControlCIError as error:
+            raise ControlCIError(
+                str(error),
+                {
+                    "suite": relative,
+                    "expected": expected,
+                    "counters": results[relative],
+                    "cases": result.diagnostics,
+                    "truncated": result.truncated,
+                },
+            ) from None
     require_startup()
     return make_report(results)
 
@@ -202,8 +377,11 @@ def run_fresh_process(root: Path) -> dict:
     try:
         completed = subprocess.run(
             [
-                str(Path(sys.executable).resolve()), "-S", "-B",
-                str(Path(__file__).resolve()), CHILD_MODE,
+                str(Path(sys.executable).resolve()),
+                "-S",
+                "-B",
+                str(Path(__file__).resolve()),
+                CHILD_MODE,
             ],
             cwd=root,
             env=child_environment(root),
@@ -218,11 +396,18 @@ def run_fresh_process(root: Path) -> dict:
         raise ControlCIError("control_suite_timeout") from None
     except OSError:
         raise ControlCIError("control_child_start_failed") from None
-    require(completed.returncode == 0, "control_child_failed")
+    if completed.returncode != 0:
+        diagnostic = None
+        try:
+            diagnostic = validate_failure(completed.stdout)
+        except ControlCIError:
+            pass
+        raise ControlCIError("control_child_failed", diagnostic)
     return validate_report(completed.stdout)
 
 
 def main(argv: list[str] | None = None) -> int:
+    diagnostic = None
     try:
         require_startup()
         arguments = sys.argv[1:] if argv is None else argv
@@ -236,9 +421,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except ControlCIError as error:
         code = str(error)
+        diagnostic = error.diagnostic
     except BaseException:
         code = "control_ci_internal_error"
-    print(json.dumps({"schema_version": SCHEMA, "status": "STOP", "failure_code": code}))
+    output = {"schema_version": SCHEMA, "status": "STOP", "failure_code": code}
+    if diagnostic is not None:
+        output["diagnostic"] = diagnostic
+    print(json.dumps(output))
     return 1
 
 
