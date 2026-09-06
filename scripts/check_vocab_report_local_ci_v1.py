@@ -66,6 +66,10 @@ def require(condition: bool, code: str) -> None:
         raise LocalUnitError(code)
 
 
+def require_assertions(optimize: int) -> None:
+    require(type(optimize) is int and optimize == 0, "assertions_disabled")
+
+
 def identity(path: Path) -> tuple:
     value = path.lstat()
     require(stat.S_ISREG(value.st_mode) and value.st_nlink == 1, "file_shape")
@@ -155,6 +159,7 @@ def main() -> int:
     started = time.monotonic()
     try:
         require(sys.dont_write_bytecode and not sys.argv[1:], "startup")
+        require_assertions(sys.flags.optimize)
         require(not any(name in sys.modules for name in ML_MODULES), "fresh_process")
         require(hasattr(signal, "SIGALRM"), "posix_required")
         # A runtime prefix must not accidentally authorize the workspace as code.

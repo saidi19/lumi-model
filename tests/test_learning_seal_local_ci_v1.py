@@ -32,6 +32,13 @@ class LearningSealGuardTests(unittest.TestCase):
     def test_code_reads_are_allowed(self) -> None:
         self.assertIsNone(self.kind("open", self.base / "unit.py", "r", os.O_RDONLY))
 
+    def test_ordinary_python_assertions_are_required(self) -> None:
+        runner.require_assertions(0)
+        for optimize in (1, 2, False, 0.0):
+            with self.subTest(optimize=optimize):
+                with self.assertRaisesRegex(runner.LocalUnitError, "assertions_disabled"):
+                    runner.require_assertions(optimize)
+
     def test_other_private_and_neighbor_reads_are_rejected(self) -> None:
         for value in ("/synthetic-only/private/rows", "/synthetic-only/code-next/unit.py",
                       "/synthetic-only/code/../private/rows"):

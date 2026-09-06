@@ -81,6 +81,10 @@ def require(condition: bool, code: str) -> None:
         raise LocalUnitError(code)
 
 
+def require_assertions(optimize: int) -> None:
+    require(type(optimize) is int and optimize == 0, "assertions_disabled")
+
+
 def identity(path: Path) -> tuple:
     value = path.lstat()
     require(stat.S_ISREG(value.st_mode) and value.st_nlink == 1, "file_shape")
@@ -281,6 +285,7 @@ def main() -> int:
     started = time.monotonic()
     try:
         require(sys.dont_write_bytecode and sys.flags.no_site and not sys.argv[1:], "startup")
+        require_assertions(sys.flags.optimize)
         require(sys.version_info[:2] == (3, 13), "runtime_version")
         require(Path(sys.executable).absolute() == ROOT / RUNTIME_PYTHON, "runtime_path")
         require(not any(name.split(".")[0] in {*ML_MODULES, "lumi", "pytest"}
