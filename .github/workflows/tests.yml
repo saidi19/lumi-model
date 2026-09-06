@@ -54,6 +54,18 @@ jobs:
           tests/test_vocab_report_local_ci_v1.py
           tests/test_learning_seal_local_ci_v1.py
           tests/test_ci_unresolved_inventory_v1.py
+          tests/test_ci_source_partition_v1.py
+
+  private-integration-readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Mandatory private integration gate (OPEN is not a passing test)
+        run: python -S -B scripts/ci_source_partition_v1.py --private-readiness
 
   test:
     runs-on: ubuntu-latest
@@ -69,10 +81,11 @@ jobs:
       - name: Frozen BF16 failure reproduction and current successor acceptance
         timeout-minutes: 4
         run: python -B scripts/run_checkpoint_import_history_ci_v1.py
-      - name: General suite (control suites run in their required isolated job)
+      - name: Source suite (private integrations stay blocked)
         if: always()
         run: >-
           python -B -m pytest
+          -p scripts.ci_source_partition_v1 --lumi-source-suite tests
           --ignore=tests/test_sft_source_bundle_v1.py
           --ignore=tests/test_sft_supervisor_v1.py
           --ignore=tests/test_sft_worker_admission_v1.py

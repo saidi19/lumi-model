@@ -37,10 +37,11 @@ EXPECTED_TEST_JOB = f"""  test:
       - run: python -m pip install -e '.[dev,data]'
       - name: Frozen BF16 failure reproduction and current successor acceptance
         timeout-minutes: 4
-{HISTORY_COMMAND}      - name: General suite (control suites run in their required isolated job)
+{HISTORY_COMMAND}      - name: Source suite (private integrations stay blocked)
         if: always()
         run: >-
           python -B -m pytest
+          -p scripts.ci_source_partition_v1 --lumi-source-suite tests
           --ignore=tests/test_sft_source_bundle_v1.py
           --ignore=tests/test_sft_supervisor_v1.py
           --ignore=tests/test_sft_worker_admission_v1.py
@@ -50,6 +51,17 @@ EXPECTED_TEST_JOB = f"""  test:
           --ignore=tests/test_sft_ledger_protocol_v1.py
           --deselect={NODES[0]}
           --deselect={NODES[1]}
+"""
+EXPECTED_READINESS_JOB = """  private-integration-readiness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Mandatory private integration gate (OPEN is not a passing test)
+        run: python -S -B scripts/ci_source_partition_v1.py --private-readiness
 """
 
 
@@ -64,9 +76,22 @@ def validate_route(workflow: str) -> None:
         raise ValueError("history_route_changed")
 
 
+def validate_readiness(workflow: str) -> None:
+    matches = list(re.finditer(r"^  private-integration-readiness:\n", workflow, re.MULTILINE))
+    if len(matches) != 1:
+        raise ValueError("private_readiness_job_inventory")
+    tail = workflow[matches[0].start():]
+    next_job = re.search(r"\n  [A-Za-z0-9_-]+:\n", tail)
+    block = tail[:next_job.start() + 1] if next_job is not None else tail
+    if block.rstrip() != EXPECTED_READINESS_JOB.rstrip():
+        raise ValueError("private_readiness_route_changed")
+
+
 class CheckpointHistoryWorkflowTests(unittest.TestCase):
     def test_real_workflow_preserves_exact_required_history_and_general_steps(self) -> None:
-        validate_route((ROOT / ".github/workflows/tests.yml").read_text())
+        workflow = (ROOT / ".github/workflows/tests.yml").read_text()
+        validate_route(workflow)
+        validate_readiness(workflow)
 
     def test_both_routed_nodes_are_executed_by_the_fixed_history_runner(self) -> None:
         actual = {
@@ -139,8 +164,34 @@ class CheckpointHistoryWorkflowTests(unittest.TestCase):
         section = workflow.split("  source-only-validators:\n", 1)[1].split("  test:\n", 1)[0]
         self.assertIn("python -S -B -m unittest -q", section)
         self.assertIn("tests/test_checkpoint_history_workflow_v1.py", section)
+        self.assertIn("tests/test_ci_source_partition_v1.py", section)
         self.assertNotIn("if:", section)
         self.assertNotIn("continue-on-error", section)
+
+    def test_private_readiness_cannot_be_missing_duplicate_or_conditional(self) -> None:
+        for changed in (
+            "",
+            EXPECTED_READINESS_JOB + EXPECTED_READINESS_JOB,
+            EXPECTED_READINESS_JOB.replace("    runs-on:", "    if: false\n    runs-on:"),
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                validate_readiness(changed)
+
+    def test_private_readiness_cannot_be_nonblocking_or_replaced(self) -> None:
+        for old, new in (
+            ("    runs-on:", "    continue-on-error: true\n    runs-on:"),
+            ("--private-readiness", "--private-readiness || true"),
+            ("--private-readiness", "--help"),
+            ("python -S -B", "python -S -B -O"),
+        ):
+            with self.subTest(change=new), self.assertRaises(ValueError):
+                validate_readiness(EXPECTED_READINESS_JOB.replace(old, new))
+
+    def test_source_partition_cannot_be_disabled_or_replaced_with_skips(self) -> None:
+        command = "-p scripts.ci_source_partition_v1 --lumi-source-suite tests"
+        for replacement in ("", "--lumi-source-only", "-k 'not private'"):
+            with self.subTest(replacement=replacement), self.assertRaises(ValueError):
+                validate_route(EXPECTED_TEST_JOB.replace(command, replacement))
 
 
 if __name__ == "__main__":
