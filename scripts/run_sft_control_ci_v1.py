@@ -12,8 +12,11 @@ import contextlib
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
+import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -30,9 +33,35 @@ EXPECTED_TESTS = 273
 TIMEOUT_SECONDS = 120
 MAXIMUM_REPORT_BYTES = 16_384
 MAXIMUM_FAILURE_CASES = 32
+WATCHDOG_SUITE = "tests/test_process_watchdog_v1.py"
+MAXIMUM_WATCHDOG_TRACEBACK_FRAMES = 32
+MAXIMUM_WATCHDOG_CODES = 64
+MAXIMUM_WATCHDOG_RESULT_FIELDS = 32
+MAXIMUM_WATCHDOG_ELAPSED_MILLISECONDS = 1_000_000
+WATCHDOG_REASONS = frozenset({
+    "child_completed", "child_failed", "parent_interrupted", "deadline_exhausted",
+    "deadline_exhausted_before_spawn", "spawn_failed", "stream_budget_exhausted",
+    "guardian_failed", "supervisor_internal_error", "cleanup_failed",
+})
+WATCHDOG_BOOLEAN_FIELDS = frozenset({
+    "child_spawned", "worker_status_reported", "group_term_attempted",
+    "group_kill_attempted", "direct_child_reaped",
+})
+WATCHDOG_OBSERVATION_FIELDS = WATCHDOG_BOOLEAN_FIELDS | {
+    "reason", "exit_code", "guardian_exit_code", "elapsed_milliseconds",
+}
 CHILD_MODE = "--fixed-suite-child"
 SCHEMA = "lumi.sft-control-ci.v0.1"
 FORBIDDEN_MODULES = ("site", "torch", "transformers", "tokenizers", "safetensors", "numpy")
+WATCHDOG_TMPFS = "/dev/shm"
+MINIMUM_TMPFS_BYTES = 16 * 1024 * 1024
+MINIMUM_TMPFS_INODES = 64
+MAXIMUM_MOUNTINFO_BYTES = 262_144
+WATCHDOG_STORAGE_FAILURE_CODES = frozenset({
+    "watchdog_tmpfs_mount_invalid", "watchdog_tmpfs_root_invalid",
+    "watchdog_tmpfs_capacity_insufficient", "watchdog_tmpfs_private_directory_invalid",
+    "watchdog_tmpfs_unavailable",
+})
 
 
 class ControlCIError(ValueError):
@@ -68,13 +97,60 @@ class DiscardText:
         pass
 
 
-class AggregateResult(unittest.TestResult):
-    """Keep fixed counters instead of traceback strings, test IDs or reasons."""
+def valid_watchdog_observation(value: object) -> bool:
+    """Only fixed reason codes and bounded primitive lifecycle observations."""
+    return (
+        type(value) is dict
+        and set(value) == WATCHDOG_OBSERVATION_FIELDS
+        and type(value["reason"]) is str
+        and len(value["reason"]) <= 64
+        and value["reason"] in WATCHDOG_REASONS
+        and all(type(value[name]) is bool for name in WATCHDOG_BOOLEAN_FIELDS)
+        and all(
+            value[name] is None or type(value[name]) is int and -255 <= value[name] <= 255
+            for name in ("exit_code", "guardian_exit_code")
+        )
+        and type(value["elapsed_milliseconds"]) is int
+        and 0 <= value["elapsed_milliseconds"] <= MAXIMUM_WATCHDOG_ELAPSED_MILLISECONDS
+    )
 
-    def __init__(self):
+
+def watchdog_observation(err: tuple, allowed_codes: tuple) -> dict | None:
+    """Inspect bounded exact-code frames; never format errors or read result files."""
+    try:
+        if type(err) is not tuple or len(err) != 3:
+            return None
+        traceback = err[2]
+        for _ in range(MAXIMUM_WATCHDOG_TRACEBACK_FRAMES):
+            if type(traceback) is not types.TracebackType:
+                return None
+            if any(traceback.tb_frame.f_code is code for code in allowed_codes):
+                value = traceback.tb_frame.f_locals.get("result")
+                if type(value) is not dict or len(value) > MAXIMUM_WATCHDOG_RESULT_FIELDS:
+                    return None
+                observation = {name: value[name] for name in WATCHDOG_OBSERVATION_FIELDS}
+                return observation if valid_watchdog_observation(observation) else None
+            traceback = traceback.tb_next
+    except BaseException:
+        # Optional diagnostics must not interfere with recording the real failure.
+        pass
+    return None
+
+
+class AggregateResult(unittest.TestResult):
+    """Keep counters and allowlisted observations, never traceback text or test IDs."""
+
+    def __init__(self, watchdog_codes: tuple = ()):
         super().__init__()
         self.diagnostics = []
         self.truncated = False
+        self.watchdog_codes = (
+            watchdog_codes
+            if type(watchdog_codes) is tuple
+            and len(watchdog_codes) <= MAXIMUM_WATCHDOG_CODES
+            and all(type(code) is types.CodeType for code in watchdog_codes)
+            else ()
+        )
 
     def _record(self, kind, err=None):
         if len(self.diagnostics) >= MAXIMUM_FAILURE_CASES:
@@ -91,7 +167,15 @@ class AggregateResult(unittest.TestResult):
                 if issubclass(err[0], expected):
                     category = value
                     break
-        self.diagnostics.append({"test_index": self.testsRun, "kind": kind, "category": category})
+        case = {"test_index": self.testsRun, "kind": kind, "category": category}
+        self.diagnostics.append(case)
+        if self.watchdog_codes and kind in {"failure", "subtest_failure"}:
+            try:
+                observation = watchdog_observation(err, self.watchdog_codes)
+                if observation is not None:
+                    case["watchdog"] = observation
+            except BaseException:
+                pass
 
     def addFailure(self, test, err) -> None:
         self.failures.append(None)
@@ -291,7 +375,11 @@ def validate_failure(raw: bytes) -> dict:
         }
         for case in detail["cases"]:
             require(
-                type(case) is dict and set(case) == {"test_index", "kind", "category"},
+                type(case) is dict
+                and set(case) in (
+                    {"test_index", "kind", "category"},
+                    {"test_index", "kind", "category", "watchdog"},
+                ),
                 "child_failure_invalid",
             )
             require(
@@ -312,11 +400,89 @@ def validate_failure(raw: bytes) -> dict:
                 and case["category"] in {"assertion", "os_error", "timeout", "other", "none"},
                 "child_failure_invalid",
             )
+            if "watchdog" in case:
+                require(
+                    detail["suite"] == WATCHDOG_SUITE
+                    and case["kind"] in {"failure", "subtest_failure"}
+                    and valid_watchdog_observation(case["watchdog"]),
+                    "child_failure_invalid",
+                )
             observed[kind_counter[case["kind"]]] += 1
         require(all(observed[key] <= counts[key] for key in observed), "child_failure_invalid")
         return detail
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise ControlCIError("child_failure_invalid") from None
+
+
+def validate_tmpfs_mountinfo(raw: bytes, device: int) -> None:
+    """Require the kernel-reported tmpfs at the fixed synthetic-storage mount."""
+    require(0 < len(raw) <= MAXIMUM_MOUNTINFO_BYTES, "watchdog_tmpfs_mount_invalid")
+    identity = f"{os.major(device)}:{os.minor(device)}".encode("ascii")
+    matches = []
+    for line in raw.splitlines():
+        before, separator, after = line.partition(b" - ")
+        fields, filesystem = before.split(), after.split()
+        if len(fields) >= 6 and fields[4] == WATCHDOG_TMPFS.encode("ascii"):
+            matches.append(
+                bool(separator) and bool(filesystem)
+                and fields[2] == identity and filesystem[0] == b"tmpfs"
+            )
+    require(matches == [True], "watchdog_tmpfs_mount_invalid")
+
+
+def require_watchdog_tmpfs() -> int:
+    """Inspect, never mount or resize, Linux's existing shared-memory filesystem."""
+    fd = os.open(WATCHDOG_TMPFS, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(fd)
+        require(
+            stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o1777
+            and info.st_uid == 0,
+            "watchdog_tmpfs_root_invalid",
+        )
+        with open("/proc/self/mountinfo", "rb") as stream:
+            validate_tmpfs_mountinfo(stream.read(MAXIMUM_MOUNTINFO_BYTES + 1), info.st_dev)
+        space = os.fstatvfs(fd)
+        require(
+            space.f_bavail * space.f_frsize >= MINIMUM_TMPFS_BYTES
+            and space.f_favail >= MINIMUM_TMPFS_INODES,
+            "watchdog_tmpfs_capacity_insufficient",
+        )
+        return info.st_dev
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def watchdog_test_storage():
+    """Only the synthetic watchdog suite uses private tmpfs on Linux.
+
+    Real fsync calls, source bytes, assertions and watchdog deadlines stay intact.
+    This removes disk-flush contention from short process-control fixtures, not
+    from production execution. It does not test crash-persistent storage.
+    """
+    if sys.platform != "linux":
+        yield
+        return
+    try:
+        device = require_watchdog_tmpfs()
+        with tempfile.TemporaryDirectory(
+            prefix="lumi-watchdog-ci-", dir=WATCHDOG_TMPFS
+        ) as directory:
+            info = os.stat(directory, follow_symlinks=False)
+            require(
+                stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
+                and info.st_uid == os.geteuid() and info.st_dev == device,
+                "watchdog_tmpfs_private_directory_invalid",
+            )
+            previous = tempfile.tempdir
+            tempfile.tempdir = directory
+            try:
+                yield
+            finally:
+                tempfile.tempdir = previous
+    except OSError:
+        raise ControlCIError("watchdog_tmpfs_unavailable") from None
 
 
 def execute_suites(root: Path) -> dict:
@@ -334,8 +500,17 @@ def execute_suites(root: Path) -> dict:
             spec.loader.exec_module(module)
             suite = unittest.defaultTestLoader.loadTestsFromModule(module)
             require(suite.countTestCases() == expected, "test_discovery_count_changed")
-            result = AggregateResult()
-            suite.run(result)
+            result = AggregateResult(
+                tuple(
+                    getattr(module.WatchdogTests, name).__code__
+                    for name in unittest.defaultTestLoader.getTestCaseNames(module.WatchdogTests)
+                ) if relative == WATCHDOG_SUITE else ()
+            )
+            storage = (
+                watchdog_test_storage() if relative == WATCHDOG_SUITE else contextlib.nullcontext()
+            )
+            with storage:
+                suite.run(result)
         results[relative] = counters(result)
         try:
             validate_counts(results[relative], expected)
@@ -372,6 +547,32 @@ def require_parent_startup() -> None:
     require("lumi" not in sys.modules, "parent_must_not_import_lumi")
 
 
+def storage_failure_code(raw: bytes) -> str | None:
+    """Forward only fixed storage-admission STOP codes, never child output text."""
+    if type(raw) is not bytes or not 0 < len(raw) <= MAXIMUM_REPORT_BYTES:
+        return None
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "child_failure_invalid")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+        if (
+            type(value) is dict and set(value) == {"schema_version", "status", "failure_code"}
+            and value["schema_version"] == SCHEMA and value["status"] == "STOP"
+            and type(value["failure_code"]) is str
+            and value["failure_code"] in WATCHDOG_STORAGE_FAILURE_CODES
+        ):
+            return value["failure_code"]
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        pass
+    return None
+
+
 def run_fresh_process(root: Path) -> dict:
     require_parent_startup()
     try:
@@ -397,6 +598,9 @@ def run_fresh_process(root: Path) -> dict:
     except OSError:
         raise ControlCIError("control_child_start_failed") from None
     if completed.returncode != 0:
+        storage_code = storage_failure_code(completed.stdout)
+        if storage_code is not None:
+            raise ControlCIError(storage_code)
         diagnostic = None
         try:
             diagnostic = validate_failure(completed.stdout)
