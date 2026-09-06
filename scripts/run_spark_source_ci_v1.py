@@ -1,6 +1,7 @@
 """Run exactly three unchanged synthetic Spark tests in the normal project runtime.
 
-Requires Python 3.12, PySpark 3.5.6 and Java 17. The workflow supplies the outer
+Requires Python 3.12, PySpark 3.5.6, Java 17 and PyTorch 2.14.0+cpu.
+The workflow supplies the outer
 process-group deadline; this runner only bounds its Java version probe. Loopback
 and offline defaults are not an OS/network sandbox. Normal synthetic pytest logs
 are retained, but Java probe output and command exceptions are never printed.
@@ -30,7 +31,7 @@ NODES = (
 MAXIMUM_JAVA_OUTPUT_BYTES = 8192
 JAVA_TIMEOUT_SECONDS = 5
 CODES = frozenset({
-    "arguments_rejected", "runtime_rejected", "pyspark_version_rejected",
+    "arguments_rejected", "runtime_rejected", "pyspark_version_rejected", "torch_build_rejected",
     "java_version_rejected", "java_probe_failed", "java_probe_timeout",
     "java_probe_output_limit", "java_cleanup_failed", "test_selection_rejected",
     "tests_failed", "runner_failed",
@@ -146,6 +147,10 @@ def check_runtime():
             "runtime_rejected")
     pyspark = importlib.import_module("pyspark")
     require(getattr(pyspark, "__version__", None) == "3.5.6", "pyspark_version_rejected")
+    torch = importlib.import_module("torch")
+    require(getattr(torch, "__version__", None) == "2.14.0+cpu"
+            and getattr(getattr(torch, "version", None), "cuda", "unknown") is None,
+            "torch_build_rejected")
     probe_java()
 
 

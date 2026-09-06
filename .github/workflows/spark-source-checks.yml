@@ -28,13 +28,18 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
       - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
-      - name: Install source-test dependencies and the exact Spark runtime
-        run: python -m pip install -e '.[dev,data]' pyspark==3.5.6
+      - name: Install the CPU-only PyTorch build from its official index
+        run: >-
+          python -m pip install --no-cache-dir
+          --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
+      - name: Install source-test dependencies while retaining the CPU-only build
+        run: >-
+          python -m pip install --no-cache-dir
+          -e '.[dev,data]' pyspark==3.5.6 torch==2.14.0+cpu
       - name: Three original synthetic Spark tests, no skips accepted
         timeout-minutes: 15
         run: >-

@@ -8,7 +8,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/spark-source-checks.yml"
-INSTALL = "run: python -m pip install -e '.[dev,data]' pyspark==3.5.6"
+CPU_INSTALL = """        run: >-
+          python -m pip install --no-cache-dir
+          --index-url https://download.pytorch.org/whl/cpu torch==2.14.0+cpu
+"""
+INSTALL = """        run: >-
+          python -m pip install --no-cache-dir
+          -e '.[dev,data]' pyspark==3.5.6 torch==2.14.0+cpu
+"""
 COMMAND = """        run: >-
           timeout --signal=TERM --kill-after=30s 12m
           python -B scripts/run_spark_source_ci_v1.py
@@ -31,19 +38,22 @@ def validate_workflow(text: str) -> None:
         '      - uses: actions/setup-python@v6\n        with:\n          python-version: "3.12"\n',
         "      - uses: actions/setup-java@v5\n        with:\n"
         '          distribution: temurin\n          java-version: "17"\n',
-        "        " + INSTALL + "\n",
+        CPU_INSTALL,
+        INSTALL,
         "        timeout-minutes: 15\n" + COMMAND,
     )
     if any(text.count(part) != 1 for part in required):
         raise ValueError("spark_workflow_contract")
     if any(token in text for token in (
         "continue-on-error", "if:", "||", "secrets.", "contents: write", "workflow_dispatch",
-        "workflow_call", "pull_request_target", "paths:", "branches:", "-O ",
+        "workflow_call", "pull_request_target", "paths:", "branches:", "-O ", "cache: pip",
     )):
         raise ValueError("spark_workflow_contract")
     if len(re.findall(r"^  [a-z][a-z0-9_-]*:\n", text.split("jobs:\n", 1)[1], re.M)) != 1:
         raise ValueError("spark_workflow_contract")
-    if len(re.findall(r"^        run:|^      - run:", text, re.M)) != 2:
+    if len(re.findall(r"^        run:|^      - run:", text, re.M)) != 3:
+        raise ValueError("spark_workflow_contract")
+    if text.index(CPU_INSTALL) >= text.index(INSTALL):
         raise ValueError("spark_workflow_contract")
 
 
@@ -73,6 +83,16 @@ class SparkWorkflowTests(unittest.TestCase):
             (" 12m\n", " 1h\n"),
             (COMMAND, COMMAND.rstrip() + " || true\n"),
             ("    steps:\n", "    continue-on-error: true\n    steps:\n"),
+        ):
+            with self.subTest(change=old), self.assertRaises(ValueError):
+                validate_workflow(self.workflow.replace(old, new))
+
+    def test_cpu_install_cannot_drift_or_restore_the_large_gpu_cache(self):
+        for old, new in (
+            ("torch==2.14.0+cpu", "torch==2.14.0"),
+            ("--no-cache-dir", ""),
+            ("https://download.pytorch.org/whl/cpu", "https://pypi.org/simple"),
+            ('python-version: "3.12"\n', 'python-version: "3.12"\n          cache: pip\n'),
         ):
             with self.subTest(change=old), self.assertRaises(ValueError):
                 validate_workflow(self.workflow.replace(old, new))

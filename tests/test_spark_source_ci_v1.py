@@ -88,6 +88,9 @@ def fake_runtime(monkeypatch, runner, *, version=(3, 12), optimize=0, pyspark="3
         ),
     )
     monkeypatch.setitem(sys.modules, "pyspark", SimpleNamespace(__version__=pyspark))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        __version__="2.14.0+cpu", version=SimpleNamespace(cuda=None),
+    ))
     probes = []
     monkeypatch.setattr(runner, "probe_java", lambda: probes.append("java"))
     return probes
@@ -275,6 +278,19 @@ def test_no_site_runtime_is_rejected(monkeypatch, runner):
     probes = fake_runtime(monkeypatch, runner)
     runner.sys.flags.no_site = 1
     with pytest.raises(runner.SparkCIError, match="runtime_rejected"):
+        runner.check_runtime()
+    assert probes == []
+
+
+@pytest.mark.parametrize("version,cuda", [
+    ("2.14.0", "13.0"), ("2.14.0+cpu", "13.0"), ("2.13.0+cpu", None),
+])
+def test_nonmatching_or_cuda_torch_build_cannot_reach_tests(monkeypatch, runner, version, cuda):
+    probes = fake_runtime(monkeypatch, runner)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        __version__=version, version=SimpleNamespace(cuda=cuda),
+    ))
+    with pytest.raises(runner.SparkCIError, match="torch_build_rejected"):
         runner.check_runtime()
     assert probes == []
 
