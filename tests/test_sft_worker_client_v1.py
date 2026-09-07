@@ -145,25 +145,94 @@ class WorkerClientTests(unittest.TestCase):
     def test_partial_send_receive_continuations_keep_one_transaction(self):
         client, server = self.client()
         request, ack, confirmation = transaction()
-        server.sendall(ack)
+        for sock in (client._sock, server):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
         send, recvmsg = socket.socket.send, socket.socket.recvmsg
+        received, peer_errors, send_sizes, receive_chunks = [], [], [], []
 
         def short_send(sock, data, *args):
-            return send(sock, data[:7], *args)
+            if sock is not client._sock:
+                return send(sock, data, *args)
+            written = send(sock, data[:7], *args)
+            send_sizes.append(written)
+            return written
 
         def short_receive(sock, size, *args):
-            return recvmsg(sock, min(size, 3), *args)
+            if sock is not client._sock:
+                return recvmsg(sock, size, *args)
+            result = recvmsg(sock, min(size, 3), *args)
+            receive_chunks.append(result[0])
+            return result
+
+        def drain_peer():
+            try:
+                # A real peer consumes the request before acknowledging it and
+                # keeps consuming while the worker transmits confirmation. A
+                # prequeued ACK plus an undrained queue is not a valid harness.
+                received.append(receive_frame(server))
+                if received[0] != request:
+                    raise AssertionError("synthetic_request_mismatch")
+                server.sendall(ack)
+                received.append(receive_frame(server))
+            except BaseException:
+                peer_errors.append("synthetic_peer_failed")
+                try:
+                    server.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
 
         with patch.object(socket.socket, "send", short_send), \
                 patch.object(socket.socket, "recvmsg", short_receive):
-            client.reserve(0, checkpoint_read_bytes=3)
-        self.assertEqual(receive_frame(server), request)
-        self.assertEqual(receive_frame(server), confirmation)
-        self.assertEqual(client.summary()["requests_sent"], 1)
-        receives = 2 + (len(ack) - 4 + 2) // 3  # Header takes two chunks of at most three.
-        self.assertEqual(client.summary()["wire_bytes_reserved"],
+            peer = threading.Thread(target=drain_peer, daemon=True)
+            peer.start()
+            try:
+                self.assertIsNone(client.reserve(0, checkpoint_read_bytes=3))
+            finally:
+                peer.join(timeout=1)  # Same existing one-second transport limit.
+        self.assertFalse(peer.is_alive())
+        self.assertEqual(peer_errors, [])
+        self.assertEqual(received, [request, confirmation])
+        self.assertEqual(b"".join(receive_chunks), ack)
+        self.assertTrue(all(0 < length <= 7 for length in send_sizes))
+        self.assertTrue(all(0 < len(chunk) <= 3 for chunk in receive_chunks))
+        self.assertGreater(len(send_sizes), 2)
+        self.assertGreater(len(receive_chunks), 2)
+        summary = client.summary()
+        for counter in ("requests_sent", "acknowledgements_validated", "confirmations_sent"):
+            self.assertEqual(summary[counter], 1)
+        self.assertEqual(summary["wire_bytes_sent"], len(request) + len(confirmation))
+        self.assertEqual(sum(send_sizes), summary["wire_bytes_sent"])
+        self.assertEqual(summary["wire_bytes_received"], len(ack))
+        self.assertEqual(summary["wire_bytes_reserved"],
                          sum(map(len, (request, ack, confirmation)))
-                         + receives * client_module.ANCILLARY_BYTES)
+                         + len(receive_chunks) * client_module.ANCILLARY_BYTES)
+        self.assertEqual(self.interrupts, [])
+
+    def test_fragmented_undrained_socket_queue_fills_without_blocking(self):
+        sender, receiver = self.pair()
+        for sock in (sender, receiver):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+        sender.setblocking(False)
+        sent, blocked = 0, False
+        for _ in range(4096):  # At most 28 KiB; no sleeps or blocking send.
+            try:
+                sent += sender.send(b"S" * 7)
+            except BlockingIOError:
+                blocked = True
+                break
+        self.assertTrue(blocked, "synthetic_undrained_queue_did_not_fill")
+        self.assertGreater(sent, 0)
+        receiver.setblocking(False)
+        drained = 0
+        while drained < sent:
+            block = receiver.recv(min(4096, sent - drained))
+            self.assertTrue(block)
+            self.assertEqual(block, b"S" * len(block))
+            drained += len(block)
+        self.assertEqual(drained, sent)
+        self.assertEqual(sender.send(b"S" * 7), 7)
 
     def test_ancillary_capacity_is_prepaid_before_each_receive_fragment(self):
         frames = transaction()

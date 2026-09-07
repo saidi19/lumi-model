@@ -136,7 +136,7 @@ worker is not a workaround.
 
 ## Verification and limitations
 
-The local combined run passed 452 tests, zero failures/errors/skips, in 0.247
+The initial local combined run passed 452 tests, zero failures/errors/skips, in 0.247
 seconds: 375 prior, 27 new socket-client, 32 new step-gate and 18 new consumer-guard
 tests. A fresh `python -S -B` process reported `ML_MODULES_LOADED=False`. Isolated
 Ruff on all eight new Python files passed. Both remote-only fixture files passed
@@ -161,8 +161,33 @@ of three planned invocations is exercised; there is no full-lifecycle claim.
 
 The fixture has a 100-second inner deadline and 120-second outer process-group
 deadline, owned-child cleanup, suppressed native stdout/stderr and fixed-code
-structural diagnostics. The exact remote result still must be observed after
-publication. Static checks or planned test assertions are not a Torch pass.
+structural diagnostics.
+
+The first published commit, `49f51ee15fe3ae4d2270b9c0127b556f31c64425`, ran in
+[Source CI](https://github.com/saidi19/lumi-model/actions/runs/34123478710):
+3938 passed, one failed, 58 skipped, 329 deselected and 7749 subtests passed in
+193.05 seconds. The real two-rank worker fixture passed; the only failure was
+the synthetic client short-send/short-receive test, which reached the existing
+deadline while sending its confirmation. The complete source run was therefore
+not accepted. Source selection was 3997; the same 327 private nodes remained
+NOT_EXECUTED and two historical nodes remained separately routed. Its exact
+[Spark CI](https://github.com/saidi19/lumi-model/actions/runs/34123478697) passed
+three tests with zero skips in 108.96 seconds. Both initial runs are preserved;
+correcting a fixture does not turn the earlier failed run into a pass. The
+corrected commit still requires its own observed remote acceptance.
+
+The test-only correction gives the fragmented-send fixture a bounded concurrent
+peer: it drains the exact request before sending ACK, then drains the exact
+confirmation. Previously the fixture prequeued ACK and did not consume either
+client frame until the entire transaction returned. A new finite, nonblocking
+control using constrained 1-KiB socket buffers demonstrates that undrained
+7-byte sends fill the queue and that draining allows sending to resume; it sends
+at most 28 KiB. The corrected transaction uses those constrained buffers too and
+checks every actual receive fragment's prepaid ancillary capacity. Production
+client code, one-second transport limits and every accounting cap are unchanged.
+After this correction, all 453 local tests passed with zero skips in 0.245 seconds
+(28 client tests, the other counts unchanged), `ML_MODULES_LOADED=False`, eight
+Python files passing isolated Ruff and both remote-only files passing AST checks.
 
 The roadmap is unchanged. This advances shared optimizer integration; actual
 input metering/admission, training-capable Linux resource enforcement, suitable-host
