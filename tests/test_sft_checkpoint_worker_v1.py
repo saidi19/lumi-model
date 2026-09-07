@@ -10,6 +10,7 @@ import sys
 import tempfile
 import types
 import unittest
+from collections import OrderedDict
 from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
@@ -21,6 +22,88 @@ sys.modules[PACKAGE] = package
 worker_module = importlib.import_module(f"{PACKAGE}.posttraining_sft_checkpoint_worker_v1")
 readers = importlib.import_module(f"{PACKAGE}.posttraining_sft_checkpoint_reader_v1")
 views = importlib.import_module(f"{PACKAGE}.posttraining_sft_checkpoint_view_v1")
+
+
+class FakeTensor:
+    """Tensor-like value whose direct container equality is intentionally invalid."""
+
+    def __init__(self, values, *, dtype="float64", shape=(2,)):
+        self.values, self.dtype, self.shape = tuple(values), dtype, shape
+
+    def __eq__(self, _other):
+        raise AssertionError("fixture_tensor_direct_equality_is_ambiguous")
+
+
+class FakeTorch:
+    Tensor = FakeTensor
+
+    @staticmethod
+    def equal(left, right):
+        return left.values == right.values
+
+
+class CheckpointFixtureComparatorTests(unittest.TestCase):
+    """Pure-stdlib regression for the CI assertion helper, not tensor execution."""
+
+    @classmethod
+    def setUpClass(cls):
+        before = set(sys.modules)
+        script = ROOT / "scripts/run_sft_checkpoint_worker_torch_fixture_v1.py"
+        spec = importlib.util.spec_from_file_location("_pure_checkpoint_comparator", script)
+        cls.fixture = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.fixture)
+        forbidden = {"torch", "transformers", "numpy", "safetensors", "tokenizers"}
+        if any(name.split(".")[0] in forbidden for name in set(sys.modules) - before):
+            raise AssertionError("fixture_import_loaded_ml")
+
+    def equal(self, left, right):
+        return self.fixture.equal_tree(FakeTorch, left, right)
+
+    def test_direct_ordered_container_equality_is_invalid_fixture_control(self):
+        left = OrderedDict(weight=FakeTensor([1, 2]))
+        right = OrderedDict(weight=FakeTensor([1, 2]))
+        with self.assertRaisesRegex(AssertionError, "fixture_tensor_direct_equality_is_ambiguous"):
+            _ = left == right
+
+    def test_ordered_model_state_recurses_instead_of_comparing_tensors_directly(self):
+        left = OrderedDict(weight=FakeTensor([1, 2]), bias=FakeTensor([3, 4]))
+        right = OrderedDict(weight=FakeTensor([1, 2]), bias=FakeTensor([3, 4]))
+        self.assertIs(self.equal(left, right), True)
+
+    def test_ordered_key_order_is_preserved(self):
+        left = OrderedDict(weight=FakeTensor([1, 2]), bias=FakeTensor([3, 4]))
+        right = OrderedDict(bias=FakeTensor([3, 4]), weight=FakeTensor([1, 2]))
+        self.assertIs(self.equal(left, right), False)
+
+    def test_plain_and_ordered_mapping_types_are_not_interchangeable(self):
+        plain = {"weight": FakeTensor([1, 2])}
+        ordered = OrderedDict(weight=FakeTensor([1, 2]))
+        self.assertIs(self.equal(plain, ordered), False)
+        self.assertIs(self.equal(ordered, plain), False)
+
+    def test_plain_dict_keeps_existing_key_set_semantics(self):
+        left = {"step": 1, "value": FakeTensor([1, 2])}
+        right = {"value": FakeTensor([1, 2]), "step": 1}
+        self.assertIs(self.equal(left, right), True)
+
+    def test_nested_optimizer_state_and_sequence_types(self):
+        left = {"state": {0: {"exp_avg": FakeTensor([1, 2])}}, "param_groups": [{"params": [0]}]}
+        right = {"state": {0: {"exp_avg": FakeTensor([1, 2])}}, "param_groups": [{"params": [0]}]}
+        self.assertIs(self.equal(left, right), True)
+        self.assertIs(self.equal([FakeTensor([1, 2])], (FakeTensor([1, 2]),)), False)
+
+    def test_missing_and_extra_ordered_keys_are_rejected(self):
+        left = OrderedDict(weight=FakeTensor([1, 2]))
+        right = OrderedDict(weight=FakeTensor([1, 2]), bias=FakeTensor([3, 4]))
+        self.assertIs(self.equal(left, right), False)
+        self.assertIs(self.equal(right, left), False)
+
+    def test_tensor_value_dtype_and_shape_mismatches_are_rejected(self):
+        left = OrderedDict(weight=FakeTensor([1, 2]))
+        for right in (FakeTensor([1, 3]), FakeTensor([1, 2], dtype="float32"),
+                      FakeTensor([1, 2], shape=(1, 2))):
+            with self.subTest(dtype=right.dtype, shape=right.shape):
+                self.assertIs(self.equal(left, OrderedDict(weight=right)), False)
 
 
 class CheckpointWorkerTests(unittest.TestCase):

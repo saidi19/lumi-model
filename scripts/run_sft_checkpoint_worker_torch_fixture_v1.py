@@ -20,6 +20,7 @@ import stat
 import sys
 import tempfile
 import types
+from collections import OrderedDict
 from pathlib import Path
 from unittest import mock
 
@@ -103,8 +104,9 @@ def equal_tree(torch, left, right):
     if isinstance(left, torch.Tensor):
         return (isinstance(right, torch.Tensor) and left.dtype == right.dtype
                 and left.shape == right.shape and torch.equal(left, right))
-    if type(left) is dict:
-        return (type(right) is dict and left.keys() == right.keys()
+    if type(left) in (dict, OrderedDict):
+        return (type(left) is type(right) and left.keys() == right.keys()
+                and (type(left) is not OrderedDict or tuple(left) == tuple(right))
                 and all(equal_tree(torch, left[key], right[key]) for key in left))
     if type(left) in (list, tuple):
         return (type(left) is type(right) and len(left) == len(right)
@@ -242,6 +244,7 @@ def run():
                     parent_fd, model=model, optimizer=optimizer, rng_state=saved_rng,
                     training_state={"step": 1, "schema_version": "SYNTHETIC"}, step=1,
                 )
+                STAGE = "save_postconditions"
                 require(receipt["checkpoint_name"] == "checkpoint-00000001")
                 require(receipt["status"] == "published_checkpoint")
                 require(receipt["published"] is True and receipt["production_eligible"] is False)
@@ -259,8 +262,11 @@ def run():
                     manifest_sha256=receipt["manifest_sha256"],
                     model=restored_model, optimizer=restored_optimizer,
                 )
+                STAGE = "restore_model_equal"
                 require(equal_tree(torch, saved_model, restored_model.state_dict()))
+                STAGE = "restore_optimizer_equal"
                 require(equal_tree(torch, saved_optimizer, restored_optimizer.state_dict()))
+                STAGE = "restore_rng_equal"
                 require(equal_tree(torch, saved_rng, returned_rng))
                 reads_before = supervisor.summary()["resources_reserved"]["checkpoint_read_bytes"]
 
@@ -270,6 +276,7 @@ def run():
                     manifest_sha256=receipt["manifest_sha256"],
                     model=restored_model, optimizer=restored_optimizer,
                 )
+                STAGE = "repeated_restore_accounting"
                 require(supervisor.summary()["resources_reserved"]["checkpoint_read_bytes"]
                         > reads_before)
                 report["repeated_restore_charged"] = True
@@ -280,8 +287,11 @@ def run():
                 expected_rng = torch.get_rng_state().clone()
                 torch.set_rng_state(returned_rng)
                 optimizer_step(torch, restored_model, restored_optimizer)
+                STAGE = "resume_model_equal"
                 require(equal_tree(torch, model.state_dict(), restored_model.state_dict()))
+                STAGE = "resume_optimizer_equal"
                 require(equal_tree(torch, optimizer.state_dict(), restored_optimizer.state_dict()))
+                STAGE = "resume_rng_equal"
                 require(torch.equal(expected_rng, torch.get_rng_state()))
                 for key in ("model_resume_equal", "optimizer_resume_equal", "rng_resume_equal"):
                     report[key] = True

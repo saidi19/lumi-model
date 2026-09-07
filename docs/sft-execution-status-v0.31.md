@@ -115,7 +115,7 @@ Local verification uses a fresh `python -S -B` process and explicitly checks tha
 Torch, Transformers, NumPy, safetensors and tokenizers were not imported. It covers
 the new independent views and worker backend/guard tests together with the frozen
 reader, saver, publisher, metered I/O, Supervisor and ledger protocol tests.
-The final local run passed 367 tests (49 new view, 38 new worker and 280 prior
+The initial local run passed 367 tests (49 new view, 38 new worker and 280 prior
 tests), zero failures/errors/skips, in 0.240 seconds; `ML_MODULES_LOADED=False`.
 Exact isolated Ruff on all six new Python files passed. The worker/view source
 and both remote-only fixture files also passed AST parsing without ML imports.
@@ -131,11 +131,44 @@ The fixture emits only structural aggregate results and fixed failure codes.
 This fixture uses the real in-process Supervisor but only rank zero of its two
 available schema slots. It is deliberately single-rank checkpoint acceptance,
 not distributed training or a multiprocess shared-controller proof. No GPU is
-enumerated or initialized. The fixture is never executed on the user's Mac;
-local treatment of these two CI files is lint and AST parsing only.
+enumerated or initialized. The fixture's `run`/`main` and the real Torch wrapper
+are never executed on the user's Mac. The wrapper receives lint/AST checks only;
+the fixture's pure comparison helper can be tested separately with fake tensors.
 
 This successor's exact remote CI result must be observed after publication;
 source inspection and a planned test do not imply a successful Torch round trip.
+
+### First remote result and test-only correction
+
+The initial adapter commit `b0b82d3e3fb6855399d938c6d906e3cc8f06df11` was
+published with exact local/remote tree and commit equality. Its
+[Source CI](https://github.com/saidi19/lumi-model/actions/runs/34119054334) passed
+the three non-ML jobs but reported one failing new checkpoint fixture, 3852
+passed, 58 skipped, 329 deselected and 7683 subtests in 237.50 seconds. The 327
+private integration nodes remained NOT_EXECUTED. Its
+[Spark CI](https://github.com/saidi19/lumi-model/actions/runs/34119054332) passed
+three tests, zero skips, in 101.83 seconds. The failed run is retained, not hidden
+or deleted.
+
+The fixture stopped in the post-restore comparison without a worker failure
+stage/code. Source inspection identified its concrete comparator defect:
+`Module.state_dict()` returns an `OrderedDict`, whereas `equal_tree` handled only
+exact plain dictionaries. It therefore invoked dictionary/tensor equality rather
+than elementwise recursive comparison, which cannot produce a scalar truth value
+for a multi-element tensor. The correction admits exact `OrderedDict` alongside
+exact `dict`, preserving exact mapping type, key membership, ordered-dictionary
+key order, tensor dtype/shape/value checks and nested recursion. Distinct fixed
+postcondition stages now locate model, optimizer and RNG comparison failures.
+
+This is a synthetic-test correction, not a worker, safety-policy, quota or data
+change. Worker/view implementations and all pre-v0.31 files stay unchanged. Fake
+tensors that reject implicit equality provide local stdlib-only regression tests;
+the real Torch result still requires a fresh exact-commit remote acceptance run.
+The corrected local suite passed 375 tests in 0.238 seconds, zero failures/errors/
+skips, with `ML_MODULES_LOADED=False`; eight new comparator regressions include
+the failing direct-OrderedDict-equality negative control. Isolated Ruff on all
+six successor Python files passed. The correction changes only the fixture,
+its stdlib test file and this status document; the Linux-only wrapper is unchanged.
 
 ## Remaining path before H100
 
