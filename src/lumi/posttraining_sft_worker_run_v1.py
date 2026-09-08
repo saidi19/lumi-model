@@ -1,0 +1,505 @@
+"""One-shot cooperative integration of admitted SFT inputs, steps and checkpoints.
+
+This is not the public launcher or a real-input/OS admission authority. A trusted
+caller already owns the model/optimizer, runtime, bounded distributed group,
+private roots, source identity and exact input pins. It supplies a pre-attached
+admission capability and an independent process-death/timeout guardian. Only
+already-imported frozen ML helpers are resolved; no first ML import occurs here.
+
+One v2 client meters input/checkpoint operations and optimizer transitions under
+ONE parent Supervisor across its three fresh invocations. Step completion obtains
+the explicit parent fence BEFORE advancing counters or saving a checkpoint. The
+parent must keep the invocation alive for subsequent checkpoint I/O, then drain
+all confirmations and validate all rank reports before completing the invocation.
+
+Resume accepts only this version's state and trusted own-generated checkpoint
+metadata (DCP uses pickle). It verifies state/run/cursor BEFORE model restore,
+then restores model, optimizer and rank RNG. Hashes are not origin authentication.
+No retries, rollback, pruning, legacy state conversion, raw logs or promotion.
+Only summary()/fixed error codes may be published. Return values remain private.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import sys
+import threading
+from types import MappingProxyType, ModuleType
+
+from .posttraining_sft_checkpoint_state_v1 import read_training_state
+from .posttraining_sft_checkpoint_worker_v1 import LIMIT_KEYS, CheckpointWorker, _directory_info
+from .posttraining_sft_metered_io_v1 import MAX_FILE_BYTES
+from .posttraining_sft_step_gate_v1 import StepGate
+from .posttraining_sft_training_state_v1 import advance_state, make_state, validate_state
+from .posttraining_sft_worker_client_v2 import WorkerLedgerClient
+from .posttraining_sft_worker_input_v1 import PIN_FIELDS, WorkerInput
+from .posttraining_sft_worker_step_v1 import WorkerStep
+
+SCHEMA_VERSION = "lumi.sft-worker-run.v0.1"
+PROFILE_FIELDS = frozenset({
+    "per_rank_batch_size", "gradient_accumulation_steps", "context_window",
+    "pad_to_multiple_of", "pad_token_id", "seed", "learning_rate", "lr_schedule",
+    "warmup_steps", "min_learning_rate_ratio", "max_grad_norm", "strategy",
+    "gradient_sync_mode", "precision",
+})
+ERROR_CODES = frozenset({
+    "invalid_arguments", "owner_mismatch", "reentry", "already_consumed", "terminal_failure",
+    "admission_rejected", "runtime_rejected", "input_rejected", "state_rejected",
+    "reserve_failed", "synchronize_failed", "checkpoint_rejected", "run_failed",
+})
+STAGES = frozenset({
+    "idle", "admission", "runtime", "inputs", "restore_state", "restore_checkpoint",
+    "planning", "step", "state", "checkpoint", "complete",
+})
+PHASES = frozenset({"inputs", "restored", "reserved", "updated", "completed", "checkpoint"})
+
+
+class WorkerRunError(RuntimeError):
+    def __init__(self, code="run_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "run_failed"
+        super().__init__(self.code)
+
+
+def _integer(value, low, high):
+    return type(value) is int and low <= value <= high
+
+
+def _number(value, low, high):
+    if type(value) not in (int, float):
+        return False
+    try:
+        return math.isfinite(value) and low <= value <= high
+    except OverflowError:
+        return False
+
+
+def _hash(value):
+    return type(value) is str and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+
+def _keys(value, expected):
+    return (type(value) is dict and all(type(key) is str for key in value)
+            and set(value) == set(expected))
+
+
+def _profile(value, *, world_size, record_limit, device_type):
+    if not _keys(value, PROFILE_FIELDS):
+        raise WorkerRunError("invalid_arguments") from None
+    integers = {
+        "per_rank_batch_size": (1, 12), "gradient_accumulation_steps": (1, 12),
+        "context_window": (2, 4095), "pad_to_multiple_of": (1, 4095),
+        "pad_token_id": (0, 2**32 - 1), "seed": (0, 2**31 - 1), "warmup_steps": (0, 1),
+    }
+    strings = {
+        "lr_schedule": {"constant", "cosine"}, "strategy": {"ddp"},
+        "gradient_sync_mode": {"last_microbatch", "every_microbatch"},
+        "precision": {"fp32", "bf16"},
+    }
+    if (any(not _integer(value[key], *bounds) for key, bounds in integers.items())
+            or any(type(value[key]) is not str or value[key] not in allowed
+                   for key, allowed in strings.items())
+            or not _number(value["learning_rate"], 1e-300, 1e6)
+            or not _number(value["max_grad_norm"], 1e-300, 1e6)
+            or not _number(value["min_learning_rate_ratio"], 0, 1)):
+        raise WorkerRunError("invalid_arguments") from None
+    if (world_size * value["per_rank_batch_size"] > record_limit
+            or value["pad_to_multiple_of"] > value["context_window"]
+            or value["context_window"] % value["pad_to_multiple_of"]
+            or value["lr_schedule"] == "cosine" and value["min_learning_rate_ratio"] == 0
+            or device_type == "cuda" and value["precision"] != "bf16"):
+        raise WorkerRunError("invalid_arguments") from None
+    result = dict(value)
+    for key in ("learning_rate", "max_grad_norm", "min_learning_rate_ratio"):
+        result[key] = float(result[key])
+    return result
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                    ensure_ascii=True, allow_nan=False).encode("ascii")).hexdigest()
+
+
+def _optimizer_binding(model, optimizer):
+    """Hash bounded admitted metadata only, never tensor values or optimizer state.
+
+    The caller checks exact fresh AdamW and the admitted model before this call.
+    Ordered parameter names and groups bind the positional Adam-slot mapping;
+    shape, dtype, trainability and every plain group setting bind configuration.
+    This is a compatibility fingerprint, not authentication or model admission.
+    """
+    nodes = 0
+
+    def reject():
+        raise WorkerRunError("runtime_rejected") from None
+
+    def plain(value, depth=0):
+        nonlocal nodes
+        nodes += 1
+        if nodes > 16_384 or depth > 6:
+            reject()
+        kind = type(value)
+        if value is None or kind is bool:
+            return value
+        if kind is int and -(2**63) < value < 2**63:
+            return value
+        if kind is float and math.isfinite(value):
+            return value
+        if kind is str and len(value) <= 256 and value.isascii():
+            return value
+        if kind in (list, tuple) and len(value) <= 128:
+            return [plain(item, depth + 1) for item in value]
+        if kind is dict and len(value) <= 64:
+            if any(type(key) is not str or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key)
+                   for key in value):
+                reject()
+            return {key: plain(item, depth + 1) for key, item in value.items()}
+        reject()
+
+    try:
+        parameters, by_identity, names, required = [], {}, set(), set()
+        for index, item in enumerate(model.named_parameters()):
+            if index >= 16_384 or type(item) is not tuple or len(item) != 2:
+                reject()
+            name, parameter = item
+            if (type(name) is not str or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.]{0,255}", name)
+                    or name in names or id(parameter) in by_identity):
+                reject()
+            shape, dtype, trainable = parameter.shape, str(parameter.dtype), parameter.requires_grad
+            if (not isinstance(shape, tuple) or len(shape) > 8
+                    or any(type(size) is not int or not 0 <= size < 2**31 for size in shape)
+                    or not re.fullmatch(r"torch\.[A-Za-z0-9_]{1,48}", dtype)
+                    or type(trainable) is not bool):
+                reject()
+            by_identity[id(parameter)] = name
+            names.add(name)
+            if trainable:
+                required.add(id(parameter))
+            parameters.append({"name": name, "shape": list(shape), "dtype": dtype,
+                               "requires_grad": trainable})
+        raw_groups = optimizer.param_groups
+        if not required or type(raw_groups) is not list or not 1 <= len(raw_groups) <= 64:
+            reject()
+        groups, bound = [], set()
+        for group in raw_groups:
+            if (type(group) is not dict or not 1 <= len(group) <= 64
+                    or any(type(key) is not str for key in group) or "params" not in group
+                    or type(group["params"]) is not list or len(group["params"]) > 16_384):
+                reject()
+            ordered = []
+            for parameter in group["params"]:
+                identity = id(parameter)
+                if identity not in by_identity or identity in bound:
+                    reject()
+                bound.add(identity)
+                ordered.append(by_identity[identity])
+            settings = {key: value for key, value in group.items() if key != "params"}
+            for key in ("lr", "initial_lr", "eps", "weight_decay"):
+                if key in settings and not _number(settings[key], 0, 1e100):
+                    reject()
+            if "betas" in settings:
+                betas = settings["betas"]
+                if (type(betas) not in (tuple, list) or len(betas) != 2
+                        or any(not _number(value, 0, 1) or value == 1 for value in betas)):
+                    reject()
+            for key in ("amsgrad", "maximize", "capturable", "differentiable",
+                        "decoupled_weight_decay", "foreach", "fused"):
+                if key in settings and type(settings[key]) is not bool:
+                    if key not in {"foreach", "fused"} or settings[key] is not None:
+                        reject()
+            groups.append({"parameters": ordered, "settings": plain(settings)})
+        if not required <= bound:
+            reject()
+        return _digest({"schema_version": "lumi.sft-optimizer-binding.v0.1",
+                        "parameters": parameters, "groups": groups})
+    except BaseException:
+        raise WorkerRunError("runtime_rejected") from None
+
+
+class WorkerRun:
+    """Borrowed client/model/optimizer/output FD; one consumed invocation per object.
+
+    Callback capabilities are trusted, cooperative services, not OS proof. The
+    fixed zero-to-two-step bounds intentionally do not expose general training.
+    The caller constructs the initial model under profile.seed before wrapping it;
+    this object sets only the frozen rank-local *training* RNG after loading data.
+    """
+
+    def __init__(self, *, client, rank, world_size, from_step, stop_step, profile,
+                 record_limit, loader_bindings, source_identity_sha256, checkpoint_limits,
+                 admit, synchronize, interrupt, device_type):
+        if hasattr(self, "_owner"):
+            self._fail("already_consumed")
+        if (type(client) is not WorkerLedgerClient or not _integer(world_size, 2, 12)
+                or not _integer(rank, 0, world_size - 1) or client._rank != rank
+                or not _integer(from_step, 0, 1) or not _integer(stop_step, 1, 2)
+                or from_step >= stop_step or not _integer(record_limit, world_size, 12)
+                or type(device_type) is not str or device_type not in {"cpu", "cuda"}
+                or not all(callable(callback) for callback in (admit, synchronize, interrupt))
+                or not _keys(loader_bindings, PIN_FIELDS)
+                or not all(_hash(value) for value in loader_bindings.values())
+                or not _hash(source_identity_sha256)
+                or not _keys(checkpoint_limits, LIMIT_KEYS)
+                or not all(_integer(value, 1, MAX_FILE_BYTES)
+                           for value in checkpoint_limits.values())):
+            raise WorkerRunError("invalid_arguments") from None
+        selected = _profile(profile, world_size=world_size, record_limit=record_limit,
+                            device_type=device_type)
+        # No method/transport operation is performed on the borrowed client here.
+        self._client, self._rank, self._world = client, rank, world_size
+        self._from, self._stop, self._record_limit = from_step, stop_step, record_limit
+        self._profile = MappingProxyType(selected)
+        self._pins = MappingProxyType(dict(loader_bindings))
+        self._limits = MappingProxyType(dict(checkpoint_limits))
+        self._device_type, self._admit = device_type, admit
+        self._synchronize, self._interrupt = synchronize, interrupt
+        self._identity = _digest({
+            "schema_version": SCHEMA_VERSION, "source_identity_sha256": source_identity_sha256,
+            "loader_bindings": dict(self._pins), "profile": selected, "world_size": world_size,
+            "record_limit": record_limit, "device_type": device_type, "target_steps": 2,
+        })
+        self._global_records = (world_size * selected["per_rank_batch_size"]
+                                * selected["gradient_accumulation_steps"])
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._stage = "idle", "idle"
+        self._failure, self._failure_stage = None, None
+        self._interrupted, self._calling = False, False
+        self._steps, self._checkpoints, self._restores = 0, 0, 0
+        self._input = self._checkpoint = self._gate = self._step = None
+
+    def __repr__(self):
+        return "<WorkerRun admitted objects only>"
+
+    def _interrupt_once(self):
+        if self._state == "complete":
+            return  # Retired helpers cannot poison a later shared-controller epoch.
+        if not self._interrupted:
+            self._interrupted = True
+            try:
+                self._interrupt()
+            except BaseException:
+                pass
+
+    def _fail(self, code):
+        if self._state == "complete":
+            raise WorkerRunError("already_consumed") from None
+        if self._failure is None:
+            self._failure = code if code in ERROR_CODES else "run_failed"
+            self._failure_stage = self._stage if self._stage in STAGES else "idle"
+        self._state = "failed"
+        self._interrupt_once()
+        raise WorkerRunError(self._failure) from None
+
+    def _check(self):
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._state == "failed" or self._interrupted:
+            self._fail("terminal_failure")
+
+    def _running(self):
+        self._check()
+        if self._state != "running":
+            self._fail("already_consumed")
+
+    def _call(self, callback, code, *args, **kwargs):
+        self._running()
+        if self._calling:
+            self._fail("reentry")
+        self._calling = True
+        try:
+            result = callback(*args, **kwargs)
+        except BaseException:
+            self._fail(code)
+        finally:
+            self._calling = False
+        self._running()
+        if result is not None:
+            self._fail(code)
+
+    def _reserve(self, rank, **amounts):
+        self._running()
+        if type(rank) is not int or rank != self._rank:
+            self._fail("reserve_failed")
+        self._call(self._client.reserve, "reserve_failed", rank, **amounts)
+
+    def _sync(self, phase, step):
+        self._running()
+        if type(phase) is not str or phase not in PHASES or not _integer(step, 0, 2):
+            self._fail("synchronize_failed")
+        if phase == "completed":
+            self._call(self._client.wait_step_commit, "synchronize_failed", step)
+        self._call(self._synchronize, "synchronize_failed", phase, step)
+
+    def _helpers(self):
+        self._input = WorkerInput(rank=self._rank, reserve=self._reserve,
+                                  interrupt=self._interrupt_once)
+        self._checkpoint = CheckpointWorker(
+            rank=self._rank, world_size=self._world, reserve=self._reserve,
+            interrupt=self._interrupt_once, limits=dict(self._limits),
+        )
+        self._gate = StepGate(
+            rank=self._rank, world_size=self._world, from_step=self._from, stop_step=self._stop,
+            reserve_step=lambda start, end: self._call(
+                self._client.reserve_step, "reserve_failed", start, end),
+            complete_step=lambda step: self._call(
+                self._client.step_complete, "reserve_failed", step),
+            synchronize=self._sync, interrupt=self._interrupt_once,
+        )
+        self._step = WorkerStep(gate=self._gate, world_size=self._world,
+                                device_type=self._device_type)
+
+    def _runtime(self, model, optimizer):
+        modules = [sys.modules.get(name) for name in (
+            "lumi.posttraining_sft_runtime_v4", "lumi.distributed_training", "lumi.pilot_training",
+        )]
+        if any(type(module) is not ModuleType for module in modules):
+            self._fail("runtime_rejected")
+        runtime, distributed, pilot = modules
+        if not all(callable(value) for value in (
+            getattr(runtime, "collate_sft_tensors", None),
+            getattr(distributed, "EpochPermutationPlanner", None),
+            getattr(distributed, "_runtime_rng_state", None),
+            getattr(distributed, "_restore_runtime_rng_state", None),
+            getattr(pilot, "scheduled_learning_rate", None),
+        )):
+            self._fail("runtime_rejected")
+        torch, device = self._step._runtime(model, optimizer, self._profile["strategy"])
+        # Raw Adam state restore maps slots by group/order. Require a fresh exact
+        # optimizer, and bind that order/config before any resume content read.
+        if type(optimizer) is not torch.optim.AdamW or optimizer.state:
+            self._fail("runtime_rejected")
+        self._identity = _digest({"plan_sha256": self._identity,
+                                  "optimizer_binding_sha256": _optimizer_binding(model, optimizer)})
+        return torch, device, runtime, distributed, pilot
+
+    def _agree(self, torch, device, value):
+        # Tiny fixed digest tensor, no object/pickle collective or RNG consumption.
+        digest = torch.tensor(list(bytes.fromhex(_digest(value))), dtype=torch.uint8, device=device)
+        peers = [torch.empty_like(digest) for _ in range(self._world)]
+        torch.distributed.all_gather(peers, digest)
+        if not all(torch.equal(peer, digest) for peer in peers):
+            self._fail("state_rejected")
+
+    def run(self, model, optimizer, *, encoded_root, output_parent_fd,
+            resume_checkpoint_name=None, resume_manifest_sha256=None):
+        self._check()
+        if self._state != "idle":
+            self._fail("reentry" if self._state == "running" else "already_consumed")
+        self._state, self._stage = "running", "admission"
+        try:
+            if (self._from == 0 and (resume_checkpoint_name is not None
+                                    or resume_manifest_sha256 is not None)
+                    or self._from == 1 and (
+                        type(resume_checkpoint_name) is not str
+                        or resume_checkpoint_name != "checkpoint-00000001"
+                        or not _hash(resume_manifest_sha256))):
+                self._fail("invalid_arguments")
+            self._call(self._admit, "admission_rejected")
+            self._stage = "runtime"
+            _directory_info(output_parent_fd)
+            self._helpers()
+            torch, device, runtime, distributed, pilot = self._runtime(model, optimizer)
+            self._agree(torch, device, {"identity": self._identity, "from_step": self._from,
+                                       "stop_step": self._stop,
+                                       "resume_manifest_sha256": resume_manifest_sha256})
+            self._stage = "inputs"
+            dataset = self._input.load(encoded_root, record_limit=self._record_limit,
+                                       **dict(self._pins))
+            if len(dataset) != self._record_limit:
+                self._fail("input_rejected")
+            self._sync("inputs", self._from)
+            torch.manual_seed(self._profile["seed"] + 10_000 + self._rank)
+            if self._device_type == "cuda":
+                torch.cuda.manual_seed_all(self._profile["seed"] + 10_000 + self._rank)
+            state = make_state(self._identity)
+            if self._from:
+                self._stage = "restore_state"
+                saved = read_training_state(
+                    output_parent_fd, checkpoint_name=resume_checkpoint_name,
+                    manifest_sha256=resume_manifest_sha256, checkpoint_worker=self._checkpoint,
+                )
+                state = validate_state(saved, run_identity_sha256=self._identity,
+                                       from_step=self._from,
+                                       global_records_per_step=self._global_records)
+                self._agree(torch, device, state)
+                self._stage = "restore_checkpoint"
+                rng = self._checkpoint.restore_checkpoint(
+                    output_parent_fd, checkpoint_name=resume_checkpoint_name,
+                    manifest_sha256=resume_manifest_sha256, model=model, optimizer=optimizer,
+                )
+                distributed._restore_runtime_rng_state(rng, device)
+                self._restores = 1
+            self._sync("restored", self._from)
+            planner = distributed.EpochPermutationPlanner(dataset_length=len(dataset),
+                                                          seed=self._profile["seed"])
+            receipt = None
+            while state["step"] < self._stop:
+                self._running()
+                self._stage = "planning"
+                step, cursor = state["step"] + 1, state["sequence_cursor"]
+                microbatches = []
+                for _ in range(self._profile["gradient_accumulation_steps"]):
+                    indices, cursor = planner.rank_batch(
+                        cursor=cursor, per_rank_batch_size=self._profile["per_rank_batch_size"],
+                        rank=self._rank, world_size=self._world,
+                    )
+                    microbatches.append(runtime.collate_sft_tensors(
+                        [dataset[index] for index in indices],
+                        context_window=self._profile["context_window"],
+                        pad_to_multiple_of=self._profile["pad_to_multiple_of"],
+                        pad_token_id=self._profile["pad_token_id"],
+                    ))
+                learning_rate = pilot.scheduled_learning_rate(
+                    base_learning_rate=self._profile["learning_rate"], step=step,
+                    schedule=self._profile["lr_schedule"],
+                    warmup_steps=self._profile["warmup_steps"],
+                    schedule_steps=2 if self._profile["lr_schedule"] == "cosine" else None,
+                    min_learning_rate_ratio=self._profile["min_learning_rate_ratio"],
+                )
+                self._stage = "step"
+                metrics = self._step.perform(
+                    model, optimizer, microbatches, to_step=step, learning_rate=learning_rate,
+                    max_grad_norm=self._profile["max_grad_norm"],
+                    strategy=self._profile["strategy"],
+                    gradient_sync_mode=self._profile["gradient_sync_mode"],
+                    precision=self._profile["precision"],
+                )
+                self._stage = "state"
+                state = advance_state(state, metrics=metrics,
+                                      global_records_per_step=self._global_records)
+                if cursor != state["sequence_cursor"] or self._gate.current_step != step:
+                    self._fail("state_rejected")
+                self._agree(torch, device, state)
+                self._steps += 1
+                self._stage = "checkpoint"
+                receipt = self._checkpoint.save_checkpoint(
+                    output_parent_fd, model=model, optimizer=optimizer,
+                    rng_state=distributed._runtime_rng_state(device),
+                    training_state=state, step=step,
+                )
+                if (type(receipt) is not dict
+                        or receipt.get("checkpoint_name") != f"checkpoint-{step:08d}"
+                        or not _hash(receipt.get("manifest_sha256"))):
+                    self._fail("checkpoint_rejected")
+                self._checkpoints += 1
+                self._sync("checkpoint", step)
+            self._running()
+            self._state, self._stage = "complete", "complete"
+            return {"training_state": dict(state), "checkpoint": dict(receipt)}
+        except BaseException:
+            self._fail("run_failed")
+
+    def summary(self):
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        return {
+            "schema_version": "lumi.sft-worker-run-summary.v0.1", "state": self._state,
+            "stage": self._stage, "failure_code": self._failure,
+            "failure_stage": self._failure_stage, "completed_steps": self._steps,
+            "saved_checkpoints": self._checkpoints, "restored_checkpoints": self._restores,
+            "os_admission_verified": False, "os_resource_enforcement": False,
+            "real_sft_execution_permitted": False, "production_eligible": False,
+        }
