@@ -1,0 +1,66 @@
+name: SFT CPU lookup acceptance
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-cpu-lookup-acceptance.yml
+      - scripts/build_sft_cpu_lookup_acceptance_v1.py
+      - scripts/run_sft_cpu_lookup_acceptance_v1.py
+      - scripts/run_sft_oci_worker_probe_v2.py
+      - scripts/sft_cpu_lookup_acceptance_report_v1.py
+      - tests/test_sft_cpu_lookup_acceptance_report_v1.py
+      - tests/test_sft_cpu_lookup_acceptance_source_v1.py
+      - tests/test_sft_cpu_version_lookup_v2.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-cpu-lookup-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-cpu-acceptance:
+    if: github.event.repository.private == true && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LUMI_CPU_LOOKUP_ACCEPTANCE_CI: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: One corrected CPU acceptance, no retry or real model/data
+        timeout-minutes: 21
+        run: >-
+          timeout --signal=TERM --kill-after=15s 20m
+          python -S -B scripts/build_sft_cpu_lookup_acceptance_v1.py --cpu-lookup-acceptance
+      - name: Retain small private acceptance and fixed-code diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-cpu-lookup-evidence-${{ github.sha }}
+          path: |
+            artifacts/lumi-sft-cpu-lookup-acceptance-v0.1/*.json
+            artifacts/lumi-sft-cpu-lookup-acceptance-v0.1/*.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain only a fully accepted software image, no registry push
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-cpu-lookup-image-${{ github.sha }}
+          path: artifacts/lumi-sft-cpu-lookup-acceptance-v0.1/cpu-release-image.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
