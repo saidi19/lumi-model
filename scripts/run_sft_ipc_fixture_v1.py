@@ -78,7 +78,8 @@ def implementation():
 def valid_code(value):
     return (type(value) is str and value in
             {"not_reported", "passed", "fixture_failed", *implementation().ERROR_CODES,
-             *base().module("posttraining_sft_ipc_diagnostic_v1").ERROR_CODES})
+             *base().module("posttraining_sft_ipc_diagnostic_v1").ERROR_CODES,
+             *base().module("posttraining_sft_ipc_pair_probe_v1").ERROR_CODES})
 
 
 def probe(label, action):
@@ -87,7 +88,9 @@ def probe(label, action):
     try:
         return action()
     except BaseException as error:
-        IPC_CODE = base().module("posttraining_sft_ipc_diagnostic_v1").failure_code(error)
+        pair = base().module("posttraining_sft_ipc_pair_probe_v1")
+        IPC_CODE = (error.code if type(error) is pair.PairProbeError
+                    else base().module("posttraining_sft_ipc_diagnostic_v1").failure_code(error))
         raise
 
 
@@ -453,10 +456,16 @@ def cannot_become_listener(left, name):
             bound = True
             info = os.lstat(path)
             need(stat.S_ISSOCK(info.st_mode) and info.st_uid == os.getuid())
-        denied(lambda: left.listen(1), (errno.EINVAL, errno.EOPNOTSUPP))
+        cannot_listen(left)
     finally:
         if bound:
             os.unlink(path)
+
+
+def cannot_listen(left):
+    module = base().module("posttraining_sft_ipc_pair_probe_v1")
+    result = module.verify_no_listener(left)
+    need(result["not_listening"] is True and result["accept_rejected"] is True)
 
 
 def connected_pair_probes(kind, name):
@@ -483,7 +492,7 @@ def connected_pair_probes(kind, name):
         left.shutdown(socket.SHUT_RDWR)
         cannot_disconnect(left)
         denied(lambda: left.connect(path), (errno.EISCONN, errno.EINVAL))
-        denied(lambda: left.listen(1), (errno.EINVAL, errno.EOPNOTSUPP))
+        cannot_listen(left)
         errors = (errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EISCONN, errno.EINVAL)
         denied(lambda: left.sendto(b"generated-closed", socket.MSG_NOSIGNAL, path), errors)
         denied(lambda: left.sendmsg([b"generated-closed"], [], socket.MSG_NOSIGNAL,
@@ -498,7 +507,7 @@ def connected_pair_probes(kind, name):
         right.close()
         cannot_disconnect(left)
         denied(lambda: left.connect(path), (errno.EISCONN, errno.EINVAL))
-        denied(lambda: left.listen(1), (errno.EINVAL, errno.EOPNOTSUPP))
+        cannot_listen(left)
         errors = (errno.EPIPE, errno.ECONNRESET, errno.ENOTCONN, errno.EISCONN, errno.EINVAL)
         denied(lambda: left.sendto(b"generated-closed", socket.MSG_NOSIGNAL, path), errors)
         denied(lambda: left.sendmsg([b"generated-closed"], [], socket.MSG_NOSIGNAL,
