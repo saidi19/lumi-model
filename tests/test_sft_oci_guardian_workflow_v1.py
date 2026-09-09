@@ -41,7 +41,7 @@ class WorkflowTests(unittest.TestCase):
         guard = next(line.strip() for line in TEXT.splitlines() if line.strip().startswith("if:"))
         self.assertEqual(guard, "if: github.event.repository.private == true"
                          " && github.run_attempt == 1"
-                         " && github.event.before == 'a0296d4dd80463023a154b5eb51bd4384158f513'"
+                         " && github.event.before == '01b89f9477dc28a6f2b771f164f347dafb53d6dc'"
                          " && github.event.after == github.sha")
         self.assertNotIn("workflow_dispatch", TEXT)
         self.assertNotIn("pull_request", TEXT)
@@ -112,13 +112,21 @@ class WorkflowTests(unittest.TestCase):
         acquire = source("acquire")
         self.assertIn("ProxyHandler({})", acquire)
         self.assertIn("NoRedirect()", acquire)
-        self.assertEqual(acquire.count("opener.open("), 3)
+        self.assertEqual(acquire.count("opener.open("), 4)
         self.assertIn("headers.clear()", acquire)
         self.assertIn("token = None", acquire)
         final_request = (acquire.split("urllib.request.Request(location", 1)[1]
                          .split("as response")[0])
         self.assertNotIn("Authorization", final_request)
         self.assertNotIn("headers=headers", final_request)
+
+    def test_prior_preflight_only_stop_is_verified_before_artifact_metadata(self):
+        acquire = source("acquire")
+        self.assertIn("/attempts/1/jobs?per_page=2", acquire)
+        self.assertLess(acquire.index("prior_source_stop(json.loads(raw))"),
+                        acquire.index("metadata(json.loads(raw))"))
+        self.assertIn("prior_native_pass_started': False", acquire)
+        self.assertIn("prior_artifact_acquisition_started': False", acquire)
 
     def test_signed_url_never_written_to_evidence_or_stdout(self):
         acquire = source("acquire")

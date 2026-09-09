@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Bounded CI-only retrieval of one accepted software artifact, never datasets.
 
-One metadata GET, one non-followed archive-URL GET, one unauthenticated signed
-HTTPS download. No retry, cookies, proxies, POST, package/registry operation or
+One prior-stop GET, one artifact metadata GET, one non-followed archive-URL GET,
+one unauthenticated signed HTTPS download. No retry, cookies, proxies, POST or
 ML import. The ZIP and its single software tar are independently pinned. The
 trusted GitHub checkout/runner and authenticated GitHub API are premises.
 Only aggregate fixed-code evidence is written; tokens/signed URLs never appear.
@@ -27,7 +27,9 @@ from pathlib import Path
 
 SCHEMA = "lumi.sft-oci-guardian-acquisition.v0.1"
 ROOT = Path(__file__).resolve().parents[1]
-APPROVED_PARENT = "a0296d4dd80463023a154b5eb51bd4384158f513"
+APPROVED_PARENT = "01b89f9477dc28a6f2b771f164f347dafb53d6dc"
+PRIOR_SOURCE_RUN = 34358096760
+PRIOR_SOURCE_JOB = 102487798348
 REPOSITORY = "saidi19/lumi-model"
 ARTIFACT_ID = 10101633554
 ACCEPTED_RUN_ID = 34345663337
@@ -40,7 +42,8 @@ TAR_SHA256 = "99d21fc60a54a65f28ceb4780f603f7ee48e49ac7b6d00a053dcdabe9ebc9ff4"
 OUTPUT = "artifacts/lumi-sft-oci-guardian-acceptance-v0.1"
 MAXIMUM_SECONDS = 300
 MAXIMUM_METADATA_BYTES = 32768
-STAGES = ("preflight", "metadata", "archive_url", "download", "verify_zip", "extract_tar",
+STAGES = ("preflight", "prior_source_stop", "metadata", "archive_url", "download",
+          "verify_zip", "extract_tar",
           "complete")
 STAGE = "preflight"
 
@@ -80,6 +83,32 @@ def metadata(value):
          and run.get("head_branch") == "codex/lumi-posttraining-product-v0.1"
          and run.get("repository_id") == run.get("head_repository_id") == 1300831104)
     need(all(type(run[key]) is int for key in ("id", "repository_id", "head_repository_id")))
+
+
+def prior_source_stop(value):
+    need(type(value) is dict and type(value.get("total_count")) is int
+         and value["total_count"] == 1 and type(value.get("jobs")) is list
+         and len(value["jobs"]) == 1)
+    job = value["jobs"][0]
+    need(type(job) is dict and job.get("id") == PRIOR_SOURCE_JOB
+         and job.get("run_id") == PRIOR_SOURCE_RUN and job.get("run_attempt") == 1
+         and job.get("head_sha") == APPROVED_PARENT and job.get("status") == "completed"
+         and job.get("conclusion") == "failure" and job.get("name") == "private-native-composition"
+         and all(type(job[key]) is int for key in ("id", "run_id", "run_attempt")))
+    steps = job.get("steps")
+    need(type(steps) is list and 4 <= len(steps) <= 32
+         and all(type(row) is dict and type(row.get("name")) is str for row in steps))
+    selected = {row["name"]: row for row in steps}
+    need(len(selected) == len(steps))
+    expected = {
+        "New source and synthetic contracts before any software download": "failure",
+        "Retrieve exact already accepted software, no rebuild or retry": "skipped",
+        "One native composition, two negative pins then one positive WorkerRun": "skipped",
+        "Retire only this acquisition's exact temporary software copy": "skipped",
+    }
+    for name, conclusion in expected.items():
+        need(name in selected and selected[name].get("status") == "completed"
+             and selected[name].get("conclusion") == conclusion)
 
 
 def signed_url(value):
@@ -160,6 +189,15 @@ def acquire(output):
                "X-GitHub-Api-Version": "2022-11-28",
                "User-Agent": "lumi-oci-guardian-acquisition-v1"}
     endpoint = f"https://api.github.com/repos/{REPOSITORY}/actions/artifacts/{ARTIFACT_ID}"
+    STAGE = "prior_source_stop"
+    predecessor = (f"https://api.github.com/repos/{REPOSITORY}/actions/runs/"
+                   f"{PRIOR_SOURCE_RUN}/attempts/1/jobs?per_page=2")
+    with opener.open(urllib.request.Request(predecessor, headers=headers),
+                     timeout=request_timeout(deadline, 20)) as response:
+        need(response.status == 200)
+        raw = response.read(MAXIMUM_METADATA_BYTES + 1)
+        need(len(raw) <= MAXIMUM_METADATA_BYTES)
+        prior_source_stop(json.loads(raw))
     STAGE = "metadata"
     with opener.open(urllib.request.Request(endpoint, headers=headers),
                      timeout=request_timeout(deadline, 20)) as response:
@@ -225,7 +263,9 @@ def acquire(output):
         STAGE = "complete"
         result = {"schema": SCHEMA, "status": "passed", "artifact_id": ARTIFACT_ID,
                   "accepted_run_id": ACCEPTED_RUN_ID, "source_commit": ACCEPTED_COMMIT,
-                  "https_requests": 3, "artifact_zip_bytes": ZIP_BYTES,
+                  "https_requests": 4, "prior_source_stop_run": PRIOR_SOURCE_RUN,
+                  "prior_artifact_acquisition_started": False,
+                  "prior_native_pass_started": False, "artifact_zip_bytes": ZIP_BYTES,
                   "artifact_zip_sha256": ZIP_SHA256, "software_tar_bytes": TAR_BYTES,
                   "software_tar_sha256": TAR_SHA256, "network_retries": 0,
                   "real_model_or_data_access": False, "gpu_used": False,

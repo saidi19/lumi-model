@@ -28,8 +28,9 @@ concurrency:
 
 jobs:
   private-native-composition:
-    # The unique direct successor push only. Later edits and reruns skip this job.
-    if: github.event.repository.private == true && github.run_attempt == 1 && github.event.before == 'a0296d4dd80463023a154b5eb51bd4384158f513' && github.event.after == github.sha
+    # Source-preflight correction only; the prior run never downloaded or ran a payload.
+    # Acquisition verifies the prior skipped stages through the authenticated API.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.event.before == '01b89f9477dc28a6f2b771f164f347dafb53d6dc' && github.event.after == github.sha
     runs-on: ubuntu-24.04
     timeout-minutes: 28
     env:

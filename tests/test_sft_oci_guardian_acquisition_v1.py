@@ -46,6 +46,161 @@ def good_metadata():
     }
 
 
+def good_prior_source_stop():
+    return {
+        "total_count": 1,
+        "jobs": [
+            {
+                "id": 102487798348,
+                "run_id": 34358096760,
+                "run_attempt": 1,
+                "head_sha": "01b89f9477dc28a6f2b771f164f347dafb53d6dc",
+                "status": "completed",
+                "conclusion": "failure",
+                "name": "private-native-composition",
+                "steps": [
+                    {
+                        "name": "New source and synthetic contracts before any software download",
+                        "status": "completed",
+                        "conclusion": "failure",
+                    },
+                    {
+                        "name": "Retrieve exact already accepted software, no rebuild or retry",
+                        "status": "completed",
+                        "conclusion": "skipped",
+                    },
+                    {
+                        "name": ("One native composition, two negative pins "
+                                 "then one positive WorkerRun"),
+                        "status": "completed",
+                        "conclusion": "skipped",
+                    },
+                    {
+                        "name": "Retire only this acquisition's exact temporary software copy",
+                        "status": "completed",
+                        "conclusion": "skipped",
+                    },
+                ],
+            }
+        ],
+    }
+
+
+class PriorSourceStopTests(unittest.TestCase):
+    def reject(self, value):
+        with self.assertRaises(acquisition.AcquisitionError) as caught:
+            acquisition.prior_source_stop(value)
+        self.assertEqual(caught.exception.args, ("acquisition_rejected",))
+
+    def test_exact_first_attempt_unit_stop_and_skipped_downstream_accepted(self):
+        value = good_prior_source_stop()
+        original = copy.deepcopy(value)
+        self.assertIsNone(acquisition.prior_source_stop(value))
+        self.assertEqual(value, original)
+
+    def test_any_acquisition_native_or_retirement_completion_rejected(self):
+        for index in (1, 2, 3):
+            for conclusion in ("success", "failure", "cancelled", "timed_out", None):
+                with self.subTest(stage=index, conclusion=conclusion):
+                    value = good_prior_source_stop()
+                    value["jobs"][0]["steps"][index]["conclusion"] = conclusion
+                    self.reject(value)
+
+    def test_any_downstream_running_or_queued_stage_rejected(self):
+        for index in (1, 2, 3):
+            for status in ("in_progress", "queued", "pending", None):
+                value = good_prior_source_stop()
+                value["jobs"][0]["steps"][index]["status"] = status
+                self.reject(value)
+
+    def test_unit_step_must_have_failed_and_completed(self):
+        for field, items in (
+            ("conclusion", ("success", "skipped", "cancelled", None)),
+            ("status", ("in_progress", "queued", None)),
+        ):
+            for item in items:
+                value = good_prior_source_stop()
+                value["jobs"][0]["steps"][0][field] = item
+                self.reject(value)
+
+    def test_wrong_job_run_attempt_sha_or_name_rejected(self):
+        for field, items in {
+            "id": (102487798349, "102487798348", 102487798348.0, True),
+            "run_id": (34358096761, "34358096760", 34358096760.0, True),
+            "run_attempt": (0, 2, "1", 1.0, True),
+            "head_sha": ("0" * 40, acquisition.ACCEPTED_COMMIT, None),
+            "name": ("other-job", None),
+        }.items():
+            for item in items:
+                value = good_prior_source_stop()
+                value["jobs"][0][field] = item
+                self.reject(value)
+
+    def test_job_must_be_completed_failure_not_success_or_unfinished(self):
+        for field, items in (
+            ("status", ("in_progress", "queued", None)),
+            ("conclusion", ("success", "skipped", "cancelled", None)),
+        ):
+            for item in items:
+                value = good_prior_source_stop()
+                value["jobs"][0][field] = item
+                self.reject(value)
+
+    def test_missing_required_job_fields_rejected(self):
+        for field in good_prior_source_stop()["jobs"][0]:
+            value = good_prior_source_stop()
+            del value["jobs"][0][field]
+            self.reject(value)
+
+    def test_nonint_or_nonexact_job_count_rejected(self):
+        for count in (None, 0, 2, True, 1.0, "1"):
+            value = good_prior_source_stop()
+            value["total_count"] = count
+            self.reject(value)
+
+    def test_wrong_top_level_or_job_shapes_rejected(self):
+        for value in (
+            None,
+            [],
+            "jobs",
+            {},
+            {"total_count": 1},
+            {"total_count": 1, "jobs": []},
+            {"total_count": 1, "jobs": [None]},
+        ):
+            self.reject(value)
+        value = good_prior_source_stop()
+        value["jobs"].append(copy.deepcopy(value["jobs"][0]))
+        self.reject(value)
+
+    def test_duplicate_stage_names_rejected(self):
+        value = good_prior_source_stop()
+        value["jobs"][0]["steps"].append(copy.deepcopy(value["jobs"][0]["steps"][1]))
+        self.reject(value)
+
+    def test_each_missing_required_stage_rejected_even_with_four_rows(self):
+        for index in range(4):
+            value = good_prior_source_stop()
+            del value["jobs"][0]["steps"][index]
+            value["jobs"][0]["steps"].append(
+                {
+                    "name": "Other unrelated step",
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            )
+            self.reject(value)
+
+    def test_malformed_or_excessive_step_rows_rejected(self):
+        for steps in (None, {}, [], [None] * 4, [{"name": 1}] * 4):
+            value = good_prior_source_stop()
+            value["jobs"][0]["steps"] = steps
+            self.reject(value)
+        value = good_prior_source_stop()
+        value["jobs"][0]["steps"].extend({"name": f"extra-{i}"} for i in range(29))
+        self.reject(value)
+
+
 class MetadataTests(unittest.TestCase):
     def reject(self, value):
         with self.assertRaises(acquisition.AcquisitionError) as caught:
@@ -325,12 +480,16 @@ class AcquisitionWithSyntheticIOTests(unittest.TestCase):
     def configure(
         self,
         *,
+        prior_value=None,
         metadata_value=None,
         download_status=200,
         length=None,
         download_data=None,
         redirect=SIGNED,
     ):
+        predecessor = Response(
+            json.dumps(good_prior_source_stop() if prior_value is None else prior_value).encode()
+        )
         first = Response(
             json.dumps(good_metadata() if metadata_value is None else metadata_value).encode()
         )
@@ -346,21 +505,36 @@ class AcquisitionWithSyntheticIOTests(unittest.TestCase):
             status=download_status,
             headers={"Content-Length": str(len(self.zip_data)) if length is None else length},
         )
-        self.responses.extend((first, redirect_error, last))
-        self.opener.open.side_effect = (first, redirect_error, last)
+        self.responses.extend((predecessor, first, redirect_error, last))
+        self.opener.open.side_effect = (predecessor, first, redirect_error, last)
 
-    def test_three_gets_no_auth_on_signed_request_and_no_proxy_redirects(self):
+    def test_four_gets_prior_stop_first_and_no_auth_on_signed_request(self):
         result = acquisition.acquire(self.output)
-        self.assertEqual(result["https_requests"], 3)
-        self.assertEqual(self.opener.open.call_count, 3)
+        self.assertEqual(result["https_requests"], 4)
+        self.assertEqual(result["prior_source_stop_run"], 34358096760)
+        self.assertIs(result["prior_artifact_acquisition_started"], False)
+        self.assertIs(result["prior_native_pass_started"], False)
+        self.assertEqual(self.opener.open.call_count, 4)
         requests = [item.args[0] for item in self.opener.open.call_args_list]
         self.assertTrue(all(request.get_method() == "GET" for request in requests))
         self.assertTrue(all(request.data is None for request in requests))
-        self.assertEqual(requests[0].get_header("Authorization"), "Bearer synthetic-api-token")
-        self.assertEqual(requests[1].get_header("Authorization"), "Bearer synthetic-api-token")
-        self.assertIsNone(requests[2].get_header("Authorization"))
-        self.assertIsNone(requests[2].get_header("Cookie"))
-        self.assertEqual(requests[2].full_url, SIGNED)
+        self.assertEqual(
+            requests[0].full_url,
+            (
+                "https://api.github.com/repos/saidi19/lumi-model/actions/runs/"
+                "34358096760/attempts/1/jobs?per_page=2"
+            ),
+        )
+        self.assertEqual(
+            requests[1].full_url,
+            ("https://api.github.com/repos/saidi19/lumi-model/actions/artifacts/10101633554"),
+        )
+        self.assertEqual(requests[2].full_url, requests[1].full_url + "/zip")
+        for request in requests[:3]:
+            self.assertEqual(request.get_header("Authorization"), "Bearer synthetic-api-token")
+        self.assertIsNone(requests[3].get_header("Authorization"))
+        self.assertIsNone(requests[3].get_header("Cookie"))
+        self.assertEqual(requests[3].full_url, SIGNED)
         self.assertEqual(self.builder.call_args.args[0].proxies, {})
         self.assertIsInstance(self.builder.call_args.args[1], acquisition.NoRedirect)
         self.assertNotIn("GH_TOKEN", self.environment)
@@ -391,6 +565,8 @@ class AcquisitionWithSyntheticIOTests(unittest.TestCase):
             "gpu_used",
             "real_sft_execution_permitted",
             "production_eligible",
+            "prior_artifact_acquisition_started",
+            "prior_native_pass_started",
         ):
             self.assertIs(result[flag], False)
 
@@ -400,13 +576,32 @@ class AcquisitionWithSyntheticIOTests(unittest.TestCase):
         self.configure(metadata_value=value)
         with self.assertRaises(acquisition.AcquisitionError):
             acquisition.acquire(self.output)
+        self.assertEqual(self.opener.open.call_count, 2)
+
+    def test_prior_native_started_stops_before_artifact_metadata_request(self):
+        value = good_prior_source_stop()
+        value["jobs"][0]["steps"][2]["conclusion"] = "failure"
+        self.configure(prior_value=value)
+        with self.assertRaises(acquisition.AcquisitionError):
+            acquisition.acquire(self.output)
         self.assertEqual(self.opener.open.call_count, 1)
+        self.assertFalse(self.github_output.exists())
+        self.assertEqual(acquisition.STAGE, "prior_source_stop")
+
+    def test_prior_acquisition_started_stops_before_artifact_metadata_request(self):
+        value = good_prior_source_stop()
+        value["jobs"][0]["steps"][1]["status"] = "in_progress"
+        self.configure(prior_value=value)
+        with self.assertRaises(acquisition.AcquisitionError):
+            acquisition.acquire(self.output)
+        self.assertEqual(self.opener.open.call_count, 1)
+        self.assertFalse(self.github_output.exists())
 
     def test_unapproved_redirect_stops_before_signed_request(self):
         self.configure(redirect="https://unapproved.example/archive")
         with self.assertRaises(acquisition.AcquisitionError):
             acquisition.acquire(self.output)
-        self.assertEqual(self.opener.open.call_count, 2)
+        self.assertEqual(self.opener.open.call_count, 3)
 
     def test_wrong_content_length_rejected_without_writing_archive(self):
         self.configure(length=str(len(self.zip_data) + 1))

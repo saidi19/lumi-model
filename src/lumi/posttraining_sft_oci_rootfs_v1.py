@@ -123,6 +123,13 @@ class _BoundedTarInfo(tarfile.TarInfo):
 
     @classmethod
     def fromtarfile(cls, archive):
+        return cls._fromtarfile(archive)
+
+    @classmethod
+    def _fromtarfile(cls, archive, *, dircheck=True):
+        # CPython 3.12.14+ routes PAX/GNU follow-up headers through this
+        # private bridge, bypassing public fromtarfile(). Both entry points
+        # must share the physical-header budget, including nested metadata.
         _check_deadline(archive._rootfs_deadline)
         raw = archive.fileobj.read(tarfile.BLOCKSIZE)
         _need(len(raw) == tarfile.BLOCKSIZE, "rootfs_archive_rejected")
@@ -133,7 +140,13 @@ class _BoundedTarInfo(tarfile.TarInfo):
               "rootfs_bounds_exhausted")
         failure, member = False, None
         try:
-            member = cls.frombuf(raw, archive.encoding, archive.errors)
+            parser = getattr(cls, "_frombuf", None)
+            if parser is None:
+                member = cls.frombuf(raw, archive.encoding, archive.errors)
+            else:
+                # Preserve the updated stdlib's security-sensitive V7
+                # directory distinction for metadata follow-up headers.
+                member = parser(raw, archive.encoding, archive.errors, dircheck=dircheck)
         except tarfile.HeaderError:
             failure = True
         _need(not failure, "rootfs_archive_rejected")

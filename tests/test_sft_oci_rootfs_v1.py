@@ -149,6 +149,37 @@ class RootfsTests(unittest.TestCase):
         self.archive.write_bytes(output.getvalue())
         owned = self.extract()
         self.assertEqual((owned.path / name).read_bytes(), b"synthetic")
+        self.assertEqual(owned.summary()["archive_headers"], 2)
+
+    def test_nested_global_and_local_pax_count_every_physical_header(self):
+        self.write_archive([member("a", pax={"comment": "synthetic local metadata"})])
+        prefix = tarfile.TarInfo.create_pax_global_header({"comment": "synthetic global metadata"})
+        self.archive.write_bytes(prefix + self.archive.read_bytes())
+        owned = self.extract()
+        self.assertEqual(owned.summary()["archive_entries"], 1)
+        self.assertEqual(owned.summary()["archive_headers"], 3)
+        self.assertEqual((owned.path / "a").read_bytes(), b"synthetic")
+
+    def test_nested_pax_header_budget_cannot_hide_behind_owned_entry_count(self):
+        self.write_archive([member("a", pax={"comment": "synthetic local metadata"})])
+        prefix = tarfile.TarInfo.create_pax_global_header({"comment": "synthetic global metadata"})
+        self.archive.write_bytes(prefix + self.archive.read_bytes())
+        # Root plus one output file fits two owned entries, but the three
+        # physical headers must exceed this independent parser bound.
+        self.rejected(code="rootfs_bounds_exhausted", maximum_entries=2)
+
+    def test_nested_gnu_long_name_and_link_count_every_header(self):
+        output = io.BytesIO()
+        name, target = "a" * 150, "/" + "b" * 150
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.GNU_FORMAT) as archive:
+            info, _ = member(name, "symlink", link=target)
+            archive.addfile(info)
+        self.archive.write_bytes(output.getvalue())
+        owned = self.extract()
+        self.assertEqual(owned.summary()["archive_headers"], 3)
+        self.assertEqual(os.readlink(owned.path / name), target)
+        owned.close()
+        self.rejected(code="rootfs_bounds_exhausted", maximum_entries=2)
 
     def test_absolute_and_parent_relative_symlink_targets_preserved(self):
         self.write_archive([member("d/a", "symlink", link="/outside/synthetic"),
@@ -521,6 +552,80 @@ class RootfsTests(unittest.TestCase):
     def test_errors_hide_raw_underlying_exception_text(self):
         with patch.object(subject.os, "read", side_effect=OSError("PRIVATE PATH RAW TEXT")):
             self.rejected(code="rootfs_operation_failed")
+
+
+class PhysicalHeaderDispatchTests(unittest.TestCase):
+    """Exercise both stdlib entry points without patching global tarfile state."""
+
+    def make_archive(self, raw, *, maximum=64, deadline=None):
+        return types.SimpleNamespace(
+            fileobj=io.BytesIO(raw), encoding="utf-8", errors="surrogateescape", pax_headers={},
+            _rootfs_deadline=time.monotonic() + 10 if deadline is None else deadline,
+            _rootfs_headers=0, _rootfs_maximum_headers=maximum, _rootfs_metadata_bytes=0,
+        )
+
+    def header(self, name="synthetic", kind=tarfile.REGTYPE):
+        info = tarfile.TarInfo(name)
+        info.type, info.size = kind, 0
+        return info.tobuf(format=tarfile.USTAR_FORMAT)
+
+    def test_public_and_private_entry_points_share_one_physical_counter(self):
+        archive = self.make_archive(self.header("one") + self.header("two"))
+        first = subject._BoundedTarInfo.fromtarfile(archive)
+        second = subject._BoundedTarInfo._fromtarfile(archive, dircheck=False)
+        self.assertEqual((first.name, second.name), ("one", "two"))
+        self.assertEqual(archive._rootfs_headers, 2)
+        self.assertEqual(archive.fileobj.tell(), 1024)
+
+    def test_private_followup_header_cannot_bypass_header_budget(self):
+        archive = self.make_archive(self.header("one") + self.header("two"), maximum=1)
+        subject._BoundedTarInfo.fromtarfile(archive)
+        with self.assertRaisesRegex(subject.RootfsError, "rootfs_bounds_exhausted"):
+            subject._BoundedTarInfo._fromtarfile(archive, dircheck=False)
+        self.assertEqual(archive._rootfs_headers, 2)
+
+    def test_private_followup_header_checks_deadline_before_reading(self):
+        archive = self.make_archive(self.header(), deadline=time.monotonic() - 1)
+        with self.assertRaisesRegex(subject.RootfsError, "rootfs_deadline_exhausted"):
+            subject._BoundedTarInfo._fromtarfile(archive, dircheck=False)
+        self.assertEqual(archive.fileobj.tell(), 0)
+        self.assertEqual(archive._rootfs_headers, 0)
+
+    def test_private_followup_header_rejects_truncated_block(self):
+        archive = self.make_archive(b"synthetic incomplete header")
+        with self.assertRaisesRegex(subject.RootfsError, "rootfs_archive_rejected"):
+            subject._BoundedTarInfo._fromtarfile(archive, dircheck=False)
+
+    def test_private_followup_header_rejects_invalid_checksum(self):
+        raw = self.header()
+        archive = self.make_archive(b"invalid" + raw[7:])
+        with self.assertRaisesRegex(subject.RootfsError, "rootfs_archive_rejected"):
+            subject._BoundedTarInfo._fromtarfile(archive, dircheck=False)
+
+    def test_updated_frombuf_receives_exact_directory_check_flag(self):
+        observed = []
+
+        class UpdatedDecoder(subject._BoundedTarInfo):
+            @classmethod
+            def _frombuf(cls, raw, encoding, errors, *, dircheck=True):
+                observed.append(dircheck)
+                return tarfile.TarInfo.frombuf(raw, encoding, errors)
+
+        archive = self.make_archive(self.header("one") + self.header("two"))
+        UpdatedDecoder.fromtarfile(archive)
+        UpdatedDecoder._fromtarfile(archive, dircheck=False)
+        self.assertEqual(observed, [True, False])
+        self.assertEqual(archive._rootfs_headers, 2)
+
+    def test_installed_stdlib_v7_directory_semantics_are_preserved(self):
+        raw = self.header("legacy/", tarfile.AREGTYPE)
+        ordinary = subject._BoundedTarInfo.fromtarfile(self.make_archive(raw))
+        followup = subject._BoundedTarInfo._fromtarfile(self.make_archive(raw), dircheck=False)
+        self.assertEqual(ordinary.type, tarfile.DIRTYPE)
+        # New stdlib releases deliberately suppress V7 directory conversion
+        # on a metadata follow-up. Older stdlib releases have no such flag.
+        expected = tarfile.AREGTYPE if hasattr(tarfile.TarInfo, "_frombuf") else tarfile.DIRTYPE
+        self.assertEqual(followup.type, expected)
 
 
 if __name__ == "__main__":
