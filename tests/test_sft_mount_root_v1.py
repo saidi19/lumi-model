@@ -41,6 +41,7 @@ class MountRootTests(unittest.TestCase):
         self.runtime = self.enterContext(patch.object(mount.netns, "_runtime"))
         self.next_fd, self.root_opens, self.ns_opens = 10, 0, 0
         self.metadata, self.closed, self.events = {}, [], []
+        self.pin_records = []
         self.old_root = info()
         self.new_root = info(2, 1, stat.S_IFDIR | 0o755)
         self.parent = info(mode=stat.S_IFDIR | 0o1777)
@@ -68,7 +69,7 @@ class MountRootTests(unittest.TestCase):
             mount, "_unshare", side_effect=lambda: self.events.append("unshare"),
         ))
         self.mount = self.enterContext(patch.object(
-            mount, "_mount", side_effect=lambda *args: self.events.append(("mount", args)),
+            mount, "_mount", side_effect=self.mount_call,
         ))
         self.seal = self.enterContext(patch.object(
             mount, "_seal", side_effect=lambda *args, **kw: self.events.append(("seal", args, kw)),
@@ -101,7 +102,23 @@ class MountRootTests(unittest.TestCase):
             value = info(mode=(stat.S_IFDIR if directory else stat.S_IFREG) | 0o755)
         fd = self.allocate(value)
         owned.append(fd)
+        self.pin_records.append((path, fd, "unshare" in self.events))
         return fd
+
+    def mount_call(self, *args, **kwargs):
+        if args[3] & mount.MS_BIND:
+            fd = int(args[0].rsplit("/", 1)[1])
+            matching = [record for record in self.pin_records if record[1] == fd]
+            self.assertEqual(len(matching), 1)
+            path, _, in_new_namespace = matching[0]
+            self.assertTrue(in_new_namespace, "old_namespace_bind_source")
+            originals = [record[1] for record in self.pin_records
+                         if record[0] == path and not record[2]]
+            self.assertEqual(len(originals), 1)
+            self.assertIn(originals[0], self.closed)
+            self.assertIn(fd, self.metadata)
+            self.assertEqual(kwargs, {"failure_code": "bind_mount_failed"})
+        self.events.append(("mount", args))
 
     def open_namespace(self, owned):
         self.ns_opens += 1
@@ -151,6 +168,66 @@ class MountRootTests(unittest.TestCase):
         ))])
         self.assertEqual(self.events[-1], ("seal", ("/", 7), {"recursive": False}))
         self.assertLess(self.events.index("pivot"), len(self.events) - 1)
+
+    def test_every_bind_repins_same_source_in_new_namespace(self):
+        self.run_setup()
+        binds = [item for item in self.mount.call_args_list if item.args[3] & mount.MS_BIND]
+        self.assertEqual(len(binds), 10)
+        self.assertEqual(len([item for item in self.pin_records
+                              if item[0] == OPTIONS["source_root"]]), 2)
+        self.assertEqual(self.metadata, {})
+
+    def reject_changed_source(self, field):
+        def changed(path, *, directory, owned):
+            fd = self.pin_path(path, directory=directory, owned=owned)
+            if path == "/usr" and "unshare" in self.events:
+                value = self.metadata[fd]
+                setattr(value, field, getattr(value, field) + 1)
+            return fd
+        self.pin.side_effect = changed
+        self.error("source_rejected")
+        self.mount.assert_called_once_with(None, "/", None, mount.MS_REC | mount.MS_PRIVATE)
+        self.pivot.assert_not_called()
+        self.assertEqual(self.metadata, {})
+        self.error("already_attempted")
+
+    def test_repin_changed_device_denied_before_root_construction(self):
+        self.reject_changed_source("st_dev")
+
+    def test_repin_changed_inode_denied_before_root_construction(self):
+        self.reject_changed_source("st_ino")
+
+    def test_repin_changed_mode_denied_before_root_construction(self):
+        self.reject_changed_source("st_mode")
+
+    def test_repin_changed_owner_denied_before_root_construction(self):
+        self.reject_changed_source("st_uid")
+
+    def test_repin_changed_group_denied_before_root_construction(self):
+        self.reject_changed_source("st_gid")
+
+    def test_repin_open_failure_closes_both_namespaces_without_retry(self):
+        def failed(path, *, directory, owned):
+            if path == "/usr" and "unshare" in self.events:
+                raise OSError("PRIVATE")
+            return self.pin_path(path, directory=directory, owned=owned)
+        self.pin.side_effect = failed
+        self.error("setup_failed")
+        self.assertEqual(self.metadata, {})
+        self.pivot.assert_not_called()
+        self.error("already_attempted")
+
+    def test_repin_original_close_failure_is_not_closed_twice(self):
+        def failed(fd):
+            original = any(path == "/usr" and pinned == fd and not fresh
+                           for path, pinned, fresh in self.pin_records)
+            self.close(fd)
+            if original:
+                raise OSError("PRIVATE")
+        self.os.close.side_effect = failed
+        self.error("close_failed")
+        self.assertEqual(self.metadata, {})
+        self.pivot.assert_not_called()
 
     def test_scaffold_chmod_overrides_restrictive_umask_only_on_new_dirs(self):
         self.run_setup()
@@ -322,6 +399,23 @@ class NativeSignatureTests(unittest.TestCase):
             mount._seal("/owned", 7, recursive=True)
         self.assertEqual(caught.exception.args, ("seal_failed",))
         library.syscall.assert_called_once()
+
+    def test_native_bind_failure_has_fixed_stage_code(self):
+        library = types.SimpleNamespace(mount=Mock(return_value=-1))
+        with (patch.object(mount.ctypes, "CDLL", return_value=library),
+              self.assertRaises(mount.MountRootError) as caught):
+            mount._mount("/proc/self/fd/20", "/owned", None, mount.MS_BIND,
+                         failure_code="bind_mount_failed")
+        self.assertEqual(caught.exception.args, ("bind_mount_failed",))
+        library.mount.assert_called_once()
+
+    def test_native_unshare_failure_is_distinct_from_bind_failure(self):
+        library = types.SimpleNamespace(unshare=Mock(return_value=-1))
+        with (patch.object(mount.ctypes, "CDLL", return_value=library),
+              self.assertRaises(mount.MountRootError) as caught):
+            mount._unshare()
+        self.assertEqual(caught.exception.args, ("namespace_unshare_failed",))
+        library.unshare.assert_called_once()
 
     def test_mount_setattr_and_pivot_use_full_width_arguments(self):
         library = types.SimpleNamespace(syscall=Mock(return_value=0), umount2=Mock(return_value=0))

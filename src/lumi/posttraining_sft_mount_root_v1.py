@@ -26,7 +26,8 @@ ERROR_CODES = frozenset({
     "runtime_rejected", "input_rejected", "already_attempted", "owner_mismatch",
     "reentry", "source_rejected", "root_rejected", "namespace_rejected",
     "namespace_unchanged", "mount_failed", "seal_failed", "pivot_failed",
-    "readback_failed", "setup_failed", "close_failed",
+    "readback_failed", "setup_failed", "close_failed", "namespace_unshare_failed",
+    "bind_mount_failed",
 })
 CLONE_NEWNS = 0x20000
 O_PATH = 0x200000
@@ -152,10 +153,10 @@ def _open_namespace(owned):
 def _unshare():
     call = ctypes.CDLL(None, use_errno=True).unshare
     call.argtypes, call.restype = [ctypes.c_int], ctypes.c_int
-    _need(call(CLONE_NEWNS) == 0, "mount_failed")
+    _need(call(CLONE_NEWNS) == 0, "namespace_unshare_failed")
 
 
-def _mount(source, target, filesystem, flags, data=None):
+def _mount(source, target, filesystem, flags, data=None, *, failure_code="mount_failed"):
     call = ctypes.CDLL(None, use_errno=True).mount
     call.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
                      ctypes.c_ulong, ctypes.c_char_p]
@@ -163,7 +164,7 @@ def _mount(source, target, filesystem, flags, data=None):
     def encode(value):
         return None if value is None else value.encode("ascii")
     _need(call(encode(source), encode(target), encode(filesystem), flags, encode(data)) == 0,
-          "mount_failed")
+          failure_code)
 
 
 def _seal(target, attrs, *, recursive):
@@ -208,7 +209,8 @@ def _bind(fd, target, *, directory, made):
         created = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                           | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         _close(created)
-    _mount(f"/proc/self/fd/{fd}", target, None, MS_BIND | (MS_REC if directory else 0))
+    _mount(f"/proc/self/fd/{fd}", target, None, MS_BIND | (MS_REC if directory else 0),
+           failure_code="bind_mount_failed")
     attrs = MS_RDONLY | MS_NOSUID | MS_NODEV
     if target.endswith("/proc"):
         attrs |= MS_NOEXEC
@@ -220,6 +222,11 @@ def _readback(path, required, forbidden=0):
     _need(info.f_flag & required == required and not info.f_flag & forbidden,
           "readback_failed")
     return info
+
+
+def _source_identity(fd):
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid
 
 
 def enter_mount_root(*, root_path, runtime_root, source_root, script_path, uid, gid,
@@ -256,8 +263,8 @@ def enter_mount_root(*, root_path, runtime_root, source_root, script_path, uid, 
         sources = [("/usr", True), (runtime_root, True), (source_root, True),
                    (script_path, False), *(("/etc/" + item, False) for item in _ETC),
                    ("/proc", True)]
-        pins = [(path, is_dir, _pin(path, directory=is_dir, owned=owned))
-                for path, is_dir in sources]
+        original_pins = [(path, is_dir, _pin(path, directory=is_dir, owned=owned))
+                         for path, is_dir in sources]
         old_namespace = _open_namespace(owned)
         old_identity = _namespace_identity(old_namespace)
         _unshare()
@@ -265,6 +272,17 @@ def enter_mount_root(*, root_path, runtime_root, source_root, script_path, uid, 
         new_identity = _namespace_identity(new_namespace)
         _need(old_identity != new_identity, "namespace_unchanged")
         _mount(None, "/", None, MS_REC | MS_PRIVATE)
+        # unshare clones the mount tree, not the vfsmount references held by
+        # already-open FDs. Linux rejects binding ordinary old-namespace mounts
+        # via /proc/self/fd. Rewalk in the new namespace, retain the old pins
+        # until identity comparison, and bind only the fresh no-symlink pins.
+        pins = []
+        for path, is_dir, original_fd in original_pins:
+            fd = _pin(path, directory=is_dir, owned=owned)
+            _need(_source_identity(fd) == _source_identity(original_fd), "source_rejected")
+            pins.append((path, is_dir, fd))
+            owned.remove(original_fd)
+            _close(original_fd)
         _mount("tmpfs", root_path, "tmpfs", MS_NOSUID | MS_NODEV,
                "size=1048576,nr_inodes=256,mode=0755")
         # A pre-mount O_PATH FD refers to the old directory, never the new tmpfs.
