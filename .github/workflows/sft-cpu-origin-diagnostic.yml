@@ -22,7 +22,8 @@ concurrency:
 
 jobs:
   private-cpu-diagnostic:
-    if: github.event.repository.private == true && github.run_attempt == 1
+    # Historical one-shot diagnostic; binding-test edits must not start it again.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.sha == '15127b62e702244923a6f56c1a936fb667ea4486'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:

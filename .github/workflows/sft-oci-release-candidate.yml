@@ -20,7 +20,8 @@ concurrency:
 
 jobs:
   private-cpu-release:
-    if: github.event.repository.private == true
+    # Historical one-shot attempt; source changes must not repeat its failed build.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.sha == 'edaa86e238223cf3a1ecfb6292640d8bc43e72de'
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     env:

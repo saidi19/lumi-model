@@ -53,7 +53,7 @@ FROZEN = {
 }
 FROZEN_WORKFLOWS = {
     ".github/workflows/sft-oci-release-candidate.yml": (
-        "85c64d8ae86993a7d99bd7abc03ebf2da33afa17b252b6bab9ad4b26618a35ef"
+        "48af59107d4e17c898bb3c2508fad0c1a37cb2bdf152ce564252c4af93767b00"
     ),
     ".github/workflows/source-checks.yml": (
         "ed75ad40b262c47864e080fff9ff3551106201b9fe4002e8a665ab9a688bbb8e"

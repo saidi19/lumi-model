@@ -25,10 +25,10 @@ PUBLISH_FILES = (
 )
 FROZEN_WORKFLOWS = {
     "sft-oci-release-candidate.yml": (
-        "85c64d8ae86993a7d99bd7abc03ebf2da33afa17b252b6bab9ad4b26618a35ef"
+        "48af59107d4e17c898bb3c2508fad0c1a37cb2bdf152ce564252c4af93767b00"
     ),
     "sft-cpu-origin-diagnostic.yml": (
-        "9104b408d8e80426fd841d4399f8073c529676c061c5ac8b29bc5109e3aa88f1"
+        "b8a2f6d838138bc16f3666cac4f4749da49d39ae63662b28ce9f23fbc7bbf76f"
     ),
     "source-checks.yml": "ed75ad40b262c47864e080fff9ff3551106201b9fe4002e8a665ab9a688bbb8e",
     "spark-source-checks.yml": "1171cef435580f7eb1736c5250f980f91890a781669e1aca1853bfaaee37caa8",
@@ -256,7 +256,7 @@ class CpuLookupAcceptanceSourceTests(unittest.TestCase):
             check = next(node for node in checks if required in ast.unparse(node))
             self.assertLess(check.lineno, calls(main, "builder.snapshot")[0].lineno)
 
-    def test_old_workflows_byte_identical_and_new_files_do_not_trigger_old_runs(self):
+    def test_bound_workflows_and_historical_publish_paths_do_not_trigger_old_runs(self):
         for name, expected in FROZEN_WORKFLOWS.items():
             raw = (ROOT / ".github/workflows" / name).read_bytes()
             with self.subTest(workflow=name):
