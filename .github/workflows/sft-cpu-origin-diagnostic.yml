@@ -1,0 +1,57 @@
+name: SFT CPU origin diagnostic
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-cpu-origin-diagnostic.yml
+      - scripts/build_sft_cpu_origin_diagnostic_v1.py
+      - scripts/run_sft_cpu_origin_diagnostic_v1.py
+      - scripts/sft_cpu_origin_diagnostic_report_v1.py
+      - tests/test_sft_cpu_origin_diagnostic_source_v1.py
+      - tests/test_sft_cpu_diagnostic_builder_source_v1.py
+      - tests/test_sft_cpu_origin_diagnostic_report_v1.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-cpu-origin-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-cpu-diagnostic:
+    if: github.event.repository.private == true && github.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LUMI_CPU_ORIGIN_DIAGNOSTIC_CI: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: One bounded CPU diagnostic; rejection checks and recovery gates unchanged
+        timeout-minutes: 16
+        run: >-
+          timeout --signal=TERM --kill-after=15s 15m
+          python -S -B scripts/build_sft_cpu_origin_diagnostic_v1.py --cpu-origin-diagnostic
+      - name: Retain only small private diagnostic evidence; no software image archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-cpu-origin-diagnostic-${{ github.sha }}
+          path: |
+            artifacts/lumi-sft-cpu-origin-diagnostic-v0.1/*.json
+            artifacts/lumi-sft-cpu-origin-diagnostic-v0.1/*.log
+          if-no-files-found: error
+          retention-days: 30
