@@ -21,6 +21,7 @@ import re
 import stat
 import threading
 
+from .posttraining_sft_mount_root_v1 import TMPFS_MAGIC, _filesystem
 from .posttraining_sft_netns_v1 import _runtime
 
 SCHEMA = "lumi.sft-landlock.v0.1"
@@ -113,7 +114,7 @@ def _open_path(path):
     try:
         owned = os.open("/", O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         _need(stat.S_ISDIR(_fd_info(owned).st_mode), "path_rejected")
-        parts = path[1:].split("/")
+        parts = [] if path == "/" else path[1:].split("/")
         for index, part in enumerate(parts):
             child = None
             try:
@@ -163,13 +164,26 @@ def _no_new_privileges():
           "privilege_rejected")
 
 
+def _private_root(fd, info):
+    _need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0
+          and stat.S_IMODE(info.st_mode) == 0o755, "path_rejected")
+    _filesystem(fd, TMPFS_MAGIC, "root_rejected")
+    view = os.fstatvfs(fd)
+    _need(view.f_flag & 7 == 7 and view.f_frsize == 4096
+          and view.f_blocks * view.f_frsize == 1048576, "path_rejected")
+
+
 def _add_rule(ruleset_fd, path, role):
     path_fd = None
     failure = None
     try:
         path_fd = _open_path(path)
         info = _fd_info(path_fd)
-        if role == "read_only":
+        if role == "private_root_listing":
+            _need(path == "/", "path_rejected")
+            _private_root(path_fd, info)
+            mask = READ_DIR
+        elif role == "read_only":
             _need(stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode), "path_rejected")
             mask = READ_ONLY_DIRECTORY if stat.S_ISDIR(info.st_mode) else READ_ONLY_FILE
         elif role == "writable":
@@ -197,7 +211,8 @@ def _add_rule(ruleset_fd, path, role):
         raise LandlockError(failure) from None
 
 
-def restrict_filesystem(*, read_only_paths, writable_paths, device_paths):
+def restrict_filesystem(*, read_only_paths, writable_paths, device_paths,
+                        allow_private_root_listing=False):
     """Consume one policy attempt; any started failure prohibits payload release."""
     global _ATTEMPT_OWNER
     _need(_SETUP_LOCK.acquire(blocking=False), "reentry")
@@ -210,6 +225,9 @@ def restrict_filesystem(*, read_only_paths, writable_paths, device_paths):
             _need(_ATTEMPT_OWNER == owner, "owner_mismatch")
             raise LandlockError("already_attempted") from None
         _paths(read_only_paths, writable_paths, device_paths)
+        _need(type(allow_private_root_listing) is bool and
+              sum(map(len, (read_only_paths, writable_paths, device_paths)))
+              + int(allow_private_root_listing) <= 16, "paths_rejected")
         try:
             _runtime()
         except BaseException:
@@ -226,6 +244,11 @@ def restrict_filesystem(*, read_only_paths, writable_paths, device_paths):
         _need(type(candidate) is int and 0 <= candidate < 2**31, "ruleset_rejected")
         ruleset_fd = candidate
         _need(fcntl.fcntl(ruleset_fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC, "ruleset_rejected")
+        if allow_private_root_listing:
+            # The unchanged secure loader opens each ancestor O_RDONLY|O_DIRECTORY.
+            # Grant names-only traversal/listing on our verified private tmpfs root,
+            # never READ_FILE/WRITE_FILE/EXECUTE or an ordinary host-root rule.
+            _add_rule(ruleset_fd, "/", "private_root_listing")
         for role, paths in (("read_only", read_only_paths), ("writable", writable_paths),
                             ("device", device_paths)):
             for path in paths:
@@ -246,6 +269,7 @@ def restrict_filesystem(*, read_only_paths, writable_paths, device_paths):
     if failure is not None:
         raise LandlockError(failure) from None
     return {"schema": SCHEMA, "abi_version": abi, "filesystem_content_policy_enforced": True,
+            "private_root_listing_only": allow_private_root_listing,
             "ptrace_domain_restricted": True, "full_pathname_unix_isolation_verified": False,
             "metadata_policy_alone_sufficient": False, "real_sft_execution_permitted": False,
             "production_eligible": False}

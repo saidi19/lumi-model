@@ -1,7 +1,9 @@
-"""Pure in-memory syscall doubles: no live filesystem, procfs, libc or ML access."""
+"""Source-AST contract checks and syscall doubles; no live procfs, libc or ML."""
 
 from __future__ import annotations
+import __future__
 
+import ast
 import ctypes
 import fcntl
 import importlib
@@ -120,9 +122,12 @@ class LandlockTests(unittest.TestCase):
     def setUp(self):
         self.kernel, self.lock = MemoryKernel(), MemoryLock()
         self.runtime, self.privileges = Mock(), Mock()
+        self.root_filesystem = Mock()
+        self.root_view = types.SimpleNamespace(f_flag=7, f_frsize=4096, f_blocks=256)
         replacements = {
             "_runtime": self.runtime, "_no_new_privileges": self.privileges,
             "_syscall": self.kernel.syscall, "_SETUP_LOCK": self.lock, "_ATTEMPT_OWNER": None,
+            "_filesystem": self.root_filesystem,
         }
         for name, value in replacements.items():
             selected = patch.object(landlock, name, value)
@@ -133,6 +138,7 @@ class LandlockTests(unittest.TestCase):
             (landlock.os, "close", self.kernel.close), (landlock.os, "getpid", lambda: 100),
             (landlock.threading, "get_ident", lambda: 200),
             (landlock.fcntl, "fcntl", self.kernel.fcntl),
+            (landlock.os, "fstatvfs", lambda fd: self.root_view),
         ):
             selected = patch.object(module, name, value)
             selected.start()
@@ -155,6 +161,7 @@ class LandlockTests(unittest.TestCase):
     def test_success_exact_receipt_masks_and_close_ownership(self):
         self.assertEqual(self.invoke(), {
             "schema": "lumi.sft-landlock.v0.1", "abi_version": 5,
+            "private_root_listing_only": False,
             "filesystem_content_policy_enforced": True, "ptrace_domain_restricted": True,
             "full_pathname_unix_isolation_verified": False,
             "metadata_policy_alone_sufficient": False, "real_sft_execution_permitted": False,
@@ -171,6 +178,91 @@ class LandlockTests(unittest.TestCase):
     def test_readonly_file_excludes_read_dir(self):
         self.invoke(read_only_paths=("/code/main.py",))
         self.assertEqual(self.kernel.rules[0], ("/code/main.py", 5))
+
+    def private_root(self):
+        self.kernel.special["/"] = stat.S_IFDIR | 0o755
+
+    def test_private_root_listing_is_opt_in_and_directory_names_only(self):
+        self.private_root()
+        receipt = self.invoke(allow_private_root_listing=True)
+        self.assertIs(receipt["private_root_listing_only"], True)
+        self.assertEqual(self.kernel.rules[0], ("/", 8))
+        self.assertEqual(self.kernel.rules[0][1] & (landlock.READ_FILE | landlock.WRITE_FILE
+                                                   | landlock.EXECUTE), 0)
+        self.root_filesystem.assert_called_once()
+        self.assertEqual(self.root_filesystem.call_args.args[1], landlock.TMPFS_MAGIC)
+
+    def test_ordinary_host_filesystem_cannot_receive_root_rule(self):
+        self.private_root()
+        self.root_filesystem.side_effect = RuntimeError(PRIVATE)
+        self.rejects("rule_rejected", allow_private_root_listing=True)
+        self.assertEqual(self.kernel.rules, [])
+
+    def test_writable_root_cannot_receive_listing_rule(self):
+        self.private_root()
+        self.root_view.f_flag = 6
+        self.rejects("path_rejected", allow_private_root_listing=True)
+
+    def test_root_capacity_must_match_private_scaffold(self):
+        self.private_root()
+        self.root_view.f_blocks = 512
+        self.rejects("path_rejected", allow_private_root_listing=True)
+
+    def test_private_root_mode_is_exact(self):
+        self.rejects("path_rejected", allow_private_root_listing=True)
+
+    def test_root_listing_flag_rejects_truthy_nonbool(self):
+        for value in (1, "yes", [], None):
+            self.rejects("paths_rejected", allow_private_root_listing=value)
+        self.assertEqual(self.kernel.events, [])
+
+    def test_private_root_rule_counts_toward_existing_sixteen_rule_cap(self):
+        self.rejects("paths_rejected", read_only_paths=tuple(f"/code{i}" for i in range(14)),
+                     allow_private_root_listing=True)
+        self.assertEqual(self.kernel.events, [])
+
+    def secure_loader_walk(self):
+        # Compile only these three pure source definitions, never import the
+        # ML runtime. The unmodified path walk operates solely on syscall doubles.
+        source = ast.parse((ROOT / "src/lumi/posttraining_sft_runtime_v4.py").read_bytes())
+        names = {"_absolute_lexical", "_secure_open_flags", "_open_secure_root"}
+        nodes = [node for node in source.body if isinstance(node, ast.FunctionDef)
+                 and node.name in names]
+        self.assertEqual({node.name for node in nodes}, names)
+        descriptors, closed = {}, []
+        def opened(path, flags, *, dir_fd=None):
+            full = path if dir_fd is None else descriptors[dir_fd].rstrip("/") + "/" + path
+            if full == "/" and ("/", landlock.READ_DIR) not in self.kernel.rules:
+                raise PermissionError("SYNTHETIC_DIRECTORY_RULE_REQUIRED")
+            self.assertEqual(flags & landlock.O_PATH, 0)
+            self.assertTrue(flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW)
+            fd = 1000 + len(descriptors)
+            descriptors[fd] = full
+            return fd
+        fake = types.SimpleNamespace(
+            path=types.SimpleNamespace(abspath=lambda path: str(path)), O_RDONLY=os.O_RDONLY,
+            O_NOFOLLOW=os.O_NOFOLLOW, O_CLOEXEC=os.O_CLOEXEC, O_DIRECTORY=os.O_DIRECTORY,
+            open=opened, close=closed.append, geteuid=lambda: 1001,
+            fstat=lambda fd: types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=1001),
+        )
+        scope = {"os": fake, "stat": stat, "Path": Path,
+                 "_secure_file_identity": lambda value: value}
+        code = compile(ast.Module(body=nodes, type_ignores=[]), "<secure-loader-contract>", "exec",
+                       flags=__future__.annotations.compiler_flag)
+        exec(code, scope)
+        result = scope["_open_secure_root"](Path("/tmp/generated"))
+        self.assertEqual(descriptors[result[1]], "/tmp/generated")
+        self.assertEqual(len(closed), 2)
+
+    def test_original_secure_loader_walk_rejects_missing_root_directory_rule(self):
+        self.invoke()
+        with self.assertRaises(PermissionError):
+            self.secure_loader_walk()
+
+    def test_original_secure_loader_walk_accepts_names_only_private_root_rule(self):
+        self.private_root()
+        self.invoke(allow_private_root_listing=True)
+        self.secure_loader_walk()
 
     def test_device_rules_exact_character_identity_and_masks(self):
         self.invoke(device_paths=tuple(landlock.DEVICES))

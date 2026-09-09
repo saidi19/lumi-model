@@ -63,6 +63,7 @@ class FilesystemLinuxTests(unittest.TestCase):
         self.assertEqual(report["schema_version"], "lumi.sft-filesystem-linux-fixture.v0.1")
         for field in (
             "filesystem_view_verified", "landlock_policy_verified",
+            "private_root_ancestor_open_verified",
             "same_uid_host_proc_root_boundary_verified", "readonly_canary_verified",
             "bounded_tmpfs_exhaustion_verified", "host_root_and_mount_namespace_unchanged",
             "direct_ip_network_isolation_verified", "actual_parent_loss_cleanup_verified",

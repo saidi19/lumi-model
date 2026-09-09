@@ -44,6 +44,7 @@ HOST_DIRECTORY = HOST_FILE = HOST_SOCKET = ROOT_PATH = CANARY_PATH = None
 INJECTED_FILE_FD = INJECTED_DIRECTORY_FD = INJECTED_FILE_IDENTITY = None
 FS_STAGE = "not_reported"
 FS_CODE = "not_reported"
+WORKER_FAILURE = None
 
 
 def safe_code(value):
@@ -211,14 +212,20 @@ def stop_helper():
 
 
 def receive(channel, deadline_ns):
-    global FS_STAGE, FS_CODE
+    global FS_STAGE, FS_CODE, WORKER_FAILURE
     value = ORIGINAL_RECEIVE(channel, deadline_ns)
     if value.get("filesystem_stage") in STAGES:
         FS_STAGE = value["filesystem_stage"]
     if safe_code(value.get("filesystem_code")):
         FS_CODE = value["filesystem_code"]
+    diagnostic = base().module("posttraining_sft_filesystem_diagnostic_v1")
+    projected = diagnostic.project_failure(value.get("worker_failure"))
+    if projected is not None:
+        WORKER_FAILURE = projected
     if os.getpid() == OUTER_PID and "empty_and_removed" in value:
         base().COMPONENT_CODE = "filesystem_" + FS_STAGE + "_" + FS_CODE
+        if WORKER_FAILURE is not None:
+            base().COMPONENT_CODE = diagnostic.component_code(WORKER_FAILURE)
         # Frozen wait_statuses(-1) must not encounter our unrelated live helper.
         stop_helper()
     return value
@@ -227,6 +234,10 @@ def receive(channel, deadline_ns):
 def send(channel, value):
     if "empty_and_removed" in value:
         value = dict(value, filesystem_stage=FS_STAGE, filesystem_code=FS_CODE)
+        diagnostic = base().module("posttraining_sft_filesystem_diagnostic_v1")
+        projected = diagnostic.project_failure(WORKER_FAILURE)
+        if projected is not None:
+            value["worker_failure"] = projected
     return ORIGINAL_SEND(channel, value)
 
 
@@ -252,6 +263,12 @@ def controller(*arguments):
 
 
 def filesystem_probes():
+    # Match the unchanged secure loader's first ancestor open, not just O_PATH.
+    root_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        need(stat.S_ISDIR(os.fstat(root_fd).st_mode))
+    finally:
+        os.close(root_fd)
     read_canary(CANARY_PATH)
     denied(lambda: os.open(HOST_FILE, os.O_RDONLY), (errno.ENOENT,))
     denied(lambda: os.open(f"/proc/{HELPER_PID}/root{HOST_FILE}", os.O_RDONLY))
@@ -333,9 +350,11 @@ def workload(case, group_fd, channel, uid, gid, runtime, deadline_ns):
                              "/etc/passwd", "/etc/group", "/proc"),
             writable_paths=("/tmp",),
             device_paths=("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"),
+            allow_private_root_listing=True,
         )
         need(type(policy.get("abi_version")) is int and policy["abi_version"] >= 5)
         need(policy == {"schema": "lumi.sft-landlock.v0.1", "abi_version": policy["abi_version"],
+                        "private_root_listing_only": True,
                         "filesystem_content_policy_enforced": True,
                         "ptrace_domain_restricted": True,
                         "full_pathname_unix_isolation_verified": False,
@@ -393,7 +412,11 @@ def workload(case, group_fd, channel, uid, gid, runtime, deadline_ns):
 
 
 def verify_case(case, watched, snapshot, statuses, worker_pid, messages):
-    global FS_STAGE, FS_CODE
+    global FS_STAGE, FS_CODE, WORKER_FAILURE
+    if case == "worker_run" and len(messages) == 1:
+        WORKER_FAILURE = base().module("posttraining_sft_filesystem_diagnostic_v1").project_failure(
+            messages[0],
+        )
     if messages and messages[0].get("filesystem_stage") in STAGES:
         FS_STAGE = messages[0]["filesystem_stage"]
         if safe_code(messages[0].get("filesystem_code")):
@@ -407,8 +430,10 @@ def verify_case(case, watched, snapshot, statuses, worker_pid, messages):
 def case_wrapper(case, uid, gid, runtime, deadline_ns):
     global ROOT_PATH, HOST_DIRECTORY, HOST_FILE, HOST_SOCKET, CANARY_PATH
     global HELPER_PID, HELPER_PIDFD, HELPER_CHANNEL, FS_STAGE, FS_CODE
+    global WORKER_FAILURE
     global INJECTED_FILE_FD, INJECTED_DIRECTORY_FD, INJECTED_FILE_IDENTITY
     FS_STAGE = FS_CODE = "not_reported"
+    WORKER_FAILURE = None
     # A previous case's receipt cannot describe this case's host-side objects.
     base().REMOVAL_REPORTED = False
     base().CURRENT_CASE, base().STAGE = case, "filesystem_host_preflight"
@@ -507,6 +532,7 @@ def run():
     need(report["cases_verified"] == report["owned_cgroups_empty_and_removed"] == 4)
     report.update(schema_version=SCHEMA, **dict.fromkeys(NONCLAIMS, False))
     report.update(filesystem_view_verified=True, landlock_policy_verified=True,
+                  private_root_ancestor_open_verified=True,
                   same_uid_host_proc_root_boundary_verified=True, readonly_canary_verified=True,
                   bounded_tmpfs_exhaustion_verified=True, owned_mountpoints_removed=4,
                   inherited_file_directory_authority_removed=True,
