@@ -1,0 +1,98 @@
+name: SFT accepted OCI guardian composition
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-oci-guardian-acceptance.yml
+      - scripts/prepare_sft_oci_guardian_v1.py
+      - scripts/run_sft_oci_guardian_fixture_v1.py
+      - scripts/run_sft_oci_guarded_worker_v1.py
+      - src/lumi/posttraining_sft_oci_rootfs_v1.py
+      - src/lumi/posttraining_sft_oci_mount_v1.py
+      - src/lumi/posttraining_sft_oci_landlock_v1.py
+      - tests/test_sft_oci_guardian_*.py
+      - tests/test_sft_oci_guarded_worker_v1.py
+      - tests/test_sft_oci_rootfs_v1.py
+      - tests/test_sft_oci_mount_v1.py
+      - tests/test_sft_oci_landlock_v1.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sft-oci-guardian-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-native-composition:
+    # The unique direct successor push only. Later edits and reruns skip this job.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.event.before == 'a0296d4dd80463023a154b5eb51bd4384158f513' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LUMI_OCI_GUARDIAN_CI: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: New source and synthetic contracts before any software download
+        timeout-minutes: 2
+        run: >-
+          python -S -B -m unittest -q
+          tests/test_sft_oci_rootfs_v1.py
+          tests/test_sft_oci_mount_v1.py
+          tests/test_sft_oci_landlock_v1.py
+          tests/test_sft_oci_guarded_worker_v1.py
+          tests/test_sft_oci_guardian_fixture_v1.py
+          tests/test_sft_oci_guardian_transaction_v1.py
+          tests/test_sft_oci_guardian_acquisition_v1.py
+          tests/test_sft_oci_guardian_workflow_v1.py
+      - name: Retrieve exact already accepted software, no rebuild or retry
+        id: software
+        timeout-minutes: 7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          timeout --signal=TERM --kill-after=15s 6m
+          python -I -S -B scripts/prepare_sft_oci_guardian_v1.py --acquire-accepted-software
+      - name: One native composition, two negative pins then one positive WorkerRun
+        timeout-minutes: 18
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+        run: |
+          timeout --signal=TERM --kill-after=30s 17m \
+            sudo -n /usr/bin/env -i LUMI_OCI_GUARDIAN_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/run_sft_oci_guardian_fixture_v1.py \
+            --synthetic-only "$LUMI_IMAGE_ARCHIVE" \
+            > artifacts/lumi-sft-oci-guardian-acceptance-v0.1/native.json 2>/dev/null
+      - name: Retire only this acquisition's exact temporary software copy
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+          LUMI_IMAGE_IDENTITY: ${{ steps.software.outputs.image_identity }}
+          LUMI_PARENT_IDENTITY: ${{ steps.software.outputs.parent_identity }}
+        run: >-
+          python -I -S -B scripts/prepare_sft_oci_guardian_v1.py --retire-input
+          "$LUMI_IMAGE_ARCHIVE" "$LUMI_IMAGE_IDENTITY" "$LUMI_PARENT_IDENTITY"
+          > artifacts/lumi-sft-oci-guardian-acceptance-v0.1/input-cleanup.json
+      - name: Retain small aggregate private evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-oci-guardian-evidence-${{ github.sha }}
+          path: artifacts/lumi-sft-oci-guardian-acceptance-v0.1/*.json
+          if-no-files-found: warn
+          retention-days: 30
