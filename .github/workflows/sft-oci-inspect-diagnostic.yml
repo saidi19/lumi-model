@@ -1,0 +1,89 @@
+name: SFT bounded OCI inspect diagnostic
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-oci-inspect-diagnostic.yml
+      - scripts/prepare_sft_oci_inspect_diagnostic_v1.py
+      - scripts/run_sft_oci_inspect_diagnostic_v1.py
+      - src/lumi/posttraining_sft_oci_inspect_diagnostic_v1.py
+      - tests/test_sft_oci_inspect_diagnostic*.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sft-oci-inspect-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-inspect-diagnostic:
+    # A separate inspect diagnostic, never a retry of the stopped guardian composition.
+    # The authenticated prior-job GET binds the native failure and successful input cleanup.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.event.before == '11486aa570657e8c71589ced46054459972d1493' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LUMI_OCI_INSPECT_DIAGNOSTIC_CI: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Inspect diagnostic source and synthetic contracts before acquisition
+        timeout-minutes: 2
+        run: >-
+          python -S -B -m unittest -q
+          tests/test_sft_oci_inspect_diagnostic_v1.py
+          tests/test_sft_oci_inspect_diagnostic_fixture_v1.py
+          tests/test_sft_oci_inspect_diagnostic_acquisition_v1.py
+          tests/test_sft_oci_inspect_diagnostic_workflow_v1.py
+      - name: Acquire exact accepted software for one inspect diagnostic
+        id: software
+        timeout-minutes: 7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          timeout --signal=TERM --kill-after=15s 6m
+          python -I -S -B scripts/prepare_sft_oci_inspect_diagnostic_v1.py
+          --acquire-accepted-software
+      - name: One bounded OCI inspect diagnostic with no payload execution
+        timeout-minutes: 9
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+        run: |
+          timeout --signal=TERM --kill-after=30s 8m \
+            sudo -n /usr/bin/env -i LUMI_OCI_INSPECT_DIAGNOSTIC_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/run_sft_oci_inspect_diagnostic_v1.py \
+            --diagnostic-only "$LUMI_IMAGE_ARCHIVE" \
+            > artifacts/lumi-sft-oci-inspect-diagnostic-v0.1/aggregate-diagnostic.json 2>/dev/null
+      - name: Retire only this diagnostic acquisition's exact temporary software copy
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+          LUMI_IMAGE_IDENTITY: ${{ steps.software.outputs.image_identity }}
+          LUMI_PARENT_IDENTITY: ${{ steps.software.outputs.parent_identity }}
+        run: >-
+          python -I -S -B scripts/prepare_sft_oci_inspect_diagnostic_v1.py --retire-input
+          "$LUMI_IMAGE_ARCHIVE" "$LUMI_IMAGE_IDENTITY" "$LUMI_PARENT_IDENTITY"
+          > artifacts/lumi-sft-oci-inspect-diagnostic-v0.1/aggregate-input-cleanup.json
+      - name: Retain only small aggregate inspect evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-oci-inspect-diagnostic-${{ github.sha }}
+          path: artifacts/lumi-sft-oci-inspect-diagnostic-v0.1/aggregate*.json
+          if-no-files-found: warn
+          retention-days: 30
