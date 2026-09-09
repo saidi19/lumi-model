@@ -77,7 +77,18 @@ def implementation():
 
 def valid_code(value):
     return (type(value) is str and value in
-            {"not_reported", "passed", "fixture_failed", *implementation().ERROR_CODES})
+            {"not_reported", "passed", "fixture_failed", *implementation().ERROR_CODES,
+             *base().module("posttraining_sft_ipc_diagnostic_v1").ERROR_CODES})
+
+
+def probe(label, action):
+    global IPC_CODE
+    stage(label)
+    try:
+        return action()
+    except BaseException as error:
+        IPC_CODE = base().module("posttraining_sft_ipc_diagnostic_v1").failure_code(error)
+        raise
 
 
 def load_frozen():
@@ -297,7 +308,8 @@ def denied(action, errors=(errno.EPERM,)):
     try:
         value = action()
     except OSError as error:
-        need(error.errno in errors)
+        if error.errno not in errors:
+            raise
     else:
         if isinstance(value, socket.socket):
             value.close()
@@ -408,7 +420,8 @@ def addressed_pair_send(left, right, path, *, message):
         else:
             amount = left.sendto(payload, socket.MSG_NOSIGNAL, path)
     except OSError as error:
-        need(error.errno in {errno.EISCONN, errno.EINVAL, errno.EOPNOTSUPP})
+        if error.errno not in {errno.EISCONN, errno.EINVAL, errno.EOPNOTSUPP}:
+            raise
     else:
         # Linux STREAM may ignore a destination on an already connected pair.
         # Success must therefore deliver only to its original, generated peer.
@@ -423,7 +436,9 @@ def cannot_disconnect(left):
     syscall.argtypes, syscall.restype = [ctypes.c_long], ctypes.c_long
     ctypes.set_errno(0)
     result = syscall(42, ctypes.c_int(left.fileno()), ctypes.byref(address), ctypes.c_int(16))
-    need(result == -1 and ctypes.get_errno() in {errno.EINVAL, errno.EAFNOSUPPORT, errno.EISCONN})
+    need(result == -1)
+    if ctypes.get_errno() not in {errno.EINVAL, errno.EAFNOSUPPORT, errno.EISCONN}:
+        raise OSError(ctypes.get_errno(), "probe_failed")
 
 
 def cannot_become_listener(left, name):
@@ -432,7 +447,8 @@ def cannot_become_listener(left, name):
         try:
             left.bind(path)
         except OSError as error:
-            need(error.errno == errno.EINVAL)
+            if error.errno != errno.EINVAL:
+                raise
         else:
             bound = True
             info = os.lstat(path)
@@ -452,12 +468,17 @@ def connected_pair_probes(kind, name):
         right.settimeout(1)
         pair_roundtrip(left, right, b"generated-pair-roundtrip")
         stage(name + "_retarget")
-        cannot_disconnect(left)
-        denied(lambda: left.connect(path), (errno.EISCONN, errno.EINVAL))
-        cannot_become_listener(left, name + "-connected")
-        addressed_pair_send(left, right, path, message=False)
-        addressed_pair_send(left, right, path, message=True)
-        pair_roundtrip(left, right, b"generated-original-peer")
+        probe(name + "_retarget_disconnect", lambda: cannot_disconnect(left))
+        probe(name + "_retarget_connect", lambda: denied(
+            lambda: left.connect(path), (errno.EISCONN, errno.EINVAL)))
+        probe(name + "_retarget_bind_listen", lambda: cannot_become_listener(
+            left, name + "-connected"))
+        probe(name + "_retarget_sendto", lambda: addressed_pair_send(
+            left, right, path, message=False))
+        probe(name + "_retarget_sendmsg", lambda: addressed_pair_send(
+            left, right, path, message=True))
+        probe(name + "_retarget_roundtrip", lambda: pair_roundtrip(
+            left, right, b"generated-original-peer"))
         stage(name + "_shutdown")
         left.shutdown(socket.SHUT_RDWR)
         cannot_disconnect(left)
@@ -525,7 +546,8 @@ def ipc_probes():
 
 
 def run():
-    global ORIGINAL_DROP
+    global ORIGINAL_DROP, STAGES
+    STAGES = STAGES | base().module("posttraining_sft_ipc_diagnostic_v1").STAGES
     guardian = base().module("posttraining_sft_cgroup_guardian_v1")
     ORIGINAL_DROP, guardian.drop_worker_privileges = guardian.drop_worker_privileges, drop
     FS.NET.network_probes = network_probes
