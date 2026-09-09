@@ -1,0 +1,62 @@
+name: SFT CPU OCI release candidate
+
+on:
+  push:
+    paths:
+      - .github/workflows/sft-oci-release-candidate.yml
+      - configs/lumi-sft-linux-cpu-release-v0.1.lock.json
+      - src/lumi/**
+      - scripts/build_sft_oci_*.py
+      - scripts/run_sft_oci_worker_probe_v1.py
+      - scripts/run_sft_worker_run_torch_fixture_v1.py
+      - tests/test_sft_oci_*.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-oci-release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-cpu-release:
+    if: github.event.repository.private == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LUMI_OCI_RELEASE_CI: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: One bounded real-software build and same-image generated CPU acceptance
+        timeout-minutes: 21
+        run: >-
+          timeout --signal=TERM --kill-after=15s 20m
+          python -S -B scripts/build_sft_oci_release_candidate_v1.py --cpu-release-candidate
+      - name: Retain small private acceptance evidence or failure localization
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-cpu-release-evidence-${{ github.sha }}
+          path: |
+            artifacts/lumi-sft-oci-release-candidate-v0.1/*.json
+            artifacts/lumi-sft-oci-release-candidate-v0.1/*.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Retain accepted software image privately; no registry push
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-cpu-release-image-${{ github.sha }}
+          path: artifacts/lumi-sft-oci-release-candidate-v0.1/cpu-release-image.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
