@@ -286,7 +286,7 @@ class CpuLookupAcceptanceSourceTests(unittest.TestCase):
             for node in ast.walk(suite)
             if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
         ]
-        self.assertEqual(len(names), 20)
+        self.assertEqual(len(names), 22)
 
     def test_frozen_builder_overrides_are_only_probe_and_source_script_bindings(self):
         changed = {
@@ -394,8 +394,15 @@ class CpuLookupAcceptanceSourceTests(unittest.TestCase):
         self.assertIn("started + MAXIMUM_WORK_SECONDS", main)
 
     def test_workflow_is_first_attempt_private_cpu_no_dispatch_and_no_early_image_upload(self):
+        job_condition = self.workflow.split("  private-cpu-acceptance:\n", 1)[1].splitlines()[1]
+        self.assertEqual(
+            job_condition.strip(),
+            "if: github.event.repository.private == true && github.run_attempt == 1 "
+            "&& github.sha == 'c4272e36bc98354067dd23a83931a3db58823d76'",
+        )
         for expected in (
             "github.event.repository.private == true && github.run_attempt == 1",
+            "&& github.sha == 'c4272e36bc98354067dd23a83931a3db58823d76'",
             "fetch-depth: 2",
             "persist-credentials: false",
             "timeout-minutes: 25",

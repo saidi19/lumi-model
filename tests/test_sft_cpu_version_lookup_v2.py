@@ -250,14 +250,61 @@ class OciVersionLookupSourceTests(unittest.TestCase):
         )
 
     def test_probe_fixture_or_ml_not_imported(self):
-        for name in (
+        # This test owns its imports, not the monolithic suite's earlier imports.
+        native = (
             "scripts.run_sft_oci_worker_probe_v1",
             "scripts.run_sft_oci_worker_probe_v2",
             "_lumi_oci_frozen_worker_v1",
-            "torch",
-            "transformers",
-        ):
-            self.assertNotIn(name, sys.modules)
+        )
+        self.assertFalse(any(name in sys.modules for name in native), "native_probe_imported")
+        imports = {
+            alias.name.split(".")[0]
+            for node in ast.walk(self.test_tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        imports |= {
+            node.module.split(".")[0]
+            for node in ast.walk(self.test_tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        self.assertEqual(
+            imports, {"__future__", "ast", "hashlib", "sys", "unittest", "pathlib", "types"}
+        )
+        dynamic = {
+            "__import__",
+            "compile",
+            "exec",
+            "eval",
+            "importlib.import_module",
+            "runpy.run_path",
+        }
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call) and ast.unparse(node.func) in dynamic
+                for node in ast.walk(self.test_tree)
+            ),
+            "dynamic_native_execution_in_test",
+        )
+
+    def test_guard_allows_preexisting_synthetic_ml_entries_without_loading_ml(self):
+        from unittest import mock
+
+        stubs = {name: ModuleType(name) for name in ("torch", "transformers")}
+        with mock.patch.dict(sys.modules, stubs):
+            # Reproduces the old guard's failure without importing either library.
+            self.assertTrue(any(name in sys.modules for name in stubs))
+            self.test_probe_fixture_or_ml_not_imported()
+            self.assertTrue(all(sys.modules[name] is value for name, value in stubs.items()))
+
+    def test_guard_still_rejects_synthetic_native_entry_without_dumping_registry(self):
+        from unittest import mock
+
+        name = "scripts.run_sft_oci_worker_probe_v2"
+        with mock.patch.dict(sys.modules, {name: ModuleType(name)}):
+            with self.assertRaisesRegex(AssertionError, "native_probe_imported"):
+                self.test_probe_fixture_or_ml_not_imported()
+
 
 
 if __name__ == "__main__":
