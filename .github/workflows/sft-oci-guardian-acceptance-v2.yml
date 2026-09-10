@@ -1,0 +1,95 @@
+name: SFT Labels-corrected OCI guardian acceptance v2
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-oci-guardian-acceptance-v2.yml
+      - scripts/prepare_sft_oci_guardian_v2.py
+      - scripts/run_sft_oci_guardian_fixture_v2.py
+      - src/lumi/posttraining_sft_oci_admission_v2.py
+      - tests/test_sft_oci_admission_v2.py
+      - tests/test_sft_oci_guardian_fixture_v2.py
+      - tests/test_sft_oci_guardian_acquisition_v2.py
+      - tests/test_sft_oci_guardian_workflow_v2.py
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sft-oci-guardian-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-native-composition-v2:
+    # One fresh successor after the exact Labels diagnostic; no rerun of an old attempt.
+    # Seven bounded GETs bind successful prior cleanup and the exact tiny diagnostic evidence.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.event.before == 'f3d8554d8999e32bb750fb8aa9020fca6818bf72' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 28
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      LUMI_OCI_GUARDIAN_V2_CI: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Labels successor source and synthetic contracts before acquisition
+        timeout-minutes: 2
+        run: >-
+          python -S -B -m unittest -q
+          tests/test_sft_oci_rootfs_v1.py
+          tests/test_sft_oci_mount_v1.py
+          tests/test_sft_oci_landlock_v1.py
+          tests/test_sft_oci_guarded_worker_v1.py
+          tests/test_sft_oci_admission_v2.py
+          tests/test_sft_oci_guardian_fixture_v2.py
+          tests/test_sft_oci_guardian_acquisition_v2.py
+          tests/test_sft_oci_guardian_workflow_v2.py
+      - name: Verify exact Labels diagnostic, then retrieve accepted software
+        id: software
+        timeout-minutes: 7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          timeout --signal=TERM --kill-after=15s 6m
+          python -I -S -B scripts/prepare_sft_oci_guardian_v2.py --acquire-accepted-software
+      - name: One v2 composition, two negative pins then one positive WorkerRun
+        timeout-minutes: 18
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+        run: |
+          timeout --signal=TERM --kill-after=30s 17m \
+            sudo -n /usr/bin/env -i LUMI_OCI_GUARDIAN_V2_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/run_sft_oci_guardian_fixture_v2.py \
+            --synthetic-only "$LUMI_IMAGE_ARCHIVE" \
+            > artifacts/lumi-sft-oci-guardian-acceptance-v0.2/aggregate-native.json 2>/dev/null
+      - name: Retire only this acquisition's exact temporary software copy
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+          LUMI_IMAGE_IDENTITY: ${{ steps.software.outputs.image_identity }}
+          LUMI_PARENT_IDENTITY: ${{ steps.software.outputs.parent_identity }}
+        run: >-
+          python -I -S -B scripts/prepare_sft_oci_guardian_v2.py --retire-input
+          "$LUMI_IMAGE_ARCHIVE" "$LUMI_IMAGE_IDENTITY" "$LUMI_PARENT_IDENTITY"
+          > artifacts/lumi-sft-oci-guardian-acceptance-v0.2/aggregate-input-cleanup.json
+      - name: Retain small aggregate private evidence only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-oci-guardian-v2-evidence-${{ github.sha }}
+          path: artifacts/lumi-sft-oci-guardian-acceptance-v0.2/aggregate*.json
+          if-no-files-found: warn
+          retention-days: 30
