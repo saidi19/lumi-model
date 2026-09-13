@@ -1,0 +1,119 @@
+name: SFT tiny importer qualification v1
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-import-qualification-v1.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sft-import-qualification-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-tiny-importer-v1:
+    # Fresh direct successor only. Publication/native execution needs new approval.
+    # Trusted disposable hosted VM and provider actions are explicit premises;
+    # cancellation/guardian-death teardown is not independently proved.
+    if: github.event.repository.private == true && github.run_attempt == 1 && github.event.before == 'ecc545fc423650bf1089311915290523c10b3172' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 36
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: src
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      AWS_EC2_METADATA_DISABLED: "true"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      LUMI_IMPORT_QUALIFICATION_ACQUISITION_CI: "1"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 2
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Bound sources and pure contracts before any software acquisition
+        timeout-minutes: 2
+        run: |
+          set -eu
+          sha256sum --check --strict <<'LUMI_PINS'
+          918267c9d051991f2b9ae5abd150ca33fdc53c3d7d4e293e7b7ffcf56ea27753  scripts/run_checkpoint_guard_qualification_v1.py
+          3525eb5bf60fd0bac35480dd845a1cb11c6fc57303c6c3cb03b5c56576cfc1d6  scripts/supervise_checkpoint_guard_qualification_v1.py
+          011d636c89ed6dd923de306907c802c73d7b951ff2432cb5f79ff885c771e149  scripts/prepare_sft_import_qualification_v1.py
+          6ecee338f985b48a420fb34a5d91c23d16d6218ad2b6285e68768562ed4037e5  scripts/verify_sft_import_qualification_v1.py
+          LUMI_PINS
+          /usr/bin/python3 -I -S -B scripts/verify_sft_import_qualification_v1.py --check-source
+          /usr/bin/python3 -S -B -m unittest -q \
+            tests/test_sft_checkpoint_guard_qualification_v1.py \
+            tests/test_sft_checkpoint_guard_harness_v1.py \
+            tests/test_sft_checkpoint_guard_supervisor_v1.py \
+            tests/test_sft_import_qualification_acquisition_v1.py \
+            tests/test_sft_import_qualification_verification_v1.py \
+            tests/test_sft_import_qualification_workflow_v1.py
+      - name: Fresh four-response accepted-software acquisition
+        id: software
+        timeout-minutes: 7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          timeout --signal=TERM --kill-after=15s 6m
+          /usr/bin/python3 -I -S -B scripts/prepare_sft_import_qualification_v1.py
+          --acquire-accepted-software
+      - name: One independent PID-supervised tiny importer qualification
+        id: native
+        timeout-minutes: 19
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+        run: |
+          set -eu
+          umask 077
+          sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/supervise_checkpoint_guard_qualification_v1.py \
+            --synthetic-only "$LUMI_IMAGE_ARCHIVE" \
+            918267c9d051991f2b9ae5abd150ca33fdc53c3d7d4e293e7b7ffcf56ea27753 \
+            > artifacts/lumi-sft-import-qualification-v0.1/aggregate-native.json 2>/dev/null
+      - name: Retire exactly the newly acquired input
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+          LUMI_IMAGE_IDENTITY: ${{ steps.software.outputs.image_identity }}
+          LUMI_PARENT_IDENTITY: ${{ steps.software.outputs.parent_identity }}
+        run: |
+          set -eu
+          umask 077
+          /usr/bin/python3 -I -S -B scripts/prepare_sft_import_qualification_v1.py --retire-input \
+            "$LUMI_IMAGE_ARCHIVE" "$LUMI_IMAGE_IDENTITY" "$LUMI_PARENT_IDENTITY" \
+            > artifacts/lumi-sft-import-qualification-v0.1/aggregate-input-cleanup.json
+      - name: Exact aggregate qualification and cleanup verification
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        run: >-
+          /usr/bin/python3 -I -S -B scripts/verify_sft_import_qualification_v1.py
+          --verify-receipts
+      - name: Retain only the four named bounded aggregates
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-import-qualification-v1-evidence-${{ github.sha }}
+          path: |
+            artifacts/lumi-sft-import-qualification-v0.1/aggregate-acquisition.json
+            artifacts/lumi-sft-import-qualification-v0.1/aggregate-native.json
+            artifacts/lumi-sft-import-qualification-v0.1/aggregate-input-cleanup.json
+            artifacts/lumi-sft-import-qualification-v0.1/aggregate-verification.json
+          if-no-files-found: warn
+          retention-days: 30
