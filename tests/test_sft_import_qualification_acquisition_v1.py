@@ -145,7 +145,7 @@ class ContractTests(unittest.TestCase):
 class AcquisitionTests(unittest.TestCase):
     def setUp(self):
         self.directory = self.enterContext(tempfile.TemporaryDirectory(
-            prefix="lumi-generated-acquisition-", dir="/private/tmp"))
+            prefix="lumi-generated-acquisition-"))
         self.root = Path(self.directory).resolve()
         self.output = self.root / "reports"
         self.output.mkdir(mode=0o700)
@@ -254,6 +254,41 @@ class AcquisitionTests(unittest.TestCase):
         raw = stdout.buffer.getvalue()
         self.assertNotIn(b"sensitive", raw)
         self.assertEqual(json.loads(raw)["status"], "failed")
+
+
+class FixturePortabilityTests(unittest.TestCase):
+    def test_all_acquisition_cases_work_without_macos_specific_parent(self):
+        create_directory = tempfile.TemporaryDirectory
+        generated = []
+
+        def portable_directory(*args, **kwargs):
+            if kwargs.get("dir") == "/private/tmp":
+                raise FileNotFoundError("generated missing macOS-specific parent")
+            self.assertNotIn("dir", kwargs)
+            directory = create_directory(*args, **kwargs)
+            generated.append(Path(directory.name).resolve())
+            return directory
+
+        result = unittest.TestResult()
+        with patch.object(tempfile, "TemporaryDirectory", side_effect=portable_directory):
+            unittest.defaultTestLoader.loadTestsFromTestCase(AcquisitionTests).run(result)
+        self.assertEqual((result.testsRun, len(result.failures), len(result.errors)), (7, 0, 0))
+        self.assertEqual(len(generated), 7)
+        self.assertTrue(all(not directory.exists() for directory in generated))
+
+    def test_fixture_uses_configured_default_parent_and_cleans_up(self):
+        with tempfile.TemporaryDirectory(prefix="lumi-generated-portable-parent-") as name:
+            parent = Path(name).resolve()
+            case = AcquisitionTests(
+                "test_four_response_success_no_signed_credentials_or_raw_retention")
+            result = unittest.TestResult()
+            with patch.object(tempfile, "tempdir", str(parent)):
+                case.run(result)
+            self.assertEqual((result.testsRun, len(result.failures), len(result.errors)),
+                             (1, 0, 0))
+            self.assertEqual(Path(case.directory).parent, parent)
+            self.assertFalse(Path(case.directory).exists())
+            self.assertEqual(list(parent.iterdir()), [])
 
 
 class RetirementTests(unittest.TestCase):
