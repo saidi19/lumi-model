@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""Fresh accepted-software qualification for one generated-only prepared pipeline.
+
+NEVER execute this native harness on the Mac. The independently pinned outer
+supervisor signals only this owned PID, not its guardian process group. Trusted
+Linux host, Docker daemon and stable reviewed checkout remain explicit premises.
+The accepted image is loaded/created/inspected/exported, never started or rebuilt.
+No real checkpoint/data argument exists. The pipeline is one-shot and runs in
+this same owner process. Cleanup includes fresh external sibling workspaces.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import importlib.util
+import json
+import os
+import re
+import signal
+import stat
+import sys
+import tempfile
+import threading
+import time
+import types
+import uuid
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).absolute().parents[1]
+SCHEMA = "lumi.checkpoint-prepared-native-qualification.v0.1"
+SOURCE_ADMISSION = "configs/lumi-4b-sft-prepared-qualification-sources-v0.2.json"
+SOURCE_ADMISSION_SHA256 = "a0c7eff87acb1b1f4db31b9c5410a9fee23acf27d20a5298e177f71baea037cc"
+SOURCE_SCHEMA = "lumi.checkpoint-prepared-source-admission.v0.2"
+LEGACY = "scripts/run_sft_oci_guardian_fixture_v2.py"
+LEGACY_SHA256 = "79dcbfec678f43a39b31bb2dd2b4c9535fc162447cc591a781b72f93f079ce58"
+FROZEN = "scripts/run_sft_cgroup_fixture_v1.py"
+FROZEN_SHA256 = "f91ed0c353a20c309ff3e1bfaab8dbe990b28c36626fdeeb0ac5131e0cf75fad"
+IMPORTER_MANIFEST = "configs/lumi-4b-sft-prepared-import-source-manifest-v0.1.json"
+GENERATOR_MANIFEST = "configs/lumi-4b-sft-generator-source-manifest-v0.1.json"
+ENTRY = "scripts/run_checkpoint_prepared_fixture_v1.py"
+GENERATOR_ENTRY = "scripts/run_checkpoint_generator_v1.py"
+SOURCE_HELPER = "scripts/run_checkpoint_guarded_import_v1.py"
+MAXIMUM_SECONDS = 1200
+CLEANUP_SECONDS = 120
+MINIMUM_FREE_DISK_BYTES = 16 * 1024**3
+MAXIMUM_EXPORT_BYTES = 2 * 1024**3
+MAXIMUM_EXTRACT_BYTES = 4 * 1024**3
+MAXIMUM_REPORT_BYTES = 32768
+MAXIMUM_SOURCE_BYTES = 8 * 1024**2
+ARCHIVE_BYTES = 1_062_113_280
+ARCHIVE_SHA256 = "99d21fc60a54a65f28ceb4780f603f7ee48e49ac7b6d00a053dcdabe9ebc9ff4"
+STAGES = frozenset({"preflight", "source_admission", "copy_image", "load_image",
+                    "create_container", "inspect_container", "export_rootfs", "workspaces",
+                    "extract_generator", "extract_importer", "pipeline", "cleanup", "complete"})
+ERROR_CODES = frozenset({"runtime_rejected", "source_rejected", "fixture_failed",
+                         "deadline_exhausted", "cleanup_unconfirmed", "pipeline_rejected"})
+NONCLAIMS = ("real_4b_import", "training_authorized", "production_eligible", "gpu_used",
+             "real_model_or_data_access", "guardian_death_containment", "hostile_root_containment",
+             "full_dynamic_dependency_closure_verified", "host_admission_verified",
+             "publisher_signature_verified", "registry_published")
+HELPER = BASE = ADMISSION = ROOTFS = PIPELINE = WORKSPACES = None
+STAGE = "preflight"
+DESCENDANTS_REAPED = True
+_ATTEMPTED = False
+
+
+class FixtureError(ValueError):
+    def __init__(self, code="fixture_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "fixture_failed"
+        super().__init__(self.code)
+
+
+def need(value, code="fixture_failed"):
+    if not value:
+        raise FixtureError(code) from None
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii") + b"\n"
+
+
+def identity(info):
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid, info.st_gid
+
+
+def _state(info):
+    return (*identity(info), info.st_mode, info.st_nlink, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def remaining(deadline):
+    value = deadline - time.monotonic()
+    need(value > 0, "deadline_exhausted")
+    return value
+
+
+def runtime():
+    need(sys.platform == "linux" and os.uname().machine == "x86_64"
+         and sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12)
+         and sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode
+         and os.getresuid() == os.getresgid() == (0, 0, 0)
+         and signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+         and os.environ.get("LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI") == "1"
+         and threading.current_thread() is threading.main_thread()
+         and threading.active_count() == 1
+         and not any(name.split(".", 1)[0] in {
+             "lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers",
+             "tensorflow", "jax", "cuda", "cupy",
+         } for name in sys.modules), "runtime_rejected")
+
+
+def source_bytes(relative, expected=None):
+    need(type(relative) is str and len(relative) <= 256
+         and re.fullmatch(r"(?:src/lumi|scripts|configs)/[A-Za-z0-9_.-]+", relative)
+         and str(PurePosixPath(relative)) == relative, "source_rejected")
+    path = ROOT / relative
+    for ancestor in (path, *path.parents):
+        need(not ancestor.is_symlink(), "source_rejected")
+    fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+             and not before.st_mode & 0o022 and 0 < before.st_size <= 262144,
+             "source_rejected")
+        parts, count = [], 0
+        while count < before.st_size:
+            size = min(65536, before.st_size - count)
+            body = os.read(fd, size)
+            need(len(body) == size, "source_rejected")
+            parts.append(body)
+            count += len(body)
+        raw = b"".join(parts)
+        need(_state(before) == _state(os.fstat(fd)) == _state(path.lstat()), "source_rejected")
+        need(expected is None or hashlib.sha256(raw).hexdigest() == expected, "source_rejected")
+        return raw
+    finally:
+        os.close(fd)
+
+
+def parse_admission(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result, "source_rejected")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs)
+        need(type(value) is dict and set(value) == {"schema", "files"}
+             and value["schema"] == SOURCE_SCHEMA and type(value["files"]) is list
+             and 1 <= len(value["files"]) <= 128 and canonical(value) == raw, "source_rejected")
+        rows, total = {}, 0
+        for row in value["files"]:
+            need(type(row) is dict and set(row) == {"path", "bytes", "sha256"}
+                 and type(row["path"]) is str
+                 and re.fullmatch(r"(?:src/lumi|scripts|configs)/[A-Za-z0-9_.-]+", row["path"])
+                 and row["path"] not in rows and type(row["bytes"]) is int
+                 and 0 < row["bytes"] <= 262144 and type(row["sha256"]) is str
+                 and re.fullmatch(r"[a-f0-9]{64}", row["sha256"]), "source_rejected")
+            rows[row["path"]] = row
+            total += row["bytes"]
+        need(total <= MAXIMUM_SOURCE_BYTES and {
+             LEGACY, FROZEN, ENTRY, GENERATOR_ENTRY, SOURCE_HELPER,
+             IMPORTER_MANIFEST, GENERATOR_MANIFEST,
+             "src/lumi/posttraining_checkpoint_prepared_pipeline_v2.py",
+             "src/lumi/posttraining_checkpoint_fixture_workspace_v1.py",
+             "src/lumi/posttraining_checkpoint_generator_sources_v1.py"} <= set(rows),
+             "source_rejected")
+        return rows
+    except BaseException:
+        raise FixtureError("source_rejected") from None
+
+
+class VerifiedHostSources:
+    """Compile authenticated bodies for only our private host package namespaces.
+
+    -B disables bytecode writes, not reads. This scoped finder therefore never
+    consults FileFinder, a .pyc cache, extension module or unverified source for
+    these modules. Unrelated stdlib/runtime packages keep their normal loaders.
+    The one-shot native process retains the finder through its child lifetimes.
+    """
+
+    def __init__(self, package, bodies):
+        self.package = package
+        self.bodies = dict(bodies)
+
+    def find_spec(self, fullname, path=None, target=None):
+        parent, _, name = fullname.rpartition(".")
+        if not (parent == self.package or parent == "_lumi_generated_cgroup_fixture_v1"
+                or re.fullmatch(r"_lumi_checkpoint_guard_base_[a-f0-9]{32}_components", parent)):
+            return None
+        need(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is not None, "source_rejected")
+        relative = "src/lumi/" + name + ".py"
+        need(relative in self.bodies, "source_rejected")
+        return importlib.util.spec_from_loader(fullname, self, origin=str(ROOT / relative))
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        relative = "src/lumi/" + module.__name__.rsplit(".", 1)[1] + ".py"
+        filename = str(ROOT / relative)
+        module.__file__, module.__cached__ = filename, None
+        exec(compile(self.bodies[relative], filename, "exec"), module.__dict__)
+
+
+def load_sources():
+    """Authenticate the full reviewed closure before importing any host component."""
+    need(SOURCE_ADMISSION_SHA256 != "0" * 64, "source_rejected")
+    rows = parse_admission(source_bytes(SOURCE_ADMISSION, SOURCE_ADMISSION_SHA256))
+    bodies = {name: source_bytes(name, row["sha256"]) for name, row in rows.items()}
+    need(all(len(bodies[name]) == row["bytes"] for name, row in rows.items()), "source_rejected")
+    need(hashlib.sha256(bodies[LEGACY]).hexdigest() == LEGACY_SHA256
+         and hashlib.sha256(bodies[FROZEN]).hexdigest() == FROZEN_SHA256, "source_rejected")
+    package = types.ModuleType("_lumi_prepared_qualification_" + uuid.uuid4().hex)
+    package.__path__ = []
+    sys.modules[package.__name__] = package
+    sys.meta_path.insert(0, VerifiedHostSources(package.__name__, bodies))
+    pipeline = importlib.import_module(
+        package.__name__ + ".posttraining_checkpoint_prepared_pipeline_v2")
+    workspaces = importlib.import_module(
+        package.__name__ + ".posttraining_checkpoint_fixture_workspace_v1")
+    helper = types.ModuleType(package.__name__ + "_oci")
+    helper.__file__ = str(ROOT / LEGACY)
+    exec(compile(bodies[LEGACY], str(ROOT / LEGACY), "exec"), helper.__dict__)
+    bundles = {}
+    for role, manifest_name, entry_name in (
+        ("generator", GENERATOR_MANIFEST, GENERATOR_ENTRY),
+        ("importer", IMPORTER_MANIFEST, ENTRY),
+    ):
+        manifest = bodies[manifest_name]
+        declared = json.loads(manifest)["files"]
+        files = {row["path"]: bodies["src/" + row["path"]] for row in declared}
+        bundle = {"files": files, "manifest": manifest, "entry": bodies[entry_name],
+            "helper": bodies[SOURCE_HELPER],
+            "expected_manifest_sha256": rows[manifest_name]["sha256"],
+            "expected_entry_sha256": rows[entry_name]["sha256"]}
+        bundles[role] = pipeline._bundle(bundle, for_generator=role == "generator")
+    return helper, pipeline, workspaces, bundles, len(rows)
+
+
+def command(*args, **kwargs):
+    return HELPER.command(*args, **kwargs)
+
+
+def copy_image(*args):
+    return HELPER.copy_image(*args)
+
+
+def create_options(*args):
+    return HELPER.create_options(*args)
+
+
+def image_inventory(*args):
+    return HELPER.image_inventory(*args)
+
+
+def container_inventory(*args):
+    return HELPER.container_inventory(*args)
+
+
+def main():
+    try:
+        need(len(sys.argv) == 3 and sys.argv[1] == "--synthetic-only")
+        result = run(Path(sys.argv[2]))
+    except BaseException as error:
+        code = error.code if type(error) is FixtureError else "fixture_failed"
+        result = {"schema": SCHEMA, "status": "failed", "stage": STAGE, "code": code,
+                  **dict.fromkeys(NONCLAIMS, False)}
+    raw = canonical(result)
+    need(len(raw) <= MAXIMUM_REPORT_BYTES)
+    need(os.write(1, raw) == len(raw))
+    return 0 if result["status"] == "passed" else 2
+
+
+def validate_pipeline(value):
+    """Only the closed, aggregate pipeline result is reportable."""
+    fixed = {"schema": PIPELINE.SCHEMA,
+        "status": "two_guardian_passes_completed_cleanup_pending", "synthetic_only": True,
+        "generation_guard_launches": 1, "import_guard_launches": 1,
+        "owned_cgroups_empty_and_removed": 2, "cleanup_required_on_success_and_failure": True,
+        **dict.fromkeys(PIPELINE.NONCLAIMS, False)}
+    hashes = {"generation_nonce_sha256", "generator_receipt_sha256",
+              "import_receipt_sha256", "control_sha256"}
+    counts = {"generated_input_files": 32, "generated_input_bytes": 4194304}
+    need(type(value) is dict and set(value) == set(fixed) | hashes | set(counts)
+         and all(type(value[key]) is type(expected) and value[key] == expected
+                 for key, expected in fixed.items())
+         and all(type(value[key]) is str and re.fullmatch(r"[a-f0-9]{64}", value[key])
+                 and value[key] != "0" * 64 for key in hashes)
+         and all(type(value[key]) is int and 0 < value[key] <= maximum
+                 for key, maximum in counts.items()), "pipeline_rejected")
+    return dict(value)
+
+
+def run_pipeline(roots, workspaces, bundles, deadline):
+    """Same owner process, no extra fork and no private packet on outer stdout."""
+    global DESCENDANTS_REAPED, STAGE
+    remaining(deadline)
+    now = time.monotonic_ns()
+    stop = min(int(deadline * 1_000_000_000), now + 240_000_000_000)
+    need(stop - now >= 121_000_000_000, "deadline_exhausted")
+    BASE.subreaper()
+    STAGE = "pipeline"
+    DESCENDANTS_REAPED = False  # The enclosing finally must explicitly wait to ECHILD.
+    nonce = hashlib.sha256(os.urandom(32)).hexdigest()
+    result = PIPELINE.run_prepared_pipeline(
+        generator_root=roots["generator"], importer_root=roots["importer"],
+        generator_mountpoint_path=str(workspaces["generator"].path / "mountpoint"),
+        generator_bundle=bundles["generator"], importer_bundle=bundles["importer"],
+        generation_nonce_sha256=nonce, base_script_path=str(ROOT / FROZEN),
+        expected_base_sha256=FROZEN_SHA256, deadline_ns=stop)
+    verified = validate_pipeline(result)
+    need(verified["generation_nonce_sha256"] == nonce, "pipeline_rejected")
+    return verified
+
+
+def run(archive_path):
+    global BASE, STAGE, ADMISSION, ROOTFS, HELPER, PIPELINE, WORKSPACES, _ATTEMPTED
+    global DESCENDANTS_REAPED
+    runtime()
+    need(not _ATTEMPTED, "runtime_rejected")
+    _ATTEMPTED = True
+    os.environ.clear()
+    os.environ.update({"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8"})
+    os.umask(0o077)
+    overall_deadline = time.monotonic() + MAXIMUM_SECONDS
+    deadline = overall_deadline - CLEANUP_SECONDS
+    STAGE = "source_admission"
+    HELPER, PIPELINE, WORKSPACES, bundles, source_count = load_sources()
+    BASE = HELPER.load_base()
+    BASE.subreaper()  # Install before the first owned Docker CLI or guardian can spawn.
+    admission = ADMISSION = HELPER.load_admission()
+    rootfs = ROOTFS = PIPELINE.addon.rootfs  # All owners use the same authenticated package.
+    parent = Path(tempfile.mkdtemp(prefix="lumi-prepared-qualification-", dir="/tmp"))
+    parent_id = identity(parent.stat())
+    config, image, exported = (parent / name
+                               for name in ("docker-config", "image.tar", "rootfs.tar"))
+    directory_ids, file_ids, roots, workspaces = {}, {}, {}, {}
+    result, container = None, None
+    load_started = load_completed = create_started = create_completed = False
+    retirement_started = retirement_completed = False
+    container_name = "lumi-oci-guardian-" + uuid.uuid4().hex
+    cleanup_inventory = {"owned_container_absent": False, "owned_image_absent": False}
+    workspace_cleanup, cleanup = {}, False
+    try:
+        config.mkdir(mode=0o700)
+        directory_ids[config] = identity(config.stat())
+        space = os.statvfs(parent)
+        need(space.f_bavail * space.f_frsize >= MINIMUM_FREE_DISK_BYTES)
+        STAGE = "copy_image"
+        copy_image(archive_path, image, deadline, file_ids)
+        STAGE = "load_image"
+        need(admission.IMAGE_ID not in image_inventory(config, min(deadline, time.monotonic()+10)))
+        need(container_name not in container_inventory(config, min(deadline, time.monotonic()+10)))
+        with image.open("rb") as source:
+            load_started = True
+            command(config, ["image", "load"], deadline=min(deadline, time.monotonic()+180),
+                    input_file=source)
+        load_completed = True
+        STAGE = "create_container"
+        create_started = True
+        options = create_options(admission.IMAGE_ID, container_name)
+        raw, _size, _sha, _status = command(config, options,
+            deadline=min(deadline, time.monotonic()+30))
+        create_completed = True
+        selected = raw.decode("ascii").strip()
+        need(re.fullmatch(r"[0-9a-f]{64}", selected) is not None)
+        container = selected
+        STAGE = "inspect_container"
+        binding = admission.verify_created_oci(
+            container, deadline=min(deadline, time.monotonic()+15))
+        STAGE = "export_rootfs"
+        with exported.open("xb") as output:
+            file_ids[exported] = identity(os.fstat(output.fileno()))
+            _raw, export_bytes, export_sha, _status = command(config, ["export", container],
+                deadline=min(deadline, time.monotonic()+180),
+                maximum=MAXIMUM_EXPORT_BYTES, output_file=output)
+        need(0 < export_bytes <= MAXIMUM_EXPORT_BYTES)
+        need(admission.verify_created_oci(container, deadline=min(deadline, time.monotonic()+15))
+             == binding)
+        # Do not retry an ambiguous container retirement.
+        retired, container = container_name, None
+        create_started = False
+        retirement_started = True
+        command(config, ["rm", retired], deadline=min(deadline, time.monotonic()+15))
+        retirement_completed = True
+        need(retired not in container_inventory(config, min(deadline, time.monotonic()+10)),
+             "cleanup_unconfirmed")
+        cleanup_inventory["owned_container_absent"] = True
+        STAGE = "workspaces"
+        for role in ("generator", "importer"):
+            remaining(deadline)
+            workspaces[role] = WORKSPACES.create_workspace(
+                parent, role=role, deadline_ns=int(deadline * 1_000_000_000))
+        mountpoint = workspaces["generator"].path / "mountpoint"
+        mountpoint.mkdir(mode=0o700)  # Inside the newly exclusive, ledger-owned workspace.
+        for role in ("generator", "importer"):
+            STAGE = "extract_" + role
+            remaining(deadline)
+            roots[role] = rootfs.extract_rootfs(exported, workspaces[role].path,
+                expected_sha256=export_sha, maximum_archive_bytes=MAXIMUM_EXPORT_BYTES,
+                maximum_file_bytes=1024**3, maximum_total_bytes=MAXIMUM_EXTRACT_BYTES,
+                maximum_entries=65536, deadline=deadline)
+        pipeline_report = run_pipeline(roots, workspaces, bundles, deadline)
+        result = {"schema": SCHEMA, "status": "passed", "stage": "complete", "code": "ok",
+            "pipeline": pipeline_report, "accepted_image_id": binding.image_id,
+            "source_identity_sha256": binding.source_identity_sha256(),
+            "archive_bytes": ARCHIVE_BYTES, "export_bytes": export_bytes,
+            "export_sha256": export_sha, "extractions": [roots[role].summary()
+                for role in ("generator", "importer")],
+            "source_admission_sha256": SOURCE_ADMISSION_SHA256,
+            "source_bound_files": source_count, "software_roots_extracted": 2,
+            "docker_containers_started": 0, "images_built": 0,
+            **dict.fromkeys(NONCLAIMS, False)}
+    finally:
+        previous_stage, STAGE = STAGE, "cleanup"
+        cleanup_deadline = min(overall_deadline, time.monotonic() + CLEANUP_SECONDS)
+        failures = []
+        # Wait independently after both success and failure; never infer removal
+        # from ECHILD. Only the pipeline/guard reports can prove cgroup removal.
+        try:
+            statuses = BASE.wait_statuses(int(cleanup_deadline * 1_000_000_000))
+            DESCENDANTS_REAPED = True
+            if result is not None and statuses:
+                failures.append(True)
+        except BaseException:
+            DESCENDANTS_REAPED = False
+            failures.append(True)
+        if DESCENDANTS_REAPED:
+            for role in ("importer", "generator"):
+                owned = roots.get(role)
+                closed = owned is None
+                if owned is not None:
+                    try:
+                        owned.close()
+                        closed = True
+                    except BaseException:
+                        failures.append(True)
+                if role in workspaces and closed:
+                    try:
+                        removed = workspaces[role].cleanup(
+                            descendants_reaped=True, native_mounts_released=True,
+                            deadline_ns=int(cleanup_deadline * 1_000_000_000))
+                        workspace_cleanup[role] = WORKSPACES.validate_cleanup_receipt(
+                            removed, role=role)
+                    except BaseException:
+                        failures.append(True)
+        if retirement_started and not retirement_completed:
+            failures.append(True)
+        if create_started:
+            create_started = False
+            try:
+                if container_name in container_inventory(
+                        config, min(cleanup_deadline, time.monotonic()+10)):
+                    command(config, ["rm", container_name],
+                            deadline=min(cleanup_deadline, time.monotonic()+15))
+                need(create_completed, "cleanup_unconfirmed")
+                need(container_name not in container_inventory(
+                    config, min(cleanup_deadline, time.monotonic()+10)), "cleanup_unconfirmed")
+                cleanup_inventory["owned_container_absent"] = True
+            except BaseException:
+                failures.append(True)
+        if load_started:
+            load_started = False
+            try:
+                if admission.IMAGE_ID in image_inventory(
+                        config, min(cleanup_deadline, time.monotonic()+10)):
+                    command(config, ["image", "rm", "--no-prune", admission.IMAGE_ID],
+                            deadline=min(cleanup_deadline, time.monotonic()+30))
+                need(load_completed, "cleanup_unconfirmed")
+                need(admission.IMAGE_ID not in image_inventory(
+                    config, min(cleanup_deadline, time.monotonic()+10)), "cleanup_unconfirmed")
+                cleanup_inventory["owned_image_absent"] = True
+            except BaseException:
+                failures.append(True)
+        for path, expected in file_ids.items():
+            try:
+                need(identity(path.lstat()) == expected)
+                path.unlink()
+            except BaseException:
+                failures.append(True)
+        for path in reversed(directory_ids):
+            try:
+                need(identity(path.lstat()) == directory_ids[path])
+                path.rmdir()  # Refuse unowned entries; no broad recursive cleanup.
+            except BaseException:
+                failures.append(True)
+        if not failures:
+            need(identity(parent.lstat()) == parent_id)
+            parent.rmdir()
+            cleanup = True
+        need(cleanup, "cleanup_unconfirmed")
+        STAGE = previous_stage
+    need(result is not None)
+    need(DESCENDANTS_REAPED and set(workspace_cleanup) == {"generator", "importer"}
+         and all(cleanup_inventory.values()), "cleanup_unconfirmed")
+    STAGE = "complete"
+    return dict(result, private_owned_cleanup_verified=True, descendants_reaped=True,
+                workspace_cleanup=workspace_cleanup, cleanup_inventory=cleanup_inventory)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

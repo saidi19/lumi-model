@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+"""One generated-only prepared harness under an independent, bounded PID watchdog.
+
+The trusted host checkout and /usr/bin/python3 are premises, not authenticated
+runtime or immutable-source claims. Only the directly owned harness pidfd may
+be signalled. Its independent guardians retain responsibility for their cgroups;
+this parent only reaps adopted children and never kills a guardian/process group.
+No native entry is exercised by local source/double tests.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import json
+import os
+import platform
+import re
+import select
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).absolute().parents[1]
+HARNESS = ROOT / "scripts/run_checkpoint_prepared_qualification_v2.py"
+PYTHON = "/usr/bin/python3"
+SCHEMA = "lumi.checkpoint-prepared-supervised-qualification.v0.1"
+HARNESS_SCHEMA = "lumi.checkpoint-prepared-native-qualification.v0.1"
+FIXED_ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8",
+             "LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI": "1"}
+MAXIMUM_HARNESS_SECONDS = 1200
+CLEANUP_SECONDS = 120
+TERM_SECONDS = 10
+MAXIMUM_SOURCE_BYTES = 131072
+ARCHIVE_BYTES = 1_062_113_280
+MAXIMUM_EXPORT_BYTES = 2 * 1024**3
+MAXIMUM_OUTPUT_BYTES = 32768
+MAXIMUM_REAPED_CHILDREN = 2048
+FALSE_FLAGS = ("real_4b_import", "training_authorized", "production_eligible",
+               "gpu_used", "real_model_or_data_access", "guardian_death_containment",
+               "hostile_root_containment", "full_dynamic_dependency_closure_verified",
+               "host_admission_verified", "publisher_signature_verified", "registry_published")
+ERROR_CODES = frozenset({"ok", "runtime_rejected", "arguments_rejected", "source_rejected",
+                         "already_attempted", "process_failed", "deadline_exhausted",
+                         "output_rejected", "cleanup_unconfirmed", "supervision_failed"})
+_ATTEMPTED = False
+
+
+class SupervisorError(ValueError):
+    def __init__(self, code="supervision_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "supervision_failed"
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise SupervisorError(code) from None
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii") + b"\n"
+
+
+def _state(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _path(path, *, maximum=None):
+    need(type(path) is str and len(path) <= 4096, "arguments_rejected")
+    selected = Path(path)
+    need(selected.is_absolute() and ".." not in selected.parts, "arguments_rejected")
+    for ancestor in reversed((selected, *selected.parents)):
+        need(not stat.S_ISLNK(ancestor.lstat().st_mode), "source_rejected")
+    info = selected.lstat()
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+         and not info.st_mode & 0o022 and info.st_size > 0, "source_rejected")
+    need(maximum is None or info.st_size <= maximum, "source_rejected")
+    return _state(info)
+
+
+def verify_harness(expected):
+    need(type(expected) is str and re.fullmatch(r"[a-f0-9]{64}", expected),
+         "arguments_rejected")
+    before = _path(str(HARNESS), maximum=MAXIMUM_SOURCE_BYTES)
+    descriptor = os.open(HARNESS, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        need(_state(os.fstat(descriptor)) == before, "source_rejected")
+        digest, total = hashlib.sha256(), 0
+        while total < before[6]:
+            raw = os.read(descriptor, min(65536, before[6] - total))
+            need(raw, "source_rejected")
+            digest.update(raw)
+            total += len(raw)
+        need(not os.read(descriptor, 1) and digest.hexdigest() == expected
+             and _state(os.fstat(descriptor)) == before
+             and _path(str(HARNESS), maximum=MAXIMUM_SOURCE_BYTES) == before,
+             "source_rejected")
+    finally:
+        os.close(descriptor)
+    return before
+
+
+def runtime():
+    # Ignored SIGCHLD can make Popen.poll() synthesize a zero exit after ECHILD.
+    need(sys.platform == "linux"
+         and signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL, "runtime_rejected")
+    need(platform.machine() == "x86_64"
+         and sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12)
+         and sys.flags.isolated and sys.flags.no_site and sys.dont_write_bytecode
+         and os.getresuid() == os.getresgid() == (0, 0, 0)
+         and threading.current_thread() is threading.main_thread()
+         and threading.active_count() == 1
+         and hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
+         and dict(os.environ) == FIXED_ENV
+         and not any(name.split(".", 1)[0] in {
+             "lumi", "torch", "transformers", "numpy", "safetensors", "tokenizers",
+             "tensorflow", "jax", "cuda", "cupy",
+         } for name in sys.modules), "runtime_rejected")
+    task = Path("/proc/self/task")
+    need(sorted(item.name for item in task.iterdir()) == [str(os.getpid())], "runtime_rejected")
+    with (task / str(os.getpid()) / "children").open("rb") as source:
+        need(source.read(4097) == b"", "runtime_rejected")
+
+
+def subreaper():
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.restype = ctypes.c_int
+    observed = ctypes.c_int()
+    need(prctl(36, 1, 0, 0, 0) == 0, "runtime_rejected")
+    need(prctl(37, ctypes.byref(observed), 0, 0, 0) == 0 and observed.value == 1,
+         "runtime_rejected")
+
+
+def _pairs(rows):
+    value = {}
+    for key, part in rows:
+        need(key not in value, "output_rejected")
+        value[key] = part
+    return value
+
+
+def _integer(raw):
+    need(len(raw) <= 19, "output_rejected")
+    value = int(raw)
+    need(0 <= value < 2**63, "output_rejected")
+    return value
+
+
+def _number(_raw):
+    raise SupervisorError("output_rejected") from None
+
+
+def _closed(value, fixed, bounds=None, hashes=()):
+    """Closed aggregate schemas: no opaque strings, paths, extra keys or bool-as-int."""
+    bounds = {} if bounds is None else bounds
+    need(type(value) is dict and set(value) == set(fixed) | set(bounds) | set(hashes),
+         "output_rejected")
+    need(all(type(value[key]) is type(expected) and value[key] == expected
+             for key, expected in fixed.items()), "output_rejected")
+    need(all(type(value[key]) is int and low <= value[key] <= high
+             for key, (low, high) in bounds.items()), "output_rejected")
+    need(all(type(value[key]) is str and re.fullmatch(r"[a-f0-9]{64}", value[key])
+             and value[key] != "0" * 64 for key in hashes), "output_rejected")
+
+
+def _pipeline(value):
+    nonclaims = ("native_qualification_completed", "private_owned_cleanup_verified",
+        "host_admission_verified", "runtime_origin_authenticated", "source_origin_authenticated",
+        "external_writer_exclusion_verified", "execution_permitted", "full_size_import_authorized",
+        "real_4b_import", "training_authorized", "production_eligible", "retry_allowed")
+    _closed(value, {
+        "schema": "lumi.prepared-checkpoint-pipeline.v0.1",
+        "status": "two_guardian_passes_completed_cleanup_pending", "synthetic_only": True,
+        "generation_guard_launches": 1, "import_guard_launches": 1,
+        "owned_cgroups_empty_and_removed": 2, "cleanup_required_on_success_and_failure": True,
+        **dict.fromkeys(nonclaims, False)},
+        {"generated_input_files": (1, 32), "generated_input_bytes": (1, 4194304)},
+        ("generation_nonce_sha256", "generator_receipt_sha256", "import_receipt_sha256",
+         "control_sha256"))
+
+
+def _workspace(value, role):
+    _closed(value, {
+        "schema": "lumi.checkpoint-fixture-workspace-cleanup.v0.1", "status": "removed",
+        "role": role, "workspace_removed": True, "source_payload_bytes_read": 0,
+        "identity_checked_removal": True, "mount_boundary_checks_passed": True,
+        "descendants_reaped_premise": True, "native_mounts_released_premise": True,
+        "descendant_reaping_verified_by_adapter": False,
+        "native_mount_release_verified_by_adapter": False, "adopted_existing_directory": False,
+        "external_mutation_excluded": False, "retry_authorized": False,
+        "production_eligible": False},
+        {"census_nodes": (1, 512), "removed_files": (0, 511), "removed_directories": (1, 512),
+         "declared_file_bytes": (0, 16777216), "kernel_metadata_read_calls": (8, 4096),
+         "kernel_metadata_bytes_read": (1, 4096 * 1026),
+         "directory_entries_observed": (0, 1024)})
+    need(value["removed_files"] + value["removed_directories"] == value["census_nodes"]
+         and value["directory_entries_observed"] == 2 * (value["census_nodes"] - 1)
+         and value["kernel_metadata_read_calls"] == 6 * value["census_nodes"] + 2
+         and value["kernel_metadata_bytes_read"] <= value["kernel_metadata_read_calls"] * 1026,
+         "output_rejected")
+
+
+def _extraction(value, export_bytes):
+    # Captured before close(): the later workspace receipts cover cleanup.
+    _closed(value, {
+        "schema": "lumi.sft-oci-rootfs.v0.1", "archive_bytes": export_bytes,
+        "installation_frozen": True, "cleanup_attempted": False, "cleanup_completed": False,
+        "operation_tainted": False, "metadata_normalized": True, "filesystem_immutable": False,
+        "production_eligible": False, "real_sft_execution_permitted": False},
+        {"archive_entries": (1, 65536), "owned_entries": (1, 65536),
+         "archive_headers": (1, 65536), "metadata_bytes": (0, 64 * 1024**2),
+         "content_bytes": (1, 4 * 1024**3), "hardlinks": (0, 65536), "symlinks": (0, 65536),
+         "installed_files": (1, 256), "installed_bytes": (1, 10 * 1024**2)})
+
+
+def validate_harness_report(value):
+    """Do not mistake completed guardians for whole-harness qualification cleanup."""
+    common = {"schema": HARNESS_SCHEMA, **dict.fromkeys(FALSE_FLAGS, False)}
+    if value["status"] == "failed":
+        stages = {"preflight", "source_admission", "copy_image", "load_image", "create_container",
+            "inspect_container", "export_rootfs", "workspaces", "extract_generator",
+            "extract_importer", "pipeline", "cleanup", "complete"}
+        codes = {"runtime_rejected", "source_rejected", "fixture_failed", "deadline_exhausted",
+                 "cleanup_unconfirmed", "pipeline_rejected"}
+        need(value.get("stage") in stages and value.get("code") in codes, "output_rejected")
+        _closed(value, dict(common, status="failed", stage=value["stage"], code=value["code"]))
+        return
+    nested = {"pipeline", "workspace_cleanup", "cleanup_inventory", "extractions"}
+    need(nested <= set(value), "output_rejected")
+    _closed({key: part for key, part in value.items() if key not in nested}, dict(common,
+        status="passed", stage="complete", code="ok", archive_bytes=ARCHIVE_BYTES,
+        accepted_image_id="sha256:321d50ae5207dee05cd58ec5436d97978becde2ee8a767f2e8768229e6a9ad43",
+        private_owned_cleanup_verified=True, descendants_reaped=True,
+        software_roots_extracted=2, docker_containers_started=0, images_built=0),
+        {"export_bytes": (1, MAXIMUM_EXPORT_BYTES), "source_bound_files": (1, 128)},
+        ("source_identity_sha256", "source_admission_sha256", "export_sha256"))
+    _pipeline(value["pipeline"])
+    _closed(value["cleanup_inventory"], {
+        "owned_container_absent": True, "owned_image_absent": True})
+    workspaces = value["workspace_cleanup"]
+    need(type(workspaces) is dict and set(workspaces) == {"generator", "importer"},
+         "output_rejected")
+    for role in ("generator", "importer"):
+        _workspace(workspaces[role], role)
+    extractions = value["extractions"]
+    need(type(extractions) is list and len(extractions) == 2, "output_rejected")
+    for extracted in extractions:
+        _extraction(extracted, value["export_bytes"])
+
+
+def parse_report(raw, returncode):
+    need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_OUTPUT_BYTES
+         and raw.isascii() and type(returncode) is int, "output_rejected")
+    try:
+        value = json.loads(raw, object_pairs_hook=_pairs, parse_int=_integer,
+                           parse_float=_number, parse_constant=_number)
+        need(type(value) is dict and value.get("schema") == HARNESS_SCHEMA
+             and value.get("status") in {"passed", "failed"}
+             and ((value["status"] == "passed") == (returncode == 0))
+             and all(value.get(key) is False for key in FALSE_FLAGS), "output_rejected")
+        need(value["status"] != "passed" or (value.get("code") == "ok"
+             and value.get("stage") == "complete"), "output_rejected")
+        pending, count = [(value, 0)], 0
+        while pending:
+            item, depth = pending.pop()
+            count += 1
+            need(count <= 1024 and depth <= 8, "output_rejected")
+            if type(item) is dict:
+                need(all(type(key) is str and 0 < len(key) <= 256
+                         and all(32 <= ord(char) <= 126 and char not in "/\\"
+                                 for char in key) for key in item),
+                     "output_rejected")
+                pending.extend((part, depth + 1) for part in item.values())
+            elif type(item) is list:
+                need(len(item) <= 64, "output_rejected")
+                pending.extend((part, depth + 1) for part in item)
+            else:
+                need(type(item) in (str, int, bool, type(None)), "output_rejected")
+                need(type(item) is not str or (len(item) <= 256
+                     and all(32 <= ord(char) <= 126 and char not in "/\\" for char in item)),
+                     "output_rejected")
+        need(raw in (canonical(value), canonical(value).rstrip(b"\n")), "output_rejected")
+        validate_harness_report(value)
+        return value
+    except SupervisorError:
+        raise
+    except BaseException:
+        raise SupervisorError("output_rejected") from None
+
+
+def _reap(deadline):
+    count, failed = 0, False
+    try:
+        if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+            return count, False
+    except BaseException:
+        return count, False
+    while time.monotonic() < deadline:
+        try:
+            pid, status = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return count, not failed
+        except BaseException:
+            return count, False
+        if pid:
+            count += 1
+            failed |= status != 0
+            if count >= MAXIMUM_REAPED_CHILDREN:
+                return count, False
+        else:
+            select.select([], [], [], min(0.05, max(0, deadline - time.monotonic())))
+    return count, False
+
+
+def watch(process, pidfd, started):
+    """No signal target is accepted except this just-created harness pidfd."""
+    deadline = started + MAXIMUM_HARNESS_SECONDS
+    final_deadline = deadline + CLEANUP_SECONDS
+    stopping = None
+    failure, term, kill = (None if pidfd is not None else "cleanup_unconfirmed"), 0, 0
+    raw, eof, returncode = bytearray(), False, None
+    descriptor = None
+    try:
+        descriptor = process.stdout.fileno()
+        os.set_blocking(descriptor, False)
+    except BaseException:
+        failure, eof = "supervision_failed", True
+    while time.monotonic() < final_deadline:
+        try:
+            returncode = process.poll()
+        except BaseException:
+            failure, returncode = "cleanup_unconfirmed", None
+        now = time.monotonic()
+        if now >= deadline and failure is None:
+            failure = "deadline_exhausted"
+        if returncode is not None and eof:
+            final_deadline = min(final_deadline, now + CLEANUP_SECONDS)
+            break
+        if returncode is not None and stopping is None:
+            stopping = now
+            final_deadline = min(final_deadline, now + CLEANUP_SECONDS)
+        if failure and stopping is None:
+            stopping = now
+            final_deadline = min(final_deadline, now + CLEANUP_SECONDS)
+        if stopping is not None and returncode is None:
+            if not term:
+                term = 1
+                try:
+                    need(pidfd is not None, "cleanup_unconfirmed")
+                    signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+                except BaseException:
+                    failure = "cleanup_unconfirmed"
+            elif not kill and now >= stopping + TERM_SECONDS:
+                kill = 1
+                try:
+                    need(pidfd is not None, "cleanup_unconfirmed")
+                    signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+                except BaseException:
+                    failure = "cleanup_unconfirmed"
+        readable = [] if eof else [descriptor]
+        try:
+            ready = select.select(readable, [], [], min(0.05, final_deadline - now))[0]
+            if ready:
+                part = os.read(descriptor, min(4096, MAXIMUM_OUTPUT_BYTES + 1 - len(raw)))
+                if part:
+                    raw.extend(part)
+                    if len(raw) > MAXIMUM_OUTPUT_BYTES:
+                        failure, eof = "output_rejected", True
+                else:
+                    eof = True
+        except BaseException:
+            failure, eof = "supervision_failed", True
+    try:
+        returncode = process.poll()
+    except BaseException:
+        returncode = None
+    if returncode is None or not eof:
+        failure = "cleanup_unconfirmed"
+    adopted, reaped = _reap(final_deadline) if returncode is not None else (0, False)
+    # A successful harness must reap its own descendants. Even a zero-exit
+    # adopted child means its reported complete cleanup was not observed here.
+    if adopted or not reaped:
+        failure = "cleanup_unconfirmed"
+    return {"raw": bytes(raw), "returncode": returncode, "failure": failure,
+            "harness_term_attempts": term, "harness_kill_attempts": kill,
+            "harness_reaped": returncode is not None, "adopted_children_reaped": adopted,
+            "all_children_reaped": reaped}
+
+
+def supervise(archive, expected):
+    global _ATTEMPTED
+    runtime()
+    need(not _ATTEMPTED, "already_attempted")
+    source_state = verify_harness(expected)
+    archive_state = _path(archive, maximum=ARCHIVE_BYTES)
+    need(archive_state[6] == ARCHIVE_BYTES, "source_rejected")
+    subreaper()
+    need(_path(str(HARNESS), maximum=MAXIMUM_SOURCE_BYTES) == source_state
+         and _path(archive, maximum=ARCHIVE_BYTES) == archive_state, "source_rejected")
+    _ATTEMPTED = True
+    started = time.monotonic()
+    process = subprocess.Popen(
+        [PYTHON, "-I", "-S", "-B", str(HARNESS), "--synthetic-only", archive],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        close_fds=True, start_new_session=True, env=dict(FIXED_ENV), cwd=ROOT,
+    )
+    pidfd, result, close_failed = None, None, False
+    try:
+        try:
+            pidfd = os.pidfd_open(process.pid, 0)
+        except BaseException:
+            pass  # No numeric-PID fallback, even for this known child.
+        result = watch(process, pidfd, started)
+    finally:
+        try:
+            process.stdout.close()
+        except BaseException:
+            close_failed = True
+        if pidfd is not None:
+            try:
+                os.close(pidfd)
+            except BaseException:
+                close_failed = True
+    need(result is not None, "supervision_failed")
+    raw, returncode = result.pop("raw"), result.pop("returncode")
+    failure = result.pop("failure")
+    if pidfd is None or close_failed:
+        failure = "cleanup_unconfirmed"
+    report = None
+    if not failure:
+        try:
+            report = parse_report(raw, returncode)
+        except SupervisorError:
+            failure = "output_rejected"
+    if not failure and returncode != 0:
+        failure = "process_failed"
+    return {"schema": SCHEMA, "status": "failed" if failure else "passed",
+            "code": failure or "ok", "harness_sha256": expected,
+            "harness_stdout_bytes": len(raw),
+            "harness_stdout_sha256": hashlib.sha256(raw).hexdigest(),
+            "harness_exit_success": returncode == 0, "harness_pidfd_bound": pidfd is not None,
+            **result, "harness_report": report,
+            "guardian_signalled_by_supervisor": False, "process_group_signalled": False,
+            "guardian_death_cleanup_verified": False, "job_teardown_cleanup_verified": False,
+            "source_immutability_verified": False, "real_4b_import": False,
+            **dict.fromkeys(FALSE_FLAGS, False)}
+
+
+def main():
+    try:
+        need(len(sys.argv) == 4 and sys.argv[1] == "--synthetic-only", "arguments_rejected")
+        result = supervise(sys.argv[2], sys.argv[3])
+        need(len(canonical(result)) <= MAXIMUM_OUTPUT_BYTES, "output_rejected")
+    except BaseException as error:
+        code = error.code if type(error) is SupervisorError else "supervision_failed"
+        result = {"schema": SCHEMA, "status": "failed", "code": code,
+                  "real_4b_import": False, "training_authorized": False,
+                  "production_eligible": False, "gpu_used": False,
+                  "guardian_death_cleanup_verified": False, "job_teardown_cleanup_verified": False,
+                  **dict.fromkeys(FALSE_FLAGS, False)}
+    raw = canonical(result)
+    need(len(raw) <= MAXIMUM_OUTPUT_BYTES, "output_rejected")
+    sys.stdout.buffer.write(raw)
+    return 0 if result["status"] == "passed" else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

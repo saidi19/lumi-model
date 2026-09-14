@@ -1,0 +1,231 @@
+"""Real pure layout/launch validators, doubled installer and guardian only."""
+
+from __future__ import annotations
+
+import ast
+import copy
+import importlib
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_prepared_launch_v1_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_prepared_launch_v2")
+spec = importlib.util.spec_from_file_location("_prepared_launch_layout_fixture",
+    ROOT / "tests/test_sft_checkpoint_prepared_layout_v2.py")
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+
+
+def installed_layout():
+    harness = fixture.LayoutTests("test_exact_addons_private_modes_frozen_tree_and_mount_controls")
+    try:
+        harness.setUp()
+        result = harness.install()
+        harness.tearDown()
+        return result
+    finally:
+        harness.doCleanups()
+
+
+def guard_result(layout):
+    # Reuse only the frozen synthetic-report factory, not its test class or native doubles.
+    tree = ast.parse((ROOT / "tests/test_sft_checkpoint_guard_composition_v3.py").read_bytes())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "worker")
+    namespace = {"subject": m.guard, "NONCE": layout["receipt"]["generation_nonce_sha256"]}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "generated-worker-report", "exec"),
+         namespace)
+    worker = namespace["worker"]()
+    for name in ("generated_input_bytes", "generated_input_files", "source_manifest_sha256",
+                 "entry_sha256", "control_sha256", "generation_nonce_sha256"):
+        worker[name] = layout["receipt"][name]
+    return {"schema": m.guard.SCHEMA, "status": "passed", "synthetic_only": True,
+        "owned_cgroups_empty_and_removed": 1, "kill_attempts": 1,
+        "controller_and_deadline_watch_installed_before_release": True,
+        "worker_exit_status_verified": True, "workload_processes_reaped": 1,
+        "memory_max_bytes": 4294967296, "swap_max_bytes": 0, "pids_max": 256,
+        "cpu_quota_us": 200000, "cpu_period_us": 100000, "maximum_seconds": 90,
+        "tmpfs_capacity_bytes": 536870912, "shm_capacity_bytes": 67108864,
+        **dict.fromkeys(m.guard.NONCLAIMS, False), "worker": worker}
+
+
+class LaunchTests(unittest.TestCase):
+    def setUp(self):
+        self.layout = installed_layout()
+        self.pins = {"expected_layout_sha256": m.sha(m.canonical(self.layout)),
+            "expected_manifest_sha256": self.layout["receipt"]["source_manifest_sha256"],
+            "expected_entry_sha256": self.layout["receipt"]["entry_sha256"],
+            "expected_control_sha256": self.layout["receipt"]["control_sha256"],
+            "expected_generation_nonce_sha256": self.layout["receipt"]["generation_nonce_sha256"]}
+        self.enterContext(patch.object(m, "_ATTEMPTED", False))
+        self.runtime = self.enterContext(patch.object(m.guard.child_bootstrap, "_runtime"))
+        self.clock = self.enterContext(patch.object(m.time, "monotonic_ns", return_value=10))
+        self.dispatch = self.enterContext(patch.object(m.guard, "run_prepared_synthetic_guard",
+                                                       return_value=guard_result(self.layout)))
+
+    def invoke(self, **changes):
+        arguments = self.pins | {
+            "base_script_path": "/release/scripts/run_sft_cgroup_fixture_v1.py",
+            "expected_base_sha256": m.guard.BASE_SHA256, "deadline_ns": 90_000_000_000} | changes
+        return m.launch_prepared_fixture(self.layout, **arguments)
+
+    def test_real_installer_shape_is_accepted_and_detached_without_dispatch(self):
+        value = m.validate_layout(self.layout, **self.pins)
+        self.assertEqual(value, self.layout)
+        value["receipt"]["generated_input_bytes"] = 1
+        value["mount_arguments"]["inventories"]["checkpoint"].clear()
+        value["environment"].clear()
+        self.assertNotEqual(value, self.layout)
+        self.dispatch.assert_not_called()
+
+    def test_exactly_one_guardian_and_path_free_success(self):
+        result = self.invoke()
+        self.dispatch.assert_called_once()
+        self.assertEqual(self.dispatch.call_args.kwargs["mount_arguments"],
+                         self.layout["mount_arguments"])
+        self.assertEqual(self.dispatch.call_args.kwargs["expected_generation_nonce_sha256"],
+                         self.pins["expected_generation_nonce_sha256"])
+        self.assertEqual(result["guard_launches"], 1)
+        self.assertFalse(result["training_authorized"])
+        self.assertFalse(result["full_size_import_authorized"])
+        self.assertFalse(result["generator_containment_verified"])
+        self.assertNotIn(fixture.PARENT.encode(), m.canonical(result))
+        self.assertNotIn(b"generated-data", m.canonical(result))
+
+    def test_nonce_manifest_entry_control_and_whole_layout_pins_all_required(self):
+        for key in self.pins:
+            with self.subTest(key=key), self.assertRaises(m.PreparedLaunchError):
+                self.invoke(**{key: "e" * 64})
+        self.assertFalse(m._ATTEMPTED)
+        self.dispatch.assert_not_called()
+
+    def test_unknown_receipt_field_and_authority_cannot_be_rebound(self):
+        for key, value in (("approval", True), ("host_admission_verified", True),
+                           ("source_mounts_installed", True), ("installation_frozen", 1)):
+            selected = copy.deepcopy(self.layout)
+            selected["receipt"][key] = value
+            with self.subTest(key=key), self.assertRaises(m.PreparedLaunchError):
+                m.validate_layout(selected, **(self.pins | {
+                    "expected_layout_sha256": m.sha(m.canonical(selected))}))
+        self.dispatch.assert_not_called()
+
+    def test_bad_counts_and_booleans_cannot_be_rebound(self):
+        for key, value in (("generated_input_files", True), ("generated_input_files", 33),
+                           ("generated_input_bytes", 1), ("private_content_write_bytes", 1),
+                           ("rootfs_addon_files", 141), ("source_payload_files_opened", 1),
+                           ("new_input_payload_readback_bytes", 1)):
+            selected = copy.deepcopy(self.layout)
+            selected["receipt"][key] = value
+            with self.subTest(key=key), self.assertRaises(m.PreparedLaunchError):
+                m.validate_layout(selected, **(self.pins | {
+                    "expected_layout_sha256": m.sha(m.canonical(selected))}))
+
+    def test_nested_path_or_environment_mutation_denied_before_dispatch(self):
+        for field in ("mount_arguments", "environment"):
+            selected = copy.deepcopy(self.layout)
+            if field == "environment":
+                selected[field]["LD_PRELOAD"] = "/unapproved"
+            else:
+                selected[field]["checkpoint_path"] = "/unapproved/checkpoint"
+            with self.subTest(field=field), self.assertRaises(m.PreparedLaunchError):
+                m.validate_layout(selected, **(self.pins | {
+                    "expected_layout_sha256": m.sha(m.canonical(selected))}))
+
+    def test_parent_mutation_during_dispatch_does_not_change_copied_context(self):
+        expected = copy.deepcopy(self.layout)
+
+        def dispatch(**arguments):
+            self.layout["environment"].clear()
+            self.layout["mount_arguments"]["inventories"]["checkpoint"].clear()
+            self.assertEqual(arguments["environment"], expected["environment"])
+            self.assertEqual(arguments["mount_arguments"], expected["mount_arguments"])
+            return guard_result(expected)
+
+        self.dispatch.side_effect = dispatch
+        self.assertEqual(self.invoke()["guard_launches"], 1)
+
+    def test_runtime_failure_before_pure_validation_and_dispatch(self):
+        self.runtime.side_effect = RuntimeError("private runtime detail")
+        with patch.object(m, "validate_layout") as validate, self.assertRaisesRegex(
+                m.PreparedLaunchError, "^runtime_rejected$"):
+            self.invoke()
+        validate.assert_not_called()
+        self.dispatch.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_invalid_controller_path_or_deadline_before_attempt(self):
+        values = [{"base_script_path": value} for value in (
+            "relative/scripts/run_sft_cgroup_fixture_v1.py", "/release/../scripts/other.py",
+            "/release/scripts/other.py", "/release//scripts/run_sft_cgroup_fixture_v1.py",
+            "/release/\nscripts/run_sft_cgroup_fixture_v1.py")]
+        values += [{"deadline_ns": value} for value in (True, 10, 91_000_000_000)]
+        values += [{"expected_base_sha256": "e" * 64}]
+        for changes in values:
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                    m.PreparedLaunchError, "arguments_rejected"):
+                self.invoke(**changes)
+        self.dispatch.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_started_failure_keeps_cleanup_code_and_cannot_retry(self):
+        self.dispatch.side_effect = m.guard.GuardCompositionError("cleanup_unconfirmed")
+        for code in ("cleanup_unconfirmed", "already_attempted"):
+            with self.assertRaisesRegex(m.PreparedLaunchError, "^" + code + "$"):
+                self.invoke()
+        self.dispatch.assert_called_once()
+
+    def test_unknown_dispatch_exception_redacted_without_retry(self):
+        self.dispatch.side_effect = OSError("private source or path detail")
+        with self.assertRaisesRegex(m.PreparedLaunchError, "^guard_failed$"):
+            self.invoke()
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_success_cannot_retry_even_with_runtime_no_longer_acceptable(self):
+        self.invoke()
+        self.runtime.side_effect = RuntimeError("private runtime detail")
+        with self.assertRaisesRegex(m.PreparedLaunchError, "already_attempted"):
+            self.invoke()
+        self.dispatch.assert_called_once()
+
+    def test_worker_success_without_guardian_lifecycle_denied(self):
+        self.dispatch.return_value = guard_result(self.layout)["worker"]
+        with self.assertRaisesRegex(m.PreparedLaunchError, "result_rejected"):
+            self.invoke()
+
+    def test_missing_cleanup_bool_count_and_privilege_overclaims_denied(self):
+        for key, value in (("owned_cgroups_empty_and_removed", 0), ("kill_attempts", True),
+                           ("workload_processes_reaped", 0), ("worker_exit_status_verified", False),
+                           ("host_admission_verified", True), ("extra", "private detail")):
+            selected = guard_result(self.layout) | {key: value}
+            with self.subTest(key=key), self.assertRaisesRegex(
+                    m.PreparedLaunchError, "result_rejected"):
+                m.validate_guard_result(selected, self.layout,
+                                        self.pins["expected_generation_nonce_sha256"])
+
+    def test_worker_nonce_and_input_totals_match_parent(self):
+        for key, value in (("generation_nonce_sha256", "e" * 64), ("generated_input_files", 1)):
+            selected = guard_result(self.layout)
+            selected["worker"][key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(
+                    m.PreparedLaunchError, "result_rejected"):
+                m.validate_guard_result(selected, self.layout,
+                                        self.pins["expected_generation_nonce_sha256"])
+
+    def test_late_deadline_denies_success(self):
+        self.clock.side_effect = (10, 90_000_000_000)
+        with self.assertRaisesRegex(m.PreparedLaunchError, "deadline_exhausted"):
+            self.invoke()
+        self.dispatch.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()
+

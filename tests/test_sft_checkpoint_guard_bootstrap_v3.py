@@ -1,0 +1,513 @@
+"""Prepared bootstrap doubles: no native Linux function, descriptor or ML executes."""
+
+from __future__ import annotations
+
+import errno
+import importlib
+import json
+import os
+import socket
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_prepared_bootstrap_v2_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+module = importlib.import_module(PACKAGE + ".posttraining_checkpoint_guard_bootstrap_v3")
+real_mount = module.mount
+
+
+def mount_arguments():
+    parent = "/tmp/lumi-prepared-root"
+    identities = {}
+    for index, role in enumerate(real_mount.input_mount.ROLES, 1):
+        uid = 10001 if role in {"checkpoint", "tokenizer", "output"} else 0
+        mode = 0o755 if role in {"root", "inputs"} else 0o700
+        identities[role] = (1, index, stat.S_IFDIR | mode, uid, uid, 2, 0, 1, 1)
+    return {"rootfs_path": parent + "/rootfs", "mountpoint_path": parent + "/mount",
+            "checkpoint_path": parent + "/checkpoint", "tokenizer_path": parent + "/tokenizer",
+            "output_path": parent + "/output", "expected_identities": identities,
+            "expected_mountpoint_identity": (1, 100, stat.S_IFDIR | 0o700, 0, 0, 2, 0, 1, 1),
+            "inventories": {"checkpoint": {"model/generated": 10},
+                            "tokenizer": {"tokenizer/generated": 10}},
+            "scratch_bytes": 536870912, "shm_bytes": 67108864}
+
+
+class _Exited(BaseException):
+    def __init__(self, code):
+        self.code = code
+
+
+class _Channel:
+    family = socket.AF_UNIX
+
+    def __init__(self, fixture):
+        self.fixture = fixture
+        self.packet = (b"G", [], 0, None)
+        self.messages = []
+
+    def fileno(self):
+        return 8
+
+    def getsockopt(self, *_args):
+        return socket.SOCK_SEQPACKET
+
+    def gettimeout(self):
+        return None
+
+    def send(self, raw):
+        if 8 not in self.fixture.fds:
+            raise OSError(errno.EBADF, "PRIVATE FD TEXT")
+        self.messages.append(raw)
+        self.fixture.calls.append("send:" + json.loads(raw)["phase"])
+        return len(raw)
+
+    def recvmsg(self, size, capacity):
+        self.fixture.calls.append("recvmsg")
+        self.fixture.received_limits = size, capacity
+        return self.packet
+
+
+class _Doubles:
+    def __init__(self):
+        self.calls, self.fds = [], {0, 1, 2, 7, 8, 9}
+        self.uid, self.gid, self.groups = (0, 0, 0), (0, 0, 0), [0]
+        self.channel = _Channel(self)
+        self.executed = None
+        self.environment = dict(module.FIXED_ENV) | {key: "a" * 64 for key in module.HASH_ENV}
+        self.arguments = {"mount_arguments": mount_arguments(), "environment": self.environment}
+        self.os = types.SimpleNamespace(
+            O_RDWR=os.O_RDWR, O_CLOEXEC=os.O_CLOEXEC, O_NOFOLLOW=os.O_NOFOLLOW,
+            open=self.open, fstat=self.fstat, dup2=self.dup2, close=self.close,
+            listdir=lambda path: [str(fd) for fd in sorted(self.fds)],
+            major=os.major, minor=os.minor, getresuid=lambda: self.uid,
+            getresgid=lambda: self.gid, getgroups=lambda: self.groups,
+            chdir=lambda path: self.calls.append("chdir:" + path), execve=self.execve,
+            _exit=self.exit,
+        )
+
+    def open(self, path, flags):
+        self.calls.append("open:" + path)
+        self.fds.add(30)
+        return 30
+
+    def fstat(self, fd):
+        if fd not in self.fds:
+            raise OSError(errno.EBADF, "PRIVATE FD TEXT")
+        return types.SimpleNamespace(st_mode=stat.S_IFCHR | 0o666, st_rdev=os.makedev(1, 3))
+
+    def dup2(self, source, target):
+        self.calls.append(f"dup2:{source}:{target}")
+        self.fds.add(target)
+        return target
+
+    def close(self, fd):
+        self.calls.append("close:" + str(fd))
+        self.fds.remove(fd)
+
+    def drop(self, uid, gid):
+        self.calls.append("drop")
+        self.uid, self.gid, self.groups = (uid,) * 3, (gid,) * 3, []
+
+    def execve(self, runtime, argv, environment):
+        self.calls.append("exec")
+        self.executed = runtime, argv, environment
+        # Native exec never returns; this impossible return must fail closed.
+
+    def exit(self, code):
+        self.calls.append("exit:" + str(code))
+        raise _Exited(code)
+
+    def replacements(self):
+        def event(name, result):
+            def called(*_args, **_kwargs):
+                self.calls.append(name)
+                return result
+            return called
+        return {
+            "_runtime": lambda: None, "_ATTEMPTED": False, "os": self.os,
+            "socket": types.SimpleNamespace(socket=_Channel, AF_UNIX=socket.AF_UNIX,
+                                             SOL_SOCKET=socket.SOL_SOCKET,
+                                             SO_TYPE=socket.SO_TYPE,
+                                             SOCK_SEQPACKET=socket.SOCK_SEQPACKET),
+            "select": types.SimpleNamespace(select=lambda *_args: (
+                [self.channel] if _args[-1] else [], [], [])),
+            "cgroup": types.SimpleNamespace(enter_current_process=event("attach", None)),
+            "netns": types.SimpleNamespace(create_loopback_namespace=event(
+                "network", {"namespace_changed": True, "only_loopback_interface": True})),
+            "mount": types.SimpleNamespace(validate_arguments=real_mount.validate_arguments,
+                enter_import_rootfs=event("mount", {"old_root_detached": True,
+                    "readonly_software_root": True, "input_output_mounts_survive_pivot": True})),
+            "landlock": types.SimpleNamespace(restrict_filesystem=event(
+                "landlock", {"filesystem_content_policy_enforced": True, "abi_version": 5})),
+            "ipc": types.SimpleNamespace(RECEIPT={"fixed": True},
+                                         install_ipc_filter=event("ipc", {"fixed": True})),
+            "resource": types.SimpleNamespace(RLIMIT_CORE=4, RLIMIT_NOFILE=7,
+                setrlimit=lambda key, values: self.calls.append(("rlimit", key, values))),
+            "guardian": types.SimpleNamespace(drop_worker_privileges=self.drop),
+        }
+
+
+class BootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = _Doubles()
+
+    def execute(self, **changes):
+        fixture = self.fixture
+        with patch.multiple(module, **fixture.replacements()):
+            with self.assertRaises(_Exited) as result:
+                module.bootstrap(7, fixture.channel, **{**fixture.arguments, **changes})
+            self.assertEqual(result.exception.code, 2)
+
+    def test_complete_doubled_order_and_fixed_exec_only_after_release(self):
+        self.execute()
+        fixture = self.fixture
+        ordered = [value for value in fixture.calls if value in {
+            "attach", "network", "mount", "landlock", "ipc", "drop", "send:ready",
+            "recvmsg", "exec", "exit:2"} or type(value) is tuple]
+        self.assertEqual(ordered, ["attach", "network", "mount", "landlock", "ipc",
+                                  ("rlimit", 4, (0, 0)), ("rlimit", 7, (1024, 1024)),
+                                  "drop", "send:ready", "recvmsg", "exec", "exit:2"])
+        self.assertEqual(fixture.executed, (module.RUNTIME, list(module.ARGV), fixture.environment))
+        self.assertEqual(fixture.fds, {0, 1, 2})
+        self.assertEqual(fixture.received_limits, (2, 256))
+        self.assertEqual([json.loads(raw) for raw in fixture.channel.messages], [module.READY])
+
+    def test_no_runtime_action_or_native_module_can_execute_in_tests(self):
+        self.execute()
+        self.assertFalse(any("torch" in str(item) for item in self.fixture.calls))
+
+    def test_environment_exact_copy_and_no_arbitrary_keys(self):
+        copied = module.validate_environment(self.fixture.environment)
+        self.fixture.environment["PATH"] = "PRIVATE UNEXPECTED PATH"
+        self.assertEqual(copied["PATH"], "/usr/bin:/bin")
+        for value in (copied | {"PYTHONPATH": "/private"}, copied | {"LD_PRELOAD": "anything"},
+                      copied | {"LUMI_PREPARED_FIXTURE_ENTRY_SHA256": "A" * 64},
+                      copied | {"HF_HUB_OFFLINE": "0"}):
+            with self.subTest(keys=sorted(value)):
+                with self.assertRaisesRegex(module.ImportBootstrapError, "environment_rejected"):
+                    module.validate_environment(value)
+
+    def test_invalid_environment_prevents_any_mutation(self):
+        fixture = self.fixture
+        with patch.multiple(module, **fixture.replacements()):
+            with self.assertRaisesRegex(module.ImportBootstrapError, "environment_rejected"):
+                module.bootstrap(7, fixture.channel, **{**fixture.arguments, "environment": {}})
+        self.assertEqual(fixture.calls, [])
+
+    def test_invalid_identity_paths_or_descriptors_prevent_mutation(self):
+        for key, value in (("expected_mountpoint_identity", (True,) * 9),
+                           ("rootfs_path", "/tmp/work/../rootfs"),
+                           ("mountpoint_path", "/another/mount"),
+                           ("mountpoint_path", "/tmp/lumi-prepared-root/rootfs")):
+            arguments = mount_arguments()
+            arguments[key] = value
+            with self.subTest(key=key), patch.multiple(module, **self.fixture.replacements()):
+                with self.assertRaisesRegex(module.ImportBootstrapError, "arguments_rejected"):
+                    module.bootstrap(7, self.fixture.channel,
+                        mount_arguments=arguments, environment=self.fixture.environment)
+            self.assertEqual(self.fixture.calls, [])
+
+    def test_same_group_channel_fd_prevents_mutation(self):
+        with patch.multiple(module, **self.fixture.replacements()):
+            with self.assertRaisesRegex(module.ImportBootstrapError, "arguments_rejected"):
+                module.bootstrap(8, self.fixture.channel, **self.fixture.arguments)
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_failed_namespace_stage_never_releases_or_executes(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["netns"] = types.SimpleNamespace(create_loopback_namespace=lambda: {})
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+            self.assertTrue(module._ATTEMPTED)
+            with self.assertRaisesRegex(module.ImportBootstrapError, "already_attempted"):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("recvmsg", fixture.calls)
+        self.assertIsNone(fixture.executed)
+        self.assertEqual(json.loads(fixture.channel.messages[-1]),
+                         {"phase": "bootstrap_failed", "stage": "network"})
+
+    def test_missing_or_non_boolean_surviving_mount_receipt_prevents_release(self):
+        for receipt in ({"old_root_detached": True, "readonly_software_root": True},
+                        *({"old_root_detached": True, "readonly_software_root": True,
+                           "input_output_mounts_survive_pivot": value}
+                          for value in (False, None, 1, "true"))):
+            with self.subTest(receipt=receipt):
+                fixture = _Doubles()
+                replacements = fixture.replacements()
+                replacements["mount"].enter_import_rootfs = lambda value=receipt, **_kwargs: value
+                with patch.multiple(module, **replacements):
+                    with self.assertRaises(_Exited) as caught:
+                        module.bootstrap(7, fixture.channel, **fixture.arguments)
+                    self.assertEqual(caught.exception.code, 2)
+                    self.assertTrue(module._ATTEMPTED)
+                    with self.assertRaisesRegex(module.ImportBootstrapError, "already_attempted"):
+                        module.bootstrap(7, fixture.channel, **fixture.arguments)
+                for action in ("landlock", "ipc", "drop", "send:ready", "recvmsg", "exec"):
+                    self.assertNotIn(action, fixture.calls)
+                self.assertIsNone(fixture.executed)
+                self.assertEqual([json.loads(raw) for raw in fixture.channel.messages],
+                                 [{"phase": "bootstrap_failed", "stage": "mount"}])
+
+    def test_invalid_mount_arguments_leave_attempt_unconsumed(self):
+        cases = []
+        missing = mount_arguments()
+        missing.pop("scratch_bytes")
+        cases.append(missing)
+        cases.append(mount_arguments() | {"approved": True})
+        cases.append(mount_arguments() | {"scratch_bytes": True})
+        cases.append(mount_arguments() | {"inventories": {"checkpoint": {"../bad": 10},
+                                                          "tokenizer": {"valid": 10}}})
+        wrong_identity = mount_arguments()
+        wrong_identity["expected_identities"]["root"] = [1] * 9
+        cases.append(wrong_identity)
+        for arguments in cases:
+            with self.subTest(fields=sorted(arguments)):
+                fixture = _Doubles()
+                with patch.multiple(module, **fixture.replacements()):
+                    with self.assertRaisesRegex(module.ImportBootstrapError, "arguments_rejected"):
+                        module.bootstrap(7, fixture.channel,
+                                         mount_arguments=arguments, environment=fixture.environment)
+                    self.assertFalse(module._ATTEMPTED)
+                self.assertEqual(fixture.calls, [])
+                self.assertEqual(fixture.fds, {0, 1, 2, 7, 8, 9})
+                self.assertEqual(fixture.channel.messages, [])
+
+    def test_mount_argument_validator_detaches_each_mutable_mapping(self):
+        original = mount_arguments()
+        copied = module.validate_mount_arguments(original)
+        self.assertEqual(copied, original)
+        self.assertIsNot(copied, original)
+        self.assertIsNot(copied["expected_identities"], original["expected_identities"])
+        self.assertIsNot(copied["inventories"], original["inventories"])
+        for role in ("checkpoint", "tokenizer"):
+            self.assertIsNot(copied["inventories"][role], original["inventories"][role])
+        copied["inventories"]["checkpoint"].clear()
+        copied["expected_identities"].clear()
+        self.assertEqual(len(original["expected_identities"]), 9)
+        self.assertEqual(original["inventories"]["checkpoint"], {"model/generated": 10})
+
+    def test_all_malformed_release_packets_are_terminal(self):
+        for packet in ((b"", [], 0, None), (b"GG", [], 0, None), (b"G", [], 32, None),
+                       (b"G", [(1, 1, b"PRIVATE")], 0, None), (bytearray(b"G"), [], 0, None)):
+            with self.subTest(packet_type=type(packet[0]).__name__):
+                self.fixture = _Doubles()
+                self.fixture.channel.packet = packet
+                self.execute()
+                self.assertIsNone(self.fixture.executed)
+                self.assertEqual(json.loads(self.fixture.channel.messages[-1]),
+                                 {"phase": "bootstrap_failed", "stage": "release"})
+                self.assertNotIn(b"PRIVATE", b"".join(self.fixture.channel.messages))
+
+    def test_release_timeout_does_not_call_recv_or_exec(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["select"] = types.SimpleNamespace(select=lambda *_args: ([], [], []))
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("recvmsg", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_second_queued_release_packet_is_rejected_without_reading_it(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["select"] = types.SimpleNamespace(
+            select=lambda *_args: ([fixture.channel], [], []))
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(fixture.calls.count("recvmsg"), 1)
+        self.assertIsNone(fixture.executed)
+        self.assertEqual(json.loads(fixture.channel.messages[-1])["stage"], "release")
+
+    def test_ambiguous_authority_close_is_not_retried_and_no_ready_is_sent(self):
+        fixture = self.fixture
+        original = fixture.os.close
+        def close(fd):
+            original(fd)
+            if fd == 7:
+                raise OSError("PRIVATE AMBIGUOUS CLOSE")
+        fixture.os.close = close
+        self.execute()
+        self.assertEqual(fixture.calls.count("close:7"), 1)
+        self.assertNotIn("send:ready", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_short_ready_send_prevents_release(self):
+        fixture = self.fixture
+        original = fixture.channel.send
+        def send(raw):
+            result = original(raw)
+            return result - 1
+        fixture.channel.send = send
+        self.execute()
+        self.assertNotIn("recvmsg", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_sanitize_rejects_wrong_device_before_attach(self):
+        fixture = self.fixture
+        original = fixture.os.fstat
+        def observed(fd):
+            if fd == 30:
+                return types.SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_rdev=0)
+            return original(fd)
+        fixture.os.fstat = observed
+        self.execute()
+        self.assertNotIn("attach", fixture.calls)
+        self.assertEqual(fixture.calls.count("close:30"), 1)
+        self.assertIsNone(fixture.executed)
+
+    def test_invalid_ipc_receipt_prevents_drop(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["ipc"].install_ipc_filter = lambda: {"fixed": False}
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("drop", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_landlock_uses_exact_existing_paths(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        observed = []
+        def restrict(**values):
+            observed.append(values)
+            return {"filesystem_content_policy_enforced": True, "abi_version": 5}
+        replacements["landlock"] = types.SimpleNamespace(restrict_filesystem=restrict)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(observed, [{"read_only_paths": module.READ_ONLY_PATHS,
+                                     "writable_paths": module.WRITABLE_PATHS,
+                                     "device_paths": module.DEVICE_PATHS,
+                                     "expected_root_identity": (1, 5, stat.S_IFDIR, 0, 0)}])
+
+    def test_landlock_explicit_data_paths_and_derived_prepared_root_identity(self):
+        fixture = self.fixture
+        mount_control = fixture.arguments["mount_arguments"]
+        original = mount_control["expected_identities"]["root"]
+        mount_control["expected_identities"]["root"] = (17, 451) + original[2:]
+        observed = []
+
+        def restrict(**values):
+            observed.append(values)
+            return {"filesystem_content_policy_enforced": True, "abi_version": 5}
+
+        replacements = fixture.replacements()
+        replacements["landlock"] = types.SimpleNamespace(restrict_filesystem=restrict)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(observed, [{
+            "read_only_paths": ("/usr", "/etc", "/opt/lumi-release", "/proc",
+                                "/inputs/checkpoint", "/inputs/tokenizer"),
+            "writable_paths": ("/tmp", "/dev/shm", "/outputs"),
+            "device_paths": ("/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"),
+            "expected_root_identity": (17, 451, stat.S_IFDIR, 0, 0),
+        }])
+        self.assertNotEqual(observed[0]["expected_root_identity"][:2],
+                            mount_control["expected_mountpoint_identity"][:2])
+
+    def test_new_landlock_paths_fit_frozen_pure_contract_and_rule_cap(self):
+        module.landlock.landlock._paths(module.READ_ONLY_PATHS, module.WRITABLE_PATHS,
+                                        module.DEVICE_PATHS)
+        rule_count = sum(map(len, (module.READ_ONLY_PATHS, module.WRITABLE_PATHS,
+                                   module.DEVICE_PATHS))) + 1
+        self.assertEqual(rule_count, 14)
+        self.assertLessEqual(rule_count, 16)
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_caller_mount_mutation_after_validation_cannot_change_mount_or_landlock(self):
+        fixture = self.fixture
+        original = fixture.arguments["mount_arguments"]
+        frozen = module.validate_mount_arguments(original)
+        observed_mount, observed_landlock = [], []
+
+        def network():
+            original["rootfs_path"] = "PRIVATE CHANGED SOURCE"
+            original["expected_identities"]["root"] = (0,) * 9
+            original["inventories"]["checkpoint"].clear()
+            original["inventories"]["tokenizer"]["injected"] = 1
+            return {"namespace_changed": True, "only_loopback_interface": True}
+
+        def enter(**values):
+            observed_mount.append(values)
+            return {"old_root_detached": True, "readonly_software_root": True,
+                    "input_output_mounts_survive_pivot": True}
+
+        def restrict(**values):
+            observed_landlock.append(values)
+            return {"filesystem_content_policy_enforced": True, "abi_version": 5}
+
+        replacements = fixture.replacements()
+        replacements["netns"] = types.SimpleNamespace(create_loopback_namespace=network)
+        replacements["mount"].enter_import_rootfs = enter
+        replacements["landlock"] = types.SimpleNamespace(restrict_filesystem=restrict)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(observed_mount, [frozen])
+        self.assertEqual(observed_landlock[0]["expected_root_identity"],
+                         (1, 5, stat.S_IFDIR, 0, 0))
+        self.assertIsNot(observed_mount[0]["inventories"], original["inventories"])
+        self.assertNotIn(b"PRIVATE", b"".join(fixture.channel.messages))
+        self.assertIsNotNone(fixture.executed)
+
+    def test_privilege_verification_failure_prevents_ready_and_exec(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["guardian"] = types.SimpleNamespace(drop_worker_privileges=lambda *_args: None)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("send:ready", fixture.calls)
+        self.assertIsNone(fixture.executed)
+        self.assertEqual(json.loads(fixture.channel.messages[-1])["stage"], "drop")
+
+    def test_environment_caller_changes_do_not_reach_exec(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        def network():
+            fixture.environment["PATH"] = "PRIVATE CHANGED"
+            return {"namespace_changed": True, "only_loopback_interface": True}
+        replacements["netns"] = types.SimpleNamespace(create_loopback_namespace=network)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(fixture.executed[2]["PATH"], "/usr/bin:/bin")
+
+    def test_runtime_checks_with_no_host_mutations(self):
+        fake_sys = types.SimpleNamespace(platform="linux", implementation=types.SimpleNamespace(
+            name="cpython"), version_info=(3, 12, 1), flags=types.SimpleNamespace(no_site=1),
+            dont_write_bytecode=True, modules={})
+        fake_thread = object()
+        fake_threading = types.SimpleNamespace(current_thread=lambda: fake_thread,
+            main_thread=lambda: fake_thread, active_count=lambda: 1)
+        with patch.object(module, "sys", fake_sys), \
+             patch.object(module, "os", self.fixture.os), \
+             patch.object(module, "threading", fake_threading), \
+             patch.object(module, "platform", types.SimpleNamespace(machine=lambda: "x86_64")):
+            module._runtime()
+            fake_sys.modules["torch"] = object()
+            with self.assertRaisesRegex(module.ImportBootstrapError, "runtime_rejected"):
+                module._runtime()
+            fake_sys.modules.clear()
+            fake_sys.platform = "darwin"
+            with self.assertRaisesRegex(module.ImportBootstrapError, "runtime_rejected"):
+                module._runtime()
+        self.assertEqual(self.fixture.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+

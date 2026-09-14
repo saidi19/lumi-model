@@ -1,0 +1,433 @@
+"""Generated aggregate receipts and real source-only pins; never native execution."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import io
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+from tests.test_sft_checkpoint_prepared_qualification_supervisor_v2 import report
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "_generated_prepared_qualification_verifier_v1",
+    ROOT / "scripts/verify_sft_prepared_qualification_v2.py")
+subject = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(subject)
+
+
+def generated(sources):
+    h, s, a, _workspaces, _bundles, count, binding = sources
+    harness = report()
+    harness.update(source_bound_files=count, source_admission_sha256=h.SOURCE_ADMISSION_SHA256,
+                   source_identity_sha256=binding.source_identity_sha256(),
+                   accepted_image_id=binding.image_id)
+    raw = subject.canonical(harness)
+    native = {"schema": s.SCHEMA, "status": "passed", "code": "ok",
+        "harness_sha256": subject.PINS["scripts/run_checkpoint_prepared_qualification_v2.py"],
+        "harness_stdout_bytes": len(raw), "harness_stdout_sha256": subject.digest(raw),
+        "harness_exit_success": True, "harness_pidfd_bound": True,
+        "harness_term_attempts": 0, "harness_kill_attempts": 0, "harness_reaped": True,
+        "adopted_children_reaped": 0, "all_children_reaped": True, "harness_report": harness,
+        "guardian_signalled_by_supervisor": False, "process_group_signalled": False,
+        "guardian_death_cleanup_verified": False, "job_teardown_cleanup_verified": False,
+        "source_immutability_verified": False, **dict.fromkeys(s.FALSE_FLAGS, False)}
+    return subject.expected_acquisition(a), native, subject.expected_retirement(a)
+
+
+def rehash(native):
+    raw = subject.canonical(native["harness_report"])
+    native.update(harness_stdout_bytes=len(raw), harness_stdout_sha256=subject.digest(raw))
+
+
+class VerifierTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.previous = list(sys.meta_path)
+        cls.addClassCleanup(lambda: sys.meta_path.__setitem__(slice(None), cls.previous))
+        before = set(sys.modules)
+        with ExitStack() as denied:
+            for module, name in ((socket, "socket"), (subprocess, "run"), (subprocess, "Popen"),
+                                 (os, "fork"), (os, "execve"), (os, "system")):
+                denied.enter_context(patch.object(module, name,
+                    side_effect=AssertionError("native_execution_forbidden")))
+            cls.sources = subject.load_sources()
+        cls.added_modules = set(sys.modules) - before
+
+    def setUp(self):
+        self.acq, self.native, self.retired = generated(self.sources)
+
+    def invoke(self):
+        return subject.validate(self.acq, self.native, self.retired, self.sources)
+
+    def reject_harness(self, value):
+        self.native["harness_report"] = value
+        rehash(self.native)
+        with self.assertRaises(ValueError):
+            self.invoke()
+
+    def test_complete_two_stage_workspace_and_extraction_receipts_pass(self):
+        result = self.invoke()
+        self.assertEqual(result, {
+            "schema": "lumi.sft-prepared-qualification-verification.v0.2",
+            "status": "passed", "code": "ok",
+            "prepared_native_qualification_receipts_verified": True,
+            "receipt_count": 3, "ordered_guardian_passes_verified": 2,
+            "source_files_verified": 78, "all_owned_cleanup_receipts_verified": True,
+            **dict.fromkeys(subject.FALSE_FLAGS, False)})
+        harness = self.native["harness_report"]
+        self.assertEqual(set(harness["workspace_cleanup"]), {"generator", "importer"})
+        self.assertEqual(len(harness["extractions"]), 2)
+        self.assertNotIn("cases", harness)
+        self.assertIs(harness["pipeline"]["native_qualification_completed"], False)
+        self.assertIs(harness["pipeline"]["private_owned_cleanup_verified"], False)
+        self.assertIs(harness["private_owned_cleanup_verified"], True)
+
+    def test_real_source_only_load_binds_78_files_without_ML_or_native_action(self):
+        h, _s, _a, workspaces, bundles, count, binding = self.sources
+        self.assertFalse({"torch", "transformers", "safetensors", "numpy", "tokenizers",
+                          "tensorflow", "jax", "cupy"} & self.added_modules)
+        self.assertEqual(count, 78)
+        self.assertEqual(set(bundles), {"generator", "importer"})
+        self.assertEqual(self.native["harness_report"]["source_admission_sha256"],
+                         h.SOURCE_ADMISSION_SHA256)
+        self.assertEqual(self.native["harness_report"]["source_identity_sha256"],
+                         binding.source_identity_sha256())
+        for role in ("generator", "importer"):
+            original = self.native["harness_report"]["workspace_cleanup"][role]
+            checked = workspaces.validate_cleanup_receipt(original, role=role)
+            self.assertEqual(checked, original)
+            self.assertIsNot(checked, original)
+        self.assertEqual(set(subject.PINS), {
+            "scripts/run_checkpoint_prepared_qualification_v2.py",
+            "scripts/supervise_checkpoint_prepared_qualification_v2.py",
+            "scripts/prepare_sft_prepared_qualification_v2.py"})
+        self.assertEqual(subject.PINS["scripts/prepare_sft_prepared_qualification_v2.py"],
+                         "7dc3543a354d3b4bca154b72ca6d2e77ffd2e229559a4f4d4da157dd46213065")
+
+    def test_wrong_pinned_script_source_is_rejected_before_execution(self):
+        with patch.object(subject, "read", return_value=b"raise AssertionError('not_executed')\n"):
+            with self.assertRaises(subject.VerificationError):
+                subject.load_sources()
+
+    def test_acquisition_exact_schema_binding_counts_and_false_flags(self):
+        mutations = [("https_requests", True), ("https_requests", 3), ("source_commit", "0" * 40),
+            ("prior_input_cleanup_verified", False), ("status", "failed"),
+            ("schema", "lumi.sft-import-qualification-acquisition.v0.2"), ("unexpected", 1)]
+        mutations += [(key, True) for key in self.sources[2].FALSE_FLAGS]
+        mutations += [(key, None) for key in self.acq]
+        original = copy.deepcopy(self.acq)
+        for key, value in mutations:
+            with self.subTest(key=key, value=value):
+                self.acq = copy.deepcopy(original)
+                self.acq[key] = value
+                with self.assertRaises(subject.VerificationError):
+                    self.invoke()
+
+    def test_retirement_exact_schema_count_and_false_flags(self):
+        original = copy.deepcopy(self.retired)
+        candidates = [{}, {**original, "owned_input_files_retired": 2},
+            {**original, "owned_input_directories_retired": True},
+            {**original, "status": "failed"}, {**original, "unexpected": 1}]
+        candidates += [{**original, key: True} for key in self.sources[2].FALSE_FLAGS]
+        for candidate in candidates:
+            self.retired = candidate
+            with self.assertRaises(subject.VerificationError):
+                self.invoke()
+
+    def test_outer_receipt_exact_fields_lifecycle_and_false_authority_flags(self):
+        original = copy.deepcopy(self.native)
+        changes = [("adopted_children_reaped", 1), ("adopted_children_reaped", False),
+            ("all_children_reaped", False), ("harness_reaped", False),
+            ("harness_term_attempts", 1), ("harness_kill_attempts", 1),
+            ("harness_exit_success", False), ("harness_pidfd_bound", False),
+            ("guardian_signalled_by_supervisor", True), ("process_group_signalled", True),
+            ("guardian_death_cleanup_verified", True), ("job_teardown_cleanup_verified", True),
+            ("source_immutability_verified", True), ("status", "failed"), ("extra", 1)]
+        changes += [(key, True) for key in self.sources[1].FALSE_FLAGS]
+        for key, value in changes:
+            with self.subTest(key=key):
+                self.native = copy.deepcopy(original)
+                self.native[key] = value
+                with self.assertRaises(subject.VerificationError):
+                    self.invoke()
+        for key in original:
+            self.native = copy.deepcopy(original)
+            del self.native[key]
+            with self.assertRaises(subject.VerificationError):
+                self.invoke()
+
+    def test_outer_worker_only_false_positive_is_not_a_harness_receipt(self):
+        self.native = {"schema": "lumi.checkpoint-prepared-fixture-entry.v0.1",
+                       "status": "passed", "real_4b_import": False}
+        with self.assertRaises(subject.VerificationError):
+            self.invoke()
+
+    def test_harness_transport_hash_count_and_source_pin_are_exact(self):
+        for key, value in (("harness_stdout_sha256", "0" * 64),
+                ("harness_stdout_bytes", 1), ("harness_stdout_bytes", True),
+                ("harness_sha256", "f" * 64)):
+            original = self.native[key]
+            self.native[key] = value
+            with self.assertRaises(subject.VerificationError):
+                self.invoke()
+            self.native[key] = original
+
+    def test_source_identity_admission_and_exact_count_bound_to_real_sources(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for key, value in (("source_identity_sha256", "2" * 64),
+                ("source_admission_sha256", "3" * 64), ("source_bound_files", 77),
+                ("source_bound_files", 79), ("source_bound_files", True),
+                ("accepted_image_id", "sha256:" + "4" * 64)):
+            with self.subTest(key=key, value=value):
+                self.reject_harness({**original, key: value})
+
+    def test_harness_closed_schema_fields_and_literal_false_flags(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for key in original:
+            candidate = copy.deepcopy(original)
+            del candidate[key]
+            self.reject_harness(candidate)
+        for key, value in (("schema", "previous-version"), ("status", "failed"),
+                ("stage", "pipeline"), ("code", "fixture_failed"), ("unexpected", 1)):
+            self.reject_harness({**original, key: value})
+        for key in self.sources[0].NONCLAIMS:
+            for value in (True, 0, None):
+                self.reject_harness({**original, key: value})
+
+    def test_cleanup_roles_cannot_be_dropped_swapped_duplicated_or_extended(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        cleanups = original["workspace_cleanup"]
+        variants = [{}, {"generator": cleanups["generator"]},
+            {"importer": cleanups["importer"]},
+            {"generator": cleanups["importer"], "importer": cleanups["generator"]},
+            {"generator": cleanups["generator"], "importer": cleanups["generator"]},
+            {**cleanups, "other": cleanups["generator"]}]
+        for variant in variants:
+            self.reject_harness({**original, "workspace_cleanup": variant})
+
+    def test_each_workspace_receipt_is_closed_and_has_no_cleanup_overclaim(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for role in ("generator", "importer"):
+            for key, value in original["workspace_cleanup"][role].items():
+                candidate = copy.deepcopy(original)
+                del candidate["workspace_cleanup"][role][key]
+                self.reject_harness(candidate)
+                if type(value) is bool:
+                    candidate = copy.deepcopy(original)
+                    candidate["workspace_cleanup"][role][key] = not value
+                    self.reject_harness(candidate)
+            for key, value in (("status", "failed"), ("schema", "other"),
+                    ("source_payload_bytes_read", 1), ("private_name", "opaque")):
+                candidate = copy.deepcopy(original)
+                candidate["workspace_cleanup"][role][key] = value
+                self.reject_harness(candidate)
+
+    def test_workspace_counters_are_strict_and_consistent(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        values = [("census_nodes", 512 + 1), ("removed_files", 512),
+            ("removed_directories", 513), ("declared_file_bytes", 16777217),
+            ("kernel_metadata_read_calls", 4097), ("kernel_metadata_bytes_read", 4202497),
+            ("directory_entries_observed", 1025), ("census_nodes", 2),
+            ("directory_entries_observed", 3), ("kernel_metadata_bytes_read", 20 * 1026 + 1)]
+        values += [(key, True) for key, value in original["workspace_cleanup"]["importer"].items()
+                   if type(value) is int]
+        for key, value in values:
+            candidate = copy.deepcopy(original)
+            candidate["workspace_cleanup"]["importer"][key] = value
+            self.reject_harness(candidate)
+
+    def test_pipeline_requires_one_generation_then_one_import_completion(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for key, value in (("generation_guard_launches", 0), ("generation_guard_launches", 2),
+                ("import_guard_launches", 0), ("import_guard_launches", True),
+                ("owned_cgroups_empty_and_removed", 1), ("status", "passed"),
+                ("synthetic_only", False), ("cleanup_required_on_success_and_failure", False)):
+            candidate = copy.deepcopy(original)
+            candidate["pipeline"][key] = value
+            self.reject_harness(candidate)
+
+    def test_pipeline_closed_schema_false_flags_and_hashes(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for key, value in original["pipeline"].items():
+            candidate = copy.deepcopy(original)
+            del candidate["pipeline"][key]
+            self.reject_harness(candidate)
+            if value is False:
+                candidate = copy.deepcopy(original)
+                candidate["pipeline"][key] = True
+                self.reject_harness(candidate)
+        for key, value in (("schema", "other"), ("private_packet", "opaque"),
+                ("generation_nonce_sha256", "0" * 64), ("generator_receipt_sha256", "A" * 64),
+                ("import_receipt_sha256", "a" * 63), ("control_sha256", None),
+                ("generated_input_files", True), ("generated_input_bytes", True),
+                ("generated_input_files", 33), ("generated_input_bytes", 4194305)):
+            candidate = copy.deepcopy(original)
+            candidate["pipeline"][key] = value
+            self.reject_harness(candidate)
+
+    def test_two_extractions_required_with_frozen_closed_schemas(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        tree = original["extractions"][0]
+        for value in ([], [tree], [tree, tree, tree], {"generator": tree, "importer": tree}):
+            self.reject_harness({**original, "extractions": value})
+        for index in (0, 1):
+            for key, value in tree.items():
+                candidate = copy.deepcopy(original)
+                del candidate["extractions"][index][key]
+                self.reject_harness(candidate)
+                if type(value) is bool:
+                    candidate = copy.deepcopy(original)
+                    candidate["extractions"][index][key] = not value
+                    self.reject_harness(candidate)
+            for key, value in (("schema", "other"), ("unknown", 1),
+                    ("archive_bytes", original["export_bytes"] + 1)):
+                candidate = copy.deepcopy(original)
+                candidate["extractions"][index][key] = value
+                self.reject_harness(candidate)
+
+    def test_extraction_cross_field_consistency_checks_cannot_be_bypassed(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for key, value in (("archive_entries", 101), ("installed_files", 140),
+                ("metadata_bytes", original["export_bytes"] + 1),
+                ("content_bytes", 2999), ("hardlinks", 100)):
+            candidate = copy.deepcopy(original)
+            candidate["extractions"][0][key] = value
+            self.reject_harness(candidate)
+        for key, value in original["extractions"][0].items():
+            if type(value) is int:
+                candidate = copy.deepcopy(original)
+                candidate["extractions"][1][key] = True
+                self.reject_harness(candidate)
+
+    def test_harness_cleanup_inventory_and_no_container_launch_counters(self):
+        original = copy.deepcopy(self.native["harness_report"])
+        for key, value in (("private_owned_cleanup_verified", False), ("descendants_reaped", 1),
+                ("software_roots_extracted", 1), ("software_roots_extracted", True),
+                ("docker_containers_started", 1), ("docker_containers_started", False),
+                ("images_built", 1), ("images_built", False), ("export_bytes", 2**32)):
+            self.reject_harness({**original, key: value})
+        for value in ({}, {"owned_container_absent": True},
+                {"owned_container_absent": True, "owned_image_absent": False},
+                {"owned_container_absent": True, "owned_image_absent": True, "extra": True}):
+            self.reject_harness({**original, "cleanup_inventory": value})
+
+    def test_failed_harness_is_not_accepted_inside_successful_outer_receipt(self):
+        h = self.sources[0]
+        failed = {"schema": h.SCHEMA, "status": "failed", "stage": "pipeline",
+                  "code": "pipeline_rejected", **dict.fromkeys(h.NONCLAIMS, False)}
+        self.reject_harness(failed)
+
+    def test_noncanonical_duplicate_float_nonfinite_and_oversized_json_rejected(self):
+        for raw in (b'{"x":1,"x":2}\n', b'{"x": 1}\n', b'{"x":1.5}\n',
+                    b'{"x":NaN}\n', b'[]\n', b'{}\n{}\n', b"x" * (subject.MAXIMUM + 1)):
+            with self.assertRaises(subject.VerificationError):
+                subject.decode(raw)
+        value = copy.deepcopy(self.native["harness_report"])
+        value["pipeline"]["private_packet"] = "/private/sensitive-body"
+        self.reject_harness(value)
+
+    def test_generated_files_verify_and_exclusive_result_preserves_prior_bytes(self):
+        with tempfile.TemporaryDirectory(
+                prefix="lumi-generated-prepared-verification-") as temporary:
+            root = Path(temporary).resolve()
+            output = root / subject.OUTPUT
+            output.mkdir(parents=True, mode=0o700)
+            for name, value in zip(subject.FILES, (self.acq, self.native, self.retired),
+                                   strict=True):
+                path = output / name
+                path.write_bytes(subject.canonical(value))
+                path.chmod(0o600)
+            with patch.object(subject, "ROOT", root), \
+                    patch.object(subject, "load_sources", return_value=self.sources):
+                result = subject.verify_receipts()
+                subject.write_verification(result)
+                path = output / "aggregate-verification.json"
+                before = path.read_bytes()
+                self.assertEqual(before, subject.canonical(result))
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                with self.assertRaises(FileExistsError):
+                    subject.write_verification(result)
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_symlink_hardlink_oversize_and_group_writable_read_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="lumi-generated-prepared-read-") as temporary:
+            root = Path(temporary).resolve()
+            path = root / "aggregate.json"
+            path.write_bytes(b"{}\n")
+            link = root / "link"
+            link.symlink_to(path)
+            with self.assertRaises(subject.VerificationError):
+                subject.read(link, subject.MAXIMUM)
+            with self.assertRaises(subject.VerificationError):
+                subject.read(path, 2)
+            path.chmod(0o666)
+            with self.assertRaises(subject.VerificationError):
+                subject.read(path, subject.MAXIMUM)
+            path.chmod(0o600)
+            os.link(path, root / "hardlink")
+            with self.assertRaises(subject.VerificationError):
+                subject.read(path, subject.MAXIMUM)
+
+    def test_verification_write_rejects_nonprivate_parent_before_creation(self):
+        with tempfile.TemporaryDirectory(prefix="lumi-generated-prepared-parent-") as temporary:
+            root = Path(temporary).resolve()
+            output = root / subject.OUTPUT
+            output.mkdir(parents=True)
+            output.chmod(0o755)
+            with patch.object(subject, "ROOT", root), self.assertRaises(subject.VerificationError):
+                subject.write_verification(self.invoke())
+            self.assertFalse((output / "aggregate-verification.json").exists())
+
+    def test_failed_receipt_main_keeps_only_fixed_error_and_false_authority_flags(self):
+        output = types.SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(subject.sys, "argv", ["verify", "--verify-receipts"]), \
+                patch.object(subject.sys, "stdout", output), \
+                patch.object(subject, "verify_receipts", side_effect=ValueError("private value")), \
+                patch.object(subject, "write_verification") as write:
+            self.assertEqual(subject.main(), 2)
+        write.assert_called_once()
+        self.assertNotIn(b"private value", output.buffer.getvalue())
+        self.assertEqual(subject.decode(output.buffer.getvalue()), {
+            "schema": subject.SCHEMA, "status": "failed", "code": "qualification_rejected",
+            **dict.fromkeys(subject.FALSE_FLAGS, False)})
+
+    def test_verification_write_failure_does_not_emit_success_or_retry(self):
+        output = types.SimpleNamespace(buffer=io.BytesIO())
+        result = self.invoke()
+        with patch.object(subject.sys, "argv", ["verify", "--verify-receipts"]), \
+                patch.object(subject.sys, "stdout", output), \
+                patch.object(subject, "verify_receipts", return_value=result), \
+                patch.object(subject, "write_verification", side_effect=FileExistsError) as write:
+            self.assertEqual(subject.main(), 2)
+        write.assert_called_once_with(result)
+        self.assertEqual(subject.decode(output.buffer.getvalue()), {
+            "schema": subject.SCHEMA, "status": "failed", "code": "verification_write_rejected",
+            **dict.fromkeys(subject.FALSE_FLAGS, False)})
+
+    def test_source_only_main_does_not_claim_native_qualification_or_write_receipt(self):
+        output = types.SimpleNamespace(buffer=io.BytesIO())
+        with patch.object(subject.sys, "argv", ["verify", "--check-source"]), \
+                patch.object(subject.sys, "stdout", output), \
+                patch.object(subject, "load_sources", return_value=self.sources) as load, \
+                patch.object(subject, "write_verification") as write:
+            self.assertEqual(subject.main(), 0)
+        load.assert_called_once()
+        write.assert_not_called()
+        self.assertEqual(subject.decode(output.buffer.getvalue()), {
+            "schema": subject.SCHEMA, "status": "passed", "code": "source_bindings_only",
+            "source_files_verified": 78, **dict.fromkeys(subject.FALSE_FLAGS, False)})
+
+
+if __name__ == "__main__":
+    unittest.main()

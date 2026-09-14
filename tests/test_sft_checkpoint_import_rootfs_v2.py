@@ -1,0 +1,498 @@
+"""Composed frozen helpers with syscall doubles only; no native Linux execution."""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import os
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_import_rootfs_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+mount = importlib.import_module(PACKAGE + ".posttraining_checkpoint_import_rootfs_v2")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+PARENT = "/tmp/lumi-private-" + "a" * 32
+PRIVATE = "synthetic-private-error-never-retained"
+
+
+def metadata(inode, mode, uid=0, size=0, rdev=0):
+    return types.SimpleNamespace(st_dev=9, st_ino=inode, st_mode=mode, st_uid=uid,
+                                 st_gid=uid, st_nlink=1, st_size=size, st_rdev=rdev,
+                                 st_mtime_ns=12, st_ctime_ns=13)
+
+
+def identity(value):
+    return tuple(getattr(value, "st_" + name) for name in
+                 ("dev", "ino", "mode", "uid", "gid", "nlink", "size", "mtime_ns", "ctime_ns"))
+
+
+class Entries:
+    def __init__(self, names):
+        self.names = names
+
+    def __enter__(self):
+        return iter(types.SimpleNamespace(name=name) for name in self.names)
+
+    def __exit__(self, *_arguments):
+        return False
+
+
+class ImportRootfsTests(unittest.TestCase):
+    def setUp(self):
+        for module in (mount, mount.input_mount):
+            self.enterContext(patch.object(module, "_ATTEMPT_OWNER", None))
+            self.enterContext(patch.object(
+                module, "sys", types.SimpleNamespace(version_info=(3, 12)),
+            ))
+        self.runtime = self.enterContext(patch.object(mount.netns, "_runtime"))
+        self.options = {name + "_path": PARENT + "/" + name
+                        for name in ("rootfs", "mountpoint", "checkpoint", "tokenizer", "output")}
+        self.options["inventories"] = {"checkpoint": {"weights.bin": 19},
+                                       "tokenizer": {"tokenizer/tokenizer.json": 7}}
+        self.rootfs, self.mountpoint = self.options["rootfs_path"], self.options["mountpoint_path"]
+        self.nodes, self.fds, self.bindings, self.flags, self.capacities = {}, {}, {}, {}, {}
+        self.events, self.pins, self.closed = [], [], []
+        self.next_fd, self.next_inode, self.generation, self.pivoted = 20, 100, 0, False
+        paths = {
+            "parent": PARENT, "checkpoint": self.options["checkpoint_path"],
+            "tokenizer": self.options["tokenizer_path"], "output": self.options["output_path"],
+            "root": self.rootfs, "inputs": self.rootfs + "/inputs",
+            "target_checkpoint": self.rootfs + "/inputs/checkpoint",
+            "target_tokenizer": self.rootfs + "/inputs/tokenizer",
+            "target_output": self.rootfs + "/outputs",
+        }
+        for index, (role, path) in enumerate(paths.items(), 1):
+            self.nodes[path] = metadata(index, stat.S_IFDIR | (
+                0o755 if role in {"root", "inputs"} else 0o700),
+                uid=10001 if role in {"checkpoint", "tokenizer", "output"} else 0)
+        self.nodes[self.mountpoint] = metadata(10, stat.S_IFDIR | 0o700)
+        self.options["expected_identities"] = {role: identity(self.nodes[path])
+                                                for role, path in paths.items()}
+        self.options["expected_mountpoint_identity"] = identity(self.nodes[self.mountpoint])
+        self.paths = paths
+        for relative in mount.oci.REQUIRED_DIRECTORIES:
+            self.add(self.rootfs + "/" + relative,
+                     stat.S_IFDIR | (0o1777 if relative == "tmp" else 0o755))
+        self.add(self.rootfs + "/usr/local/bin/python3.12", stat.S_IFREG | 0o755)
+        self.add(paths["checkpoint"] + "/weights.bin", stat.S_IFREG | 0o600, 10001, 19)
+        self.add(paths["tokenizer"] + "/tokenizer", stat.S_IFDIR | 0o700, 10001)
+        self.add(paths["tokenizer"] + "/tokenizer/tokenizer.json", stat.S_IFREG | 0o600, 10001, 7)
+        self.os = types.SimpleNamespace(
+            **{name: getattr(os, name) for name in (
+                "O_RDONLY", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK")},
+            getpid=Mock(return_value=4000), open=Mock(side_effect=self.open),
+            fstat=Mock(side_effect=lambda fd: self.nodes[self.fds[fd].resolved]),
+            close=Mock(side_effect=self.close), listdir=Mock(side_effect=self.names),
+            scandir=Mock(side_effect=lambda fd: Entries(self.names(fd))),
+            fchdir=Mock(side_effect=self.fchdir), mknod=Mock(side_effect=self.mknod),
+            chmod=Mock(side_effect=self.chmod), mkdir=Mock(side_effect=self.mkdir),
+            symlink=Mock(),
+            stat=Mock(side_effect=lambda path, **_kw: self.nodes[self.resolve(path)]),
+            makedev=os.makedev, major=os.major, minor=os.minor,
+        )
+        for module in (mount, mount.input_mount, mount.oci):
+            self.enterContext(patch.object(module, "os", self.os))
+        self.pin = self.enterContext(patch.object(mount.oci, "_pin", side_effect=self.pin_path))
+        self.enterContext(patch.object(mount.input_mount, "_pin", side_effect=self.pin_path))
+        self.enterContext(patch.object(mount.mount_root, "_pin",
+                                      side_effect=lambda path, *, directory, owned:
+                                      self.pin_path(path, owned)))
+        self.enterContext(patch.object(mount.input_mount.fcntl, "fcntl",
+                                      return_value=mount.input_mount.fcntl.FD_CLOEXEC))
+        self.enterContext(patch.object(
+            mount.mount_root, "_source_identity",
+            side_effect=lambda fd: identity(self.nodes[self.fds[fd].resolved])[:5],
+        ))
+        self.enterContext(patch.object(
+            mount.mount_root, "_open_namespace", side_effect=self.namespace,
+        ))
+        self.namespace_identity = self.enterContext(patch.object(
+            mount.mount_root, "_namespace_identity",
+            side_effect=lambda fd: (10, self.fds[fd].generation),
+        ))
+        self.unshare = self.enterContext(patch.object(
+            mount.mount_root, "_unshare", side_effect=self.unshare_call,
+        ))
+        self.mount_call = self.enterContext(patch.object(
+            mount.mount_root, "_mount", side_effect=self.mounting,
+        ))
+        self.seal = self.enterContext(patch.object(
+            mount.mount_root, "_seal", side_effect=self.sealing,
+        ))
+        self.readback = self.enterContext(patch.object(
+            mount.mount_root, "_readback", side_effect=self.view,
+        ))
+        self.enterContext(patch.object(mount.mount_root, "_filesystem"))
+        self.pivot = self.enterContext(patch.object(
+            mount.oci, "_pivot", side_effect=self.pivot_call,
+        ))
+        self.native = self.enterContext(patch.object(
+            mount.mount_root.ctypes, "CDLL", side_effect=AssertionError("no_native_execution"),
+        ))
+
+    def tearDown(self):
+        self.assertFalse(mount._SETUP_LOCK.locked())
+        self.assertFalse(mount.input_mount._SETUP_LOCK.locked())
+        self.assertEqual(len(self.closed), len(set(self.closed)))
+        self.native.assert_not_called()
+
+    def add(self, path, mode, uid=0, size=0, rdev=0):
+        self.next_inode += 1
+        self.nodes[path] = metadata(self.next_inode, mode, uid, size, rdev)
+
+    def logical(self, path):
+        if path.startswith("/proc/self/fd/"):
+            return self.fds[int(path.rpartition("/")[2])].logical
+        if self.pivoted:
+            return self.mountpoint + ("" if path == "/" else path)
+        return path
+
+    def resolve(self, path):
+        logical = self.logical(path)
+        for target in sorted(self.bindings, key=len, reverse=True):
+            if logical == target or logical.startswith(target + "/"):
+                return self.bindings[target] + logical[len(target):]
+        return logical
+
+    def allocate(self, logical, resolved=None):
+        descriptor, self.next_fd = self.next_fd, self.next_fd + 1
+        self.fds[descriptor] = types.SimpleNamespace(logical=logical,
+                                                     resolved=resolved or self.resolve(logical),
+                                                     generation=self.generation)
+        return descriptor
+
+    def pin_path(self, path, owned):
+        logical = self.logical(path)
+        descriptor = self.allocate(logical, self.resolve(path))
+        self.assertIn(self.fds[descriptor].resolved, self.nodes)
+        owned.append(descriptor)
+        self.pins.append((path, descriptor, self.generation))
+        return descriptor
+
+    def open(self, path, flags, *, dir_fd=None):
+        if path.startswith("/proc/self/fd/"):
+            self.assertEqual(flags, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NONBLOCK)
+            source = self.fds[int(path.rpartition("/")[2])]
+            return self.allocate(source.logical, source.resolved)
+        self.assertTrue(flags & mount.mount_root.O_PATH)
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertTrue(flags & os.O_CLOEXEC)
+        source = self.fds[dir_fd]
+        return self.allocate(source.logical + "/" + path, source.resolved + "/" + path)
+
+    def close(self, descriptor):
+        self.closed.append(descriptor)
+        del self.fds[descriptor]
+
+    def names(self, descriptor):
+        prefix = self.fds[descriptor].resolved + "/"
+        return sorted({name[len(prefix):].split("/", 1)[0]
+                       for name in self.nodes if name.startswith(prefix)})
+
+    def namespace(self, owned):
+        descriptor = self.allocate("namespace", "namespace")
+        owned.append(descriptor)
+        return descriptor
+
+    def unshare_call(self):
+        self.generation += 1
+        self.events.append(("unshare", self.generation))
+
+    def mounting(self, source, target, filesystem, flags, data=None, **kwargs):
+        self.events.append(("mount", source, target, flags))
+        if flags & mount.mount_root.MS_BIND:
+            self.assertEqual(flags, mount.mount_root.MS_BIND)
+            source_fd, target_fd = [int(value.rpartition("/")[2]) for value in (source, target)]
+            first, second = self.fds[source_fd], self.fds[target_fd]
+            self.assertEqual(first.generation, self.generation)
+            self.assertEqual(second.generation, self.generation)
+            self.assertEqual(kwargs, {"failure_code": "bind_mount_failed"})
+            self.bindings[second.logical] = first.resolved
+            self.flags[second.logical] = 0
+        elif filesystem in {"tmpfs", "proc"}:
+            fields = dict(item.split("=", 1) for item in data.split(","))
+            mode, uid = int(fields.get("mode", "0755"), 8), int(fields.get("uid", "0"))
+            storage = "overlay:" + target
+            self.add(storage, stat.S_IFDIR | mode, uid)
+            self.bindings[target], self.flags[target] = storage, flags
+            self.capacities[target] = int(fields.get("size", "0"))
+
+    def sealing(self, path, flags, *, recursive):
+        logical = self.logical(path)
+        self.events.append(("seal", logical, flags, recursive))
+        self.flags[logical] = flags
+
+    def view(self, path, required, forbidden=0):
+        logical = self.logical(path)
+        self.events.append(("readback", logical, required, forbidden, self.pivoted))
+        target = next(key for key in sorted(self.flags, key=len, reverse=True)
+                      if logical == key or logical.startswith(key + "/"))
+        flags = self.flags[target]
+        if flags & required != required or flags & forbidden:
+            raise mount.mount_root.MountRootError("readback_failed")
+        return types.SimpleNamespace(f_flag=flags, f_frsize=4096,
+                                     f_blocks=self.capacities.get(target, 0) // 4096)
+
+    def mknod(self, path, mode, rdev):
+        self.assertTrue(path.startswith(self.mountpoint + "/dev/"))
+        self.add(self.resolve(path), mode, rdev=rdev)
+
+    def chmod(self, path, mode):
+        self.assertTrue(path.startswith(self.mountpoint + "/dev/"))
+        node = self.nodes[self.resolve(path)]
+        node.st_mode = stat.S_IFMT(node.st_mode) | mode
+
+    def mkdir(self, path, mode):
+        self.assertEqual(path, self.mountpoint + "/dev/shm")
+        self.add(self.resolve(path), stat.S_IFDIR | mode)
+
+    def fchdir(self, descriptor):
+        self.assertEqual(self.fds[descriptor].logical, self.mountpoint)
+        self.assertEqual(self.fds[descriptor].generation, 2)
+        self.events.append(("fchdir", descriptor))
+
+    def pivot_call(self):
+        self.pivoted = True
+        self.events.append(("pivot",))
+
+    def run_setup(self, **changes):
+        return mount.enter_import_rootfs(**(self.options | changes))
+
+    def error(self, code, **changes):
+        with self.assertRaises(mount.ImportRootfsError) as caught:
+            self.run_setup(**changes)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_composed_success_no_authority_or_content_claims_and_closed_fds(self):
+        result = self.run_setup()
+        self.assertEqual(result["schema"], mount.SCHEMA)
+        for name in ("readonly_software_root", "input_output_mounts_survive_pivot",
+                     "old_root_detached", "private_tmpfs", "private_shm_tmpfs", "fresh_procfs"):
+            self.assertIs(result[name], True)
+        for name in ("source_metadata_mutated", "host_software_binds", "host_mounts_modified",
+                     "rootfs_content_authenticated", "input_content_authenticated",
+                     "other_writable_aliases_excluded", "source_immutability_verified",
+                     "ambient_descriptors_closed", "resource_limits_verified",
+                     "complete_os_sandbox_verified", "worker_dispatched",
+                     "real_import_execution_permitted", "training_authorized",
+                     "production_eligible"):
+            self.assertIs(result[name], False)
+        self.assertEqual(result["source_payload_bytes_read"], 0)
+        self.assertEqual(result["input_mount_receipt"]["declared_metadata_files_verified"], 2)
+        self.assertEqual(self.fds, {})
+
+    def test_root_first_four_binds_only_and_no_bind_after_inputs(self):
+        self.run_setup()
+        binds = [event for event in self.events if event[0] == "mount" and event[3] == 4096]
+        self.assertEqual(len(binds), 4)
+        seals = [event for event in self.events if event[0] == "seal"]
+        self.assertEqual([event[2:] for event in seals],
+                         [(7, False), (15, True), (15, True), (14, True), (11, False), (15, False)])
+        self.assertLess(self.events.index(seals[0]), self.events.index(("unshare", 2)))
+        self.assertLess(self.events.index(binds[-1]), self.events.index(("pivot",)))
+        self.assertEqual(self.bindings[self.mountpoint + "/outputs"], self.options["output_path"])
+
+    def test_all_three_targets_keep_source_identities_after_pivot(self):
+        self.run_setup()
+        for role, path in (("checkpoint", "/inputs/checkpoint"),
+                           ("tokenizer", "/inputs/tokenizer"), ("output", "/outputs")):
+            self.assertEqual(identity(self.nodes[self.resolve(path)]),
+                             self.options["expected_identities"][role])
+            self.assertTrue(any(pin[0] == path and pin[2] == 2 for pin in self.pins))
+
+    def test_root_readonly_output_writable_and_all_input_flags_checked_after_pivot(self):
+        self.run_setup()
+        self.assertEqual(self.flags[self.mountpoint], 7)
+        self.assertEqual(self.flags[self.mountpoint + "/outputs"], 14)
+        checks = [event for event in self.events if event[0] == "readback" and event[-1]]
+        self.assertIn(("readback", self.mountpoint + "/outputs", 14, 1, True), checks)
+        self.assertEqual(sum(event[2] == 15 and "/inputs/" in event[1] for event in checks), 7)
+
+    def test_overlays_and_oci_readback_preserved(self):
+        self.run_setup()
+        self.assertEqual(self.os.mknod.call_count, 4)
+        self.assertEqual(self.os.symlink.call_count, 4)
+        self.assertEqual(self.capacities[self.mountpoint + "/tmp"], 536870912)
+        self.assertEqual(self.capacities[self.mountpoint + "/dev/shm"], 67108864)
+        self.assertIn(("readback", self.mountpoint + "/proc", 15, 0, True), self.events)
+
+    def test_final_namespace_fd_used_for_pivot_and_earlier_root_pins_closed(self):
+        self.run_setup()
+        index = self.events.index(("pivot",))
+        self.assertEqual(self.events[index - 1][0], "fchdir")
+        self.assertTrue(all(fd in self.closed for _path, fd, generation in self.pins
+                            if generation < 2))
+
+    def test_invalid_siblings_aliases_identity_shapes_and_limits_before_runtime(self):
+        for changes in ({"rootfs_path": self.options["checkpoint_path"]},
+                        {"mountpoint_path": "/other/mountpoint"},
+                        {"expected_mountpoint_identity": ()}, {"scratch_bytes": True},
+                        {"scratch_bytes": 536870913}, {"shm_bytes": 0}):
+            self.error("input_rejected", **changes)
+        self.error("alias_rejected",
+                   expected_mountpoint_identity=self.options["expected_identities"]["output"])
+        self.runtime.assert_not_called()
+        self.pin.assert_not_called()
+
+    def test_pure_argument_validator_copies_each_mapping_and_has_no_side_effects(self):
+        value = mount.validate_arguments(**self.options)
+        self.assertEqual(value, self.options | {"scratch_bytes": 536870912, "shm_bytes": 67108864})
+        value["expected_identities"].clear()
+        value["inventories"]["checkpoint"].clear()
+        self.assertEqual(len(self.options["expected_identities"]), 9)
+        self.assertEqual(self.options["inventories"]["checkpoint"], {"weights.bin": 19})
+        self.runtime.assert_not_called()
+        self.pin.assert_not_called()
+        self.assertIsNone(mount._ATTEMPT_OWNER)
+
+    def test_pure_argument_validator_redacts_invalid_input_without_consuming_attempt(self):
+        with self.assertRaises(mount.ImportRootfsError) as caught:
+            mount.validate_arguments(**(self.options | {"rootfs_path": PRIVATE}))
+        self.assertEqual(caught.exception.args, ("input_rejected",))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.runtime.assert_not_called()
+        self.pin.assert_not_called()
+        self.assertIsNone(mount._ATTEMPT_OWNER)
+
+    def test_pure_validator_preserves_nine_item_identity_and_accepts_no_approval(self):
+        value = mount.validate_arguments(**self.options)
+        self.assertEqual(value["expected_identities"]["root"], identity(self.nodes[self.rootfs]))
+        self.assertEqual(len(value["expected_identities"]["root"]), 9)
+        with self.assertRaises(TypeError):
+            mount.validate_arguments(**self.options, approved=True)
+        self.runtime.assert_not_called()
+
+    def test_wrong_runtime_rejected_before_metadata_and_not_consumed(self):
+        mount.sys.version_info = (3, 13)
+        self.error("runtime_rejected")
+        self.pin.assert_not_called()
+        mount.sys.version_info = (3, 12)
+        self.run_setup()
+
+    def test_exact_parent_mode_and_owner_rejected_before_namespace(self):
+        self.nodes[PARENT].st_mode = stat.S_IFDIR | 0o755
+        self.options["expected_identities"]["parent"] = identity(self.nodes[PARENT])
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+        self.error("already_attempted")
+
+    def test_mountpoint_identity_mismatch_before_namespace(self):
+        self.nodes[self.mountpoint].st_ino += 1
+        self.error("identity_rejected")
+        self.unshare.assert_not_called()
+
+    def test_mountpoint_nonempty_rejected(self):
+        self.add(self.mountpoint + "/unexpected", stat.S_IFREG | 0o600)
+        self.error("root_rejected")
+        self.unshare.assert_not_called()
+
+    def test_worker_file_permissions_rejected_without_fixing_source(self):
+        self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_mode = stat.S_IFREG | 0o400
+        self.error("layout_rejected")
+        self.os.chmod.assert_not_called()
+        self.pivot.assert_not_called()
+
+    def test_prepared_target_mode_not_silently_changed(self):
+        target = self.paths["target_output"]
+        self.nodes[target].st_mode = stat.S_IFDIR | 0o755
+        self.options["expected_identities"]["target_output"] = identity(self.nodes[target])
+        self.error("layout_rejected")
+        self.os.chmod.assert_not_called()
+
+    def test_final_target_identity_loss_is_terminal(self):
+        original = self.pivot.side_effect
+
+        def lose_output():
+            original()
+            self.bindings.pop(self.mountpoint + "/outputs")
+
+        self.pivot.side_effect = lose_output
+        self.error("identity_rejected")
+        self.error("already_attempted")
+        self.assertEqual(self.fds, {})
+
+    def test_readonly_output_regression_rejected(self):
+        original = self.pivot.side_effect
+
+        def readonly_output():
+            original()
+            self.flags[self.mountpoint + "/outputs"] = 15
+
+        self.pivot.side_effect = readonly_output
+        self.error("readback_failed")
+
+    def test_root_readonly_loss_rejected_after_pivot(self):
+        original = self.pivot.side_effect
+
+        def writable_root():
+            original()
+            self.flags[self.mountpoint] = 6
+
+        self.pivot.side_effect = writable_root
+        self.error("readback_failed")
+
+    def test_unknown_error_redacted_and_no_retry_after_started_mount(self):
+        self.pivot.side_effect = OSError(PRIVATE)
+        self.error("setup_failed")
+        self.error("already_attempted")
+        self.assertEqual(self.fds, {})
+
+    def test_close_failure_not_retried(self):
+        original = self.os.close.side_effect
+
+        def fail_once(descriptor):
+            original(descriptor)
+            if len(self.closed) == 1:
+                raise OSError(PRIVATE)
+
+        self.os.close.side_effect = fail_once
+        self.error("close_failed")
+        self.assertEqual(self.fds, {})
+
+    def test_same_owner_changed_owner_and_lock_reentry(self):
+        self.run_setup()
+        self.error("already_attempted")
+        self.os.getpid.return_value = 4001
+        self.error("owner_mismatch")
+        self.assertTrue(mount._SETUP_LOCK.acquire(blocking=False))
+        try:
+            self.error("reentry")
+        finally:
+            mount._SETUP_LOCK.release()
+
+    def test_second_namespace_must_change(self):
+        original = self.unshare.side_effect
+
+        def only_first():
+            if not self.generation:
+                original()
+
+        self.unshare.side_effect = only_first
+        self.error("namespace_unchanged")
+        self.pivot.assert_not_called()
+
+    def test_source_contains_no_source_mutators_payload_reads_or_worker_dispatch(self):
+        tree = ast.parse(Path(mount.__file__).read_text())
+        forbidden = {"read", "read_bytes", "write", "write_bytes", "chmod", "chown", "mkdir",
+                     "unlink", "rename", "replace", "rmdir", "execve", "fork", "enter_oci_rootfs"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotIn(node.func.attr, forbidden)
+        self.assertFalse(any(name.split(".", 1)[0] in mount.netns.ML_ROOTS
+                             for name in IMPORT_ADDITIONS))
+
+
+if __name__ == "__main__":
+    unittest.main()
+

@@ -1,0 +1,381 @@
+"""Pure bootstrap doubles: no native Linux function, descriptor or ML executes."""
+
+from __future__ import annotations
+
+import errno
+import importlib
+import json
+import os
+import socket
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_generator_bootstrap_v1_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+module = importlib.import_module(PACKAGE + ".posttraining_checkpoint_generator_bootstrap_v1")
+
+
+class _Exited(BaseException):
+    def __init__(self, code):
+        self.code = code
+
+
+class _Channel:
+    family = socket.AF_UNIX
+
+    def __init__(self, fixture):
+        self.fixture = fixture
+        self.packet = (b"G", [], 0, None)
+        self.messages = []
+
+    def fileno(self):
+        return 8
+
+    def getsockopt(self, *_args):
+        return socket.SOCK_SEQPACKET
+
+    def gettimeout(self):
+        return None
+
+    def send(self, raw):
+        if 8 not in self.fixture.fds:
+            raise OSError(errno.EBADF, "PRIVATE FD TEXT")
+        self.messages.append(raw)
+        self.fixture.calls.append("send:" + json.loads(raw)["phase"])
+        return len(raw)
+
+    def recvmsg(self, size, capacity):
+        self.fixture.calls.append("recvmsg")
+        self.fixture.received_limits = size, capacity
+        return self.packet
+
+
+class _Doubles:
+    def __init__(self):
+        self.calls, self.fds = [], {0, 1, 2, 7, 8, 9}
+        self.uid, self.gid, self.groups = (0, 0, 0), (0, 0, 0), [0]
+        self.channel = _Channel(self)
+        self.executed = None
+        self.environment = dict(module.FIXED_ENV) | {key: "a" * 64 for key in module.HASH_ENV}
+        self.arguments = {"rootfs_path": "/private/work/rootfs",
+                          "mountpoint_path": "/private/work/mount",
+                          "root_identity": (1, 2, stat.S_IFDIR, 0, 0),
+                          "environment": self.environment}
+        self.os = types.SimpleNamespace(
+            O_RDWR=os.O_RDWR, O_CLOEXEC=os.O_CLOEXEC, O_NOFOLLOW=os.O_NOFOLLOW,
+            open=self.open, fstat=self.fstat, dup2=self.dup2, close=self.close,
+            listdir=lambda path: [str(fd) for fd in sorted(self.fds)],
+            major=os.major, minor=os.minor, getresuid=lambda: self.uid,
+            getresgid=lambda: self.gid, getgroups=lambda: self.groups,
+            chdir=lambda path: self.calls.append("chdir:" + path), execve=self.execve,
+            _exit=self.exit,
+        )
+
+    def open(self, path, flags):
+        self.calls.append("open:" + path)
+        self.fds.add(30)
+        return 30
+
+    def fstat(self, fd):
+        if fd not in self.fds:
+            raise OSError(errno.EBADF, "PRIVATE FD TEXT")
+        return types.SimpleNamespace(st_mode=stat.S_IFCHR | 0o666, st_rdev=os.makedev(1, 3))
+
+    def dup2(self, source, target):
+        self.calls.append(f"dup2:{source}:{target}")
+        self.fds.add(target)
+        return target
+
+    def close(self, fd):
+        self.calls.append("close:" + str(fd))
+        self.fds.remove(fd)
+
+    def drop(self, uid, gid):
+        self.calls.append("drop")
+        self.uid, self.gid, self.groups = (uid,) * 3, (gid,) * 3, []
+
+    def execve(self, runtime, argv, environment):
+        self.calls.append("exec")
+        self.executed = runtime, argv, environment
+        # Native exec never returns; this impossible return must fail closed.
+
+    def exit(self, code):
+        self.calls.append("exit:" + str(code))
+        raise _Exited(code)
+
+    def replacements(self):
+        def event(name, result):
+            def called(*_args, **_kwargs):
+                self.calls.append(name)
+                return result
+            return called
+        return {
+            "_runtime": lambda: None, "_ATTEMPTED": False, "os": self.os,
+            "socket": types.SimpleNamespace(socket=_Channel, AF_UNIX=socket.AF_UNIX,
+                                             SOL_SOCKET=socket.SOL_SOCKET,
+                                             SO_TYPE=socket.SO_TYPE,
+                                             SOCK_SEQPACKET=socket.SOCK_SEQPACKET),
+            "select": types.SimpleNamespace(select=lambda *_args: (
+                [self.channel] if _args[-1] else [], [], [])),
+            "cgroup": types.SimpleNamespace(enter_current_process=event("attach", None)),
+            "netns": types.SimpleNamespace(create_loopback_namespace=event(
+                "network", {"namespace_changed": True, "only_loopback_interface": True})),
+            "mount": types.SimpleNamespace(enter_oci_rootfs=event(
+                "mount", {"old_root_detached": True, "readonly_root": True})),
+            "landlock": types.SimpleNamespace(restrict_filesystem=event(
+                "landlock", {"filesystem_content_policy_enforced": True, "abi_version": 5})),
+            "ipc": types.SimpleNamespace(RECEIPT={"fixed": True},
+                                         install_ipc_filter=event("ipc", {"fixed": True})),
+            "resource": types.SimpleNamespace(RLIMIT_CORE=4, RLIMIT_NOFILE=7,
+                setrlimit=lambda key, values: self.calls.append(("rlimit", key, values))),
+            "guardian": types.SimpleNamespace(drop_worker_privileges=self.drop),
+        }
+
+
+class BootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = _Doubles()
+
+    def test_exact_generator_entry_environment_and_no_input_output_mount_paths(self):
+        self.assertEqual(module.ENTRY, "/opt/lumi-release/guardian/generator_entry.py")
+        self.assertEqual(module.ARGV, ("/usr/local/bin/python3.12", "-I", "-B", module.ENTRY,
+                                       "--synthetic-only"))
+        self.assertEqual(module.HASH_ENV, {"LUMI_GENERATOR_ENTRY_SHA256",
+            "LUMI_IMPORT_SOURCE_MANIFEST_SHA256", "LUMI_GENERATION_NONCE_SHA256"})
+        self.assertEqual(module.READ_ONLY_PATHS, ("/usr", "/etc", "/opt/lumi-release", "/proc"))
+        self.assertEqual(module.WRITABLE_PATHS, ("/tmp", "/dev/shm"))
+        for key in module.HASH_ENV:
+            with self.assertRaisesRegex(module.GeneratorBootstrapError, "environment_rejected"):
+                module.validate_environment(self.fixture.environment | {key: "0" * 64})
+        with self.assertRaisesRegex(module.GeneratorBootstrapError, "environment_rejected"):
+            module.validate_environment(self.fixture.environment | {"LUMI_IMPORT_ENTRY_SHA256":
+                                                                     "a" * 64})
+
+    def execute(self, **changes):
+        fixture = self.fixture
+        with patch.multiple(module, **fixture.replacements()):
+            with self.assertRaises(_Exited) as result:
+                module.bootstrap(7, fixture.channel, **{**fixture.arguments, **changes})
+            self.assertEqual(result.exception.code, 2)
+
+    def test_complete_doubled_order_and_fixed_exec_only_after_release(self):
+        self.execute()
+        fixture = self.fixture
+        ordered = [value for value in fixture.calls if value in {
+            "attach", "network", "mount", "landlock", "ipc", "drop", "send:ready",
+            "recvmsg", "exec", "exit:2"} or type(value) is tuple]
+        self.assertEqual(ordered, ["attach", "network", "mount", "landlock", "ipc",
+                                  ("rlimit", 4, (0, 0)), ("rlimit", 7, (1024, 1024)),
+                                  "drop", "send:ready", "recvmsg", "exec", "exit:2"])
+        self.assertEqual(fixture.executed, (module.RUNTIME, list(module.ARGV), fixture.environment))
+        self.assertEqual(fixture.fds, {0, 1, 2})
+        self.assertEqual(fixture.received_limits, (2, 256))
+        self.assertEqual([json.loads(raw) for raw in fixture.channel.messages], [module.READY])
+
+    def test_no_runtime_action_or_native_module_can_execute_in_tests(self):
+        self.execute()
+        self.assertFalse(any("torch" in str(item) for item in self.fixture.calls))
+
+    def test_environment_exact_copy_and_no_arbitrary_keys(self):
+        copied = module.validate_environment(self.fixture.environment)
+        self.fixture.environment["PATH"] = "PRIVATE UNEXPECTED PATH"
+        self.assertEqual(copied["PATH"], "/usr/bin:/bin")
+        for value in (copied | {"PYTHONPATH": "/private"}, copied | {"LD_PRELOAD": "anything"},
+                      copied | {"LUMI_GENERATOR_ENTRY_SHA256": "A" * 64},
+                      copied | {"HF_HUB_OFFLINE": "0"}):
+            with self.subTest(keys=sorted(value)):
+                with self.assertRaisesRegex(module.GeneratorBootstrapError, "environment_rejected"):
+                    module.validate_environment(value)
+
+    def test_invalid_environment_prevents_any_mutation(self):
+        fixture = self.fixture
+        with patch.multiple(module, **fixture.replacements()):
+            with self.assertRaisesRegex(module.GeneratorBootstrapError, "environment_rejected"):
+                module.bootstrap(7, fixture.channel, **{**fixture.arguments, "environment": {}})
+        self.assertEqual(fixture.calls, [])
+
+    def test_invalid_identity_paths_or_descriptors_prevent_mutation(self):
+        cases = ({"root_identity": (True, 2, stat.S_IFDIR, 0, 0)},
+                 {"rootfs_path": "/private/work/../rootfs"},
+                 {"mountpoint_path": "/another/mount"},
+                 {"mountpoint_path": "/private/work/rootfs"})
+        for values in cases:
+            with self.subTest(values=values), \
+                 patch.multiple(module, **self.fixture.replacements()):
+                with self.assertRaisesRegex(module.GeneratorBootstrapError, "arguments_rejected"):
+                    module.bootstrap(7, self.fixture.channel,
+                                     **{**self.fixture.arguments, **values})
+            self.assertEqual(self.fixture.calls, [])
+
+    def test_same_group_channel_fd_prevents_mutation(self):
+        with patch.multiple(module, **self.fixture.replacements()):
+            with self.assertRaisesRegex(module.GeneratorBootstrapError, "arguments_rejected"):
+                module.bootstrap(8, self.fixture.channel, **self.fixture.arguments)
+        self.assertEqual(self.fixture.calls, [])
+
+    def test_failed_namespace_stage_never_releases_or_executes(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["netns"] = types.SimpleNamespace(create_loopback_namespace=lambda: {})
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+            self.assertTrue(module._ATTEMPTED)
+            with self.assertRaisesRegex(module.GeneratorBootstrapError, "already_attempted"):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("recvmsg", fixture.calls)
+        self.assertIsNone(fixture.executed)
+        self.assertEqual(json.loads(fixture.channel.messages[-1]),
+                         {"phase": "bootstrap_failed", "stage": "network"})
+
+    def test_all_malformed_release_packets_are_terminal(self):
+        for packet in ((b"", [], 0, None), (b"GG", [], 0, None), (b"G", [], 32, None),
+                       (b"G", [(1, 1, b"PRIVATE")], 0, None), (bytearray(b"G"), [], 0, None)):
+            with self.subTest(packet_type=type(packet[0]).__name__):
+                self.fixture = _Doubles()
+                self.fixture.channel.packet = packet
+                self.execute()
+                self.assertIsNone(self.fixture.executed)
+                self.assertEqual(json.loads(self.fixture.channel.messages[-1]),
+                                 {"phase": "bootstrap_failed", "stage": "release"})
+                self.assertNotIn(b"PRIVATE", b"".join(self.fixture.channel.messages))
+
+    def test_release_timeout_does_not_call_recv_or_exec(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["select"] = types.SimpleNamespace(select=lambda *_args: ([], [], []))
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("recvmsg", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_second_queued_release_packet_is_rejected_without_reading_it(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["select"] = types.SimpleNamespace(
+            select=lambda *_args: ([fixture.channel], [], []))
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(fixture.calls.count("recvmsg"), 1)
+        self.assertIsNone(fixture.executed)
+        self.assertEqual(json.loads(fixture.channel.messages[-1])["stage"], "release")
+
+    def test_ambiguous_authority_close_is_not_retried_and_no_ready_is_sent(self):
+        fixture = self.fixture
+        original = fixture.os.close
+        def close(fd):
+            original(fd)
+            if fd == 7:
+                raise OSError("PRIVATE AMBIGUOUS CLOSE")
+        fixture.os.close = close
+        self.execute()
+        self.assertEqual(fixture.calls.count("close:7"), 1)
+        self.assertNotIn("send:ready", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_short_ready_send_prevents_release(self):
+        fixture = self.fixture
+        original = fixture.channel.send
+        def send(raw):
+            result = original(raw)
+            return result - 1
+        fixture.channel.send = send
+        self.execute()
+        self.assertNotIn("recvmsg", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_sanitize_rejects_wrong_device_before_attach(self):
+        fixture = self.fixture
+        original = fixture.os.fstat
+        def observed(fd):
+            if fd == 30:
+                return types.SimpleNamespace(st_mode=stat.S_IFREG | 0o600, st_rdev=0)
+            return original(fd)
+        fixture.os.fstat = observed
+        self.execute()
+        self.assertNotIn("attach", fixture.calls)
+        self.assertEqual(fixture.calls.count("close:30"), 1)
+        self.assertIsNone(fixture.executed)
+
+    def test_invalid_ipc_receipt_prevents_drop(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["ipc"].install_ipc_filter = lambda: {"fixed": False}
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("drop", fixture.calls)
+        self.assertIsNone(fixture.executed)
+
+    def test_landlock_uses_exact_existing_paths(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        observed = []
+        def restrict(**values):
+            observed.append(values)
+            return {"filesystem_content_policy_enforced": True, "abi_version": 5}
+        replacements["landlock"] = types.SimpleNamespace(restrict_filesystem=restrict)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(observed, [{"read_only_paths": module.READ_ONLY_PATHS,
+                                     "writable_paths": module.WRITABLE_PATHS,
+                                     "device_paths": module.DEVICE_PATHS,
+                                     "expected_root_identity": fixture.arguments["root_identity"]}])
+
+    def test_privilege_verification_failure_prevents_ready_and_exec(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        replacements["guardian"] = types.SimpleNamespace(drop_worker_privileges=lambda *_args: None)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertNotIn("send:ready", fixture.calls)
+        self.assertIsNone(fixture.executed)
+        self.assertEqual(json.loads(fixture.channel.messages[-1])["stage"], "drop")
+
+    def test_environment_caller_changes_do_not_reach_exec(self):
+        fixture = self.fixture
+        replacements = fixture.replacements()
+        def network():
+            fixture.environment["PATH"] = "PRIVATE CHANGED"
+            return {"namespace_changed": True, "only_loopback_interface": True}
+        replacements["netns"] = types.SimpleNamespace(create_loopback_namespace=network)
+        with patch.multiple(module, **replacements):
+            with self.assertRaises(_Exited):
+                module.bootstrap(7, fixture.channel, **fixture.arguments)
+        self.assertEqual(fixture.executed[2]["PATH"], "/usr/bin:/bin")
+
+    def test_runtime_checks_with_no_host_mutations(self):
+        fake_sys = types.SimpleNamespace(platform="linux", implementation=types.SimpleNamespace(
+            name="cpython"), version_info=(3, 12, 1), flags=types.SimpleNamespace(no_site=1),
+            dont_write_bytecode=True, modules={})
+        fake_thread = object()
+        fake_threading = types.SimpleNamespace(current_thread=lambda: fake_thread,
+            main_thread=lambda: fake_thread, active_count=lambda: 1)
+        with patch.object(module, "sys", fake_sys), \
+             patch.object(module, "os", self.fixture.os), \
+             patch.object(module, "threading", fake_threading), \
+             patch.object(module, "platform", types.SimpleNamespace(machine=lambda: "x86_64")):
+            module._runtime()
+            fake_sys.modules["torch"] = object()
+            with self.assertRaisesRegex(module.GeneratorBootstrapError, "runtime_rejected"):
+                module._runtime()
+            fake_sys.modules.clear()
+            fake_sys.platform = "darwin"
+            with self.assertRaisesRegex(module.GeneratorBootstrapError, "runtime_rejected"):
+                module._runtime()
+        self.assertEqual(self.fixture.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

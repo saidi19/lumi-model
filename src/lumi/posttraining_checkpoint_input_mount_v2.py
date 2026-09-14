@@ -1,0 +1,303 @@
+"""One-shot metadata-only input/output mounts in a fresh Linux namespace.
+
+This is a trusted-parent building block, not a real-import entry point. The
+parent must authenticate the runtime/rootfs and manifests, own a dedicated
+worker/cgroup, exclude concurrent writers and other writable aliases, and
+supply exact native metadata identities. It must later pivot into ``root_path``
+without rebinding it nonrecursively, close all authority FDs, isolate networking,
+drop privilege and apply the separately approved resource/read/write controls.
+
+All four roots are distinct siblings under a root-owned 0700 private directory.
+The already prepared rootfs has empty /inputs/checkpoint, /inputs/tokenizer and
+/outputs mountpoints. Nothing is created, chmod'd or chown'd here. Worker data
+must already be UID/GID 10001, directories 0700, single-link files 0600. A
+read-only bind does NOT prove source immutability or exclude external writers.
+
+Never call natively on a Mac. Local tests use syscall doubles. Failure after
+runtime admission consumes the attempt; the parent must terminate this child,
+not retry or restore its previous namespace. Log only the fixed code/receipt.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import stat
+import sys
+import threading
+
+from . import posttraining_sft_mount_root_v1 as mount_root
+from . import posttraining_sft_netns_v1 as netns
+
+SCHEMA = "lumi.sft-checkpoint-input-mount.v0.1"
+UID = GID = 10001
+INPUT_FLAGS = 15  # MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC
+OUTPUT_FLAGS = 14  # Writable, but nosuid/nodev/noexec.
+MAXIMUM_FILES, MAXIMUM_DIRECTORIES, MAXIMUM_BYTES = 129, 129, 64 * 1024**3
+ROLES = ("parent", "checkpoint", "tokenizer", "output", "root", "inputs",
+         "target_checkpoint", "target_tokenizer", "target_output")
+ERROR_CODES = frozenset({
+    "input_rejected", "runtime_rejected", "already_attempted", "owner_mismatch",
+    "reentry", "source_rejected", "identity_rejected", "layout_rejected",
+    "alias_rejected", "namespace_rejected", "namespace_unchanged",
+    "namespace_unshare_failed", "mount_failed", "bind_mount_failed",
+    "seal_failed", "readback_failed", "close_failed", "setup_failed",
+})
+_SETUP_LOCK = threading.Lock()
+_ATTEMPT_OWNER = None
+
+
+class InputMountError(RuntimeError):
+    def __init__(self, code="setup_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "setup_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code):
+    if not value:
+        raise InputMountError(code) from None
+
+
+def _identity(descriptor):
+    value = os.fstat(descriptor)
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _close(owned, descriptor):
+    owned.remove(descriptor)  # Never retry an ambiguous close.
+    try:
+        os.close(descriptor)
+    except BaseException:
+        raise InputMountError("close_failed") from None
+
+
+def _pin(path, owned):
+    return mount_root._pin(path, directory=True, owned=owned)
+
+
+def _directory(descriptor, uid, mode, code):
+    value = os.fstat(descriptor)
+    _need(stat.S_ISDIR(value.st_mode) and value.st_uid == value.st_gid == uid
+          and stat.S_IMODE(value.st_mode) == mode and value.st_ino > 0, code)
+
+
+def _listing(descriptor, owned):
+    listing = os.open(f"/proc/self/fd/{descriptor}", os.O_RDONLY | os.O_DIRECTORY
+                      | os.O_CLOEXEC | os.O_NONBLOCK)
+    owned.append(listing)
+    _need(_identity(listing) == _identity(descriptor), "identity_rejected")
+    result = []
+    with os.scandir(listing) as entries:
+        for entry in entries:
+            _need(len(result) < MAXIMUM_FILES + MAXIMUM_DIRECTORIES
+                  and type(entry.name) is str, "layout_rejected")
+            result.append(entry.name)
+    _close(owned, listing)
+    return result
+
+
+def _manifest(value):
+    _need(type(value) is dict and 0 < len(value) <= MAXIMUM_FILES, "input_rejected")
+    total, directories = 0, {""}
+    for name, size in value.items():
+        _need(type(name) is str and len(name) <= 256 and not name.startswith("/"),
+              "input_rejected")
+        try:
+            parts = mount_root._path("/" + name)
+        except BaseException:
+            raise InputMountError("input_rejected") from None
+        _need(type(size) is int and 0 < size <= MAXIMUM_BYTES and len(parts) <= 8,
+              "input_rejected")
+        total += size
+        for index in range(1, len(parts)):
+            directories.add("/".join(parts[:index]))
+    _need(total <= MAXIMUM_BYTES and len(directories) <= MAXIMUM_DIRECTORIES
+          and not directories.intersection(value), "input_rejected")
+    return dict(value), directories
+
+
+def _inputs(checkpoint_path, tokenizer_path, output_path, root_path,
+            expected_identities, inventories):
+    paths = (checkpoint_path, tokenizer_path, output_path, root_path)
+    try:
+        parts = [mount_root._path(path) for path in paths]
+    except BaseException:
+        raise InputMountError("input_rejected") from None
+    _need(len(parts[0]) >= 3 and len({tuple(p[:-1]) for p in parts}) == 1
+          and len(set(paths)) == 4, "input_rejected")
+    mapping = dict(zip(("checkpoint", "tokenizer", "output", "root"), paths, strict=False))
+    mapping.update(parent=checkpoint_path.rpartition("/")[0],
+                   inputs=root_path + "/inputs",
+                   target_checkpoint=root_path + "/inputs/checkpoint",
+                   target_tokenizer=root_path + "/inputs/tokenizer",
+                   target_output=root_path + "/outputs")
+    _need(type(expected_identities) is dict and set(expected_identities) == set(ROLES),
+          "input_rejected")
+    for identity in expected_identities.values():
+        _need(type(identity) is tuple and len(identity) == 9
+              and all(type(item) is int and item >= 0 for item in identity)
+              and identity[1] > 0, "input_rejected")
+    _need(len({value[:2] for value in expected_identities.values()}) == len(ROLES),
+          "alias_rejected")
+    _need(type(inventories) is dict and set(inventories) == {"checkpoint", "tokenizer"},
+          "input_rejected")
+    manifests = {role: _manifest(inventories[role]) for role in ("checkpoint", "tokenizer")}
+    _need(sum(len(value[0]) for value in manifests.values()) <= MAXIMUM_FILES
+          and sum(sum(value[0].values()) for value in manifests.values()) <= MAXIMUM_BYTES,
+          "input_rejected")
+    return mapping, dict(expected_identities), manifests
+
+
+def _pin_roots(paths, expected, owned):
+    descriptors = {}
+    for role in ROLES:
+        descriptor = _pin(paths[role], owned)
+        descriptors[role] = descriptor
+        _need(_identity(descriptor) == expected[role], "identity_rejected")
+        worker = role in {"checkpoint", "tokenizer", "output"}
+        mode = 0o755 if role in {"root", "inputs"} else 0o700
+        _directory(descriptor, UID if worker else 0, mode, "layout_rejected")
+    for role in ("output", "target_checkpoint", "target_tokenizer", "target_output"):
+        _need(_listing(descriptors[role], owned) == [], "layout_rejected")
+    return descriptors
+
+
+def _tree(descriptor, manifest, owned, *, readonly, seen):
+    """Bounded name/metadata enumeration; no regular-file content is opened/read."""
+    files, directories = manifest
+    result = {}
+
+    def visit(current, relative):
+        _directory(current, UID, 0o700, "layout_rejected")
+        identity = _identity(current)
+        _need(identity[:2] not in seen, "alias_rejected")
+        seen.add(identity[:2])
+        result[relative] = identity
+        if readonly:
+            mount_root._readback(f"/proc/self/fd/{current}", INPUT_FLAGS)
+        expected = {name[len(relative) + (1 if relative else 0):].split("/", 1)[0]
+                    for name in set(files) | directories
+                    if name and (not relative or name.startswith(relative + "/"))}
+        names = _listing(current, owned)
+        _need(len(names) == len(set(names)) and set(names) == expected, "layout_rejected")
+        for name in sorted(names):
+            child_relative = relative + "/" + name if relative else name
+            directory = child_relative in directories
+            flags = mount_root.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC
+            if directory:
+                flags |= os.O_DIRECTORY
+            child = os.open(name, flags, dir_fd=current)
+            owned.append(child)
+            _need(fcntl.fcntl(child, fcntl.F_GETFD) & fcntl.FD_CLOEXEC,
+                  "source_rejected")
+            if directory:
+                visit(child, child_relative)
+            else:
+                value = os.fstat(child)
+                _need(stat.S_ISREG(value.st_mode) and value.st_uid == value.st_gid == UID
+                      and stat.S_IMODE(value.st_mode) == 0o600 and value.st_nlink == 1
+                      and value.st_size == files[child_relative], "layout_rejected")
+                identity = _identity(child)
+                _need(identity[:2] not in seen, "alias_rejected")
+                seen.add(identity[:2])
+                result[child_relative] = identity
+                if readonly:
+                    mount_root._readback(f"/proc/self/fd/{child}", INPUT_FLAGS)
+            _close(owned, child)
+        _need(_identity(current) == result[relative], "identity_rejected")
+
+    visit(descriptor, "")
+    return result
+
+
+def mount_input_views(*, checkpoint_path, tokenizer_path, output_path, root_path,
+                      expected_identities, inventories):
+    """Return a partial mount receipt, never permission or a worker launch.
+
+    ``expected_identities`` has the nine ROLES, each a trusted native fstat tuple
+    (dev, ino, mode, uid, gid, nlink, size, mtime_ns, ctime_ns). ``inventories``
+    contains only checkpoint/tokenizer relative-name to byte-count mappings.
+    This function neither authenticates those control inputs nor hashes payloads.
+    """
+    global _ATTEMPT_OWNER
+    _need(_SETUP_LOCK.acquire(blocking=False), "reentry")
+    owned, failure, total_files = [], None, 0
+    try:
+        owner = os.getpid(), threading.get_ident()
+        if _ATTEMPT_OWNER is not None:
+            _need(_ATTEMPT_OWNER == owner, "owner_mismatch")
+            raise InputMountError("already_attempted") from None
+        paths, expected, manifests = _inputs(checkpoint_path, tokenizer_path, output_path,
+                                             root_path, expected_identities, inventories)
+        try:
+            netns._runtime()
+            _need(sys.version_info[:2] == (3, 12), "runtime_rejected")
+        except BaseException:
+            raise InputMountError("runtime_rejected") from None
+        _ATTEMPT_OWNER = owner
+        original = _pin_roots(paths, expected, owned)
+        seen = {expected[role][:2] for role in ROLES if role not in {"checkpoint", "tokenizer"}}
+        trees = {role: _tree(original[role], manifests[role], owned, readonly=False, seen=seen)
+                 for role in ("checkpoint", "tokenizer")}
+        old_namespace = mount_root._open_namespace(owned)
+        old_identity = mount_root._namespace_identity(old_namespace)
+        mount_root._unshare()
+        new_namespace = mount_root._open_namespace(owned)
+        new_identity = mount_root._namespace_identity(new_namespace)
+        _need(new_identity != old_identity, "namespace_unchanged")
+        mount_root._mount(None, "/", None, mount_root.MS_REC | mount_root.MS_PRIVATE)
+        fresh = _pin_roots(paths, expected, owned)
+        for descriptor in original.values():
+            _close(owned, descriptor)
+        seen = {expected[role][:2] for role in ROLES if role not in {"checkpoint", "tokenizer"}}
+        for role in ("checkpoint", "tokenizer", "output"):
+            source, target = fresh[role], fresh["target_" + role]
+            # Fresh-namespace descriptors only. Nonrecursive binds do not import
+            # pre-existing source submounts; exact tree readback must still match.
+            mount_root._mount(f"/proc/self/fd/{source}", f"/proc/self/fd/{target}",
+                              None, mount_root.MS_BIND, failure_code="bind_mount_failed")
+            bound = _pin(paths["target_" + role], owned)
+            _need(_identity(bound) == expected[role], "identity_rejected")
+            flags = OUTPUT_FLAGS if role == "output" else INPUT_FLAGS
+            mount_root._seal(f"/proc/self/fd/{bound}", flags, recursive=True)
+            mount_root._readback(f"/proc/self/fd/{bound}", flags,
+                                 mount_root.MS_RDONLY if role == "output" else 0)
+            if role != "output":
+                actual = _tree(bound, manifests[role], owned, readonly=True, seen=seen)
+                _need(actual == trees[role], "identity_rejected")
+                total_files += len(manifests[role][0])
+            else:
+                _directory(bound, UID, 0o700, "layout_rejected")
+                _need(_listing(bound, owned) == [], "layout_rejected")
+            _close(owned, bound)
+        _need(mount_root._namespace_identity(old_namespace) == old_identity
+              and mount_root._namespace_identity(new_namespace) == new_identity,
+              "namespace_rejected")
+    except BaseException as error:
+        failure = (error.code if type(error) in (InputMountError, mount_root.MountRootError)
+                   and error.code in ERROR_CODES else "setup_failed")
+    finally:
+        while owned:
+            try:
+                _close(owned, owned[-1])
+            except BaseException:
+                failure = "close_failed"
+        _SETUP_LOCK.release()
+    if failure is not None:
+        raise InputMountError(failure) from None
+    return {
+        "schema": SCHEMA, "fresh_mount_namespace": True, "private_propagation": True,
+        "input_views_readonly_nosuid_nodev_noexec": True,
+        "declared_metadata_files_verified": total_files,
+        "output_view_writable_nosuid_nodev_noexec": True,
+        "worker_uid": UID, "worker_gid": GID,
+        "source_metadata_mutated": False, "source_payload_bytes_read": 0,
+        "other_writable_aliases_excluded": False, "source_immutability_verified": False,
+        "input_content_authenticated": False, "rootfs_authenticated": False,
+        "old_root_detached": False, "ambient_descriptors_closed": False,
+        "resource_limits_verified": False, "complete_os_sandbox_verified": False,
+        "worker_dispatched": False, "real_import_execution_permitted": False,
+        "training_authorized": False, "production_eligible": False,
+    }
+
