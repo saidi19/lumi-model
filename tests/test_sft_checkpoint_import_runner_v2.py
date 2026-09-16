@@ -7,6 +7,8 @@ import copy
 import hashlib
 import os
 import tempfile
+import threading
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -88,6 +90,16 @@ def fixture_kernel_contract(metadata, dtype="bfloat16"):
 
 class RunnerControlTests(unittest.TestCase):
     def setUp(self):
+        # Model the single-owner prerequisite for these synthetic control tests.
+        # Patch this module's reference, never functions on global threading:
+        # unrelated pytest/library threads must not preempt the guard under test.
+        # Explicit extra-thread/off-main tests still exercise the real rejection.
+        self.thread_state = types.SimpleNamespace(
+            current_thread=threading.current_thread,
+            main_thread=threading.main_thread,
+            active_count=lambda: 1,
+        )
+        self.enterContext(patch.object(m, "threading", self.thread_state))
         self.temp = tempfile.TemporaryDirectory(prefix="lumi-runner-control-fixture-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
@@ -265,6 +277,31 @@ class RunnerControlTests(unittest.TestCase):
                 self.run_fixture()
             opened.assert_not_called()
         self.assertFalse(self.attempt.exists())
+
+    def test_non_main_thread_refuses_before_io(self):
+        with patch.object(m.threading, "current_thread", return_value=object()), \
+                patch.object(m.os, "open") as opened:
+            with self.assertRaisesRegex(m.ImportRunnerError, "single_owner_process_required"):
+                self.run_fixture()
+            opened.assert_not_called()
+        self.assertFalse(self.attempt.exists())
+
+    def test_unrelated_real_thread_does_not_replace_the_synthetic_control_under_test(self):
+        original_count = threading.active_count
+        stop = threading.Event()
+        child = threading.Thread(target=stop.wait, daemon=True)
+        child.start()
+        try:
+            self.assertIs(threading.active_count, original_count)
+            self.assertGreaterEqual(threading.active_count(), 2)
+            self.assertEqual(m.threading.active_count(), 1)
+            with self.assertRaisesRegex(m.ImportRunnerError, "metadata_rejected"):
+                self.run_fixture(expected_base_sha256="0" * 64)
+            self.assertFalse(self.attempt.exists())
+        finally:
+            stop.set()
+            child.join(5)
+        self.assertFalse(child.is_alive())
 
 
     def test_wrong_kernel_contract_pin_rejected_before_attempt(self):

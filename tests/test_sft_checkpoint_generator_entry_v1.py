@@ -8,6 +8,7 @@ import importlib.util
 import json
 import stat
 import sys
+import threading
 import types
 import unittest
 from contextlib import ExitStack
@@ -35,8 +36,13 @@ def runtime_context():
     operating = types.SimpleNamespace(uname=lambda: types.SimpleNamespace(machine="x86_64"),
         getresuid=lambda: (10001, 10001, 10001), getresgid=lambda: (10001, 10001, 10001),
         getgroups=lambda: [])
+    # Model this synthetic runtime's thread count, not the surrounding test process.
+    # Replacing the entry's module reference never patches global threading functions.
+    threads = types.SimpleNamespace(current_thread=threading.current_thread,
+        main_thread=threading.main_thread, active_count=lambda: 1)
     stack.enter_context(patch.object(m, "sys", system))
     stack.enter_context(patch.object(m, "os", operating))
+    stack.enter_context(patch.object(m, "threading", threads))
     return stack, system, operating
 
 
@@ -200,6 +206,47 @@ class EntryTests(unittest.TestCase):
         with stack, self.assertRaises(m.GeneratorEntryError):
             m.runtime_check([str(m.ENTRY), "--synthetic-only"],
                 self.environment | {"LUMI_GENERATION_NONCE_SHA256": "0" * 64})
+
+    def test_runtime_thread_count_model_preserves_extra_thread_rejection(self):
+        real_count = threading.active_count
+        stack, _system, _operating = runtime_context()
+        with stack:
+            self.assertIsNot(m.threading, threading)
+            self.assertIs(m.threading.current_thread, threading.current_thread)
+            self.assertIs(m.threading.main_thread, threading.main_thread)
+            self.assertIs(threading.active_count, real_count)
+            with patch.object(m.threading, "active_count", return_value=2):
+                with self.assertRaisesRegex(m.GeneratorEntryError, "^runtime_rejected$"):
+                    m.runtime_check([str(m.ENTRY), "--synthetic-only"], self.environment)
+                self.assertIs(threading.active_count, real_count)
+        self.assertIs(m.threading, threading)
+        self.assertIs(threading.active_count, real_count)
+
+    def test_runtime_thread_model_preserves_off_main_rejection(self):
+        real_current = threading.current_thread
+        stack, _system, _operating = runtime_context()
+        with stack, patch.object(m.threading, "current_thread", return_value=object()):
+            with self.assertRaisesRegex(m.GeneratorEntryError, "^runtime_rejected$"):
+                m.runtime_check([str(m.ENTRY), "--synthetic-only"], self.environment)
+            self.assertIs(threading.current_thread, real_current)
+        self.assertIs(m.threading, threading)
+
+    def test_runtime_context_isolated_from_owned_background_test_thread(self):
+        release = threading.Event()
+        worker = threading.Thread(target=lambda: release.wait(5),
+                                  name="lumi-entry-synthetic-test-thread")
+        worker.start()
+        try:
+            self.assertTrue(worker.is_alive())
+            self.assertGreaterEqual(threading.active_count(), 2)
+            stack, _system, _operating = runtime_context()
+            with stack:
+                m.runtime_check([str(m.ENTRY), "--synthetic-only"], self.environment)
+        finally:
+            release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertIs(m.threading, threading)
 
     def test_helper_pin_matches_prior_bytes_and_wrong_bytes_never_execute(self):
         raw = (ROOT / "scripts/run_checkpoint_guarded_import_v1.py").read_bytes()
