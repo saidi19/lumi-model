@@ -1,0 +1,71 @@
+name: SFT SDK census diagnostic v1
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-sdk-census-diagnostic-v1.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-sdk-census-diagnostic-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sdk-census:
+    # One fresh read-only census; never repeat the consumed cleanup attempt.
+    if: github.event.repository.private == true && github.repository_id == '1300831104' && github.run_attempt == 1 && github.event.before == '7d6007defa8868c4276372411b7ae6ca1189ec75' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Authenticate read-only diagnostic and frozen target helper
+        timeout-minutes: 1
+        run: |
+          set -eu
+          sha256sum --check --strict <<'LUMI_PINS'
+          cd661fc6ef24fa6c91bc8465d175d8a8ffdbb42a480c84a1588513dfc5b33d21  scripts/diagnose_sft_sdk_census_v1.py
+          724cb2d2a6ff01dff790d77bf88434f2be15b0f43e2def32b9def25af5c74ba5  scripts/reclaim_sft_android_sdk_v1.py
+          LUMI_PINS
+      - name: Synthetic diagnostic contracts only
+        timeout-minutes: 1
+        run: |
+          set -eu
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_sdk_census_diagnostic_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_sdk_capacity_preflight_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_prepared_setup_preflight_v1.py
+      - name: One exact read-only SDK metadata census
+        timeout-minutes: 4
+        run: |
+          set -euC
+          umask 077
+          mkdir -p artifacts
+          mkdir artifacts/lumi-sft-sdk-census-diagnostic-v0.1
+          timeout --signal=TERM --kill-after=5s 300s \
+            sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 \
+            LUMI_SDK_CENSUS_DIAGNOSTIC_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/diagnose_sft_sdk_census_v1.py --read-only-sdk-census \
+            > artifacts/lumi-sft-sdk-census-diagnostic-v0.1/aggregate-census.json 2>/dev/null
+      - name: Retain only the closed census aggregate
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumi-sdk-census-diagnostic-v1-${{ github.sha }}
+          path: artifacts/lumi-sft-sdk-census-diagnostic-v0.1/aggregate-census.json
+          if-no-files-found: error
+          retention-days: 14
