@@ -1,0 +1,72 @@
+name: SFT SDK capacity preflight v1
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-sdk-capacity-preflight-v1.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-sdk-capacity-preflight-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sdk-capacity:
+    # One fresh disposable VM; not a rerun of any previous qualification.
+    if: github.event.repository.private == true && github.repository_id == '1300831104' && github.run_attempt == 1 && github.event.before == '716774386cc3eba22f860c7699d6a33654882a02' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Authenticate new cleanup and unchanged setup probe
+        timeout-minutes: 1
+        run: |
+          set -eu
+          sha256sum --check --strict <<'LUMI_PINS'
+          724cb2d2a6ff01dff790d77bf88434f2be15b0f43e2def32b9def25af5c74ba5  scripts/reclaim_sft_android_sdk_v1.py
+          121104c9011ea8de23b05c0af03640e52b28a6a23d2acdbba75f68169dab5da1  scripts/probe_sft_prepared_setup_v1.py
+          LUMI_PINS
+      - name: Owned-fixture and frozen-source synthetic contracts only
+        timeout-minutes: 1
+        run: |
+          set -eu
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_sdk_capacity_preflight_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_prepared_setup_preflight_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_checkpoint_prepared_qualification_v2.py
+      - name: One exact SDK reclamation and conditional setup observation
+        timeout-minutes: 6
+        run: |
+          set -euC
+          umask 077
+          mkdir -p artifacts
+          mkdir artifacts/lumi-sft-sdk-capacity-preflight-v0.1
+          timeout --signal=TERM --kill-after=5s 330s \
+            sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 \
+            LUMI_SDK_CAPACITY_CI=1 LUMI_PREPARED_SETUP_PREFLIGHT_CI=1 \
+            LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/reclaim_sft_android_sdk_v1.py --fresh-sdk-capacity-check \
+            > artifacts/lumi-sft-sdk-capacity-preflight-v0.1/aggregate-capacity.json 2>/dev/null
+      - name: Retain only the closed capacity aggregate
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumi-sdk-capacity-preflight-v1-${{ github.sha }}
+          path: artifacts/lumi-sft-sdk-capacity-preflight-v0.1/aggregate-capacity.json
+          if-no-files-found: error
+          retention-days: 14
