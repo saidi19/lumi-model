@@ -1,0 +1,78 @@
+name: SFT SDK prefix capacity v1
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-sdk-prefix-capacity-v1.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-sdk-prefix-capacity-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sdk-prefix-capacity:
+    # One fresh audited prefix removal; no retry, acquisition or qualification.
+    if: github.event.repository.private == true && github.repository_id == '1300831104' && github.run_attempt == 1 && github.event.before == 'c3cba987b2191ebfff1913a4a69ff05afe852daa' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Authenticate prefix recovery and frozen source closure
+        timeout-minutes: 1
+        run: |
+          set -eu
+          sha256sum --check --strict <<'LUMI_PINS'
+          d8a0fd9e370aec987724799b10a20c501ccdafb3b71bb502fff86b57d76fb6b1  scripts/reclaim_sft_sdk_prefix_v1.py
+          6fbc13badfef5704f2efd855607534a07e9f2f743a28f90662d7332558a6ac40  tests/test_sft_sdk_prefix_capacity_v1.py
+          724cb2d2a6ff01dff790d77bf88434f2be15b0f43e2def32b9def25af5c74ba5  scripts/reclaim_sft_android_sdk_v1.py
+          121104c9011ea8de23b05c0af03640e52b28a6a23d2acdbba75f68169dab5da1  scripts/probe_sft_prepared_setup_v1.py
+          d119a2a1f85a3d6b635141edf1ba9c231893519aa032c45b1c56b9ab82b927fe  tests/test_sft_prepared_setup_preflight_v1.py
+          253bb5d0b113949baecb5ea229590c1f1e2091d9f2e659abf6fbbbe9c3e1f107  scripts/run_checkpoint_prepared_qualification_v2.py
+          21dbe1f0fd776c4aca59442c3dd46f384e658d8a3710358c64a9b46d3ab28774  tests/test_sft_checkpoint_prepared_qualification_v2.py
+          LUMI_PINS
+      - name: Synthetic prefix contracts and frozen setup bindings only
+        timeout-minutes: 1
+        run: |
+          set -eu
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_sdk_prefix_capacity_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_prepared_setup_preflight_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_checkpoint_prepared_qualification_v2.py
+      - name: One exact SDK prefix recovery then unchanged setup check
+        timeout-minutes: 6
+        run: |
+          set -euC
+          umask 077
+          mkdir -p artifacts
+          mkdir artifacts/lumi-sft-sdk-prefix-capacity-v0.1
+          timeout --signal=TERM --kill-after=5s 330s \
+            sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 \
+            LUMI_SDK_PREFIX_CAPACITY_CI=1 \
+            LUMI_PREPARED_SETUP_PREFLIGHT_CI=1 \
+            LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/reclaim_sft_sdk_prefix_v1.py --fresh-sdk-prefix-capacity-check \
+            > artifacts/lumi-sft-sdk-prefix-capacity-v0.1/aggregate-prefix-capacity.json 2>/dev/null
+      - name: Retain only the closed prefix capacity aggregate
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumi-sdk-prefix-capacity-v1-${{ github.sha }}
+          path: artifacts/lumi-sft-sdk-prefix-capacity-v0.1/aggregate-prefix-capacity.json
+          if-no-files-found: error
+          retention-days: 14
