@@ -1,0 +1,112 @@
+{
+  "schema": "lumi.sdk-sharded-census-plan.v0.1",
+  "date": "2026-09-22",
+  "purpose": "One fresh read-only metadata census of fixed immediate-child SDK shards; no capacity recovery or qualification.",
+  "approval_context": "User requested the next sharded census, was asked to choose global versus per-shard limits, delegated the choice ('jeta bhalo hoy oita kor'), was told the selected one-million-node aggregate maximum, and asked to resume. No cleanup or cap increase beyond these bounds is authorized.",
+  "repository": "saidi19/lumi-model",
+  "repository_id": 1300831104,
+  "private_repository_required": true,
+  "branch": "codex/lumi-posttraining-product-v0.1",
+  "required_parent": "7da33c657497386dc0e5cf4c6fb1f66bf03cfc05",
+  "publication_paths": [
+    "scripts/diagnose_sft_sdk_sharded_census_v1.py",
+    "tests/test_sft_sdk_sharded_census_v1.py",
+    ".github/workflows/sft-sdk-sharded-census-v1.yml",
+    "configs/lumi-4b-sft-sdk-sharded-census-plan-v0.1.json"
+  ],
+  "bindings": {
+    "tests/test_sft_sdk_sharded_census_v1.py": "e396083251240609754890c16906654b70e25a185e7ccfd67cbc85c5709bd2c4",
+    "scripts/diagnose_sft_sdk_sharded_census_v1.py": "bda1dde344a6cf52d814bc80d3ed73494821f258ceb5b8ca6a19805ab87b2a09",
+    ".github/workflows/sft-sdk-sharded-census-v1.yml": "4807ae988ee16532a74d6bc00f2b55e5d3eee29192d1ea1a4a8d8f870eeb99f2",
+    "scripts/reclaim_sft_android_sdk_v1.py": "724cb2d2a6ff01dff790d77bf88434f2be15b0f43e2def32b9def25af5c74ba5",
+    "scripts/diagnose_sft_sdk_census_v1.py": "cd661fc6ef24fa6c91bc8465d175d8a8ffdbb42a480c84a1588513dfc5b33d21",
+    "tests/test_sft_sdk_census_diagnostic_v1.py": "6a773460ae11aa26d479c499f3cb36e478763eeb6f4f79fdf57d3f4187c5d4a7",
+    "configs/lumi-4b-sft-sdk-census-diagnostic-plan-v0.1.json": "152b1dfc571ab9154fcce42df852233658bd95a62933c1da0e62bbaf3133625c",
+    "artifacts/lumi-sft-sdk-census-diagnostic-v0.1/aggregate-census.json": "e61e83793f37a07fd0ecce2df880cccc374810a9053b42b281eecf95fc479af1"
+  },
+  "target": {
+    "exact_root": "/usr/local/lib/android/sdk",
+    "arbitrary_cli_path": false,
+    "shard_definition": "Each immediate SDK child is one fixed shard, including its root node and descendants. A regular file or symlink is a one-node leaf shard; never open/follow leaf payloads. No adaptive resharding.",
+    "root_excluded_from_descendant_count": true,
+    "host_premise": "Trusted fresh disposable GitHub Ubuntu VM without concurrent writers; not a proven concurrency-exclusion claim.",
+    "boundary_checks": "Descriptor-relative O_NOFOLLOW opening; reject SDK/descendant mounts, cross-device nodes, hardlinked regular files, special types and identity changes; re-list directories and SDK root before completion.",
+    "all_directory_paths_remain_transient": true,
+    "retained_names_paths_or_exception_text": false
+  },
+  "limits": {
+    "per_shard_nodes_including_shard_root": 250000,
+    "aggregate_accepted_nodes": 1000000,
+    "maximum_root_entries_or_shards": 250000,
+    "directory_depth_exclusive": 48,
+    "per_shard_relative_name_bytes": 33554432,
+    "aggregate_relative_name_bytes": 134217728,
+    "per_shard_allocated_bytes": 68719476736,
+    "aggregate_allocated_bytes": 68719476736,
+    "internal_seconds": 240,
+    "outer_seconds": 330,
+    "outer_kill_grace_seconds": 5,
+    "execution_step_minutes": 6,
+    "job_minutes": 10,
+    "report_bytes": 8192,
+    "maximum_attempts": 1,
+    "automatic_or_manual_retry": false,
+    "count_semantics": "Node caps bound accepted distinct entries, not total OS metadata syscalls or directory-listing entries. Re-list and identity checks repeat; one rejected boundary observation may be needed. Name-byte totals count accepted full relative paths, not peak RAM.",
+    "stop_on_any_shard_or_aggregate_bound": true
+  },
+  "execution": {
+    "workflow": "SFT SDK sharded census v1",
+    "runner": "ubuntu-24.04",
+    "python": "/usr/bin/python3 -I -S -B",
+    "required_runtime": "CPython 3.12 Linux x86_64 root, main thread",
+    "frozen_helper_definitions_only": true,
+    "helper_calls": [
+      "open_target",
+      "identity",
+      "check_mounts"
+    ],
+    "sdk_payload_reads": 0,
+    "sdk_mutations": 0,
+    "diagnostic_network_calls": 0,
+    "diagnostic_child_processes": 0,
+    "setup_probe_calls": 0,
+    "software_image_acquisition": 0,
+    "model_or_dataset_access": 0,
+    "gpu_use": false,
+    "qualification": false,
+    "training": false,
+    "report_path": "artifacts/lumi-sft-sdk-sharded-census-v0.1/aggregate-sharded-census.json",
+    "artifact_name_prefix": "lumi-sdk-sharded-census-v1-",
+    "artifact_retention_days": 14,
+    "local_tests": "Owned synthetic temporary directories and mocked runtime/target/audit/timer boundaries only."
+  },
+  "publication_side_effects": {
+    "checkout_and_artifact_transport_network": true,
+    "source_and_spark_ci_triggered": true,
+    "ordinary_source_ci_may_download_cpu_test_dependencies": true,
+    "old_native_workflows_not_triggered": true
+  },
+  "local_validation": {
+    "new_synthetic_tests": 46,
+    "frozen_regressions": 126,
+    "combined_tests_per_runtime": 172,
+    "runtimes": ["CPython 3.11.15", "CPython 3.13.7"],
+    "all_passed": true,
+    "ruff_version": "0.15.1",
+    "new_lint_findings": 0,
+    "yaml_parsed": true,
+    "independent_review_passed": true,
+    "source_partition_bindings_verified": true,
+    "prior_bindings_preserved": 19
+  },
+  "result_semantics": {
+    "observed_budget_hit": "Successful limit localization; incomplete census. No automatic further scan or cleanup.",
+    "observed_census_complete": "All bounded metadata shards completed with directory re-list, identity and mount checks; does not prove reclaimable disk or authorize deletion.",
+    "historical_failure_cause_proven": false,
+    "capacity_accepted": false,
+    "gate_5_complete": false,
+    "native_qualification_passed": false,
+    "training_authorized": false,
+    "production_eligible": false
+  }
+}

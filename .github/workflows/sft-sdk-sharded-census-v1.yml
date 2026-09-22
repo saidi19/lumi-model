@@ -1,0 +1,70 @@
+name: SFT SDK sharded census v1
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-sdk-sharded-census-v1.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sft-sdk-sharded-census-v1-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sdk-sharded-census:
+    # One fresh read-only census; no cleanup or qualification.
+    if: github.event.repository.private == true && github.repository_id == '1300831104' && github.run_attempt == 1 && github.event.before == '7da33c657497386dc0e5cf4c6fb1f66bf03cfc05' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Authenticate sharded diagnostic and frozen target helper
+        timeout-minutes: 1
+        run: |
+          set -eu
+          sha256sum --check --strict <<'LUMI_PINS'
+          bda1dde344a6cf52d814bc80d3ed73494821f258ceb5b8ca6a19805ab87b2a09  scripts/diagnose_sft_sdk_sharded_census_v1.py
+          724cb2d2a6ff01dff790d77bf88434f2be15b0f43e2def32b9def25af5c74ba5  scripts/reclaim_sft_android_sdk_v1.py
+          LUMI_PINS
+      - name: Synthetic sharded contracts only
+        timeout-minutes: 1
+        run: |
+          set -eu
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_sdk_sharded_census_v1.py
+          /usr/bin/python3 -I -S -B -m unittest discover -q -s tests -p test_sft_sdk_census_diagnostic_v1.py
+      - name: One exact read-only sharded SDK metadata census
+        timeout-minutes: 6
+        run: |
+          set -euC
+          umask 077
+          mkdir -p artifacts
+          mkdir artifacts/lumi-sft-sdk-sharded-census-v0.1
+          timeout --signal=TERM --kill-after=5s 330s \
+            sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 \
+            LUMI_SDK_SHARDED_CENSUS_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/diagnose_sft_sdk_sharded_census_v1.py --read-only-sharded-sdk-census \
+            > artifacts/lumi-sft-sdk-sharded-census-v0.1/aggregate-sharded-census.json 2>/dev/null
+      - name: Retain only the closed sharded aggregate
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v4
+        with:
+          name: lumi-sdk-sharded-census-v1-${{ github.sha }}
+          path: artifacts/lumi-sft-sdk-sharded-census-v0.1/aggregate-sharded-census.json
+          if-no-files-found: error
+          retention-days: 14
