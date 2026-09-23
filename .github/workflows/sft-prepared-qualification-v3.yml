@@ -1,0 +1,148 @@
+name: SFT prepared importer qualification v3
+
+on:
+  push:
+    branches:
+      - codex/lumi-posttraining-product-v0.1
+    paths:
+      - .github/workflows/sft-prepared-qualification-v3.yml
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: sft-prepared-qualification-v3-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  private-prepared-importer-v3:
+    # LOCAL PREPARATION ONLY. Separate bound publication/execution approval required.
+    # Intended guard after approval: private repo ID 1300831104, run_attempt == 1,
+    # event.before == bd38d257038632d6424cbc08128219776feeb90a, event.after == github.sha.
+    # Trusted disposable VM/provider actions; guardian-death/job teardown not proved.
+    if: github.event.repository.private == true && github.repository_id == '1300831104' && github.run_attempt == 1 && github.event.before == 'bd38d257038632d6424cbc08128219776feeb90a' && github.event.after == github.sha
+    runs-on: ubuntu-24.04
+    timeout-minutes: 48
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: src
+      CUDA_VISIBLE_DEVICES: ""
+      HF_HUB_OFFLINE: "1"
+      HF_DATASETS_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      TOKENIZERS_PARALLELISM: "false"
+      AWS_EC2_METADATA_DISABLED: "true"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      LUMI_PREPARED_QUALIFICATION_ACQUISITION_V3_CI: "1"
+    steps:
+      - uses: actions/checkout@v6
+        timeout-minutes: 2
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Authenticate successor and frozen executables
+        timeout-minutes: 1
+        run: |
+          set -eu
+          sha256sum --check --strict <<'LUMI_PINS'
+          b874a73d527c9ad8381f9616726a1d020bccf54d84dabdf332810a76ddc0a256  scripts/prepare_sft_prepared_qualification_v3.py
+          f2e30549ccca33eaad17b1b52ccd891edf82687307a95674374618669c402f24  scripts/verify_sft_prepared_qualification_v3.py
+          b87227b542a1365e6cd3286000a8e8ecf9115c63813570d91a4b6ebba11fe7d8  tests/test_sft_prepared_qualification_v3.py
+          7dc3543a354d3b4bca154b72ca6d2e77ffd2e229559a4f4d4da157dd46213065  scripts/prepare_sft_prepared_qualification_v2.py
+          d888d17f893e8827e3a051410de5c93a6706996a232f461016b2930caad5ee26  scripts/verify_sft_prepared_qualification_v2.py
+          253bb5d0b113949baecb5ea229590c1f1e2091d9f2e659abf6fbbbe9c3e1f107  scripts/run_checkpoint_prepared_qualification_v2.py
+          31630b2896319e8ce9ede86ed82099506b285eb9d4366f6b4b8fb4f0311de093  scripts/supervise_checkpoint_prepared_qualification_v2.py
+          d8a0fd9e370aec987724799b10a20c501ccdafb3b71bb502fff86b57d76fb6b1  scripts/reclaim_sft_sdk_prefix_v1.py
+          724cb2d2a6ff01dff790d77bf88434f2be15b0f43e2def32b9def25af5c74ba5  scripts/reclaim_sft_android_sdk_v1.py
+          121104c9011ea8de23b05c0af03640e52b28a6a23d2acdbba75f68169dab5da1  scripts/probe_sft_prepared_setup_v1.py
+          LUMI_PINS
+      - name: Check frozen native source closure only
+        timeout-minutes: 1
+        run: /usr/bin/python3 -I -S -B scripts/verify_sft_prepared_qualification_v3.py --check-source
+      - name: Portable synthetic contracts only
+        timeout-minutes: 2
+        run: |
+          set -eu
+          for suite in test_sft_prepared_qualification_v3.py test_sft_sdk_prefix_capacity_v1.py test_sft_prepared_setup_preflight_v1.py test_sft_checkpoint_prepared_qualification_v2.py test_sft_checkpoint_prepared_qualification_supervisor_v2.py test_sft_prepared_qualification_acquisition_v2.py test_sft_prepared_qualification_verification_v2.py test_sft_checkpoint_fixture_workspace_v1.py; do
+            /usr/bin/python3 -S -B -m unittest -q "tests/$suite"
+          done
+      - name: One freshly audited SDK prefix removal and frozen setup check
+        id: capacity
+        timeout-minutes: 6
+        run: |
+          set -euC
+          umask 077
+          mkdir -p artifacts
+          mkdir artifacts/lumi-sft-sdk-prefix-capacity-v0.1
+          timeout --signal=TERM --kill-after=5s 330s \
+            sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 \
+            LUMI_SDK_PREFIX_CAPACITY_CI=1 LUMI_PREPARED_SETUP_PREFLIGHT_CI=1 \
+            LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/reclaim_sft_sdk_prefix_v1.py \
+            --fresh-sdk-prefix-capacity-check \
+            > artifacts/lumi-sft-sdk-prefix-capacity-v0.1/aggregate-prefix-capacity.json 2>/dev/null
+      - name: Require this job's prefix readiness before any acquisition
+        timeout-minutes: 1
+        run: /usr/bin/python3 -I -S -B scripts/verify_sft_prepared_qualification_v3.py --check-prefix
+      - name: Fresh four-response accepted-software acquisition
+        id: software
+        timeout-minutes: 7
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          timeout --signal=TERM --kill-after=15s 6m
+          /usr/bin/python3 -I -S -B scripts/prepare_sft_prepared_qualification_v3.py
+          --acquire-accepted-software
+      - name: One independent PID-supervised prepared importer qualification
+        id: native
+        timeout-minutes: 23
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+        run: |
+          set -euC
+          umask 077
+          sudo -n /usr/bin/env -i \
+            PATH=/usr/bin:/bin LC_ALL=C.UTF-8 LUMI_CHECKPOINT_GUARD_QUALIFICATION_CI=1 \
+            /usr/bin/python3 -I -S -B scripts/supervise_checkpoint_prepared_qualification_v2.py \
+            --synthetic-only "$LUMI_IMAGE_ARCHIVE" \
+            253bb5d0b113949baecb5ea229590c1f1e2091d9f2e659abf6fbbbe9c3e1f107 \
+            > artifacts/lumi-sft-prepared-qualification-v0.3/aggregate-native.json 2>/dev/null
+      - name: Retire exactly the newly acquired input
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          LUMI_IMAGE_ARCHIVE: ${{ steps.software.outputs.image_archive }}
+          LUMI_IMAGE_IDENTITY: ${{ steps.software.outputs.image_identity }}
+          LUMI_PARENT_IDENTITY: ${{ steps.software.outputs.parent_identity }}
+        run: |
+          set -euC
+          umask 077
+          /usr/bin/python3 -I -S -B scripts/prepare_sft_prepared_qualification_v3.py --retire-input \
+            "$LUMI_IMAGE_ARCHIVE" "$LUMI_IMAGE_IDENTITY" "$LUMI_PARENT_IDENTITY" \
+            > artifacts/lumi-sft-prepared-qualification-v0.3/aggregate-input-cleanup.json
+      - name: Verify exact prefix native and retirement receipts
+        if: always() && steps.software.outcome == 'success'
+        timeout-minutes: 1
+        run: >-
+          /usr/bin/python3 -I -S -B scripts/verify_sft_prepared_qualification_v3.py
+          --verify-receipts
+      - name: Retain only five named bounded aggregates
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v4
+        with:
+          name: sft-prepared-qualification-v3-evidence-${{ github.sha }}
+          path: |
+            artifacts/lumi-sft-sdk-prefix-capacity-v0.1/aggregate-prefix-capacity.json
+            artifacts/lumi-sft-prepared-qualification-v0.3/aggregate-acquisition.json
+            artifacts/lumi-sft-prepared-qualification-v0.3/aggregate-native.json
+            artifacts/lumi-sft-prepared-qualification-v0.3/aggregate-input-cleanup.json
+            artifacts/lumi-sft-prepared-qualification-v0.3/aggregate-verification.json
+          if-no-files-found: warn
+          retention-days: 30
