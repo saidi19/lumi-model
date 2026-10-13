@@ -1,0 +1,91 @@
+# SFT execution status v0.132: full-size streaming staging and worker settings
+
+2026-09-28. Implemented and locally tested the actual opaque-byte copy primitive
+for the full-size VM inputs, plus the full-size import unit settings. **202 tests
+passed; no real input acquisition, VM action, mount, systemd dispatch, GPU or
+training occurred.** This is a component implementation, not a completed native
+full-size parent. Gate 5 is still incomplete. The tiny Linux success in v0.130
+and full-size metadata/control preparation in v0.131 are unchanged.
+
+## Implemented
+
+`posttraining_vm_fullsize_staging_v1.py` accepts the hash-pinned v0.1 input
+selection as bytes and copies streams into an exclusively created input tree
+under an already-open private directory. It requests only exact selected keys,
+hashes opaque chunks without parsing trainer/model/tokenizer bytes, checks each
+response's declared and actual size, and validates SHA-256 before acceptance.
+Nested tokenizer paths and root-level trainer files are preserved exactly.
+
+There is one supplied transport call per object, no application retry or resume.
+The component requests at most 1 MiB per read and writes at most each object's
+bound size. A one-byte EOF probe per object is separately budgeted: up to
+48,843,765,465 response-body bytes for a conforming transport, including the
+22-byte probe allowance. Normal success returns the exact 48,843,765,443 content
+bytes. This is NOT a total network cap: TLS, headers, transport retry behavior,
+socket timeouts and a hard process deadline remain the transport/parent's job.
+Acquisition is separate from the frozen coordinator's source-read/write budgets.
+
+Files are exclusive, non-symlink, fsynced and mode 0400 after successful copy;
+private directory traversal uses directory descriptors and no-follow opens.
+Every response body and file writer is closed before a successful return. The
+started marker survives failures and success, rejecting reuse of that attempt.
+No cleanup removes partial files or evidence. Failure messages retain fixed
+codes only. Public `stage_inputs` remains closed; this private primitive does
+not grant host admission or acquisition authority.
+
+Mode 0400 is **not filesystem immutability**: the owning user could chmod a
+writable backing file. The component explicitly returns read-only mount and
+acquisition-cgroup-reaped claims as false. The independently admitted root
+parent must terminate/reap acquisition, remove credentials and writable aliases,
+and supply verified read-only bind mounts before starting a distinct worker.
+
+`posttraining_vm_fullsize_controls_v1.py` derives settings from the qualified
+tiny route: only memory (64 GiB), deadline (3,600 seconds), inaccessible paths
+and input/source/output bind paths change. UID/GID 10001, zero swap, tasks 64,
+no network, no restart, kill-whole-cgroup, no capabilities, strict system
+protection and null logs remain. Inputs and outputs are disk-backed host binds;
+the inherited small `/work` tmpfs is scratch, not 48.8-GB input storage. Settings
+construction does not mount anything or prove capacity, host identity, resource
+enforcement/readback or cumulative native-write limits.
+
+## Verification
+
+- 25 new tests: successful opaque copy, exact paths/modes, stream closure,
+  short/overlong/invalid streams, hash/header mismatch, bounded chunks/EOF,
+  partial/zero/disk-failed writes, deadlines, fsync/close/transport failure,
+  no retry, rejected paths/duplicates/parent conflicts/symlinks, runtime/public
+  entry closure, and unchanged inherited controls.
+- 177 prior adapter, selection, resource, I/O and coordinator regressions.
+- Total: 202 tests, zero failures/errors/skips, 0.408 seconds; Ruff passed.
+- The test runtime gate and transport were doubled; only tiny synthetic content
+  (including a roughly 1-MiB chunk-boundary case) was copied into temporary files.
+  No real 4B tensors, tokenizer data or trainer state was opened.
+- Parent audit hook observed zero network and forbidden-payload attempts; no ML
+  modules loaded. This hook is not an OS sandbox or native qualification.
+- Actual saved control validated against its exact pin: 22 objects,
+  48,843,765,443 bytes. Seven v0.131 bindings and four native-success evidence
+  bindings verified unchanged. Native result metadata, not model payload, was
+  read for that check. No previous evidence/source was edited; no commit/push.
+
+Initial local lint found four long lines, corrected before final verification.
+An ad-hoc prior-evidence check first used the wrong metadata dictionary key;
+the corrected read-only check validated the four native bindings. Neither was
+a remote execution or import attempt.
+
+## Remaining work, without restarting completed qualification
+
+The executable root-parent integration is still missing: authenticated host/
+runtime/source closure; the bounded exact-key AWS transport and credential
+lifecycle; acquisition cgroup termination/readback; disk-backed layout and
+mount/cgroup readback; invoking the existing full-size entry once; independent
+package checksum verification, durable retention, and cleanup. The new stream
+primitive and settings are reusable pieces of that integration, not its proof.
+
+After that local wiring, bind the total setup/transfer/import/verification/
+retention budgets and obtain explicit full-size execution approval. Do not
+switch the old generated-only AWS authorization to real data. Do not rerun the
+already successful tiny qualification merely to produce another local report.
+
+Current claims: `real_4b_import=false`, `fullsize_host_admission=false`,
+`gate_5_complete=false`, `training_authorized=false`, `production_eligible=false`.
+Gate 6 GPU smoke/save/resume and SFT remain after real import; no GPU was started.

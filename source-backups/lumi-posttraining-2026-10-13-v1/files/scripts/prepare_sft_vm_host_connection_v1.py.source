@@ -1,0 +1,332 @@
+"""Read-only EC2 control-plane admission and pinned short SSH configuration.
+
+Does not launch, connect, install, issue credentials or admit native OS/runtime.
+Requires a concrete fresh-host binding from the future authorized provisioner.
+Never uses ssh-keyscan/accept-new or the prior terminated rehearsal's identity.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import os
+import re
+import stat
+from pathlib import Path
+
+import check_sft_temporary_issuer_v2 as issuer
+
+PROPOSAL_SHA = "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061"
+PROPOSAL = Path("configs/lumi-vm-fullsize-host-proposal-v0.1.json")
+TUNNEL_SECONDS = 120
+MAX_CONSOLE = 262144
+
+
+def need(value):
+    if not value:
+        raise ValueError("host_connection_rejected") from None
+
+
+def targets(value, proposal):
+    patterns = {
+        "attempt": r"[0-9a-f]{32}",
+        "instance": r"i-[0-9a-f]{17}",
+        "endpoint": r"eice-[0-9a-f]{17}",
+        "root_volume": r"vol-[0-9a-f]{17}",
+        "work_volume": r"vol-[0-9a-f]{17}",
+        "vm_group": r"sg-[0-9a-f]{17}",
+        "endpoint_group": r"sg-[0-9a-f]{17}",
+        "key_name": r"lumi-[a-z0-9-]{1,80}",
+    }
+    need(type(value) is dict and set(value) == set(patterns))
+    need(all(type(value[k]) is str and re.fullmatch(p, value[k]) for k, p in patterns.items()))
+    need(value["attempt"] == proposal["prepared_attempt"])
+    need(
+        value["root_volume"] != value["work_volume"]
+        and value["vm_group"] != value["endpoint_group"]
+    )
+
+
+def one(rows):
+    need(type(rows) is list and len(rows) == 1)
+    return rows[0]
+
+
+def owned(row, attempt):
+    tags = row.get("Tags", [])
+    need(sum(t.get("Key") == "LumiAttempt" for t in tags) == 1)
+    need(next(t["Value"] for t in tags if t["Key"] == "LumiAttempt") == attempt)
+
+
+def inspect(observed, binding, proposal):
+    targets(binding, proposal)
+    host = proposal["host"]
+    need(observed["identity"]["Account"] == host["account"])
+    reservation = one(observed["instances"]["Reservations"])
+    need(reservation["OwnerId"] == host["account"])
+    vm = one(reservation["Instances"])
+    need(vm["InstanceId"] == binding["instance"] and vm["State"]["Name"] == "running")
+    owned(vm, binding["attempt"])
+    for field, expected in (
+        ("ImageId", host["ami"]),
+        ("InstanceType", host["instance_type"]),
+        ("Architecture", host["architecture"]),
+        ("VpcId", host["vpc"]),
+        ("SubnetId", host["subnet"]),
+        ("KeyName", binding["key_name"]),
+    ):
+        need(vm[field] == expected)
+    need(vm["Placement"]["AvailabilityZone"] == host["availability_zone"])
+    need(vm.get("InstanceLifecycle") is None and not vm.get("IamInstanceProfile"))
+    need(not vm.get("PublicIpAddress"))
+    need(
+        vm["MetadataOptions"]["HttpTokens"] == "required"
+        and vm["MetadataOptions"]["State"] == "applied"
+    )
+    need({g["GroupId"] for g in vm["SecurityGroups"]} == {binding["vm_group"]})
+    need(
+        all(
+            not n.get("Ipv6Addresses") and not n.get("Association", {}).get("PublicIp")
+            for n in vm["NetworkInterfaces"]
+        )
+    )
+    status = one(observed["health"]["InstanceStatuses"])
+    need(
+        status["InstanceId"] == binding["instance"]
+        and status["InstanceStatus"]["Status"] == status["SystemStatus"]["Status"] == "ok"
+    )
+    need(
+        observed["shutdown"]["InstanceId"] == binding["instance"]
+        and observed["shutdown"]["InstanceInitiatedShutdownBehavior"]["Value"] == "stop"
+    )
+    image = one(observed["image"]["Images"])
+    need(
+        image["ImageId"] == host["ami"]
+        and image["OwnerId"] == host["ami_owner"]
+        and image["Architecture"] == host["architecture"]
+        and image["State"] == "available"
+    )
+    endpoint = one(observed["endpoint"]["InstanceConnectEndpoints"])
+    need(
+        endpoint["InstanceConnectEndpointId"] == binding["endpoint"]
+        and endpoint["State"] == "create-complete"
+        and endpoint["VpcId"] == host["vpc"]
+        and endpoint["SubnetId"] == host["subnet"]
+        and set(endpoint["SecurityGroupIds"]) == {binding["endpoint_group"]}
+    )
+    owned(endpoint, binding["attempt"])
+    groups = observed["group"]["SecurityGroups"]
+    need(
+        len(groups) == 2
+        and {g["GroupId"] for g in groups} == {binding["vm_group"], binding["endpoint_group"]}
+    )
+    group = next(g for g in groups if g["GroupId"] == binding["vm_group"])
+    need(group["GroupId"] == binding["vm_group"] and group["VpcId"] == host["vpc"])
+    owned(group, binding["attempt"])
+    rule = one(group["IpPermissions"])
+    need(rule["IpProtocol"] == "tcp" and rule["FromPort"] == rule["ToPort"] == 22)
+    need(not rule.get("IpRanges") and not rule.get("Ipv6Ranges") and not rule.get("PrefixListIds"))
+    source = one(rule["UserIdGroupPairs"])
+    need(source["GroupId"] == binding["endpoint_group"] and source["UserId"] == host["account"])
+    endpoint_group = next(g for g in groups if g["GroupId"] == binding["endpoint_group"])
+    owned(endpoint_group, binding["attempt"])
+    need(endpoint_group["VpcId"] == host["vpc"] and not endpoint_group["IpPermissions"])
+    outbound = one(endpoint_group["IpPermissionsEgress"])
+    need(
+        outbound["IpProtocol"] == "tcp"
+        and outbound["FromPort"] == outbound["ToPort"] == 22
+        and not outbound.get("IpRanges")
+        and not outbound.get("Ipv6Ranges")
+        and not outbound.get("PrefixListIds")
+    )
+    peer = one(outbound["UserIdGroupPairs"])
+    need(peer["GroupId"] == binding["vm_group"] and peer["UserId"] == host["account"])
+    volumes = observed["volumes"]["Volumes"]
+    need(len(volumes) == 2)
+    by_id = {v["VolumeId"]: v for v in volumes}
+    need(set(by_id) == {binding["root_volume"], binding["work_volume"]})
+    devices = vm["BlockDeviceMappings"]
+    need(len(devices) == 2)
+    by_volume = {d["Ebs"]["VolumeId"]: d for d in devices}
+    need(set(by_volume) == set(by_id))
+    for kind, gib in (("root", 32), ("work", 128)):
+        volume_id = binding[kind + "_volume"]
+        volume, device = by_id[volume_id], by_volume[volume_id]
+        owned(volume, binding["attempt"])
+        need(
+            volume["Encrypted"] is True
+            and volume["Size"] == gib
+            and volume["VolumeType"] == "gp3"
+            and volume["State"] == "in-use"
+            and volume["AvailabilityZone"] == host["availability_zone"]
+            and volume["Iops"] == 3000
+            and volume["Throughput"] == 125
+        )
+        need(device["Ebs"]["DeleteOnTermination"] is False)
+        attachment = one(volume["Attachments"])
+        need(
+            attachment["InstanceId"] == binding["instance"]
+            and attachment["State"] == "attached"
+            and attachment["Device"] == device["DeviceName"]
+        )
+        need((device["DeviceName"] == vm["RootDeviceName"]) == (kind == "root"))
+    return {
+        "control_plane_matches": True,
+        "native_host_admitted": False,
+        "gate_5_complete": False,
+        "tunnel_seconds": TUNNEL_SECONDS,
+    }
+
+
+def host_key(reply, instance):
+    need(reply["InstanceId"] == instance and type(reply["Output"]) is str)
+    raw = reply["Output"].encode("ascii")
+    need(len(raw) <= MAX_CONSOLE)
+    # AWS CLI versions may decode the API's base64 console body for presentation.
+    if b"-----BEGIN SSH HOST KEY KEYS-----" not in raw:
+        raw = base64.b64decode(raw, validate=True)
+    need(len(raw) <= MAX_CONSOLE)
+    start, end = b"-----BEGIN SSH HOST KEY KEYS-----", b"-----END SSH HOST KEY KEYS-----"
+    need(raw.count(start) == raw.count(end) == 1)
+    block = raw.split(start, 1)[1].split(end, 1)[0]
+    keys = []
+    for line in block.splitlines():
+        fields = line.strip().split()
+        if fields and fields[0] == b"ssh-ed25519":
+            need(len(fields) in {2, 3})
+            data = base64.b64decode(fields[1], validate=True)
+            need(len(data) == 51 and data[:19] == b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20")
+            keys.append((fields[1].decode(), data))
+    encoded, data = one(keys)
+    return encoded, "SHA256:" + base64.b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+
+
+def safe_path(path):
+    need(path.is_absolute() and re.fullmatch(r"/[A-Za-z0-9_./-]+", str(path)))
+    need(path == path.resolve())
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+
+
+def ssh_config(binding, key_path, known_hosts):
+    # Paths are selected by the controller, never copied from console output.
+    targets(binding, {"prepared_attempt": binding["attempt"]})
+    safe_path(key_path)
+    safe_path(known_hosts)
+    info = key_path.stat()
+    need(
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and info.st_nlink == 1
+        and stat.S_IMODE(info.st_mode) in {0o400, 0o600}
+    )
+    alias = "lumi-fullsize-" + binding["attempt"]
+    proxy = (
+        "/opt/homebrew/bin/aws --profile default --region us-east-1 "
+        "ec2-instance-connect open-tunnel --instance-id "
+        + binding["instance"]
+        + " --instance-connect-endpoint-id "
+        + binding["endpoint"]
+        + " --remote-port 22 --max-tunnel-duration 120"
+    )
+    options = {
+        "HostName": binding["instance"],
+        "User": "ubuntu",
+        "IdentityFile": str(key_path),
+        "UserKnownHostsFile": str(known_hosts),
+        "GlobalKnownHostsFile": "/dev/null",
+        "HostKeyAlias": alias,
+        "HostKeyAlgorithms": "ssh-ed25519",
+        "StrictHostKeyChecking": "yes",
+        "BatchMode": "yes",
+        "IdentitiesOnly": "yes",
+        "IdentityAgent": "none",
+        "ForwardAgent": "no",
+        "ClearAllForwardings": "yes",
+        "PermitLocalCommand": "no",
+        "PasswordAuthentication": "no",
+        "KbdInteractiveAuthentication": "no",
+        "VerifyHostKeyDNS": "no",
+        "UpdateHostKeys": "no",
+        "ControlMaster": "no",
+        "ControlPath": "none",
+        "RequestTTY": "no",
+        "ConnectTimeout": "20",
+        "ConnectionAttempts": "1",
+        "ServerAliveInterval": "15",
+        "ServerAliveCountMax": "2",
+        "ProxyCommand": proxy,
+    }
+    return "Host " + alias + "\n" + "".join(f"    {k} {v}\n" for k, v in options.items())
+
+
+def _prepare_bound_connection(binding, key_path, output, *, cloud=None):
+    """Read-only AWS calls and new local public metadata; never connects to VM."""
+    raw = PROPOSAL.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == PROPOSAL_SHA)
+    proposal = json.loads(raw)
+    targets(binding, proposal)
+    safe_path(output)
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    # Validate private-key metadata without reading or copying key material.
+    config = ssh_config(binding, key_path, output / "known_hosts")
+    cloud = issuer.Cloud() if cloud is None else cloud
+    issuer.base.save(output / "started.json", {"target": binding, "proposal_sha256": PROPOSAL_SHA})
+    calls = {
+        "identity": ("sts", "get-caller-identity", {}),
+        "instances": ("ec2", "describe-instances", {"InstanceIds": [binding["instance"]]}),
+        "health": ("ec2", "describe-instance-status", {"InstanceIds": [binding["instance"]]}),
+        "shutdown": (
+            "ec2",
+            "describe-instance-attribute",
+            {"InstanceId": binding["instance"], "Attribute": "instanceInitiatedShutdownBehavior"},
+        ),
+        "image": ("ec2", "describe-images", {"ImageIds": [proposal["host"]["ami"]]}),
+        "endpoint": (
+            "ec2",
+            "describe-instance-connect-endpoints",
+            {"InstanceConnectEndpointIds": [binding["endpoint"]]},
+        ),
+        "group": (
+            "ec2",
+            "describe-security-groups",
+            {"GroupIds": [binding["vm_group"], binding["endpoint_group"]]},
+        ),
+        "volumes": (
+            "ec2",
+            "describe-volumes",
+            {"VolumeIds": [binding["root_volume"], binding["work_volume"]]},
+        ),
+    }
+    report = {
+        "status": "failed_closed",
+        "control_plane_matches": False,
+        "native_host_admitted": False,
+        "ssh_connection_started": False,
+        "gate_5_complete": False,
+        "raw_console_retained": False,
+    }
+    stage = "observations"
+    try:
+        observed = {k: cloud.cli(service, op, **args) for k, (service, op, args) in calls.items()}
+        stage = "control_plane"
+        report.update(inspect(observed, binding, proposal))
+        stage = "host_key"
+        reply = cloud.cli("ec2", "get-console-output", InstanceId=binding["instance"], Latest=True)
+        key, fingerprint = host_key(reply, binding["instance"])
+        alias = "lumi-fullsize-" + binding["attempt"]
+        for name, text in (("known_hosts", f"{alias} ssh-ed25519 {key}\n"), ("ssh_config", config)):
+            fd = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+        report.update(
+            status="prepared_pinned_connection_not_native_admission",
+            host_key_fingerprint=fingerprint,
+            ssh_config_sha256=hashlib.sha256(config.encode()).hexdigest(),
+        )
+    except Exception:
+        report["failed_stage"] = stage
+    issuer.base.save(output / "result.json", report)
+    return report

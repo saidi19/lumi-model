@@ -1,0 +1,215 @@
+"""Repair v0.3 composed byte-count bindings; offline source successor only."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_v3 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.3"
+BASE_SHA = "990e6f1630db21e64ee06034dce54c41beb84feb2548d7addb2f481b26da30cc"
+ANCESTOR = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.2"
+ANCESTOR_SHA = "7ec91d363c3ab1422bb35c35757e8ae04fa166d5943c3bdc18aa2952d8b64602"
+PREVIOUS_BUILDER_SHA = "8eb21dd059b13e40a154daf37c9e421e89967580ba1ff8553bb6d8bfd6bc2c8d"
+PREVIOUS_VERIFICATION = ROOT / "evidence/lumi-vm-attempt-018-source-v0.3-verification-v0.1.json"
+PREVIOUS_VERIFICATION_SHA = "205f5f97729aa7534f00c9d380c52a9f4dad2b8d3dc99081cabe43130b17c059"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-018-source-v0.3-authentication-failure-v0.1.json"
+FAILURE_SHA = "8d6de31036d320ca2d4e588981450596f08a361b6a77ee7d321fd7dcfdbf2543"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.4"
+ATTEMPT = previous.ATTEMPT
+TAR = previous.TAR
+SELECTION = previous.SELECTION
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_v4_source_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, digest, size=None):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def update_json(raw, hash_map, binding_map):
+    value = json.loads(raw)
+    changed = False
+
+    def visit(item):
+        nonlocal changed
+        if type(item) is dict:
+            result = {key: visit(child) for key, child in item.items()}
+            bound_hash = item.get("sha256")
+            if type(item.get("bytes")) is int and bound_hash in binding_map:
+                pair = (item["sha256"], item["bytes"])
+                result["sha256"], result["bytes"] = binding_map[bound_hash]
+                changed |= (result["sha256"], result["bytes"]) != pair
+            return result
+        if type(item) is list:
+            return [visit(child) for child in item]
+        if type(item) is str and item in hash_map:
+            changed |= item != hash_map[item]
+            return hash_map[item]
+        return item
+
+    result = visit(value)
+    return encode(result) if changed else raw
+
+
+def close(base, ancestor, preserved):
+    current = dict(base)
+    selection = base[SELECTION]
+    for _ in range(64):
+        hash_map, binding_map = {}, {}
+        for name, raw in base.items():
+            if name in preserved:
+                continue
+            after = sha(current[name])
+            for anchored in (ancestor[name], raw):
+                before = sha(anchored)
+                need(before not in hash_map or hash_map[before] == after)
+                hash_map[before] = after
+                binding_map[before] = (after, len(current[name]))
+        following = {}
+        for name, raw in base.items():
+            if name in preserved or name == TAR:
+                following[name] = raw
+            elif name.endswith(".json"):
+                following[name] = update_json(raw, hash_map, binding_map)
+            elif name.endswith(".py"):
+                following[name] = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda match, mapping=hash_map: mapping.get(
+                        match[0].decode(), match[0].decode()
+                    ).encode(),
+                    raw,
+                )
+            else:
+                following[name] = raw
+        following[TAR] = previous.rebuild_tar(base[TAR], following, selection)
+        if following == current:
+            return current
+        current = following
+    raise ValueError("attempt018_v4_hash_cycle")
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_BUILDER_SHA)
+    prior = json.loads(read(PREVIOUS_VERIFICATION, PREVIOUS_VERIFICATION_SHA))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    need(
+        prior["source_release_sha256"] == BASE_SHA
+        and failure["attempt"] == ATTEMPT
+        and failure["status"] == "offline_preflight_test_rejected_before_cloud"
+        and failure["failed_stage"] == "local_source_authentication"
+        and failure["cloud_calls"] == failure["cloud_mutations"] == 0
+        and failure["cpu_instance_launched"] is False
+        and failure["checkpoint_access"] is False
+        and failure["retry_performed"] is False
+    )
+    manifest = json.loads(read(BASE / "release.json", BASE_SHA))
+    ancestor_manifest = json.loads(read(ANCESTOR / "release.json", ANCESTOR_SHA))
+    base = {
+        name: read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    ancestor = {
+        name: read(ANCESTOR / name, pin["sha256"], pin["bytes"])
+        for name, pin in ancestor_manifest["outputs"].items()
+    }
+    need(len(base) == len(ancestor) == 156 and set(base) == set(ancestor))
+    preserved = {
+        name
+        for name in base
+        if name != TAR
+        and (
+            "/" not in name
+            or name.startswith("evidence/")
+            or name.endswith((".gz", ".tar", ".pem"))
+        )
+    }
+    final = close(base, ancestor, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            need(raw == base[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    selection = json.loads(final[SELECTION])
+    members = previous.tar_members(final[TAR])
+    embedded = json.loads(members["release-manifest.json"])
+    need(
+        selection["object_versions_bound"] is True
+        and selection["versioned_object_count"] == 22
+        and all(sha(members[name]) == digest for name, digest in embedded.items())
+        and members["controls/input-selection.json"] == final[SELECTION]
+        and members[previous.STAGING] == final[previous.STAGING]
+        and members[previous.TRANSPORT] == final[previous.TRANSPORT]
+    )
+    report = {
+        "schema": "lumi.vm-attempt018-source.v0.4",
+        "attempt": ATTEMPT,
+        "base_release_sha256": BASE_SHA,
+        "binding_ancestor_release_sha256": ANCESTOR_SHA,
+        "v03_authentication_failure_sha256": FAILURE_SHA,
+        "repair": "propagate_sha256_and_byte_count_bindings",
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "iam_source_action": "s3:GetObjectVersion",
+        "transport_version_query_and_response_bound": True,
+        "retention_implementation_preserved": True,
+        "watchdog_launch_interlock_preserved": True,
+        "network_quota_kind": "nftables_ip_packet_quota",
+        "wire_or_billing_byte_cap_claimed": False,
+        "consequent_hash_or_size_changes": sorted(
+            name for name in final if final[name] != base[name]
+        ),
+        "prior_evidence_byte_identical": True,
+        "cloud_calls": 0,
+        "payload_reads": 0,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "outputs": {
+            name: {"bytes": len(raw), "sha256": sha(raw)} for name, raw in sorted(final.items())
+        },
+    }
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in sorted((files | {"release.json": encode(report)}).items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("repaired_source_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

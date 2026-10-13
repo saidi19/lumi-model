@@ -1,0 +1,198 @@
+"""Actual cloud validators plus qualification join; AWS/SSH remain synthetic."""
+
+import copy
+import importlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_fresh_host_v1 as fresh
+from tests import test_sft_vm_initial_provisioning_v1 as provision
+from tests import test_sft_vm_runtime_qualification_v1 as fixtures
+
+m = importlib.import_module("prepare_sft_vm_native_admission_v1")
+actual_qualification = m.qualification._qualify_prepared_channel_once
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.host = self.root / "host"
+        (self.host / "host-setup/connection").mkdir(parents=True)
+        self.key = self.host / "connection-key"
+        self.key.write_bytes(b"SYNTHETIC-KEY")
+        self.key.chmod(0o600)
+        self.data, self.launch, _ = fresh.fixture()
+        self.cloud = fresh.Cloud(self.data)
+        self.report = dict(setup_completed=True, total_control_content_bytes_charged=18000000)
+        self.provisioned = dict(
+            binding=fresh.prior.B,
+            report=self.report,
+            launch_monotonic=0,
+            host_deadline_monotonic=14400,
+        )
+        self.write("binding.json", fresh.prior.B)
+        self.write("result.json", self.report)
+        self.write("launch.json", self.launch)
+        self.write("host-setup/initial-proof.json", provision.proof())
+        _, fingerprint = m.connection.host_key(
+            dict(InstanceId=fresh.prior.B["instance"], Output=fresh.prior.CONSOLE),
+            fresh.prior.B["instance"],
+        )
+        self.previous = dict(
+            status="prepared_pinned_connection_not_native_admission",
+            control_plane_matches=True,
+            native_host_admitted=False,
+            host_key_fingerprint=fingerprint,
+        )
+        self.write("host-setup/connection/result.json", self.previous)
+        self.answer = dict(
+            status="generated_runtime_qualified_and_reaped_not_admission",
+            qualification_completed=True,
+            host_admitted=False,
+            binding_created=False,
+            control_content_bytes_charged=300000,
+            observation=fixtures.reply(),
+        )
+        self.qualify = self.enterContext(
+            patch.object(
+                m.qualification, "_qualify_prepared_channel_once", return_value=self.answer
+            )
+        )
+
+    def write(self, name, value):
+        path = self.host / name
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    def call(self, **changes):
+        return m._prepare_native_admission_once(
+            self.provisioned,
+            self.host,
+            self.root / "prepared",
+            cloud=self.cloud,
+            clock=changes.get("clock", lambda: 100),
+            wait=lambda _: None,
+        )
+
+    def test_actual_cloud_readback_validators_then_original_boot_and_budget_passed(self):
+        result = self.call()
+        self.assertEqual(result["cloud_observation_calls"], 12)
+        self.assertEqual(result["total_control_content_bytes_charged"], 18300000)
+        self.assertTrue(result["native_qualification_completed"])
+        self.assertFalse(result["host_admitted"] or result["binding_created"])
+        args, kw = self.qualify.call_args
+        self.assertEqual(args[-1]["machine_id"], provision.proof()["machine_id"])
+        self.assertEqual(args[-1]["boot_id"], provision.proof()["boot_id"])
+        self.assertEqual(kw["remaining_control_bytes"], 32 * 1024**2 - 18000000)
+        self.assertEqual(kw["host_deadline"], 14400)
+        self.assertEqual(kw["deadline"], 800)
+        self.assertTrue(all(op.startswith(("describe-", "get-")) for _, op, _ in self.cloud.calls))
+        self.assertFalse(any("binding.json" == p.name for p in (self.root / "prepared").rglob("*")))
+
+    def test_existing_output_is_consumed_before_any_cloud_action(self):
+        self.call()
+        calls = len(self.cloud.calls)
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(len(self.cloud.calls), calls)
+        self.qualify.assert_called_once()
+
+    def test_actual_preparation_delivery_and_pinned_commands_join_with_only_remote_io_doubled(self):
+        request = dict(
+            schema="lumi.vm-detached-setup-request.v0.1",
+            attempt=fresh.prior.B["attempt"],
+            machine_id=provision.proof()["machine_id"],
+            boot_id=provision.proof()["boot_id"],
+            volumes={k: fresh.prior.B[k] for k in ("root_volume", "work_volume")},
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14300,
+        )
+        states = importlib.import_module("run_sft_vm_runtime_qualification_detached_v1")
+        responses = [
+            dict(
+                request=request,
+                observed_boottime=1000,
+                host_admitted=False,
+                binding_created=False,
+                retry_allowed=False,
+            ),
+            states.result("dispatch_requested"),
+            states.result("returned", observation=fixtures.reply()),
+            states.result("completed", observation=fixtures.reply()),
+        ]
+        self.qualify.side_effect = actual_qualification
+        with patch.object(
+            m.qualification.sender,
+            "pipe_exchange",
+            side_effect=lambda *_: json.dumps(responses.pop(0)).encode(),
+        ) as ssh:
+            result = self.call()
+        self.assertTrue(result["native_qualification_completed"])
+        self.assertEqual(ssh.call_count, 4)
+        self.assertTrue(all(call.args[2] <= 80 for call in ssh.call_args_list))
+        self.assertFalse(result["host_admitted"])
+
+    def test_bound_disk_identity_mismatch_rejected_before_cloud(self):
+        changed = dict(fresh.prior.B, work_volume="vol-" + "9" * 17)
+        self.write("binding.json", changed)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.calls, [])
+        self.qualify.assert_not_called()
+
+    def test_original_host_deadline_cannot_be_renewed(self):
+        self.provisioned["host_deadline_monotonic"] += 100
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_frozen_fresh_host_age_window_not_bypassed(self):
+        with self.assertRaises(ValueError):
+            self.call(clock=lambda: 1350)
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_live_volume_encryption_failure_blocks_qualification(self):
+        self.data["volumes"]["Volumes"][1]["Encrypted"] = False
+        with self.assertRaises(ValueError):
+            self.call()
+        self.qualify.assert_not_called()
+
+    def test_live_snapshot_or_multiattach_violation_blocks_qualification(self):
+        self.data["volumes"]["Volumes"][1]["MultiAttachEnabled"] = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.qualify.assert_not_called()
+
+    def test_refreshed_host_key_must_match_original_setup(self):
+        self.previous["host_key_fingerprint"] = "changed"
+        self.write("host-setup/connection/result.json", self.previous)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.qualify.assert_not_called()
+
+    def test_qualification_failure_keeps_stop_responsibility_and_scrubs_error(self):
+        self.qualify.side_effect = ValueError("private-error")
+        with self.assertRaises(ValueError):
+            self.call()
+        raw = (self.root / "prepared/result.json").read_text()
+        self.assertNotIn("private-error", raw)
+        report = json.loads(raw)
+        self.assertTrue(report["outer_stop_required_on_failure"])
+        self.assertFalse(report["native_qualification_completed"])
+
+    def test_forged_qualification_cannot_create_admission(self):
+        self.answer["observation"] = copy.deepcopy(self.answer["observation"])
+        self.answer["observation"]["host_admitted"] = True
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_public_entry_cannot_launch(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

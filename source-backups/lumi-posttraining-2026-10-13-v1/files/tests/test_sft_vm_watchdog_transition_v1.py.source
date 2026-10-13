@@ -1,0 +1,64 @@
+"""Synthetic transition coverage; no native qualification or artifact access."""
+
+import copy
+import unittest
+from unittest.mock import patch
+
+from tests.test_sft_vm_network_bootstrap_v2 import m, policy, prior
+
+
+class WatchdogTransitionTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = prior.snapshot()
+        self.before = policy.inspect(prior.encode(self.rows))
+
+    def observe(self, rows, done, transitioned=False):
+        with (
+            patch.object(m, "setup_finished", return_value=done),
+            patch.object(m, "snapshot", return_value=prior.encode(rows)),
+        ):
+            return m.observe(policy, self.before, transitioned)
+
+    def test_pending_setup_preserves_gate(self):
+        _, transitioned, done = self.observe(self.rows, False)
+        self.assertFalse(transitioned)
+        self.assertFalse(done)
+
+    def test_receipt_before_gate_removal_is_allowed(self):
+        _, transitioned, done = self.observe(self.rows, True)
+        self.assertFalse(transitioned)
+        self.assertTrue(done)
+
+    def test_gate_removal_requires_completed_receipt(self):
+        with self.assertRaises(ValueError):
+            self.observe(self.rows[:-1], False)
+
+    def test_completed_transition_preserves_counters(self):
+        after, transitioned, done = self.observe(self.rows[:-1], True)
+        self.assertTrue(transitioned)
+        self.assertTrue(done)
+        self.assertEqual(after["used"], self.before["used"])
+
+    def test_transition_cannot_revert(self):
+        with self.assertRaises(ValueError):
+            self.observe(self.rows, True, transitioned=True)
+
+    def test_completed_receipt_cannot_disappear(self):
+        with self.assertRaises(ValueError):
+            self.observe(self.rows[:-1], False, transitioned=True)
+
+    def test_completed_receipt_does_not_allow_depleted_quota(self):
+        rows = copy.deepcopy(self.rows[:-1])
+        rows[1]["quota"]["used"] = policy.QUOTAS["all_in"]
+        with self.assertRaises(ValueError):
+            self.observe(rows, True)
+
+    def test_completed_receipt_does_not_allow_changed_identity(self):
+        rows = copy.deepcopy(self.rows[:-1])
+        rows[1]["quota"]["handle"] += 1000
+        with self.assertRaises(ValueError):
+            self.observe(rows, True)
+
+
+if __name__ == "__main__":
+    unittest.main()

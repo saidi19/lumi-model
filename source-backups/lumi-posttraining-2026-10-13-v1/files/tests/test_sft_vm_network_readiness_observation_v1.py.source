@@ -1,0 +1,221 @@
+"""Offline tests only; no credentials, cloud calls, or model access."""
+
+import copy
+import importlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("observe_sft_vm_network_readiness_v1")
+
+
+class ReadinessTests(unittest.TestCase):
+    def test_complete_synthetic_snapshot_and_sdk_request_shapes(self):
+        import botocore.session
+        import botocore.validate
+
+        from tests import test_sft_vm_cleanup_store_v1 as old
+        from tests.test_sft_vm_private_network_v1 import fixture
+
+        bucket = old.StoreTests()
+        bucket.setUp()
+        selected = fixture()
+        table, gateway = selected["public_route_table"], selected["public_default_gateway"]
+        values = {
+            "describe-vpcs": {
+                "Vpcs": [
+                    dict(
+                        VpcId=m.selection.VPC,
+                        OwnerId=m.selection.ACCOUNT,
+                        State="available",
+                        CidrBlockAssociationSet=[
+                            dict(CidrBlock="172.31.0.0/16", CidrBlockState=dict(State="associated"))
+                        ],
+                    )
+                ]
+            },
+            "describe-subnets": {
+                "Subnets": [
+                    dict(
+                        SubnetId=s["id"],
+                        OwnerId=s["owner"],
+                        VpcId=s["vpc"],
+                        CidrBlock=s["cidr"],
+                        AvailabilityZone=s["az"],
+                        State=s["state"],
+                        AssignIpv6AddressOnCreation=False,
+                        AvailableIpAddressCount=4000,
+                    )
+                    for s in selected["subnets"]
+                ]
+            },
+            "describe-route-tables": {
+                "RouteTables": [
+                    dict(
+                        RouteTableId=table,
+                        OwnerId=m.selection.ACCOUNT,
+                        VpcId=m.selection.VPC,
+                        Associations=[dict(Main=True)],
+                        Routes=[
+                            dict(
+                                DestinationCidrBlock="0.0.0.0/0", State="active", GatewayId=gateway
+                            )
+                        ],
+                    )
+                ]
+            },
+            "describe-internet-gateways": {
+                "InternetGateways": [
+                    dict(
+                        OwnerId=m.selection.ACCOUNT,
+                        Attachments=[dict(State="available", VpcId=m.selection.VPC)],
+                    )
+                ]
+            },
+            "describe-nat-gateways": {"NatGateways": []},
+            "describe-addresses": {"Addresses": []},
+        }
+        calls = []
+
+        def read(service, op, **fields):
+            calls.append((service, op, fields))
+            if service in {"sts", "s3api"}:
+                return bucket.read(service, op, **fields)
+            if service == "service-quotas":
+                entry = next(q for q in m.QUOTAS.values() if q[1] == fields["QuotaCode"])
+                return {
+                    "Quota": dict(
+                        ServiceCode=entry[0],
+                        QuotaCode=entry[1],
+                        QuotaName=entry[2],
+                        GlobalQuota=False,
+                        Value=100,
+                    )
+                }
+            if service == "pricing":
+                usage = fields["Filters"][1]["Value"]
+                dim = dict(
+                    beginRange="0",
+                    endRange="Inf",
+                    unit="GB" if usage.endswith("Bytes") else "Hrs",
+                    pricePerUnit=dict(USD="0.005" if "IPv4" in usage else "0.045"),
+                )
+                product = dict(
+                    product=dict(attributes=dict(usagetype=usage)),
+                    terms=dict(
+                        OnDemand={
+                            "one": dict(
+                                effectiveDate="2026-09-01T00:00:00Z", priceDimensions={"one": dim}
+                            )
+                        }
+                    ),
+                )
+                return {"PriceList": [json.dumps(product)]}
+            return copy.deepcopy(values[op])
+
+        report = {}
+        m.observe(types.SimpleNamespace(cli=read), report)
+        self.assertTrue(report["store_snapshot_passed"] and report["network_snapshot_passed"])
+        self.assertEqual(len(calls), 22)
+        sdk = botocore.session.Session()
+        for service, op, fields in calls:
+            name = "".join(word.capitalize() for word in op.split("-"))
+            shape = (
+                sdk.get_service_model("s3" if service == "s3api" else service)
+                .operation_model(name)
+                .input_shape
+            )
+            botocore.validate.validate_parameters(fields, shape)
+
+    def test_transport_no_writes_or_foreign_bucket(self):
+        cloud = m.Cloud()
+        with patch.object(m.subprocess, "run") as call:
+            for service, operation, fields in (
+                ("ec2", "run-instances", {}),
+                ("s3api", "put-bucket-policy", {}),
+                ("s3api", "get-object", {}),
+                ("s3api", "get-bucket-policy", {"Bucket": "foreign"}),
+            ):
+                with self.assertRaises(ValueError):
+                    cloud.cli(service, operation, **fields)
+            call.assert_not_called()
+
+    def test_transport_partial_failed_or_large_response_rejected(self):
+        for stdout, code in ((b'{"NextToken":"more"}', 0), (b"{}", 1), (b" " * 524289, 0)):
+            response = types.SimpleNamespace(stdout=stdout, stderr=b"", returncode=code)
+            with patch.object(m.subprocess, "run", return_value=response):
+                with self.assertRaises(ValueError):
+                    m.Cloud().cli("sts", "get-caller-identity")
+
+    def test_transport_single_attempt_raw_json_no_stdin_file(self):
+        response = types.SimpleNamespace(stdout=b"{}", stderr=b"", returncode=0)
+        with patch.object(m.subprocess, "run", return_value=response) as call:
+            cloud = m.Cloud()
+            cloud.cli("sts", "get-caller-identity")
+            self.assertEqual(call.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+            self.assertNotIn("file:///dev/stdin", call.call_args.args[0])
+            cloud.calls = 24
+            with self.assertRaises(ValueError):
+                cloud.cli("sts", "get-caller-identity")
+            self.assertEqual(call.call_count, 1)
+
+    def test_route_explicit_precedes_main_and_rejects_nat_blackhole(self):
+        main = dict(RouteTableId="rtb-main", Associations=[dict(Main=True)], Routes=[])
+        explicit = dict(
+            RouteTableId="rtb-explicit",
+            Associations=[dict(SubnetId=m.selection.PUBLIC_SUBNET)],
+            Routes=[dict(DestinationCidrBlock="0.0.0.0/0", State="active", GatewayId="igw-target")],
+        )
+        self.assertEqual(m.public_route([main, explicit]), ("rtb-explicit", "igw-target"))
+        for change in (dict(State="blackhole"), dict(GatewayId="nat-other")):
+            bad = copy.deepcopy(explicit)
+            bad["Routes"][0].update(change)
+            with self.assertRaises(ValueError):
+                m.public_route([bad])
+
+    def test_quota_identity_capacity_and_finite_value(self):
+        q = dict(
+            ServiceCode="vpc", QuotaCode="known", QuotaName="exact", GlobalQuota=False, Value=5
+        )
+        self.assertEqual(m.headroom(q, "vpc", "known", "exact", 4)["required_additional"], 1)
+        for change in (
+            dict(Value=4),
+            dict(Value=float("nan")),
+            dict(QuotaName="other"),
+            dict(GlobalQuota=True),
+        ):
+            with self.assertRaises(ValueError):
+                m.headroom(q | change, "vpc", "known", "exact", 4)
+
+    def test_price_exact_unambiguous_unbounded_tier(self):
+        product = dict(
+            product=dict(attributes=dict(usagetype="NatGateway-Hours")),
+            terms=dict(
+                OnDemand={
+                    "term": dict(
+                        effectiveDate="2026-09-01T00:00:00Z",
+                        priceDimensions={
+                            "dim": dict(
+                                beginRange="0",
+                                endRange="Inf",
+                                unit="Hrs",
+                                pricePerUnit=dict(USD="0.045"),
+                            )
+                        },
+                    )
+                }
+            ),
+        )
+        cloud = types.SimpleNamespace(cli=lambda *a, **k: {"PriceList": [json.dumps(product)]})
+        self.assertEqual(m.price_rows(cloud, "AmazonEC2", "NatGateway-Hours")["usd"], "0.045")
+        cloud.cli = lambda *a, **k: {"PriceList": []}
+        with self.assertRaises(ValueError):
+            m.price_rows(cloud, "AmazonEC2", "NatGateway-Hours")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,191 @@
+"""Diagnostic-only source fragment. Private transport; not execution authority."""
+
+import json
+import os
+import selectors
+import signal
+import subprocess
+import time
+
+MAX_REPLY = 4096
+EXCHANGE_STAGES = frozenset(
+    {
+        "arguments",
+        "spawn",
+        "setup",
+        "deadline",
+        "select",
+        "write",
+        "read",
+        "reply_limit",
+        "wait",
+        "exit",
+        "cleanup",
+        "unknown",
+    }
+)
+EXIT_KINDS = frozenset({"none", "zero", "exit_2", "exit_255", "other_nonzero", "signal"})
+REMOTE_STAGES = frozenset(
+    {
+        "none",
+        "alarm",
+        "parents",
+        "source_read",
+        "source_hash",
+        "module_load",
+        "source_recheck",
+        "guard_proof",
+        "reply_write",
+    }
+)
+
+
+class ExchangeFailure(ValueError):
+    def __init__(self, stage, exit_kind="none", remote_stage="none"):
+        super().__init__("ssh_exchange_failed")
+        self.stage = stage if type(stage) is str and stage in EXCHANGE_STAGES else "unknown"
+        self.exit_kind = exit_kind if type(exit_kind) is str and exit_kind in EXIT_KINDS else "none"
+        self.remote_stage = (
+            remote_stage if type(remote_stage) is str and remote_stage in REMOTE_STAGES else "none"
+        )
+
+
+def exchange_diagnostic(error):
+    if type(error) is not ExchangeFailure:
+        return dict(exchange_stage="unknown", exit_kind="none", remote_stage="none")
+    # Revalidate attributes; never trust exception text or arbitrary attributes.
+    clean = ExchangeFailure(error.stage, error.exit_kind, error.remote_stage)
+    return dict(
+        exchange_stage=clean.stage, exit_kind=clean.exit_kind, remote_stage=clean.remote_stage
+    )
+
+
+def remote_failure_stage(raw):
+    if type(raw) is not bytes or len(raw) > 256:
+        return "none"
+
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+        if (
+            type(value) is dict
+            and set(value) == {"schema", "code"}
+            and value["schema"] == "lumi.initial-proof-failure.v1"
+            and type(value["code"]) is str
+            and value["code"] in REMOTE_STAGES - {"none"}
+        ):
+            return value["code"]
+    except (ValueError, TypeError, UnicodeError):
+        pass
+    return "none"
+
+
+def pipe_exchange(argv, body, timeout):
+    """Original transport bounds and cleanup; only fixed failure metadata added."""
+    if not (0 < timeout <= 100 and type(body) in {bytes, bytearray} and len(body) <= 65536):
+        raise ExchangeFailure("arguments") from None
+    env = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    env.update(
+        PATH="/usr/bin:/bin:/opt/homebrew/bin", LC_ALL="C", AWS_MAX_ATTEMPTS="1", AWS_PAGER=""
+    )
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=env,
+        )
+    except BaseException:
+        raise ExchangeFailure("spawn") from None
+    stage, exit_kind, remote_stage = "setup", "none", "none"
+    try:
+        deadline = time.monotonic() + timeout
+        reply, offset = bytearray(), 0
+        with selectors.DefaultSelector() as selector:
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ, "read")
+            if body:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, "write")
+            else:
+                process.stdin.close()
+            while selector.get_map():
+                stage = "deadline"
+                remaining = deadline - time.monotonic()
+                if not remaining > 0:
+                    raise ExchangeFailure(stage)
+                stage = "select"
+                events = selector.select(remaining)
+                if not events:
+                    raise ExchangeFailure(stage)
+                for key, _ in events:
+                    if key.data == "write":
+                        stage = "write"
+                        try:
+                            count = os.write(key.fd, memoryview(body)[offset:])
+                        except BlockingIOError:
+                            continue
+                        if not count > 0:
+                            raise ExchangeFailure(stage)
+                        offset += count
+                        if offset == len(body):
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                    else:
+                        stage = "read"
+                        try:
+                            chunk = os.read(key.fd, MAX_REPLY + 1 - len(reply))
+                        except BlockingIOError:
+                            continue
+                        reply.extend(chunk)
+                        stage = "reply_limit"
+                        if len(reply) > MAX_REPLY:
+                            raise ExchangeFailure(stage)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+            stage = "wait"
+            code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            exit_kind = (
+                "zero"
+                if code == 0
+                else "exit_2"
+                if code == 2
+                else "exit_255"
+                if code == 255
+                else "signal"
+                if code < 0
+                else "other_nonzero"
+            )
+            if code != 0:
+                # A recognized remote envelope is still failure, never admission.
+                remote_stage = remote_failure_stage(bytes(reply)) if code == 2 else "none"
+                raise ExchangeFailure("exit", exit_kind, remote_stage)
+        return bytes(reply)
+    except ExchangeFailure:
+        raise
+    except BaseException:
+        raise ExchangeFailure(stage, exit_kind, remote_stage) from None
+    finally:
+        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            process.stdin.close()
+            process.stdout.close()
+        except BaseException:
+            raise ExchangeFailure("cleanup", exit_kind, remote_stage) from None
+
+
+def run(**_arguments):
+    raise ValueError("diagnostic_fragment_not_execution_authority") from None

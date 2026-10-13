@@ -1,0 +1,74 @@
+# SFT execution status v0.116
+
+2026-09-26. The generation-stable child ownership and reap primitive for the
+write-guard process composition is implemented and locally verified. **This
+closes the pidfd child-lifecycle design primitive, but it does not fork or run
+the process composition; Gate 5 remains incomplete.** No real process, signal,
+waitid, pidfd, socket, cgroup, listener, payload, remote mutation, GPU
+operation, inference or training occurred.
+
+## Completed
+
+- A fresh numeric child PID is used exactly once for `pidfd_open`. All later
+  liveness, termination, wait, reap and close operations are bound to the
+  resulting pidfd; there is no `waitpid`, numeric-PID signal, process scan,
+  `Popen` fallback or retry.
+- Admission requires one non-inheritable descriptor, stable fdinfo identity,
+  exact guardian/broker/worker role, one process/thread owner and an unchanged
+  absolute deadline. Initial non-consuming `waitid(P_PIDFD)` plus pidfd poll
+  proves that an already-exited child is not returned as live.
+- Termination is one-shot `pidfd_send_signal(SIGKILL)`. A
+  `ProcessLookupError` is only a race indication; an observed and consumed
+  `waitid(P_PIDFD)` event is still required before reap is claimed.
+- Reap performs a non-consuming observation followed by one matching consuming
+  event. It accepts only the bound child and valid exit/killed/dumped shapes.
+  Only a normal status-zero exit satisfies success; abnormal exit can be
+  consumed for cleanup without claiming success.
+- Close is allowed only after reap. The stored descriptor is revoked before
+  its final identity check, so descriptor replacement is not closed and an
+  ambiguous close can never be retried.
+- Failed initial admission performs bounded terminate, actual consuming reap
+  and close when identity remains known. Uncertain cleanup fails closed as
+  `cleanup_unconfirmed`.
+- Snapshots expose only role and aggregate counts/booleans—no PID, pidfd,
+  fdinfo identity, raw exit event or exception text.
+
+## Verification
+
+**878 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 21 new child-lifecycle tests plus the previous 857
+regressions. All pidfd-open, identity, waitid, poll, signal, clock and close
+boundaries in the new tests are synthetic.
+
+Syntax/AST checks pass for the two new files on both runtimes; maximum line
+length is 89 and trailing whitespace is zero. Tests used `-B`, and no bytecode
+file for the new component is present. The five predecessor-plan bindings and
+all six new-plan bindings match their recorded sizes and SHA-256 values.
+
+Development record:
+`configs/lumi-4b-sft-write-child-lifecycle-development-v0.1.json`.
+
+SHA-256: `0ca43a41df8296d299868bf63e9c6091db30a9b1b93298e014ec0cb6c5edef8d`.
+
+Verification:
+`evidence/lumi-4b-sft-write-child-lifecycle-development-verification-v0.1.json`.
+
+SHA-256: `1c7dd6fae9364466543a8d96fcbbe3b25e593c44e93c51255cd5f4be0c99ab22`.
+
+## Exact next work and unchanged boundary
+
+The next successor must implement the actual fully doubled private composition
+over the frozen topology and this child owner: controller forks and pidfd-binds
+guardian; guardian adopts its prefork topology, creates the lease, forks and
+pidfd-binds broker and worker; every process closes down to its exact final
+descriptor set. Cleanup must use only these pidfd owners.
+
+After that, one fixed controller event loop must verify READY before guardian
+arm, reserve aggregate bytes and receive ACK before each broker CONTINUE,
+verify CONSUMED, collect terminal reports, and enforce the absolute cleanup
+deadline. Listener/drop/seal/full-size bootstrap integration and a separately
+authorized Linux native qualification still follow.
+
+GPU is still unnecessary. No S3 or other remote availability check was made.
+Real import, training and production remain disabled. The new source, test and
+three records are local and untracked; nothing was staged, committed or pushed.

@@ -1,0 +1,393 @@
+"""Private full-size controller/guardian lifecycle, not execution admission.
+
+The public API is unconditionally closed. Internal calls require a separately
+admitted, authenticated staged entry/runtime/rootfs and native write boundary;
+none is manufactured here. Local tests replace every native boundary with
+doubles. Never invoke the private path natively on the Mac.
+
+Reuses the pinned independent controller, owned cgroup lease and parent watcher,
+but not the synthetic driver's hidden 220-second worker deadline. One absolute
+deadline is passed unchanged; bounded cleanup does not renew the import budget.
+Capacity, read-only mounts and cooperative content reservations do not enforce
+cumulative arbitrary native writes. Guardian death/hostile root remain outside
+this claim. No old source, qualification manifest or evidence is modified.
+"""
+
+from __future__ import annotations
+
+import os
+import select
+import signal
+import socket
+import time
+import uuid
+
+from . import posttraining_checkpoint_fullsize_bootstrap_v1 as child_bootstrap
+from . import posttraining_checkpoint_fullsize_entry_v1 as entry
+from . import posttraining_checkpoint_fullsize_guard_v1 as preparation
+from . import posttraining_checkpoint_guard_composition_v3 as frozen
+
+SCHEMA = "lumi.checkpoint-fullsize-guard-result.v0.1"
+BASE_SHA256 = frozen.BASE_SHA256
+FIXED_LIMITS = {"pids_max": 256, "cpu_quota_us": 200_000, "cpu_period_us": 100_000}
+CLEANUP_NS = 10_000_000_000
+ERROR_CODES = frozenset({"host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "environment_rejected", "already_attempted", "worker_rejected", "packet_rejected",
+    "guard_failed", "cleanup_unconfirmed", "deadline_exhausted", "parent_lost"})
+NONCLAIMS = ("execution_permitted", "host_admission_verified", "runtime_origin_authenticated",
+    "source_immutability_verified", "external_writer_exclusion_verified",
+    "native_cumulative_write_enforcement_verified", "arbitrary_native_writes_metered",
+    "guardian_death_cleanup_verified", "hostile_root_containment_verified",
+    "fullsize_native_qualification_verified", "real_4b_import", "training_authorized",
+    "production_eligible", "gate_5_complete", "retry_allowed")
+ENV_BINDINGS = {
+    "LUMI_IMPORT_SOURCE_MANIFEST_SHA256": "source_manifest_sha256",
+    "LUMI_FULLSIZE_ENTRY_SHA256": "entry_sha256",
+    "LUMI_FULLSIZE_CONTROL_SHA256": "control_sha256",
+    "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256": "attempt_nonce_sha256",
+}
+_ATTEMPTED = False
+_canonical = frozen._canonical
+_packet = frozen._packet
+_receive = frozen._receive
+_load_base = frozen._load_base
+
+
+class FullsizeCompositionError(ValueError):
+    def __init__(self, code="guard_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "guard_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code="guard_failed"):
+    if not value:
+        raise FullsizeCompositionError(code) from None
+
+
+def run_fullsize_guard(**_arguments):
+    """No flag, digest, supplied identity or success receipt opens admission."""
+    raise FullsizeCompositionError("host_guard_not_bound") from None
+
+
+def _worker(value, prepared_entry):
+    """Exact allowlisted entry summary, checked against the parent's own plan."""
+    fixed = {
+        "schema": entry.SCHEMA,
+        "status": "coordinator_returned_parent_verification_required",
+        "coordinator_passes": 1, "checkpoint_full_audits": 2, "tokenizer_full_audits": 2,
+        "input_files": sum(map(len, prepared_entry["inventories"].values())),
+        "input_bytes": sum(sum(rows.values()) for rows in prepared_entry["inventories"].values()),
+        **prepared_entry["bindings"], **dict.fromkeys(entry.FALSE_FLAGS, False),
+    }
+    counters = {
+        "coordinator_read_bytes_reserved": prepared_entry["limits"][
+            "maximum_coordinator_read_bytes"],
+        "private_write_bytes_reserved": prepared_entry["limits"]["maximum_private_write_bytes"],
+    }
+    _need(type(value) is dict and set(value) == set(fixed) | set(counters)
+          | {"coordinator_result_sha256"}, "worker_rejected")
+    _need(all(type(value[key]) is type(expected) and value[key] == expected
+              for key, expected in fixed.items()), "worker_rejected")
+    _need(entry._pin(value["coordinator_result_sha256"])
+          and all(type(value[key]) is int and 0 < value[key] <= cap
+                  for key, cap in counters.items()), "worker_rejected")
+    return dict(value)
+
+
+def _cleanup_stop(deadline_ns):
+    return min(deadline_ns + CLEANUP_NS, time.monotonic_ns() + CLEANUP_NS)
+
+
+def _await_start(channel, token, deadline_ns):
+    """A child cannot start setup before its parent owns a termination pidfd."""
+    stop = min(deadline_ns, time.monotonic_ns() + CLEANUP_NS)
+    _need(_packet(channel, stop) == token, "packet_rejected")
+    _need(time.monotonic_ns() < deadline_ns, "deadline_exhausted")
+    _need(not select.select([channel], [], [], 0)[0], "packet_rejected")
+
+
+def _signal_if_alive(pidfd):
+    """One signal attempt using an owned generation-bound handle, never a PID."""
+    if not select.select([pidfd], [], [], 0)[0]:
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL, None, 0)
+        except ProcessLookupError:
+            pass
+
+
+def _guard(base, context, case, channel, controller_pid, _uid, _gid, _runtime, deadline_ns):
+    """Only the fresh independent guardian owns, kills and removes its leaf."""
+    parent_fd = lease = workload_channel = child_channel = worker_pidfd = None
+    killed, close_attempted, removed, cleanup_ok = [0], False, False, True
+    result = {"status": "failed", "case": case, "code": "guard_failed",
+              "empty_and_removed": False}
+    try:
+        base.close_except({channel.fileno()})
+        base.subreaper()
+        parent_fd = os.open("/sys/fs/cgroup", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                            | os.O_CLOEXEC | os.O_NONBLOCK)
+        prepared = context["prepared"]
+        limits = {**FIXED_LIMITS,
+                  "memory_max_bytes": prepared["proposed_guard_limits"]["memory_max_bytes"]}
+        lease = base.module("posttraining_sft_cgroup_v1").CgroupLease(
+            parent_fd, name="lumi-sft-" + uuid.uuid4().hex, limits=limits)
+        original_kill = lease.kill
+
+        def kill_once():
+            _need(killed[0] == 0)
+            killed[0] += 1  # An ambiguous kill is consumed too.
+            return original_kill()
+
+        lease.kill = kill_once
+        lease.verify_limits()
+        _need(lease.snapshot()["populated"] == 0)
+        workload_channel, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        group_fd = lease.fileno()
+        worker_pid = os.fork()
+        if worker_pid == 0:
+            try:
+                closing, workload_channel = workload_channel, None
+                closing.close()
+                base.close_except({group_fd, child_channel.fileno()})
+                _await_start(child_channel, b"S", deadline_ns)
+                child_bootstrap._bootstrap_admitted(group_fd, child_channel,
+                    mount_arguments=prepared["mount_arguments"], environment=context["environment"])
+            finally:
+                os._exit(2)
+        worker_pidfd = os.pidfd_open(worker_pid, 0)
+        closing, child_channel = child_channel, None
+        closing.close()
+        _need(time.monotonic_ns() < deadline_ns, "deadline_exhausted")
+        _need(workload_channel.send(b"S") == 1)
+        _need(_canonical(_receive(workload_channel, deadline_ns))
+              == _canonical(child_bootstrap.READY), "worker_rejected")
+        observed = lease.snapshot()
+        _need(observed["populated"] == observed["pids_current"] == 1)
+        released = [False]
+
+        def release():
+            _need(not released[0])
+            released[0] = True  # A partial send cannot be retried.
+            _need(workload_channel.send(b"G") == 1)
+            base.send(channel, {"phase": "armed", "case": case})
+
+        watched = base.module("posttraining_sft_cgroup_guardian_v1").watch_parent(
+            lease, expected_parent_pid=controller_pid, deadline_ns=deadline_ns,
+            cleanup_timeout_ms=10_000, release=release)
+        reason = watched.get("reason")
+        _need(reason == "workload_empty",
+              reason if reason in {"parent_lost", "deadline_exhausted"} else "guard_failed")
+        _need(killed[0] == 1 and released[0]
+              and all(watched[key] is True for key in ("kill_attempted", "empty_verified",
+                      "parent_pidfd_bound", "release_called", "pidfd_closed")))
+        stop = _cleanup_stop(deadline_ns)
+        statuses = base.wait_statuses(stop)
+        _need(worker_pid in statuses and 1 <= len(statuses) <= 4
+              and all(type(value) is int and value == 0 for value in statuses.values()))
+        observed = lease.snapshot()
+        _need(observed["populated"] == observed["pids_current"] == 0)
+        worker = _worker(_receive(workload_channel, stop), prepared["prepared_entry"])
+        _need(_packet(workload_channel, stop) == b"", "packet_rejected")
+        _need(time.monotonic_ns() < deadline_ns, "deadline_exhausted")
+        close_attempted = True
+        lease.close()
+        removed = True
+        result = {"status": "passed", "case": case, "reason": "workload_empty",
+                  "empty_and_removed": True, "workload_processes_reaped": len(statuses),
+                  "kill_attempts": killed[0], "worker": worker}
+    except BaseException as error:
+        result["code"] = error.code if type(error) is FullsizeCompositionError else "guard_failed"
+    finally:
+        if worker_pidfd is not None and not removed:
+            try:
+                # A failed or stopped pre-attachment bootstrap is outside the
+                # leaf; its independently owned pidfd is the only extra target.
+                _signal_if_alive(worker_pidfd)
+            except BaseException:
+                cleanup_ok = False
+        if worker_pidfd is None and workload_channel is not None:
+            try:
+                # No pidfd means no S release was sent. EOF denies child setup.
+                closing, workload_channel = workload_channel, None
+                closing.close()
+            except BaseException:
+                cleanup_ok = False
+        if lease is not None and not removed:
+            try:
+                if killed[0] == 0:
+                    lease.kill()
+                stop = _cleanup_stop(deadline_ns)
+                while lease.snapshot()["populated"] and time.monotonic_ns() < stop:
+                    time.sleep(0.02)
+                observed = lease.snapshot()
+                _need(observed["populated"] == observed["pids_current"] == 0)
+                base.wait_statuses(stop)
+                _need(not close_attempted)
+                close_attempted = True
+                lease.close()
+                removed = True
+            except BaseException:
+                cleanup_ok = False
+        for closing in (child_channel, workload_channel):
+            if closing is not None:
+                try:
+                    closing.close()
+                except BaseException:
+                    cleanup_ok = False
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except BaseException:
+                cleanup_ok = False
+        if worker_pidfd is not None:
+            try:
+                os.close(worker_pidfd)
+            except BaseException:
+                cleanup_ok = False
+        if not removed or not cleanup_ok:
+            result = {"status": "failed", "case": case, "code": "cleanup_unconfirmed",
+                      "empty_and_removed": False}
+        elif result["status"] == "failed":
+            result["empty_and_removed"] = True
+        try:
+            base.send(channel, result)
+        finally:
+            channel.close()
+    os._exit(0 if result["status"] == "passed" else 2)
+
+
+def _run_case(base, deadline_ns):
+    """Own one controller; preserve the supplied deadline, without a tiny-case clamp."""
+    channel = child_channel = pidfd = None
+    case, final, armed = "worker_run", None, False
+    try:
+        channel, child_channel = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        outer_pid = os.getpid()
+        controller_pid = os.fork()
+        if controller_pid == 0:
+            try:
+                closing, channel = channel, None
+                closing.close()
+                base.close_except({child_channel.fileno()})
+                _await_start(child_channel, b"C", deadline_ns)
+                base.controller(case, child_channel, outer_pid, 10001, 10001,
+                                child_bootstrap.RUNTIME, deadline_ns)
+            finally:
+                os._exit(2)
+        closing, child_channel = child_channel, None
+        closing.close()
+        pidfd = os.pidfd_open(controller_pid, 0)
+        _need(time.monotonic_ns() < deadline_ns, "deadline_exhausted")
+        _need(channel.send(b"C") == 1)
+        receive_deadline = deadline_ns + CLEANUP_NS + 2_000_000_000
+        while time.monotonic_ns() < receive_deadline:
+            if not select.select([channel], [], [], 0.1)[0]:
+                continue
+            value = _receive(channel, receive_deadline)
+            _need(value.get("case") == case, "packet_rejected")
+            if value.get("phase") == "armed":
+                _need(not armed and set(value) == {"phase", "case"}, "packet_rejected")
+                armed = True
+                continue
+            final = value
+            break
+        _need(armed and type(final) is dict and final.get("status") == "passed"
+              and final.get("empty_and_removed") is True)
+        statuses = base.wait_statuses(_cleanup_stop(deadline_ns))
+        _need(type(statuses) is dict and len(statuses) == 1 and controller_pid in statuses
+              and type(statuses[controller_pid]) is int and statuses[controller_pid] == 0)
+        _need(_packet(channel, _cleanup_stop(deadline_ns)) == b"", "packet_rejected")
+        return final
+    finally:
+        cleanup_ok = True
+        if pidfd is not None:
+            try:
+                _signal_if_alive(pidfd)
+            except BaseException:
+                cleanup_ok = False
+            try:
+                os.close(pidfd)
+            except BaseException:
+                cleanup_ok = False
+        for closing in (child_channel, channel):
+            if closing is not None:
+                try:
+                    closing.close()
+                except BaseException:
+                    cleanup_ok = False
+        _need(cleanup_ok, "cleanup_unconfirmed")
+
+
+def _run_admitted_once(*, entry_arguments, mount_arguments, environment,
+                       base_script_path, expected_base_sha256, deadline_ns):
+    """Private pre-admitted path; no caller flag establishes missing premises.
+
+    Pure validation precedes the first source read/fork. The independently
+    authenticated parent must have staged the fixed entry and exact controls,
+    excluded external writers and installed native cumulative-write enforcement.
+    These unresolved premises are why the public API remains closed.
+    """
+    global _ATTEMPTED
+    try:
+        child_bootstrap._runtime()
+    except BaseException:
+        raise FullsizeCompositionError("runtime_rejected") from None
+    _need(not _ATTEMPTED, "already_attempted")
+    try:
+        prepared = preparation.prepare_guard(entry_arguments=entry_arguments,
+                                              mount_arguments=mount_arguments)
+        copied_environment = child_bootstrap.validate_environment(environment)
+        bindings = prepared["prepared_entry"]["bindings"]
+        _need(all(copied_environment[name] == bindings[key]
+                  for name, key in ENV_BINDINGS.items()), "environment_rejected")
+        _need(type(base_script_path) is str and 0 < len(base_script_path) <= 4096
+              and type(expected_base_sha256) is str and expected_base_sha256 == BASE_SHA256,
+              "arguments_rejected")
+        now = time.monotonic_ns()
+        maximum = prepared["proposed_guard_limits"]["maximum_seconds"] * 1_000_000_000
+        _need(type(deadline_ns) is int and 0 < now < deadline_ns < 2**63
+              and deadline_ns <= now + maximum, "arguments_rejected")
+    except FullsizeCompositionError:
+        raise
+    except BaseException:
+        raise FullsizeCompositionError("arguments_rejected") from None
+    _ATTEMPTED = True
+    base = None
+    try:
+        base = _load_base(base_script_path, expected_base_sha256)
+        base.receive = _receive  # Only this new authenticated module, never frozen globals.
+        context = {"prepared": prepared, "environment": copied_environment}
+
+        def guarded(*args):
+            return _guard(base, context, *args)
+
+        base.guardian = guarded
+        base.subreaper()
+        result = _run_case(base, deadline_ns)
+        _need(type(result) is dict and set(result) == {
+            "status", "case", "reason", "empty_and_removed", "workload_processes_reaped",
+            "kill_attempts", "worker"} and result["status"] == "passed"
+            and result["case"] == "worker_run" and result["reason"] == "workload_empty"
+            and result["empty_and_removed"] is True and type(result["kill_attempts"]) is int
+            and result["kill_attempts"] == 1
+            and type(result["workload_processes_reaped"]) is int
+            and 1 <= result["workload_processes_reaped"] <= 4)
+        worker = _worker(result["worker"], prepared["prepared_entry"])
+        _need(time.monotonic_ns() < deadline_ns, "deadline_exhausted")
+        return {"schema": SCHEMA, "status": "passed_parent_admission_still_required",
+            "owned_cgroups_empty_and_removed": 1,
+            "workload_processes_reaped": result["workload_processes_reaped"], "kill_attempts": 1,
+            "controller_and_deadline_watch_installed_before_release": True,
+            "worker_exit_status_verified": True, "worker": worker,
+            **prepared["proposed_guard_limits"], **FIXED_LIMITS,
+            "tmpfs_capacity_bytes": prepared["mount_arguments"]["scratch_bytes"],
+            "shm_capacity_bytes": prepared["mount_arguments"]["shm_bytes"],
+            **dict.fromkeys(NONCLAIMS, False)}
+    except BaseException as error:
+        if base is not None:
+            try:
+                base.wait_statuses(_cleanup_stop(deadline_ns))
+            except BaseException:
+                raise FullsizeCompositionError("cleanup_unconfirmed") from None
+        code = error.code if type(error) is FullsizeCompositionError else "guard_failed"
+        raise FullsizeCompositionError(code) from None

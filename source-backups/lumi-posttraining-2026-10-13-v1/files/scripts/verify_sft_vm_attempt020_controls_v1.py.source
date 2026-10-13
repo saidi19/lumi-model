@@ -1,0 +1,203 @@
+"""Independent read-only verification of attempt-020 control deployments."""
+
+from __future__ import annotations
+
+import json
+import os
+import types
+from pathlib import Path
+
+from scripts import inspect_sft_vm_attempt019_control_targets_v1 as transport
+from scripts import sft_vm_dedicated_cleanup_bucket_v11 as bucket_source
+from scripts import verify_sft_vm_attempt019_controls_v1 as qualified
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+ACCOUNT = "573978149073"
+FUNCTION = "lumi-stop-" + ATTEMPT
+WORKER_ROLE = "lumi-stop-worker-" + ATTEMPT
+SCHEDULE_ROLE = "lumi-stop-schedule-" + ATTEMPT
+GROUP = "lumi-stop-" + ATTEMPT
+LOG_GROUP = "/aws/lambda/" + FUNCTION
+BUCKET = "lumi-cleanup-" + ATTEMPT
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/network-cleanup/"
+WATCH_OUTPUT = ROOT / (
+    "evidence/lumi-vm-attempt-020-inert-watchdog-deployment-verification-v0.1.json"
+)
+STORE_OUTPUT = ROOT / "evidence/lumi-vm-attempt-020-cleanup-bucket-verification-v0.1.json"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-020-control-plan-v0.2/plan.json"
+PLAN_SHA = "6e3a355033b684f11900bf189d17b06e6cb5fe3c43dccfa021015d47f4439ee4"
+SOURCE_RELEASE = ROOT / "artifacts/lumi-vm-attempt-020-source-v0.1/release.json"
+SOURCE_RELEASE_SHA = "059fbed8faf317fdf778cba3e29af02c5271ce4f4d76e2961381b76010a5ce52"
+SOURCE_BINDINGS = {
+    "scripts/prepare_sft_vm_deployment_bindings_v21.py": (
+        4439,
+        "2edc65d2a7e476fd206758aa9afbb3c3c6608fb8970c53fa7a8e057481be14f5",
+    ),
+    "scripts/execute_sft_vm_inert_watchdog_v13.py": (
+        8173,
+        "927329abb83f7b59f39d486d81f77b3ca8d9473fc413a2f10a7b4f2051e61d3c",
+    ),
+    "scripts/sft_vm_dedicated_cleanup_bucket_v11.py": (
+        4130,
+        "43352490e179943e258b43c124194e37b37045a78fada130f937cb5e084690ca",
+    ),
+    "configs/lumi-vm-attempt-020-watchdog-execution-proposal-v0.1.json": (
+        808,
+        "ad286f37e275238ba34672eee0c5332de85ecb752fbcff5a14cc743d8a65aed8",
+    ),
+    "configs/lumi-vm-attempt-020-watchdog-execution-approval-v0.1.json": (
+        1650,
+        "9f732ebd35ab58400f7706083679d577398721fdb160dabffda1dc88e2a63843",
+    ),
+    "configs/lumi-vm-attempt-020-cleanup-bucket-proposal-v0.1.json": (
+        780,
+        "1a623b0e3ae06512ea5a91eb099bf013cd2807182ad5f9af641c14e4e1182ffb",
+    ),
+    "configs/lumi-vm-attempt-020-cleanup-bucket-approval-v0.1.json": (
+        1839,
+        "03e53be1659a5032655b3a7752c3e167507916f74b7ad90263a9016da14af4d6",
+    ),
+    "artifacts/lumi-vm-attempt-020-control-plan-v0.2/plan.json": (21108, PLAN_SHA),
+    "artifacts/lumi-vm-attempt-020-source-v0.1/release.json": (
+        27030,
+        SOURCE_RELEASE_SHA,
+    ),
+    "artifacts/lumi-vm-attempt-020-watchdog-deployment-v0.1/entry-result.json": (
+        967,
+        "1b4c8a18d3a9452ae9b2e0cc1cc7cb7c88787eabde34147e042ffc8827344848",
+    ),
+    "artifacts/lumi-vm-attempt-020-watchdog-deployment-v0.1/deployment/result.json": (
+        593,
+        "106cc5c5eac4978a1c6a82314d8bad78c994fd75d359b85e3312fbaeaabae82c",
+    ),
+    "artifacts/lumi-vm-attempt-020-cleanup-bucket-v0.1/result.json": (
+        440,
+        "6aad9f0eb2be3c28bc61bcb9e3b38950e070c294977a1d5b7bd8b79c09225223",
+    ),
+    "artifacts/lumi-vm-attempt-020-cleanup-bucket-v0.1/started.json": (
+        169,
+        "d7f56a8fe0e94e2ce1c282b78a65ce8c5fb3ad7ef02f3a0e901efa7361dac277",
+    ),
+}
+MAX_CALLS = 28
+MAX_SECONDS = 300
+ABSENCE_CODES = {name: set(codes) for name, codes in transport.ABSENCE_CODES.items()}
+ABSENCE_CODES["s3"].add("NoSuchLifecycleConfiguration")
+VERIFICATION_TRANSPORT = types.SimpleNamespace(
+    READ_DELAYS=transport.READ_DELAYS,
+    MAX_READ_RETRIES=transport.MAX_READ_RETRIES,
+    ABSENCE_CODES=ABSENCE_CODES,
+    transient=transport.transient,
+    error_code=transport.error_code,
+)
+READBACK_ENCRYPTION = json.loads(json.dumps(bucket_source.ENCRYPTION))
+READBACK_ENCRYPTION["Rules"][0]["BucketKeyEnabled"] = False
+READBACK_ENCRYPTION["Rules"][0]["BlockedEncryptionTypes"] = {"EncryptionType": ["SSE-C"]}
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_control_verification_rejected") from None
+
+
+def bind():
+    bucket_source.ENCRYPTION = READBACK_ENCRYPTION
+    values = {
+        "ROOT": ROOT,
+        "ATTEMPT": ATTEMPT,
+        "ACCOUNT": ACCOUNT,
+        "FUNCTION": FUNCTION,
+        "WORKER_ROLE": WORKER_ROLE,
+        "SCHEDULE_ROLE": SCHEDULE_ROLE,
+        "GROUP": GROUP,
+        "LOG_GROUP": LOG_GROUP,
+        "BUCKET": BUCKET,
+        "PREFIX": PREFIX,
+        "WATCH_OUTPUT": WATCH_OUTPUT,
+        "STORE_OUTPUT": STORE_OUTPUT,
+        "PLAN": PLAN,
+        "PLAN_SHA": PLAN_SHA,
+        "SOURCE_RELEASE": SOURCE_RELEASE,
+        "SOURCE_RELEASE_SHA": SOURCE_RELEASE_SHA,
+        "SOURCE_BINDINGS": SOURCE_BINDINGS,
+        "MAX_CALLS": MAX_CALLS,
+        "MAX_SECONDS": MAX_SECONDS,
+        "transport": VERIFICATION_TRANSPORT,
+        "bucket_source": bucket_source,
+        "local": local,
+    }
+    for key, value in values.items():
+        setattr(qualified, key, value)
+    return qualified
+
+
+def local():
+    bind()
+    raw = {name: qualified.read(name, *pin) for name, pin in SOURCE_BINDINGS.items()}
+    plan = json.loads(raw[str(PLAN.relative_to(ROOT))])
+    watch = json.loads(
+        raw["artifacts/lumi-vm-attempt-020-watchdog-deployment-v0.1/entry-result.json"]
+    )
+    deployed = json.loads(
+        raw["artifacts/lumi-vm-attempt-020-watchdog-deployment-v0.1/deployment/result.json"]
+    )
+    store = json.loads(raw["artifacts/lumi-vm-attempt-020-cleanup-bucket-v0.1/result.json"])
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["execution_permitted"] is False
+        and watch["status"] == "deployed_unarmed_invocation_disabled"
+        and watch["deployment"] == deployed
+        and watch["total_control_calls"] <= 45
+        and watch["mutation_dispatches"] == 9
+        and watch["invocation"] is False
+        and watch["schedule_creation"] is False
+        and watch["instance_actions"] == 0
+        and watch["retry"] is False
+        and store["status"] == "created_private_cleanup_store_verified"
+        and store["calls"] <= 20
+        and store["mutation_dispatches"] == 6
+        and store["privacy_readback_verified"] is True
+        and store["shared_bucket_mutation"] is False
+        and store["object_access"] is False
+        and store["iam_mutation"] is False
+        and store["instance_action"] is False
+        and store["retry"] is False
+    )
+    return plan, watch, store
+
+
+def verify_live(cloud):
+    watch, store = bind().verify_live(cloud)
+    watch["schema"] = "lumi.attempt020-inert-watchdog-deployment-verification.v0.1"
+    store["schema"] = "lumi.attempt020-cleanup-bucket-verification.v0.1"
+    return watch, store
+
+
+Reads = qualified.Reads
+
+
+def run():
+    need(not WATCH_OUTPUT.exists() and not STORE_OUTPUT.exists())
+    cloud = transport.clients()
+    try:
+        watch, store = verify_live(cloud)
+    finally:
+        for client in cloud.values():
+            client.close()
+    for path, value in ((WATCH_OUTPUT, watch), (STORE_OUTPUT, store)):
+        raw = qualified.encode(value)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    print(
+        json.dumps(
+            {"watchdog": watch["status"], "cleanup_store": store["status"]},
+            sort_keys=True,
+        )
+    )
+    return watch, store
+
+
+if __name__ == "__main__":
+    run()

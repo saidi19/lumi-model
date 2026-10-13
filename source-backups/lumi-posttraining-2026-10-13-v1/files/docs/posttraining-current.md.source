@@ -1,0 +1,813 @@
+# Lumi post-training: active roadmap
+
+Updated 2026-10-01. This is the current navigation/critical-path summary, **not a
+new execution contract, gate, approval or replacement for frozen evidence**.
+The old [v0.1 roadmap](posttraining-product-roadmap-v0.1.md) and numbered status
+documents remain historical snapshots. Its opening September-5/v0.6 link and
+older token-shortfall paragraphs are not the current task list.
+
+## Where we actually are
+
+| Original gate / component | Evidence-backed position |
+| --- | --- |
+| Gates 1–4: base pretraining and backup | Recorded complete: Lumi 4B, step 76,294, 80B pretraining tokens; original private S3 lineage remains bound. S3 availability was not refreshed in this review. |
+| Gate 5: private research data selection/seal | Saved seal and independent verification pass; 309,643 train records and 19,557 validation records. |
+| Gate 5: tokenization/encoded shards | Saved independent verification passes for nine train shards and one validation shard: 11,855,217 train supervised tokens, 939,293 validation supervised tokens. No new token selection is needed to close this existing work item. |
+| Gate 5: checkpoint import | **Incomplete.** Tiny generated-input native import passed; actual full-size checkpoint import and independently verified, retained SFT package have not happened. |
+| Gate 5: synthetic native watchdog | Verified in the one-shot AWS v0.3 attempt, with independent cleanup completion. This is not complete bootstrap or real checkpoint-import qualification. |
+| Gate 6: GPU smoke/resume and SFT | Not started. A local/synthetic test count does not make this ready. |
+| Gate 7: post-SFT quality/safety evaluation | Pending the SFT checkpoint. |
+| Gate 8: serving/deployment | Pending required model, evaluation and production approvals. |
+
+Latest verified result (2026-10-01): the [v0.3 watchdog outcome](../evidence/lumi-vm-watchdog-object-outcome-v0.3.json)
+contains actual boot, ready and successful shutdown-observer receipts plus independently
+observed STOP. Automatic cleanup verification failed; its original result is preserved.
+Separate exact-resource verification and cleanup established that the new VM, volumes,
+interface, security group and private report bucket are gone, without another launch
+or report-object read. The unchanged report assessor then passed the narrow native
+watchdog check. A teardown-metadata edge case was hardened locally and 37 guarded
+tests passed, but the original cleanup error's exact transient cause was not captured.
+No repeat watchdog run is required by this outcome. The existing full-bootstrap/host
+admission and actual full-size import work below remain open; GPU/SFT has not started.
+
+Fresh-host cloud-admission join (2026-10-01): the
+[new outer setup join](../scripts/run_sft_vm_host_setup_v1.py) now connects
+[fresh launch/volume and private-route checks](../scripts/prepare_sft_vm_host_connection_v2.py)
+to the existing pinned SSH, seed/sender and guarded disk/setup delivery. The old
+host checker alone did not prove the work volume was newly created without a
+snapshot. The successor requires the provisioner's original dispatch record,
+matching client token and launch/volume timestamps, exact root snapshot, blank
+work snapshot and retained disks. It also requires an existing public-NAT-to-IGW
+route for the private VM; failures prevent SSH/setup. No NAT is created or public
+IP silently enabled. These are configuration checks, not live connectivity proof.
+
+[Fresh-host local verification](../evidence/lumi-vm-fresh-host-local-verification-v0.1.json)
+records 13 new and 365 combined passing tests with no skips or guard violations.
+The joined test exercises the actual metadata validators, connection preparation,
+seed/sender and setup delivery; only AWS responses and SSH/native execution are
+doubled. The original deadlines and control budget are forwarded. Prior disk
+sources, archive and evidence remain unchanged. Public AWS manuals were consulted;
+no AWS API, SSH, VM, model/data, native disk or GPU operation ran.
+
+**Provisioning is still incomplete:** these files consume a future authenticated
+launch record; they do not create the host. Their launch-field projection is not
+a runnable/approved request and does not bind early-stop UserData. Next is the
+single resource-creation/initial-expiry/lifecycle controller. Actual route/quota/
+price refresh, Linux admission and private retention/readback also remain open.
+No live NAT availability or new work-volume provenance has been verified here.
+
+Guarded work-disk preparation update (2026-10-01): the
+[work-disk preparer](../scripts/prepare_sft_vm_work_disk_v1.py) is now joined through
+the [current local delivery candidate](../scripts/run_sft_vm_setup_delivery_v3.py)
+and v0.5 control archive. It checks the exact distinct root/work EBS identities,
+rejects partitions, mounted/aliased work devices and existing signatures, and
+formats/mounts only after the existing host watchdog is armed. Mounted-root
+permissions and the unchanged storage checker are verified before the frozen
+download/install path. A 120-second internal preparation deadline stays inside
+the original setup deadline; it is not a separate supervisor or a restarted
+setup allowance. The original unit/watchdog still provide independent limits.
+Failures preserve partial storage and do not retry or unmount it.
+
+[Local disk-preparation verification](../evidence/lumi-vm-work-disk-local-verification-v0.1.json)
+records 82 focused and 340 combined passing tests with no skips or guard
+violations. A joined test runs the actual preparation/bootstrap and frozen
+wheel/storage/setup logic; all native commands, observations and installer work
+remain doubled. The 19-member archive preserves 17 previous member bodies.
+The previous verification and its 24 bound source/evidence/release hashes match.
+Public Linux manuals were consulted, but no AWS/SSH/VM action, actual block-device
+access, format/mount, model/data read or GPU work occurred.
+
+At this point the authenticated fresh-host provisioning/admission join was next:
+cloud provenance must prove the work volume was newly created
+without a snapshot, with encryption/retention, original deadlines and usable
+bounded egress. Empty signature output alone does not prove a new volume or
+exclude other-namespace writers. Native Linux qualification, retention/readback
+and complete full-size authorization remain open. Public execution entries stay
+closed. The cloud-check/setup connection is now recorded above; actual resource
+creation is still pending. The earlier setup entries below are historical; the
+new outer join calls the v3 delivery candidate, not the v1/v2 candidates below.
+
+Historical setup return-contract correction (2026-10-01): the frozen storage/wheel path
+returns a wrapper containing `storage_snapshot` and `setup`, but the previous
+network bootstrap compared that wrapper with a flat setup receipt. Successful
+setup would therefore be rejected before network transition. The previous tests
+mocked this boundary with a flat result; their passing count did not cover this
+actual return chain. No native full-bootstrap failure was needed to reproduce it.
+
+The [corrected bootstrap](../scripts/run_sft_vm_network_bootstrap_v3.py) validates
+the wrapper and unchanged storage floors, extracts `setup`, then still checks
+the independently saved receipt. The [then-current delivery candidate](../scripts/run_sft_vm_setup_delivery_v2.py)
+binds this correction through the versioned seed, sender, v0.4 control archive and
+detached entry. Only the bootstrap archive member changed; the other 17 members
+and all prior artifacts remain untouched. Do not use the historical v1 delivery
+candidate below for a future full bootstrap.
+
+[Correction verification](../evidence/lumi-vm-setup-return-contract-local-verification-v0.1.json)
+records 71 focused and 258 combined passing local tests, no skips, no guard
+violations and no ML imports. New tests join the actual bootstrap, wheel,
+storage and offline setup functions and their receipt parsers; native effects
+and installer execution remain doubled. This is not native qualification.
+No AWS/SSH/VM action, credential/model/data read or GPU use occurred. At that
+point concrete host/disk preparation was the next implementation task; it was
+not completed by that correction. The later disk integration is recorded above.
+
+Historical setup connection update (2026-10-01): the [detached root setup entry](../scripts/run_sft_vm_setup_detached_v1.py)
+and [controller-side setup join](../scripts/run_sft_vm_setup_delivery_v1.py) now connect
+the existing seed/control upload to the frozen network/wheel/offline setup path.
+Setup runs under one bounded systemd unit, not inside the short SSH connection.
+Later pinned connections inspect exact receipts and successful terminal state,
+then stop/reap the unit. Ambiguous dispatch or reap is not repeated. Original
+deadlines and the shared control-content budget are retained; a shutdown request
+is not claimed as independent STOP evidence. No live import binding is written.
+
+[Local verification](../evidence/lumi-vm-setup-detached-local-verification-v0.1.json)
+records 187 passing regression tests, including actual frozen bootstrap control
+flow and existing seed/sender framing with native effects doubled. The preliminary
+guard run blocked six synthetic temporary-input fixtures; its test-only path
+classification was corrected without opening actual model/credential paths.
+The final run had no guard violations or ML imports. The existing 18-file control
+archive and native watchdog evidence remain unchanged. No AWS/SSH/VM action,
+native setup, real model/data read or GPU use occurred. Remaining work is the
+concrete host/disk preparation and native admission join, private package retention
+and independent readback, then complete full-size bindings and run authorization.
+
+“Supervised tokens” above are the tokens that contribute to training loss, not
+all serialized input tokens. The saved train serialized total is 33,596,489;
+validation is 2,295,902. The existing 10M research train-supervised-token floor
+is exceeded. This does not establish model quality or production rights.
+
+The research dataset is explicitly **non-production**. Nothing here promotes
+sources, removes rights blockers, authorizes training, or claims a production
+dataset seal. No dataset/model payload was reopened for this review.
+
+## Why progress took too long
+
+The delay is not SFT GPU runtime: GPU SFT has not begun. Much of the later work
+was checkpoint-import infrastructure. The older bespoke write-meter/controller/
+guardian route accumulated complexity; [v0.120](sft-execution-status-v0.120.md)
+already selected a dedicated Linux VM and standard supervisor instead. That
+engineering detour must not be described as time needed to select SFT tokens.
+
+The necessary remaining import checks are real, but repeatedly treating small
+validators and test-count increases as the next major milestone obscured the
+distance to an actual run. The active overview also lagged behind the data
+receipts. This document corrects the status and narrows the implementation
+focus; it does not claim those unfinished checks have passed.
+
+## Critical path; no new framework project
+
+Implementation update (2026-09-28): the existing import handoff now has a
+[completion adapter](../src/lumi/posttraining_vm_fullsize_completion_v1.py)
+that runs the [existing SFT checksum consumer in a separate read-only unit](../scripts/verify_sft_vm_fullsize_package_v1.py),
+reaps it, and fsyncs/preserves the complete output/evidence tree by a same-disk
+rename. A joined tiny-package test exercises the actual checksum functions and
+filesystem preservation. This is local integration, not a real 4B run. It does
+not claim S3/off-host retention or permit instance termination.
+
+The [acquisition child](../scripts/acquire_sft_vm_fullsize_inputs_v1.py) now calls
+the existing exact-key transport/stager, and its
+[root-parent wiring](../src/lumi/posttraining_vm_fullsize_acquisition_unit_v1.py)
+connects acquisition to that same import/completion path. It uses acquisition-only
+systemd credentials, an isolated writable acquisition directory (not a writable
+alias of the release), a persistent one-shot dispatch marker and actual terminal/
+empty-cgroup readback before moving the inputs into the handoff location.
+The frozen handoff then stops the credential-bearing unit before import.
+Failures preserve partial files and do not start the next phase or retry.
+
+Local tests exercise the real frozen downloader/stager on tiny synthetic bodies
+and the actual parent filesystem handoff; native systemd/SDK and completion
+execution are doubled in these new tests. All 285 selected checks pass with no
+network/payload guard violations. This is **not** native qualification of the
+new acquisition entry or completion of Gate 5. The concrete host setup, pinned
+Linux SDK/runtime qualification, authenticated release/storage/egress admission,
+root credential-source teardown and approved off-host retention remain to be
+finished. No route, model, tokenizer, dataset or frozen kernel changed.
+
+Source/bootstrap progress: an actual offline
+[source/control bundle](../artifacts/lumi-vm-fullsize-source-release-v0.1/build.json)
+has now been assembled for a fresh prepared attempt: 49 Python source files,
+62 total members, 911,360 archive bytes. It includes the dynamically loaded
+transport module explicitly; the first closure test caught its omission before
+any host dispatch. An independent archive validator checks source/control hashes,
+exact membership, the original CPU runtime lock and the unchanged input selection.
+The new [source stager](../scripts/stage_sft_vm_fullsize_release_v1.py) lays out
+the existing paths with root-private ancestors and worker-private source/output
+directories, rejects reuse, preserves partial failures, and reads back file hashes.
+The actual bundle passed a temporary-filesystem staging rehearsal with host/UID
+admission doubled; all 303 selected local checks pass. Nothing was uploaded or
+installed, and no native staging/import ran. This closes local release assembly
+and source-layout plumbing, **not** Linux SDK/runtime qualification, full host
+admission, credential teardown or off-host backup. The frozen CPU wheel lock is
+included. The acquisition SDK artifacts below are separate from that preserved
+source-only bundle; its contents and hash have not been rewritten.
+
+Acquisition SDK progress: the [SDK lock](../configs/lumi-vm-acquisition-sdk-v0.1.lock.json)
+reuses five versions and hashes from the existing project staging lock. Public
+package metadata and the actual five wheels agree: 15,791,700 wheel bytes were
+downloaded and SHA-256 verified. The first fetch failed because this Python's
+default trust store had zero CA certificates (verification error 20). The fresh
+v0.2 fetch uses an existing hash-bound certifi bundle, keeping certificate and
+hostname verification enabled. The failed v0.1 attempt remains untouched;
+neither attempt automatically retries.
+
+A fresh SDK-only local venv was installed offline with required hashes. Its
+dependency check and all four existing wire checks pass using the unchanged
+production SDK factory, the standard SDK rather than the AWS CLI vendor alias,
+dummy credentials and doubled HTTP sends. The regular suite now passes 318
+checks (303 previous plus 15 SDK preparation/TLS tests), with zero network or
+payload guard violations during those checks. This turn did use public package
+networking; it did not read AWS credentials or S3 objects. These results are on
+Mac/Python 3.13.7, **not native Linux/Python 3.12 qualification**. The next runtime
+work is offline installation and qualification of these pinned wheels on the
+concrete Linux host. Host admission, credential teardown, approved off-host
+retention and the real full-size import remain open.
+
+Offline Linux setup is now implemented, not executed: the
+[installer](../scripts/install_sft_vm_acquisition_sdk_v1.py) consumes an exact
+11-member, 15,851,520-byte bundle containing the five verified wheels and the
+unchanged SDK-check source closure. It creates `/opt/lumi-sft-acquisition/venv`
+once, installs without an index or dependency resolution, checks dependencies,
+then runs the existing four wire checks. Failures preserve the destination and
+a fixed stage code; they cannot be retried in place. Native admission and install
+commands are doubled in the local tests; **332 selected local tests pass**.
+
+The [systemd template](../configs/lumi-vm-acquisition-sdk-install-v0.1.service)
+requires an admitted Linux x86-64/Python 3.12 host and the unit name
+`lumi-sdk-install-v1.service`. It specifies private networking, 1-GiB RAM, zero
+swap, 64 tasks and a 600-second setup deadline. It is not installed, enabled or
+dispatched. Disk admission and the combined workflow budget are still separate.
+The [deployment descriptor](../artifacts/lumi-vm-acquisition-sdk-release-v0.1/deployment.json)
+binds the current installer: its pre-execution atime-handling correction
+supersedes only the installer hash in the preserved build receipt, not the
+archive. No earlier source release or SDK evidence was changed. Do not treat
+this packaging result as a native install, host admission or S3 authorization.
+
+Concrete host preparation: [the full-size host proposal](lumi-vm-fullsize-host-run-proposal-v0.1.md)
+now selects one `r6i.4xlarge` (16 vCPU, 128 GiB), the same available Ubuntu image,
+encrypted 32-GiB root plus 128-GiB work volumes, and a four-hour whole-host
+ceiling. Read-only AWS identity, image, offering, subnet, quota and price checks
+succeeded on 2026-09-28. Compute is $1.008/hour at that observation; known
+four-hour compute/storage is about $4.10 before ancillary charges. The proposed
+$10 active-run budget is not a hard AWS billing cap. Preserved volumes would
+add about $0.421/day until approved cleanup.
+
+No host was launched. Both disks are proposed as non-auto-deleting to preserve
+real output; expiry must stop compute even if backup fails. The proposal is
+explicitly blocked on three integration outcomes: executable root host/bootstrap
+admission, acquisition credential teardown before import, and bounded private
+backup with independent readback/lifecycle. Native SDK installation alone would
+not close those gaps. The former tiny-run approval does not authorize this run.
+
+Credential handoff implementation update: the
+[new root-parent join](../src/lumi/posttraining_vm_fullsize_credential_handoff_v1.py)
+now calls the unchanged acquisition parent, removes only the authenticated root
+credential source after empty-cgroup proof, unmounts its private tmpfs without
+force/lazy flags, fsyncs an aggregate cleanup receipt, then calls the unchanged
+completion path. It preserves acquisition's successful exited state because
+the frozen handoff must validate and stop that unit itself before import.
+This avoids breaking the existing terminal gate. File unlink/unmount is not a
+claim of cryptographic erasure or AWS credential revocation.
+
+All 350 selected local checks pass (332 prior plus 18 new). Tests exercise real
+tiny-file acquisition handoff and source unlink; root ownership, Linux mounts,
+systemd operations and completion are doubled. Changed source/mount identity,
+live children, failed unlink/unmount or failed cleanup receipt prevent import.
+Failed attempts preserve aggregate records and do not retry cleanup. No real
+credential, model payload, AWS resource or native mount was accessed or changed.
+
+The cleanup **code path is now connected locally**; host bootstrap must still
+provision the root-only nonshared tmpfs with host swap disabled and properly
+scoped short-lived credentials, bind this successor in the final release and
+qualify it natively. Existing source bundles are unchanged and do not include
+the new module yet. The remaining execution integration is that admitted root
+bootstrap plus private backup/readback/lifecycle, followed by final bindings
+and bounded full-size approval. Public execution entry points remain closed.
+
+Credential provisioning is now joined locally by the
+[private root setup driver](../src/lumi/posttraining_vm_fullsize_credential_setup_v1.py).
+It creates and verifies the private 128-KiB tmpfs, reads at most 64 KiB once from
+a root-owned private pipe within five seconds, validates the temporary-credential
+shape/expiry, writes only the existing three credential fields, then invokes
+the already tested acquisition/cleanup workflow. No secret is passed in argv,
+environment or aggregate reports. A partial write is removable only when its
+inode was created by this invocation; unexpected files or ambiguous mounts
+are preserved for host-level cleanup. A preflight failure before the workflow's
+exclusive marker does not falsely transfer cleanup responsibility.
+
+The driver requires 3,675–7,200 seconds of credential validity at dispatch to
+cover the existing 3,615-second acquisition ceiling and a 60-second margin.
+A default one-hour session will fail closed; the future credential issuer must
+support the required lifetime or a separately bounded change is needed. This
+is **shape/expiry validation, not authentication of the issuer or IAM scope**.
+No AWS session was issued, real secret read, mount performed or host launched.
+
+All 366 selected local checks pass (350 prior plus 16 new); real synthetic pipes
+and temporary files are exercised while native mounts/ownership/systemd and
+completion remain doubled. Root host/runtime/source/disk/egress/expiry admission,
+authenticated least-privilege credential delivery and private backup/readback
+still need integration and native acceptance. The complete cloud launcher is
+not finished; existing source bundles remain unchanged and omit these new
+root-driver modules until the final authenticated release is assembled.
+
+The [live credential-issuer check](../evidence/lumi-vm-fullsize-credential-issuer-observation-v0.1.json)
+on 2026-09-28 found that both the default and `lumi-s3` CLI profiles resolve to
+the account root identity. Login is valid. Resolving `lumi-s3-canary` caused its
+configured role assumption to fail with AWS `AccessDenied`: root accounts may
+not assume roles. No temporary session was issued by that failed probe.
+The complete `/lumi/` role-path listing contains 13 roles: two trust only EC2,
+11 trust only Glue, and all report a 3,600-second maximum session duration.
+This is not an account-wide issuer inventory or a permissions-policy audit.
+No compatible direct issuer has been identified for the unchanged private-pipe
+contract. A non-root controller login is needed before checking the concrete
+trust, exact source permissions and achievable session duration; it alone does
+not close host admission. IAM mutations and any credential-duration or
+instance-profile contract changes require explicit approval. Root credentials
+must not be delivered to the VM. No import was retried, IAM changed, payload
+accessed, instance launched or GPU used in this check.
+
+The user subsequently authorized temporary IAM access with cleanup. A
+[live deny-all issuer check](../evidence/lumi-vm-temporary-issuer-verification-v0.1.json)
+demonstrated the non-root route: create a narrowly scoped temporary user/key,
+assume its dedicated role for 7,200 seconds, then remove all newly created IAM
+resources. The returned session had 7,199 seconds remaining, satisfying the
+unchanged lifetime requirement. Both the role and session explicitly denied
+all resource actions; there were no S3 or instance requests. The user/key, two
+inline policies and role were deleted. Independent post-process GetUser/GetRole
+checks confirmed absence. No credential is retained for subsequent work.
+
+The initial v0.1 probe stopped before IAM creation because the CLI stdin JSON
+adapter was rejected. Its code and evidence remain unchanged; v0.2 corrected
+only that adapter, passed a read-only identity precheck, and completed the live
+issuance/cleanup check. Eleven synthetic checks and Ruff pass. This establishes
+a way to bootstrap a non-root issuer without asking the user to create a new
+login; it is not exact-source permission verification, authenticated delivery,
+native host admission or a full-size run. Those need fresh just-in-time scoped
+credentials after the remaining workflow is bound. No new login is currently
+requested from the user. The old root/profile observations remain historical
+evidence, not the current blocker by themselves.
+
+The next [exact-source permission preparation](lumi-vm-acquisition-permissions-v0.1.md)
+now binds only the existing 22 selected object ARNs. The role policy explicitly
+denies other resources/actions, non-TLS transport and expired access. Its 7,237
+characters fit the role inline-policy quota, not the STS session-policy quota.
+AWS read-only simulation passed all 38 resource/action decisions in the
+corrected v0.2 matrix (23 allowed, 15 explicit denials). The v0.1 matrix's
+incorrect mixed-service resource pairing and failed result remain preserved;
+the correction changed test resources, not the source permission scope.
+Thirty-three focused local tests and Ruff pass. No IAM resources or credentials
+were created and no source requests were made. These are expiring simulation
+artifacts: future admitted issuance must build/attach/read back a fresh policy.
+Source-scoped issuer delivery, live bucket/KMS access, host admission and
+retention are **not** proven by this simulation; the runnable launcher remains
+unfinished. Do not reuse the earlier deny-all probe as a download credential.
+
+The [private source-scoped issuer](../scripts/issue_sft_vm_acquisition_credentials_v1.py)
+now connects that policy builder to temporary-user/role provisioning, policy and
+trust readback, one STS issuance, long-term-key removal before delivery, and
+owned-resource cleanup after delivery return/failure. An unpredictable owner
+tag plus resource IDs prevents cleanup of preexisting or changed-owner IAM
+resources. Role ownership/trust/policy is checked again before delivery. The
+source policy's remaining lifetime is checked alongside the STS lifetime.
+
+[Local integration evidence](../evidence/lumi-vm-acquisition-issuer-local-verification-v0.1.json)
+records 82 passing focused tests (15 new issuer cases), Ruff and a guarded run
+with zero network/process or payload/credential violations and no ML imports.
+The synthetic issuer is connected through a real pipe to the existing receiver,
+generated acquisition fixture and credential-source cleanup. IAM/STS, native
+host controls and completion are doubled. The initial guard run blocked an
+SDK import-time local IPv6 probe; the test-only import now stubs that bind, with
+the audit guard retained. This was not an outbound AWS request.
+
+No real source-scoped credentials or IAM resources were created in this update.
+The public issuer entry remains closed. Its private delivery callback is an
+integration point, **not** proof of authenticated SSH or host admission. Those
+connections, combined deadline enforcement, retention and final bindings remain
+unfinished; the new issuer is not yet in the frozen full-size release. Do not
+claim instantaneous session revocation from IAM cleanup readback or treat the
+local synthetic pass as an actual 4B import.
+
+The [host-connection preparation](../scripts/prepare_sft_vm_host_connection_v1.py)
+now provides read-only control-plane checks for a concrete future full-size
+instance: exact owned instance/endpoint/group/volume identities, healthy CPU
+host and pinned AMI owner, private SSH ingress, encrypted retained volumes,
+mandatory IMDSv2, no instance profile and shutdown-stop behavior. It extracts
+the exact instance's Ed25519 public host key from AWS console output and
+prepares strict pinned SSH configuration; raw console output is not retained.
+No rehearsal instance or private key is reused. The proposal still has no
+concrete full-size instance binding, so this code has not run against AWS.
+
+[Local evidence](../evidence/lumi-vm-host-connection-local-verification-v0.1.json)
+records 94 passing focused tests (12 new), zero guarded network/process or
+payload/credential events, and no ML imports. Separately, local `ssh -G`
+accepted the synthetic configuration and `ssh-keygen` matched the synthetic
+public-key fingerprint without connecting or reading a real private key.
+
+An important connection constraint is now explicit: AWS EICE TCP connections
+last at most 3,600 seconds, whereas the existing root-parent deadline is 8,435
+seconds. The configured connection cap is 120 seconds, for short commands.
+The workflow must detach under systemd and collect durable status over later
+read-only connections. It must not tie the entire import to one tunnel, resend
+credentials after an ambiguous send or restart a started pass. The local
+detached-parent protocol, controller-side SSH adapter and fixed root entry are
+now implemented and locally joined as described below. The admitting native
+bootstrap and installation/binding are **not yet complete**. Native
+OS/storage/runtime/expiry/egress admission and retention are still open.
+See the [AWS EICE documentation](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connect-with-ec2-instance-connect-endpoint.html).
+No launch, SSH connection, live credential issuance, model download or GPU run
+occurred in this preparation. The original proposal and source bundles remain
+unchanged. Control-plane metadata checks alone are not native host admission.
+
+Detached-parent update (2026-09-29): the
+[new local protocol](../src/lumi/posttraining_vm_detached_parent_v1.py) provides
+exclusive dispatch and delivery markers, a private FIFO into the existing
+credential workflow, separate-child cleanup through ExecStopPost, and aggregate
+read-only status without re-delivery or restart. Parent normal exit also runs
+cleanup (`RemainAfterExit=no`); credentials are not placed in argv or journals.
+A real tiny FIFO joins the existing workflow in the local fixture, while Linux
+identity, mounts, systemd and completion remain mocked. Fourteen new tests and
+108 guarded regression tests pass with zero guard violations and no ML imports;
+[the receipt](../evidence/lumi-vm-detached-parent-local-verification-v0.1.json)
+also records the corrected development-test failures. The test entry is a
+never-executed placeholder, not a runnable native controller. The subsequent
+controller-side delivery update is recorded below. No live credentials, model reads, SSH, instance launch
+or GPU were used. Frozen source files and earlier evidence are unchanged.
+
+Short-SSH delivery update (2026-09-29): the
+[controller adapter](../scripts/run_sft_vm_detached_delivery_v1.py) now constructs
+fixed dispatch/submit/status/stop commands, rechecks the prepared SSH configuration
+and host-key pins per connection, limits each exchange to 100 seconds and 4096
+reply bytes, and carries credentials only through stdin. The issuer callback
+waits for workflow completion and reaped children. Ambiguous dispatch/delivery
+does not resend; it requests stop once and checks status. If stop cannot be
+confirmed, the report says so, while the existing issuer still cleans its IAM
+resources without claiming instantaneous session revocation.
+
+The controller requires the already-running host's absolute deadline (at most
+the proposal's 14,400 seconds remaining), reserving 120 seconds for cleanup.
+It does not reset that host allowance or shorten the frozen parent limit of
+8435 seconds by mistakenly treating it as the complete controller budget.
+Thirteen new tests and 121 guarded regression tests pass, including real local
+pipes and the existing issuer with synthetic IAM/STS; SSH processes and remote
+responses are mocked. See the [receipt](../evidence/lumi-vm-detached-delivery-local-verification-v0.1.json).
+This is **not native execution**: the subsequent root-entry update is below;
+bootstrap/admission and actual deadline binding still must be supplied, followed
+by retention/readback and bounded full-size-run approval. No live AWS, SSH, model
+read, instance action or GPU was used for this update.
+
+Root-entry update (2026-09-29): the fixed
+[parent entry](../scripts/run_sft_vm_parent_entry_v1.py) now implements the
+dispatch/submit/status/serve/stop interface expected by both the short-SSH
+adapter and systemd parent. It verifies all nine pinned root-controller source
+modules before loading any of them, without `lumi.__init__` or ML imports. It
+requires the root-installed binding, matching machine/boot identity, unchanged
+prepared descriptor and the existing host deadline. Source and host/no-swap
+checks occur before credential input. Expiry blocks new work but leaves status
+and stop available on the same bound boot.
+
+Fifteen new local tests and 136 guarded regression tests pass with zero guard
+violations. The actual pinned stdlib source closure loads locally; the entry's
+dispatch/serve calls join the existing real tiny FIFO fixture. Native identity,
+systemd, ownership/mount admission and completion remain mocked, not qualified.
+See the [entry receipt](../evidence/lumi-vm-parent-entry-local-verification-v0.1.json).
+No live binding was created and this entry is not installed on Linux. A trusted
+root bootstrap still must verify native runtime, storage, egress and independent
+expiry before installing the entry/binding; root-owned metadata alone does not
+prove these premises. Next complete that native bootstrap/install integration,
+then retention/readback and the bounded full-size-run approval. Prior sources,
+receipts and worker limits remain unchanged; no AWS/GPU/model access occurred.
+
+Root-source install update (2026-09-29): before installation, review found that
+the v1 entry's complete `fstat` equality could reject a legitimate Linux read
+when `atime` changes. The [v2 entry](../scripts/run_sft_vm_parent_entry_v2.py)
+checks all identity, permission and content metadata but excludes read access
+time; the preserved v1 fails the reproducer while v2 passes. No earlier source
+or receipt was overwritten.
+
+The [root-controller installer](../scripts/stage_sft_vm_root_controller_v1.py)
+now prepares and stages a separate 112,640-byte, 11-file source overlay. It
+preserves the frozen worker archive and joins its exact prepared descriptor.
+Exclusive creation, mode-0400 files, fsync, exact readback and failure preservation
+are exercised locally. It never writes `binding.json` or `binding.sha256`, so
+source installation does not authorize execution. The actual prepared archive
+was independently unpacked and installed into a temporary directory with all
+11 files/modes matched; native identity and root ownership were doubled.
+The 160 guarded local tests include both entry versions (15 inherited v2 cases,
+two new metadata cases and seven installer cases); zero guard violations or ML
+imports. Portable unit tests use a synthetic descriptor, not private artifacts.
+See the [install receipt](../evidence/lumi-vm-root-controller-install-local-verification-v0.1.json).
+
+This closes **root-source packaging/install**, not the whole native bootstrap.
+CPU/SDK runtime setup plus storage, egress and independent expiry checks still
+must be joined before the bootstrap can create a live host binding. Retention
+and full-size run approval remain after that. No upload, native installation,
+AWS action, GPU or model/data payload access occurred.
+
+CPU-runtime setup update (2026-09-29): the
+[offline CPU installer](../scripts/install_sft_vm_cpu_runtime_v1.py) and
+[bounded unit template](../configs/lumi-vm-cpu-runtime-install-v0.1.service) now
+target the existing `/opt/lumi-sft-rehearsal/venv` path without the obsolete tiny
+rehearsal archive dependency. The original 34-package CPU lock is unchanged.
+The installer authenticates and reuses the current SDK install helpers, audits
+pre-staged read-only wheels by streamed size/hash, installs offline with required
+hashes/no dependencies, checks dependencies and reads back every locked package
+version without importing ML. A failed audit/install consumes its destination.
+The unit specifies 600 seconds, 1 GiB RAM, zero swap and disabled networking;
+its output is restricted to aggregate receipts. These are setup controls, not
+an import authorization or native ABI qualification.
+
+Nine new tests, the existing 14 SDK tests and prior regressions total 183 guarded
+passes, with no guard violations or ML imports. Native admission, pip and version
+results are mocked; no actual wheels were downloaded or installed. The initial
+local pin check caught the old SDK build hash; the implementation now uses the
+current installer binding recorded in preserved SDK deployment evidence. See the
+[CPU install receipt](../evidence/lumi-vm-cpu-runtime-install-local-verification-v0.1.json).
+Still required: staged/authenticated CPU wheels, sequential CPU/SDK/root-source
+bootstrap integration with an overall setup deadline, native storage/egress/
+expiry checks and only then a live host binding. No native bootstrap, AWS host,
+GPU, credential or model/data action occurred in this update.
+
+Setup-sequence update (2026-09-29): the
+[private bootstrap sequence](../scripts/run_sft_vm_setup_sequence_v1.py) now joins
+CPU install → SDK install → frozen worker-source staging → root-source staging.
+It authenticates fixed installer/template/archive pins and requires fresh
+destinations/units. Each independently bounded child must have a successful
+terminal, be stopped with an empty cgroup, and supply the expected aggregate
+receipt before the next step starts. The CPU/SDK templates are reused as
+transient exec units with explicit runtime limits and retained terminal state;
+they are stopped after inspection. A failed or ambiguous step preserves evidence
+and blocks the remaining sequence with no retry.
+
+The caller must supply the original remaining setup deadline (at most 1800
+seconds), with enough time for each complete next child and teardown. No live
+execution binding is written. Ten new tests and 193 guarded regressions pass;
+the sequence's native admission, systemd and installer receipts are mocked,
+while temporary exclusive/fsynced markers are real. Individual installer tests
+remain included. See the [sequence receipt](../evidence/lumi-vm-setup-sequence-local-verification-v0.1.json).
+
+This joins the four setup components, **not the entire admitted native run**.
+Authenticated input deployment, the native outer bootstrap/deadline, disk and
+network/expiry admission, then private retention/readback and bounded full-size
+approval remain. No cloud action, package download, native install, model/data
+read or GPU occurred. Earlier sources and evidence remain unchanged.
+
+Storage-to-setup update (2026-09-29): the read-only
+[storage guard](../scripts/check_sft_vm_storage_v1.py) is now joined before the
+preserved setup sequence. It matches EBS serial volume IDs and disk capacities
+to independently authenticated caller bindings, checks mount/device identity,
+private work-mount flags, available space, aliases and runtime redirection, then
+rechecks mount metadata before setup. It forwards the same machine identity and
+original deadline; it does not format, mount, read block devices or create an
+execution binding. Fourteen new tests and 207 guarded regressions pass, with
+zero guard violations and no ML imports. Four prior sequence bindings still
+match. See the [storage receipt](../evidence/lumi-vm-storage-local-verification-v0.1.json).
+
+Native disk/namespace observations are mocked. This establishes neither a live
+host admission nor absence of writers in other namespaces; it does not recheck
+cloud encryption or volume preservation. Authenticated deployment, native disk
+preparation and outer bootstrap, isolation, egress/expiry enforcement, durable
+retention/readback and bounded run approval remain. Only official public
+documentation was browsed; no AWS account calls, instance launch, credentials,
+model/data reads or GPU use occurred in this update. Gate 5 remains incomplete.
+
+Setup-input deployment update (2026-09-29): the
+[setup-input packager/stager](../scripts/stage_sft_vm_setup_inputs_v1.py) now
+assembles the 14 exact existing installer, source, service, lock and SDK inputs
+into a 16,998,400-byte canonical control archive. The archive is prepared at
+`artifacts/lumi-vm-setup-inputs-release-v0.1/setup-inputs.tar`; the receiver source
+must be separately authenticated before use. It verifies all frozen member
+hashes before any staging writes, creates three exclusive input directories,
+fsyncs and reads back files, and preserves partial output on failure without
+retry. It does not invoke setup or create a live execution binding.
+
+Fifteen new tests and 222 guarded regressions pass. The real control archive
+was assembled and its 14 files were staged/read back in a temporary directory;
+native host checks and root ownership were mocked. Seven earlier distinct
+bindings match. See the [deployment receipt](../evidence/lumi-vm-setup-inputs-local-verification-v0.1.json).
+No network, AWS, SSH, native host, model/data or GPU action occurred. CPU wheels
+are not in the control archive and their pinned acquisition remains separate.
+Authenticated remote transfer, read-only input mounts, required private receipt
+parents and the outer bootstrap's original deadline still need integration,
+alongside the previously listed isolation/egress/expiry/retention work.
+
+Setup-control transfer update (2026-09-29): the
+[bounded sender](../scripts/send_sft_vm_setup_inputs_v1.py) now reuses pinned
+connection/configuration checks to send the exact receiver source and prepared
+archive on one SSH stdin stream. It leaves the old 64 KiB credential pipe
+unchanged. The fixed remote launcher verifies both hashes, boot identity and
+the original host setup deadline, then invokes only the frozen input stager.
+The remote ceiling is 85 seconds, local exchange 100 seconds and bounded local
+reap 5 seconds, within the existing 120-second tunnel. The reply is limited to
+4096 bytes and must exactly match the typed aggregate staging receipt.
+
+The sender consumes a fresh local marker, charges full attempted control content
+and never resends. An ambiguous send remains remote-completion-unknown; local
+SSH cleanup is not proof of remote termination. The content charge does not
+measure SSH/EICE wire traffic or replace pending global network enforcement.
+Fifteen new tests and 237 guarded regressions pass: real local pipes, preserved
+control inputs and synthetic receiver execution were used, with actual process,
+native identity and timer effects mocked. See the
+[transfer receipt](../evidence/lumi-vm-setup-delivery-local-verification-v0.1.json).
+
+No SSH/AWS/network action or host/GPU launch occurred. The private sender still
+needs connection to the admitted outer bootstrap and its original machine/boot
+identity, deadlines, remaining upload budget and receipt parents. CPU wheel
+acquisition, read-only input mounts, native disk/isolation, global egress/expiry
+enforcement and durable retention/readback remain. Gate 5 is not complete.
+
+Native-seed integration update (2026-09-29): the
+[setup bootstrap preparation](../scripts/start_sft_vm_setup_bootstrap_v1.py)
+now joins fixed seed creation → exact seed-receipt validation → the frozen
+control sender. The seed checks machine/boot identity and creates only three
+fresh root-private receipt parents plus an exclusive seed receipt. Existing or
+partial seed directories block another attempt. An invalid or ambiguous seed
+never advances to upload; failed upload retains both seed and child evidence.
+
+The caller's already-running local setup deadline passes through unchanged.
+Native setup is bounded by absolute `CLOCK_BOOTTIME=1800`, not a restarted
+30-minute allowance; seed rejects boot age at or beyond 1670 seconds to leave
+transfer headroom. Seed command bytes are deducted from the same control upload
+allowance. Ten new tests and 247 guarded regressions pass, including actual
+frozen-sender integration with SSH mocked, and real temporary-directory seed
+writes/readback with native observations mocked. See the
+[bootstrap receipt](../evidence/lumi-vm-setup-bootstrap-local-verification-v0.1.json).
+
+This is setup preparation, not complete native bootstrap/admission. Concrete
+authorized provisioning/control-plane integration, pinned CPU wheel acquisition,
+read-only mounts, disk preparation/isolation, global egress/resource/expiry
+enforcement and retention/readback remain. No real seed, SSH, cloud action,
+installation, model/data read or GPU use occurred. Gate 5 remains incomplete.
+
+CPU-wheel preparation update (2026-09-29): the
+[one-shot wheel acquisition implementation](../scripts/acquire_sft_vm_cpu_wheels_v1.py)
+uses the unchanged lock's 34 wheels / 248,715,637 expected content bytes and
+feeds the unchanged offline installer's complete file/hash audit. It separates
+acquisition from the old rehearsal's install side effects: exact HTTPS origins,
+one GET each, no redirects/proxies/authentication/retry, strict response bounds,
+exclusive private files and raw-text-free aggregate failure receipts. The
+remaining original deadline is required and capped at 300 seconds; an existing
+alarm is rejected rather than replaced. Partial acquisitions consume the attempt.
+
+The CPU/SDK service templates already declare their read-only input paths;
+there is no need for a duplicate mount layer for those installer namespaces.
+The templates remain unchanged. Their declarations are not a claim that the
+native mounts or wider host writer exclusion have been verified.
+
+Ten new tests and 257 guarded regressions pass, including real temporary-file
+readback by the frozen installer after 34 synthetic responses. HTTP, native
+boundary and timer effects are mocked; no real wheel was downloaded/installed,
+no network/AWS/model/data/GPU action occurred. See the
+[wheel acquisition receipt](../evidence/lumi-vm-cpu-wheels-local-verification-v0.1.json).
+Deployment and bounded-unit dispatch/stop/receipt integration remain, alongside
+global network/expiry enforcement, native storage/isolation and retention. The
+new acquisition function stays private/closed to public execution until those
+prerequisites are independently established. Gate 5 remains incomplete.
+
+Wheel-unit integration update (2026-09-29): the
+[bounded wheel-unit coordinator](../scripts/run_sft_vm_cpu_wheel_unit_v1.py)
+joins storage/setup preflight → one 300-second wheel unit → successful terminal
+inspection → stop/empty cgroup → exact aggregate receipt → unchanged offline
+setup. The original deadline is forwarded, not restarted. The unit has 1 GiB
+RAM, zero swap, 64 tasks, no capabilities, readonly code/lock files and null
+streams. Failed/ambiguous acquisition or cleanup never advances to install.
+
+Ten new tests and 267 guarded regressions pass. Native preflight, systemd and
+downstream setup are mocked; exclusive temporary evidence writes are real.
+See the [unit receipt](../evidence/lumi-vm-cpu-wheel-unit-local-verification-v0.1.json).
+All six checked prior wheel bindings still match. No network, native dispatch,
+download, cloud/credential/model/data action or GPU use occurred.
+
+Global HTTPS quota and original host-expiry enforcement remain unimplemented
+for this full-size path: public dispatch is closed, and the private coordinator
+requires independent admission before use. This does not constitute a working
+native network guard. Deploy the new sources only with the final authenticated
+bootstrap release; earlier archives stay frozen. Native disk preparation,
+isolation and retention/readback remain. Gate 5 is still incomplete.
+
+Network-boundary correction (2026-09-29): implementation review found that the
+earlier roadmap conflated host packet quotas with a strict total inbound wire
+cap. Host filtering processes packets that have already arrived; the tiny-VM
+quota is not proof of the proposed full-size wire guarantee. See the
+[boundary review and proposed correction](lumi-vm-network-budget-boundary-review-v0.1.md).
+No numeric limits, frozen proposal, evidence or execution permission changed.
+An explicit decision on that guarantee is needed before enabling the network
+path. Exact payload/request limits remain intact, public dispatch stays closed,
+and native expiry implementation remains pending. This was local/documentation
+inspection only: no new test-count milestone, firewall action or cloud run.
+
+Approved network-correction implementation (2026-09-29): the user accepted the
+limited packet-threshold interpretation. A separate
+[approval overlay](../configs/lumi-vm-network-contract-correction-v0.1.json)
+preserves the frozen draft and earlier decision-required review. Numeric limits,
+exact content/request/hash constraints and no-retry rules are unchanged.
+
+The [local policy and expiry builders](lumi-vm-network-expiry-controls-v0.1.md)
+provide fresh owned-table creation, combined-before-setup quotas, a single-rule
+setup transition with persistent counters, strict bounded readback and an
+original-deadline shutdown timer. Fourteen new tests and 281 guarded regressions
+pass, along with Ruff; six prior component bindings and three earlier file hashes
+match. See the [verification record](../evidence/lumi-vm-network-expiry-local-verification-v0.1.json).
+
+These builders do not install enforcement. Native nft/systemd are unavailable on
+this Mac; readback fixtures are synthetic. Authenticated bootstrap deployment,
+native qualification/activation, quota-failure cancellation, successful-setup
+transition binding and wheel-unit integration remain. Public dispatch stays
+closed. No AWS/firewall/unit/payload action or GPU use occurred; public official
+documentation was consulted. Gate 5 is still incomplete.
+
+Network/bootstrap integration (2026-09-29): the
+[new guarded bootstrap](lumi-vm-network-bootstrap-v0.1.md) now joins fresh policy
+installation, original expiry activation, active watchdog/readback, the frozen
+wheel/offline setup path and a verified single-rule setup transition. The
+watchdog keeps the combined quotas and original deadline active after setup.
+Failures request shutdown and preserve fixed-code evidence without retries.
+Existing sources and prepared archives remain unchanged.
+
+Twenty-one new tests and 302 guarded regressions pass with Ruff; seven previous
+artifact bindings match. See the
+[verification receipt](../evidence/lumi-vm-network-bootstrap-local-verification-v0.1.json).
+Native identity, systemd/nft commands and downstream setup are mocked; these are
+local integration results, not Linux admission. No AWS/firewall/GPU/payload action
+occurred. Final authenticated deployment, native Linux qualification, concrete
+lifecycle binding, retention/readback and full-size authorization remain. Gate 5
+is still incomplete; GPU training has not started.
+
+Setup deployment release v0.2 (2026-09-29): the
+[fresh bundle and matched delivery chain](lumi-vm-setup-deployment-v0.2.md) are
+prepared locally. Eighteen files occupy 17,039,360 archive bytes: the previous
+14 controls unchanged plus four frozen wheel/network controls. New versioned
+receiver, sender and seed/bootstrap bind the exact source/archive hashes; no
+earlier source or archive was replaced. Including seed/receiver commands, the
+control-content charge is 17,054,876 bytes, within the unchanged 32 MiB limit.
+
+Forty-three versioned-path tests and 345 guarded regressions pass, plus Ruff.
+Seventeen earlier evidence bindings and both old archive/build hashes match.
+See the [verification record](../evidence/lumi-vm-setup-deployment-local-verification-v0.2.json).
+Archive build/readback and temporary staging are real local checks; native host
+checks and SSH delivery remain simulated. Nothing was uploaded or executed on a
+VM. The local setup-control release is complete, but native Linux qualification,
+concrete host/storage admission, authenticated guard invocation, retention and
+full-size execution authorization remain. Gate 5 is incomplete; GPU not started.
+
+Native firewall/timer attempt (2026-09-29): one approved temporary `t3.small`
+launched, but the controller mishandled the first EC2
+`InvalidInstanceID.NotFound` propagation response. No native result was obtained.
+The instance was terminated and its ephemeral disk/security group removed;
+independent read-only checks confirmed cleanup and no late result marker. The
+old VM failure and all prior evidence remain preserved. See the
+[observed outcome and narrow correction](lumi-vm-network-native-outcome-v0.1.md).
+
+Controller v2 now uses bounded read-only visibility polling, never a repeated
+launch/mutation. Ten successor tests and 359 guarded regressions pass. This is
+not native recovery evidence: a fresh same-scope single-VM approval is required
+before another launch. No replacement was launched, no real input was accessed,
+and no GPU was used. Gate 5 is still incomplete.
+
+1. **One runnable CPU-import workflow.** Finish the authenticated root-parent/
+   acquisition bootstrap around the existing standard systemd controls, exact
+   S3 transport, staging and cold entry. Reuse the existing converter and SFT
+   checksum consumer. Connect independent verification and durable package
+   retention to that workflow. Bind the concrete host/runtime/storage and
+   combined setup/transfer/import/verification/retention budget for approval.
+   Acceptance: one concrete runnable workflow and an explicit bounded run
+   proposal, not another disconnected validator or a new test-count target.
+2. **One approved full-size CPU import.** Acquire only the existing pinned
+   inputs, run once, preserve failed evidence without retry, independently check
+   the package after worker termination, retain it and verify resource cleanup.
+   Acceptance: the real package and verified lifecycle/retention evidence.
+   No GPU rental is needed to complete this import.
+3. **Gate 6.** After actual import, finish the SFT-specific launch binding,
+   then the separately authorized GPU smoke/save/resume and bounded SFT.
+   Do not run the legacy launcher unchanged: v0.120 records an authorization-
+   before-CUDA ordering issue that still needs explicit closure.
+
+Already completed work is not to be redone without evidence of a broken
+binding: data selection, tokenization, the original model/tokenizer, and the
+successful tiny native coordinator qualification. Do not add new data sources,
+new token floors, a new converter/package format, generic native-write brokers,
+extra pretraining, or production serving to this critical path. Preserve all
+existing parser, provenance, rights, evaluation, resource and no-retry rules.
+Any necessary contract change still needs its own explicit approval.
+
+## Evidence used in this review
+
+- [Research data seal](../evidence/lumi-4b-sft-learning-candidate-seal-v0.3.json)
+  and [verification](../evidence/lumi-4b-sft-learning-candidate-seal-verification-v0.3.json).
+- [Encoded-token receipt](../evidence/lumi-4b-sft-token-consistent-shards-v0.2.json)
+  and [verification](../evidence/lumi-4b-sft-token-consistent-shards-verification-v0.2.json).
+- [Actual tiny Linux result and cloud cleanup](sft-execution-status-v0.130.md).
+- [Latest component implementation and exact remaining integration](sft-execution-status-v0.133.md).
+- [Acquisition-to-completion local integration evidence](../evidence/lumi-vm-fullsize-acquisition-local-verification-v0.1.json).
+- [Offline release and source-layout evidence](../evidence/lumi-vm-fullsize-release-local-verification-v0.1.json).
+- [Pinned SDK acquisition, TLS correction and local compatibility evidence](../evidence/lumi-vm-acquisition-sdk-preparation-verification-v0.1.json).
+- [Offline Linux installer and prepared SDK release evidence](../evidence/lumi-vm-acquisition-sdk-install-local-verification-v0.1.json).
+- [Current read-only AWS host/price observations](../evidence/lumi-vm-fullsize-host-readonly-observation-v0.1.json).
+- [Credential-source cleanup joined to existing acquisition/handoff](../evidence/lumi-vm-fullsize-credential-handoff-local-verification-v0.1.json).
+- [Private-pipe provisioning joined to acquisition and cleanup](../evidence/lumi-vm-fullsize-credential-setup-local-verification-v0.1.json).
+
+The two saved verification-to-receipt file hashes were rechecked in this review
+and match. That is a metadata/evidence refresh, not a new audit of all private
+dataset bytes or current S3 objects. Public SDK package networking and the later
+read-only AWS host/price calls are recorded above. The subsequently authorized
+temporary IAM creation, deny-all STS issuance and verified deletion are recorded
+separately above. No S3 payload request, VM action, GPU, inference, training or
+production action occurred in these updates. Gate 5 remains incomplete.

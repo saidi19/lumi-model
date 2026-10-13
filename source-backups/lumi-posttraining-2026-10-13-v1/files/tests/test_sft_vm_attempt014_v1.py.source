@@ -1,0 +1,104 @@
+"""Fresh source authentication and diagnostic integration; no cloud or subprocess."""
+
+import importlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt014_v1 as b
+from scripts import prepare_sft_vm_deployment_bindings_v7 as plan_builder
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temporary.cleanup)
+        cls.root = Path(temporary.name).resolve() / "candidate"
+        with patch.object(b, "OUTPUT", cls.root):
+            cls.report = b.prepare()
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.addClassCleanup(sys.path.remove, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+
+    def test_actual_outer_guest_loader_and_source_roles(self):
+        self.outer.authenticate()
+        self.outer.loading.fresh_identity()
+        self.assertEqual(len(self.outer.loading.sources.inputs()), 34)
+        self.assertEqual(self.outer.store.worker.ATTEMPT, b.NEW)
+        self.assertIn(str(self.root), self.outer.__file__)
+
+    def test_all_156_hashes_and_fresh_identity(self):
+        self.assertEqual(len(self.report["outputs"]), 156)
+        for name, pin in self.report["outputs"].items():
+            raw = (self.root / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(b.closure.sha(raw), pin["sha256"])
+            if name.startswith("scripts/"):
+                self.assertNotIn(b.OLD.encode(), raw)
+        self.assertEqual(self.outer.store.worker.BUCKET, b.BUCKET)
+        self.assertFalse(self.report["old_authorization_reused"])
+        self.assertFalse(self.report["old_timer_reused"])
+
+    def test_diagnostics_reach_bound_modules(self):
+        roles = self.outer.loading.sources.inputs()
+        transport = roles["run_sft_vm_detached_delivery_v1"]
+        self.assertIn(b"class ExchangeFailure", transport)
+        self.assertIn(b"remote_failure_stage", transport)
+        self.assertIn(b"initial_proof_failure", roles["run_sft_vm_host_setup_v3"])
+        boot = roles["build_sft_vm_initial_boot_v1"]
+        self.assertIn(b"lumi.initial-proof-failure.v1", boot)
+        self.assertIn(b"signal.alarm(20)", boot)
+        self.assertIn(b"source_bytes()", boot)
+
+    def test_checkpoint_and_cpu_limits_unchanged(self):
+        name = "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"
+        self.assertEqual((self.root / name).read_bytes(), (b.BASE / name).read_bytes())
+        name = "configs/lumi-vm-fullsize-host-proposal-v0.1.json"
+        before = (b.BASE / name).read_bytes().replace(b.OLD.encode(), b.NEW.encode())
+        self.assertEqual((self.root / name).read_bytes(), before)
+        network = json.loads(
+            (self.root / "configs/lumi-vm-private-network-plan-v0.1.json").read_bytes()
+        )
+        self.assertIn(b.CIDR, json.dumps(network))
+        self.assertFalse(self.report["selected_cidr_live_absence_verified"])
+
+    def test_no_authority_or_overwrite(self):
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertTrue(self.report["fresh_controls_required"])
+        self.assertFalse(self.report["historical_failure_root_cause_resolved"])
+        with self.assertRaises(ValueError):
+            b.run(approved=True)
+        with patch.object(b, "OUTPUT", self.root), patch.object(b, "build", return_value=({}, {})):
+            with self.assertRaises(ValueError):
+                b.prepare()
+
+    def test_deployment_plan_matches_source_and_keeps_limits(self):
+        plan = plan_builder.build()
+        path = b.ROOT / "configs/lumi-vm-attempt-014-deployment-plan-v0.1.json"
+        self.assertEqual(path.read_bytes(), plan_builder.encode(plan))
+        old = json.loads((b.ROOT / plan_builder.OLD_PLAN).read_bytes())
+        for field in ("transport_change", "cost_disclosure", "exclusions"):
+            self.assertEqual(plan[field], old[field])
+        scope = dict(plan["cpu_scope_reference"])
+        before = json.loads(json.dumps(old["cpu_scope_reference"]).replace(b.OLD, b.NEW))
+        scope["output"] = before["output"]
+        self.assertEqual(scope, before)
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["predecessor_state"]["current_state_rechecked"])
+        self.assertTrue(plan["predecessor_state"]["endpoint_capacity_recheck_required"])
+
+    def test_old_controls_cannot_authorize_new_attempt(self):
+        self.assertFalse((b.ROOT / plan_builder.WATCH).exists())
+        self.assertFalse((b.ROOT / plan_builder.STORE).exists())
+        with self.assertRaises(ValueError):
+            plan_builder.controls()
+        with self.assertRaises(ValueError):
+            plan_builder.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

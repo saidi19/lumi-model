@@ -1,0 +1,218 @@
+"""Private pinned binding delivery, not full host admission or a public launcher.
+
+Caller must already own authenticated preparation, cloud/retention admission,
+host-bound execution authority and outer STOP supervision. This layer returns
+only binding evidence, never credentials or an executable workflow channel.
+Every exchange fits the frozen EIC tunnel; service execution is detached.
+"""
+
+import hashlib
+import json
+import math
+import time
+from pathlib import Path
+
+import run_sft_vm_native_binding_detached_v1 as native
+import run_sft_vm_native_readiness_delivery_v1 as readiness
+
+sender = readiness.sender
+ATTEMPT = native.ATTEMPT
+SOURCE = Path(__file__).with_name("run_sft_vm_native_binding_detached_v1.py")
+SOURCE_SHA = "8f652198e5a87d31f546cd83fc45eb6a316536dcd180068bd4d0cad58531230a"
+BINDER = Path(__file__).with_name("bind_sft_vm_native_admission_v1.py")
+MAX_POLLS = 24
+ABORT_RESERVE = 35
+CAP = 32 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("native_binding_delivery_rejected") from None
+
+
+def launcher(operation, expected, request, lengths):
+    need(operation in {"dispatch", "status", "finish", "cancel"})
+    receiver, binder = lengths
+    need(all(type(n) is int and 0 < n <= 32768 for n in lengths))
+    action = (
+        "m.dispatch(expected,request,binder,source)"
+        if operation == "dispatch"
+        else f"m.{operation}(expected,request,binder)"
+    )
+    return f"""import hashlib,json,os,signal,sys,types
+try:
+ signal.alarm(75)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ raw=sys.stdin.buffer.read({receiver + binder + 1})
+ assert len(raw)=={receiver + binder}
+ source,binder=raw[:{receiver}],raw[{receiver}:]
+ assert hashlib.sha256(source).hexdigest()=={SOURCE_SHA!r}
+ assert hashlib.sha256(binder).hexdigest()=={native.BINDER_SHA!r}
+ m=types.ModuleType('_authenticated_native_binding')
+ m.__file__='/opt/lumi-bootstrap-input/run_sft_vm_native_binding_detached_v1.py'
+ exec(compile(source,m.__file__,'exec'),m.__dict__)
+ expected={expected!r}
+ request={request!r}
+ answer={action}
+ body=json.dumps(answer,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+ assert len(body)<=4096
+ sys.stdout.buffer.write(body)
+except BaseException:
+ sys.exit(1)
+"""
+
+
+def state_reply(value, states):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "state",
+            "observation",
+            "binding_may_exist",
+            "host_admitted",
+            "gate_5_complete",
+            "retry_allowed",
+        }
+    )
+    need(value["state"] in states and value["binding_may_exist"] is True)
+    need(all(value[k] is False for k in ("host_admitted", "gate_5_complete", "retry_allowed")))
+    if value["state"] in {"returned", "completed"}:
+        native.validate_report(value["observation"])
+    else:
+        need(value["observation"] is None)
+    return value
+
+
+def expected_binding_sha(request):
+    value = dict(
+        schema="lumi.vm-root-host-binding.v0.1",
+        attempt=ATTEMPT,
+        machine_id=request["machine_id"],
+        boot_id=request["boot_id"],
+        host_started_boottime=0,
+        host_deadline_boottime=request["host_deadline_boottime"],
+        prepared_sha256="f6aab162e22e2c5a6b871f270766d7687080a5ec3350d328af5cd549cc8719fd",
+    )
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    ).hexdigest()
+
+
+def _bind_prepared_channel_once(
+    output,
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    request,
+    *,
+    deadline,
+    host_deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+    wait=time.sleep,
+):
+    readiness.validate_request(request, binding)
+    expected = {k: request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")}
+    need(all(type(t) in {int, float} and math.isfinite(t) for t in (deadline, host_deadline)))
+    need(300 < deadline - clock() <= 350 and deadline <= host_deadline - 11315)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= CAP)
+    source, binder = SOURCE.read_bytes(), BINDER.read_bytes()
+    need(0 < len(source) <= 32768 and hashlib.sha256(source).hexdigest() == SOURCE_SHA)
+    need(0 < len(binder) <= 32768 and hashlib.sha256(binder).hexdigest() == native.BINDER_SHA)
+    # Dispatch, bounded observations, finish, and one cancellation, command included.
+    need((MAX_POLLS + 3) * (len(source) + len(binder) + 16384) <= remaining_control_bytes)
+    body, lengths = source + binder, (len(source), len(binder))
+    sender.command(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        launcher("dispatch", expected, request, lengths),
+    )
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = sender.delivery.connection.issuer.base.save
+    report = dict(
+        status="started",
+        dispatch_attempted=False,
+        finish_attempted=False,
+        cancel_attempted=False,
+        cancellation_observed=False,
+        binding_delivery_completed=False,
+        binding_state="not_dispatched",
+        status_reads=0,
+        control_content_bytes_charged=0,
+        host_admitted=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+        outer_stop_required_on_failure=True,
+        cancellation_revokes_binding=False,
+    )
+    save(output / "started.json", report)
+
+    def exchange(operation):
+        code = launcher(operation, expected, request, lengths)
+        argv = sender.command(binding, key, directory, config_sha, hosts_sha, code)
+        need(len(argv[-1].encode()) <= 16384)
+        charge = len(argv[-1].encode()) + len(body)
+        reserve = 0 if operation == "cancel" else ABORT_RESERVE
+        timeout = min(80, deadline - clock() - reserve)
+        need(timeout > 0 and (operation != "dispatch" or timeout == 80))
+        need(report["control_content_bytes_charged"] + charge <= remaining_control_bytes)
+        report["control_content_bytes_charged"] += charge
+        return sender.delivery.decode(sender.pipe_exchange(argv, body, timeout))
+
+    try:
+        report.update(dispatch_attempted=True, binding_state="unknown_after_dispatch")
+        state_reply(exchange("dispatch"), {"dispatch_requested"})
+        for _ in range(MAX_POLLS):
+            report["status_reads"] += 1
+            observed = state_reply(exchange("status"), {"running", "returned"})
+            if observed["state"] == "returned":
+                need(observed["observation"]["binding_sha256"] == expected_binding_sha(request))
+                report["finish_attempted"] = True
+                final = state_reply(exchange("finish"), {"completed"})
+                need(final["observation"] == observed["observation"])
+                report.update(
+                    binding_delivery_completed=True,
+                    binding_state="created_and_reaped",
+                    observation=final["observation"],
+                )
+                break
+            pause = min(10, deadline - clock() - ABORT_RESERVE - 1)
+            need(pause > 0)
+            wait(pause)
+        need(report["binding_delivery_completed"])
+        report["status"] = "native_binding_delivered_not_full_host_admission"
+        # A lost local save is also failure after a possibly committed binding.
+        save(output / "result.json", report)
+    except BaseException:
+        report.update(
+            status="failed_preserve_no_retry",
+            binding_state="unknown_after_dispatch",
+            binding_delivery_completed=False,
+        )
+        if report["dispatch_attempted"]:
+            report["cancel_attempted"] = True
+            try:
+                state_reply(exchange("cancel"), {"cancelled"})
+                report["cancellation_observed"] = True
+            except BaseException:
+                pass  # Outer shared STOP supervisor is mandatory even if cancellation succeeded.
+        # Exclusive save may itself have partially succeeded. Never overwrite it.
+        if not (output / "result.json").exists():
+            save(output / "result.json", report)
+        else:
+            save(output / "failure.json", report)
+        raise ValueError("native_binding_delivery_failed_outer_stop_required") from None
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("native_admission_and_execution_authority_not_bound") from None

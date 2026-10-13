@@ -1,0 +1,353 @@
+"""Private pinned retention delivery and exact-host STOP/readback.
+
+No CLI, issuer invocation, launch, source access or admission override. The
+caller must supply independently admitted bindings, clients and ORIGINAL
+deadlines. This controller is not proof of independent controller-crash safety.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import shlex
+import time
+
+import issue_sft_vm_retention_credentials_v1 as issuer
+import run_sft_vm_detached_delivery_v1 as transport
+
+ATTEMPT = issuer.ATTEMPT
+ENTRY_SHA = "1e78705b8779a6011ee236267b0db87039fa45537b225b786d99cfe9043a4493"
+ENTRY = (
+    f"/var/lib/lumi-vm-fullsize/{ATTEMPT}/retention-release/scripts/"
+    "run_sft_vm_retention_parent_v1.py"
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_delivery_rejected") from None
+
+
+def same(value, expected):
+    need(type(value) is dict and issuer.base.compact(value) == issuer.base.compact(expected))
+
+
+def remote_program(operation, binding_sha):
+    need(operation in {"dispatch", "submit", "status", "cancel"})
+    need(type(binding_sha) is str and transport.re.fullmatch(r"[0-9a-f]{64}", binding_sha))
+    # This fixed program travels over the existing pinned SSH channel. Load the
+    # original entry only after its hash/ownership check; its native boundary and
+    # full source/binding checks remain authoritative, including after expiry.
+    return f"""import hashlib,json,os,stat,sys,types
+from pathlib import Path
+p=Path({ENTRY!r})
+for parent in p.parents:
+ r=parent.lstat()
+ if not stat.S_ISDIR(r.st_mode) or r.st_uid!=0 or r.st_mode&0o022: raise ValueError()
+fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+with os.fdopen(fd,'rb') as f:
+ r=os.fstat(f.fileno())
+ if not stat.S_ISREG(r.st_mode) or (r.st_uid,r.st_gid,r.st_nlink)!=(0,0,1): raise ValueError()
+ if stat.S_IMODE(r.st_mode)!=0o400: raise ValueError()
+ raw=f.read(131073)
+if hashlib.sha256(raw).hexdigest()!={ENTRY_SHA!r}: raise ValueError()
+m=types.ModuleType('_bound_retention_entry');m.__file__=str(p)
+exec(compile(raw,str(p),'exec'),m.__dict__)
+b=m.root_file(m.ROOT/'retention-controller/binding.json',16384)
+if m.sha(b)!={binding_sha!r}: raise ValueError()
+op={operation!r}
+if op in ('dispatch','submit'):
+ result=m.execute(op)
+else:
+ result=m.execute('status')
+ parent=sys.modules[m.PACKAGE+'.posttraining_vm_retention_parent_v1']
+ if op=='cancel':
+  parent.old.handoff._stop_and_reap(parent.unit())
+  result=parent._status_admitted({binding_sha!r},m.decode(b)['deadline_boottime'])
+ result['worker_cgroup_empty']=parent.old.handoff.frozen.cgroup_empty(parent.worker.unit_name(m.ATTEMPT))
+ result['receipt']=None
+ empty=result['parent_cgroup_empty'] and result['worker_cgroup_empty']
+ if result['state']=='retention_returned' and empty:
+  result['receipt']=parent.worker.retention.decode(parent.worker.retention.small(m.ROOT/'retention-continuation.result.json','root',0o600,4096))
+encoded=json.dumps(result,separators=(',',':'),allow_nan=False).encode()
+if len(encoded)>4096: raise ValueError()
+sys.stdout.buffer.write(encoded)
+"""
+
+
+class SSH:
+    def __init__(
+        self,
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        retention_binding_sha,
+        *,
+        remaining_control_bytes,
+    ):
+        transport.connection.targets(binding, {"prepared_attempt": ATTEMPT})
+        need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= 32 * 1024**2)
+        remote_program("status", retention_binding_sha)
+        self.binding, self.key, self.directory = dict(binding), key, directory
+        self.config_sha, self.hosts_sha = config_sha, hosts_sha
+        self.retention_binding_sha = retention_binding_sha
+        self.remaining_control_bytes = remaining_control_bytes
+
+    def __call__(self, operation, body=b"", *, timeout):
+        need(type(body) in {bytes, bytearray} and len(body) <= 65536)
+        need(bool(body) == (operation == "submit"))
+        program = remote_program(operation, self.retention_binding_sha)
+        config, hosts = self.directory / "ssh_config", self.directory / "known_hosts"
+        expected = transport.connection.ssh_config(self.binding, self.key, hosts).encode()
+        need(transport.read_pinned(config, self.config_sha, 16384) == expected)
+        transport.read_pinned(hosts, self.hosts_sha, 4096)
+        remote = "sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(program)
+        charge = len(remote.encode()) + len(body)
+        need(charge <= self.remaining_control_bytes)
+        self.remaining_control_bytes -= charge  # Lost acknowledgements remain charged.
+        argv = [
+            "/usr/bin/ssh",
+            "-F",
+            str(config),
+            "-T",
+            "-o",
+            "LogLevel=QUIET",
+            "lumi-fullsize-" + ATTEMPT,
+            remote,
+        ]
+        return transport.decode(transport.pipe_exchange(argv, body, timeout))
+
+
+def observe(value):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "state",
+            "parent_cgroup_empty",
+            "worker_cgroup_empty",
+            "gate_5_complete",
+            "instance_termination_allowed",
+            "retry_allowed",
+            "receipt",
+        }
+    )
+    need(
+        value["state"]
+        in {"dispatch_requested", "running", "retention_returned", "failed", "interrupted"}
+    )
+    need(all(type(value[k]) is bool for k in ("parent_cgroup_empty", "worker_cgroup_empty")))
+    need(
+        all(
+            value[k] is False
+            for k in ("gate_5_complete", "instance_termination_allowed", "retry_allowed")
+        )
+    )
+    need(value["receipt"] is None or type(value["receipt"]) is dict)
+    return value
+
+
+def receipt(value):
+    need(type(value) is dict)
+    expected_true = (
+        "offhost_retention_verified",
+        "retention_cgroup_reaped",
+        "credential_source_cleanup_complete",
+    )
+    expected_false = (
+        "real_4b_import",
+        "gate_5_complete",
+        "training_authorized",
+        "production_eligible",
+        "instance_termination_allowed",
+        "retry_allowed",
+    )
+    need(
+        set(value) == {"schema", "binding_sha256", "commit_sha256", *expected_true, *expected_false}
+    )
+    need(value["schema"] == "lumi.vm-retention-continuation.v0.1")
+    need(
+        all(value[k] is True for k in expected_true)
+        and all(value[k] is False for k in expected_false)
+    )
+    need(
+        all(
+            type(value[k]) is str and transport.re.fullmatch(r"[0-9a-f]{64}", value[k])
+            for k in ("binding_sha256", "commit_sha256")
+        )
+    )
+    return value
+
+
+def _stop_exact_host(binding, cloud, deadline, *, clock=time.monotonic, wait=time.sleep):
+    """One STOP, bounded readbacks, no Force/terminate/delete or deadline renewal."""
+    transport.connection.targets(binding, {"prepared_attempt": ATTEMPT})
+    need(
+        type(deadline) in {int, float}
+        and math.isfinite(deadline)
+        and 0 < deadline - clock() <= 14400
+    )
+    raw = transport.connection.PROPOSAL.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == transport.connection.PROPOSAL_SHA)
+    host = json.loads(raw)["host"]
+    report = dict(
+        stop_attempted=False, stopped_verified=False, calls=0, delete_on_termination_disabled=False
+    )
+    end = min(deadline, clock() + 300)
+    try:
+        for _ in range(30):
+            need(end - clock() > 20)
+            report["calls"] += 1
+            response = cloud.cli("ec2", "describe-instances", InstanceIds=[binding["instance"]])
+            need(not response.get("NextToken"))
+            reservation = transport.connection.one(response["Reservations"])
+            need(reservation["OwnerId"] == issuer.base.ACCOUNT)
+            row = transport.connection.one(reservation["Instances"])
+            need(row["InstanceId"] == binding["instance"] and row["ClientToken"] == ATTEMPT)
+            transport.connection.owned(row, ATTEMPT)
+            for field, expected in (
+                ("ImageId", host["ami"]),
+                ("InstanceType", host["instance_type"]),
+                ("VpcId", host["vpc"]),
+                ("SubnetId", host["subnet"]),
+                ("KeyName", binding["key_name"]),
+            ):
+                need(row[field] == expected)
+            volumes = row["BlockDeviceMappings"]
+            need(
+                len(volumes) == 2
+                and {v["Ebs"]["VolumeId"] for v in volumes}
+                == {binding["root_volume"], binding["work_volume"]}
+            )
+            need(all(v["Ebs"]["DeleteOnTermination"] is False for v in volumes))
+            report["delete_on_termination_disabled"] = True
+            state = row["State"]["Name"]
+            if state == "stopped":
+                report["stopped_verified"] = True
+                break
+            need(state in {"pending", "running", "stopping"})
+            if state == "running" and not report["stop_attempted"]:
+                need(end - clock() > 20)
+                report["stop_attempted"] = True
+                report["calls"] += 1
+                try:
+                    cloud.cli(
+                        "ec2",
+                        "stop-instances",
+                        InstanceIds=[binding["instance"]],
+                        Force=False,
+                        Hibernate=False,
+                    )
+                except BaseException:
+                    pass  # Lost acknowledgement is read back, never resent.
+            wait(min(5, max(0, end - clock() - 20)))
+    except BaseException:
+        pass
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _deliver_admitted_once(
+    raw,
+    binding,
+    output,
+    exchange,
+    *,
+    prior_binding_sha,
+    cloud,
+    deadline,
+    host_deadline,
+    clock=time.monotonic,
+    wait=time.sleep,
+):
+    """Issuer callback; caller owns admission and bounded cloud client calls.
+
+    Successful return requires completed retention, empty guest cgroups and a
+    matching stopped EC2 instance. Failure always preserves explicit outcomes.
+    Guest cancel/host STOP are within previously admitted lifecycle authority.
+    """
+    transport.connection.targets(binding, {"prepared_attempt": ATTEMPT})
+    need(type(raw) in {bytes, bytearray} and 0 < len(raw) <= 65536)
+    need(
+        type(prior_binding_sha) is str
+        and transport.re.fullmatch(r"[0-9a-f]{64}", prior_binding_sha)
+    )
+    need(all(type(n) in {int, float} and math.isfinite(n) for n in (deadline, host_deadline)))
+    need(
+        120 < deadline - clock() <= 1800
+        and deadline <= host_deadline - 300
+        and host_deadline - clock() <= 14400
+    )
+    transport.connection.safe_path(output)
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    save = issuer.base.save
+    save(output / "started.json", dict(attempt=ATTEMPT, retry_allowed=False))
+    report = dict(
+        retention_verified=False,
+        guest_stop_verified=False,
+        cancel_attempted=False,
+        stopped_verified=False,
+        gate_5_complete=False,
+        credential_contents_retained=False,
+        retry_allowed=False,
+    )
+    phase, result = "dispatch", None
+
+    def left(reserve=120):
+        remaining = deadline - clock() - reserve
+        need(remaining > 0)
+        return min(60, remaining)
+
+    try:
+        expected = dict(dispatch_requested=True, workflow_completed=False, gate_5_complete=False)
+        same(exchange("dispatch", timeout=left()), expected)
+        phase = "submit"
+        same(
+            exchange("submit", raw, timeout=left()),
+            dict(delivery_sent=True, workflow_completed=False, gate_5_complete=False),
+        )
+        phase = "status"
+        for _ in range(180):
+            value = observe(exchange("status", timeout=left()))
+            empty = value["parent_cgroup_empty"] and value["worker_cgroup_empty"]
+            if value["state"] == "retention_returned" and empty:
+                result = receipt(value["receipt"])
+                need(result["binding_sha256"] == prior_binding_sha)
+                report.update(retention_verified=True, guest_stop_verified=True)
+                break
+            need(value["state"] not in {"failed", "interrupted"})
+            wait(min(10, left()))
+        else:
+            raise ValueError("status_limit")
+    except BaseException:
+        report["failed_phase"] = phase
+        report["cancel_attempted"] = True
+        try:
+            value = observe(exchange("cancel", timeout=left(0)))
+            report["guest_stop_verified"] = (
+                value["parent_cgroup_empty"] and value["worker_cgroup_empty"]
+            )
+        except BaseException:
+            report["cancel_outcome_unconfirmed"] = True
+    finally:
+        # Separate original whole-host deadline: no new four-hour budget.
+        try:
+            report["host_stop"] = _stop_exact_host(
+                binding, cloud, host_deadline, clock=clock, wait=wait
+            )
+            report["stopped_verified"] = report["host_stop"]["stopped_verified"]
+        except BaseException:
+            report["host_stop_unresolved"] = True
+        save(output / "result.json", report)
+    need(
+        report["retention_verified"]
+        and report["guest_stop_verified"]
+        and report["stopped_verified"]
+    )
+    return result

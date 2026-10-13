@@ -1,0 +1,641 @@
+"""Actual frozen controllers/issuers with synthetic cloud and SSH boundaries."""
+
+import ast
+import datetime as dt
+import importlib
+import json
+import shlex
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("run_sft_vm_joined_admission_v2")
+h = m.retained_host
+prep = importlib.import_module("tests.test_sft_vm_native_admission_preparation_v1")
+bound = importlib.import_module("tests.test_sft_vm_native_binding_delivery_v1")
+retained = importlib.import_module("tests.test_sft_vm_retention_binding_delivery_v1")
+bucket_fixture = importlib.import_module("tests.test_sft_vm_retention_admission_v1")
+life = importlib.import_module("tests.test_sft_vm_admitted_lifecycle_v1")
+PROPOSAL = m.lifecycle.workflow.connection.PROPOSAL.read_bytes()
+
+
+def bucket_clients(callback):
+    clients = {}
+    for name, operations in m.BucketReadCloud.OPS.items():
+        config = types.SimpleNamespace(
+            retries={"total_max_attempts": 1}, proxies={}, connect_timeout=3, read_timeout=5
+        )
+        service = "s3" if name == "s3api" else name
+        client = types.SimpleNamespace(
+            meta=types.SimpleNamespace(
+                region_name="us-east-1",
+                endpoint_url=f"https://{service}.us-east-1.amazonaws.com",
+                config=config,
+            )
+        )
+        for operation in operations:
+            setattr(
+                client,
+                operation.replace("-", "_"),
+                Mock(
+                    side_effect=lambda name=name, operation=operation, **kw: callback(
+                        name, operation, **kw
+                    )
+                ),
+            )
+        clients[name] = client
+    return clients
+
+
+class BucketTransportTests(unittest.TestCase):
+    def test_actual_wrapper_only_fixed_owner_control_reads(self):
+        callback = Mock(return_value={})
+        cloud = m.BucketReadCloud(bucket_clients(callback))
+        with patch.object(m.lifecycle.guard.provision, "timeout") as timeout:
+            cloud.cli("sts", "get-caller-identity")
+            cloud.cli(
+                "s3api",
+                "get-bucket-location",
+                Bucket=m.bucket.BUCKET,
+                ExpectedBucketOwner=m.bucket.ACCOUNT,
+            )
+        self.assertEqual(callback.call_count, 2)
+        self.assertEqual([c.args for c in timeout.call_args_list], [(20,), (20,)])
+        for operation in ("get-object", "put-object", "list-objects", "delete-object"):
+            with self.assertRaises(ValueError):
+                cloud.cli("s3api", operation, Bucket=m.bucket.BUCKET)
+        with self.assertRaises(ValueError):
+            cloud.cli(
+                "s3api", "get-bucket-policy", Bucket="foreign", ExpectedBucketOwner=m.bucket.ACCOUNT
+            )
+        self.assertEqual(callback.call_count, 2)
+
+    def test_wrong_sdk_endpoint_retry_proxy_timeout_and_region(self):
+        for field, value in (("region_name", "eu-west-1"), ("endpoint_url", "http://localhost")):
+            clients = bucket_clients(Mock())
+            setattr(clients["s3api"].meta, field, value)
+            with self.assertRaises(ValueError):
+                m.BucketReadCloud(clients)
+        for field, value in (
+            ("retries", {"total_max_attempts": 2}),
+            ("proxies", {"https": "proxy"}),
+            ("connect_timeout", 4),
+            ("read_timeout", 6),
+        ):
+            clients = bucket_clients(Mock())
+            setattr(clients["s3api"].meta.config, field, value)
+            with self.assertRaises(ValueError):
+                m.BucketReadCloud(clients)
+
+    def test_timeout_not_retried_or_raw_retained(self):
+        callback = Mock(side_effect=TimeoutError("private-sdk-error"))
+        cloud = m.BucketReadCloud(bucket_clients(callback))
+        with self.assertRaisesRegex(ValueError, "^bucket_control_read_failed$"):
+            cloud.cli("sts", "get-caller-identity")
+        callback.assert_called_once()
+
+
+class HostTests(unittest.TestCase):
+    def setUp(self):
+        self.data, self.launch, _ = prep.fresh.fixture()
+        self.data["image"]["Images"][0]["BlockDeviceMappings"].extend(
+            [
+                {"DeviceName": "/dev/sdb", "VirtualName": "ephemeral0"},
+                {"DeviceName": "/dev/sdc", "VirtualName": "ephemeral1"},
+            ]
+        )
+        self.cloud = prep.fresh.Cloud(self.data)
+
+    def call(self, **kw):
+        return h.inspect(
+            self.cloud,
+            prep.fresh.prior.B,
+            PROPOSAL,
+            self.launch,
+            **(dict(deadline=11240, host_deadline=14400, clock=lambda: 11000) | kw),
+        )
+
+    def test_actual_existing_controls_and_lineage_without_fake_freshness(self):
+        value = self.call()
+        self.assertEqual(value["observation_calls"], 11)
+        self.assertTrue(value["delete_on_termination_disabled"])
+        self.assertFalse(value["host_admitted"])
+        self.assertEqual(len(self.cloud.calls), 11)
+        self.assertTrue(all(op.startswith(("describe-", "get-")) for _, op, _ in self.cloud.calls))
+        with self.assertRaises(ValueError):
+            prep.fresh.m.inspect(
+                self.data,
+                prep.fresh.prior.B,
+                prep.fresh.prior.P,
+                self.launch,
+                observed_at=h.frozen.utc(self.launch["started_at"]) + dt.timedelta(seconds=11000),
+            )
+
+    def test_disk_encryption_snapshot_multiattach_and_deletion_reject(self):
+        for key, value in (
+            ("Encrypted", False),
+            ("SnapshotId", "snap-" + "a" * 17),
+            ("MultiAttachEnabled", True),
+            ("Size", 64),
+        ):
+            with (
+                self.subTest(key=key),
+                patch.dict(self.data["volumes"]["Volumes"][1], {key: value}),
+            ):
+                with self.assertRaises(ValueError):
+                    self.call()
+        vm = self.data["instances"]["Reservations"][0]["Instances"][0]
+        vm["BlockDeviceMappings"][0]["Ebs"]["DeleteOnTermination"] = True
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_wrong_original_lineage_and_current_public_host_reject(self):
+        vm = self.data["instances"]["Reservations"][0]["Instances"][0]
+        for change in (
+            {"ClientToken": "f" * 32},
+            {"PublicIpAddress": "8.8.8.8"},
+            {"LaunchTime": "2020-01-01T00:00:00Z"},
+        ):
+            with patch.dict(vm, change), self.assertRaises(ValueError):
+                self.call()
+
+    def test_deadline_response_size_pagination_and_transport_failure(self):
+        for change in (
+            {"deadline": 11220},
+            {"deadline": 11241},
+            {"host_deadline": 11900},
+            {"deadline": True},
+            {"deadline": float("nan")},
+        ):
+            with self.assertRaises(ValueError):
+                self.call(**change)
+        self.assertEqual(self.cloud.calls, [])
+        for reply in ({"NextToken": "unread"}, {"large": "x" * 262145}):
+            with patch.object(self.cloud, "cli", return_value=reply), self.assertRaises(ValueError):
+                self.call()
+        with patch.object(self.cloud, "cli", side_effect=TimeoutError("secret")) as cloud:
+            with self.assertRaisesRegex(ValueError, "^retained_host_check_failed_no_mutation$"):
+                self.call()
+            cloud.assert_called_once()
+
+    def test_late_response_wrong_proposal_and_public_closed(self):
+        with self.assertRaises(ValueError):
+            self.call(clock=Mock(side_effect=[11000, 11000, 11241]))
+        with self.assertRaises(ValueError):
+            h.inspect(
+                self.cloud,
+                prep.fresh.prior.B,
+                b"{}",
+                self.launch,
+                deadline=11240,
+                host_deadline=14400,
+                clock=lambda: 11000,
+            )
+        with self.assertRaises(ValueError):
+            h.run(approved=True)
+
+
+class JoinedTests(unittest.TestCase):
+    def setUp(self):
+        self.f = prep.Tests()
+        self.f.setUp()
+        self.f.data["image"]["Images"][0]["BlockDeviceMappings"].extend(
+            [
+                {"DeviceName": "/dev/sdb", "VirtualName": "ephemeral0"},
+                {"DeviceName": "/dev/sdc", "VirtualName": "ephemeral1"},
+            ]
+        )
+        self.addCleanup(self.f.doCleanups)
+        self.f.qualify.side_effect = prep.actual_qualification
+        self.t = 100
+        self.events = []
+        self.charges = 0
+        self.failed = None
+        self.budget = m.Budget()
+        self.source_issuer = life.source.Fake()
+        self.retention_issuer = life.retained.Fake()
+        self.enterContext(patch.object(life.source, "NOW", life.retained.NOW))
+        self.bucket = bucket_fixture.BucketTests()
+        self.bucket.setUp()
+        self.request = dict(
+            schema="lumi.vm-detached-setup-request.v0.1",
+            attempt=m.lifecycle.ATTEMPT,
+            machine_id=prep.provision.proof()["machine_id"],
+            boot_id=prep.provision.proof()["boot_id"],
+            volumes={k: self.f.provisioned["binding"][k] for k in ("root_volume", "work_volume")},
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14300,
+        )
+        self.prior_pin = m.native_binding.expected_binding_sha(self.request)
+        self.states = importlib.import_module("run_sft_vm_runtime_qualification_detached_v1")
+        self.original_cloud = self.f.cloud.cli
+        self.stops = 0
+
+        def cloud(service, op, **kw):
+            if op == "stop-instances":
+                self.stops += 1
+                self.f.data["instances"]["Reservations"][0]["Instances"][0]["State"]["Name"] = (
+                    "stopped"
+                )
+                return {}
+            if service == "s3api":
+                raise AssertionError("host SDK cannot make S3 calls")
+            if self.failed == "post_host" and self.t >= 8000 and op == "describe-volumes":
+                raise TimeoutError("private-host-error")
+            return self.original_cloud(service, op, **kw)
+
+        self.f.cloud.cli = cloud
+
+        def bucket_cloud(service, op, **kw):
+            self.events.append("bucket:" + op)
+            if self.failed == "bucket":
+                raise TimeoutError("private-bucket-error")
+            return self.bucket.cloud.cli(service, op, **kw)
+
+        self.bucket_cloud = m.BucketReadCloud(bucket_clients(bucket_cloud))
+        self.enterContext(
+            patch.object(m.native_binding.sender, "pipe_exchange", side_effect=self.control)
+        )
+        self.enterContext(
+            patch.object(m.lifecycle.workflow, "pipe_exchange", side_effect=self.workflow_wire)
+        )
+
+    def wait(self, seconds):
+        self.t += seconds
+
+    def control(self, argv, body, timeout):
+        self.assertLessEqual(timeout, 80)
+        self.charges += len(argv[-1].encode()) + len(body)
+        code = shlex.split(argv[-1])[-1]
+        if "_authenticated_detached_qualification" in code:
+            label = "qualification"
+        elif "_authenticated_native_binding" in code:
+            label = "binding"
+        elif "_authenticated_retention_source" in code:
+            label = "source"
+        else:
+            self.assertIn("_authenticated_retention_binding", code)
+            label = "retention_binding"
+        tree = ast.parse(code)
+        end = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+                if node.targets[0].id == "answer":
+                    op = node.value.func.attr
+                elif node.targets[0].id == "end":
+                    end = ast.literal_eval(node.value)
+        self.events.append(label + ":" + op)
+        if self.failed == label and op not in {"cancel", "original_request"}:
+            raise TimeoutError("private-control-error")
+        if label == "source":
+            self.assertFalse(self.source_issuer.entities or self.retention_issuer.entities)
+            return json.dumps(m.source.receiver.report(self.prior_pin)).encode()
+        if op == "original_request":
+            value = dict(
+                request=self.request,
+                observed_boottime=100,
+                host_admitted=False,
+                binding_created=False,
+                retry_allowed=False,
+            )
+        else:
+            state = {
+                "dispatch": "dispatch_requested",
+                "status": "returned",
+                "finish": "completed",
+                "cancel": "cancelled",
+            }[op]
+            if label == "qualification":
+                value = self.states.result(
+                    state, observation=prep.fixtures.reply() if op in {"status", "finish"} else None
+                )
+            elif label == "binding":
+                value = bound.m.result(
+                    state,
+                    observation=bound.observation(self.request)
+                    if op in {"status", "finish"}
+                    else None,
+                )
+            else:
+                self.assertFalse(self.source_issuer.entities or self.retention_issuer.entities)
+                value = retained.m.result(
+                    state,
+                    retained.observation(self.prior_pin, end)
+                    if op in {"status", "finish"}
+                    else None,
+                )
+        return json.dumps(value).encode()
+
+    def workflow_wire(self, argv, body, timeout):
+        self.charges += len(argv[-1].encode()) + len(body)
+        remote = argv[-1]
+        backup = "_bound_retention_entry" in remote
+        if backup:
+            tree = ast.parse(shlex.split(remote)[-1])
+            op = next(
+                ast.literal_eval(n.value)
+                for n in ast.walk(tree)
+                if isinstance(n, ast.Assign)
+                and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id == "op"
+            )
+        else:
+            fields = remote.split()
+            op = "cancel" if "/usr/bin/systemctl" in fields else fields[6]
+        label = "backup" if backup else "workflow"
+        self.events.append(label + ":" + op)
+        if self.failed == label and op == "submit":
+            raise TimeoutError("private-session-error")
+        if op in {"dispatch", "submit"}:
+            if op == "submit":
+                self.assertTrue(body)
+                issuer = self.retention_issuer if backup else self.source_issuer
+                self.assertFalse(issuer.keys)
+            value = (
+                dict(dispatch_requested=True, workflow_completed=False)
+                if op == "dispatch"
+                else dict(delivery_sent=True, workflow_completed=False)
+            )
+            if backup:
+                value["gate_5_complete"] = False
+        elif backup:
+            value = life.delivery.observed("failed" if op == "cancel" else "retention_returned")
+            if value["receipt"]:
+                value["receipt"]["binding_sha256"] = self.prior_pin
+        elif op == "cancel":
+            return b""
+        else:
+            self.t = 8000
+            value = dict(
+                state="workflow_returned",
+                parent_cgroup_empty=True,
+                children_reaped=True,
+                gate_5_complete=False,
+                retry_allowed=False,
+            )
+        return json.dumps(value).encode()
+
+    def call(self, **kw):
+        return m._prepare_and_admit_once(
+            self.f.provisioned,
+            self.f.host,
+            self.f.root / "joined",
+            cloud=self.f.cloud,
+            bucket_cloud=self.bucket_cloud,
+            proposal_raw=PROPOSAL,
+            budget=self.budget,
+            clock=lambda: self.t,
+            wait=self.wait,
+            **kw,
+        )
+
+    def lifecycle(self):
+        admitted = self.call()
+        return m.lifecycle._run_after_native_admission(
+            self.f.root / "lifecycle",
+            self.f.provisioned["binding"],
+            selection_raw=(life.ROOT / m.lifecycle.acquisition.permissions.SELECTION).read_bytes(),
+            proposal_raw=PROPOSAL,
+            acquisition_cloud=self.source_issuer,
+            retention_cloud=self.retention_issuer,
+            host_cloud=self.f.cloud,
+            launch_monotonic=0,
+            host_deadline=14400,
+            clock=lambda: self.t,
+            wait=self.wait,
+            now=lambda: life.retained.NOW,
+            **admitted,
+        )
+
+    def test_real_preparation_binding_source_and_returned_callbacks(self):
+        value = self.call()
+        self.assertEqual(
+            set(value),
+            {"workflow_exchange", "workflow_deadline", "prior_binding_sha", "admit_retention"},
+        )
+        self.assertEqual(value["prior_binding_sha"], self.prior_pin)
+        self.assertEqual(value["workflow_deadline"], 9100)
+        self.assertIsInstance(value["workflow_exchange"], m.Workflow)
+        self.assertEqual(self.events[-1], "source:_stage_once")
+        self.assertEqual(self.budget.used, 18000000 + self.charges)
+        self.assertEqual(self.stops, 0)
+
+    def test_actual_lifecycle_issuers_controls_retention_and_single_stop(self):
+        result = self.lifecycle()
+        self.assertTrue(result["lifecycle_completed"], result)
+        self.assertTrue(result["offhost_retention_verified"])
+        self.assertEqual(self.stops, 1)
+        self.assertEqual(self.source_issuer.issues, 1)
+        self.assertEqual(self.retention_issuer.issues, 1)
+        self.assertFalse(self.source_issuer.entities or self.retention_issuer.entities)
+        self.assertLess(
+            self.events.index("source:_stage_once"), self.events.index("workflow:dispatch")
+        )
+        self.assertLess(
+            self.events.index("workflow:status"), self.events.index("retention_binding:dispatch")
+        )
+        self.assertLess(
+            self.events.index("retention_binding:finish"), self.events.index("backup:dispatch")
+        )
+        self.assertEqual(self.budget.used, 18000000 + self.charges)
+        self.assertFalse(self.budget.uncertain)
+        for path in (self.f.root / "lifecycle").rglob("*.json"):
+            self.assertNotIn("session-secret", path.read_text())
+
+    def outer(self):
+        def provision(output, **_kw):
+            # Move only this test's synthetic fixture into the real outer layout.
+            self.f.host.rename(output)
+            self.f.host = output
+            return self.f.provisioned
+
+        with patch.object(m.lifecycle.guard, "_provision_guarded_once", side_effect=provision):
+            return m._provision_and_run_once(
+                self.f.root / "outer",
+                selection_raw=(
+                    life.ROOT / m.lifecycle.acquisition.permissions.SELECTION
+                ).read_bytes(),
+                proposal_raw=PROPOSAL,
+                host_cloud=self.f.cloud,
+                bucket_cloud=self.bucket_cloud,
+                watchdog_cloud=object(),
+                acquisition_cloud=self.source_issuer,
+                retention_cloud=self.retention_issuer,
+                clock=lambda: self.t,
+                wait=self.wait,
+                now=lambda: life.retained.NOW,
+            )
+
+    def test_entire_outer_to_real_adapter_issuers_and_one_stop(self):
+        result = self.outer()
+        self.assertTrue(result["lifecycle_completed"], result)
+        self.assertEqual(self.stops, 1)
+        self.assertEqual(result["control_bytes_charged_or_reserved"], 18000000 + self.charges)
+        self.assertFalse(result["control_accounting_uncertain"])
+        self.assertEqual(self.source_issuer.issues, 1)
+        self.assertEqual(self.retention_issuer.issues, 1)
+
+    def test_entire_outer_admission_failure_stops_without_issuer(self):
+        self.failed = "binding"
+        result = self.outer()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.stops, 1)
+        self.assertEqual(self.source_issuer.issues + self.retention_issuer.issues, 0)
+        self.assertEqual(result["control_bytes_charged_or_reserved"], m.CAP)
+        self.assertTrue(result["control_accounting_uncertain"])
+
+    def test_retention_callback_wrong_identity_and_replay_reject(self):
+        admitted = self.call()
+        callback = admitted["admit_retention"]
+        for args in (
+            (self.f.provisioned["binding"], "f" * 64, 14400),
+            (self.f.provisioned["binding"], self.prior_pin, 14401),
+        ):
+            with self.assertRaises(ValueError):
+                callback(*args)
+        self.t = 8000
+        callback(self.f.provisioned["binding"], self.prior_pin, 14400)
+        with self.assertRaises(ValueError):
+            callback(self.f.provisioned["binding"], self.prior_pin, 14400)
+
+    def test_lost_native_binding_ack_consumes_budget_and_source_not_sent(self):
+        self.failed = "binding"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertTrue(self.budget.uncertain)
+        self.assertEqual(self.budget.remaining, 0)
+        self.assertNotIn("source:_stage_once", self.events)
+        self.assertEqual(self.source_issuer.issues, 0)
+
+    def test_lost_source_ack_prevents_workflow(self):
+        self.failed = "source"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertTrue(self.budget.uncertain)
+        self.assertNotIn("workflow:dispatch", self.events)
+
+    def test_bucket_failure_blocks_retention_binding_and_issuer_stops_once(self):
+        self.failed = "bucket"
+        result = self.lifecycle()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.retention_issuer.issues, 0)
+        self.assertNotIn("retention_binding:dispatch", self.events)
+        self.assertEqual(self.stops, 1)
+
+    def test_retained_volume_failure_blocks_bucket_and_retention(self):
+        self.failed = "post_host"
+        result = self.lifecycle()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.retention_issuer.issues, 0)
+        self.assertFalse(any(e.startswith("bucket:") for e in self.events))
+        self.assertEqual(self.stops, 1)
+
+    def test_retention_binding_failure_blocks_issuer_stops_once(self):
+        self.failed = "retention_binding"
+        result = self.lifecycle()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.retention_issuer.issues, 0)
+        self.assertTrue(self.budget.uncertain)
+        self.assertEqual(self.stops, 1)
+
+    def test_workflow_failure_prevents_retention_checks(self):
+        self.failed = "workflow"
+        result = self.lifecycle()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.retention_issuer.issues, 0)
+        self.assertFalse(any(e.startswith("bucket:") for e in self.events))
+        self.assertEqual(self.budget.used, 18000000 + self.charges)
+        self.assertEqual(self.stops, 1)
+
+    def test_backup_failure_preserves_cleanup_and_one_stop(self):
+        self.failed = "backup"
+        result = self.lifecycle()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.retention_issuer.issues, 1)
+        self.assertFalse(self.retention_issuer.entities)
+        self.assertEqual(self.budget.used, 18000000 + self.charges)
+        self.assertEqual(self.stops, 1)
+
+    def test_old_prepare_window_or_reused_output_never_restarts(self):
+        self.t = 1350
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.events, [])
+        self.t = 100
+        self.call()
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_late_retention_reserve_rejects_before_cloud(self):
+        callback = self.call()["admit_retention"]
+        self.t = 11841
+        before = len(self.f.cloud.calls)
+        with self.assertRaises(ValueError):
+            callback(self.f.provisioned["binding"], self.prior_pin, 14400)
+        self.assertEqual(len(self.f.cloud.calls), before)
+
+    def test_no_budget_for_retention_or_workflow_stops_before_wire(self):
+        admitted = self.call()
+        self.budget.used = m.CAP
+        before = self.charges
+        with self.assertRaises(ValueError):
+            admitted["workflow_exchange"]("dispatch", timeout=60)
+        self.assertEqual(self.charges, before)
+
+
+class OuterTests(unittest.TestCase):
+    def test_actual_pins_budget_failure_and_public_boundary(self):
+        m.authenticate()
+        budget = m.Budget()
+        budget.charge(10)
+        with self.assertRaises(ValueError):
+            budget.charge(True)
+        with self.assertRaises(ValueError):
+            budget.phase(lambda: (_ for _ in ()).throw(TimeoutError("private-error")))
+        self.assertTrue(budget.uncertain)
+        self.assertEqual(budget.remaining, 0)
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+    def test_real_outer_lifecycle_passes_adapter_and_one_stop_ledger(self):
+        f = life.Tests()
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        provisioned = dict(
+            binding=life.delivery.BINDING,
+            launch_monotonic=0,
+            host_deadline_monotonic=14400,
+            report=dict(setup_completed=True),
+        )
+        adapter = dict(
+            workflow_exchange=f.workflow,
+            workflow_deadline=10000,
+            prior_binding_sha="a" * 64,
+            admit_retention=f.admit,
+        )
+        with (
+            patch.object(m.lifecycle.guard, "_provision_guarded_once", return_value=provisioned),
+            patch.object(m, "_prepare_and_admit_once", return_value=adapter) as admit,
+        ):
+            result = m._provision_and_run_once(
+                f.root / "outer",
+                selection_raw=(
+                    life.ROOT / m.lifecycle.acquisition.permissions.SELECTION
+                ).read_bytes(),
+                proposal_raw=PROPOSAL,
+                host_cloud=f.host,
+                bucket_cloud=object(),
+                watchdog_cloud=object(),
+                acquisition_cloud=f.source,
+                retention_cloud=f.retained,
+                clock=lambda: f.elapsed,
+                wait=f.wait,
+                now=lambda: life.retained.NOW,
+            )
+        self.assertTrue(result["lifecycle_completed"])
+        self.assertEqual(f.stops(), 1)
+        self.assertEqual(admit.call_args.args[:2], (provisioned, f.root / "outer/execution/host"))
+        self.assertFalse(result["gate_5_complete"] or result["real_4b_import"])

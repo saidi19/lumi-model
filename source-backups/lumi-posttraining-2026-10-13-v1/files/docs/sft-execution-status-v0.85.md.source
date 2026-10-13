@@ -1,0 +1,76 @@
+# SFT execution status v0.85
+
+2026-09-13. The local guardian/bootstrap/rootfs/entry composition is implemented
+and synthetic-tested. This completes the local composition-code part of the
+existing Gate 5 import task; Gate 5 itself is not complete. No new roadmap gate
+has been introduced.
+
+## Completed in this successor
+
+- Rootfs adapter v1 (24 tests) binds/seals the software root before input/output
+  mounts, re-pins the root in the final namespace, pivots without another root
+  bind and checks that the input/output views survive.
+- Bootstrap v2 (24 tests) composes that adapter with the existing cgroup,
+  network, Landlock, IPC, authority-descriptor and privilege-drop controls.
+  The exact entry and three environment pins are fixed.
+- Guardian composition v2 (30 tests) binds the parent's generation nonce, arms
+  controller/deadline supervision before one release, checks the closed entry
+  report and mounted-input totals, and requires successful exits, EOF and
+  removal of its empty owned cgroup.
+- Prepared entry v1 (30 tests) verifies the helper/source/control bundle before
+  one tiny coordinator call. It retains only fixed statuses, hashes and counts.
+
+All 108 new tests plus the previous 87 component tests pass on Python 3.11.15 and
+3.13.7: 195 tests per runtime, no failures, errors or skips. Final test processes
+had audit hooks denying network/process/native-library calls and ML imports;
+no prohibited operation was attempted and no ML root was loaded. Eight new
+Python files pass syntax and 100-column checks. No Ruff or native Linux result
+is claimed.
+
+## Integration fixes made before handoff
+
+The ordinary frozen lumi package initializer may load model libraries too early
+for the new runner's pre-ML check. The authenticated entry now establishes an
+inert exact lumi namespace first; original source bytes are not changed.
+
+Review also found that /outputs/attempt-001 gives a parent path too shallow for
+the frozen runner. The entry now exclusively creates /outputs/import (0700,
+worker-owned) and uses /outputs/import/attempt-001. A regression test executes
+the actual frozen path validator, not a replacement validator.
+
+The entry's generated success report is tested against the actual new guardian
+parser/validator. Existing sources, previous evidence and existing CI are
+unchanged. All new files are still local; nothing was committed or pushed.
+
+## Remaining existing sequence
+
+1. Prepare this successor's nonce-bound tiny generated fixture, root-owned
+   worker-readable controls, authenticated source manifest and rootfs scaffold.
+2. Bind a verified Linux x86_64 CPython 3.12 launcher and run the bounded
+   generated-only native qualification of this composition.
+3. Separately admit the dedicated host/runtime, input backing-store and writer
+   exclusion, full-size resource limits and real-host readback, then perform
+   the authorized real checkpoint CPU import.
+4. After successful verified import, complete the existing GPU-worker,
+   private-data and CUDA-smoke prerequisites before SFT.
+
+The tiny successor keeps the existing 4 GiB outer cgroup and 90-second bound;
+its coordinator is limited to 60 seconds, 64 MiB logical reads and 16 MiB
+import writes. Source-copy writes are a separate maximum 4 MiB. The 512 MiB
+tmpfs and 64 MiB shm values are capacities, not cumulative write counters.
+These are not full-size host admission or measured resource requirements.
+
+No new rootfs/tensor fixture was prepared or executed here. Source origin,
+external-writer exclusion and real host capacity remain parent prerequisites.
+Read-only mounts and synthetic test results are not an authorization to import
+the real checkpoint. The public real import entry still rejects
+host_guard_not_bound.
+
+No real checkpoint/tokenizer/dataset payload, network/S3/instance, GPU, inference
+or training operation occurred. GPU is not needed for the next preparation-code
+step. Execution permission, training authorization and production eligibility
+remain false.
+
+Plan: configs/lumi-4b-sft-checkpoint-import-composition-development-v0.1.json.
+Report: evidence/lumi-4b-sft-checkpoint-import-composition-development-v0.1.json.
+Verification: matching import-composition-development-verification-v0.1.json.

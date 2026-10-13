@@ -1,0 +1,476 @@
+import copy
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import shlex
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+
+# urllib3 otherwise probes an IPv6 loopback bind while importing the SDK.
+# Signing fixtures need no sockets at all.
+with patch("socket.has_ipv6", False):
+    import botocore.config
+    import botocore.exceptions
+    import botocore.session
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def module(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / (name + ".py"))
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+m = module("sft_vm_watchdog_report_channel_v1")
+p = module("probe_sft_vm_watchdog_object_v1")
+builder = module("prepare_sft_vm_watchdog_object_v1")
+ATTEMPT = "a" * 32
+BINDINGS = {"probe": "b" * 64, "bootstrap": "c" * 64, "policy": "d" * 64}
+
+
+def report(slot):
+    status, checks = {
+        "boot": ("report_channel_ready", {"transport_ready": True}),
+        "ready": ("ready_for_deliberate_policy_fault", dict.fromkeys(m.READY, True)),
+        "observer": ("watchdog_failure_receipt_verified", dict.fromkeys(m.SUCCESS, True)),
+        "failure": ("failed", {"failed_stage": "policy_installed", "identity": True}),
+    }[slot]
+    return {
+        "schema": "lumi.watchdog-native-probe.v0.2",
+        "status": status,
+        "checks": checks,
+        **m.FLAGS,
+    }
+
+
+class ReportChannelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = botocore.session.Session().create_client(
+            "s3",
+            region_name="us-east-1",
+            endpoint_url="https://s3.us-east-1.amazonaws.com",
+            aws_access_key_id="AKIASYNTHETIC00000000",
+            aws_secret_access_key="NOT_A_SECRET",
+            config=botocore.config.Config(
+                signature_version="s3v4",
+                proxies={},
+                retries={"total_max_attempts": 1},
+                ignore_configured_endpoint_urls=True,
+                s3={"addressing_style": "virtual"},
+            ),
+        )
+        cls.config = m.issue(cls.client, attempt=ATTEMPT, bindings=BINDINGS)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.close()
+
+    def directory(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        root.chmod(0o700)
+        return root
+
+    def client_stub(self):
+        client = Mock()
+        client.meta.endpoint_url = "https://s3.us-east-1.amazonaws.com"
+        client.meta.region_name = "us-east-1"
+        client.meta.config.retries = {"total_max_attempts": 1}
+        client.meta.config.proxies = {}
+        client.meta.config.signature_version = "s3v4"
+        return client
+
+    def test_actual_sdk_signs_exact_length_headers_and_keys(self):
+        for slot, url in self.config["puts"].items():
+            parsed = urlsplit(url)
+            query = parse_qs(parsed.query)
+            self.assertEqual(query["X-Amz-SignedHeaders"], [m.SIGNED_HEADERS])
+            self.assertEqual(query["X-Amz-Expires"], ["900"])
+            self.assertEqual(parsed.path, "/" + ATTEMPT + "/" + slot + ".json")
+            m.validate_url(url, attempt=ATTEMPT, slot=slot, now=time.time())
+        self.assertEqual(len(self.config["puts"]), 4)
+
+    def test_exact_roundtrip_and_total_body_limit(self):
+        total = 0
+        for slot in m.SLOTS:
+            raw = m.encode(ATTEMPT, BINDINGS, slot, report(slot))
+            self.assertEqual(len(raw), 8192)
+            self.assertEqual(
+                m.decode(raw, attempt=ATTEMPT, bindings=BINDINGS, slot=slot), report(slot)
+            )
+            total += len(raw)
+        self.assertEqual(total, 32768)
+
+    def test_source_exception_or_authority_cannot_enter_report(self):
+        for change in (
+            {"source": "PRIVATE_SENTINEL"},
+            {"exception": "PRIVATE_SENTINEL"},
+            {"host_admitted": True},
+            {"gate_5_complete": 0},
+            {"checks": {"failed_stage": "PRIVATE_SENTINEL"}},
+        ):
+            with self.assertRaises(ValueError):
+                m.encode(ATTEMPT, BINDINGS, "failure", dict(report("failure"), **change))
+
+    def test_cross_attempt_slot_or_source_bindings_rejected(self):
+        raw = m.encode(ATTEMPT, BINDINGS, "ready", report("ready"))
+        for kwargs in (
+            dict(attempt="e" * 32, bindings=BINDINGS, slot="ready"),
+            dict(attempt=ATTEMPT, bindings={**BINDINGS, "probe": "f" * 64}, slot="ready"),
+            dict(attempt=ATTEMPT, bindings=BINDINGS, slot="observer"),
+        ):
+            with self.assertRaises(ValueError):
+                m.decode(raw, **kwargs)
+
+    def test_truncated_oversized_corrupt_or_noncanonical_body_rejected(self):
+        raw = m.encode(ATTEMPT, BINDINGS, "ready", report("ready"))
+        changed = json.loads(raw)
+        changed["report_sha256"] = "0" * 64
+        damaged = m.canonical(changed).ljust(8192, b" ")
+        for bad in (raw[:-1], raw + b" ", raw[:-1] + b"\n", damaged):
+            with self.assertRaises(ValueError):
+                m.decode(bad, attempt=ATTEMPT, bindings=BINDINGS, slot="ready")
+
+    def test_duplicate_keys_rejected(self):
+        raw = m.encode(ATTEMPT, BINDINGS, "boot", report("boot"))
+        raw = (b'{"slot":"boot",' + raw.lstrip(b"{").rstrip()).ljust(8192, b" ")
+        with self.assertRaises(ValueError):
+            m.decode(raw, attempt=ATTEMPT, bindings=BINDINGS, slot="boot")
+
+    def test_wrong_host_scheme_path_duplicate_query_and_expiry_rejected(self):
+        url = self.config["puts"]["boot"]
+        parsed = urlsplit(url)
+        query = parse_qs(parsed.query)
+        weakened = dict(query, **{"X-Amz-SignedHeaders": ["host"]})
+        for bad in (
+            url.replace("https://", "http://"),
+            url.replace(".s3.us-east-1.amazonaws.com", ".example.com"),
+            url.replace("/boot.json", "/ready.json"),
+            url + "&X-Amz-Expires=900",
+            url + "#fragment",
+            urlunsplit(parsed._replace(query=urlencode(weakened, doseq=True))),
+        ):
+            with self.assertRaises(ValueError):
+                m.validate_url(bad, attempt=ATTEMPT, slot="boot", now=time.time())
+        with self.assertRaises(ValueError):
+            m.validate_url(url, attempt=ATTEMPT, slot="boot", now=time.time() + 901)
+
+    def response(self, status=200):
+        response = Mock(status=status)
+        response.getheader.return_value = "AES256"
+        connection = Mock()
+        connection.getresponse.return_value = response
+        return connection, response
+
+    def test_one_put_exact_bytes_headers_and_no_response_body_read(self):
+        directory = self.directory()
+        connection, response = self.response()
+        with patch.object(m.http.client, "HTTPSConnection", return_value=connection) as factory:
+            receipt = m.put_once(self.config, "boot", report("boot"), claim_directory=directory)
+        factory.assert_called_once()
+        self.assertEqual(factory.call_args.kwargs["timeout"], 3)
+        connection.request.assert_called_once()
+        args, kwargs = connection.request.call_args
+        self.assertEqual(args[0], "PUT")
+        self.assertEqual(len(kwargs["body"]), 8192)
+        self.assertEqual(kwargs["headers"], m.HEADERS)
+        response.read.assert_not_called()
+        connection.close.assert_called_once()
+        self.assertEqual(receipt["sha256"], hashlib.sha256(kwargs["body"]).hexdigest())
+        self.assertNotIn("X-Amz", str(receipt))
+
+    def test_redirect_conflict_and_denied_response_not_followed_or_retried(self):
+        for status in (301, 307, 403, 409, 412, 500):
+            directory = self.directory()
+            connection, _ = self.response(status)
+            with patch.object(m.http.client, "HTTPSConnection", return_value=connection) as factory:
+                with self.assertRaisesRegex(ValueError, "^report_upload_failed$"):
+                    m.put_once(self.config, "ready", report("ready"), claim_directory=directory)
+                with self.assertRaises(ValueError):
+                    m.put_once(self.config, "ready", report("ready"), claim_directory=directory)
+            factory.assert_called_once()
+            connection.request.assert_called_once()
+
+    def test_ambiguous_upload_cannot_be_repeated_or_leak_url(self):
+        connection, _ = self.response()
+        connection.request.side_effect = TimeoutError(
+            "PRIVATE_SENTINEL " + self.config["puts"]["boot"]
+        )
+        directory = self.directory()
+        with patch.object(m.http.client, "HTTPSConnection", return_value=connection) as factory:
+            for _ in range(2):
+                with self.assertRaises(ValueError) as caught:
+                    m.put_once(self.config, "boot", report("boot"), claim_directory=directory)
+                self.assertEqual(str(caught.exception), "report_upload_failed")
+                self.assertTrue(caught.exception.__suppress_context__)
+        factory.assert_called_once()
+        connection.request.assert_called_once()
+
+    def test_claim_symlink_and_wrong_directory_mode_rejected(self):
+        root = self.directory()
+        claim = root / "boot.started"
+        destination = root / "private"
+        destination.write_bytes(b"unchanged")
+        claim.symlink_to(destination)
+        with self.assertRaises(FileExistsError):
+            m.claim(root, "boot")
+        self.assertEqual(destination.read_bytes(), b"unchanged")
+        root.chmod(0o755)
+        with self.assertRaises(ValueError):
+            m.claim(root, "ready")
+
+    def test_invalid_report_cannot_start_network_or_claim(self):
+        root = self.directory()
+        with patch.object(m.http.client, "HTTPSConnection") as factory:
+            with self.assertRaises(ValueError):
+                m.put_once(self.config, "boot", {"text": "PRIVATE_SENTINEL"}, claim_directory=root)
+        factory.assert_not_called()
+        self.assertEqual(list(root.iterdir()), [])
+
+    def test_collector_reads_only_four_exact_objects_and_closes_streams(self):
+        bodies = []
+        client = self.client_stub()
+
+        def get(**kwargs):
+            slot = kwargs["Key"].split("/")[-1].removesuffix(".json")
+            self.assertEqual(
+                kwargs,
+                {
+                    "Bucket": "lumi-watchdog-report-" + ATTEMPT,
+                    "Key": ATTEMPT + "/" + slot + ".json",
+                    "ExpectedBucketOwner": "573978149073",
+                },
+            )
+            body = Mock(wraps=io.BytesIO(m.encode(ATTEMPT, BINDINGS, slot, report(slot))))
+            bodies.append(body)
+            return {"Body": body, "ContentLength": 8192, "ServerSideEncryption": "AES256"}
+
+        client.get_object.side_effect = get
+        reports = m.collect(client, attempt=ATTEMPT, bindings=BINDINGS)
+        self.assertEqual(set(reports), set(m.SLOTS))
+        self.assertEqual(client.get_object.call_count, 4)
+        self.assertEqual(set(name for name, _, _ in client.mock_calls), {"get_object"})
+        for body in bodies:
+            body.read.assert_called_once_with(8193)
+            body.close.assert_called_once()
+
+    def test_missing_objects_do_not_imply_success(self):
+        client = self.client_stub()
+        client.get_object.side_effect = botocore.exceptions.ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "GetObject"
+        )
+        reports = m.collect(client, attempt=ATTEMPT, bindings=BINDINGS)
+        self.assertEqual(reports, {})
+        self.assertEqual(client.get_object.call_count, 4)
+        self.assertFalse(
+            m.assess(reports, stopped_observed=True, cleanup_verified=True)[
+                "native_watchdog_qualified"
+            ]
+        )
+
+    def test_denied_read_does_not_look_like_missing_object(self):
+        client = self.client_stub()
+        client.get_object.side_effect = botocore.exceptions.ClientError(
+            {"Error": {"Code": "AccessDenied", "Message": "PRIVATE_SENTINEL"}}, "GetObject"
+        )
+        with self.assertRaisesRegex(ValueError, "^report_read_failed$"):
+            m.collect(client, attempt=ATTEMPT, bindings=BINDINGS)
+        client.get_object.assert_called_once()
+
+    def test_oversized_remote_object_is_closed_without_read(self):
+        body = Mock()
+        client = self.client_stub()
+        client.get_object.return_value = {
+            "Body": body,
+            "ContentLength": 8193,
+            "ServerSideEncryption": "AES256",
+        }
+        with self.assertRaises(ValueError):
+            m.collect(client, attempt=ATTEMPT, bindings=BINDINGS)
+        body.read.assert_not_called()
+        body.close.assert_called_once()
+
+    def test_retrying_or_redirected_client_is_rejected_before_cloud_call(self):
+        for field, value in (
+            ("retries", {"total_max_attempts": 2}),
+            ("proxies", None),
+            ("signature_version", "s3"),
+        ):
+            client = self.client_stub()
+            setattr(client.meta.config, field, value)
+            with self.assertRaises(ValueError):
+                m.collect(client, attempt=ATTEMPT, bindings=BINDINGS)
+            client.get_object.assert_not_called()
+
+    def test_success_requires_channel_proof_ready_shutdown_and_cleanup(self):
+        reports = {slot: report(slot) for slot in ("boot", "ready", "observer")}
+        self.assertTrue(
+            m.assess(reports, stopped_observed=True, cleanup_verified=True)[
+                "native_watchdog_qualified"
+            ]
+        )
+        for slot in reports:
+            short = {k: v for k, v in reports.items() if k != slot}
+            self.assertFalse(
+                m.assess(short, stopped_observed=True, cleanup_verified=True)[
+                    "native_watchdog_qualified"
+                ]
+            )
+        for stopped, cleanup in ((False, True), (True, False), (1, True)):
+            self.assertFalse(
+                m.assess(reports, stopped_observed=stopped, cleanup_verified=cleanup)[
+                    "native_watchdog_qualified"
+                ]
+            )
+
+    def test_failure_slot_overrides_observer_success(self):
+        reports = {slot: report(slot) for slot in m.SLOTS}
+        value = m.assess(reports, stopped_observed=True, cleanup_verified=True)
+        self.assertTrue(all(v is False for v in value.values()))
+
+    def test_observer_failure_rejects_success(self):
+        reports = {slot: report(slot) for slot in ("boot", "ready", "observer")}
+        reports["observer"] = {**report("failure"), "checks": {"failed_stage": "shutdown_receipt"}}
+        self.assertFalse(
+            m.assess(reports, stopped_observed=True, cleanup_verified=True)[
+                "native_watchdog_qualified"
+            ]
+        )
+
+    def test_native_wrapper_pins_and_public_gates(self):
+        for name, digest in p.PINS.items():
+            self.assertEqual(
+                hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest(), digest
+            )
+        for code in (m, p):
+            with self.assertRaises(ValueError):
+                code.run(approved=True)
+        with patch.object(p.sys, "platform", "darwin"), patch.object(p, "load") as loader:
+            with self.assertRaises(ValueError):
+                p.prepare(observer=False)
+        loader.assert_not_called()
+
+    def test_compressed_release_fits_and_preserves_each_source(self):
+        config = m.issue(self.client, attempt=ATTEMPT, bindings=builder.BINDINGS)
+        raw, summary = builder.build(config)
+        self.assertLessEqual(len(raw), 16384)
+        cloud = json.loads(gzip.decompress(raw).split(b"\n", 1)[1])
+        self.assertEqual(len(cloud["write_files"]), 6)
+        for item in cloud["write_files"]:
+            self.assertEqual(item["permissions"], "0400")
+            self.assertEqual(item["owner"], "root:root")
+            name = Path(item["path"]).name
+            if name in builder.PINS:
+                self.assertEqual(
+                    hashlib.sha256(item["content"].encode()).hexdigest(), builder.PINS[name]
+                )
+            else:
+                self.assertEqual(name, "report-channel.json")
+                self.assertEqual(json.loads(item["content"]), config)
+        self.assertNotIn("X-Amz", json.dumps(summary))
+        self.assertFalse(summary["secret_payload_persisted"])
+
+    def test_oversized_capabilities_are_rejected_before_launch(self):
+        config = m.issue(self.client, attempt=ATTEMPT, bindings=builder.BINDINGS)
+        # A large incompressible synthetic session token must fail at preparation.
+        import random
+
+        rng = random.Random(42)
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        for slot in m.SLOTS:
+            token = "".join(rng.choice(alphabet) for _ in range(7000))
+            config["puts"][slot] += "&X-Amz-Security-Token=" + token
+        with self.assertRaises(ValueError):
+            builder.build(config)
+
+    def prepared_adapter(self, observer):
+        probe = module("probe_sft_vm_watchdog_native_v3")
+        bootstrap = Mock()
+        bootstrap.PINS = {"build_sft_vm_network_expiry_v3.py": p.PINS.get("policy", "d" * 64)}
+        config = copy.deepcopy(self.config)
+        config["bindings"] = {
+            "probe": hashlib.sha256(b"synthetic adapter").hexdigest(),
+            "bootstrap": p.PINS["run_sft_vm_network_bootstrap_v2.py"],
+            "policy": "d" * 64,
+        }
+
+        def read(path, *args):
+            return (
+                m.canonical(config) if path.name == "report-channel.json" else b"synthetic adapter"
+            )
+
+        bootstrap.read.side_effect = read
+        modules = {
+            "run_sft_vm_network_bootstrap_v2.py": bootstrap,
+            "sft_vm_watchdog_report_channel_v1.py": m,
+            "probe_sft_vm_watchdog_native_v3.py": probe,
+        }
+        with (
+            patch.object(p.sys, "platform", "linux"),
+            patch.object(p.sys, "version_info", (3, 12)),
+            patch.object(
+                p.sys, "flags", types.SimpleNamespace(isolated=True, dont_write_bytecode=True)
+            ),
+            patch.object(p.os, "getuid", return_value=0),
+            patch.object(p.os, "getgid", return_value=0),
+            patch.object(p, "load", side_effect=lambda name, read: modules[name]),
+            patch.object(Path, "mkdir") as mkdir,
+        ):
+            _, _, _, _, prepared = p.prepare(observer=observer)
+        self.assertEqual(mkdir.call_count, 0 if observer else 1)
+        return prepared
+
+    def test_native_adapter_routes_reports_and_pins_observer_entry(self):
+        probe = self.prepared_adapter(False)
+        with patch.object(m, "put_once") as upload:
+            probe.report(report("ready")["checks"], "ready_for_deliberate_policy_fault")
+            self.assertEqual(upload.call_args.args[1], "ready")
+            probe.report(report("failure")["checks"], "failed")
+            self.assertEqual(upload.call_args.args[1], "failure")
+        unit = probe.observer_unit("a" * 64)
+        self.assertIn("network.target nss-lookup.target\n", unit)
+        entry = next(line for line in unit.splitlines() if line.startswith("ExecStop="))
+        argv = shlex.split(entry.split("=", 1)[1])
+        compile(argv[4], "observer", "exec")
+        self.assertIn("probe_sft_vm_watchdog_object_v1.py", argv[4])
+        observer = self.prepared_adapter(True)
+        with patch.object(m, "put_once") as upload:
+            observer.report(report("observer")["checks"], "watchdog_failure_receipt_verified")
+            self.assertEqual(upload.call_args.args[1], "observer")
+
+    def test_failed_boot_delivery_prevents_native_test_start(self):
+        bootstrap, channel, probe = Mock(), Mock(), Mock()
+        channel.FLAGS = m.FLAGS
+        channel.put_once.side_effect = ValueError("report_upload_failed")
+        with (
+            patch.object(
+                p,
+                "prepare",
+                return_value=(bootstrap, channel, self.config, Path("/synthetic"), probe),
+            ),
+            patch.object(p.signal, "alarm"),
+            self.assertRaises(SystemExit),
+        ):
+            p.native_once()
+        channel.put_once.assert_called_once()
+        probe.native_once.assert_not_called()
+        bootstrap.stop_host.assert_called_once()
+
+    def test_prior_attempt_evidence_remains_byte_for_byte(self):
+        for version in ("v0.1", "v0.2"):
+            value = json.loads(
+                (
+                    ROOT / ("evidence/lumi-vm-watchdog-native-outcome-" + version + ".json")
+                ).read_bytes()
+            )
+            for name, digest in value["artifact_bindings"].items():
+                self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), digest)

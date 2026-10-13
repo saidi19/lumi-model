@@ -1,0 +1,326 @@
+"""Exercise the actual repaired receiver and sender together offline."""
+
+import ast
+import importlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt021_v1 as build
+
+MACHINE = "a" * 32
+BOOT = "11111111-2222-3333-4444-555555555555"
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.release = build.build()
+        cls.tree = tempfile.TemporaryDirectory()
+        cls.release_root = Path(cls.tree.name).resolve()
+        for name, raw in cls.files.items():
+            path = cls.release_root / name
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(raw)
+        cls.names = {Path(name).stem for name in cls.files if name.startswith("scripts/")}
+        cls.previous = {name: sys.modules.pop(name) for name in cls.names if name in sys.modules}
+        sys.path.insert(0, str(cls.release_root / "scripts"))
+        cls.sender = importlib.import_module("send_sft_vm_setup_inputs_v5")
+        cls.receiver = cls.sender.inputs
+        cls.bootstrap = importlib.import_module("start_sft_vm_setup_bootstrap_v5")
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(str(cls.release_root / "scripts"))
+        for name in cls.names:
+            sys.modules.pop(name, None)
+        sys.modules.update(cls.previous)
+        cls.tree.cleanup()
+
+    def setUp(self):
+        self.temp = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(self.temp).resolve()
+        self.output = self.root / "delivery"
+        self.key = self.root / "key"
+        self.receiver.write(self.key, b"synthetic-never-used-for-ssh")
+        self.binding = {
+            "attempt": build.NEW,
+            "instance": "i-" + "1" * 17,
+            "endpoint": "eice-" + "2" * 17,
+            "root_volume": "vol-" + "3" * 17,
+            "work_volume": "vol-" + "4" * 17,
+            "vm_group": "sg-" + "5" * 17,
+            "endpoint_group": "sg-" + "6" * 17,
+            "key_name": "lumi-synthetic",
+        }
+        config = self.sender.delivery.connection.ssh_config(
+            self.binding, self.key, self.root / "known_hosts"
+        ).encode()
+        hosts = b"synthetic-public-key"
+        for name, raw in (("ssh_config", config), ("known_hosts", hosts)):
+            self.receiver.write(self.root / name, raw)
+        self.config_sha, self.hosts_sha = build.sha(config), build.sha(hosts)
+        self.archive = self.release_root / build.SETUP_TAR
+        self.receiver_path = self.release_root / build.SETUP_STAGE
+
+    def send(self):
+        return self.sender._send_admitted_once(
+            self.binding,
+            self.key,
+            self.root,
+            self.config_sha,
+            self.hosts_sha,
+            self.receiver_path,
+            self.archive,
+            MACHINE,
+            BOOT,
+            1500,
+            self.output,
+            deadline=1800,
+            remaining_control_bytes=self.receiver.CAP,
+            clock=lambda: 0,
+        )
+
+    def bootstrap_send(self):
+        return self.bootstrap._seed_and_send_admitted_once(
+            self.binding,
+            self.key,
+            self.root,
+            self.config_sha,
+            self.hosts_sha,
+            self.receiver_path,
+            self.archive,
+            self.output,
+            deadline=1800,
+            remaining_control_bytes=self.receiver.CAP,
+            clock=lambda: 0,
+        )
+
+    def actual_stage_reply(self):
+        opt, receipts = self.root / "opt", self.root / "receipts"
+        opt.mkdir()
+        receipts.mkdir()
+        original = Path.lstat
+
+        def root_identity(path, *args, **kwargs):
+            values = list(original(path, *args, **kwargs))
+            values[4:6] = [0, 0]
+            return os.stat_result(values)
+
+        with (
+            patch.object(self.receiver, "OPT", opt),
+            patch.object(self.receiver, "RECEIPTS", receipts),
+            patch.object(self.receiver, "boundary"),
+            patch.object(Path, "lstat", root_identity),
+        ):
+            raw = self.files[build.SETUP_TAR]
+            produced = self.receiver._stage_admitted_once(raw, build.sha(raw), MACHINE)
+            for name, body in self.receiver.unpack(raw, build.sha(raw)).items():
+                self.assertEqual((opt / name).read_bytes(), body)
+                self.assertEqual(stat.S_IMODE((opt / name).stat().st_mode), 0o400)
+            self.assertTrue((receipts / build.NEW / "result.json").is_file())
+            with self.assertRaises(ValueError):
+                self.receiver._stage_admitted_once(raw, build.sha(raw), MACHINE)
+        return produced
+
+    def test_actual_receiver_stage_receipt_accepted_by_real_sender(self):
+        produced = self.actual_stage_reply()
+        self.assertEqual(produced["files"], 19)
+        with patch.object(
+            self.sender, "pipe_exchange", return_value=self.receiver.canonical(produced)
+        ) as exchange:
+            result = self.send()
+            self.assertTrue(result["remote_staging_confirmed"])
+            self.assertFalse(result["host_admitted"])
+            with self.assertRaises(FileExistsError):
+                self.send()
+            self.assertEqual(exchange.call_count, 1)
+
+    def test_old_sender_rejects_actual_receiver_receipt(self):
+        produced = self.actual_stage_reply()
+        old = (build.BASE / build.SETUP_SEND).read_bytes()
+        node = next(
+            node
+            for node in ast.parse(old).body
+            if getattr(node, "name", None) == "expected_receipt"
+        )
+        namespace = {
+            "inputs": self.receiver,
+            "ARCHIVE_SHA": self.sender.ARCHIVE_SHA,
+            "ARCHIVE_BYTES": self.sender.ARCHIVE_BYTES,
+        }
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "<old-receipt>", "exec"), namespace)
+        self.assertEqual(namespace["expected_receipt"]()["files"], 18)
+        self.assertNotEqual(
+            self.receiver.canonical(namespace["expected_receipt"]()),
+            self.receiver.canonical(produced),
+        )
+
+    def test_seed_and_actual_sender_join_accept_actual_receiver_receipt(self):
+        produced = self.actual_stage_reply()
+        seed_receipt = {
+            "schema": "lumi.vm-setup-seed.v0.1",
+            "attempt": build.NEW,
+            "machine_id": MACHINE,
+            "boot_id": BOOT,
+            "observed_boottime": 100.0,
+            "setup_deadline_boottime": 1800,
+            "receipt_parents_created": True,
+            "host_admitted": False,
+            "expiry_enforced": False,
+            "execution_permitted": False,
+            "retry_allowed": False,
+        }
+        with (
+            patch.object(
+                self.sender.delivery,
+                "pipe_exchange",
+                return_value=self.receiver.canonical(seed_receipt),
+            ) as seed,
+            patch.object(
+                self.sender, "pipe_exchange", return_value=self.receiver.canonical(produced)
+            ) as transfer,
+        ):
+            result = self.bootstrap_send()
+            self.assertTrue(result["seed_confirmed"])
+            self.assertTrue(result["control_staging_confirmed"])
+            self.assertFalse(result["host_admitted"])
+            self.assertFalse(result["expiry_enforced"])
+            self.assertLessEqual(result["total_control_content_bytes_charged"], self.receiver.CAP)
+            with self.assertRaises(FileExistsError):
+                self.bootstrap_send()
+            self.assertEqual(seed.call_count, 1)
+            self.assertEqual(transfer.call_count, 1)
+
+    def test_manifest_count_changes_do_not_leave_stale_sender_count(self):
+        files = dict(self.receiver.FILES)
+        with patch.object(self.receiver, "FILES", files | {"synthetic-extra": None}):
+            self.assertEqual(self.sender.expected_receipt()["files"], 20)
+
+    def test_full_receipt_mutations_rejected_before_remote_seed(self):
+        original = self.receiver.receipt
+        cases = (
+            {"schema": "wrong"},
+            {"attempt": "wrong"},
+            {"archive_sha256": "0" * 64},
+            {"archive_bytes": 1},
+            {"files": 18},
+            {"files": True},
+            {"host_admitted": True},
+            {"binding_created": 0},
+            {"retry_allowed": True},
+            {"unexpected": "private"},
+        )
+        for change in cases:
+            with (
+                self.subTest(change=change),
+                patch.object(
+                    self.receiver,
+                    "receipt",
+                    side_effect=lambda raw, change=change: original(raw) | change,
+                ),
+                patch.object(self.sender.delivery, "pipe_exchange") as seed,
+                patch.object(self.sender, "pipe_exchange") as transfer,
+                self.assertRaises(ValueError),
+            ):
+                self.bootstrap_send()
+            seed.assert_not_called()
+            transfer.assert_not_called()
+            self.assertFalse(self.output.exists())
+
+    def test_bad_runtime_receipt_has_fixed_contract_stage_and_no_exception_text(self):
+        wrong = self.receiver.receipt(self.files[build.SETUP_TAR]) | {
+            "files": 18,
+            "staged_files_readback_match": True,
+            "readonly_mounts_established": False,
+        }
+        with patch.object(
+            self.sender, "pipe_exchange", return_value=self.receiver.canonical(wrong)
+        ):
+            with self.assertRaises(ValueError):
+                self.send()
+        result = json.loads((self.output / "result.json").read_bytes())
+        self.assertEqual(result["failure_stage"], "receipt_contract")
+        self.assertTrue(result["remote_completion_unknown"])
+        self.assertFalse(result["remote_staging_confirmed"])
+
+    def test_ambiguous_transport_remains_one_dispatch_with_allowlisted_stage(self):
+        with patch.object(
+            self.sender, "pipe_exchange", side_effect=TimeoutError("PRIVATE_SENTINEL")
+        ):
+            with self.assertRaises(ValueError):
+                self.send()
+        raw = (self.output / "result.json").read_bytes()
+        self.assertNotIn(b"PRIVATE_SENTINEL", raw)
+        self.assertEqual(json.loads(raw)["failure_stage"], "exchange")
+        with patch.object(self.sender, "pipe_exchange") as again:
+            with self.assertRaises(FileExistsError):
+                self.send()
+            again.assert_not_called()
+
+    def test_malformed_reply_is_reported_without_raw_content(self):
+        with patch.object(self.sender, "pipe_exchange", return_value=b"PRIVATE_SENTINEL"):
+            with self.assertRaises(ValueError):
+                self.send()
+        raw = (self.output / "result.json").read_bytes()
+        self.assertEqual(json.loads(raw)["failure_stage"], "receipt_decode")
+        self.assertNotIn(b"PRIVATE_SENTINEL", raw)
+
+    def test_modified_payload_rejected_before_sender_dispatch_or_marker(self):
+        bad = self.root / "bad-receiver.py"
+        self.receiver.write(bad, b"modified-source")
+        self.receiver_path = bad
+        with patch.object(self.sender, "pipe_exchange") as transport:
+            with self.assertRaises(ValueError):
+                self.send()
+            transport.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_native_frame_transport_caps_and_parser_remain_unchanged(self):
+        def functions(raw):
+            return {
+                node.name: ast.dump(node)
+                for node in ast.parse(raw).body
+                if isinstance(node, ast.FunctionDef)
+            }
+
+        old = functions((build.BASE / build.SETUP_SEND).read_bytes())
+        new = functions(self.files[build.SETUP_SEND])
+        for name in ("native_launcher", "pipe_exchange", "command", "run"):
+            self.assertEqual(old[name], new[name])
+        self.assertEqual(self.sender.LOCAL_SECONDS, 100)
+        self.assertEqual(self.sender.REMOTE_SECONDS, 85)
+        self.assertEqual(self.receiver.CAP, 32 * 1024**2)
+
+    def test_outer_graph_authenticates_and_uses_closed_public_entry(self):
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        outer.authenticate()
+        self.assertEqual(outer.network.selection.ATTEMPT, build.NEW)
+        with self.assertRaises(ValueError):
+            outer.run(approved=True)
+        with self.assertRaises(ValueError):
+            build.run(approved=True)
+
+    def test_outer_authentication_rejects_contract_mismatch_before_paid_allocation(self):
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        good = self.sender.expected_receipt()
+        with patch.object(self.sender, "expected_receipt", return_value=good | {"files": 18}):
+            with self.assertRaises(ValueError):
+                outer.authenticate()
+
+    def test_fresh_source_preserves_consumed_attempt_and_reports_limits(self):
+        self.assertEqual(self.release["operational_predecessor"], build.OLD)
+        self.assertTrue(self.release["sender_receiver_receipts_equal"])
+        self.assertFalse(self.release["real_linux_or_remote_transfer_qualified"])
+        self.assertFalse(self.release["execution_permitted"])
+        self.assertFalse(self.release["old_authorization_reused"])
+        self.assertEqual(self.release["write_attempts_per_operation"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

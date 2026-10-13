@@ -1,0 +1,169 @@
+import configparser
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_acquisition_sdk_install_v1 as prior
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "cpu_runtime_test", ROOT / "scripts/install_sft_vm_cpu_runtime_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.inputs = self.root / "inputs"
+        self.wheels = self.inputs / "wheels"
+        self.wheels.mkdir(parents=True)
+        self.dest = self.root / "runtime"
+        self.enterContext(patch.object(m, "INPUT", self.inputs))
+        self.enterContext(patch.object(m, "DEST", self.dest))
+        self.enterContext(patch.object(m, "boundary"))
+        self.enterContext(patch.object(m, "owned", side_effect=lambda p, **kw: p.lstat()))
+        self.helper = prior.m
+        self.enterContext(patch.object(m, "helpers", return_value=self.helper))
+        self.rows = [
+            dict(
+                name=f"package{i}",
+                version="1.0",
+                filename=f"package{i}-1.whl",
+                bytes=3,
+                sha256=self.helper.sha(b"abc"),
+            )
+            for i in range(34)
+        ]
+        self.raw = json.dumps(
+            dict(python_abi="cp312", platform="linux/amd64", requirements=self.rows)
+        ).encode()
+        (self.inputs / "runtime-lock.json").write_bytes(self.raw)
+        self.enterContext(patch.object(m, "LOCK_SHA", self.helper.sha(self.raw)))
+        for row in self.rows:
+            (self.wheels / row["filename"]).write_bytes(b"abc")
+        self.calls = []
+        self.bad_versions = False
+        self.fail_command = None
+
+        def run(args, timeout, output=None):
+            self.calls.append((args, timeout))
+            if len(self.calls) == self.fail_command:
+                raise OSError("synthetic private exception")
+            if output is not None:
+                versions = {r["name"]: r["version"] for r in self.rows}
+                if self.bad_versions:
+                    versions[self.rows[0]["name"]] = "wrong"
+                output.write(json.dumps(versions).encode())
+
+        self.enterContext(patch.object(self.helper, "run_command", side_effect=run))
+
+    def test_exact_sequence_uses_offline_install_and_all_versions(self):
+        result = m.install()
+        self.assertEqual(result["wheel_count"], 34)
+        self.assertEqual(result["wheel_bytes"], 102)
+        self.assertFalse(result["host_admitted"])
+        self.assertFalse(result["native_ml_import_exercised"])
+        self.assertEqual(len(self.calls), 4)
+        pip, timeout = self.calls[1]
+        for option in (
+            "--no-index",
+            "--no-deps",
+            "--require-hashes",
+            "--no-compile",
+            "--only-binary=:all:",
+        ):
+            self.assertIn(option, pip)
+        self.assertEqual(timeout, 300)
+        self.assertIn("importlib.metadata", self.calls[-1][0][-1])
+        self.assertNotIn("import torch", self.calls[-1][0][-1])
+        with self.assertRaises(FileExistsError):
+            m.install()
+        self.assertEqual(len(self.calls), 4)
+
+    def test_corrupt_wheel_consumes_destination_without_pip(self):
+        (self.wheels / self.rows[0]["filename"]).write_bytes(b"bad")
+        with self.assertRaises(ValueError):
+            m.install()
+        self.assertFalse(self.calls)
+        self.assertEqual(
+            json.loads((self.dest / "failed.json").read_bytes())["stage"], "wheel_audit"
+        )
+        with self.assertRaises(FileExistsError):
+            m.install()
+
+    def test_unknown_or_missing_wheel_blocks_install(self):
+        (self.wheels / "extra.whl").write_bytes(b"abc")
+        with self.assertRaises(ValueError):
+            m.audit_wheels(self.rows)
+        (self.wheels / "extra.whl").unlink()
+        (self.wheels / self.rows[0]["filename"]).unlink()
+        with self.assertRaises(ValueError):
+            m.audit_wheels(self.rows)
+
+    def test_changed_lock_rejected_before_destination(self):
+        (self.inputs / "runtime-lock.json").write_bytes(self.raw + b" ")
+        with self.assertRaises(ValueError):
+            m.install()
+        self.assertFalse(self.dest.exists())
+        self.assertFalse(self.calls)
+
+    def test_bad_version_readback_never_writes_success(self):
+        self.bad_versions = True
+        with self.assertRaises(ValueError):
+            m.install()
+        self.assertFalse((self.dest / "result.json").exists())
+        self.assertEqual(json.loads((self.dest / "failed.json").read_bytes())["stage"], "versions")
+
+    def test_pip_failure_preserved_without_exception_text(self):
+        self.fail_command = 2
+        with self.assertRaises(ValueError):
+            m.install()
+        raw = (self.dest / "failed.json").read_bytes()
+        self.assertNotIn(b"private exception", raw)
+        self.assertEqual(json.loads(raw)["stage"], "offline_install")
+        self.assertFalse((self.dest / "result.json").exists())
+        with self.assertRaises(FileExistsError):
+            m.install()
+
+
+class BoundaryTests(unittest.TestCase):
+    def test_native_boundary_rejects_mac_before_helpers_or_writes(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "helpers") as helper:
+            with self.assertRaises(ValueError):
+                m.install()
+        helper.assert_not_called()
+
+    def test_service_network_resource_and_timeout_limits(self):
+        config = configparser.ConfigParser(interpolation=None)
+        config.read(ROOT / "configs/lumi-vm-cpu-runtime-install-v0.1.service")
+        service = config["Service"]
+        for name, value in {
+            "PrivateNetwork": "yes",
+            "IPAddressDeny": "any",
+            "Restart": "no",
+            "MemoryMax": "1G",
+            "MemorySwapMax": "0",
+            "TasksMax": "64",
+            "TimeoutStartSec": "600",
+            "KillMode": "control-group",
+            "StandardOutput": "null",
+            "StandardError": "null",
+            "LimitCORE": "0",
+        }.items():
+            self.assertEqual(service[name], value)
+        self.assertEqual(service["ReadOnlyPaths"], "/opt/lumi-cpu-input")
+        self.assertIn("/usr/bin/python3 -I -B", service["ExecStart"])
+
+    def test_frozen_helper_and_original_cpu_lock_hashes_match(self):
+        self.assertEqual(
+            prior.m.sha((ROOT / "scripts/install_sft_vm_acquisition_sdk_v1.py").read_bytes()),
+            m.HELPER_SHA,
+        )
+        raw = (ROOT / "configs/lumi-sft-linux-cpu-release-v0.1.lock.json").read_bytes()
+        self.assertEqual(prior.m.sha(raw), m.LOCK_SHA)
+        self.assertEqual(len(json.loads(raw)["requirements"]), 34)

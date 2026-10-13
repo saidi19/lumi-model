@@ -1,0 +1,124 @@
+"""Inherited cleanup regressions plus bounded pagination and exact-key checks."""
+
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_v05_host_cleanup_v1.py").read_text()
+source = source.replace("cleanup_sft_vm_v05_host_resources_v1.py",
+                        "cleanup_sft_vm_v05_host_resources_v2.py")
+source = source.replace("key-0123456789abcdef0", "key-001ddc510adbf2902")
+source = source.replace("worker.calls = 64", "worker.calls = 96")
+inherited = types.ModuleType("cleanup_v2_inherited_tests")
+inherited.__file__ = str(ROOT / "tests/test_sft_vm_v05_host_cleanup_v1.py")
+exec(compile(source, inherited.__file__, "exec"), inherited.__dict__)
+m = inherited.m
+
+
+class CleanupV2Tests(inherited.CleanupTests):
+    def pages(self, count):
+        worker = self.setup_worker()
+        def hook(op, fields, value):
+            if op == "describe_security_group_vpc_associations":
+                page = int(fields.get("NextToken", "0"))
+                if page < count - 1:
+                    value["NextToken"] = str(page + 1)
+        self.cloud.hook = hook
+        return worker
+
+    def test_empty_first_page_with_token_is_not_completion(self):
+        worker = self.pages(2)
+        worker.run()
+        self.assertEqual(worker.stage, "cleanup_verified")
+        self.assertEqual(worker.association_queries, 4)
+        self.assertEqual(worker.association_pages, 8)
+        self.assertEqual(worker.calls, 59)
+        self.assertEqual(worker.writes, 5)
+        queries = [fields for op, fields in self.cloud.calls
+                   if op == "describe_security_group_vpc_associations"]
+        for first, second in zip(queries[::2], queries[1::2], strict=True):
+            self.assertEqual(first["Filters"], second["Filters"])
+            self.assertEqual(second["MaxResults"], 100)
+            self.assertEqual(second["NextToken"], "1")
+        self.assertNotIn(b"NextToken", m.canonical(self.saved))
+
+    def test_eight_page_complete_queries_fit_total_budget(self):
+        worker = self.pages(8)
+        worker.run()
+        self.assertEqual(worker.calls, 83)
+        self.assertEqual(worker.writes, 5)
+        self.assertEqual(worker.association_pages, 32)
+
+    def test_page_limit_incomplete_query_never_mutates(self):
+        worker = self.pages(9)
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(worker.check, "association_page_cap")
+        self.assertEqual(worker.association_pages, 8)
+        self.assertEqual(worker.writes, 0)
+
+    def test_association_on_second_page_never_mutates(self):
+        worker = self.setup_worker()
+        def hook(op, fields, value):
+            if op == "describe_security_group_vpc_associations":
+                if "NextToken" in fields:
+                    value["SecurityGroupVpcAssociations"] = [{"VpcId": "foreign"}]
+                else:
+                    value["NextToken"] = "opaque"
+        self.cloud.hook = hook
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(worker.check, "association_rows_present")
+        self.assertEqual(worker.writes, 0)
+
+    def test_cycles_malformed_tokens_shapes_and_truncation_rejected(self):
+        for case in ("cycle", "number", "oversized", "missing_list", "null_list", "truncated"):
+            worker = self.setup_worker()
+            def hook(op, fields, value, case=case):
+                if op != "describe_security_group_vpc_associations":
+                    return
+                if case == "cycle":
+                    value["NextToken"] = "same"
+                elif case == "number":
+                    value["NextToken"] = 0
+                elif case == "oversized":
+                    value["NextToken"] = "x" * 8193
+                elif case == "missing_list":
+                    del value["SecurityGroupVpcAssociations"]
+                elif case == "null_list":
+                    value["SecurityGroupVpcAssociations"] = None
+                else:
+                    value["IsTruncated"] = True
+            self.cloud.hook = hook
+            with self.assertRaises(ValueError):
+                worker.run()
+            self.assertEqual(worker.writes, 0)
+
+    def test_terminal_empty_and_null_tokens_are_valid(self):
+        for token in (None, ""):
+            worker = self.setup_worker()
+            def hook(op, fields, value, token=token):
+                if op == "describe_security_group_vpc_associations":
+                    value["NextToken"] = token
+            self.cloud.hook = hook
+            worker.run()
+            self.assertEqual(worker.stage, "cleanup_verified")
+
+    def test_recreated_key_with_same_name_and_material_rejected(self):
+        worker = self.setup_worker()
+        self.cloud.key["KeyPairId"] = "key-11111111111111111"
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(worker.check, "pinned_key_identity")
+        self.assertEqual(worker.writes, 0)
+
+    def test_association_api_failure_is_not_retried(self):
+        worker = self.setup_worker()
+        def hook(op, fields, value):
+            if op == "describe_security_group_vpc_associations":
+                raise RuntimeError("not retained")
+        self.cloud.hook = hook
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(worker.association_pages, 1)
+        self.assertEqual(worker.writes, 0)

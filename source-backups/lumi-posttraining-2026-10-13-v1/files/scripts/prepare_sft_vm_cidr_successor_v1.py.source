@@ -1,0 +1,187 @@
+"""Local CIDR correction only; not a fresh execution or identity grant.
+
+Preserve consumed attempt-008. Derive a separate, read-only candidate source
+tree; keep payload archives, checkpoint selection and all runtime limits intact.
+The observed free CIDR must be freshly admitted before any future execution.
+"""
+
+import ast
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "artifacts/lumi-vm-recovery-outer-v0.8"
+BASE_SHA = "dd9170eb58a6ccd50269e5b0d4c4aee8abea91fc13ff76e5ea763f4a0387596e"
+OUTPUT = "artifacts/lumi-vm-network-cidr-successor-v0.1"
+DIAGNOSTIC = "evidence/lumi-vm-attempt-008-network-admission-diagnostic-v0.1.json"
+DIAGNOSTIC_SHA = "5094bf4d3fdd861873048e6ed52001b48a4b05138b1cb5041e29f5478fb428ed"
+FAILURE = "evidence/lumi-vm-attempt-008-cpu-execution-verification-v0.1.json"
+FAILURE_SHA = "09337db0638ec99b3d9d15f1b5289de86687b34b7bd44f48f397ac27383b87f0"
+PLAN = "configs/lumi-vm-private-network-plan-v0.1.json"
+NETWORK = "scripts/run_sft_vm_private_network_v1.py"
+OUTER = "scripts/run_sft_vm_private_outer_v7.py"
+OLD, NEW = "172.31.96.0/27", "172.31.96.32/27"
+LIMIT = 32 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("cidr_successor_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, digest, size=None):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= LIMIT)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def inputs():
+    diagnostic = json.loads(read(ROOT / DIAGNOSTIC, DIAGNOSTIC_SHA))
+    failure = json.loads(read(ROOT / FAILURE, FAILURE_SHA))
+    need(diagnostic["expected_cidr"] == OLD and diagnostic["first_available_27"] == NEW)
+    need(diagnostic["expected_cidr_overlap_count"] == 1)
+    need(failure["outcome"]["network_mutation_api_calls"] == 0)
+    need(failure["outcome"]["execution_marker_consumed"] is True)
+    manifest = json.loads(read(ROOT / BASE / "release.json", BASE_SHA))
+    pins = manifest["outputs"]
+    need(len(pins) == 145)
+    blobs = {n: read(ROOT / BASE / n, p["sha256"], p["bytes"]) for n, p in pins.items()}
+    need(sum(map(len, blobs.values())) < LIMIT)
+    return blobs, pins
+
+
+def build(blobs, pins):
+    need(set(blobs) == set(pins))
+    need(
+        all(
+            sha(raw) == pins[n]["sha256"] and len(raw) == pins[n]["bytes"]
+            for n, raw in blobs.items()
+        )
+    )
+    seeds = dict(blobs)
+    for name, count in ((PLAN, 1), (NETWORK, 2)):
+        need(seeds[name].count(OLD.encode()) == count)
+        seeds[name] = seeds[name].replace(OLD.encode(), NEW.encode())
+    outer = seeds[OUTER].decode()
+    need(outer.count("import hashlib\n") == 1)
+    outer = outer.replace("import hashlib\n", "import hashlib\nimport ipaddress\n")
+    anchor = (
+        '        tables = cloud.cli("ec2", "describe-route-tables", Filters=vf, MaxResults=100)[\n'
+    )
+    need(outer.count(anchor) == 1)
+    early = """        # Reject an occupied pinned target immediately after the scoped subnet read.
+        # This is additional fail-closed validation; full selection below remains.
+        target = json.loads(self.raw)["targets"]["new_private_subnet_cidr"]
+        wanted = ipaddress.IPv4Network(target, strict=True)
+        need(wanted.prefixlen == 27)
+        for subnet in subnets:
+            need(subnet["OwnerId"] == selection.ACCOUNT and subnet["VpcId"] == selection.VPC)
+            if wanted.overlaps(ipaddress.IPv4Network(subnet["CidrBlock"], strict=True)):
+                self.report = dict(status="network_target_occupied", selected_cidr=target,
+                                   calls=cloud.calls, cloud_mutations=0)
+                raise ValueError("network_target_occupied") from None
+"""
+    outer = outer.replace(anchor, early + anchor)
+    seeds[OUTER] = outer.encode()
+    current = dict(seeds)
+    for _iteration in range(64):
+        mapping = {}
+        for name, raw in blobs.items():
+            before, after = sha(raw), sha(current[name])
+            need(before not in mapping or mapping[before] == after)
+            mapping[before] = after
+        following = {}
+        for name, raw in seeds.items():
+            if not name.endswith((".py", ".json")) or name.startswith("evidence/"):
+                following[name] = raw
+            else:
+                following[name] = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda m, mapping=mapping: mapping.get(m[0].decode(), m[0].decode()).encode(),
+                    raw,
+                )
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("cidr_successor_hash_cycle") from None
+    changed = {name for name in blobs if current[name] != blobs[name]}
+    changed_hashes = {sha(blobs[name]) for name in changed}
+    for name, raw in current.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name in changed:
+            need(not any(pin.encode() in raw for pin in changed_hashes))
+        if name not in {PLAN, NETWORK, OUTER}:
+            # All other changes must be hash substitutions only, no logic/limits.
+            need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", blobs[name])
+            )
+        if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+            need(raw == blobs[name])
+    before, after = json.loads(blobs[PLAN]), json.loads(current[PLAN])
+    before["targets"]["new_private_subnet_cidr"] = NEW
+    need(before == after)
+    need(sum(map(len, current.values())) < LIMIT)
+    report = dict(
+        schema="lumi.vm-network-cidr-successor.v0.1",
+        status="local_candidate_not_execution_ready",
+        source_release_sha256=BASE_SHA,
+        source_attempt="242bd09f5fa84b1f9a4e46cb4592ad8b",
+        source_identity_retained=True,
+        consumed_execution_renewed=False,
+        old_cidr=OLD,
+        proposed_cidr=NEW,
+        new_cidr_current_availability_verified=False,
+        early_collision_check_after_subnet_read=True,
+        iterations=_iteration + 1,
+        logical_changes=[PLAN, NETWORK, OUTER],
+        changed_files=sorted(changed),
+        unchanged_files=len(blobs) - len(changed),
+        outputs={n: dict(bytes=len(raw), sha256=sha(raw)) for n, raw in sorted(current.items())},
+        execution_permitted=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    return current, report
+
+
+def prepare():
+    files, report = build(*inputs())
+    destination = ROOT / OUTPUT
+    need(
+        not destination.exists()
+        and not any(p.is_symlink() for p in (destination, *destination.parents))
+    )
+    files = files | {"release.json": encode(report)}
+    need(sum(map(len, files.values())) < LIMIT)
+    destination.mkdir(mode=0o700)
+    for name, raw in sorted(files.items()):
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+            stream.flush()
+            os.fsync(stream.fileno())
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("cidr_candidate_is_not_execution_authority") from None

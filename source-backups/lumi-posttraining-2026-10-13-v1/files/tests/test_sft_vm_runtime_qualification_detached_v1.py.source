@@ -1,0 +1,410 @@
+"""Actual source/caps and transport composition; native services/SSH doubled."""
+
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("run_sft_vm_runtime_qualification_detached_v1")
+d = importlib.import_module("run_sft_vm_runtime_qualification_delivery_v2")
+fixtures = importlib.import_module("tests.test_sft_vm_runtime_qualification_v1")
+reply = fixtures.reply
+
+
+def response(state):
+    return m.result(state, observation=reply() if state in {"returned", "completed"} else None)
+
+
+class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.f = fixtures.ChannelTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.expected = {
+            k: self.f.request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")
+        }
+        self.native_request = dict(
+            request=self.f.request,
+            observed_boottime=1000,
+            host_admitted=False,
+            binding_created=False,
+            retry_allowed=False,
+        )
+        self.t = 0
+        self.responses = [
+            self.native_request,
+            response("dispatch_requested"),
+            response("running"),
+            response("returned"),
+            response("completed"),
+        ]
+
+        def exchange(*_args):
+            value = self.responses.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return json.dumps(value).encode()
+
+        self.exchange = self.enterContext(
+            patch.object(d.sender, "pipe_exchange", side_effect=exchange)
+        )
+
+    def wait(self, seconds):
+        self.t += seconds
+
+    def call(self, **kw):
+        args = dict(
+            deadline=700,
+            host_deadline=14400,
+            remaining_control_bytes=4000000,
+            clock=lambda: self.t,
+            wait=self.wait,
+        )
+        return d._qualify_prepared_channel_once(
+            self.f.root / "detached",
+            self.f.binding,
+            self.f.key,
+            self.f.root,
+            self.f.config_pin,
+            self.f.hosts_pin,
+            self.expected,
+            **(args | kw),
+        )
+
+    def test_real_pinned_channel_all_exchanges_fit_existing_120_second_tunnel(self):
+        value = self.call()
+        self.assertTrue(value["qualification_completed"])
+        self.assertFalse(value["host_admitted"] or value["binding_created"])
+        config = (self.f.root / "ssh_config").read_text()
+        self.assertIn("--max-tunnel-duration 120", config)
+        charges = []
+        for call in self.exchange.call_args_list:
+            argv, body, timeout = call.args
+            self.assertLessEqual(timeout, 80)
+            self.assertIn("signal.alarm(75)", argv[-1])
+            charges.append(len(argv[-1].encode()) + len(body))
+        self.assertEqual(value["control_content_bytes_charged"], sum(charges))
+        self.assertEqual(self.exchange.call_count, 5)
+        self.assertEqual(
+            json.loads((self.f.root / "detached/original-request.json").read_bytes()),
+            self.f.request,
+        )
+
+    def test_native_work_can_span_multiple_tunnels_without_redispatch(self):
+        self.responses = (
+            [self.native_request, response("dispatch_requested")]
+            + [response("running")] * 25
+            + [response("returned"), response("completed")]
+        )
+        value = self.call()
+        self.assertGreater(self.t, 120)
+        self.assertEqual(value["status_reads"], 26)
+        self.assertTrue(value["qualification_completed"])
+        dispatches = [
+            c for c in self.exchange.call_args_list if "answer=m.dispatch" in c.args[0][-1]
+        ]
+        self.assertEqual(len(dispatches), 1)
+
+    def test_lost_dispatch_acknowledgement_cancelled_once_never_retried(self):
+        self.responses = [self.native_request, TimeoutError("private-text"), response("cancelled")]
+        with self.assertRaises(ValueError):
+            self.call()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(self.exchange.call_count, 3)
+        saved = (self.f.root / "detached/result.json").read_text()
+        self.assertNotIn("private-text", saved)
+        report = json.loads(saved)
+        self.assertTrue(report["cancellation_observed"])
+        self.assertFalse(report["qualification_completed"])
+
+    def test_lost_finish_acknowledgement_never_repeats_finish(self):
+        self.responses = [
+            self.native_request,
+            response("dispatch_requested"),
+            response("returned"),
+            TimeoutError("lost"),
+            response("cancelled"),
+        ]
+        with self.assertRaises(ValueError):
+            self.call()
+        finishes = [c for c in self.exchange.call_args_list if "answer=m.finish" in c.args[0][-1]]
+        self.assertEqual(len(finishes), 1)
+
+    def test_failed_cancellation_stays_unproven_for_outer_stop(self):
+        self.responses = [self.native_request, TimeoutError(), TimeoutError()]
+        with self.assertRaises(ValueError):
+            self.call()
+        report = json.loads((self.f.root / "detached/result.json").read_bytes())
+        self.assertTrue(report["cancel_attempted"])
+        self.assertFalse(report["cancellation_observed"])
+
+    def test_foreign_saved_boot_rejected_before_dispatch(self):
+        self.native_request["request"] = dict(
+            self.f.request, boot_id="00000000-0000-0000-0000-000000000000"
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_called_once()
+
+    def test_insufficient_native_time_rejected_before_dispatch(self):
+        self.native_request["observed_boottime"] = 3000
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_called_once()
+
+    def test_bad_deadline_or_control_reserve_rejected_without_exchange(self):
+        for change in (
+            {"deadline": 650},
+            {"deadline": 701},
+            {"host_deadline": 12000},
+            {"remaining_control_bytes": 500000},
+            {"deadline": float("nan")},
+        ):
+            with self.assertRaises(ValueError):
+                self.call(**change)
+        self.exchange.assert_not_called()
+
+    def test_extra_data_or_false_reaping_not_accepted(self):
+        for change in (
+            {"host_admitted": True},
+            {"exception": "raw"},
+            {"observation": None},
+            {"retry_allowed": True},
+        ):
+            with self.assertRaises(ValueError):
+                d.state_reply(response("completed") | change, {"completed"})
+
+    def test_completed_observation_must_equal_prior_terminal_observation(self):
+        final = response("completed")
+        final["observation"]["generated_files_unchanged"] = 62
+        self.responses = [
+            self.native_request,
+            response("dispatch_requested"),
+            response("returned"),
+            final,
+            response("cancelled"),
+        ]
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_no_unbounded_polling(self):
+        self.responses = (
+            [self.native_request, response("dispatch_requested")]
+            + [response("running")] * 60
+            + [response("cancelled")]
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        report = json.loads((self.f.root / "detached/result.json").read_bytes())
+        self.assertEqual(report["status_reads"], 60)
+        self.assertEqual(self.exchange.call_count, 63)
+
+
+class NativeTests(unittest.TestCase):
+    def setUp(self):
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.root = self.base / "qualification"
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.request = dict(
+            attempt=m.ATTEMPT,
+            machine_id="a" * 32,
+            boot_id="12345678-1234-1234-1234-123456789012",
+            volumes=dict(root_volume="vol-" + "1" * 17, work_volume="vol-" + "2" * 17),
+            schema="lumi.vm-detached-setup-request.v0.1",
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14300,
+        )
+        self.expected = {
+            k: self.request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")
+        }
+        self.b = types.SimpleNamespace(
+            boot_time=Mock(return_value=1000),
+            owned=Mock(),
+            sync=Mock(),
+            command=Mock(),
+            encode=lambda v: json.dumps(v).encode(),
+            show=Mock(return_value=b"not-found"),
+        )
+
+        def read(path, cap=131072):
+            raw = path.read_bytes()
+            if not 0 < len(raw) <= cap:
+                raise ValueError("read_cap")
+            return raw
+
+        def write(path, raw):
+            if not 0 < len(raw) <= 32768:
+                raise ValueError("frozen_metadata_write_cap")
+            with path.open("xb") as output:
+                output.write(raw)
+            path.chmod(0o400)
+
+        self.b.read, self.b.write = read, write
+        self.enterContext(patch.object(m, "read_root", side_effect=read))
+        self.h = types.SimpleNamespace(
+            cgroup_empty=Mock(return_value=True), observe=Mock(), validate_terminal=Mock()
+        )
+        self.enterContext(patch.object(m, "context", return_value=(self.b, self.h, self.request)))
+        self.sources = {
+            "qualification.py": d.previous.SOURCE.read_bytes(),
+            "readiness.py": d.readiness.SOURCE.read_bytes(),
+            "source-release.tar.gz": d.previous.ARCHIVE.read_bytes(),
+        }
+        self.source = d.SOURCE.read_bytes()
+
+    def dispatch(self):
+        return m.dispatch(self.expected, self.request, self.sources, self.source)
+
+    def test_authentic_sources_staged_once_without_widening_32k_metadata_writer(self):
+        self.assertEqual(m.sha(self.source), d.SOURCE_SHA)
+        self.assertEqual(self.dispatch()["state"], "dispatch_requested")
+        for name, body in self.sources.items():
+            self.assertEqual((self.root / name).read_bytes(), body)
+            self.assertEqual((self.root / name).stat().st_mode & 0o777, 0o400)
+        argv = self.b.command.call_args.args[0]
+        self.assertIn("--no-block", argv)
+        self.assertIn("--property=RuntimeMaxSec=620", argv)
+        self.assertIn("--property=FailureAction=poweroff", argv)
+        self.assertIn("--property=Restart=no", argv)
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_called_once()
+
+    def test_bad_source_never_creates_root(self):
+        self.sources["qualification.py"] += b"changed"
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.assertFalse(self.root.exists())
+
+    def test_previous_unit_is_rejected_before_writes(self):
+        self.b.show.return_value = b"loaded"
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.assertFalse(self.root.exists())
+
+    def test_dispatch_deadline_cannot_be_renewed(self):
+        self.b.boot_time.return_value = 14300 - 11315 - 650
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_not_called()
+
+    def test_ambiguous_systemd_dispatch_leaves_consumed_evidence(self):
+        self.b.command.side_effect = TimeoutError("lost")
+        with self.assertRaises(TimeoutError):
+            self.dispatch()
+        self.assertTrue((self.root / "dispatch.json").exists())
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_called_once()
+
+    def test_context_cannot_replace_original_deadline(self):
+        with self.assertRaises(ValueError):
+            m.dispatch(
+                self.expected,
+                dict(self.request, host_deadline_boottime=14400),
+                self.sources,
+                self.source,
+            )
+        self.assertFalse(self.root.exists())
+
+    def test_serve_authenticates_payload_then_calls_frozen_qualification(self):
+        self.dispatch()
+        self.b.show.return_value = b"active"
+        qualifier = types.SimpleNamespace(_qualify_same_host=Mock(return_value=reply()))
+        with (
+            patch.object(m, "__file__", str(self.root / "receiver.py")),
+            patch.object(m, "load", return_value=qualifier),
+            patch.object(m.signal, "signal"),
+            patch.object(m.signal, "alarm"),
+        ):
+            m._serve_once()
+        qualifier._qualify_same_host.assert_called_once_with(
+            self.request, self.sources["source-release.tar.gz"], self.sources["readiness.py"]
+        )
+        self.assertEqual(json.loads((self.root / "result.json").read_bytes()), reply())
+
+    def test_serve_source_drift_fails_without_loading_or_raw_exception(self):
+        self.dispatch()
+        self.b.show.return_value = b"active"
+        path = self.root / "qualification.py"
+        path.chmod(0o600)
+        path.write_bytes(b"changed")
+        with (
+            patch.object(m, "__file__", str(self.root / "receiver.py")),
+            patch.object(m, "load") as load,
+            patch.object(m.signal, "signal"),
+            patch.object(m.signal, "alarm"),
+        ):
+            with self.assertRaises(ValueError):
+                m._serve_once()
+        load.assert_not_called()
+        self.assertEqual(json.loads((self.root / "failed.json").read_bytes())["state"], "failed")
+
+    def test_status_accepts_startup_but_not_completion_before_terminal_and_empty_cgroup(self):
+        self.dispatch()
+        self.h.observe.return_value = dict(ActiveState="activating", SubState="start")
+        self.assertEqual(m.status(self.expected, self.request)["state"], "running")
+        self.h.validate_terminal.assert_not_called()
+        self.h.observe.return_value = dict(ActiveState="failed", SubState="failed")
+        self.h.validate_terminal.side_effect = ValueError("terminal_failed")
+        with self.assertRaises(ValueError):
+            m.status(self.expected, self.request)
+
+    def test_finish_requires_terminal_and_reaps_parent(self):
+        self.dispatch()
+        self.b.write(self.root / "result.json", self.b.encode(reply()))
+        self.h.observe.return_value = dict(ActiveState="active", SubState="exited")
+        self.b.show.return_value = b"inactive"
+        self.assertEqual(m.finish(self.expected, self.request)["state"], "completed")
+        self.h.validate_terminal.assert_called_once()
+        self.assertTrue((self.root / "reaped.json").exists())
+        with self.assertRaises(FileExistsError):
+            m.finish(self.expected, self.request)
+
+    def test_nonempty_cgroup_never_returns_success(self):
+        self.dispatch()
+        self.h.observe.return_value = dict(ActiveState="active", SubState="exited")
+        self.h.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            m.status(self.expected, self.request)
+
+    def test_cancel_stops_parent_before_children_and_only_once(self):
+        self.dispatch()
+        self.b.command.reset_mock()
+        self.assertEqual(m.cancel(self.expected, self.request)["state"], "cancelled")
+        actual = [call.args[0][-1] for call in self.b.command.call_args_list]
+        self.assertEqual(actual, m.units())
+        with self.assertRaises(FileExistsError):
+            m.cancel(self.expected, self.request)
+
+    def test_public_entries_stay_closed(self):
+        for module in (m, d):
+            with self.assertRaises(ValueError):
+                module.run(approved=True)
+
+
+class BoundaryTests(unittest.TestCase):
+    def test_mac_rejected_before_installed_host_read(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "read_root") as read:
+            with self.assertRaises(ValueError):
+                m.context({})
+            read.assert_not_called()
+
+    def test_detached_dependencies_remain_exact_frozen_sources(self):
+        root = Path(__file__).resolve().parents[1] / "scripts"
+        self.assertEqual(
+            m.sha((root / "run_sft_vm_network_bootstrap_v4.py").read_bytes()), m.BOOTSTRAP_SHA
+        )
+        self.assertEqual(
+            m.sha((root / "run_sft_vm_setup_detached_v3.py").read_bytes()), m.SETUP_SHA
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

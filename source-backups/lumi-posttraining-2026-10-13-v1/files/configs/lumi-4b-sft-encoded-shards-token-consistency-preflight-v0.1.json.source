@@ -1,0 +1,66 @@
+{
+  "authorization": {
+    "encoded_shard_materialization_authorized": false,
+    "gpu_authorized": false,
+    "network_authorized": false,
+    "nonproduction_successor_seal_authorized": false,
+    "production_dataset_seal_authorized": false,
+    "sft_training_authorized": false
+  },
+  "bindings": {
+    "chat_template": {
+      "path": "configs/lumi-4b-chat-template-v0.1.json",
+      "sha256": "bc7853a9277feddae2fd3db786c6a12f4fa3602a135a0408c38d4390f33bec12"
+    },
+    "learning_seal": {
+      "path": "evidence/lumi-4b-sft-learning-candidate-seal-runtime-recovery-v0.2.json",
+      "sha256": "3e214b10e460944f8ec02fe366e1581f22bee2f2cf569d8cbc7b0b7092288b76"
+    },
+    "learning_seal_verification": {
+      "path": "evidence/lumi-4b-sft-learning-candidate-seal-runtime-recovery-verification-v0.2.json",
+      "sha256": "1f5cbeeea8b1f0b338a3352f54c04b48849483b6025cf4c1ad4cf77581719c52"
+    },
+    "token_consistency_diagnostic": {
+      "path": "evidence/lumi-4b-sft-encoded-shard-token-consistency-v0.1.json",
+      "sha256": "08e3430dc0804ac3064385d97427ede5c4d450f0d1561b58399a86312eeb1d99"
+    },
+    "token_consistency_verification": {
+      "path": "evidence/lumi-4b-sft-encoded-shard-token-consistency-verification-v0.1.json",
+      "sha256": "5c93d2ff0461d26856758f701d03ef7bf985c373360130d374b7dabcfea7927f"
+    },
+    "tokenizer": {
+      "path": "../lumi-artifacts/4b-segment2-throughput-gate-v0.1/8bedfbc868e8/staging/input/tokenizer/tokenizer.json",
+      "sha256": "1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee"
+    },
+    "train_jsonl": {
+      "path": "artifacts/lumi-sft-learning-candidate-seal-runtime-recovery-v0.2/attempt-001/private/train.jsonl",
+      "sha256": "e525d1a031aa6db507a886306aa515af9f90751393759d0ebe0a7c612eaf125d"
+    },
+    "validation_jsonl": {
+      "path": "artifacts/lumi-sft-learning-candidate-seal-runtime-recovery-v0.2/attempt-001/private/validation.jsonl",
+      "sha256": "a5d1bf515f8bacbd7c794dede8f2d18cfee802bb5aa71656365a4bcb08946bf5"
+    }
+  },
+  "exact_successor_authorization_text": "I approve one bounded local-only Lumi registry-v0.17 token-consistent non-production seal and encoded-shard successor. Bind smoke-only learning seal file SHA-256 3e214b10e460944f8ec02fe366e1581f22bee2f2cf569d8cbc7b0b7092288b76 and internal seal SHA-256 73859088ad74b5ce39292d479348fea9bd555e372ea89832df420bd20025acc6, seal verification SHA-256 1f5cbeeea8b1f0b338a3352f54c04b48849483b6025cf4c1ad4cf77581719c52, tokenizer-consistency diagnostic SHA-256 08e3430dc0804ac3064385d97427ede5c4d450f0d1561b58399a86312eeb1d99 and verification SHA-256 5c93d2ff0461d26856758f701d03ef7bf985c373360130d374b7dabcfea7927f, exact train JSONL SHA-256 e525d1a031aa6db507a886306aa515af9f90751393759d0ebe0a7c612eaf125d and validation JSONL SHA-256 a5d1bf515f8bacbd7c794dede8f2d18cfee802bb5aa71656365a4bcb08946bf5, frozen tokenizer.json SHA-256 1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee, and chat template SHA-256 bc7853a9277feddae2fd3db786c6a12f4fa3602a135a0408c38d4390f33bec12. Preserve all 264,981 rows and both JSONL files byte-for-byte. Create an immutable non-production smoke-only token-consistent successor seal that corrects the historical mixed-tokenizer ledger to the independently reproduced exact encoding totals: 251,176 train rows / 17,504,230 serialized tokens / 7,307,300 supervised tokens and 13,805 validation rows / 990,198 serialized tokens / 425,279 supervised tokens, with maximum record length 3,947 and no 4K overflow. Then encode exactly those rows using the dependency-free PureByteLevelBPETokenizer bound to the exact tokenizer.json and the frozen assistant-and-tool-only chat mask, in train-then-validation order, into little-endian uint32 token shards, little-endian int32 label shards with ignore index -100, and raw-text-free hashed indices. Use maximum 4,194,304 serialized tokens per shard and require exactly five train shards plus one validation shard, exact contiguous indices, unmasked labels equal input IDs, and independent file-hash, byte-size, record-count, serialized-token, supervised-token, masking, split, seal, and manifest verification. Maximum 120 local runtime-minutes / 264,981 input-row reads / 264,981 encoded-index row reads / 536,870,912 additional private write bytes / 0 network bytes / 0 GPU use. It may create only the versioned plan, implementation, runner, verifier, tests, immutable smoke-only token-consistent successor seal, raw-text-free encoded shard directory, materialization receipt, and independent verification. Preserve the frozen 10M production floor and every registry/source blocker. No raw training text in shard outputs, manifests, receipts, logs, or tests; no predecessor mutation, registry or active data-contract change, production dataset seal, SFT training, external API, download, S3 action, remote access, instance action, production promotion, or unrelated access.",
+  "observed_token_contract": {
+    "maximum_record_tokens": 3947,
+    "train": {
+      "records": 251176,
+      "serialized_tokens": 17504230,
+      "supervised_tokens": 7307300
+    },
+    "validation": {
+      "records": 13805,
+      "serialized_tokens": 990198,
+      "supervised_tokens": 425279
+    }
+  },
+  "output_projection": {
+    "encoded_shards": 6,
+    "maximum_tokens_per_shard": 4194304,
+    "train_shards": 5,
+    "validation_shards": 1
+  },
+  "schema_version": "lumi.sft-encoded-shards-token-consistency-preflight.v0.1",
+  "status": "PASS_successor_ready_seal_correction_and_shards_not_authorized"
+}

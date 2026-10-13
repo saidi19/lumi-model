@@ -1,0 +1,205 @@
+"""One fresh read-only network diagnostic; finite check codes, no workload."""
+
+import ast
+import copy
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+from scripts import preflight_sft_vm_attempt022_v1 as entry
+
+ROOT = entry.ROOT
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-022-network-diagnostic-v0.1"
+PROOF = ROOT / "evidence/lumi-vm-attempt-022-readonly-preflight-verification-v0.1.json"
+PROOF_SHA = "c6144744e83ada4125ead89edf3bfbf72204882c791a0ec29795c123f9787e7d"
+ENTRY_SHA = "eacd5f09b14262f281110d17a5e368c1627d7d7f1ecd2a75b559dc82bbbea33d"
+OUTER_SHA = "dba4e3377f5908835535f732a16ff3ee91678464dbb6c792712fa693be58ac8f"
+MAX_CALLS, MAX_SECONDS = 20, 300
+SERVICES = {"sts", "ec2", "service-quotas", "pricing"}
+OPERATIONS = {
+    "GetCallerIdentity", "DescribeInstanceConnectEndpoints", "DescribeVpcs",
+    "DescribeSubnets", "DescribeRouteTables", "DescribeInternetGateways",
+    "DescribeNatGateways", "DescribeAddresses", "GetServiceQuota", "GetProducts",
+}
+need = entry.need
+
+
+class DiagnosticBudget(entry.budget.AdmissionBudget):
+    def __init__(self, credentials, *, clock=time.monotonic):
+        super().__init__(credentials, clock=clock)
+        self.last_operation = None
+
+    def consume(self, service, *, credential=False, model, **fields):
+        need(service in SERVICES and model.name in OPERATIONS)
+        need(self.calls < MAX_CALLS and 0 <= self.clock() - self.start < MAX_SECONDS - 20)
+        super().consume(service, credential=credential, model=model, **fields)
+        self.last_operation = service + "." + model.name
+
+
+class Checks:
+    def __init__(self):
+        self.last_check = None
+        self.selection = None
+        self.allowed_codes = set()
+
+    def check(self, value, code):
+        need(code in self.allowed_codes)
+        self.last_check = code
+        need(value)
+
+    def selected(self, actual, expected):
+        need(type(actual) is dict and type(expected) is dict and set(actual) == set(expected))
+        key = "new_private_subnet_cidr"
+        changed = [name for name in actual if actual[name] != expected[name]]
+        self.selection = {
+            "pinned_cidr": expected[key],
+            "computed_first_free_cidr": actual[key],
+            "target_field_difference_count": len(changed),
+            "only_cidr_differs": changed == [key],
+            "targets_match": actual == expected,
+        }
+
+
+def diagnostic_class(outer, checks):
+    raw = entry.files.read(Path(outer.__file__))
+    need(entry.sha(raw) == OUTER_SHA)
+    node = next(n for n in ast.parse(raw).body if isinstance(n, ast.ClassDef)
+                and n.name == "NetworkAdmission")
+    node = copy.deepcopy(node)
+
+    class Instrument(ast.NodeTransformer):
+        def visit_Call(self, call):
+            self.generic_visit(call)
+            if isinstance(call.func, ast.Name) and call.func.id == "need":
+                code = "network_check_" + str(call.lineno)
+                if ast.unparse(call.args[0]) == (
+                    "selected['targets'] == json.loads(self.raw)['targets']"
+                ):
+                    code = "network_selection_targets_match"
+                checks.allowed_codes.add(code)
+                call.func = ast.Name(id="diagnostic_need", ctx=ast.Load())
+                call.args.append(ast.Constant(code))
+            return call
+
+        def visit_Assign(self, statement):
+            self.generic_visit(statement)
+            if (len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name)
+                    and statement.targets[0].id == "selected"):
+                record = ast.parse(
+                    "record_selection(selected['targets'], json.loads(self.raw)['targets'])"
+                ).body[0]
+                return [statement, ast.copy_location(record, statement)]
+            return statement
+
+    transformed = Instrument().visit(node)
+
+    class Restore(ast.NodeTransformer):
+        def visit_Call(self, call):
+            self.generic_visit(call)
+            if isinstance(call.func, ast.Name) and call.func.id == "diagnostic_need":
+                call.func = ast.Name(id="need", ctx=ast.Load())
+                call.args.pop()
+            return call
+
+        def visit_Expr(self, statement):
+            if (isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Name)
+                    and statement.value.func.id == "record_selection"):
+                return None
+            return self.generic_visit(statement)
+
+    original = next(n for n in ast.parse(raw).body if isinstance(n, ast.ClassDef)
+                    and n.name == "NetworkAdmission")
+    need(ast.dump(Restore().visit(copy.deepcopy(transformed)), include_attributes=False)
+         == ast.dump(original, include_attributes=False))
+    namespace = {name: getattr(outer, name) for name in (
+        "ReadCloud", "readiness", "network", "json", "ipaddress", "Decimal",
+    )}
+    namespace.update(diagnostic_need=checks.check, record_selection=checks.selected)
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[transformed], type_ignores=[])),
+                 "<bound-network-diagnostic>", "exec"), namespace)
+    return namespace["NetworkAdmission"]
+
+
+def local():
+    need(entry.sha(entry.files.read(Path(entry.__file__))) == ENTRY_SHA)
+    need(entry.sha(entry.files.read(PROOF)) == PROOF_SHA)
+    proof = json.loads(entry.files.read(PROOF))
+    need(proof["status"] == "stopped_no_retry_failure_evidence_verified")
+    need(proof["failed_stage"] == "network" and proof["retry"] is False)
+    for name, digest in proof["source_bindings"].items():
+        need(entry.sha(entry.files.read(ROOT / name)) == digest)
+    outer, _, _ = entry.local()
+    checks = Checks()
+    cls = diagnostic_class(outer, checks)
+    plan_path = entry.RELEASE / "configs/lumi-vm-private-network-plan-v0.1.json"
+    plan = entry.files.read(plan_path)
+    need(entry.sha(plan) == outer.network.PLAN_SHA)
+    return outer, cls, checks, plan
+
+
+def run():
+    outer, cls, checks, plan = local()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    OUTPUT.mkdir(mode=0o700)
+    entry.files.save(OUTPUT / "started.json", {
+        "entry_sha256": entry.sha(entry.files.read(Path(__file__))),
+        "prior_failure_proof_sha256": PROOF_SHA,
+        "maximum_sdk_reads_including_identity": MAX_CALLS,
+        "maximum_seconds": MAX_SECONDS,
+        "retry": False, "cloud_mutations": 0,
+    })
+    start = time.monotonic()
+    report = dict(
+        schema="lumi.vm-attempt022-network-diagnostic.v0.1", attempt=entry.ATTEMPT,
+        status="started", cloud_mutations=0, object_access=0, instance_actions=0,
+        cpu_launch_authorized=False, gate_5_complete=False, gpu=False, training=False,
+        retry=False, original_failure_cause_captured=False,
+        historical_failure_proof_sha256=PROOF_SHA,
+    )
+    bundle = None
+    with DiagnosticBudget(outer.credentials) as meter:
+        try:
+            first = True
+            rounded = float(math.floor(time.monotonic()))
+
+            def clock():
+                nonlocal first
+                if first:
+                    first = False
+                    return rounded
+                return time.monotonic()
+
+            reader = outer.credentials.Reader(rounded + 18000, clock=clock)
+            bundle = meter.clients(reader)
+            network = cls({k: bundle.clients[k] for k in SERVICES}, plan, clock=time.monotonic)
+            network()
+            report.update(status="fresh_network_diagnostic_passed")
+        except BaseException as error:
+            report.update(status="fresh_network_diagnostic_rejected",
+                          failure_diagnostic=outer.failure.describe(error, "network_admission"))
+        finally:
+            if bundle is not None:
+                bundle.close()
+            report.update(
+                last_check=checks.last_check, selection_comparison=checks.selection,
+                last_operation=meter.last_operation,
+                sdk_read_dispatches=meter.calls,
+                credential_identity_dispatches=meter.credential_calls,
+                elapsed_seconds=round(time.monotonic() - start, 3),
+            )
+            report["selection_contract_mismatch_confirmed"] = bool(
+                report["status"] == "fresh_network_diagnostic_rejected"
+                and checks.last_check == "network_selection_targets_match"
+                and checks.selection is not None and checks.selection["only_cidr_differs"]
+            )
+            entry.files.save(OUTPUT / "result.json", report)
+    print(json.dumps(report, sort_keys=True))
+    return report
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--inspect-once"])
+    run()

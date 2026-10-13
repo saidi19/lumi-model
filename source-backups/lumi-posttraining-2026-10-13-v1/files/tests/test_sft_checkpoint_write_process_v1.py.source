@@ -1,0 +1,602 @@
+"""Synthetic doubled-fork composition tests; no process or cgroup exists."""
+
+from __future__ import annotations
+
+import importlib
+import sys
+import threading
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, call, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_process_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_process_v1")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+
+PRIVATE = "SYNTHETIC-PRIVATE-PAYLOAD"
+
+
+class FakeTopology:
+    events = None
+    next_fail_transition = None
+    next_fail_close = False
+
+    def __init__(self):
+        self.stage = "initial"
+        self.closed = False
+        self.fail_transition = type(self).next_fail_transition
+        self.fail_close = type(self).next_fail_close
+        type(self).next_fail_transition = None
+        type(self).next_fail_close = False
+
+    def adopt_fork_child_admitted_once(self):
+        self.events.append(("adopt", self.stage))
+        return self.snapshot()
+
+    def transition_admitted_once(self, stage, *, extra_keep=()):
+        self.events.append(("transition", stage, tuple(extra_keep)))
+        if self.fail_transition == stage:
+            raise RuntimeError(PRIVATE)
+        self.stage = stage
+        return tuple(extra_keep)
+
+    def close_all_admitted_once(self):
+        self.events.append(("topology_close", self.stage))
+        if self.fail_close:
+            raise RuntimeError(PRIVATE)
+        self.closed = True
+        return self.snapshot()
+
+    def snapshot(self):
+        return {"stage": self.stage, "closed": self.closed}
+
+
+class FakeOwner:
+    events = None
+    fds = {"guardian": 70, "broker": 71, "worker": 72}
+
+    def __init__(self, role):
+        self.role = role
+        self._fd = self.fds[role]
+        self._identity = (role, 1)
+        self._reaped = False
+        self._close_attempted = False
+        self._failed = False
+        self._lock = threading.Lock()
+
+    def _enter(self, *, allow_failed=False):
+        if self._failed and not allow_failed:
+            raise RuntimeError(PRIVATE)
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError(PRIVATE)
+        return True
+
+    def terminate_admitted_once(self):
+        self.events.append(("terminate", self.role))
+        return self.snapshot()
+
+    def reap_admitted_once(self, *, deadline_ns, require_success):
+        self.events.append(("reap", self.role, deadline_ns, require_success))
+        self._reaped = True
+        return self.snapshot()
+
+    def close_admitted_once(self):
+        self.events.append(("owner_close", self.role))
+        self._fd = None
+        self._close_attempted = True
+        return self.snapshot()
+
+    def snapshot(self):
+        return {"role": self.role, "reaped": self._reaped}
+
+
+class FakeLease:
+    events = None
+    fd = 60
+    fail_kill = False
+    fail_close = False
+
+    def __init__(self, parent_fd, *, name, limits):
+        self.events.append(("lease", parent_fd, name, dict(limits)))
+        self.parent_fd = parent_fd
+
+    def fileno(self):
+        self.events.append(("lease_fd", self.fd))
+        return self.fd
+
+    def kill(self):
+        self.events.append(("lease_kill",))
+        if type(self).fail_kill:
+            raise RuntimeError(PRIVATE)
+
+    def close(self):
+        self.events.append(("lease_close",))
+        if type(self).fail_close:
+            raise RuntimeError(PRIVATE)
+
+
+class FakeAuthority:
+    def __init__(self, name):
+        self.name = name
+
+
+class ProcessCompositionTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 1_000_000_000
+        self.deadline = self.now + 1_000_000_000
+        self.cleanup_ms = 100
+        self.parent_fd = 50
+        self.parent_identity = ("dir", self.parent_fd)
+        self.limits = {
+            "memory_max_bytes": 4 * 1024**3,
+            "pids_max": 256,
+            "cpu_quota_us": 200_000,
+            "cpu_period_us": 100_000,
+        }
+        self.name = "lumi-sft-" + "a" * 32
+        self.events = []
+        self.fork_values = [200]
+        self.bind_fail_role = None
+        self.pidfd_identities = {
+            70: ("guardian", 1),
+            71: ("broker", 1),
+            72: ("worker", 1),
+            80: ("broker", 1),
+        }
+        self.main = object()
+
+        m._ATTEMPTED = False
+        FakeTopology.events = self.events
+        FakeTopology.next_fail_transition = None
+        FakeTopology.next_fail_close = False
+        FakeOwner.events = self.events
+        FakeLease.events = self.events
+        FakeLease.fail_kill = False
+        FakeLease.fail_close = False
+
+        self.topology_type = self.enterContext(patch.object(
+            m.topology, "_Topology", FakeTopology,
+        ))
+        self.owner_type = self.enterContext(patch.object(
+            m.child, "_ChildOwner", FakeOwner,
+        ))
+        self.lease_type = self.enterContext(patch.object(
+            m.cgroup, "CgroupLease", FakeLease,
+        ))
+        self.runtime = self.enterContext(patch.object(
+            m, "_runtime", return_value=None,
+        ))
+        self.clock = self.enterContext(patch.object(
+            m.time, "monotonic_ns", side_effect=lambda: self.now,
+        ))
+        self.settings = self.enterContext(patch.object(
+            m.cgroup, "_settings", side_effect=lambda value: dict(value),
+        ))
+        self.directory = self.enterContext(patch.object(
+            m.cgroup, "_directory", side_effect=lambda fd: ("dir", fd),
+        ))
+        self.precreate = self.enterContext(patch.object(
+            m.topology, "_precreate_admitted_once",
+            side_effect=lambda **_arguments: FakeTopology(),
+        ))
+        self.fork = self.enterContext(patch.object(
+            m.os, "fork", side_effect=self.fork_result, create=True,
+        ))
+        self.bind = self.enterContext(patch.object(
+            m.child, "_bind_admitted_once", side_effect=self.bind_result,
+        ))
+        self.identity = self.enterContext(patch.object(
+            m.child, "_identity", side_effect=self.identity_result,
+        ))
+        self.close = self.enterContext(patch.object(
+            m.os, "close", side_effect=lambda fd: self.events.append(("close", fd)),
+        ))
+        self.getpid = self.enterContext(patch.object(
+            m.os, "getpid", return_value=100,
+        ))
+        self.current_thread = self.enterContext(patch.object(
+            m.threading, "current_thread", return_value=self.main,
+        ))
+        self.main_thread = self.enterContext(patch.object(
+            m.threading, "main_thread", return_value=self.main,
+        ))
+        self.active_count = self.enterContext(patch.object(
+            m.threading, "active_count", return_value=1,
+        ))
+        self.enter_group = self.enterContext(patch.object(
+            m.cgroup, "enter_current_process",
+            side_effect=lambda fd: self.events.append(("enter_group", fd)),
+        ))
+        self.duplicate = self.enterContext(patch.object(
+            m.fcntl, "fcntl", return_value=80,
+        ))
+        self.inheritable = self.enterContext(patch.object(
+            m.os, "get_inheritable", return_value=False,
+        ))
+        self.detach = self.enterContext(patch.object(
+            m.authority, "_detach_admitted_once",
+            side_effect=lambda _topology, name: FakeAuthority(name),
+        ))
+        self.exit = self.enterContext(patch.object(
+            m.os, "_exit", return_value=None,
+        ))
+
+    def fork_result(self):
+        value = self.fork_values.pop(0)
+        if isinstance(value, BaseException):
+            raise value
+        self.events.append(("fork", value))
+        return value
+
+    def bind_result(self, pid, role, *, deadline_ns):
+        self.events.append(("bind", pid, role, deadline_ns))
+        if role == self.bind_fail_role:
+            raise RuntimeError(PRIVATE)
+        return FakeOwner(role)
+
+    def identity_result(self, fd):
+        value = self.pidfd_identities.get(fd)
+        if isinstance(value, BaseException):
+            raise value
+        if value is None:
+            raise AssertionError(PRIVATE)
+        return value
+
+    def compose(self, **changes):
+        values = {
+            "cgroup_parent_fd": self.parent_fd,
+            "cgroup_name": self.name,
+            "limits": dict(self.limits),
+            "deadline_ns": self.deadline,
+            "cleanup_timeout_ms": self.cleanup_ms,
+        }
+        values.update(changes)
+        return m._compose_admitted_once(**values)
+
+    def error(self, code, **changes):
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            self.compose(**changes)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertNotIn(PRIVATE, repr(caught.exception))
+
+    def guardian_branch(self, topology=None):
+        return m._guardian_branch_admitted_once(
+            FakeTopology() if topology is None else topology,
+            self.parent_fd, self.parent_identity, self.name,
+            dict(self.limits), self.deadline,
+            self.deadline + self.cleanup_ms * 1_000_000,
+        )
+
+    def test_import_is_inert_and_public_entry_is_closed(self):
+        roots = m.topology.listener.ML_ROOTS
+        self.assertFalse(any(name.split(".", 1)[0] in roots
+                             for name in IMPORT_ADDITIONS))
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            m.compose_write_processes(approval=True, callback=PRIVATE)
+        self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.runtime.assert_not_called()
+        self.fork.assert_not_called()
+
+    def test_error_vocabulary_cannot_retain_private_text(self):
+        for value in (PRIVATE, None, True, {}, "unknown"):
+            error = m.ProcessCompositionError(value)
+            self.assertEqual(error.args, ("fork_failed",))
+            self.assertNotIn(PRIVATE, repr(error))
+
+    def test_runtime_rejection_precedes_arguments_attempt_and_fork(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        self.error(
+            "runtime_rejected", cgroup_parent_fd=True,
+            cgroup_name=PRIVATE, limits={}, deadline_ns=0,
+            cleanup_timeout_ms=0,
+        )
+        self.assertFalse(m._ATTEMPTED)
+        self.fork.assert_not_called()
+
+    def test_scalar_thread_limit_and_deadline_arguments_are_exact(self):
+        variants = (
+            {"cgroup_parent_fd": True},
+            {"cgroup_parent_fd": 2},
+            {"cgroup_name": PRIVATE},
+            {"cgroup_name": True},
+            {"limits": []},
+            {"deadline_ns": True},
+            {"deadline_ns": self.now},
+            {"deadline_ns": self.now + m.MAXIMUM_NS + 1},
+            {"cleanup_timeout_ms": True},
+            {"cleanup_timeout_ms": 0},
+            {"cleanup_timeout_ms": 10_001},
+        )
+        for changes in variants:
+            with self.subTest(changes=changes):
+                self.error("arguments_rejected", **changes)
+        self.active_count.return_value = 2
+        self.error("arguments_rejected")
+        self.fork.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_limit_or_parent_descriptor_rejection_precedes_attempt(self):
+        self.settings.side_effect = RuntimeError(PRIVATE)
+        self.error("arguments_rejected")
+        self.settings.side_effect = lambda value: dict(value)
+        self.directory.side_effect = RuntimeError(PRIVATE)
+        self.error("arguments_rejected")
+        self.fork.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_controller_forks_binds_closes_parent_and_transitions_once(self):
+        result = self.compose()
+        report = result.snapshot()
+        cleanup_deadline = self.deadline + self.cleanup_ms * 1_000_000
+        self.assertEqual(self.events[:4], [
+            ("fork", 200),
+            ("bind", 200, "guardian", cleanup_deadline),
+            ("close", self.parent_fd),
+            ("transition", "controller", (70,)),
+        ])
+        self.assertEqual(report["role"], "controller")
+        self.assertTrue(report["final_topology_bound"])
+        self.assertTrue(all(report[name] is False for name in m.FALSE_FLAGS))
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_second_composition_is_rejected_before_second_topology_or_fork(self):
+        self.compose()
+        self.fork_values.append(201)
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            self.compose()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertEqual(self.precreate.call_count, 1)
+        self.assertEqual(self.fork.call_count, 1)
+
+    def test_outer_fork_failure_closes_topology_and_consumed_parent(self):
+        self.fork_values = [OSError(PRIVATE)]
+        self.error("fork_failed")
+        self.assertIn(("topology_close", "initial"), self.events)
+        self.assertIn(("close", self.parent_fd), self.events)
+
+    def test_guardian_bind_failure_closes_topology_and_parent(self):
+        self.bind_fail_role = "guardian"
+        self.error("fork_failed")
+        self.assertIn(("topology_close", "initial"), self.events)
+        self.assertIn(("close", self.parent_fd), self.events)
+
+    def test_controller_transition_failure_retires_guardian(self):
+        FakeTopology.next_fail_transition = "controller"
+        self.error("fork_failed")
+        self.assertIn(("terminate", "guardian"), self.events)
+        self.assertIn(("reap", "guardian",
+                       self.deadline + self.cleanup_ms * 1_000_000, False),
+                      self.events)
+        self.assertIn(("owner_close", "guardian"), self.events)
+
+    def test_parent_descriptor_change_is_not_closed_and_guardian_is_retired(self):
+        self.directory.side_effect = [
+            self.parent_identity, ("dir", self.parent_fd + 1),
+        ]
+        self.error("cleanup_unconfirmed")
+        self.assertNotIn(("close", self.parent_fd), self.events)
+        self.assertEqual(self.directory.call_count, 2)
+        self.assertIn(("terminate", "guardian"), self.events)
+        self.assertIn(("topology_close", "initial"), self.events)
+
+    def test_controller_cleanup_retires_guardian_and_topology_once(self):
+        result = self.compose()
+        report = result.cleanup_admitted_once()
+        self.assertTrue(report["cleanup_attempted"])
+        self.assertTrue(report["topology_cleaned"])
+        self.assertIn(("terminate", "guardian"), self.events)
+        self.assertIn(("topology_close", "controller"), self.events)
+        with self.assertRaises(m.ProcessCompositionError):
+            result.cleanup_admitted_once()
+
+    def test_final_role_transfers_only_through_bound_authority_adapter(self):
+        result = self.compose()
+        transferred = result.take_endpoint_authority_admitted_once(
+            "control_controller"
+        )
+        self.assertIsInstance(transferred, FakeAuthority)
+        self.assertEqual(transferred.name, "control_controller")
+        self.assertEqual(result.snapshot()["endpoint_authorities_transferred"], 1)
+
+    def test_guardian_nested_forks_bind_and_transition_in_fixed_order(self):
+        self.fork_values = [301, 302]
+        result = self.guardian_branch()
+        cleanup_deadline = self.deadline + self.cleanup_ms * 1_000_000
+        self.assertEqual(self.events, [
+            ("adopt", "initial"),
+            ("transition", "guardian_prefork", (self.parent_fd,)),
+            ("lease", self.parent_fd, self.name, self.limits),
+            ("lease_fd", 60),
+            ("fork", 301),
+            ("bind", 301, "broker", cleanup_deadline),
+            ("fork", 302),
+            ("bind", 302, "worker", cleanup_deadline),
+            ("transition", "guardian_watch", (self.parent_fd, 60, 71, 72)),
+        ])
+        report = result.snapshot()
+        self.assertEqual(report["role"], "guardian_watch")
+        self.assertEqual(report["nested_children_bound"], 2)
+
+    def test_guardian_worker_fork_failure_cleans_broker_lease_parent_and_topology(self):
+        self.fork_values = [301, OSError(PRIVATE)]
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            self.guardian_branch()
+        self.assertEqual(caught.exception.code, "fork_failed")
+        for expected in (
+            ("lease_kill",), ("terminate", "broker"),
+            ("owner_close", "broker"), ("lease_close",),
+            ("close", self.parent_fd),
+            ("topology_close", "guardian_prefork"),
+        ):
+            self.assertIn(expected, self.events)
+
+    def test_guardian_descriptor_alias_rejection_cleans_both_children(self):
+        FakeOwner.fds = {"guardian": 70, "broker": 71, "worker": 71}
+        self.fork_values = [301, 302]
+        try:
+            with self.assertRaises(m.ProcessCompositionError) as caught:
+                self.guardian_branch()
+            self.assertEqual(caught.exception.code, "descriptor_changed")
+            self.assertIn(("terminate", "broker"), self.events)
+            self.assertIn(("terminate", "worker"), self.events)
+        finally:
+            FakeOwner.fds = {"guardian": 70, "broker": 71, "worker": 72}
+
+    def test_broker_role_adopts_transitions_joins_and_closes_inherited_fds(self):
+        role = m._role_branch_admitted_once(
+            FakeTopology(), "broker", self.parent_fd, self.parent_identity,
+            60, ("dir", 60),
+        )
+        self.assertEqual(self.events, [
+            ("adopt", "initial"),
+            ("transition", "broker", (self.parent_fd, 60)),
+            ("close", self.parent_fd),
+            ("enter_group", 60),
+            ("close", 60),
+        ])
+        self.assertEqual(role.snapshot()["role"], "broker")
+
+    def test_worker_closes_inherited_broker_pidfd_before_transition(self):
+        owner = FakeOwner("broker")
+        role = m._role_branch_admitted_once(
+            FakeTopology(), "worker", self.parent_fd, self.parent_identity,
+            60, ("dir", 60), owner,
+        )
+        self.assertEqual(self.events[:3], [
+            ("adopt", "initial"),
+            ("close", 71),
+            ("transition", "worker", (self.parent_fd, 60)),
+        ])
+        self.assertIsNone(owner._fd)
+        self.assertTrue(owner._close_attempted)
+        self.assertEqual(role.snapshot()["role"], "worker")
+
+    def test_worker_inherited_pidfd_identity_change_fails_without_close(self):
+        owner = FakeOwner("broker")
+        self.pidfd_identities[71] = ("changed", 9)
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            m._role_branch_admitted_once(
+                FakeTopology(), "worker", self.parent_fd,
+                self.parent_identity, 60, ("dir", 60), owner,
+            )
+        self.assertEqual(caught.exception.code, "cleanup_unconfirmed")
+        self.assertNotIn(("close", 71), self.events)
+
+    def test_role_group_join_failure_closes_each_owned_copy_once(self):
+        self.enter_group.side_effect = RuntimeError(PRIVATE)
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            m._role_branch_admitted_once(
+                FakeTopology(), "broker", self.parent_fd,
+                self.parent_identity, 60, ("dir", 60),
+            )
+        self.assertEqual(caught.exception.code, "topology_failed")
+        self.assertEqual(self.events.count(("close", self.parent_fd)), 1)
+        self.assertEqual(self.events.count(("close", 60)), 1)
+        self.assertIn(("topology_close", "broker"), self.events)
+
+    def test_guardian_can_create_one_identity_checked_broker_pidfd_duplicate(self):
+        self.fork_values = [301, 302]
+        result = self.guardian_branch()
+        self.assertEqual(result.duplicate_broker_pidfd_admitted_once(), 80)
+        self.duplicate.assert_called_once_with(71, m.fcntl.F_DUPFD_CLOEXEC, 3)
+        self.inheritable.assert_called_once_with(80)
+        self.assertEqual(result.snapshot()["broker_pidfd_duplicates_created"], 1)
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            result.duplicate_broker_pidfd_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+
+    def test_failed_pidfd_duplicate_is_closed_once_when_identity_is_known(self):
+        owner = FakeOwner("broker")
+        self.inheritable.return_value = True
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            m._duplicate_child_pidfd(owner)
+        self.assertEqual(caught.exception.code, "child_binding_failed")
+        self.assertEqual(self.events.count(("close", 80)), 1)
+
+    def test_changed_pidfd_duplicate_is_retained_and_not_closed_as_replacement(self):
+        owner = FakeOwner("broker")
+        self.pidfd_identities[80] = ("changed", 9)
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            m._duplicate_child_pidfd(owner)
+        self.assertEqual(caught.exception.code, "cleanup_unconfirmed")
+        self.assertNotIn(("close", 80), self.events)
+
+    def test_guardian_cleanup_kills_reaps_closes_lease_parent_and_topology(self):
+        self.fork_values = [301, 302]
+        result = self.guardian_branch()
+        report = result.cleanup_admitted_once()
+        self.assertTrue(report["topology_cleaned"])
+        for expected in (
+            ("lease_kill",), ("terminate", "broker"),
+            ("terminate", "worker"), ("owner_close", "broker"),
+            ("owner_close", "worker"), ("lease_close",),
+            ("close", self.parent_fd),
+            ("topology_close", "guardian_watch"),
+        ):
+            self.assertIn(expected, self.events)
+        self.assertFalse(report["lease_owned"])
+
+    def test_guardian_cleanup_continues_after_failures_and_reports_uncertain(self):
+        self.fork_values = [301, 302]
+        result = self.guardian_branch()
+        FakeLease.fail_kill = True
+        FakeLease.fail_close = True
+        result._topology.fail_close = True
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            result.cleanup_admitted_once()
+        self.assertEqual(caught.exception.code, "cleanup_unconfirmed")
+        self.assertIn(("terminate", "broker"), self.events)
+        self.assertIn(("terminate", "worker"), self.events)
+        self.assertIn(("close", self.parent_fd), self.events)
+
+    def test_role_process_entry_fails_closed_and_cleans_final_topology(self):
+        m._role_process_entry(
+            FakeTopology(), "broker", self.parent_fd, self.parent_identity,
+            60, ("dir", 60), self.deadline,
+        )
+        self.exit.assert_called_once_with(2)
+        self.assertIn(("topology_close", "broker"), self.events)
+
+    def test_guardian_process_entry_fails_closed_and_cleans_composition(self):
+        composition = Mock()
+        composition.cleanup_admitted_once.return_value = {}
+        with patch.object(
+            m, "_guardian_branch_admitted_once", return_value=composition,
+        ):
+            m._guardian_process_entry(
+                FakeTopology(), self.parent_fd, self.parent_identity,
+                self.name, dict(self.limits), self.deadline,
+                self.deadline + self.cleanup_ms * 1_000_000,
+            )
+        composition.cleanup_admitted_once.assert_called_once_with()
+        self.exit.assert_called_once_with(2)
+
+    def test_wrong_owner_and_reentry_cannot_transfer_endpoint(self):
+        result = self.compose()
+        self.getpid.return_value = 101
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            result.take_endpoint_authority_admitted_once("control_controller")
+        self.assertEqual(caught.exception.code, "owner_mismatch")
+        self.getpid.return_value = 100
+        self.assertTrue(result._lock.acquire(blocking=False))
+        try:
+            with self.assertRaises(m.ProcessCompositionError) as reentry:
+                result.take_endpoint_authority_admitted_once(
+                    "control_controller"
+                )
+            self.assertEqual(reentry.exception.code, "reentry")
+            self.assertTrue(result._lock.locked())
+        finally:
+            result._lock.release()
+
+
+if __name__ == "__main__":
+    unittest.main()

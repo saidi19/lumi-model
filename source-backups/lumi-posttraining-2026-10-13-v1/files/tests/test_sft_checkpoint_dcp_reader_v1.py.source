@@ -1,0 +1,348 @@
+"""Tiny stdlib fixtures; native Torch is replaced only at the lazy import seam."""
+
+from __future__ import annotations
+
+import hashlib
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_dcp_reader_v1 as module
+
+
+class _FilesystemReader:
+    def __init__(self, path):
+        self.path = path
+
+    def read_metadata(self):
+        path = self.fs.concat_path(self.path, ".metadata")
+        with self.fs.create_stream(path, "rb") as stream:
+            return stream.read()
+
+    def read_data(self, plan, planner=None):
+        path = self.fs.concat_path(self.path, "__0_0.distcp")
+        with self.fs.create_stream(path, "rb") as stream:
+            info = types.SimpleNamespace(offset=plan[0], length=plan[1],
+                                         transform_descriptors=plan[2] if len(plan) > 2 else ())
+            sliced = self._slice_file(stream, info)
+            try:
+                return sliced.read()
+            finally:
+                sliced.close()
+
+
+class DCPReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name).resolve()
+        self.root = self.parent / "checkpoint"
+        self.root.mkdir(mode=0o700)
+        (self.root / "model").mkdir(mode=0o700)
+        self.payloads = {"model/.metadata": b"tiny metadata\n", "model/__0_0.distcp": b"0123456789",
+                         "trainer-rank-00000.pt": b"opaque trainer"}
+        lines = []
+        for name, raw in self.payloads.items():
+            target = self.root / name
+            target.write_bytes(raw)
+            target.chmod(0o600)
+            lines.append(f"{hashlib.sha256(raw).hexdigest()}  {name}\n")
+        manifest = "".join(lines).encode()
+        (self.root / "manifest.sha256").write_bytes(manifest)
+        (self.root / "manifest.sha256").chmod(0o600)
+        self.audit_bytes = len(manifest) + sum(map(len, self.payloads.values()))
+        self.options = {"expected_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+                        "maximum_file_bytes": 4096, "maximum_read_bytes": 10000,
+                        "maximum_read_call_bytes": 4096, "check_budget": lambda: None}
+        self.filesystem = types.SimpleNamespace(FileSystemReader=_FilesystemReader)
+        self.lazy = patch.object(module.importlib, "import_module", return_value=self.filesystem)
+        self.importer = self.lazy.start()
+        self.addCleanup(self.lazy.stop)
+
+    def entered(self, **overrides):
+        return module.verified_dcp_reader(self.root, **{**self.options, **overrides})
+
+    def test_complete_audit_then_repeated_metadata_and_tensor_reads(self):
+        with self.entered() as lease:
+            initial = lease.summary()
+            self.assertEqual(initial["dcp_input_audit_bytes"], self.audit_bytes)
+            self.assertEqual(initial["hash_verified_files"], 3)
+            self.assertEqual(lease.reader.read_metadata(), b"tiny metadata\n")
+            lease.reader.reset()
+            self.assertEqual(lease.reader.read_metadata(), b"tiny metadata\n")
+            self.assertEqual(lease.reader.read_data((2, 4)), b"2345")
+        result = lease.summary()
+        extra = 2 * len(b"tiny metadata\n") + 4
+        self.assertEqual(result["dcp_read_bytes_reserved"], self.audit_bytes + extra)
+        self.assertEqual(result["model_payload_read_bytes_reserved"], extra)
+        self.assertTrue(result["dcp_reads_metered"])
+        for key in ("physical_disk_bytes_measured", "os_resource_limits_enforced",
+                    "real_4b_import", "training_authorized", "production_eligible"):
+            self.assertIs(result[key], False)
+
+    def test_import_is_after_verification(self):
+        def imported(name):
+            self.assertEqual(name, "torch.distributed.checkpoint.filesystem")
+            self.assertGreater(reservations[0], 0)
+            return self.filesystem
+        reservations = [0]
+        original = module._Lease._reserve
+        def reserved(lease, *args, **kwargs):
+            reservations[0] += kwargs["checkpoint_read_bytes"]
+            return original(lease, *args, **kwargs)
+        self.importer.side_effect = imported
+        with patch.object(module._Lease, "_reserve", reserved), self.entered():
+            self.assertEqual(reservations[0], self.audit_bytes)
+
+    def test_invalid_limits_rejected_before_open_or_import(self):
+        cases = [("maximum_file_bytes", True), ("maximum_read_bytes", 0),
+                 ("maximum_read_call_bytes", 1024**3 + 1),
+                 ("maximum_read_call_bytes", 1.0), ("expected_manifest_sha256", "bad"),
+                 ("check_budget", None)]
+        for key, value in cases:
+            with self.subTest(key=key), patch.object(module.os, "open") as opened:
+                with self.assertRaisesRegex(module.DCPReadError, "invalid_arguments"):
+                    with self.entered(**{key: value}):
+                        self.fail("unexpected entry")
+                opened.assert_not_called()
+        self.importer.assert_not_called()
+
+    def test_failed_callback_prevents_any_open(self):
+        with patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.DCPReadError, "budget_check_failed"):
+                with self.entered(check_budget=lambda: True):
+                    self.fail("unexpected entry")
+            opened.assert_not_called()
+        self.importer.assert_not_called()
+
+    def test_checksum_failure_does_not_import(self):
+        (self.root / "model/__0_0.distcp").write_bytes(b"XXXXXXXXXX")
+        with self.assertRaisesRegex(module.DCPReadError, "audit_failed"):
+            with self.entered():
+                self.fail("unexpected entry")
+        self.importer.assert_not_called()
+
+    def test_readonly_source_is_refused_without_chmod(self):
+        path = self.root / "model/__0_0.distcp"
+        path.chmod(0o400)
+        with self.assertRaisesRegex(module.DCPReadError, "audit_failed"):
+            with self.entered():
+                self.fail("unexpected entry")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+        self.importer.assert_not_called()
+
+    def test_symlink_ancestry_is_refused(self):
+        alias = self.parent / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(module.DCPReadError, "path_rejected"):
+            with module.verified_dcp_reader(alias, **self.options):
+                self.fail("unexpected entry")
+        self.importer.assert_not_called()
+
+    def test_dotdot_and_relative_roots_are_refused(self):
+        for path in (Path("checkpoint"), self.root / ".." / "checkpoint"):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                    module.DCPReadError, "path_rejected"):
+                with module.verified_dcp_reader(path, **self.options):
+                    self.fail("unexpected entry")
+
+    def test_audit_cap_failure_does_not_import(self):
+        with self.assertRaisesRegex(module.DCPReadError, "audit_failed"):
+            with self.entered(maximum_read_bytes=self.audit_bytes - 1):
+                self.fail("unexpected entry")
+        self.importer.assert_not_called()
+
+    def test_repeated_reads_exhaust_one_shared_cap_and_poison(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered(maximum_read_bytes=self.audit_bytes + 14) as lease:
+                self.assertEqual(lease.reader.read_metadata(), b"tiny metadata\n")
+                with self.assertRaises(module.DCPReadError):
+                    lease.reader.read_data((0, 2))
+                lease.summary()
+        with self.assertRaisesRegex(module.DCPReadError, "terminal_failure"):
+            lease.summary()
+
+    def test_read_call_cap_is_enforced_by_frozen_view(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered(maximum_read_call_bytes=3) as lease:
+                lease.reader.read_data((0, 4))
+
+    def test_slice_cannot_escape_its_bound_file(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered() as lease:
+                lease.reader.read_data((9, 2))
+
+    def test_transforms_are_rejected(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered() as lease:
+                lease.reader.read_data((0, 1, ("not admitted",)))
+
+    def test_one_initial_reset_preserves_counts(self):
+        with self.entered() as lease:
+            before = lease.summary()
+            self.assertIsNone(lease.reader.reset())
+            self.assertEqual(lease.summary(), before)
+            self.assertEqual(lease.reader.read_data((0, 2)), b"01")
+
+    def test_second_reset_is_terminal(self):
+        with self.assertRaisesRegex(module.DCPReadError, "reset_rejected"):
+            with self.entered() as lease:
+                lease.reader.reset()
+                lease.reader.reset()
+        with self.assertRaises(module.DCPReadError):
+            lease.summary()
+
+    def test_reset_arguments_are_rejected_even_if_none(self):
+        for positional in (True, False):
+            with self.subTest(positional=positional):
+                with self.assertRaisesRegex(module.DCPReadError, "reset_rejected"):
+                    with self.entered() as lease:
+                        if positional:
+                            lease.reader.reset(None)
+                        else:
+                            lease.reader.reset(checkpoint_id=None)
+
+    def test_reset_after_restore_is_rejected(self):
+        with self.assertRaisesRegex(module.DCPReadError, "reset_rejected"):
+            with self.entered() as lease:
+                lease.reader.read_data((0, 1))
+                lease.reader.reset()
+
+    def test_second_restore_is_rejected_before_native_method(self):
+        calls = []
+        original = _FilesystemReader.read_data
+        def restored(reader, *args, **kwargs):
+            calls.append(1)
+            return original(reader, *args, **kwargs)
+        with patch.object(_FilesystemReader, "read_data", restored):
+            with self.assertRaisesRegex(module.DCPReadError, "restore_already_started"):
+                with self.entered() as lease:
+                    lease.reader.read_data((0, 1))
+                    lease.reader.read_data((1, 1))
+        self.assertEqual(calls, [1])
+
+    def test_failed_native_restore_is_consumed_even_if_exception_is_caught(self):
+        calls = []
+        def failed(*_args, **_kwargs):
+            calls.append(1)
+            raise RuntimeError("PRIVATE TOKEN")
+        with patch.object(_FilesystemReader, "read_data", failed):
+            with self.assertRaises(module.DCPReadError):
+                with self.entered() as lease:
+                    reader = lease.reader
+                    with self.assertRaisesRegex(module.DCPReadError, "reader_failed") as caught:
+                        reader.read_data((0, 1))
+                    self.assertEqual(caught.exception.args, ("reader_failed",))
+                    reader.read_data((0, 1))
+        self.assertEqual(calls, [1])
+
+    def test_reset_does_not_refund_metadata_reads(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered(maximum_read_bytes=self.audit_bytes + 15) as lease:
+                lease.reader.read_metadata()
+                before = lease.summary()["dcp_read_bytes_reserved"]
+                lease.reader.reset()
+                self.assertEqual(lease.summary()["dcp_read_bytes_reserved"], before)
+                lease.reader.read_data((0, 3))
+
+    def test_stream_exposes_no_descriptor_or_real_path(self):
+        with self.entered() as lease:
+            reader = lease.reader
+            path = reader.fs.concat_path(reader.path, "__0_0.distcp")
+            with reader.fs.create_stream(path, "rb") as stream:
+                for name in ("fileno", "__fspath__", "name", "raw", "buffer"):
+                    self.assertFalse(hasattr(stream, name))
+                data = bytearray(3)
+                self.assertEqual(stream.readinto(data), 3)
+                self.assertEqual(data, b"012")
+
+    def test_out_of_inventory_path_is_terminal(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered() as lease:
+                lease.reader.fs.concat_path(lease.reader.path, "../trainer-rank-00000.pt")
+
+    def test_dependency_failure_is_fixed_and_closes_session(self):
+        self.importer.side_effect = RuntimeError("PRIVATE TOKEN")
+        closed = []
+        original = module.CheckpointReadSession.close
+        def closing(session):
+            closed.append(session)
+            original(session)
+        with patch.object(module.CheckpointReadSession, "close", closing):
+            with self.assertRaisesRegex(module.DCPReadError, "dependencies_unavailable") as caught:
+                with self.entered():
+                    self.fail("unexpected entry")
+        self.assertEqual(caught.exception.args, ("dependencies_unavailable",))
+        self.assertEqual(len(closed), 1)
+        self.assertTrue(closed[0].closed)
+
+    def test_body_exception_is_fixed_and_closes(self):
+        with self.assertRaisesRegex(module.DCPReadError, "operation_failed") as caught:
+            with self.entered() as lease:
+                session = lease._session
+                raise RuntimeError("PRIVATE TOKEN")
+        self.assertEqual(caught.exception.args, ("operation_failed",))
+        self.assertTrue(session.closed)
+
+    def test_reader_is_closed_after_success(self):
+        with self.entered() as lease:
+            reader = lease.reader
+        with self.assertRaisesRegex(module.DCPReadError, "closed"):
+            reader.read_metadata()
+
+    def test_post_close_callback_failure_revokes_success(self):
+        holder = []
+        def budget():
+            if holder and holder[0]._closed:
+                raise RuntimeError("PRIVATE TOKEN")
+        with self.assertRaisesRegex(module.DCPReadError, "budget_check_failed"):
+            with self.entered(check_budget=budget) as lease:
+                holder.append(lease)
+        self.assertTrue(lease._session.closed)
+        with self.assertRaises(module.DCPReadError):
+            lease.summary()
+
+    def test_close_failure_revokes_success_without_retry(self):
+        original = module.CheckpointReadSession.close
+        calls = []
+        def closing(session):
+            calls.append(1)
+            original(session)
+            raise OSError("PRIVATE TOKEN")
+        with patch.object(module.CheckpointReadSession, "close", closing):
+            with self.assertRaisesRegex(module.DCPReadError, "close_failed"):
+                with self.entered() as lease:
+                    pass
+        self.assertEqual(len(calls), 1)
+        with self.assertRaises(module.DCPReadError):
+            lease.summary()
+
+    def test_owner_mismatch_is_terminal(self):
+        with self.assertRaises(module.DCPReadError):
+            with self.entered() as lease:
+                lease._owner = (-1, -1)
+                _ = lease.reader
+
+    def test_callback_reentry_is_terminal(self):
+        holder = []
+        def budget():
+            if holder:
+                holder[0].summary()
+        with self.assertRaisesRegex(module.DCPReadError, "budget_check_failed"):
+            with self.entered(check_budget=budget) as lease:
+                holder.append(lease)
+                _ = lease.reader
+
+    def test_no_eager_or_mocked_ml_import(self):
+        before = set(sys.modules)
+        with self.entered():
+            pass
+        forbidden = {"torch", "transformers", "numpy", "safetensors", "tokenizers"}
+        self.assertFalse(any(name.split(".")[0] in forbidden for name in set(sys.modules) - before))
+
+
+if __name__ == "__main__":
+    unittest.main()

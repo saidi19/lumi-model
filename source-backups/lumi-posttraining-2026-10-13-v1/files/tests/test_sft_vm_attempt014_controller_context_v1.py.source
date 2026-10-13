@@ -1,0 +1,287 @@
+"""Offline replay through the authenticated private graph, not a cloud retry."""
+
+import ast
+import hashlib
+import importlib
+import json
+import socket
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-attempt-014-source-v0.1"
+STAGED = (
+    ROOT / "artifacts/lumi-vm-private-outer-execution-v0.15/attempt-014/host-preparation/staged"
+)
+sys.path.insert(0, str(ROOT))
+repair = importlib.import_module("scripts.prepare_sft_vm_attempt014_local_repair_v1")
+
+
+def guard(event, args):
+    if event.startswith("socket."):
+        raise RuntimeError("network_forbidden")
+    if event == "subprocess.Popen" and args[1] != ["/usr/bin/ssh", "-V"]:
+        raise RuntimeError("remote_or_other_process_forbidden")
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        name = str(args[0])
+        if "/.aws/" in name or "connection-key" in name:
+            raise RuntimeError("credentials_and_private_keys_forbidden")
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        raw = (RELEASE / "release.json").read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == (
+            "ea70b6104481d305d6cbe262ac28737e58e814eff223edb5dbda47fd77bfc375"
+        )
+        for name, pin in json.loads(raw)["outputs"].items():
+            assert hashlib.sha256((RELEASE / name).read_bytes()).hexdigest() == pin["sha256"]
+        manifest = json.loads((STAGED / "manifest.json").read_bytes())
+        for pin in manifest["modules"].values():
+            raw = (RELEASE / "scripts" / pin["filename"]).read_bytes()
+            assert hashlib.sha256(raw).hexdigest() == pin["sha256"]
+        sys.path.insert(0, str(RELEASE / "scripts"))
+        cls.entry = importlib.import_module(manifest["entry"])
+        cls.entry.authenticate()
+        cls.provision = cls.entry.lifecycle.guard.provision
+        cls.transport = cls.provision.setup.delivery.seed.sender.delivery
+
+    def test_full_private_transport_local_ssh_exit(self):
+        self.assertEqual(self.transport.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3), b"")
+
+    def test_cleanup_failure_loses_operation_and_exception_category(self):
+        # Synthetic faults prove a diagnostic gap, not the historical cause.
+        processes = []
+        popen = self.transport.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        self.addCleanup(lambda: [p.stdout.close() for p in processes])
+        for error in (PermissionError("synthetic"), RuntimeError("synthetic")):
+            with (
+                self.subTest(kind=type(error).__name__),
+                patch.object(self.transport.os, "killpg", side_effect=error),
+                patch.object(self.transport.subprocess, "Popen", side_effect=capture),
+            ):
+                with self.assertRaises(self.transport.ExchangeFailure) as caught:
+                    self.transport.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3)
+                self.assertEqual(
+                    self.transport.exchange_diagnostic(caught.exception),
+                    {"exchange_stage": "cleanup", "exit_kind": "zero", "remote_stage": "none"},
+                )
+                self.assertFalse(processes[-1].stdout.closed)
+
+    def candidate(self, module, transform):
+        candidate = types.ModuleType("local_repair_candidate")
+        candidate.__file__ = module.__file__
+        source = transform(Path(module.__file__).read_text())
+        exec(compile(source, module.__file__, "exec"), candidate.__dict__)
+        return candidate
+
+    def test_repaired_transport_full_graph_local_ssh(self):
+        candidate = self.candidate(self.transport, repair.transport)
+        self.assertEqual(candidate.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3), b"")
+
+    def test_repaired_cleanup_attempts_all_operations_with_bounded_wait(self):
+        candidate = self.candidate(self.transport, repair.transport)
+        source = repair.transport(Path(self.transport.__file__).read_text())
+        function = next(
+            n
+            for n in ast.parse(source).body
+            if isinstance(n, ast.FunctionDef) and n.name == "pipe_exchange"
+        )
+        cleanup = next(n for n in function.body if isinstance(n, ast.Try) and n.finalbody).finalbody
+        code = compile(ast.Module(body=cleanup, type_ignores=[]), "<cleanup>", "exec")
+        for failed in (None, "kill", "wait", "stdin", "stdout", "all"):
+            with self.subTest(failed=failed):
+                process = Mock()
+                os_mock = Mock()
+                operations = [
+                    os_mock.killpg,
+                    process.wait,
+                    process.stdin.close,
+                    process.stdout.close,
+                ]
+                for label, operation in zip(
+                    ("kill", "wait", "stdin", "stdout"), operations, strict=True
+                ):
+                    if failed in (label, "all"):
+                        operation.side_effect = PermissionError("synthetic secret must not escape")
+                namespace = dict(
+                    candidate.__dict__,
+                    process=process,
+                    os=os_mock,
+                    exit_kind="zero",
+                    remote_stage="none",
+                )
+                if failed is None:
+                    exec(code, namespace)
+                else:
+                    with self.assertRaises(candidate.ExchangeFailure) as caught:
+                        exec(code, namespace)
+                    stage = "cleanup_" + ("kill" if failed == "all" else failed)
+                    self.assertEqual(
+                        candidate.exchange_diagnostic(caught.exception)["exchange_stage"], stage
+                    )
+                for operation in operations:
+                    operation.assert_called_once()
+                process.wait.assert_called_once_with(timeout=2)
+
+    def test_missing_process_group_is_benign_but_pipes_still_closed(self):
+        candidate = self.candidate(self.transport, repair.transport)
+        with patch.object(candidate.os, "killpg", side_effect=ProcessLookupError):
+            self.assertEqual(candidate.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3), b"")
+
+    def test_repaired_real_pipe_closed_when_kill_fails(self):
+        candidate = self.candidate(self.transport, repair.transport)
+        processes = []
+        popen = candidate.subprocess.Popen
+
+        def capture(*args, **kwargs):
+            process = popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch.object(candidate.os, "killpg", side_effect=PermissionError),
+            patch.object(candidate.subprocess, "Popen", side_effect=capture),
+        ):
+            with self.assertRaises(candidate.ExchangeFailure) as caught:
+                candidate.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3)
+        self.assertEqual(
+            candidate.exchange_diagnostic(caught.exception)["exchange_stage"], "cleanup_kill"
+        )
+        self.assertTrue(processes[0].stdin.closed)
+        self.assertTrue(processes[0].stdout.closed)
+
+    def test_provision_checks_unchanged_except_diagnostic_assignments(self):
+        source = Path(self.provision.__file__).read_text()
+
+        def stripped(raw):
+            tree = ast.parse(raw)
+            cls = next(n for n in tree.body if getattr(n, "name", None) == "Transaction")
+            node = next(n for n in cls.body if getattr(n, "name", None) == "instance")
+
+            class RemoveDiagnostics(ast.NodeTransformer):
+                def visit_Assign(self, item):
+                    if any(
+                        isinstance(t, ast.Attribute) and t.attr == "stop_observation_check"
+                        for t in item.targets
+                    ):
+                        return None
+                    return item
+
+            return ast.dump(RemoveDiagnostics().visit(node))
+
+        self.assertEqual(stripped(source), stripped(repair.provision(source)))
+
+    def test_candidate_preserves_transport_body_and_fail_closed_authority(self):
+        before = ast.parse(Path(self.transport.__file__).read_text())
+        after = ast.parse(repair.transport(Path(self.transport.__file__).read_text()))
+
+        def body(tree):
+            node = next(n for n in tree.body if getattr(n, "name", None) == "pipe_exchange")
+            for item in node.body:
+                if isinstance(item, ast.Try) and item.finalbody:
+                    item.finalbody = []
+            return ast.dump(node)
+
+        self.assertEqual(body(before), body(after))
+        self.assertEqual(len(repair.build()), 2)
+        with self.assertRaises(ValueError):
+            repair.run(approved=True)
+
+    def transaction(self, output, *, bad_owner=False):
+        p = self.provision
+        tx = p.Transaction(Path(output), None, lambda: 1000.0, lambda _: None, lambda: None)
+        tx.binding["instance"] = "i-00000000000000001"
+        calls = []
+
+        class FakeCloud:
+            def cli(self, service, operation, **fields):
+                calls.append((service, operation, fields))
+                if operation == "stop-instances":
+                    return {}
+                assert operation == "describe-instances"
+                stopped = any(op == "stop-instances" for _, op, _ in calls)
+                return {
+                    "Reservations": [
+                        {
+                            "OwnerId": "invalid" if bad_owner else tx.host["account"],
+                            "Instances": [
+                                {
+                                    "InstanceId": tx.binding["instance"],
+                                    "ClientToken": p.ATTEMPT,
+                                    "ImageId": tx.host["ami"],
+                                    "InstanceType": tx.host["instance_type"],
+                                    "VpcId": tx.host["vpc"],
+                                    "SubnetId": tx.host["subnet"],
+                                    "KeyName": tx.binding["key_name"],
+                                    "Tags": [{"Key": "LumiAttempt", "Value": p.ATTEMPT}],
+                                    "State": {"Name": "stopped" if stopped else "running"},
+                                }
+                            ],
+                        }
+                    ]
+                }
+
+        tx.cloud = FakeCloud()
+        return tx, calls
+
+    def test_actual_stop_path_one_dispatch_then_verified(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tx, calls = self.transaction(folder)
+            tx.stop_failed_launch()
+            self.assertTrue(tx.report["stopped_verified"])
+            self.assertFalse(tx.report["stop_verification_unresolved"])
+            self.assertEqual(
+                [op for _, op, _ in calls],
+                ["describe-instances", "stop-instances", "describe-instances"],
+            )
+            self.assertEqual(
+                calls[1][2],
+                {"InstanceIds": [tx.binding["instance"]], "Force": False, "Hibernate": False},
+            )
+
+    def test_owner_mismatch_rejects_before_stop_and_has_same_coarse_code(self):
+        with tempfile.TemporaryDirectory() as folder:
+            tx, calls = self.transaction(folder, bad_owner=True)
+            tx.stop_failed_launch()
+            self.assertFalse(tx.report["stop_attempted"])
+            self.assertTrue(tx.report["stop_verification_unresolved"])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(
+                tx.report["stop_observation_diagnostic"],
+                {"stage": "stop_observation", "kind": "validation", "check": "none"},
+            )
+
+    def test_repaired_stop_identifies_owner_without_weakening_rejection(self):
+        candidate = self.candidate(self.provision, repair.provision)
+        with patch.object(self, "provision", candidate), tempfile.TemporaryDirectory() as folder:
+            tx, calls = self.transaction(folder, bad_owner=True)
+            tx.stop_failed_launch()
+            self.assertFalse(tx.report["stop_attempted"])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(tx.report["stop_observation_check"], "owner")
+
+    def test_repaired_stop_success_still_one_dispatch(self):
+        candidate = self.candidate(self.provision, repair.provision)
+        with patch.object(self, "provision", candidate), tempfile.TemporaryDirectory() as folder:
+            tx, calls = self.transaction(folder)
+            tx.stop_failed_launch()
+            self.assertTrue(tx.report["stopped_verified"])
+            self.assertEqual(sum(op == "stop-instances" for _, op, _ in calls), 1)
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+    sys.addaudithook(guard)
+    unittest.main()

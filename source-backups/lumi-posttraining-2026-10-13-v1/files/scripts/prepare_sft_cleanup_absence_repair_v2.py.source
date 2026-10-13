@@ -1,0 +1,72 @@
+"""Offline-only bounded absence reconciliation; never launches a live attempt."""
+
+import ast
+import hashlib
+import json
+
+from scripts import prepare_sft_cleanup_absence_repair_v1 as prior
+
+PROOF = prior.ROOT / "evidence/lumi-cleanup-candidate-live-verification-v0.8.json"
+PROOF_SHA = "273c6c8450bb7af1c0283392c9e69813d1a82d4529892d216bd947abe288cc70"
+BEFORE = prior.BEFORE
+AFTER = '''        except PermissionError as error:
+            cleanup_stage = "cleanup_kill_permission"
+            # Observation only: never repeat SIGKILL or the remote command.
+            # A bounded settling window is not success: kernel ESRCH is required.
+            if error.errno == 1 and exit_kind == "zero" and process.returncode == 0:
+                for observation in range(20):
+                    if time.monotonic() >= cleanup_deadline:
+                        break
+                    try:
+                        os.killpg(process.pid, 0)
+                    except ProcessLookupError as absent:
+                        if absent.errno == 3:
+                            cleanup_stage = None
+                        break
+                    except PermissionError as denied:
+                        if denied.errno != 1:
+                            break
+                    except BaseException:
+                        break
+                    if observation == 19:
+                        break
+                    remaining = cleanup_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        time.sleep(min(0.01, remaining))
+                    except BaseException:
+                        break'''
+START = '''    finally:
+        cleanup_stage = None'''
+START_AFTER = '''    finally:
+        cleanup_deadline = time.monotonic() + 2
+        cleanup_stage = None'''
+WAIT = "            process.wait(timeout=2)"
+WAIT_AFTER = "            process.wait(timeout=max(0, cleanup_deadline - time.monotonic()))"
+
+
+def build():
+    raw = PROOF.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != PROOF_SHA:
+        raise ValueError("evidence_changed")
+    value = json.loads(raw)
+    for name, digest in value["source_sha256"].items():
+        if hashlib.sha256((prior.ROOT / name).read_bytes()).hexdigest() != digest:
+            raise ValueError("evidence_binding_changed")
+    if (value["result"]["probe_reply_matches"] is not False
+            or value["result"]["instrumentation"] is not False
+            or not value["cleanup"]["disposable_resources_removed"]):
+        raise ValueError("unexpected_evidence")
+    # Also authenticate the original source and all earlier repair bindings.
+    source = prior.build().replace(prior.AFTER, prior.BEFORE)
+    for before, after in ((BEFORE, AFTER), (START, START_AFTER), (WAIT, WAIT_AFTER)):
+        if source.count(before) != 1:
+            raise ValueError("unexpected_source")
+        source = source.replace(before, after)
+    ast.parse(source)
+    return source
+
+
+def run(**_kwargs):
+    raise ValueError("offline_candidate_not_execution_authority")

@@ -1,0 +1,185 @@
+"""Generated only: fixed entry controls, genuine import and source cold loading."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_script(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / 'scripts' / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class EntryTests(unittest.TestCase):
+    def setUp(self):
+        self.entry = load_script('run_sft_vm_coordinator_entry_v1')
+        self.generator = load_script('create_sft_vm_coordinator_fixture_v1')
+        temporary = tempfile.TemporaryDirectory(prefix='lumi-vm-generated-entry-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        for owner, name in ((socket.socket, 'connect'), (socket.socket, 'connect_ex'),
+                            (socket, 'getaddrinfo')):
+            self.enterContext(patch.object(owner, name, side_effect=AssertionError('network')))
+        self.generator.FIXTURE = self.root / 'fixture'
+        self.generator.SOURCE = ROOT / 'src/lumi'
+        self.generator.generate()
+        from lumi import posttraining_checkpoint_import_runner_v4 as runner
+
+        self.runner = runner
+        self.entry.CONTROL = self.generator.FIXTURE / 'controls.json'
+        self.entry.CHECKPOINT = self.generator.FIXTURE / 'checkpoint'
+        self.entry.TOKENIZER = self.generator.FIXTURE / 'tokenizer'
+        self.entry.SOURCE = ROOT / 'src/lumi'
+        self.entry.ATTEMPT = self.root / 'attempt'
+        self.entry.SUMMARY = self.root / 'summary.json'
+        self.raw = self.entry.CONTROL.read_bytes()
+        self.pin = runner.sha(self.raw)
+
+    def execute(self):
+        # Host observations alone are synthetic on Mac; actual parsers, hashes,
+        # kernel, package and checksum verification are not replaced.
+        def space(path):
+            return SimpleNamespace(f_flag=0 if path == self.root else os.ST_RDONLY)
+        with patch.object(self.entry, 'load_runner', return_value=self.runner), \
+                patch.object(self.runner, '_runtime'), \
+                patch.object(self.entry.os, 'statvfs', space):
+            return self.entry.execute(self.pin)
+
+    def test_generated_entry_actual_full_chain_and_summary(self):
+        before = {path: self.runner.sha(path.read_bytes())
+                  for path in self.generator.FIXTURE.rglob('*') if path.is_file()}
+        result = self.execute()
+        self.assertEqual(result['full_input_audits'], 2)
+        self.assertTrue(result['independent_checksum_consumer'])
+        self.assertFalse(result['fullsize_resource_admission'])
+        self.assertEqual(json.loads(self.entry.SUMMARY.read_bytes()), result)
+        self.assertEqual({path:self.runner.sha(path.read_bytes()) for path in before}, before)
+        with self.assertRaisesRegex(ValueError, 'generated_entry_rejected'):
+            self.execute()
+
+    def test_wrong_control_hash_rejected_before_coordinator(self):
+        with self.assertRaises(ValueError):
+            self.entry.read_control('0' * 64)
+        self.assertFalse(self.entry.ATTEMPT.exists())
+
+    def test_bad_control_mode_and_symlink_rejected(self):
+        self.entry.CONTROL.chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.entry.read_control(self.pin)
+        self.entry.CONTROL.chmod(0o600)
+        link = self.root / 'control-link'
+        link.symlink_to(self.entry.CONTROL)
+        self.entry.CONTROL = link
+        with self.assertRaises(ValueError):
+            self.entry.read_control(self.pin)
+
+    def test_real_scope_large_geometry_and_paths_are_rejected(self):
+        value = json.loads(self.raw)
+        for change in ('real', 'large', 'path', 'approval'):
+            modified = json.loads(self.raw)
+            if change == 'real':
+                base = json.loads(bytes.fromhex(modified['metadata'][0]))
+                base.pop('synthetic_fixture_only')
+                modified['metadata'][0] = self.runner.canonical(base).hex()
+            elif change == 'large':
+                config = json.loads(bytes.fromhex(modified['metadata'][3]))
+                config['hidden_size'] = 4096
+                modified['metadata'][3] = self.runner.canonical(config).hex()
+            else:
+                modified[change] = '/real' if change == 'path' else True
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.entry.arguments(self.runner.canonical(modified), self.runner)
+        self.assertEqual(self.entry.arguments(self.raw, self.runner)['metadata'][0].hex(),
+                         value['metadata'][0])
+
+    def test_writable_inputs_rejected_before_control_read(self):
+        with patch.object(self.entry, 'load_runner', return_value=self.runner), \
+                patch.object(self.runner, '_runtime'), \
+                patch.object(self.entry.os, 'statvfs', return_value=SimpleNamespace(f_flag=0)), \
+                patch.object(self.entry, 'read_control') as read:
+            with self.assertRaises(ValueError):
+                self.entry.execute(self.pin)
+            read.assert_not_called()
+
+    def test_runtime_failure_precedes_control_io(self):
+        with patch.object(self.entry, 'load_runner', return_value=self.runner), \
+                patch.object(self.runner, '_runtime', side_effect=ValueError('runtime_rejected')), \
+                patch.object(self.entry, 'read_control') as read:
+            with self.assertRaises(ValueError):
+                self.entry.execute(self.pin)
+            read.assert_not_called()
+
+    def test_corrupt_generated_input_has_no_success_summary_or_retry(self):
+        path = self.entry.CHECKPOINT / 'model/__0_0.distcp'
+        raw = path.read_bytes()
+        path.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        with self.assertRaisesRegex(ValueError, 'kernel_failed'):
+            self.execute()
+        self.assertTrue(self.entry.CONSUMED)
+        self.assertFalse(self.entry.SUMMARY.exists())
+        self.assertTrue((self.entry.ATTEMPT / self.runner.FAILED).is_file())
+
+
+class ColdTests(unittest.TestCase):
+    def test_release_closure_includes_computed_fixture_namespace_imports(self):
+        builder = load_script('prepare_sft_vm_coordinator_release_v1')
+        sources = builder.source_closure(ROOT)
+        for name in ('posttraining_checkpoint_import_runner_v3',
+                     'posttraining_checkpoint_import_torch_v5',
+                     'posttraining_checkpoint_package_v2',
+                     'posttraining_checkpoint_io_contract_v1'):
+            self.assertIn('src/lumi/' + name + '.py', sources)
+        self.assertLessEqual(sum(map(len, sources.values())), 2 * 1024**2)
+
+    def test_all_control_scripts_load_without_ml_or_lumi_package(self):
+        code = r'''
+import importlib.abc, importlib.util, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+class Deny(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in {'lumi','torch','transformers','numpy','safetensors'}:
+            raise AssertionError('premature ML')
+sys.meta_path.insert(0,Deny())
+for name in ('run_sft_vm_coordinator_entry_v1','create_sft_vm_coordinator_fixture_v1',
+             'run_sft_vm_coordinator_rehearsal_v1'):
+    spec=importlib.util.spec_from_file_location(name,root/'scripts'/(name+'.py'))
+    module=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+module.load_control(root)
+assert 'lumi' not in sys.modules and 'torch' not in sys.modules
+'''
+        result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(ROOT)],
+                                capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_entry_has_no_mock_or_runtime_override_switch(self):
+        import ast
+
+        raw = (ROOT / 'scripts/run_sft_vm_coordinator_entry_v1.py').read_text()
+        tree = ast.parse(raw)
+        self.assertNotIn('unittest', raw)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)]
+        self.assertEqual(sum(isinstance(node.func, ast.Attribute) and node.func.attr == '_runtime'
+                             for node in calls), 1)
+        self.assertEqual(sum(isinstance(node.func, ast.Attribute)
+                             and node.func.attr == '_coordinate_admitted_import'
+                             for node in calls), 1)
+
+
+if __name__ == '__main__':
+    unittest.main()

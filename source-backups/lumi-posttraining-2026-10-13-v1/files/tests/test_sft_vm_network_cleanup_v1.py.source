@@ -1,0 +1,409 @@
+"""Synthetic EC2/S3 only, including the actual frozen transaction plus bridge."""
+
+import copy
+import importlib
+import io
+import json
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests.test_sft_vm_private_network_transaction_v1 import PLAN, Cloud
+from tests.test_sft_vm_private_network_v1 import fixture
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("sft_vm_network_cleanup_v1")
+bridge = importlib.import_module("sft_vm_network_cleanup_bridge_v1")
+transaction = importlib.import_module("run_sft_vm_private_network_v1")
+TOKEN = "a" * 32
+
+
+class ApiError(Exception):
+    def __init__(self, code):
+        self.response = {"Error": {"Code": code}}
+        super().__init__("PRIVATE_SENTINEL")
+
+
+class S3:
+    def __init__(self):
+        self.calls, self.objects = [], {}
+        self.lost_ack, self.fail = False, False
+
+    def put_object(self, **kw):
+        self.calls.append(copy.deepcopy(kw))
+        if self.fail:
+            raise ApiError("AccessDenied")
+        if kw["Key"] in self.objects:
+            raise ApiError("PreconditionFailed")
+        self.objects[kw["Key"]] = kw["Body"]
+        if self.lost_ack:
+            raise TimeoutError("PRIVATE_SENTINEL")
+        return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+
+
+class EC2:
+    def __init__(self):
+        tags = [dict(Key="LumiAttempt", Value=m.ATTEMPT), dict(Key="LumiNetworkNonce", Value=TOKEN)]
+        self.address = dict(
+            AllocationId="eipalloc-" + "3" * 17,
+            Tags=copy.deepcopy(tags),
+            Domain="vpc",
+            NetworkBorderGroup=m.REGION,
+            AssociationId="eipassoc-" + "5" * 17,
+        )
+        self.nat = dict(
+            NatGatewayId="nat-" + "4" * 17,
+            Tags=copy.deepcopy(tags),
+            VpcId=m.VPC,
+            SubnetId=m.SUBNET,
+            ConnectivityType="public",
+            State="available",
+            NatGatewayAddresses=[dict(AllocationId=self.address["AllocationId"])],
+        )
+        self.calls, self.stuck, self.lost_ack = [], False, False
+        self.hide = 0
+        self.paginated = False
+
+    def describe_nat_gateways(self, **kw):
+        self.calls.append(("DescribeNatGateways", kw))
+        row = self.nat
+        if self.hide:
+            self.hide -= 1
+            row = None
+        value = {"NatGateways": [copy.deepcopy(row)] if row else []}
+        if self.paginated:
+            value["NextToken"] = "PRIVATE_SENTINEL"
+        return value
+
+    def describe_addresses(self, **kw):
+        self.calls.append(("DescribeAddresses", kw))
+        if self.address is None and "AllocationIds" in kw:
+            raise ApiError("InvalidAllocationID.NotFound")
+        return {"Addresses": [copy.deepcopy(self.address)] if self.address else []}
+
+    def delete_nat_gateway(self, **kw):
+        self.calls.append(("DeleteNatGateway", kw))
+        self.nat["State"] = "deleting" if self.stuck else "deleted"
+        if not self.stuck:
+            self.address.pop("AssociationId", None)
+            self.nat["NatGatewayAddresses"] = []
+        if self.lost_ack:
+            raise TimeoutError("PRIVATE_SENTINEL")
+        return {"NatGatewayId": kw["NatGatewayId"]}
+
+    def release_address(self, **kw):
+        self.calls.append(("ReleaseAddress", kw))
+        self.address = None
+        if self.lost_ack:
+            raise TimeoutError("PRIVATE_SENTINEL")
+        return {}
+
+
+class CleanupTests(unittest.TestCase):
+    def setUp(self):
+        self.ec2, self.s3 = EC2(), S3()
+        self.bound = dict(
+            armed=True, attempt=m.ATTEMPT, nonce=TOKEN, not_before=2000000000, expires_at=2000000900
+        )
+        self.now = self.bound["not_before"]
+        self.context = Mock()
+        self.context.get_remaining_time_in_millis.return_value = 840000
+
+    def wait(self, seconds):
+        self.now += seconds
+
+    def observe(self):
+        return m.observe(
+            self.bound,
+            self.ec2,
+            m.Claims(self.s3, TOKEN),
+            self.context,
+            clock=lambda: self.now,
+            wait=self.wait,
+        )
+
+    def mutations(self):
+        return [n for n, _ in self.ec2.calls if n in {"DeleteNatGateway", "ReleaseAddress"}]
+
+    def test_success_and_real_sdk_request_shapes(self):
+        result = self.observe()
+        self.assertTrue(result["cost_resources_released"])
+        self.assertEqual(self.mutations(), ["DeleteNatGateway", "ReleaseAddress"])
+        import botocore.session
+        import botocore.validate
+
+        sdk = botocore.session.Session()
+        for operation, fields in self.ec2.calls:
+            shape = sdk.get_service_model("ec2").operation_model(operation).input_shape
+            botocore.validate.validate_parameters(fields, shape)
+        for fields in self.s3.calls:
+            shape = sdk.get_service_model("s3").operation_model("PutObject").input_shape
+            botocore.validate.validate_parameters(fields, shape)
+            self.assertLessEqual(len(fields["Body"]), 512)
+            self.assertEqual(fields["IfNoneMatch"], "*")
+            self.assertEqual(fields["ExpectedBucketOwner"], m.ACCOUNT)
+        self.assertNotIn("nat-", json.dumps(result))
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_lost_delete_and_release_ack_are_observed_not_retried(self):
+        self.ec2.lost_ack = True
+        self.assertTrue(self.observe()["cost_resources_released"])
+        self.assertEqual(self.mutations(), ["DeleteNatGateway", "ReleaseAddress"])
+
+    def test_duplicate_delivery_cannot_repeat_stale_mutation(self):
+        original = copy.deepcopy(self.ec2)
+        self.assertTrue(self.observe()["cost_resources_released"])
+        self.ec2 = original  # Worst case stale readback still says available.
+        result = self.observe()
+        self.assertFalse(result["cost_resources_released"])
+        self.assertTrue(result["claim_unavailable"])
+        self.assertEqual(self.mutations(), [])
+
+    def test_lost_claim_ack_never_dispatches_or_retries(self):
+        self.s3.lost_ack = True
+        result = self.observe()
+        self.assertTrue(result["claim_unavailable"])
+        self.assertFalse(result["cost_resources_released"])
+        self.assertEqual(len(self.s3.calls), 1)
+        self.assertEqual(self.mutations(), [])
+
+    def test_claim_access_denied_prevents_deletion(self):
+        self.s3.fail = True
+        self.assertFalse(self.observe()["cost_resources_released"])
+        self.assertEqual(len(self.s3.calls), 1)
+        self.assertEqual(self.mutations(), [])
+
+    def test_stuck_nat_keeps_associated_eip_and_bounds_polling(self):
+        self.ec2.stuck = True
+        result = self.observe()
+        self.assertEqual(self.mutations(), ["DeleteNatGateway"])
+        self.assertFalse(result["cost_resources_released"])
+        self.assertEqual(result["reads"], 144)
+        self.assertEqual(self.now, self.bound["not_before"] + 720)
+
+    def test_empty_discovery_is_not_success(self):
+        self.ec2.nat = self.ec2.address = None
+        result = self.observe()
+        self.assertFalse(result["cost_resources_released"])
+        self.assertEqual(result["stage"], "cleanup_unconfirmed")
+        self.assertEqual(self.mutations(), [])
+
+    def test_late_nat_after_lost_creation_ack_is_discovered(self):
+        self.ec2.hide = 3
+        self.assertTrue(self.observe()["cost_resources_released"])
+        self.assertEqual(self.mutations(), ["DeleteNatGateway", "ReleaseAddress"])
+
+    def test_nat_is_not_deleted_until_matching_eip_becomes_visible(self):
+        original = self.ec2.describe_addresses
+        hidden = [3]
+
+        def delayed(**kw):
+            if hidden[0]:
+                hidden[0] -= 1
+                self.assertEqual(self.mutations(), [])
+                return {"Addresses": []}
+            return original(**kw)
+
+        with patch.object(self.ec2, "describe_addresses", side_effect=delayed):
+            self.assertTrue(self.observe()["cost_resources_released"])
+
+    def test_late_readback_cannot_report_completion(self):
+        original = self.ec2.describe_addresses
+
+        def delayed(**kw):
+            value = original(**kw)
+            self.now = self.bound["expires_at"]
+            return value
+
+        with patch.object(self.ec2, "describe_addresses", side_effect=delayed):
+            self.assertEqual(self.observe()["stage"], "cleanup_rejected")
+        self.assertEqual(self.mutations(), [])
+
+    def test_orphan_eip_released_without_false_nat_absence_claim(self):
+        self.ec2.nat = None
+        self.ec2.address.pop("AssociationId")
+        result = self.observe()
+        self.assertEqual(self.mutations(), ["ReleaseAddress"])
+        self.assertTrue(result["eip_absent_observed"])
+        self.assertFalse(result["cost_resources_released"])
+
+    def test_foreign_duplicate_tags_wrong_vpc_and_foreign_allocation_fail_closed(self):
+        mutations = [
+            lambda e: e.nat.update(VpcId="vpc-" + "9" * 17),
+            lambda e: e.nat["Tags"].append(copy.deepcopy(e.nat["Tags"][0])),
+            lambda e: e.nat["Tags"][1].update(Value="b" * 32),
+            lambda e: e.address.update(AllocationId="eipalloc-" + "9" * 17),
+        ]
+        for change in mutations:
+            self.ec2 = EC2()
+            change(self.ec2)
+            self.assertEqual(self.observe()["stage"], "cleanup_rejected")
+            self.assertEqual(self.mutations(), [])
+
+    def test_pagination_rejected(self):
+        self.ec2.paginated = True
+        self.assertEqual(self.observe()["stage"], "cleanup_rejected")
+        self.assertEqual(self.mutations(), [])
+
+    def test_tag_change_after_discovery_is_not_treated_as_deleted(self):
+        def changed(_seconds):
+            self.ec2.nat["Tags"][1]["Value"] = "b" * 32
+
+        with patch.object(self, "wait", side_effect=changed):
+            result = self.observe()
+        self.assertEqual(result["stage"], "cleanup_rejected")
+        self.assertFalse(result["cost_resources_released"])
+        self.assertIn("NatGatewayIds", self.ec2.calls[-1][1])
+
+    def test_early_expired_and_context_deadline_have_no_calls(self):
+        for now in (self.bound["not_before"] - 1, self.bound["expires_at"] - 25, float("nan")):
+            self.now = now
+            self.assertEqual(self.observe()["stage"], "cleanup_rejected")
+        self.now = self.bound["not_before"]
+        self.context.get_remaining_time_in_millis.return_value = 25000
+        self.assertEqual(self.observe()["stage"], "cleanup_rejected")
+        self.assertEqual(self.ec2.calls, [])
+
+    def test_binding_duplicates_wrong_types_and_extended_window_rejected(self):
+        for update in (
+            {"nonce": "../x"},
+            {"armed": 1},
+            {"not_before": True},
+            {"expires_at": self.bound["not_before"] + 901},
+            {"extra": 1},
+        ):
+            with self.assertRaises(ValueError):
+                m.binding(json.dumps(dict(self.bound, **update)))
+        with self.assertRaises(ValueError):
+            m.binding('{"armed":false,"armed":false}')
+
+    def test_unarmed_and_forged_handler_never_import_sdk_or_log_input(self):
+        stream = io.StringIO()
+        with patch.dict(m.os.environ, {"LUMI_NETWORK_CLEANUP_BINDING": '{"armed":false}'}):
+            with redirect_stdout(stream):
+                self.assertEqual(
+                    m.handler({"secret": "PRIVATE_SENTINEL"}, self.context)["stage"], "unarmed"
+                )
+        self.assertNotIn("PRIVATE_SENTINEL", stream.getvalue())
+
+    def test_bridge_actual_frozen_transaction_shares_claims(self):
+        with tempfile.TemporaryDirectory() as folder:
+            cloud = Cloud()
+            claimed = bridge.ClaimedCloud(cloud, self.s3, clock=lambda: cloud.clock)
+            expiry = bridge.ExpiryBridge(claimed, Mock())
+            report = transaction._with_preflighted_network_once(
+                Path(folder).resolve() / "attempt",
+                plan_raw=PLAN,
+                cloud=claimed,
+                admit=fixture,
+                expiry=expiry,
+                workload=Mock(),
+                clock=lambda: cloud.clock,
+                wait=cloud.wait,
+            )
+            self.assertTrue(report["cost_resources_released"])
+            self.assertEqual(len(self.s3.calls), 2)
+            token = claimed.claims.token
+            duplicate = m.Claims(self.s3, token)
+            self.assertFalse(duplicate.take("delete-nat-gateway", "nat-" + "4" * 17))
+            self.assertFalse(duplicate.take("release-address", "eipalloc-" + "3" * 17))
+
+    def test_bridge_requires_binding_and_never_opens_public_entry(self):
+        cloud = bridge.ClaimedCloud(Mock(), self.s3, clock=lambda: 100)
+        with self.assertRaises(ValueError):
+            cloud.cli("ec2", "release-address", AllocationId="eipalloc-" + "3" * 17)
+        cloud.bind(TOKEN, 18100)
+        with self.assertRaises(ValueError):
+            cloud.bind(TOKEN, 18100)
+        with self.assertRaisesRegex(ValueError, "network_cleanup_live_admission_required"):
+            bridge.run(approved=True)
+
+    def test_claim_key_is_fixed_to_operation_not_resource_id(self):
+        one = m.Claims(self.s3, TOKEN)
+        two = m.Claims(self.s3, TOKEN)
+        self.assertTrue(one.take("release-address", "eipalloc-" + "3" * 17))
+        self.assertFalse(two.take("release-address", "eipalloc-" + "4" * 17))
+        self.assertEqual(len(self.s3.objects), 1)
+
+    def test_slow_claim_cannot_dispatch_past_original_deadline(self):
+        tick = [100]
+        bare = Mock()
+        cloud = bridge.ClaimedCloud(bare, self.s3, clock=lambda: tick[0])
+        cloud.bind(TOKEN, 200)
+        original = self.s3.put_object
+
+        def slow(**kw):
+            answer = original(**kw)
+            tick[0] = 180
+            return answer
+
+        with patch.object(self.s3, "put_object", side_effect=slow), self.assertRaises(ValueError):
+            cloud.cli("ec2", "release-address", AllocationId="eipalloc-" + "3" * 17)
+        bare.cli.assert_not_called()
+        self.assertEqual(len(self.s3.objects), 1)
+
+    def test_handler_uses_no_retry_clients_and_fixed_redacted_output(self):
+        self.ec2.close = Mock()
+        self.s3.close = Mock()
+        factory = Mock(side_effect=[self.ec2, self.s3])
+        sdk = types.SimpleNamespace(client=factory)
+        self.context.invoked_function_arn = (
+            f"arn:aws:lambda:{m.REGION}:{m.ACCOUNT}:function:lumi-net-{TOKEN}"
+        )
+        event = {k: v for k, v in self.bound.items() if k != "armed"}
+        stream = io.StringIO()
+        original = m.observe
+
+        def bounded(bound, ec2, claims, context):
+            return original(bound, ec2, claims, context, clock=lambda: self.now, wait=self.wait)
+
+        with (
+            patch.dict(sys.modules, {"boto3": sdk}),
+            patch.dict(m.os.environ, {"LUMI_NETWORK_CLEANUP_BINDING": json.dumps(self.bound)}),
+            patch.object(m.time, "time", side_effect=lambda: self.now),
+            patch.object(m, "observe", side_effect=bounded),
+            redirect_stdout(stream),
+        ):
+            result = m.handler(event, self.context)
+        self.assertTrue(result["cost_resources_released"])
+        for call in factory.call_args_list:
+            self.assertEqual(call.kwargs["config"].retries, {"total_max_attempts": 1})
+            self.assertEqual(call.kwargs["config"].proxies, {})
+        self.ec2.close.assert_called_once()
+        self.s3.close.assert_called_once()
+        self.assertEqual(json.loads(stream.getvalue()), result)
+        self.assertNotIn(TOKEN, stream.getvalue())
+
+    def test_wrong_function_event_or_early_handler_has_no_sdk_calls(self):
+        sdk = types.SimpleNamespace(client=Mock())
+        event = {k: v for k, v in self.bound.items() if k != "armed"}
+        for function, incoming, now in (
+            ("wrong", event, self.now),
+            (
+                f"arn:aws:lambda:{m.REGION}:{m.ACCOUNT}:function:lumi-net-{TOKEN}",
+                dict(event, nonce="b" * 32),
+                self.now,
+            ),
+            (
+                f"arn:aws:lambda:{m.REGION}:{m.ACCOUNT}:function:lumi-net-{TOKEN}",
+                event,
+                self.now - 1,
+            ),
+        ):
+            self.context.invoked_function_arn = function
+            with (
+                patch.dict(sys.modules, {"boto3": sdk}),
+                patch.dict(m.os.environ, {"LUMI_NETWORK_CLEANUP_BINDING": json.dumps(self.bound)}),
+                patch.object(m.time, "time", return_value=now),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(m.handler(incoming, self.context)["stage"], "rejected")
+        sdk.client.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

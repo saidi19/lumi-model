@@ -1,0 +1,339 @@
+"""One exact, user-authorized NAT/EIP recovery; never delete retained dependencies."""
+
+import hashlib
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-010-cost-cleanup-recovery-v0.2"
+ACCOUNT = "573978149073"
+ATTEMPT = "9b87f7f591a240ef8b10f46b8d008fa0"
+NONCE = "f0e1b394ef5d4586b08a526177b5fe01"
+VPC = "vpc-0905fbf9490a2dead"
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+PREFIX = f"lumi-corpus/v0.1/control/sft-import-research/{ATTEMPT}/network-cleanup/{NONCE}/"
+IDS = dict(
+    nat="nat-03537ad4f804fd1d5",
+    address="eipalloc-00358717ec0291124",
+    table="rtb-0a737e12d5b748f61",
+    subnet="subnet-07386c9d440cb3df8",
+    instance="i-04afbb5dbed16b970",
+    endpoint="eice-0610246d79f65e4e5",
+)
+VOLUMES = {"vol-0d4073e16f8374d1e", "vol-0b621ec4cadc3452c"}
+READS = {
+    "describe_nat_gateways",
+    "describe_addresses",
+    "describe_route_tables",
+    "describe_instances",
+    "describe_instance_connect_endpoints",
+    "get_object",
+}
+WRITES = {"delete_route", "delete_nat_gateway", "release_address", "put_object"}
+ABSENT = {"NatGatewayNotFound", "InvalidAllocationID.NotFound", "NoSuchKey"}
+
+
+def need(value):
+    if not value:
+        raise ValueError("exact_cost_cleanup_rejected")
+
+
+def owned(row, kind):
+    for key, value in (("LumiAttempt", ATTEMPT), ("LumiNetworkNonce", NONCE)):
+        need([t.get("Value") for t in row.get("Tags", []) if t.get("Key") == key] == [value])
+    field = {"nat": "NatGatewayId", "address": "AllocationId", "table": "RouteTableId"}[kind]
+    need(row.get(field) == IDS[kind])
+    if kind in {"nat", "table"}:
+        need(row.get("VpcId") == VPC)
+        if kind == "table" or "OwnerId" in row:
+            need(row.get("OwnerId") == ACCOUNT)
+    if kind == "nat":
+        need(row.get("SubnetId") == "subnet-0dc6039a6453f7c95")
+        need(row.get("ConnectivityType") == "public")
+        need(
+            all(a.get("AllocationId") == IDS["address"] for a in row.get("NatGatewayAddresses", []))
+        )
+    if kind == "address":
+        need(row.get("Domain") == "vpc" and row.get("NetworkBorderGroup") == "us-east-1")
+
+
+class Recovery:
+    def __init__(self, clients, save, timeout, *, clock=time.monotonic, wait=time.sleep):
+        self.clients, self.save, self.timeout = clients, save, timeout
+        self.clock, self.wait, self.start = clock, wait, clock()
+        self.calls, self.bytes, self.ec2_writes, self.claim_writes = 0, 0, 0, 0
+        self.sent, self.stage = set(), "initial"
+
+    def call(self, service, operation, **fields):
+        need(operation in READS | WRITES and self.calls < 79)
+        need(self.clock() - self.start < 875)
+        need(service == ("s3" if operation in {"get_object", "put_object"} else "ec2"))
+        self.stage = operation
+        if operation in WRITES:
+            identity = (operation, fields.get("Key"))
+            need(identity not in self.sent)
+            self.sent.add(identity)
+            if service == "s3":
+                need(self.claim_writes < 2)
+                self.claim_writes += 1
+            else:
+                need(self.ec2_writes < 3)
+                self.ec2_writes += 1
+            self.save(
+                f"mutation-{len(self.sent):02d}",
+                dict(operation=operation, claim_key=fields.get("Key"), retry=False),
+            )
+        self.calls += 1
+        try:
+            with self.timeout(20):
+                value = getattr(self.clients[service], operation)(**fields)
+        except Exception as error:
+            if (
+                operation in READS
+                and getattr(error, "response", {}).get("Error", {}).get("Code") in ABSENT
+            ):
+                return None
+            raise ValueError("cleanup_call_failed") from None
+        need(not any(value.get(k) for k in ("NextToken", "nextToken", "IsTruncated")))
+        size = len(
+            json.dumps({k: v for k, v in value.items() if k != "Body"}, default=str).encode()
+        )
+        self.bytes += size
+        need(size <= 262144 and self.bytes <= 1048576)
+        return value
+
+    def row(self, kind):
+        op, arg, key = {
+            "nat": ("describe_nat_gateways", "NatGatewayIds", "NatGateways"),
+            "address": ("describe_addresses", "AllocationIds", "Addresses"),
+            "table": ("describe_route_tables", "RouteTableIds", "RouteTables"),
+        }[kind]
+        value = self.call("ec2", op, **{arg: [IDS[kind]]})
+        if value is None:
+            return None
+        rows = value[key]
+        need(len(rows) <= 1)
+        if not rows:
+            return None
+        owned(rows[0], kind)
+        return rows[0]
+
+    def verify_preserved(self):
+        rows = self.call("ec2", "describe_instances", InstanceIds=[IDS["instance"]])["Reservations"]
+        need(len(rows) == 1 and rows[0]["OwnerId"] == ACCOUNT and len(rows[0]["Instances"]) == 1)
+        instance = rows[0]["Instances"][0]
+        need(instance["InstanceId"] == IDS["instance"] and instance["ClientToken"] == ATTEMPT)
+        need(instance["State"]["Name"] == "stopped" and instance["SubnetId"] == IDS["subnet"])
+        need(instance["InstanceType"] == "r6i.4xlarge" and instance["VpcId"] == VPC)
+        disks = instance["BlockDeviceMappings"]
+        need({d["Ebs"]["VolumeId"] for d in disks} == VOLUMES)
+        need(all(d["Ebs"]["DeleteOnTermination"] is False for d in disks))
+        endpoints = self.call(
+            "ec2",
+            "describe_instance_connect_endpoints",
+            InstanceConnectEndpointIds=[IDS["endpoint"]],
+        )["InstanceConnectEndpoints"]
+        need(len(endpoints) == 1)
+        e = endpoints[0]
+        need(e["InstanceConnectEndpointId"] == IDS["endpoint"] and e["VpcId"] == VPC)
+        need(e["OwnerId"] == ACCOUNT and e["State"] == "create-complete")
+
+    def claim_present(self, operation, kind):
+        value = self.call(
+            "s3",
+            "get_object",
+            Bucket=BUCKET,
+            Key=PREFIX + operation + ".json",
+            ExpectedBucketOwner=ACCOUNT,
+        )
+        if value is None:
+            return False
+        body = value["Body"]
+        try:
+            need(0 < value["ContentLength"] <= 512)
+            with self.timeout(20):
+                raw = body.read(513)
+            need(len(raw) == value["ContentLength"])
+            need(
+                json.loads(raw)
+                == dict(attempt=ATTEMPT, nonce=NONCE, operation=operation, resource=IDS[kind])
+            )
+        finally:
+            body.close()
+        return True
+
+    def take_claim(self, operation, kind):
+        raw = json.dumps(
+            dict(attempt=ATTEMPT, nonce=NONCE, operation=operation, resource=IDS[kind]),
+            sort_keys=True,
+        ).encode()
+        result = self.call(
+            "s3",
+            "put_object",
+            Bucket=BUCKET,
+            Key=PREFIX + operation + ".json",
+            ExpectedBucketOwner=ACCOUNT,
+            Body=raw,
+            ContentLength=len(raw),
+            ContentType="application/json",
+            IfNoneMatch="*",
+            ServerSideEncryption="AES256",
+        )
+        need(result.get("ResponseMetadata", {}).get("HTTPStatusCode") == 200)
+
+    def route(self):
+        table = self.row("table")
+        need(table is not None and not table.get("PropagatingVgws"))
+        associations = table["Associations"]
+        need(len(associations) == 1 and associations[0].get("Main") is False)
+        need(associations[0]["SubnetId"] == IDS["subnet"])
+        rows = [r for r in table["Routes"] if r.get("DestinationCidrBlock") == "0.0.0.0/0"]
+        need(len(rows) <= 1)
+        if rows:
+            need(rows[0].get("NatGatewayId") == IDS["nat"])
+        return bool(rows)
+
+    def run(self):
+        self.verify_preserved()
+        nat, address = self.row("nat"), self.row("address")
+        has_route = self.route()
+        nat_claim = self.claim_present("delete-nat-gateway", "nat")
+        eip_claim = self.claim_present("release-address", "address")
+        self.save(
+            "preflight",
+            dict(
+                nat_state=nat["State"] if nat else "absent",
+                eip_present=address is not None,
+                nat_claim_present=nat_claim,
+                eip_claim_present=eip_claim,
+                stopped_instance_preserved=True,
+            ),
+        )
+        # Existing immutable claims never confer permission to resend a mutation.
+        need(not nat_claim or nat is None or nat["State"] in {"deleted", "deleting"})
+        need(not eip_claim or address is None)
+        if has_route:
+            self.call(
+                "ec2", "delete_route", RouteTableId=IDS["table"], DestinationCidrBlock="0.0.0.0/0"
+            )
+            need(not self.route())
+        if nat is not None and nat["State"] not in {"deleted", "deleting"}:
+            self.take_claim("delete-nat-gateway", "nat")
+            try:
+                self.call("ec2", "delete_nat_gateway", NatGatewayId=IDS["nat"])
+            except Exception:
+                pass  # Readback only; never resend a possibly accepted mutation.
+        for _ in range(60):
+            nat = self.row("nat")
+            if nat is None or nat["State"] == "deleted":
+                break
+            self.wait(10)
+        need(nat is None or nat["State"] == "deleted")
+        address = self.row("address")
+        if address is not None:
+            need(not address.get("AssociationId") and not address.get("NetworkInterfaceId"))
+            self.take_claim("release-address", "address")
+            try:
+                self.call("ec2", "release_address", AllocationId=IDS["address"])
+            except Exception:
+                pass
+        need(self.row("address") is None)
+        need(not self.route())
+        self.verify_preserved()
+        return dict(
+            status="cost_resources_released_verified",
+            nat_deleted=True,
+            eip_absent=True,
+            default_route_removed=True,
+            stopped_instance_and_two_volumes_preserved=True,
+            endpoint_and_dependent_subnet_table_preserved=True,
+        )
+
+
+def main():
+    raise ValueError("successor_requires_explicit_fresh_approval")
+    proof = ROOT / "evidence/lumi-vm-attempt-010-cpu-execution-verification-v0.1.json"
+    need(
+        hashlib.sha256(proof.read_bytes()).hexdigest()
+        == "1dd4b4c5d69ec96be19467c4afc6cfcbb36bb6bf3561ee3c36cc2bc476abcb7a"
+    )
+    for name, pin in json.loads(proof.read_bytes())["source_bindings"].items():
+        p = ROOT / name
+        need(not p.is_symlink() and p.stat().st_size == pin["bytes"])
+        need(hashlib.sha256(p.read_bytes()).hexdigest() == pin["sha256"])
+    release = ROOT / "artifacts/lumi-vm-attempt-010-source-v0.1"
+    raw = (release / "release.json").read_bytes()
+    need(
+        hashlib.sha256(raw).hexdigest()
+        == "6b93341e30ab6e2f1f0dbaacc47d69731a023574fb55fdda43a72dcd258001f6"
+    )
+    for name, pin in json.loads(raw)["outputs"].items():
+        if name.startswith("scripts/"):
+            need(hashlib.sha256((release / name).read_bytes()).hexdigest() == pin["sha256"])
+    sys.path.insert(0, str(release / "scripts"))
+    import sft_vm_controller_credentials_v2 as credentials
+
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = (json.dumps(value, sort_keys=True) + "\n").encode()
+        need(written + len(raw) <= 65536)
+        with os.fdopen(
+            os.open(OUTPUT / (name + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        ) as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        written += len(raw)
+
+    save(
+        "started",
+        dict(
+            human_authorization="PENDING_NEW_RECOVERY_APPROVAL",
+            exact_targets=IDS,
+            maximum_seconds=900,
+            maximum_ec2_mutations=3,
+            maximum_claim_puts=2,
+            maximum_calls_including_initial_identity=80,
+            retry=False,
+            gpu=False,
+            training=False,
+            entry_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        ),
+    )
+    start = time.monotonic()
+    bundle = recovery = None
+    result = dict(status="stopped_no_retry", real_4b_import=False, gate_5_complete=False)
+    try:
+        bundle = credentials.Clients(credentials.Reader(start + 900))
+        recovery = Recovery(
+            bundle.clients, save, credentials.joined.lifecycle.guard.provision.timeout
+        )
+        recovery.start = start
+        result.update(recovery.run())
+    except Exception:
+        result["failed_stage"] = recovery.stage if recovery else "credentials"
+    finally:
+        if recovery:
+            result.update(
+                calls=recovery.calls,
+                ec2_mutations=recovery.ec2_writes,
+                claim_puts=recovery.claim_writes,
+                response_bytes=recovery.bytes,
+            )
+        if bundle:
+            result["credential_generations"] = bundle.reader.calls
+            bundle.close()
+        result["elapsed_seconds"] = round(time.monotonic() - start, 3)
+        save("result", result)
+        print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

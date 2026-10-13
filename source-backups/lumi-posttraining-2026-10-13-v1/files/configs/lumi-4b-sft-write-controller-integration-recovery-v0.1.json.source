@@ -1,0 +1,155 @@
+{
+  "schema_version": "lumi.sft-write-controller-integration-recovery.v0.1",
+  "date": "2026-09-26",
+  "status": "PASS_local_synthetic_integration_and_role_corrections_NOT_native_execution",
+  "scope": "One local successor combining real topology/authority/ledger/controller integration with child-role corrections. Newly exercised socket/fork/pidfd/cgroup/descriptor boundaries are doubled; the aggregate suite may use generated temporary fixtures. Public execution and private process composition remain closed; no private payload or remote access.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_authority_v2.py",
+      "bytes": 9062,
+      "sha256": "c2ab31c5af45184e02de14a5fb85884b383ff4354fc06684a08759a73498cc5c"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_controller_v1.py",
+      "bytes": 13346,
+      "sha256": "90ddcdf447d9b2cffcafe462a3d89a413991116b483e93b6d5950b064b8f909d"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_process_v2.py",
+      "bytes": 22959,
+      "sha256": "cbb5c5b1de24e18dec9bf8b1a9032f33c13a175091c7b67b99f3940dfb503031"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_controller_v1.py",
+      "bytes": 16969,
+      "sha256": "7a529047f02d2d75b22445d4d92d2845140655133f3e89d4eb20a63af5f6cde6"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_process_v2.py",
+      "bytes": 8388,
+      "sha256": "94ba5bdf285b35733a6899a6764ec93b9df8b7774f88ca0f75199219c29e8579"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-process-composition-development-v0.1.json",
+      "bytes": 7700,
+      "sha256": "37a465ed5bccbf870532a2c8005f2e443fbe583f841c994e6e826b461a82c3b0"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-process-composition-development-verification-v0.1.json",
+      "bytes": 8402,
+      "sha256": "2f5bb2ba123bb526f56156b3ab22850f4d7572c283868c9fee7df684ac31e26d"
+    },
+    {
+      "path": "docs/sft-execution-status-v0.118.md",
+      "bytes": 4332,
+      "sha256": "ce3b3cb8d193d5d16f4e182dca889e55dfd8e27df101db4f867c223c769e33b1"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_guard_bootstrap_v3.py",
+      "bytes": 10007,
+      "sha256": "d6f93addb7387bf80fde6902cc39ffea2cd6889f00c037fe08988882d3cb880d"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_transport_v1.py",
+      "bytes": 16181,
+      "sha256": "195a8d42b4bab8e72db05d5577b2e0ac2d0b3294b4e9237b1bea99add074bab8"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_ledger_v1.py",
+      "bytes": 10043,
+      "sha256": "a566ed583aa861d5b8a7e3d03edf53a4b6225b3efdb3740737150055fbeb0091"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_guardian_v2.py",
+      "bytes": 16259,
+      "sha256": "92020df5157cb59b48615830d7c915de1469bc55043ea48d46a37c833faaa27d"
+    }
+  ],
+  "findings_and_corrections": [
+    {
+      "id": "socket_identity_mode_mismatch",
+      "finding": "Topology v1 canonicalizes st_mode to S_IFMT; authority v1 compared full st_mode after detach. Realistic socket permission bits made valid endpoints fail.",
+      "correction": "Authority v2 uses the same S_IFMT tuple; device, inode, owner, FD and status flags remain checked. The regression executes both actual identity implementations and reproduces the old failure."
+    },
+    {
+      "id": "ledger_service_before_ready",
+      "finding": "READY and CONSUMED are mediated worker writes. A controller that waits for READY before servicing reservations cannot make progress.",
+      "correction": "One controller event loop services the actual parent ledger in every phase. Reservation precedes ACK, ACK failure never refunds, and ARM is attempted only once after broker-ready and reserved READY."
+    },
+    {
+      "id": "shared_broker_workload_cgroup",
+      "finding": "A broker blocked in listener receive keeps a shared leaf populated after the worker exits. Guardian v2 waits for leaf empty before terminating broker.",
+      "correction": "Process v2 child branch enters the workload leaf only for the worker. Broker limit admission remains an explicit prerequisite; this change does not authorize an unbounded broker."
+    },
+    {
+      "id": "ambient_descriptor_leak",
+      "finding": "A topology transition closes topology-owned endpoints, not unrelated inherited FDs. Earlier prose overstated total descriptor exclusion.",
+      "correction": "Child-role and guardian transitions now call the frozen descriptor enumerator/close helper and require exact non-stdio readback of the kept set."
+    },
+    {
+      "id": "ambiguous_inherited_close_retry",
+      "finding": "Process v1 cleared inherited_open only after close succeeded, permitting an error-path second attempt.",
+      "correction": "Process v2 consumes the attempt before calling close; tests prove a failing close is called once."
+    },
+    {
+      "id": "launch_and_cleanup_not_yet_safe",
+      "finding": "Fork can run child setup before pidfd binding; controller-first guardian termination and guardian-v2 lease ownership handoff are not yet proved safe.",
+      "correction": "Private process-v2 composition rejects before runtime inspection, topology creation or fork. These lifecycle issues are recorded as unresolved, not claimed fixed."
+    }
+  ],
+  "controller_contract": {
+    "channels": 4,
+    "maximum_packet_bytes": 33,
+    "ledger_offer_bytes": 24,
+    "ledger_ack_bytes": 8,
+    "ledger_serviced_before_ready": true,
+    "reservation_before_ack": true,
+    "cross_channel_consumed_before_armed_supported": true,
+    "guardian_report_before_worker_digest_supported": true,
+    "eof_never_counts_as_completion": true,
+    "unsolicited_ancillary_rights_closed_then_rejected": true,
+    "no_retry_or_refund": true,
+    "retained_output": "Fixed codes, aggregate counters, booleans and an unverified worker-result digest only; no wire frames, private text, IDs, FD numbers or exceptions.",
+    "worker_result_digest_is_independently_verified": false,
+    "role_producer_wire_contract_bound": false
+  },
+  "verification": {
+    "new_controller_tests": 31,
+    "new_process_role_tests": 15,
+    "prior_regressions": 924,
+    "total_tests_per_runtime": 970,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ],
+    "failures": 0,
+    "errors": 0,
+    "skips": 0,
+    "predecessor_bound_files_checked": 19,
+    "predecessor_binding_mismatches": 0
+  },
+  "remaining_gate_5_phases": [
+    "Finish one cohesive role/bootstrap/lifecycle integration: child start admission before setup, broker resource admission, guardian ARM/terminal report producer, listener handoff and broker ledger transport, sealed worker entry, ownership-aware cleanup, and full-size authenticated source closure.",
+    "Separately admitted Linux native qualification with synthetic fixtures: fork/pidfd/waitid, real socket identity and ordering, descriptor readback, cgroup completion/cleanup, seccomp and failure paths. Mac synthetic tests do not establish these.",
+    "Bounded real checkpoint import and independent artifact/result verification after unchanged admission passes."
+  ],
+  "nonclaims": {
+    "process_launcher_open": false,
+    "native_execution": false,
+    "role_producers_bound": false,
+    "native_endpoint_authentication_verified": false,
+    "entry_result_verified": false,
+    "native_qualification_verified": false,
+    "checkpoint_payload_read": false,
+    "model_tokenizer_or_dataset_read": false,
+    "network_used": false,
+    "gpu_used": false,
+    "inference_calls": 0,
+    "training_started": false,
+    "gate_5_complete": false,
+    "production_eligible": false,
+    "ci_or_remote_failure_resolved": false,
+    "committed_or_pushed": false
+  },
+  "time_estimate": "No reliable completion date is established. Local integration and the first end-to-end Linux qualification must finish before a time estimate can be grounded; synthetic test counts are not an estimate of Gate-5 completion."
+}

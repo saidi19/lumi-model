@@ -1,0 +1,463 @@
+"""Small real files/SDK signing; native mounts, credentials and units doubled."""
+
+import importlib
+import importlib.util
+import json
+import sys
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_retention_v1 as prior
+
+u = importlib.import_module(prior.PACKAGE + ".posttraining_vm_retention_unit_v1")
+
+
+def entry():
+    path = prior.ROOT / "scripts/retain_sft_vm_package_v1.py"
+    spec = importlib.util.spec_from_file_location("_retention_entry_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class EntryJoinedTests(unittest.TestCase):
+    def setUp(self):
+        prior.RetentionTests.setUp(self)
+        self.entry = entry()
+        self.entry.ROOT = self.destination
+        self.raw_entry = b"synthetic-entry"
+        self.raw_complete = prior.m.canonical(self.completed)
+        self.native = self.enterContext(
+            patch.object(self.entry, "boundary", return_value=Path("/synthetic"))
+        )
+        self.helper = types.SimpleNamespace(credentials=Mock(return_value=prior.CREDS), sdk=Mock())
+        from botocore.config import Config
+
+        self.helper.sdk.return_value = (self.session, Config)
+        self.load = self.enterContext(
+            patch.object(self.entry, "load", return_value=(prior.t, self.helper))
+        )
+        self.read = self.enterContext(
+            patch.object(self.entry, "read", side_effect=self.read_control)
+        )
+        self.admit = self.enterContext(
+            patch.object(
+                self.entry,
+                "admission",
+                return_value={
+                    "completion_sha256": prior.m.sha(self.raw_complete),
+                    "deadline_boottime": 1100,
+                },
+            )
+        )
+        self.enterContext(patch.object(self.entry.time, "CLOCK_BOOTTIME", 7, create=True))
+        self.enterContext(patch.object(self.entry.time, "clock_gettime", return_value=1000))
+        # Fresh real clients; never reuse the fixture's already wrapped channels.
+        self.original_client = self.session.create_client
+        self.enterContext(patch.object(self.session, "create_client", side_effect=self.client))
+
+    def client(self, *args, **kwargs):
+        result = self.original_client(*args, **kwargs)
+        self.addCleanup(result.close)
+        self.enterContext(
+            patch.object(result._endpoint.http_session, "send", side_effect=self.store.send)
+        )
+        return result
+
+    def read_control(self, path, *_args):
+        if path == self.entry.ENTRY:
+            return self.raw_entry
+        if path.name == "admission.json":
+            return b"{}"
+        self.assertEqual(path, self.destination / "completion.json")
+        return self.raw_complete
+
+    def execute(self):
+        return self.entry.execute(prior.m.sha(self.raw_entry))
+
+    def test_entry_to_frozen_retention_real_sdk_and_commit(self):
+        result = self.execute()
+        self.assertTrue(result["commit_readback_verified"])
+        self.assertFalse(result["gate_5_complete"])
+        self.assertEqual(len(self.store.calls), 20)
+        self.helper.credentials.assert_called_once()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(len(self.store.calls), 20)
+
+    def test_boundary_failure_never_reads_code_or_credentials(self):
+        self.native.side_effect = ValueError("private-native-text")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.read.assert_not_called()
+        self.helper.credentials.assert_not_called()
+
+    def test_changed_entry_pin_rejected_before_loader(self):
+        with self.assertRaises(ValueError):
+            self.entry.execute("0" * 64)
+        self.load.assert_not_called()
+        self.helper.credentials.assert_not_called()
+
+    def test_invalid_admission_consumes_child_without_secret_or_sdk(self):
+        self.admit.side_effect = ValueError("invalid")
+        for _ in range(2):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.admit.assert_called_once()
+        self.helper.credentials.assert_not_called()
+        self.helper.sdk.assert_not_called()
+
+    def test_completion_hash_mismatch_before_secret(self):
+        self.admit.return_value["completion_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.helper.credentials.assert_not_called()
+
+    def test_longlived_credential_rejected_without_sdk(self):
+        self.helper.credentials.return_value = prior.CREDS | {"access_key": "AKIADUMMY"}
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.helper.sdk.assert_not_called()
+
+    def test_deadline_not_renewed_after_slow_sdk_setup(self):
+        self.helper.sdk.side_effect = lambda: (self.session, None)
+        with patch.object(self.entry.time, "clock_gettime", return_value=1101):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.assertEqual(self.store.calls, [])
+
+    def test_corrupt_remote_readback_fails_once_keeps_local_files(self):
+        self.store.corrupt_key = prior.m.PREFIX + "package/config.json"
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertTrue((self.package / "config.json").exists())
+        self.assertTrue((self.destination / "retention/failed.json").exists())
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(len(self.store.calls), 2)
+
+
+class ParentJoinedTests(unittest.TestCase):
+    def setUp(self):
+        prior.RetentionTests.setUp(self)
+        self.enterContext(patch.object(u, "ROOT", self.root))
+        self.enterContext(patch.object(u.handoff.frozen, "host_check"))
+        self.enterContext(
+            patch.object(u.credentials, "_snapshot", return_value={"synthetic": True})
+        )
+        self.enterContext(patch.object(u.time, "CLOCK_BOOTTIME", 7, create=True))
+        self.enterContext(patch.object(u.time, "clock_gettime", return_value=1000))
+        self.cleanup = self.enterContext(patch.object(u.credentials, "_remove_source"))
+        self.stop = self.enterContext(patch.object(u.handoff, "_stop_and_reap"))
+        self.observe = self.enterContext(
+            patch.object(
+                u.handoff.frozen,
+                "observe",
+                return_value={
+                    "ActiveState": "active",
+                    "SubState": "exited",
+                    "Result": "success",
+                    "ExecMainCode": "1",
+                    "ExecMainStatus": "0",
+                },
+            )
+        )
+        self.native = self.enterContext(
+            patch.object(u.handoff.frozen, "run_command", side_effect=self.commands)
+        )
+        self.fail_dispatch = self.bad_receipt = False
+        self.dispatches = 0
+
+    def commands(self, args, *_args, **_kwargs):
+        if args[0] == "/usr/bin/systemctl":
+            return types.SimpleNamespace(returncode=4, stdout=b"not-found\n")
+        self.assertEqual(args[0], "/usr/bin/systemd-run")
+        self.dispatches += 1
+        if self.fail_dispatch:
+            raise OSError("SECRET ambiguous launch text")
+        # Native mount projection is doubled; actual frozen retention and SDK
+        # run on the same tiny original fixture, then return the worker receipt.
+        result = prior.RetentionTests.call(self)
+        if self.bad_receipt:
+            result["gate_5_complete"] = True
+        prior.write(
+            self.destination / "retention-worker/view/retention/result.json",
+            prior.m.canonical(result),
+        )
+        return types.SimpleNamespace(returncode=0)
+
+    def execute(self):
+        return u._run_admitted_once(
+            prior.m.ATTEMPT,
+            self.completed,
+            entry_sha256="a" * 64,
+            machine_id="b" * 32,
+            deadline=time.monotonic() + 120,
+        )
+
+    def test_parent_success_requires_stop_then_credential_cleanup_then_receipt(self):
+        self.cleanup.side_effect = lambda *_: self.stop.assert_called_once()
+        value = self.execute()
+        self.assertTrue(value["retention_cgroup_reaped"])
+        self.assertTrue(value["credential_source_unlinked"])
+        self.assertFalse(value["instance_termination_allowed"] or value["gate_5_complete"])
+        self.assertEqual(self.dispatches, 1)
+        self.assertEqual(len(self.store.calls), 20)
+        self.assertTrue((self.package / "model.safetensors").exists())
+        with self.assertRaises(FileExistsError):
+            self.execute()
+        self.assertEqual(self.dispatches, 1)
+
+    def test_ambiguous_launch_stopped_once_and_not_retried(self):
+        self.fail_dispatch = True
+        with self.assertRaisesRegex(ValueError, "^retention_unit_failed$"):
+            self.execute()
+        self.stop.assert_called_once()
+        self.cleanup.assert_called_once()
+        report = (self.destination / "retention-worker/failed.json").read_bytes()
+        self.assertNotIn(b"SECRET", report)
+        self.assertIn(b"failed_dispatch", report)
+        with self.assertRaises(FileExistsError):
+            self.execute()
+        self.assertEqual(self.dispatches, 1)
+
+    def test_failed_child_reaped_no_success(self):
+        self.observe.return_value.update(
+            SubState="failed", ActiveState="failed", Result="exit-code"
+        )
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.stop.assert_called_once()
+        self.cleanup.assert_called_once()
+        self.assertFalse((self.destination / "retention-worker/result.json").exists())
+
+    def test_stop_failure_does_not_remove_credential_source(self):
+        self.stop.side_effect = ValueError("stop")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.stop.assert_called_once()
+        self.cleanup.assert_not_called()
+        value = json.loads((self.destination / "retention-worker/failed.json").read_bytes())
+        self.assertFalse(value["retention_cgroup_reaped"])
+
+    def test_cleanup_failure_is_not_retried_or_called_success(self):
+        self.cleanup.side_effect = ValueError("cleanup")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.cleanup.assert_called_once()
+        self.assertFalse((self.destination / "retention-worker/result.json").exists())
+
+    def test_bad_worker_receipt_rejected_after_cleanup(self):
+        self.bad_receipt = True
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.cleanup.assert_called_once()
+
+    def test_bad_deadline_no_native_or_dispatch_marker(self):
+        for deadline in (True, float("nan"), float("inf"), time.monotonic() + 10):
+            with self.assertRaises(ValueError):
+                u._run_admitted_once(
+                    prior.m.ATTEMPT,
+                    self.completed,
+                    entry_sha256="a" * 64,
+                    machine_id="b" * 32,
+                    deadline=deadline,
+                )
+        self.native.assert_not_called()
+        self.assertFalse((self.destination / "retention-worker").exists())
+
+    def test_timeout_stops_once_and_preserves_outputs(self):
+        now = [time.monotonic()]
+        deadline = now[0] + 120
+
+        def running(_unit):
+            now[0] = deadline
+            return {"SubState": "running"}
+
+        self.observe.side_effect = running
+        with (
+            patch.object(u.time, "monotonic", side_effect=lambda: now[0]),
+            patch.object(u.time, "sleep"),
+        ):
+            with self.assertRaises(ValueError):
+                u._run_admitted_once(
+                    prior.m.ATTEMPT,
+                    self.completed,
+                    entry_sha256="a" * 64,
+                    machine_id="b" * 32,
+                    deadline=deadline,
+                )
+        self.stop.assert_called_once()
+        self.cleanup.assert_called_once()
+        self.assertTrue((self.package / "model.safetensors").exists())
+
+    def test_setup_failure_before_dispatch_still_cleans_source(self):
+        with (
+            patch.object(u, "_identity", side_effect=ValueError("identity")),
+            patch.object(u.handoff.frozen, "cgroup_empty", return_value=True),
+        ):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.stop.assert_not_called()
+        self.cleanup.assert_called_once()
+        self.assertEqual(self.dispatches, 0)
+
+    def test_result_write_failure_does_not_repeat_stop_or_cleanup(self):
+        original = u.handoff.frozen.write_new
+
+        def writing(path, value):
+            if path == self.destination / "retention-worker/result.json":
+                raise OSError("disk-full")
+            return original(path, value)
+
+        with patch.object(u.handoff.frozen, "write_new", side_effect=writing):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.stop.assert_called_once()
+        self.cleanup.assert_called_once()
+        self.assertTrue((self.destination / "retention-worker/failed.json").exists())
+
+
+class ContractsTests(unittest.TestCase):
+    def test_unit_has_only_view_writable_and_exact_readonly_inputs(self):
+        p = u.properties(prior.m.ATTEMPT, 120)
+        root = u.ROOT / prior.m.ATTEMPT
+        self.assertEqual(p["BindPaths"], f"{root}/retention-worker/view:{root}")
+        for name in u.READONLY:
+            self.assertIn(f"{root}/{name}:{root}/{name}", p["BindReadOnlyPaths"].split())
+        self.assertEqual(p["CapabilityBoundingSet"], "CAP_DAC_READ_SEARCH")
+        self.assertEqual(p["NoNewPrivileges"], "yes")
+        self.assertEqual(p["MemorySwapMax"], "0")
+        self.assertEqual(p["Restart"], "no")
+        self.assertEqual(p["RuntimeMaxSec"], "120")
+        self.assertIn("retention-credentials/aws-session.json", p["LoadCredential"])
+        self.assertNotIn("stage/inputs", str(p))
+        self.assertNotIn("SetCredential", p)
+        self.assertEqual(p["StandardOutput"], p["StandardError"])
+        self.assertEqual(p["StandardOutput"], "null")
+
+    def test_arguments_and_public_entries_closed(self):
+        for attempt, seconds in (("x", 120), (prior.m.ATTEMPT, True), (prior.m.ATTEMPT, 1781)):
+            with self.assertRaises(ValueError):
+                u.properties(attempt, seconds)
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            u.run_retention(approved=True)
+        self.assertEqual(
+            u.command(prior.m.ATTEMPT, "a" * 64, 120)[-2:], ["--entry-sha256", "a" * 64]
+        )
+
+    def test_readonly_mounts_require_exact_ro_targets_and_ro_descendants(self):
+        e = entry()
+        good = b"10 1 0:1 / /a ro - ext4 /dev/x rw\n"
+        e.mounts(good, ["/a"])
+        for raw in (
+            good.replace(b"/a ro", b"/a rw"),
+            good + b"11 10 0:2 / /a/child rw - tmpfs tmpfs rw\n",
+            b"",
+        ):
+            with self.assertRaises(ValueError):
+                e.mounts(raw, ["/a"])
+
+    def test_all_cold_source_pins_match_local_bytes(self):
+        e = entry()
+        for name, pin in e.PINS.items():
+            self.assertEqual(e.sha((prior.ROOT / "src/lumi" / (name + ".py")).read_bytes()), pin)
+        self.assertEqual(
+            e.sha((prior.ROOT / "scripts/acquire_sft_vm_fullsize_inputs_v1.py").read_bytes()),
+            e.HELPER_PIN,
+        )
+
+    def test_changed_source_fails_before_any_module_execution(self):
+        e = entry()
+        with patch.object(e, "read", return_value=b"raise RuntimeError('MUST NOT EXECUTE')"):
+            with self.assertRaisesRegex(ValueError, "retention_entry_rejected"):
+                e.load()
+        self.assertNotIn(e.PACKAGE, sys.modules)
+
+    def test_mac_boundary_rejected_before_native_reads(self):
+        e = entry()
+        with patch.object(e.sys, "platform", "darwin"), patch.object(e, "kernel") as k:
+            with self.assertRaises(ValueError):
+                e.boundary()
+        k.assert_not_called()
+
+    def test_admission_rejects_wrong_identity_and_expired_deadline(self):
+        e = entry()
+        p = Mock()
+        p.lstat.return_value = types.SimpleNamespace(st_dev=1, st_ino=2)
+        p.__truediv__ = Mock(return_value=p)
+        value = dict(
+            schema="lumi.vm-retention-admission.v0.1",
+            attempt=e.ATTEMPT,
+            completion_sha256="a" * 64,
+            view_identity=[1, 2],
+            deadline_boottime=1200,
+            readonly_identities={n: [1, 2] for n in u.READONLY},
+        )
+        with (
+            patch.object(e, "ROOT", p),
+            patch.object(e.time, "CLOCK_BOOTTIME", 7, create=True),
+            patch.object(e.time, "clock_gettime", return_value=1000),
+        ):
+            self.assertEqual(e.admission(json.dumps(value).encode()), value)
+            for end in (999, 4000, float("nan"), True):
+                with self.assertRaises(ValueError):
+                    e.admission(json.dumps(value | {"deadline_boottime": end}).encode())
+            with self.assertRaises(ValueError):
+                e.admission(json.dumps(value | {"view_identity": [1, 3]}).encode())
+
+    def test_duplicate_admission_keys_rejected(self):
+        with self.assertRaises(ValueError):
+            entry().decode(b'{"attempt":"a","attempt":"b"}')
+
+    def test_kernel_limits_capabilities_and_no_new_privileges(self):
+        e = entry()
+        rows = {
+            "cgroup": f"0::/system.slice/{e.UNIT}\n".encode(),
+            "memory.max": b"1073741824",
+            "memory.swap.max": b"0",
+            "pids.max": b"64",
+            "status": b"\n".join(
+                [
+                    b"NoNewPrivs:\t1",
+                    b"CapEff:\t04",
+                    b"CapPrm:\t04",
+                    b"CapBnd:\t04",
+                    b"CapInh:\t00",
+                    b"CapAmb:\t00",
+                ]
+            ),
+        }
+        with patch.object(e, "kernel", side_effect=lambda p, *_: rows[Path(p).name]):
+            e.limits()
+            for name, bad in (
+                ("memory.max", b"max"),
+                ("memory.swap.max", b"1"),
+                ("pids.max", b"65"),
+                ("cgroup", b"0::/wrong"),
+                ("status", rows["status"].replace(b"CapEff:\t04", b"CapEff:\t06")),
+                ("status", rows["status"].replace(b"NoNewPrivs:\t1", b"NoNewPrivs:\t0")),
+            ):
+                good = rows[name]
+                rows[name] = bad
+                with self.assertRaises(ValueError):
+                    e.limits()
+                rows[name] = good
+
+    def test_actual_cold_closure_loads_without_lumi_or_ml(self):
+        e = entry()
+        e.RELEASE = prior.ROOT
+        with patch.dict(sys.modules):
+            for name in list(sys.modules):
+                if name.split(".")[0] in {"botocore", "boto3"}:
+                    del sys.modules[name]
+            with patch.object(e, "read", side_effect=lambda p, *_: p.read_bytes()):
+                transport, helper = e.load()
+            self.assertEqual(transport.retention.PROPOSAL_SHA, prior.m.PROPOSAL_SHA)
+            self.assertTrue(callable(helper.credentials))
+            self.assertNotIn("lumi", sys.modules)
+            self.assertNotIn("torch", sys.modules)
+            self.assertNotIn("transformers", sys.modules)

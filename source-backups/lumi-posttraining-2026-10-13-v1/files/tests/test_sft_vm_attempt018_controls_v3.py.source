@@ -1,0 +1,25 @@
+"""Offline control-plan tests for the immutable-version source repair."""
+import unittest
+
+from scripts import prepare_sft_vm_attempt018_controls_v3 as m
+
+
+class Tests(unittest.TestCase):
+    def test_plan_binds_repair_and_requires_fresh_preflight(self):
+        plan = m.build()
+        self.assertEqual(plan["release_manifest_sha256"], m.RELEASE_SHA)
+        self.assertEqual(plan["source_repair"]["versioned_object_count"], 22)
+        self.assertEqual(plan["source_repair"]["s3_action"], "s3:GetObjectVersion")
+        self.assertFalse(plan["source_repair"]["wire_or_billing_byte_cap_claimed"])
+        self.assertIn("preflight_required", plan["status"])
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["gate_5_complete"])
+
+    def test_public_execution_entry_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

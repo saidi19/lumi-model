@@ -1,0 +1,241 @@
+"""Offline receipt/binding audit of the two completed control deployments.
+
+Live readback occurred inside the bounded deployers. This verifier makes zero
+additional AWS calls and does not claim a separate independent live admission.
+"""
+
+import json
+import sys
+from pathlib import Path
+
+from scripts import execute_sft_vm_inert_watchdog_v15 as watchdog
+from scripts import prepare_sft_vm_attempt022_control_package_v1 as package
+from scripts import sft_vm_dedicated_cleanup_bucket_v13 as bucket
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_PROOF = "evidence/lumi-vm-attempt-022-control-package-verification-v0.1.json"
+PACKAGE_PROOF_SHA = "8486e67510bde91fc0867fbd5d24a6d6834be8dfdf263ed3e3328d67a4feb7fa"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-control-execution-verification-v0.1.json"
+AUTHORIZATION = "configs/lumi-vm-attempt-022-controls-execution-authorization-v0.1.json"
+AUTHORIZATION_SHA = "b80acaf97e77c0a241bd6e748f4a982d79958544a68fa87f38d0510394ccd3ba"
+SUPPLEMENT = "evidence/lumi-vm-attempt-022-control-package-test-selection-supplement-v0.1.json"
+SUPPLEMENT_SHA = "a069a8ec5638dabc97280c4ead05eb907ac26be9d775ad290d250e032529335c"
+need, sha, read = package.need, package.sha, package.read
+
+
+def raw(path):
+    return read(str(path.relative_to(ROOT)))
+
+
+def load(path):
+    return json.loads(raw(path))
+
+
+def audit_receipts(directory, count, allowlist, mutations):
+    starts = sorted(directory.glob("call-*-started.json"))
+    results = sorted(directory.glob("call-*-result.json"))
+    need(len(starts) == len(results) == count)
+    seen_mutations = set()
+    for index in range(1, count + 1):
+        started = load(directory / f"call-{index:02d}-started.json")
+        result = load(directory / f"call-{index:02d}-result.json")
+        key = started["service"], started["operation"]
+        digest = started["request_sha256"]
+        need(digest in allowlist.get(key, set()))
+        need(result == dict(started, status=result["status"]))
+        need(result["status"] in {"acknowledged", "absent"})
+        if started["mutation"]:
+            need(started["operation"].startswith(("create-", "put-")))
+            need(result["status"] == "acknowledged")
+            fingerprint = key, digest
+            need(fingerprint not in seen_mutations)
+            seen_mutations.add(fingerprint)
+        else:
+            need(started["operation"].startswith(("get-", "head-", "describe-")))
+    need(len(seen_mutations) == mutations)
+    return starts + results
+
+
+def verify():
+    prepared = json.loads(read(PACKAGE_PROOF, PACKAGE_PROOF_SHA))
+    authorization = json.loads(read(AUTHORIZATION, AUTHORIZATION_SHA))
+    supplement = json.loads(read(SUPPLEMENT, SUPPLEMENT_SHA))
+    need(authorization["package_verification_sha256"] == PACKAGE_PROOF_SHA)
+    need(authorization["test_selection_supplement_sha256"] == SUPPLEMENT_SHA)
+    need(supplement["original_verification_sha256"] == PACKAGE_PROOF_SHA)
+    need(supplement["source_bindings"] == prepared["source_bindings"])
+    need(supplement["corrected_direct_tests_passed"] == 16)
+    need(supplement["approved_entry_or_plan_changes"] is False)
+    for name, digest in prepared["source_bindings"].items():
+        read(name, digest)
+    plan, deployer = watchdog.sources()
+    bucket.sources()
+    watch_approval, bucket_approval = load(watchdog.APPROVAL), load(bucket.APPROVAL)
+    need(
+        watch_approval["human_message"] == bucket_approval["human_message"]
+        == authorization["human_message"]
+    )
+    need(
+        watchdog.encode(watch_approval)
+        == watchdog.encode(
+            watchdog.expected_approval(watch_approval["human_message"], sha(raw(watchdog.PROPOSAL)))
+        )
+    )
+    need(
+        bucket.encode(bucket_approval)
+        == bucket.encode(bucket.expected_approval(bucket_approval["human_message"]))
+    )
+    watch = load(watchdog.OUTPUT / "entry-result.json")
+    deployed = load(watchdog.OUTPUT / "deployment/result.json")
+    store = load(bucket.OUTPUT / "result.json")
+    need(watch["deployment"] == deployed)
+    need(watch["status"] == deployed["status"] == "deployed_unarmed_invocation_disabled")
+    need(watch["total_control_calls"] <= 45 and watch["mutation_dispatches"] == 9)
+    need(watch["elapsed_seconds"] < 600)
+    need(deployed["code_sha256"] == plan["watchdog"]["expected_code_sha256_base64"])
+    need(deployed["runtime_state"] == "Active")
+    need(deployed["roles_created"] == [deployer.WORKER_ROLE, deployer.SCHEDULER_ROLE])
+    need(
+        deployed["function_arn"]
+        == f"arn:aws:lambda:{deployer.REGION}:{deployer.ACCOUNT}:function:{deployer.FUNCTION}"
+    )
+    need(deployed["unarmed_verified"] is True and deployed["invocation_disabled_verified"] is True)
+    need(deployed["schedule_created"] is False and deployed["instance_created"] is False)
+    need(watch["instance_actions"] == 0)
+    need(
+        all(
+            watch[k] is False
+            for k in (
+                "invocation",
+                "schedule_creation",
+                "retry",
+                "rollback",
+                "bucket_policy_mutation",
+                "gpu",
+                "training",
+                "gate_5_complete",
+            )
+        )
+    )
+    need(store["status"] == "created_private_cleanup_store_verified")
+    need(store["bucket"] == bucket.BUCKET and store["calls"] <= 20)
+    need(store["mutation_dispatches"] == 6 and store["elapsed_seconds"] < 300)
+    need(store["create_acknowledged"] is True and store["privacy_readback_verified"] is True)
+    need(watch["total_control_calls"] + store["calls"] <= 65)
+    need(watch["elapsed_seconds"] + store["elapsed_seconds"] <= 900)
+    need(
+        all(
+            store[k] is False
+            for k in (
+                "shared_bucket_mutation",
+                "object_access",
+                "iam_mutation",
+                "instance_action",
+                "retry",
+                "gpu",
+                "training",
+                "gate_5_complete",
+                "cpu_entry_bound",
+            )
+        )
+    )
+    watch_allowlist = {
+        key: {sha(content) for content in payloads}
+        for key, payloads in watchdog.qualified.allowed_requests(deployer).items()
+    }
+    bucket_allowlist = {
+        key: {sha(bucket.encode(fields))} for key, fields in bucket.requests().items()
+    }
+    watch_receipts = audit_receipts(
+        watchdog.OUTPUT, watch["total_control_calls"], watch_allowlist, 9
+    )
+    bucket_receipts = audit_receipts(bucket.OUTPUT, store["calls"], bucket_allowlist, 6)
+    # Evidence order is corroborative, not a remote timestamp/clock guarantee.
+    need(
+        (watchdog.OUTPUT / "entry-result.json").stat().st_mtime_ns
+        <= (bucket.OUTPUT / "started.json").stat().st_mtime_ns
+    )
+    paths = [
+        watchdog.APPROVAL,
+        bucket.APPROVAL,
+        watchdog.OUTPUT / "entry-started.json",
+        watchdog.OUTPUT / "entry-result.json",
+        watchdog.OUTPUT / "deployment/result.json",
+        bucket.OUTPUT / "started.json",
+        bucket.OUTPUT / "result.json",
+        *watch_receipts,
+        *bucket_receipts,
+    ]
+    bindings = dict(prepared["source_bindings"])
+    bindings.update({
+        PACKAGE_PROOF: PACKAGE_PROOF_SHA,
+        AUTHORIZATION: AUTHORIZATION_SHA,
+        SUPPLEMENT: SUPPLEMENT_SHA,
+    })
+    bindings.update({str(p.relative_to(ROOT)): sha(raw(p)) for p in paths})
+    bindings[str(Path(__file__).relative_to(ROOT))] = sha(raw(Path(__file__)))
+    test_path = "tests/test_sft_vm_attempt022_control_execution_v1.py"
+    bindings[test_path] = sha(read(test_path))
+    return {
+        "schema": "lumi.vm-attempt022-control-execution-verification.v0.1",
+        "attempt": watchdog.ATTEMPT,
+        "status": "both_control_deployments_succeeded_receipts_verified",
+        "source_bindings": bindings,
+        "verification_kind": "offline_receipts_bound_to_deployer_live_readback",
+        "watchdog": {
+            "status": watch["status"],
+            "control_calls": watch["total_control_calls"],
+            "mutation_dispatches": 9,
+            "elapsed_seconds": watch["elapsed_seconds"],
+            "runtime_state": "Active",
+            "unarmed_verified": True,
+            "invocation_disabled_verified": True,
+            "schedule_created": False,
+        },
+        "cleanup_bucket": {
+            "status": store["status"],
+            "bucket": bucket.BUCKET,
+            "calls": store["calls"],
+            "mutation_dispatches": 6,
+            "elapsed_seconds": store["elapsed_seconds"],
+            "privacy_readback_verified": True,
+        },
+        "sequential_order_evidence_verified": True,
+        "total_deployment_control_calls": watch["total_control_calls"] + store["calls"],
+        "summed_deployment_elapsed_seconds": round(
+            watch["elapsed_seconds"] + store["elapsed_seconds"], 3
+        ),
+        "maximum_combined_control_calls": 65,
+        "maximum_combined_runtime_seconds": 900,
+        "corrected_test_selection_supplement_bound": True,
+        "additional_aws_verification_calls": 0,
+        "independent_live_admission_passed": False,
+        "prior_evidence_preserved": True,
+        "shared_bucket_mutation": False,
+        "object_access": False,
+        "instance_actions": 0,
+        "retry": False,
+        "cpu_launch_authorized": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "next_required": "Prepare fresh bounded read-only control verification/admission "
+        "and then bind the final separately approved one-shot CPU import.",
+    }
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--write-once"] and not OUTPUT.exists())
+    report = verify()
+    package.write_new(str(OUTPUT.relative_to(ROOT)), package.encode(report))
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "total_control_calls": report["total_deployment_control_calls"],
+                "additional_aws_calls": 0,
+            },
+            sort_keys=True,
+        )
+    )

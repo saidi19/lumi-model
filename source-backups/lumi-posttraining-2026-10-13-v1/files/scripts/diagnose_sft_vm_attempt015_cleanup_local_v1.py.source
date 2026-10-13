@@ -1,0 +1,118 @@
+"""Network-free replay of consumed transport; never launches or contacts a host."""
+
+import hashlib
+import importlib
+import json
+import socket
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-015-source-v0.1"
+PROOF = ROOT / "evidence/lumi-vm-attempt-015-cpu-execution-verification-v0.1.json"
+PROOF_SHA = "1e00cd0cdf2ba5b0831f04d2b6d947df1c76a3116424649ae75186f743c5aabd"
+VERSION = ["/usr/bin/ssh", "-V"]
+PROXY = [
+    "/usr/bin/ssh",
+    "-F",
+    "/dev/null",
+    "-o",
+    "ProxyCommand=/usr/bin/true",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "IdentityFile=none",
+    "-o",
+    "IdentityAgent=none",
+    "-o",
+    "UserKnownHostsFile=/dev/null",
+    "-o",
+    "GlobalKnownHostsFile=/dev/null",
+    "-o",
+    "StrictHostKeyChecking=yes",
+    "-o",
+    "ConnectTimeout=2",
+    "local-proxy-test.invalid",
+]
+
+
+def guard(event, args):
+    if event.startswith("socket."):
+        raise RuntimeError("network_forbidden")
+    if event == "subprocess.Popen" and args[1] not in (VERSION, PROXY):
+        raise RuntimeError("process_not_allowlisted")
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        if any(x in str(args[0]) for x in ("/.aws/", "/.ssh/", "connection-key")):
+            raise RuntimeError("credentials_forbidden")
+
+
+def diagnose():
+    raw = PROOF.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == PROOF_SHA
+    proof = json.loads(raw)
+    for name, pin in proof["source_bindings"].items():
+        body = (ROOT / name).read_bytes()
+        assert len(body) == pin["bytes"] and hashlib.sha256(body).hexdigest() == pin["sha256"]
+    path = ROOT / (
+        "artifacts/lumi-vm-private-outer-execution-v0.17/attempt-015/"
+        "host-preparation/staged/manifest.json"
+    )
+    manifest = json.loads(path.read_bytes())
+    sys.path.insert(0, str(BASE / "scripts"))
+    entry = importlib.import_module(manifest["entry"])
+    entry.authenticate()
+    transport = entry.lifecycle.guard.provision.setup.delivery.seed.sender.delivery
+    rows = []
+    for label, argv in (("version", VERSION), ("local_proxy_closes", PROXY)):
+        observations = []
+        original = transport.os.killpg
+
+        def observed(group, sig, original=original, observations=observations):
+            try:
+                result = original(group, sig)
+            except OSError as error:
+                category = (
+                    "absent"
+                    if isinstance(error, ProcessLookupError)
+                    else "permission"
+                    if isinstance(error, PermissionError)
+                    else "os_error"
+                )
+                observations.append(
+                    dict(
+                        category=category, errno=error.errno if error.errno in (1, 3, 13) else None
+                    )
+                )
+                raise
+            observations.append(dict(category="signal_sent", errno=None))
+            return result
+
+        with patch.object(transport.os, "killpg", side_effect=observed):
+            try:
+                reply = transport.pipe_exchange(argv, b"", 3)
+                result = dict(status="returned", reply_bytes=len(reply))
+            except transport.ExchangeFailure as error:
+                result = dict(status="rejected", **transport.exchange_diagnostic(error))
+        rows.append(dict(case=label, cleanup_observations=observations, result=result))
+    return dict(
+        schema="lumi.cleanup-local-replay.v0.1",
+        rows=rows,
+        historical_failure_root_cause_proven=False,
+        historical_exception_type_or_errno_retained=False,
+        historical_raw_ssh_output_retained=False,
+        real_ssh_proxy_command_replayed=False,
+        local_proxy_only=True,
+        aws_calls=0,
+        host_launches=0,
+        execution_permitted=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+    sys.addaudithook(guard)
+    print(json.dumps(diagnose(), sort_keys=True, indent=2))

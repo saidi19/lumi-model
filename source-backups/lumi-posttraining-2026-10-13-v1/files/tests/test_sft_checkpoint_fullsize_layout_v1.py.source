@@ -1,0 +1,484 @@
+"""Generated controls and in-memory syscall doubles; never native layout or payloads."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import importlib.util
+import json
+import os
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_fullsize_layout_test_namespace"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_fullsize_layout_v1")
+IMPORTED = set(sys.modules) - before_import
+PARENT = "/tmp/lumi-fullsize-layout-generated"
+TREE = PARENT + "/rootfs"
+PRIVATE = "PRIVATE_EXCEPTION_OR_PAYLOAD"
+
+
+def fixture():
+    spec = importlib.util.spec_from_file_location("_fullsize_layout_addon_fixture",
+        ROOT / "tests/test_sft_checkpoint_fullsize_sources_v1.py")
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    arguments = fixtures.bundle()
+    plan = json.loads(arguments["control_bodies"]["plan.json"])
+    inventories = {role: {row["path"]: row["bytes"] for row in plan[role + "_inventory"]}
+                   for role in m.INPUT_ROLES}
+    return arguments, inventories
+
+
+class Entries:
+    def __init__(self, names):
+        self.names = names
+
+    def __enter__(self):
+        return iter(types.SimpleNamespace(name=name) for name in self.names)
+
+    def __exit__(self, *_args):
+        return False
+
+
+class LayoutTests(unittest.TestCase):
+    def setUp(self):
+        self.arguments, self.inventories = fixture()
+        self.nodes, self.fds, self.closed, self.events = {}, {}, [], []
+        self.counter, self.descriptor = 10, 20
+        self.add(PARENT, stat.S_IFDIR | 0o700)
+        self.add(TREE, stat.S_IFDIR | 0o700)
+        for role, files in self.inventories.items():
+            path = PARENT + "/" + role
+            self.add(path, stat.S_IFDIR | 0o700, 10001)
+            for relative, size in files.items():
+                parts = relative.split("/")
+                for count in range(1, len(parts)):
+                    child = path + "/" + "/".join(parts[:count])
+                    if child not in self.nodes:
+                        self.add(child, stat.S_IFDIR | 0o700, 10001)
+                self.add(path + "/" + relative, stat.S_IFREG | 0o600, 10001, size)
+        self.owned = object.__new__(m.rootfs.OwnedRootfs)
+        self.owned._parent, self.owned._path = Path(PARENT), Path(TREE)
+        self.owned._root_name = "rootfs"
+        self.owned._parent_fd, self.owned._root_fd = self.fd(PARENT), self.fd(TREE)
+        self.owned._frozen = self.owned._closed = self.owned._tainted = False
+        self.owned._installed_bytes = self.owned._installed_files = self.owned._content_bytes = 0
+        self.owned._nodes = {(): (m.rootfs._identity(self.nodes[TREE]), "directory", 0o755)}
+        self.owned._seen = set()
+        self.owned._limits = {"file": 262144, "total": 8 * 1024**2, "entries": 256}
+        self.owned._guard = Mock(side_effect=self.guard)
+        self.owned._verify_tree = Mock(side_effect=self.verify)
+        self.owned._parents = Mock(side_effect=self.parents)
+        self.owned._write = Mock(side_effect=self.write)
+        self.owned._directory = Mock(side_effect=lambda parts:
+            self.fd(TREE + ("/" + "/".join(parts) if parts else "")))
+        self.owned.freeze = Mock(side_effect=self.freeze)
+        self.fake_os = types.SimpleNamespace(**{name: getattr(os, name) for name in (
+            "O_RDONLY", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK")},
+            open=Mock(side_effect=self.open), close=Mock(side_effect=self.close),
+            fstat=Mock(side_effect=lambda fd: self.nodes[self.fds[fd]]),
+            stat=Mock(side_effect=self.stat), mkdir=Mock(side_effect=self.mkdir),
+            fchown=Mock(side_effect=self.chown), fchmod=Mock(side_effect=self.chmod),
+            scandir=Mock(side_effect=self.scandir))
+        for module in (m, m.prepared, m.input_mount):
+            self.enterContext(patch.object(module, "os", self.fake_os))
+        self.enterContext(patch.object(m.rootfs, "_open_absolute",
+                                      side_effect=lambda path, **kwargs: self.fd(str(path))))
+        self.enterContext(patch.object(m.input_mount.fcntl, "fcntl",
+                                      return_value=m.input_mount.fcntl.FD_CLOEXEC))
+        self.runtime = self.enterContext(patch.object(m.addon, "_runtime"))
+        self.native = self.enterContext(patch.object(m.import_rootfs.mount_root.ctypes, "CDLL",
+                                                     side_effect=AssertionError("no_native")))
+        self.options = {"checkpoint_path": PARENT + "/checkpoint",
+            "tokenizer_path": PARENT + "/tokenizer", "inventories": self.inventories,
+            "addon_arguments": self.arguments,
+            "expected_input_identities": {role: self.identity(PARENT + "/" + role)
+                                          for role in m.INPUT_ROLES}}
+        self.original_inputs = copy.deepcopy({path: info for path, info in self.nodes.items()
+            if any(path.startswith(PARENT + "/" + role) for role in m.INPUT_ROLES)})
+
+    def tearDown(self):
+        self.assertEqual(len(self.closed), len(set(self.closed)))
+        self.assertEqual(set(self.fds), {self.owned._parent_fd, self.owned._root_fd})
+        self.native.assert_not_called()
+
+    def add(self, path, mode, uid=0, size=0):
+        self.assertNotIn(path, self.nodes)
+        self.counter += 1
+        self.nodes[path] = types.SimpleNamespace(st_dev=7, st_ino=self.counter, st_mode=mode,
+            st_uid=uid, st_gid=uid, st_nlink=1, st_size=size, st_mtime_ns=1, st_ctime_ns=1)
+
+    def identity(self, path):
+        value = self.nodes[path]
+        return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+                value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+    def fd(self, path):
+        if path not in self.nodes:
+            raise FileNotFoundError(PRIVATE)
+        self.descriptor += 1
+        self.fds[self.descriptor] = path
+        return self.descriptor
+
+    def open(self, name, flags, mode=None, *, dir_fd=None):
+        if name.startswith("/proc/self/fd/"):
+            return self.fd(self.fds[int(name.rsplit("/", 1)[1])])
+        self.assertTrue(flags & os.O_NOFOLLOW and flags & os.O_CLOEXEC)
+        path = self.fds[dir_fd] + "/" + name
+        if stat.S_ISREG(self.nodes[path].st_mode):
+            self.assertTrue(flags & m.input_mount.mount_root.O_PATH)
+            self.events.append(("metadata-open", path))
+        return self.fd(path)
+
+    def close(self, fd):
+        self.closed.append(fd)
+        del self.fds[fd]
+
+    def scandir(self, fd):
+        prefix = self.fds[fd] + "/"
+        return Entries([path[len(prefix):] for path in self.nodes
+                        if path.startswith(prefix) and "/" not in path[len(prefix):]])
+
+    def stat(self, name, *, dir_fd, follow_symlinks):
+        self.assertFalse(follow_symlinks)
+        path = self.fds[dir_fd] + "/" + name
+        if path not in self.nodes:
+            raise FileNotFoundError()
+        return self.nodes[path]
+
+    def mkdir(self, name, mode, *, dir_fd):
+        path = self.fds[dir_fd] + "/" + name
+        self.add(path, stat.S_IFDIR | mode)
+        parent = self.nodes[self.fds[dir_fd]]
+        parent.st_nlink += 1
+        parent.st_mtime_ns += 1
+        parent.st_ctime_ns += 1
+        self.events.append(("mkdir", path))
+
+    def chown(self, fd, uid, gid):
+        path = self.fds[fd]
+        self.assertIn(path, (PARENT + "/output", PARENT + "/mountpoint"))
+        self.nodes[path].st_uid, self.nodes[path].st_gid = uid, gid
+
+    def chmod(self, fd, mode):
+        path = self.fds[fd]
+        self.assertIn(path, (PARENT + "/output", PARENT + "/mountpoint"))
+        self.nodes[path].st_mode = stat.S_IFDIR | mode
+
+    def guard(self):
+        if self.owned._closed or self.owned._tainted:
+            raise ValueError(PRIVATE)
+
+    def verify(self):
+        expected = {TREE + ("/" + "/".join(parts) if parts else ""):
+                    node[0] for parts, node in self.owned._nodes.items()}
+        found = {path: m.rootfs._identity(info) for path, info in self.nodes.items()
+                 if path == TREE or path.startswith(TREE + "/")}
+        self.assertEqual(found, expected)
+
+    def parents(self, parts):
+        for count in range(1, len(parts) + 1):
+            key = parts[:count]
+            if key not in self.owned._nodes:
+                path = TREE + "/" + "/".join(key)
+                self.add(path, stat.S_IFDIR | 0o700)
+                self.owned._nodes[key] = m.rootfs._identity(self.nodes[path]), "directory", 0o755
+                self.events.append(("target-or-parent", path))
+
+    def write(self, parts, stream, size, mode):
+        self.parents(parts[:-1])
+        self.assertEqual(mode, 0o444)
+        self.assertEqual(len(stream.read()), size)
+        path = TREE + "/" + "/".join(parts)
+        self.add(path, stat.S_IFREG | mode, size=size)
+        self.owned._nodes[parts] = m.rootfs._identity(self.nodes[path]), "file", mode
+        self.owned._content_bytes += size
+        self.events.append(("software-write", path))
+
+    def freeze(self):
+        self.verify()
+        for parts, (_identity, kind, mode) in self.owned._nodes.items():
+            if kind == "directory":
+                path = TREE + ("/" + "/".join(parts) if parts else "")
+                self.nodes[path].st_mode = stat.S_IFDIR | mode
+        self.owned._frozen = True
+        self.events.append(("freeze",))
+
+    def install(self, **changes):
+        return m._prepare_admitted_once(self.owned, **(self.options | changes))
+
+    def error(self, code=None, **changes):
+        with self.assertRaises(m.FullsizeLayoutError) as caught:
+            self.install(**changes)
+        if code:
+            self.assertEqual(caught.exception.code, code)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def no_mutation(self):
+        self.owned._parents.assert_not_called()
+        self.owned._write.assert_not_called()
+        self.fake_os.mkdir.assert_not_called()
+        self.assertFalse(self.owned._tainted)
+
+    def test_pure_validation_has_no_io_and_returns_detached_controls(self):
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError):
+            value = m.validate_layout(inventories=self.inventories, addon_arguments=self.arguments)
+        self.assertEqual(value["inventories"], self.inventories)
+        value["inventories"]["checkpoint"].clear()
+        value["addon_arguments"]["files"].clear()
+        self.assertTrue(self.inventories["checkpoint"])
+        self.assertTrue(self.arguments["files"])
+        self.no_mutation()
+
+    def test_public_entry_always_closed_before_runtime_or_argument_inspection(self):
+        for arguments in ({}, {"approved": True}, {"owned": object(), **self.options}):
+            with self.assertRaisesRegex(m.FullsizeLayoutError, "host_guard_not_bound"):
+                m.prepare_layout(**arguments)
+        self.runtime.assert_not_called()
+        self.no_mutation()
+
+    def test_runtime_failure_precedes_controls_and_object_access(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        self.error("runtime_rejected", inventories=None, addon_arguments=None)
+        self.owned._guard.assert_not_called()
+        self.no_mutation()
+
+    def test_imports_do_not_load_ml_modules(self):
+        self.assertFalse({name.split(".", 1)[0] for name in IMPORTED} &
+                         {"torch", "numpy", "safetensors", "transformers", "lumi"})
+
+    def test_layout_integrates_real_addon_and_metadata_tree_without_payload_io(self):
+        result = self.install()
+        self.assertEqual(result["mount_arguments"],
+                         m.import_rootfs.validate_arguments(**result["mount_arguments"]))
+        self.assertEqual(result["environment"],
+                         m.addon.bootstrap.validate_environment(result["environment"]))
+        self.assertEqual({path: self.nodes[path] for path in self.original_inputs},
+                         self.original_inputs)
+        opens = [event for event in self.events if event[0] == "metadata-open"]
+        self.assertEqual(len(opens), 2 * sum(map(len, self.inventories.values())))
+        self.assertEqual(set(self.fds), {self.owned._parent_fd, self.owned._root_fd})
+        self.assertTrue(self.owned._frozen)
+        self.assertFalse(self.owned._tainted)
+
+    def test_final_parent_metadata_is_after_creation_and_root_is_not_mountpoint(self):
+        before = self.identity(PARENT)
+        result = self.install()["mount_arguments"]
+        self.assertNotEqual(before, result["expected_identities"]["parent"])
+        self.assertEqual(result["expected_identities"]["parent"], self.identity(PARENT))
+        self.assertEqual(result["expected_identities"]["root"], self.identity(TREE))
+        self.assertNotEqual(result["expected_identities"]["root"][:2],
+                            result["expected_mountpoint_identity"][:2])
+
+    def test_target_modes_are_set_before_source_addon_freeze(self):
+        self.install()
+        for parts, mode in m.TARGET_MODES.items():
+            info = self.nodes[TREE + "/" + "/".join(parts)]
+            self.assertEqual((info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)), (0, 0, mode))
+        for role, uid in (("output", 10001), ("mountpoint", 0)):
+            info = self.nodes[PARENT + "/" + role]
+            self.assertEqual((info.st_uid, stat.S_IMODE(info.st_mode)), (uid, 0o700))
+        self.assertEqual(self.fake_os.mkdir.call_count, 2)
+
+    def test_receipt_retains_only_aggregate_bindings_and_no_authority(self):
+        receipt = self.install()["receipt"]
+        self.assertNotIn(PARENT, json.dumps(receipt))
+        for key in m.FALSE_FLAGS:
+            self.assertIs(receipt[key], False)
+        for key in ("input_payload_read_bytes", "input_payload_write_bytes",
+                    "existing_input_permission_changes"):
+            self.assertEqual(receipt[key], 0)
+        self.assertEqual(receipt["addon_content_write_bytes"], self.owned._installed_bytes)
+        self.assertEqual(receipt["new_rootfs_mount_targets"], 4)
+        self.assertTrue(receipt["input_layout_prepared"])
+
+    def test_missing_extra_changed_or_unsafe_inventory_rejects(self):
+        for change in ({}, {"unexpected": 1}, {"../escape": 1}, {"model": 1},
+                       {name: size + 1 for name, size in self.inventories["checkpoint"].items()}):
+            with self.subTest(change=change):
+                self.error(inventories=self.inventories | {"checkpoint": change})
+        self.no_mutation()
+
+    def test_invalid_and_boolean_sizes_reject(self):
+        name = next(iter(self.inventories["checkpoint"]))
+        for size in (True, 0, -1, 2**70, "7"):
+            self.error(inventories=self.inventories | {"checkpoint": {name: size}})
+        self.no_mutation()
+
+    def test_source_or_control_binding_mismatch_precedes_native_mutation(self):
+        for field in ("expected_manifest_sha256", "expected_entry_sha256",
+                      "expected_control_sha256", "expected_attempt_nonce_sha256"):
+            self.error("binding_rejected", addon_arguments=self.arguments | {field: "0" * 64})
+        self.no_mutation()
+
+    def test_only_exact_owned_type_is_accepted(self):
+        original = self.owned
+        self.owned = types.SimpleNamespace(**original.__dict__)
+        self.error("layout_rejected")
+        original._guard.assert_not_called()
+        self.no_mutation()
+
+    def test_frozen_used_or_tainted_owned_root_rejects(self):
+        for key, value in (("_frozen", True), ("_tainted", True),
+                           ("_installed_files", 1), ("_installed_bytes", 1)):
+            previous = getattr(self.owned, key)
+            setattr(self.owned, key, value)
+            self.error()
+            setattr(self.owned, key, previous)
+        self.no_mutation()
+
+    def test_fixed_sibling_paths_and_exact_identity_shapes_required(self):
+        for path in (Path(PARENT + "/checkpoint"), PARENT + "/tokenizer", "/tmp/elsewhere", "../x"):
+            self.error(checkpoint_path=path)
+        for ids in ({}, {"checkpoint": (1,), "tokenizer": (1,)},
+                    dict.fromkeys(m.INPUT_ROLES, (1, 2, 3, 4, 5, 6, 7, 8, True)),
+                    dict.fromkeys(m.INPUT_ROLES, self.options["expected_input_identities"]
+                                  ["checkpoint"])):
+            self.error(expected_input_identities=ids)
+        self.no_mutation()
+
+    def test_preexisting_output_or_mountpoint_is_not_reused_or_mutated(self):
+        for role in ("output", "mountpoint"):
+            path = PARENT + "/" + role
+            self.add(path, stat.S_IFDIR | 0o700)
+            self.error()
+            del self.nodes[path]
+        self.no_mutation()
+
+    def test_preexisting_target_or_consumed_target_rejects(self):
+        for parts in m.TARGET_MODES:
+            self.owned._seen.add(parts)
+            self.error()
+            self.owned._seen.remove(parts)
+        self.no_mutation()
+
+    def test_combined_addon_and_target_capacity_checked_before_mkdir(self):
+        bundle = m.validate_layout(inventories=self.inventories, addon_arguments=self.arguments)
+        required = {()}
+        for name in bundle["additions"]:
+            parts = tuple(name.split("/"))
+            required.update(parts[:i] for i in range(1, len(parts) + 1))
+        self.owned._limits["entries"] = len(required) + len(m.TARGET_MODES) - 1
+        self.error()
+        self.no_mutation()
+
+    def test_content_or_single_file_capacity_rejects_before_mutation(self):
+        limits = dict(self.owned._limits)
+        for key in ("total", "file"):
+            self.owned._limits = limits | {key: 1}
+            self.error()
+        self.no_mutation()
+
+    def test_input_root_identity_change_rejects_before_mutation(self):
+        self.nodes[PARENT + "/checkpoint"].st_ctime_ns += 1
+        self.error()
+        self.no_mutation()
+
+    def test_input_file_wrong_size_owner_mode_or_link_count_rejects(self):
+        path = PARENT + "/checkpoint/" + next(iter(self.inventories["checkpoint"]))
+        info = self.nodes[path]
+        for key, value in (("st_size", 0), ("st_uid", 0), ("st_gid", 0),
+                           ("st_mode", stat.S_IFREG | 0o644), ("st_nlink", 2)):
+            old = getattr(info, key)
+            setattr(info, key, value)
+            self.error()
+            setattr(info, key, old)
+        self.no_mutation()
+
+    def test_extra_input_entry_rejects(self):
+        self.add(PARENT + "/checkpoint/unexpected", stat.S_IFREG | 0o600, 10001, 1)
+        self.error()
+        self.no_mutation()
+
+    def test_cross_input_file_alias_rejected(self):
+        paths = [PARENT + "/" + role + "/" + next(iter(self.inventories[role]))
+                 for role in m.INPUT_ROLES]
+        self.nodes[paths[1]].st_ino = self.nodes[paths[0]].st_ino
+        self.error()
+        self.no_mutation()
+
+    def test_nonempty_fresh_output_rejected_after_freeze(self):
+        def freeze():
+            self.freeze()
+            self.add(PARENT + "/output/unexpected", stat.S_IFREG | 0o600, 10001, 1)
+        self.owned.freeze.side_effect = freeze
+        self.error("layout_rejected")
+        self.assertTrue(self.owned._tainted)
+
+    def test_late_input_metadata_change_rejects_and_taints(self):
+        def freeze():
+            self.freeze()
+            path = PARENT + "/checkpoint/" + next(iter(self.inventories["checkpoint"]))
+            self.nodes[path].st_ctime_ns += 1
+        self.owned.freeze.side_effect = freeze
+        self.error("layout_rejected")
+        self.assertTrue(self.owned._tainted)
+
+    def test_final_path_identity_replacement_rejects(self):
+        original = m.prepared._mount_arguments
+        def replaced(*args):
+            result = original(*args)
+            identity = result["expected_identities"]["checkpoint"]
+            result["expected_identities"]["checkpoint"] = (identity[0], identity[1] + 999,
+                                                           *identity[2:])
+            return result
+        with patch.object(m.prepared, "_mount_arguments", side_effect=replaced):
+            self.error("layout_rejected")
+        self.assertTrue(self.owned._tainted)
+
+    def test_first_mkdir_failure_consumes_attempt_without_cleanup_or_retry(self):
+        self.owned._parents.side_effect = OSError(PRIVATE)
+        self.error()
+        self.assertTrue(self.owned._tainted)
+        calls = self.owned._parents.call_count
+        self.error()
+        self.assertEqual(self.owned._parents.call_count, calls)
+
+    def test_source_write_failure_keeps_new_siblings_and_taints(self):
+        self.owned._write.side_effect = OSError(PRIVATE)
+        self.error()
+        self.assertTrue(self.owned._tainted)
+        self.assertIn(PARENT + "/output", self.nodes)
+        self.assertIn(PARENT + "/mountpoint", self.nodes)
+        self.assertFalse(self.owned._frozen)
+
+    def test_freeze_failure_taints_without_retry(self):
+        self.owned.freeze.side_effect = OSError(PRIVATE)
+        self.error()
+        self.assertTrue(self.owned._tainted)
+        self.assertGreater(self.owned._installed_files, 0)
+        self.owned.freeze.assert_called_once()
+
+    def test_final_close_failure_taints_and_descriptor_is_not_closed_twice(self):
+        def close(fd):
+            path = self.fds[fd]
+            first = min(key for key, value in self.fds.items() if value == path)
+            self.close(fd)
+            if path == PARENT + "/mountpoint" and fd == first and self.owned._frozen:
+                raise OSError(PRIVATE)
+        self.fake_os.close.side_effect = close
+        self.error()
+        self.assertTrue(self.owned._tainted)
+        self.assertEqual(set(self.fds), {self.owned._parent_fd, self.owned._root_fd})
+
+    def test_successful_owned_attempt_cannot_run_twice(self):
+        self.install()
+        writes = self.owned._write.call_count
+        self.error()
+        self.assertEqual(self.owned._write.call_count, writes)
+
+
+if __name__ == "__main__":
+    unittest.main()

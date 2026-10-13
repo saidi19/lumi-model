@@ -1,0 +1,144 @@
+"""Bind the v0.5 read-only transport repair before fresh live admission."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_controls_v5 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "3a43ec7e3646580b6880257b5207a620bd29457fdf4cd6f599678d98d28ce93d"
+BASE_PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.5/plan.json"
+BASE_PLAN_SHA = "b85f942cb8ee24ace8a4633435c1561426b69074a70fd77c7ed079a0c9f881ae"
+SOURCE_RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.5"
+SOURCE_RELEASE_SHA = "8b66eff48b193009d4fc51761488deeb4c70488ead72e3e099838f9333cf5a5f"
+SOURCE_VERIFICATION = "evidence/lumi-vm-attempt-018-source-v0.5-verification-v0.1.json"
+SOURCE_VERIFICATION_SHA = "8e22ba2569d0595c01c01afa1c870bfd0fa72e8f313ac458cf95691a574f24ab"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.6"
+ATTEMPT = previous.ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_control_plan_v6_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None):
+    path = ROOT / name
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    previous.build()
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    release = json.loads(read(SOURCE_RELEASE + "/release.json", SOURCE_RELEASE_SHA))
+    proof = json.loads(read(SOURCE_VERIFICATION, SOURCE_VERIFICATION_SHA))
+    need(
+        proof["status"] == "offline_read_only_transport_repair_verified"
+        and proof["source_release_sha256"] == SOURCE_RELEASE_SHA
+        and proof["bounded_transient_reads_verified"] is True
+        and proof["write_retry_prohibited_verified"] is True
+        and proof["execution_authority_created"] is False
+        and release["application_read_attempts_per_call_maximum"] == 3
+        and release["application_read_retries_total_maximum"] == 8
+        and release["write_attempts_per_operation"] == 1
+    )
+    bindings = {}
+    old_prefix = "artifacts/lumi-vm-attempt-018-source-v0.4/"
+    for old_name in plan["source_bindings"]:
+        need(old_name.startswith(old_prefix))
+        relative = old_name.removeprefix(old_prefix)
+        bindings[SOURCE_RELEASE + "/" + relative] = release["outputs"][relative]
+    plan["schema"] = "lumi.vm-attempt-018-control-plan.v0.6"
+    plan["status"] = "offline_read_transport_repair_verified_fresh_preflight_required"
+    plan["release_manifest_sha256"] = SOURCE_RELEASE_SHA
+    plan["source_bindings"] = bindings
+    plan["source_preparation_evidence"] = {
+        "path": SOURCE_VERIFICATION,
+        "sha256": SOURCE_VERIFICATION_SHA,
+    }
+    plan["source_repair"]["bounded_transient_read_recovery"] = True
+    plan["source_repair"]["read_attempts_per_call_maximum"] = 3
+    plan["source_repair"]["read_retries_total_maximum"] = 8
+    plan["source_repair"]["write_attempts_per_operation"] = 1
+    plan["transport_change"].update(
+        sdk_attempts_per_call=1,
+        application_transient_read_attempts_per_call_maximum=3,
+        application_transient_read_retries_total_maximum=8,
+        write_attempts_per_operation=1,
+    )
+    plan["cpu_scope_reference"]["output"] = (
+        "artifacts/lumi-vm-private-outer-execution-v0.23/attempt-018"
+    )
+    plan["cpu_scope_reference"]["execution_entry_sha256"] = None
+    plan["successful_readonly_preflight"] = None
+    plan["readiness_review"]["decision"] = "fresh_v023_readonly_preflight_required"
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Fresh read-only admission binds source v0.5 and plan v0.6 without mutation",
+        "Fresh v0.23 proposal and explicit approval bind the repaired scope and hashes",
+        "Immediate pre-launch read-only admission passes again before the execution marker",
+    ]
+    plan["readiness_review"]["risk"] = (
+        "Bounded transient read recovery is synthetic and offline until fresh live admission; "
+        "it does not prove a successful remote boot or import."
+    )
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-018-control-plan-release.v0.6",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": SOURCE_RELEASE_SHA,
+        "source_verification_sha256": SOURCE_VERIFICATION_SHA,
+        "bounded_transient_read_recovery": True,
+        "write_attempts_per_operation": 1,
+        "source_versions_bound": True,
+        "retention_implementation_bound": True,
+        "watchdog_launch_interlock_bound": True,
+        "network_quota_kind": "nftables_ip_packet_quota",
+        "wire_or_billing_byte_cap_claimed": False,
+        "fresh_readonly_preflight_required": True,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

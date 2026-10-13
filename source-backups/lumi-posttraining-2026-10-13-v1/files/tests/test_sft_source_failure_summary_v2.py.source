@@ -1,0 +1,157 @@
+"""Synthetic-only quiet/verbose summary and redaction contracts."""
+
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/parse_sft_source_failure_summary_v2.py"
+SPEC = importlib.util.spec_from_file_location("summary_parser_v2", PATH)
+PARSER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PARSER)
+
+
+class SummaryTests(unittest.TestCase):
+    paths = {"tests/test_demo.py", "tests/test_other.py"}
+
+    def fixture(self, row, footer="1 failed in 1.00s", decorated=False):
+        if decorated:
+            footer = "=== " + footer + " ==="
+        return ("=== short test summary info ===\n" + row + "\n" + footer + "\n").encode()
+
+    def parse(self, row, **kwargs):
+        return PARSER.parse_summary(self.fixture(row, **kwargs), self.paths)
+
+    def test_plain_quiet_footer(self):
+        self.assertEqual(
+            self.parse("FAILED tests/test_demo.py::test_a - ValueError: SECRET"),
+            [{"test": "tests/test_demo.py::test_a", "error_type": "ValueError"}],
+        )
+
+    def test_decorated_footer(self):
+        self.assertEqual(
+            self.parse("FAILED tests/test_demo.py::test_a - ValueError: SECRET", decorated=True),
+            self.parse("FAILED tests/test_demo.py::test_a - ValueError: SECRET"),
+        )
+
+    def test_timestamp_and_color(self):
+        raw = self.fixture("\x1b[31mFAILED tests/test_demo.py::test_a - TypeError: SECRET\x1b[0m")
+        raw = b"\n".join(b"2026-09-14T04:20:48.1234567Z " + row for row in raw.splitlines())
+        self.assertEqual(PARSER.parse_summary(raw, self.paths)[0]["error_type"], "TypeError")
+
+    def test_parameters_and_fake_message_removed(self):
+        value = self.parse(
+            "FAILED tests/test_demo.py::test_a[SECRET - ValueError: X::Y] - TypeError: SECRET"
+        )
+        self.assertEqual(value, [{"test": "tests/test_demo.py::test_a", "error_type": None}])
+
+    def test_unbalanced_parameter_name_never_retained(self):
+        value = self.parse("FAILED tests/test_demo.py::test_a[SECRET]]] - ValueError: SECRET")
+        self.assertNotIn("SECRET", json.dumps(value))
+        self.assertIsNone(value[0]["error_type"])
+
+    def test_custom_type_not_retained(self):
+        self.assertIsNone(
+            self.parse("FAILED tests/test_demo.py::test_a - SecretError: X")[0]["error_type"]
+        )
+
+    def test_assertion_expression_not_inferred(self):
+        self.assertIsNone(
+            self.parse("FAILED tests/test_demo.py::test_a - assert SECRET == X")[0]["error_type"]
+        )
+
+    def test_collection_error(self):
+        self.assertEqual(
+            self.parse("ERROR tests/test_other.py - ImportError: X", footer="1 error in 0.02s"),
+            [{"test": "tests/test_other.py", "error_type": "ImportError"}],
+        )
+
+    def test_pytest_failed_type(self):
+        self.assertEqual(
+            self.parse("FAILED tests/test_demo.py::test_a - Failed: X")[0]["error_type"], "Failed"
+        )
+
+    def test_parameter_deduplication_counts_rows_before_collapse(self):
+        value = self.parse(
+            "FAILED tests/test_demo.py::test_a[A] - ValueError: X\n"
+            "FAILED tests/test_demo.py::test_a[B] - TypeError: X",
+            footer="2 failed in 1.00s",
+        )
+        self.assertEqual(len(value), 1)
+
+    def test_mixed_footer_counts_and_duration(self):
+        value = self.parse(
+            "FAILED tests/test_demo.py::test_a - ValueError: X\n"
+            "ERROR tests/test_other.py - ImportError: X",
+            footer="1 failed, 800 passed, 2 skipped, 1 error, 3 warnings in 10.12s (0:00:10)",
+        )
+        self.assertEqual(len(value), 2)
+
+    def test_last_summary_only(self):
+        raw = self.fixture("FAILED tests/test_demo.py::test_old - ValueError: X")
+        raw += self.fixture("FAILED tests/test_demo.py::test_new - KeyError: X")
+        self.assertEqual(
+            PARSER.parse_summary(raw, self.paths)[0]["test"], "tests/test_demo.py::test_new"
+        )
+
+    def test_missing_or_truncated_summary_rejected(self):
+        for raw in (
+            b"no summary",
+            b"=== short test summary info ===\nFAILED tests/test_demo.py::test_a - ValueError: X",
+        ):
+            with self.assertRaises(PARSER.SummaryRejected):
+                PARSER.parse_summary(raw, self.paths)
+
+    def test_zero_failures_and_count_mismatch_rejected(self):
+        for footer in ("0 failed in 1.00s", "2 failed in 1.00s", "1 passed in 1.00s"):
+            with self.assertRaises(PARSER.SummaryRejected):
+                self.parse("FAILED tests/test_demo.py::test_a - ValueError: X", footer=footer)
+
+    def test_unbound_path_rejected(self):
+        with self.assertRaises(PARSER.SummaryRejected):
+            self.parse("FAILED tests/test_secret.py::test_a - ValueError: X")
+
+    def test_oversized_log_rejected(self):
+        with self.assertRaises(PARSER.SummaryRejected):
+            PARSER.parse_summary(b"X" * (PARSER.MAXIMUM_LOG_BYTES + 1), self.paths)
+
+    def test_no_extra_message_text(self):
+        value = self.parse(
+            "FAILED tests/test_demo.py::test_a - AssertionError: SECRET\nraw assertion SECRET"
+        )
+        self.assertNotIn("SECRET", json.dumps(value))
+
+    def test_failed_and_error_counts_are_not_interchangeable(self):
+        with self.assertRaises(PARSER.SummaryRejected):
+            self.parse(
+                "FAILED tests/test_demo.py::test_a - ValueError: X", footer="1 error in 1.0s"
+            )
+
+    def test_duplicate_counts_rejected(self):
+        for footer in ("1 failed, 0 failed in 1.0s", "1 failed, 1 warning, 2 warnings in 1.0s"):
+            with self.assertRaises(PARSER.SummaryRejected):
+                self.parse("FAILED tests/test_demo.py::test_a - ValueError: X", footer=footer)
+
+    def test_same_node_failed_and_error(self):
+        value = self.parse(
+            "FAILED tests/test_demo.py::test_a - ValueError: X\n"
+            "ERROR tests/test_demo.py::test_a - TypeError: X",
+            footer="1 failed, 1 error in 1.0s",
+        )
+        self.assertEqual(len(value), 2)
+
+    def test_truncated_parameter_row_rejected(self):
+        with self.assertRaises(PARSER.SummaryRejected):
+            self.parse("FAILED tests/test_demo.py::test_a[truncated")
+
+    def test_collection_interruption_banner(self):
+        value = self.parse(
+            "ERROR tests/test_other.py - ImportError: X\n"
+            "!!!! Interrupted: 1 error during collection !!!!",
+            footer="1 error in 1.0s",
+        )
+        self.assertEqual(len(value), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

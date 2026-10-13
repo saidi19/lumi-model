@@ -1,0 +1,50 @@
+# SFT execution status v0.95
+
+2026-09-16. The Source CI diagnostic recovered 15 observed, parameter-free failed
+test identifiers in two files. This list is not claimed exhaustive. The one-shot
+read on 2026-09-15 used two GETs and 99,267 bytes, below 128 KiB; no raw log,
+exception message or parameter was retained. The authorization is consumed.
+
+## Local fix completed
+
+The two synthetic test contexts depended on the surrounding process's real
+Python thread count. The runner's 25 old tests pass alone, but adding one owned
+background thread reproduces guard-preemption failures. The generator's nominal
+mocked-runtime test also changes from passing to `runtime_rejected` with a live
+background thread. Actual remote thread state was not retained, so this is a
+reproduced defect consistent with the failed identifiers, not a claim that every
+remote failure cause has been proven.
+
+Only the two test files were changed. They now replace their module-under-test's
+`threading` reference with an explicit synthetic count, while retaining real
+current/main thread identity functions. No global threading function or
+production runtime guard was changed. Five added regressions cover modeled
+extra-thread rejection, off-main rejection, and unrelated owned threads.
+
+## Verification
+
+- 46 tests passed on each of Python 3.11.15 and 3.13.7, both with and without an
+  owned background thread: four successful runs, no skips or expected failures.
+- 63 CI scope/workflow guard tests passed. The frozen Source partition still
+  verifies all 423 bound files and preserves its 327 private entries.
+- Production file hashes are unchanged; independent diff review found no blocker;
+  `git diff --check` passed. Current hashes still match the tested files on resume.
+- Ruff and the exact Ubuntu/Python 3.12 CI environment were not available locally.
+  No packages were downloaded to fill those gaps.
+
+## Remaining boundary
+
+The fix is local, uncommitted and unpushed. No workflow, routing or test-selection
+policy was changed; no test was removed, skipped or marked expected-failure.
+Historical reports, plans and started markers remain unchanged. Historical test
+bytes remain at commit `6585a1e073a6a5302630ed63a3c1a3d81adda429`; old native
+qualification plans are not being silently rebound to the edited tests. A future
+qualification successor must explicitly bind their new hashes and counts.
+
+No additional remote read, CI/native rerun, GPU use, checkpoint import or training
+occurred on resume. Source CI still requires remote verification after approved
+publication. The earlier native qualification failure remains separately open;
+its attempt is consumed. Gate 5 is not complete.
+
+Evidence: `evidence/lumi-4b-sft-source-thread-context-fix-v0.1.json` and
+`evidence/lumi-4b-sft-source-failure-names-v0.1.json`.

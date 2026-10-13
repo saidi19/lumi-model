@@ -1,0 +1,128 @@
+"""Correct stale CPU-scope metadata after the successful v0.5 preflight."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_controls_v4 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "7dbac6c340a101fdd6985b813cef5f4e2c4512a17b02c8f2be1f293f9a420d3b"
+BASE_PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.4/plan.json"
+BASE_PLAN_SHA = "afe0b2cbb823250f61034b3d393eb89473a9ffaa430cb6915a2c0099c6a24c86"
+SOURCE_RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.4"
+SOURCE_RELEASE_SHA = "29b71cbaf944c97867bc8466e19aa8ff3e89834ec12641ff0744f651b70d9bfb"
+HOST_PROPOSAL = SOURCE_RELEASE + "/configs/lumi-vm-fullsize-host-proposal-v0.1.json"
+PREFLIGHT = "evidence/lumi-vm-attempt-018-readonly-preflight-verification-v0.5.json"
+PREFLIGHT_SHA = "c4ec0781342f87e192128361e73fa16ce021adffdcaf16585df383be4f5af709"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.5"
+ATTEMPT = previous.ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_control_plan_v5_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None):
+    path = ROOT / name
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    previous.build()
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    release = json.loads(read(SOURCE_RELEASE + "/release.json", SOURCE_RELEASE_SHA))
+    host_pin = release["outputs"]["configs/lumi-vm-fullsize-host-proposal-v0.1.json"]
+    host_raw = read(HOST_PROPOSAL, host_pin["sha256"])
+    need(len(host_raw) == host_pin["bytes"])
+    host = json.loads(host_raw)
+    preflight = json.loads(read(PREFLIGHT, PREFLIGHT_SHA))
+    need(
+        preflight["status"] == "readonly_preflight_passed"
+        and preflight["source_release_sha256"] == SOURCE_RELEASE_SHA
+        and preflight["cloud_mutations"] == preflight["object_access"] == 0
+        and preflight["execution_authority_created"] is False
+        and host["transport"]["source_versions_bound"] is True
+        and host["transport"]["hard_ip_packet_quotas_implemented"] is True
+        and host["transport"]["wire_or_billing_byte_cap_claimed"] is False
+        and host["retention_proposal"]["status"]
+        == "implemented_requires_admitted_one_shot_credentials_and_readback"
+        and host["controls"]["watchdog_launch_interlock_bound"] is True
+        and host["controls"]["cpu_execution_authorized"] is False
+    )
+    scope = dict(plan["cpu_scope_reference"])
+    scope["output"] = "artifacts/lumi-vm-private-outer-execution-v0.22/attempt-018"
+    scope["source"] = host["transport"]
+    scope["retention"] = host["retention_proposal"]
+    scope["status"] = "guarded_execution_prepared_not_authorized"
+    scope["watchdog_launch_interlock_bound"] = True
+    scope["watchdog_exact_attempt_and_instance_scope"] = True
+    scope["execution_entry_sha256"] = None
+    scope["separate_full_scope_approval_required"] = True
+    plan["schema"] = "lumi.vm-attempt-018-control-plan.v0.5"
+    plan["status"] = "readonly_preflight_passed_v022_proposal_required"
+    plan["cpu_scope_reference"] = scope
+    plan["successful_readonly_preflight"] = {"path": PREFLIGHT, "sha256": PREFLIGHT_SHA}
+    plan["readiness_review"]["decision"] = "explicit_v022_cpu_approval_required"
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Fresh v0.22 proposal and explicit approval bind the corrected final scope and hashes",
+        "Immediate pre-launch read-only admission passes again before the execution marker",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-018-control-plan-release.v0.5",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": SOURCE_RELEASE_SHA,
+        "successful_readonly_preflight_sha256": PREFLIGHT_SHA,
+        "source_versions_bound": True,
+        "retention_implementation_bound": True,
+        "watchdog_launch_interlock_bound": True,
+        "network_quota_kind": "nftables_ip_packet_quota",
+        "wire_or_billing_byte_cap_claimed": False,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

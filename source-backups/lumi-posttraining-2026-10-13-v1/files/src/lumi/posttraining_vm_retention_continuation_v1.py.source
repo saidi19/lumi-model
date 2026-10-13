@@ -1,0 +1,220 @@
+"""Private post-completion adapter; never restart acquisition or model import.
+
+Consumes a separate credential pipe after the original detached parent has
+finished and been reaped. Requires independent retention-scope admission,
+private-bucket/SDK/release checks and writer exclusion by the final controller.
+This module does not open a public CLI or create an authorization binding.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import math
+import time
+import types
+from pathlib import Path
+
+from . import posttraining_vm_detached_parent_v1 as original
+from . import posttraining_vm_retention_unit_v1 as worker
+
+setup = original.setup
+ROOT = original.handoff.ROOT
+REPO = Path(__file__).resolve().parents[2]
+ATTEMPT = worker.retention.ATTEMPT
+ENTRY_SHA = "4ec3f33ba9236f34f3ceb1b0c83f2c8abc46c9ec969b8f5c964bf5dd6f390197"
+WORKER_SHA = "f9b2965c257af4ffa7e091e92fcc3598849cbfb7497797f9d506a95b97d52e31"
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_continuation_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _validator():
+    raw = worker.retention.small(REPO / "scripts/run_sft_vm_parent_entry_v2.py", "root", 0o400)
+    need(sha(raw) == ENTRY_SHA)
+    module = types.ModuleType("_retention_prior_binding_validator")
+    exec(compile(raw, "bound_prior_parent_entry", "exec"), module.__dict__)
+    return module
+
+
+def _completed_parent(attempt, machine_id, expected_binding_sha256):
+    need(attempt == ATTEMPT and worker.retention.pin(expected_binding_sha256))
+    original.handoff.frozen.host_check(machine_id)
+    root = ROOT / attempt
+    prior = _validator()
+    controller = root / "controller"
+    need(sha(prior.root_file(controller / "parent.py")) == ENTRY_SHA)
+    # Authenticate the original root controller closure; this does not execute it.
+    for name, pin in prior.SOURCE_PINS.items():
+        need(sha(prior.root_file(controller / "src/lumi" / name)) == pin)
+    raw = prior.root_file(controller / "binding.json", 16384)
+    pin = prior.root_file(controller / "binding.sha256", 65).decode("ascii").strip()
+    need(pin == expected_binding_sha256 == sha(raw))
+    boot = original.handoff.frozen.small(Path("/proc/sys/kernel/random/boot_id"), 65)
+    now = time.clock_gettime(time.CLOCK_BOOTTIME)
+    binding = prior.validate_binding(
+        prior.decode(raw), attempt, "status", machine_id, boot.strip().decode("ascii"), now
+    )
+    # Keep the original 300-second host teardown allowance; never restart it.
+    remaining = binding["host_deadline_boottime"] - now - 300
+    need(math.isfinite(remaining) and remaining >= 1800)
+    status = original._status_admitted(attempt)
+    need(
+        worker.retention.canonical(status)
+        == worker.retention.canonical(
+            dict(
+                state="workflow_returned",
+                parent_cgroup_empty=True,
+                children_reaped=True,
+                gate_5_complete=False,
+                retry_allowed=False,
+            )
+        )
+    )
+    raw_result = worker.retention.small(root / "detached-parent.result.json", "root", 0o600, 4096)
+    need(
+        worker.retention.canonical(worker.retention.decode(raw_result))
+        == worker.retention.canonical(
+            dict(state="workflow_returned", gate_5_complete=False, offhost_retention_verified=False)
+        )
+    )
+    completed = worker.retention.decode(
+        worker.retention.small(root / "completion.json", "root", 0o600)
+    )
+    worker.retention._runtime(attempt)
+    need(completed["status"] == "verified_package_preserved_locally_offhost_retention_pending")
+    start = time.monotonic()
+    need(binding["host_deadline_boottime"] - time.clock_gettime(time.CLOCK_BOOTTIME) - 300 >= 1800)
+    return completed, start + 1800
+
+
+def normalize_retention_credentials(raw, now, required_seconds):
+    """Separate STS session, valid for the remaining budget plus 60 seconds.
+
+    Shape/lifetime only: issuer identity, exact-prefix IAM scope and private
+    bucket policy still require independent admission. Never use AWS profiles.
+    """
+    need(type(raw) in {bytes, bytearray} and 0 < len(raw) <= setup.MAX_INPUT)
+    need(type(now) in {int, float} and math.isfinite(now))
+    need(type(required_seconds) in {int, float} and math.isfinite(required_seconds))
+    need(0 < required_seconds <= 1800)
+    value = worker.retention.decode(raw)
+    need(set(value) == {"AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration"})
+    keys = {
+        "AccessKeyId": "access_key",
+        "SecretAccessKey": "secret_key",
+        "SessionToken": "session_token",
+    }
+    need(
+        all(
+            type(value[k]) is str
+            and 1 <= len(value[k]) <= 16384
+            and all(32 < ord(c) < 127 for c in value[k])
+            for k in keys
+        )
+    )
+    need(value["AccessKeyId"].startswith("ASIA"))
+    need(type(value["Expiration"]) is str and len(value["Expiration"]) <= 40)
+    expiry = dt.datetime.fromisoformat(value["Expiration"].replace("Z", "+00:00"))
+    need(expiry.tzinfo is not None and expiry.utcoffset() == dt.timedelta(0))
+    need(required_seconds + 60 <= expiry.timestamp() - now <= 3600)
+    result = worker.retention.canonical({out: value[k] for k, out in keys.items()}) + b"\n"
+    need(len(result) <= setup.MAX_INPUT)
+    return result
+
+
+def continue_retention(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _continue_admitted_once(attempt, *, machine_id, expected_binding_sha256, credential_fd):
+    """Final controller must independently admit this retention operation.
+
+    The old acquisition/import binding is only provenance/time evidence, NOT
+    new retention authorization. Caller owns the pipe and supervisor lifetime.
+    No approval boolean or public execute path can substitute for admission.
+    """
+    completed, deadline = _completed_parent(attempt, machine_id, expected_binding_sha256)
+    root = ROOT / attempt
+    source = root / "retention-credentials"
+    for path in (source, root / "retention-worker"):
+        need(not path.exists() and not path.is_symlink())
+    original.marker(root, "retention-continuation.started.json", dict(retry_allowed=False))
+    phase, mount, snapshot, ownership, raw = "receive", None, None, {}, None
+    cleanup_attempted = False
+    try:
+        raw = setup._read_pipe(credential_fd, min(deadline, time.monotonic() + 5))
+        normalized = normalize_retention_credentials(raw, time.time(), deadline - time.monotonic())
+        phase = "credential_setup"
+        source.mkdir(mode=0o700, exist_ok=False)
+        setup.completion._fsync_directory(root)
+        mount = setup._mount_empty(source)
+        setup._write_source(source, normalized, ownership)
+        snapshot = setup.workflow._snapshot(source)
+        phase = "retention_worker"
+        result = worker._run_admitted_once(
+            attempt, completed, entry_sha256=WORKER_SHA, machine_id=machine_id, deadline=deadline
+        )
+        need(
+            type(result) is dict
+            and result.get("retention_cgroup_reaped") is True
+            and result.get("credential_source_unlinked") is True
+            and result.get("credential_tmpfs_unmounted") is True
+            and result.get("gate_5_complete") is False
+            and result.get("instance_termination_allowed") is False
+        )
+        worker._validate_result(result["retention"], completed)
+        phase = "receipt"
+        report = dict(
+            schema="lumi.vm-retention-continuation.v0.1",
+            offhost_retention_verified=True,
+            retention_cgroup_reaped=True,
+            credential_source_cleanup_complete=True,
+            binding_sha256=expected_binding_sha256,
+            commit_sha256=result["retention"]["commit_sha256"],
+            real_4b_import=False,
+            gate_5_complete=False,
+            training_authorized=False,
+            production_eligible=False,
+            instance_termination_allowed=False,
+            retry_allowed=False,
+        )
+        original.marker(root, "retention-continuation.result.json", report)
+        return report
+    except BaseException:
+        # Once the worker marker exists its own cleanup attempt is authoritative:
+        # do not repeat it, even if failed or interrupted. Ambiguous mount setup
+        # is also preserved rather than guessed/unmounted.
+        if mount is not None and not (root / "retention-worker").exists():
+            cleanup_attempted = True
+            try:
+                setup._abandon_undispatched(
+                    source, mount, snapshot, worker.unit_name(attempt), ownership
+                )
+            except BaseException:
+                pass
+        try:
+            original.marker(
+                root,
+                "retention-continuation.failed.json",
+                dict(
+                    stage=phase,
+                    predispatch_cleanup_attempted=cleanup_attempted,
+                    retry_allowed=False,
+                    output_deletion_allowed=False,
+                    instance_termination_allowed=False,
+                ),
+            )
+        except BaseException:
+            pass
+        raise ValueError("retention_continuation_failed") from None
+    finally:
+        if isinstance(raw, bytearray):
+            raw[:] = b"\0" * len(raw)
+        # This clears one buffer, not all Python/kernel copies or credentials.

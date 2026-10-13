@@ -1,0 +1,766 @@
+"""Generated controls and fixed script doubles; no actual worker, payload or native ML."""
+
+from __future__ import annotations
+
+import ast
+import copy
+import importlib
+import importlib.util
+import json
+import stat
+import sys
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "scripts/run_checkpoint_fullsize_import_v1.py"
+spec = importlib.util.spec_from_file_location("_lumi_fullsize_script_tests", SCRIPT)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+fixture_spec = importlib.util.spec_from_file_location("_fullsize_script_entry_fixture",
+    ROOT / "tests/test_sft_checkpoint_fullsize_entry_v1.py")
+fixtures = importlib.util.module_from_spec(fixture_spec)
+fixture_spec.loader.exec_module(fixtures)
+entry = fixtures.m
+bootstrap = importlib.import_module(
+    fixtures.PACKAGE + ".posttraining_checkpoint_fullsize_bootstrap_v1")
+
+
+class FullsizeScriptTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(m, "_ATTEMPTED", False))
+        self.bodies, self.sources = fixtures.fixture(fullsize=True)
+        self.entry_raw = b"# synthetic fixed entry\n"
+        self.control_raw = entry.build_control(self.bodies,
+            entry_sha256=fixtures.digest(self.entry_raw),
+            source_manifest_sha256=fixtures.SOURCE_PIN,
+            attempt_nonce_sha256=fixtures.NONCE_PIN)
+        self.environment = {**m.FIXED_ENV,
+            "LUMI_FULLSIZE_ENTRY_SHA256": fixtures.digest(self.entry_raw),
+            "LUMI_FULLSIZE_CONTROL_SHA256": fixtures.digest(self.control_raw),
+            "LUMI_IMPORT_SOURCE_MANIFEST_SHA256": fixtures.SOURCE_PIN,
+            "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256": fixtures.NONCE_PIN}
+        self.argv = [str(m.ENTRY), "--bound-checkpoint-import"]
+        self.entry_arguments = fixtures.arguments(self.bodies, self.sources, self.control_raw)
+        self.entry_arguments["expected_entry_sha256"] = fixtures.digest(self.entry_raw)
+        self.prepared = entry.prepare_entry(**self.entry_arguments)
+        self.worker = entry._result(fixtures.coordinator_result(self.prepared), self.prepared)
+        self.files = dict.fromkeys(m.REQUIRED_SOURCES, b"# synthetic source\n")
+        self.files.update({"lumi/" + name: body for name, body in self.sources.items()})
+        total = sum(map(len, self.files.values()))
+        self.source_report = {"source_manifest_sha256": fixtures.SOURCE_PIN,
+            "source_files_verified": len(self.files), "source_bytes_verified": total,
+            "source_verification_read_bytes": total + 1000}
+        self.copy_report = {"private_source_copy_files": len(self.files),
+            "private_source_copy_bytes_reserved": total,
+            "private_source_copy_readback_bytes": total,
+            "private_source_copies_rootfs_immutable": False,
+            "hostile_owner_code_immutability_verified": False}
+
+    def invoke(self, **overrides):
+        return m._run_admitted_once(**({"argv": self.argv, "environment": self.environment}
+                                       | overrides))
+
+    def validate_control(self, raw=None):
+        raw = self.control_raw if raw is None else raw
+        return m.validate_control(raw, expected_control_sha256=fixtures.digest(raw),
+            expected_entry_sha256=fixtures.digest(self.entry_raw),
+            expected_source_manifest_sha256=fixtures.SOURCE_PIN,
+            expected_attempt_nonce_sha256=fixtures.NONCE_PIN)
+
+    def validate_sources(self, *, files=None, source_report=None, copy_report=None):
+        return m.validate_source_reports(self.files if files is None else files,
+            self.source_report if source_report is None else source_report,
+            self.copy_report if copy_report is None else copy_report,
+            expected_manifest_sha256=fixtures.SOURCE_PIN)
+
+    def pipeline_doubles(self):
+        events = []
+
+        def read(path, *, maximum):
+            events.append(("read", path, maximum))
+            if path == m.ENTRY:
+                return self.entry_raw
+            if path == m.CONTROL:
+                return self.control_raw
+            self.assertEqual(path.parent, m.CONTROL_ROOT)
+            return self.bodies[path.name]
+
+        helper = Mock()
+        helper.verify_source_tree.side_effect = lambda *_: events.append("source_verified") or (
+            self.files, self.source_report)
+        helper.stage_private_sources.side_effect = lambda *_: events.append("staged") or (
+            Path("/outputs/lumi-import-code-generated/src"), self.copy_report)
+        module = types.SimpleNamespace(
+            prepare_entry=Mock(side_effect=lambda **kwargs: events.append("prepared")
+                               or entry.prepare_entry(**kwargs)),
+            _run_admitted_once=Mock(side_effect=lambda **_kwargs: events.append("imported")
+                                   or self.worker))
+        runtime = self.stack.enter_context(patch.object(m, "runtime_check"))
+        reading = self.stack.enter_context(patch.object(m, "root_read", side_effect=read))
+        loading = self.stack.enter_context(patch.object(m, "load_helpers", return_value=helper))
+        output = self.stack.enter_context(patch.object(m, "_output_check",
+            side_effect=lambda *_: events.append("output")))
+        parent = self.stack.enter_context(patch.object(m, "prepare_import_parent",
+            side_effect=lambda *_: events.append("parent")))
+        install = self.stack.enter_context(patch.object(m, "install_package",
+            side_effect=lambda *_: events.append("installed") or module))
+        duplicate = self.stack.enter_context(patch.object(m.os, "dup", return_value=99001))
+        redirect = self.stack.enter_context(patch.object(m.os, "dup2"))
+        close = self.stack.enter_context(patch.object(m.os, "close"))
+        stream = self.stack.enter_context(patch.object(m.sys, "stdout"))
+        writing = self.stack.enter_context(patch.object(m.os, "write",
+                                                        side_effect=AssertionError("no stdout")))
+        return types.SimpleNamespace(events=events, helper=helper, module=module, runtime=runtime,
+            reading=reading, loading=loading, output=output, parent=parent, install=install,
+            writing=writing, duplicate=duplicate, redirect=redirect, close=close, stream=stream)
+
+    def test_public_main_is_unconditionally_closed_before_any_effect_or_dispatch(self):
+        forbidden = Mock(side_effect=AssertionError("public entry must be inert"))
+        with patch.object(m, "runtime_check", forbidden), \
+                patch.object(m, "_run_admitted_once", forbidden), \
+                patch.object(m, "root_read", forbidden), patch.object(m.os, "write", forbidden), \
+                patch("builtins.open", forbidden), patch("os.open", forbidden), \
+                patch("socket.socket", forbidden):
+            self.assertEqual(m.main(), 2)
+        forbidden.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_local_runtime_rejects_before_source_or_control_reads(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "root_read") as read:
+            with self.assertRaisesRegex(m.FullsizeScriptError, "^runtime_rejected$"):
+                self.invoke()
+        read.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_fixed_argv_rejects_paths_approval_or_missing_option(self):
+        for argv in ([str(m.ENTRY)], [str(m.ENTRY), "--approved"],
+                     [str(m.ENTRY), "--bound-checkpoint-import", "/real/checkpoint"]):
+            with self.subTest(argv=argv), self.assertRaises(m.FullsizeScriptError):
+                m.runtime_check(argv, self.environment)
+
+    def test_fixed_environment_and_pins_match_fullsize_bootstrap(self):
+        self.assertEqual(m.FIXED_ENV, bootstrap.FIXED_ENV)
+        self.assertEqual(m.PIN_KEYS, bootstrap.HASH_ENV)
+        self.assertEqual(str(m.ENTRY), bootstrap.ENTRY)
+        self.assertEqual(tuple(self.argv), bootstrap.ARGV[3:])
+
+    def supported_runtime_doubles(self):
+        runtime = types.SimpleNamespace(platform="linux", implementation=types.SimpleNamespace(
+            name="cpython"), version_info=(3, 12, 0), flags=types.SimpleNamespace(
+            isolated=1, ignore_environment=1, no_user_site=1, optimize=0),
+            dont_write_bytecode=True, byteorder="little", modules={})
+        self.stack.enter_context(patch.object(m, "sys", runtime))
+        self.stack.enter_context(patch.object(m.os, "uname",
+                                              return_value=types.SimpleNamespace(machine="x86_64")))
+        self.stack.enter_context(patch.object(m.os, "getresuid",
+                                              return_value=(10001, 10001, 10001), create=True))
+        self.stack.enter_context(patch.object(m.os, "getresgid",
+                                              return_value=(10001, 10001, 10001), create=True))
+        self.stack.enter_context(patch.object(m.os, "getgroups", return_value=[]))
+        thread = object()
+        self.stack.enter_context(patch.object(m.threading, "current_thread", return_value=thread))
+        self.stack.enter_context(patch.object(m.threading, "main_thread", return_value=thread))
+        self.stack.enter_context(patch.object(m.threading, "active_count", return_value=1))
+        return runtime
+
+    def test_supported_runtime_metadata_accepts_exact_environment_without_io(self):
+        self.supported_runtime_doubles()
+        with patch.object(m, "root_read") as read, patch.object(m.os, "open") as opened:
+            m.runtime_check(self.argv, self.environment)
+        read.assert_not_called()
+        opened.assert_not_called()
+
+    def test_supported_runtime_still_rejects_environment_injection_or_invalid_pins(self):
+        self.supported_runtime_doubles()
+        variants = [self.environment | {"LD_PRELOAD": "/secret/library"},
+                    self.environment | {"PATH": "/secret/bin"},
+                    {key: value for key, value in self.environment.items() if key != "LC_ALL"}]
+        for key in m.PIN_KEYS:
+            for value in (True, "0" * 64, "A" * 64, "f" * 63, None):
+                variants.append(self.environment | {key: value})
+        for environment in variants:
+            with self.subTest(environment=environment), \
+                    self.assertRaisesRegex(m.FullsizeScriptError, "^runtime_rejected$"):
+                m.runtime_check(self.argv, environment)
+
+    def test_supported_runtime_rejects_imported_ml_or_existing_lumi_namespace(self):
+        runtime = self.supported_runtime_doubles()
+        for name in (*m.ML_ROOTS, "lumi", "lumi.private", "torch.nn"):
+            runtime.modules = {name: object()}
+            with self.subTest(name=name), \
+                    self.assertRaisesRegex(m.FullsizeScriptError, "^runtime_rejected$"):
+                m.runtime_check(self.argv, self.environment)
+
+    def test_supported_runtime_rejects_wrong_uid_gid_and_additional_threads(self):
+        self.supported_runtime_doubles()
+        for method in ("getresuid", "getresgid"):
+            with self.subTest(method=method), patch.object(m.os, method, return_value=(0, 0, 0)), \
+                    self.assertRaisesRegex(m.FullsizeScriptError, "^runtime_rejected$"):
+                m.runtime_check(self.argv, self.environment)
+        with patch.object(m.threading, "active_count", return_value=2), \
+                self.assertRaisesRegex(m.FullsizeScriptError, "^runtime_rejected$"):
+            m.runtime_check(self.argv, self.environment)
+
+    def test_helper_size_and_hash_match_frozen_file(self):
+        raw = (ROOT / "scripts/run_checkpoint_guarded_import_v1.py").read_bytes()
+        self.assertEqual((len(raw), fixtures.digest(raw)), (m.HELPER_BYTES, m.HELPER_SHA256))
+        self.assertEqual((m.HELPER_BYTES, m.HELPER_SHA256),
+            (14356, "687a2989ccefdf2466dc77cda62d99d5c6428bc60c74e0e32e15991cec120690"))
+
+    def test_actual_source_closure_and_script_bind_to_generated_fullsize_controls(self):
+        # Only code and generated metadata: no model/data file is read, staged or run.
+        manifest = (ROOT / "configs/lumi-4b-sft-fullsize-import-source-manifest-v0.1.json"
+                    ).read_bytes()
+        files = {row["path"]: (ROOT / "src" / row["path"]).read_bytes()
+                 for row in json.loads(manifest)["files"]}
+        script = SCRIPT.read_bytes()
+        helper = (ROOT / "scripts/run_checkpoint_guarded_import_v1.py").read_bytes()
+        addon = importlib.import_module(fixtures.PACKAGE
+                                       + ".posttraining_checkpoint_fullsize_sources_v1")
+        composition = importlib.import_module(fixtures.PACKAGE
+                                             + ".posttraining_checkpoint_fullsize_composition_v1")
+        bodies, old_runtime = fixtures.fixture(fullsize=True)
+        runtime = {name: files["lumi/" + name] for name in m.RUNTIME_NAMES}
+        delta = sum(map(len, runtime.values())) - sum(map(len, old_runtime.values()))
+        envelope = json.loads(bodies["envelope.json"])
+        envelope["runtime_sources"] = [{"path": name, "bytes": len(raw),
+                                        "sha256": fixtures.digest(raw)}
+                                       for name, raw in runtime.items()]
+        envelope["hf_read_cap_bytes"] += 2 * delta
+        envelope["coordinator_read_cap_bytes"] += 3 * delta
+        bodies["envelope.json"] = fixtures.canonical(envelope)
+        kernel = json.loads(bodies["kernel-io.json"])
+        kernel["hf_io_contract"]["maximum_read_bytes"] = envelope["hf_read_cap_bytes"]
+        bodies["kernel-io.json"] = fixtures.canonical(fixtures.io.build_kernel_io_contract(
+            json.loads(bodies["plan.json"]),
+            checkpoint_read_contract=kernel["checkpoint_read_contract"],
+            hf_io_contract=kernel["hf_io_contract"]))
+        entry_pin, manifest_pin = fixtures.digest(script), fixtures.digest(manifest)
+        control = entry.build_control(bodies, entry_sha256=entry_pin,
+            source_manifest_sha256=manifest_pin, attempt_nonce_sha256=fixtures.NONCE_PIN)
+        pins = {"expected_entry_sha256": entry_pin,
+                "expected_source_manifest_sha256": manifest_pin,
+                "expected_control_sha256": fixtures.digest(control),
+                "expected_attempt_nonce_sha256": fixtures.NONCE_PIN}
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            header = m.validate_control(control, **pins)
+            m.validate_bodies(header, bodies)
+            prepared = entry.prepare_entry(control, bodies, runtime_sources=runtime, **pins)
+            summary = addon.validate_bundle(files, manifest, script, helper, control, bodies,
+                expected_manifest_sha256=manifest_pin, expected_entry_sha256=entry_pin,
+                expected_control_sha256=fixtures.digest(control),
+                expected_attempt_nonce_sha256=fixtures.NONCE_PIN)
+            worker = entry._result(fixtures.coordinator_result(prepared), prepared)
+            self.assertEqual(m.validate_worker(worker, prepared),
+                             composition._worker(worker, prepared))
+        self.assertEqual(prepared["plan"]["model_parameters"], 4002376704)
+        self.assertEqual(summary["source_files"], 39)
+        self.assertLessEqual(summary["addon_bytes"], addon.MAXIMUM_ADDON_BYTES)
+        self.assertFalse(summary["execution_permitted"])
+        self.assertEqual(bootstrap.validate_environment(summary["environment"]),
+                         summary["environment"])
+
+    def test_wrong_helper_bytes_never_execute(self):
+        with patch.object(m, "root_read", return_value=b"raise RuntimeError('private')"), \
+                patch("builtins.exec") as execute:
+            with self.assertRaisesRegex(m.FullsizeScriptError, "^helper_binding_rejected$"):
+                m.load_helpers()
+        execute.assert_not_called()
+
+    def test_self_entry_hash_is_bound_before_helper_or_any_other_read(self):
+        doubles = self.pipeline_doubles()
+        self.entry_raw += b"# corrupt"
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^entry_binding_rejected$"):
+            self.invoke()
+        doubles.reading.assert_called_once()
+        doubles.loading.assert_not_called()
+        doubles.install.assert_not_called()
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_success_orders_fixed_reads_source_stage_prepare_and_one_import(self):
+        doubles = self.pipeline_doubles()
+        self.assertEqual(self.invoke(), self.worker)
+        self.assertEqual([event[1] for event in doubles.events if isinstance(event, tuple)],
+                         [m.ENTRY, m.CONTROL] + [m.CONTROL_ROOT / name for name in m.CONTROL_NAMES])
+        self.assertEqual([event for event in doubles.events if isinstance(event, str)],
+                         ["source_verified", "output", "parent", "staged", "installed",
+                          "prepared", "imported"])
+        doubles.helper.verify_source_tree.assert_called_once_with(
+            m.SOURCE_ROOT, m.SOURCE_MANIFEST, fixtures.SOURCE_PIN)
+        doubles.helper.stage_private_sources.assert_called_once_with(m.OUTPUT, self.files)
+        doubles.module.prepare_entry.assert_called_once_with(**self.entry_arguments)
+        doubles.module._run_admitted_once.assert_called_once_with(**self.entry_arguments)
+        doubles.parent.assert_called_once_with(doubles.helper)
+        doubles.writing.assert_not_called()
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_success_is_consumed_and_second_call_cannot_read_or_dispatch_again(self):
+        doubles = self.pipeline_doubles()
+        self.invoke()
+        doubles.reading.reset_mock()
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+            self.invoke()
+        doubles.reading.assert_not_called()
+        doubles.module._run_admitted_once.assert_called_once()
+
+    def test_ambiguous_first_read_failure_consumes_attempt_without_retry(self):
+        doubles = self.pipeline_doubles()
+        doubles.reading.side_effect = OSError("secret entry path")
+        with self.assertRaises(m.FullsizeScriptError) as caught:
+            self.invoke()
+        self.assertNotIn("secret", str(caught.exception))
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+            self.invoke()
+        doubles.reading.assert_called_once()
+        doubles.loading.assert_not_called()
+
+    def test_each_body_is_read_at_exact_pinned_cap_and_corruption_precedes_source_stage(self):
+        for name in m.CONTROL_NAMES:
+            with self.subTest(name=name), patch.object(m, "_ATTEMPTED", False):
+                original = self.bodies[name]
+                self.bodies[name] += b"corrupt"
+                doubles = self.pipeline_doubles()
+                with self.assertRaises(m.FullsizeScriptError):
+                    self.invoke()
+                self.assertIn(((m.CONTROL_ROOT / name,), {"maximum": len(original)}),
+                    [(call.args, call.kwargs) for call in doubles.reading.call_args_list])
+                doubles.helper.verify_source_tree.assert_not_called()
+                doubles.parent.assert_not_called()
+                doubles.install.assert_not_called()
+                self.bodies[name] = original
+
+    def test_malicious_header_names_and_types_are_rejected_before_any_body_read(self):
+        original = json.loads(self.control_raw)
+        changes = [lambda c: c["files"][0].update(path="../outside"),
+                   lambda c: c["files"][0].update(path="/secret/absolute"),
+                   lambda c: c["files"][0].update(bytes=True),
+                   lambda c: c["files"][0].update(bytes=0),
+                   lambda c: c["files"][0].update(bytes=m.MAXIMUM_CONTROL_BYTES + 1),
+                   lambda c: c["files"][0].update(sha256="A" * 64),
+                   lambda c: c["files"].reverse(),
+                   lambda c: c.update(approved=True)]
+        for change in changes:
+            with self.subTest(change=change), patch.object(m, "_ATTEMPTED", False):
+                control = copy.deepcopy(original)
+                change(control)
+                self.control_raw = fixtures.canonical(control)
+                self.environment["LUMI_FULLSIZE_CONTROL_SHA256"] = fixtures.digest(self.control_raw)
+                doubles = self.pipeline_doubles()
+                with self.assertRaises(m.FullsizeScriptError):
+                    self.invoke()
+                self.assertEqual([call.args[0] for call in doubles.reading.call_args_list],
+                                 [m.ENTRY, m.CONTROL])
+                doubles.helper.verify_source_tree.assert_not_called()
+                doubles.parent.assert_not_called()
+
+    def test_noncanonical_duplicate_and_nonfinite_headers_reject_before_source_or_write(self):
+        for raw in (self.control_raw + b"\n", b'{"x":1,"x":2}', b'{"x":NaN}',
+                    b'{"x":1e999}', b'[]', b'not-json'):
+            with self.subTest(raw=raw[:30]), patch.object(m, "_ATTEMPTED", False):
+                self.control_raw = raw
+                self.environment["LUMI_FULLSIZE_CONTROL_SHA256"] = fixtures.digest(raw)
+                doubles = self.pipeline_doubles()
+                with self.assertRaises(m.FullsizeScriptError):
+                    self.invoke()
+                doubles.helper.verify_source_tree.assert_not_called()
+                doubles.parent.assert_not_called()
+                doubles.install.assert_not_called()
+
+    def test_control_and_body_validation_are_pure_and_detached(self):
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            control = self.validate_control()
+            bodies = m.validate_bodies(control, self.bodies)
+        self.assertEqual(bodies, self.bodies)
+        self.assertIsNot(bodies, self.bodies)
+
+    def test_control_validator_rejects_each_independent_pin_mismatch(self):
+        pins = {"expected_control_sha256": fixtures.digest(self.control_raw),
+            "expected_entry_sha256": fixtures.digest(self.entry_raw),
+            "expected_source_manifest_sha256": fixtures.SOURCE_PIN,
+            "expected_attempt_nonce_sha256": fixtures.NONCE_PIN}
+        for key in pins:
+            with self.subTest(key=key), self.assertRaises(m.FullsizeScriptError):
+                m.validate_control(self.control_raw, **(pins | {key: "f" * 64}))
+
+    def test_source_and_copy_reports_validate_purely_without_claiming_immutability(self):
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            result = self.validate_sources()
+        self.assertIsInstance(result, dict)
+        self.assertNotIn("lumi/modeling_lumi.py", fixtures.canonical(result).decode())
+        self.assertNotIn("synthetic source", fixtures.canonical(result).decode())
+
+    def test_source_reports_reject_extra_fields_wrong_pins_bool_and_inconsistent_counts(self):
+        changes = {"source_manifest_sha256": "f" * 64, "source_files_verified": True,
+            "source_bytes_verified": self.source_report["source_bytes_verified"] + 1,
+            "source_verification_read_bytes": self.source_report["source_bytes_verified"] - 1,
+            "extra_private_path": "/secret/source"}
+        for key, value in changes.items():
+            with self.subTest(key=key), self.assertRaises(m.FullsizeScriptError):
+                self.validate_sources(source_report=self.source_report | {key: value})
+        for key in self.source_report:
+            report = dict(self.source_report)
+            del report[key]
+            with self.subTest(missing=key), self.assertRaises(m.FullsizeScriptError):
+                self.validate_sources(source_report=report)
+
+    def test_source_paths_types_counts_and_byte_caps_reject_without_io(self):
+        too_many = self.files | {f"lumi/extra_{index}.py": b"" for index in range(129)}
+        too_large = {**self.files, "lumi/large.py": b"x" * (m.MAXIMUM_SOURCE_FILE_BYTES + 1)}
+        too_total = self.files | {f"lumi/large_{index}.py": b"x" * m.MAXIMUM_SOURCE_FILE_BYTES
+                                  for index in range(17)}
+        variants = [too_many, too_large, too_total, self.files | {"../secret.py": b"code"},
+                    self.files | {"lumi/configuration_lumi.py": bytearray(b"source")}]
+        for files in variants:
+            with self.subTest(count=len(files)), self.assertRaises(m.FullsizeScriptError):
+                self.validate_sources(files=files)
+
+    def test_copy_reports_reject_extra_fields_bool_counts_and_fabricated_immutability(self):
+        changes = {"private_source_copy_files": True,
+            "private_source_copy_bytes_reserved": self.copy_report[
+                "private_source_copy_bytes_reserved"] + 1,
+            "private_source_copy_readback_bytes": self.copy_report[
+                "private_source_copy_readback_bytes"] - 1,
+            "private_source_copies_rootfs_immutable": True,
+            "hostile_owner_code_immutability_verified": True, "extra_private_path": "/secret/copy"}
+        for key, value in changes.items():
+            with self.subTest(key=key), self.assertRaises(m.FullsizeScriptError):
+                self.validate_sources(copy_report=self.copy_report | {key: value})
+        for key in self.copy_report:
+            report = dict(self.copy_report)
+            del report[key]
+            with self.subTest(missing=key), self.assertRaises(m.FullsizeScriptError):
+                self.validate_sources(copy_report=report)
+
+    def test_bad_source_report_is_rejected_before_output_creation(self):
+        doubles = self.pipeline_doubles()
+        self.source_report["source_files_verified"] = True
+        with self.assertRaises(m.FullsizeScriptError):
+            self.invoke()
+        doubles.output.assert_not_called()
+        doubles.parent.assert_not_called()
+        doubles.helper.stage_private_sources.assert_not_called()
+
+    def test_bad_copy_report_is_rejected_before_package_install(self):
+        doubles = self.pipeline_doubles()
+        self.copy_report["hostile_owner_code_immutability_verified"] = True
+        with self.assertRaises(m.FullsizeScriptError):
+            self.invoke()
+        doubles.install.assert_not_called()
+        doubles.module._run_admitted_once.assert_not_called()
+
+    def test_source_verification_failure_precedes_all_writes_and_imports(self):
+        doubles = self.pipeline_doubles()
+        doubles.helper.verify_source_tree.side_effect = OSError("secret source path")
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^source_binding_rejected$"):
+            self.invoke()
+        doubles.output.assert_not_called()
+        doubles.parent.assert_not_called()
+        doubles.helper.stage_private_sources.assert_not_called()
+        doubles.install.assert_not_called()
+
+    def test_missing_required_source_rejects_before_output_creation(self):
+        doubles = self.pipeline_doubles()
+        del self.files["lumi/posttraining_checkpoint_fullsize_entry_v1.py"]
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^source_binding_rejected$"):
+            self.invoke()
+        doubles.output.assert_not_called()
+        doubles.parent.assert_not_called()
+        doubles.helper.stage_private_sources.assert_not_called()
+
+    def test_staging_failure_never_installs_or_calls_worker_and_is_consumed(self):
+        doubles = self.pipeline_doubles()
+        doubles.helper.stage_private_sources.side_effect = OSError("secret staged path")
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^source_staging_failed$"):
+            self.invoke()
+        doubles.install.assert_not_called()
+        doubles.module._run_admitted_once.assert_not_called()
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_changed_runtime_source_fails_real_resource_validation_before_worker(self):
+        doubles = self.pipeline_doubles()
+        self.files["lumi/modeling_lumi.py"] = b"wrong-source-model"
+        total = sum(map(len, self.files.values()))
+        self.source_report.update(source_bytes_verified=total,
+                                  source_verification_read_bytes=total + 1000)
+        self.copy_report.update(private_source_copy_bytes_reserved=total,
+                                private_source_copy_readback_bytes=total)
+        with self.assertRaises(m.FullsizeScriptError):
+            self.invoke()
+        doubles.module._run_admitted_once.assert_not_called()
+
+    def test_private_worker_failure_is_closed_consumed_and_not_retried(self):
+        doubles = self.pipeline_doubles()
+        doubles.module._run_admitted_once.side_effect = KeyboardInterrupt("secret worker failure")
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^import_failed$"):
+            self.invoke()
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+            self.invoke()
+        doubles.module._run_admitted_once.assert_called_once()
+
+    def test_changed_worker_summary_denies_success_without_retry(self):
+        doubles = self.pipeline_doubles()
+        self.worker = self.worker | {"gate_5_complete": True}
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^result_rejected$"):
+            self.invoke()
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+            self.invoke()
+        doubles.module._run_admitted_once.assert_called_once()
+
+    def test_report_data_never_leaks_into_returned_worker_summary(self):
+        doubles = self.pipeline_doubles()
+        observed = self.invoke()
+        self.assertEqual(set(observed), set(self.worker))
+        self.assertNotIn("source_files_verified", observed)
+        self.assertNotIn("private_source_copy_files", observed)
+        self.assertNotIn("synthetic source", fixtures.canonical(observed).decode())
+        doubles.writing.assert_not_called()
+
+    def test_stdout_is_silenced_before_staged_import_and_restored_once_on_success(self):
+        doubles = self.pipeline_doubles()
+        installed = doubles.install.side_effect
+
+        def install(source):
+            doubles.duplicate.assert_called_once_with(1)
+            doubles.redirect.assert_called_once_with(2, 1)
+            doubles.stream.flush.assert_called_once_with()
+            return installed(source)
+
+        doubles.install.side_effect = install
+        self.assertEqual(self.invoke(), self.worker)
+        self.assertEqual([call.args for call in doubles.redirect.call_args_list],
+                         [(2, 1), (99001, 1)])
+        doubles.close.assert_called_once_with(99001)
+        self.assertEqual(doubles.stream.flush.call_count, 2)
+
+    def test_failed_initial_flush_keeps_null_sink_and_never_imports_or_retries(self):
+        doubles = self.pipeline_doubles()
+        doubles.stream.flush.side_effect = OSError("private buffer text")
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^import_failed$"):
+            self.invoke()
+        doubles.redirect.assert_called_once_with(2, 1)
+        doubles.stream.flush.assert_called_once_with()
+        doubles.close.assert_called_once_with(99001)
+        doubles.install.assert_not_called()
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+            self.invoke()
+
+    def test_failed_final_flush_cannot_reopen_report_channel_or_return_success(self):
+        doubles = self.pipeline_doubles()
+        doubles.stream.flush.side_effect = [None, OSError("private delayed output")]
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^import_failed$"):
+            self.invoke()
+        doubles.redirect.assert_called_once_with(2, 1)
+        self.assertEqual(doubles.stream.flush.call_count, 2)
+        doubles.close.assert_called_once_with(99001)
+        doubles.module._run_admitted_once.assert_called_once()
+        with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+            self.invoke()
+
+    def test_python_buffer_flush_happens_before_restoring_report_descriptor(self):
+        doubles = self.pipeline_doubles()
+        order = []
+        doubles.redirect.side_effect = lambda *args: order.append(("dup2", args))
+        doubles.stream.flush.side_effect = lambda: order.append(("flush", ()))
+        doubles.close.side_effect = lambda *args: order.append(("close", args))
+        self.assertEqual(self.invoke(), self.worker)
+        self.assertEqual(order, [("dup2", (2, 1)), ("flush", ()), ("flush", ()),
+                                 ("dup2", (99001, 1)), ("close", (99001,))])
+
+    def test_import_prepare_and_worker_failures_restore_stdout_and_close_saved_fd_once(self):
+        for stage in ("install", "prepare", "worker"):
+            with self.subTest(stage=stage), patch.object(m, "_ATTEMPTED", False):
+                doubles = self.pipeline_doubles()
+                selected = {"install": doubles.install,
+                            "prepare": doubles.module.prepare_entry,
+                            "worker": doubles.module._run_admitted_once}[stage]
+                selected.side_effect = RuntimeError("secret staged exception")
+                with self.assertRaises(m.FullsizeScriptError):
+                    self.invoke()
+                self.assertEqual([call.args for call in doubles.redirect.call_args_list],
+                                 [(2, 1), (99001, 1)])
+                doubles.close.assert_called_once_with(99001)
+                self.assertTrue(m._ATTEMPTED)
+
+    def test_stdout_duplicate_failure_denies_import_without_restore_or_close_guess(self):
+        doubles = self.pipeline_doubles()
+        doubles.duplicate.side_effect = OSError("secret dup failure")
+        with self.assertRaises(m.FullsizeScriptError):
+            self.invoke()
+        doubles.duplicate.assert_called_once_with(1)
+        doubles.redirect.assert_not_called()
+        doubles.close.assert_not_called()
+        doubles.install.assert_not_called()
+
+    def test_initial_stdout_redirect_failure_restores_and_never_starts_import(self):
+        doubles = self.pipeline_doubles()
+        doubles.redirect.side_effect = [OSError("secret redirect failure"), None]
+        with self.assertRaises(m.FullsizeScriptError):
+            self.invoke()
+        self.assertEqual([call.args for call in doubles.redirect.call_args_list],
+                         [(2, 1), (99001, 1)])
+        doubles.close.assert_called_once_with(99001)
+        doubles.install.assert_not_called()
+
+    def test_ambiguous_stdout_restore_or_close_never_retries_or_returns_success(self):
+        for stage in ("restore", "close"):
+            with self.subTest(stage=stage), patch.object(m, "_ATTEMPTED", False):
+                doubles = self.pipeline_doubles()
+                if stage == "restore":
+                    doubles.redirect.side_effect = [None, OSError("secret restore failure")]
+                else:
+                    doubles.close.side_effect = OSError("secret close failure")
+                with self.assertRaises(m.FullsizeScriptError):
+                    self.invoke()
+                with self.assertRaisesRegex(m.FullsizeScriptError, "^already_attempted$"):
+                    self.invoke()
+                self.assertEqual([call.args for call in doubles.redirect.call_args_list],
+                                 [(2, 1), (99001, 1)])
+                doubles.close.assert_called_once_with(99001)
+                doubles.module._run_admitted_once.assert_called_once()
+
+    def test_package_install_uses_inert_lumi_namespace_and_exact_new_entry_module(self):
+        modules = {key: value for key, value in sys.modules.items()
+                   if key.split(".", 1)[0] not in m.ML_ROOTS | {"lumi"}}
+        with patch.dict(sys.modules, modules, clear=True), \
+                patch.object(m.importlib, "import_module") as imported:
+            m.install_package(Path("/outputs/lumi-import-code-generated/src"))
+            package = sys.modules["lumi"]
+            self.assertEqual(package.__path__, ["/outputs/lumi-import-code-generated/src/lumi"])
+            self.assertIsNone(package.__spec__.loader)
+        imported.assert_called_once_with("lumi.posttraining_checkpoint_fullsize_entry_v1")
+
+    def test_preexisting_lumi_namespace_is_not_overwritten(self):
+        installed = types.ModuleType("lumi")
+        with patch.dict(sys.modules, {"lumi": installed}), \
+                patch.object(m.importlib, "import_module") as imported:
+            with self.assertRaises(m.FullsizeScriptError):
+                m.install_package(Path("/outputs/lumi-import-code-generated/src"))
+            self.assertIs(sys.modules["lumi"], installed)
+        imported.assert_not_called()
+
+    def test_parent_creation_is_fixed_exclusive_private_and_fsynced(self):
+        helper = Mock()
+        helper.open_directory.return_value = 80
+        info = types.SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFDIR | 0o700,
+            st_uid=10001, st_gid=10001, st_nlink=2, st_size=0, st_mtime_ns=1, st_ctime_ns=1)
+        with patch.object(m.os, "fstat", return_value=info), \
+                patch.object(m.os, "mkdir") as mkdir, \
+                patch.object(m.os, "open", return_value=81) as opened, \
+                patch.object(m.os, "stat", return_value=info) as observed, \
+                patch.object(m.os, "fsync") as synced, patch.object(m.os, "close") as closed:
+            m.prepare_import_parent(helper)
+        helper.open_directory.assert_called_once_with(m.OUTPUT)
+        mkdir.assert_called_once_with("import", 0o700, dir_fd=80)
+        opened.assert_called_once_with("import", m.DIR_FLAGS, dir_fd=80)
+        observed.assert_called_once_with("import", dir_fd=80, follow_symlinks=False)
+        self.assertEqual([call.args for call in synced.call_args_list], [(81,), (80,)])
+        self.assertEqual([call.args for call in closed.call_args_list], [(81,), (80,)])
+
+    def test_existing_parent_is_not_reused_removed_or_chmodded(self):
+        helper = Mock()
+        helper.open_directory.return_value = 80
+        info = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=10001, st_gid=10001)
+        with patch.object(m.os, "fstat", return_value=info), \
+                patch.object(m.os, "mkdir", side_effect=FileExistsError("secret path")) as mkdir, \
+                patch.object(m.os, "open") as opened, patch.object(m.os, "rmdir") as remove, \
+                patch.object(m.os, "chmod") as chmod, patch.object(m.os, "close") as closed:
+            with self.assertRaisesRegex(m.FullsizeScriptError, "^output_rejected$"):
+                m.prepare_import_parent(helper)
+        mkdir.assert_called_once()
+        opened.assert_not_called()
+        remove.assert_not_called()
+        chmod.assert_not_called()
+        closed.assert_called_once_with(80)
+
+    def test_root_owned_control_metadata_rejects_worker_owner_writable_mode_and_hardlinks(self):
+        for uid, gid, mode, links in ((10001, 10001, 0o400, 1), (0, 0, 0o666, 1),
+                                     (0, 0, 0o400, 2), (0, 10001, 0o400, 1)):
+            info = types.SimpleNamespace(st_mode=stat.S_IFREG | mode,
+                                         st_uid=uid, st_gid=gid, st_nlink=links)
+            with self.subTest(uid=uid, mode=mode, links=links), \
+                    self.assertRaises(m.FullsizeScriptError):
+                m._root_owned(info)
+
+    def root_read_doubles(self, *, changed=False):
+        directory = types.SimpleNamespace(st_dev=1, st_ino=1, st_mode=stat.S_IFDIR | 0o755,
+            st_uid=0, st_gid=0, st_nlink=2, st_size=128, st_mtime_ns=9, st_ctime_ns=9)
+        control = types.SimpleNamespace(st_dev=1, st_ino=2, st_mode=stat.S_IFREG | 0o400,
+            st_uid=0, st_gid=0, st_nlink=1, st_size=5, st_mtime_ns=9, st_ctime_ns=9)
+        observed = types.SimpleNamespace(**vars(control))
+        if changed:
+            observed.st_ctime_ns += 1
+        opened = self.stack.enter_context(patch.object(m.os, "open",
+            side_effect=lambda path, *_args, **_kwargs: 99 if path == m.CONTROL.name else 50))
+        self.stack.enter_context(patch.object(m.os, "fstat",
+            side_effect=lambda fd: control if fd == 99 else directory))
+        self.stack.enter_context(patch.object(m.os, "stat", return_value=observed))
+        read = self.stack.enter_context(patch.object(m.os, "read", side_effect=[b"ab", b"cde"]))
+        close = self.stack.enter_context(patch.object(m.os, "close"))
+        return opened, read, close
+
+    def test_root_read_walks_nofollow_ancestors_checks_snapshot_and_bounds_each_read(self):
+        opened, read, closed = self.root_read_doubles()
+        self.assertEqual(m.root_read(m.CONTROL, maximum=5), b"abcde")
+        self.assertEqual([call.args for call in read.call_args_list], [(99, 5), (99, 3)])
+        self.assertTrue(all(call.args[1] & m.os.O_NOFOLLOW for call in opened.call_args_list))
+        self.assertEqual(opened.call_args_list[-1].args, (m.CONTROL.name, m.READ_FLAGS))
+        self.assertEqual([call.args for call in closed.call_args_list][-2:], [(99,), (50,)])
+
+    def test_root_read_size_over_cap_rejects_before_read_and_closes_both_handles(self):
+        _, read, closed = self.root_read_doubles()
+        with self.assertRaises(m.FullsizeScriptError):
+            m.root_read(m.CONTROL, maximum=4)
+        read.assert_not_called()
+        self.assertEqual([call.args for call in closed.call_args_list][-2:], [(99,), (50,)])
+
+    def test_root_read_detects_replaced_control_metadata(self):
+        _, _, closed = self.root_read_doubles(changed=True)
+        with self.assertRaises(m.FullsizeScriptError):
+            m.root_read(m.CONTROL, maximum=5)
+        self.assertEqual([call.args for call in closed.call_args_list][-2:], [(99,), (50,)])
+
+    def test_root_read_short_or_invalid_body_closes_once_without_retry(self):
+        for reads in ([b"ab", b""], [b"abcdef"], ["not-bytes"]):
+            with self.subTest(reads=reads):
+                _, read, closed = self.root_read_doubles()
+                read.side_effect = reads
+                with self.assertRaises(m.FullsizeScriptError):
+                    m.root_read(m.CONTROL, maximum=5)
+                self.assertEqual(read.call_count, len(reads))
+                self.assertEqual(sum(call.args == (99,) for call in closed.call_args_list), 1)
+
+    def test_root_read_bad_ancestor_owner_rejects_before_leaf_open_or_payload_read(self):
+        opened, read, closed = self.root_read_doubles()
+        bad = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755,
+                                     st_uid=10001, st_gid=10001, st_nlink=2)
+        with patch.object(m.os, "fstat", return_value=bad):
+            with self.assertRaises(m.FullsizeScriptError):
+                m.root_read(m.CONTROL, maximum=5)
+        opened.assert_called_once_with("/", m.DIR_FLAGS)
+        read.assert_not_called()
+        closed.assert_called_once_with(50)
+
+    def test_ast_has_one_private_entry_call_no_public_import_or_tiny_fixture(self):
+        tree = ast.parse(SCRIPT.read_bytes())
+        calls = [node.func.attr for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Attribute)]
+        self.assertEqual(calls.count("_run_admitted_once"), 1)
+        self.assertNotIn("run_import", calls)
+        self.assertNotIn("run_tiny_fixture", calls)
+        self.assertNotIn("_coordinate_admitted_import", calls)
+
+
+if __name__ == "__main__":
+    unittest.main()

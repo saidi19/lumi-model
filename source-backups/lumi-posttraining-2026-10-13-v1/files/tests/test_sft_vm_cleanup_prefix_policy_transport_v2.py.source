@@ -1,0 +1,53 @@
+import importlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("apply_sft_vm_cleanup_prefix_protection_v2")
+
+
+class TransportTests(unittest.TestCase):
+    def test_json_argument_mode_no_stdin_file_and_no_retries(self):
+        response = types.SimpleNamespace(stdout=b"{}", stderr=b"", returncode=0)
+        with patch.object(m.subprocess, "run", return_value=response) as call:
+            m.Cloud().call(
+                "s3api",
+                "put-bucket-policy",
+                Bucket=m.base.BUCKET,
+                ExpectedBucketOwner=m.base.ACCOUNT,
+                Policy='{"Statement":[]}',
+            )
+        argv = call.call_args.args[0]
+        value = json.loads(argv[argv.index("--cli-input-json") + 1])
+        self.assertEqual(json.loads(value["Policy"]), {"Statement": []})
+        self.assertEqual(call.call_args.kwargs["stdin"], m.subprocess.DEVNULL)
+        self.assertNotIn("input", call.call_args.kwargs)
+        self.assertEqual(call.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+
+    def test_foreign_bucket_unknown_field_and_nonpolicy_write_rejected(self):
+        with patch.object(m.subprocess, "run") as call:
+            for service, operation, fields in (
+                ("s3api", "put-object", {}),
+                (
+                    "s3api",
+                    "get-bucket-policy",
+                    dict(Bucket="other", ExpectedBucketOwner=m.base.ACCOUNT),
+                ),
+                ("sts", "get-caller-identity", dict(SecretAccessKey="forbidden")),
+            ):
+                with self.assertRaises(ValueError):
+                    m.Cloud().call(service, operation, **fields)
+        call.assert_not_called()
+
+    def test_old_attempt_must_prove_no_write_before_successor(self):
+        with patch.object(m.base, "run_once", return_value={}) as call:
+            m.run()
+        self.assertEqual(call.call_args.args[0], m.OUTPUT)
+
+
+if __name__ == "__main__":
+    unittest.main()

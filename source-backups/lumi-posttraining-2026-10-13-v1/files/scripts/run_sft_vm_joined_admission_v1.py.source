@@ -1,0 +1,434 @@
+"""Private native adapters for the frozen admitted lifecycle; no public launch.
+
+Only an explicitly authorized host-bound outer controller may invoke the private
+entry. This module does not grant that authority. Existing lifecycle owns one
+shared STOP ledger; cloud transports retain their original bounded timeouts.
+"""
+
+import datetime as dt
+import hashlib
+import time
+from pathlib import Path
+
+import check_sft_vm_retained_host_v1 as retained_host
+import check_sft_vm_retention_bucket_v1 as bucket
+import prepare_sft_vm_native_admission_v1 as prepare
+import run_sft_vm_admitted_lifecycle_v1 as lifecycle
+import run_sft_vm_native_binding_delivery_v1 as native_binding
+import run_sft_vm_retention_binding_delivery_v1 as retention_binding
+import send_sft_vm_retention_source_v1 as source
+
+CAP = 32 * 1024**2
+ENTRY_SHA = "4ec3f33ba9236f34f3ceb1b0c83f2c8abc46c9ec969b8f5c964bf5dd6f390197"
+PINS = {
+    "check_sft_vm_retained_host_v1.py": (
+        "dffb3f54584778a8681ad48445588649bc4bfcfdd4580852c44899f9b82a682c"
+    ),
+    "check_sft_vm_retention_bucket_v1.py": (
+        "fc6689efb07d0cd066993b3cb95b19c498cea6e86254e83d6d8a099cd3828c5f"
+    ),
+    "prepare_sft_vm_native_admission_v1.py": (
+        "a74d35a6883c97da8ea6ea20ebca4c81cb043a89cb119b33a99ad0c735406b53"
+    ),
+    "run_sft_vm_admitted_lifecycle_v1.py": (
+        "f2df40f656ba3eec320cd913aaa724a7231b40cfdabb02fa742d3b37939fc370"
+    ),
+    "run_sft_vm_native_binding_delivery_v1.py": (
+        "c75d56b872cfe6407495cd0b83ae766d4ebbcab966c5f65490d6345a1da4f78b"
+    ),
+    "run_sft_vm_retention_binding_delivery_v1.py": (
+        "35db141738e0babbe05f08b1a719b15f531532267f0f9c8b73e535426fee820f"
+    ),
+    "send_sft_vm_retention_source_v1.py": (
+        "1713e134f318a7942051cb172b31cb52cb50291f43b16d6cea9c8eba2942caa9"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("joined_admission_rejected") from None
+
+
+def authenticate():
+    for name, pin in PINS.items():
+        need(
+            hashlib.sha256(prepare.INPUTS.read(Path(__file__).with_name(name), 131072)).hexdigest()
+            == pin
+        )
+
+
+class Budget:
+    """One native-control content cap; uncertainty consumes the remaining cap."""
+
+    def __init__(self):
+        self.used = 0
+        self.uncertain = False
+
+    @property
+    def remaining(self):
+        return CAP - self.used
+
+    def charge(self, count):
+        need(not self.uncertain and type(count) is int and 0 <= count <= self.remaining)
+        self.used += count
+
+    def phase(self, operation):
+        try:
+            need(not self.uncertain and self.remaining > 0)
+            value = operation()
+            self.charge(value["control_content_bytes_charged"])
+            return value
+        except BaseException:
+            self.used, self.uncertain = CAP, True
+            raise ValueError("admission_phase_failed_stop_required") from None
+
+
+class BucketReadCloud:
+    """Dedicated bounded read-only clients; never extend host SDK permissions."""
+
+    OPS = {
+        "sts": {"get-caller-identity"},
+        "s3api": {
+            "get-bucket-location",
+            "get-public-access-block",
+            "get-bucket-ownership-controls",
+            "get-bucket-encryption",
+            "get-bucket-versioning",
+            "get-bucket-policy-status",
+            "get-bucket-policy",
+        },
+    }
+
+    def __init__(self, clients):
+        need(type(clients) is dict and set(clients) == set(self.OPS))
+        for name, client in clients.items():
+            meta = client.meta
+            service = "s3" if name == "s3api" else name
+            need(meta.region_name == "us-east-1")
+            need(meta.endpoint_url == f"https://{service}.us-east-1.amazonaws.com")
+            need(meta.config.retries.get("total_max_attempts") == 1 and meta.config.proxies == {})
+            need(0 < meta.config.connect_timeout <= 3 and 0 < meta.config.read_timeout <= 5)
+        self.clients = clients
+
+    def cli(self, service, operation, **fields):
+        need(operation in self.OPS.get(service, set()))
+        need(
+            fields
+            == (
+                {}
+                if service == "sts"
+                else dict(Bucket=bucket.BUCKET, ExpectedBucketOwner=bucket.ACCOUNT)
+            )
+        )
+        try:
+            with lifecycle.guard.provision.timeout(20):
+                return getattr(self.clients[service], operation.replace("-", "_"))(**fields)
+        except BaseException:
+            raise ValueError("bucket_control_read_failed") from None
+
+
+class Workflow(lifecycle.workflow.SSH):
+    """Frozen SSH execution, with exact command/body charging before invocation."""
+
+    def __init__(self, *args, budget, deadline, clock):
+        super().__init__(*args)
+        self.budget, self.deadline, self.clock = budget, deadline, clock
+
+    def __call__(self, operation, body=b"", *, timeout=100):
+        need(operation in {"dispatch", "submit", "status", "cancel"})
+        need(type(body) in {bytes, bytearray} and len(body) <= 65536)
+        need(bool(body) == (operation == "submit"))
+        need(lifecycle.number(timeout) and 0 < timeout <= min(100, self.deadline - self.clock()))
+        attempt = self.binding["attempt"]
+        if operation == "cancel":
+            remote = [
+                "sudo",
+                "-n",
+                "/usr/bin/systemctl",
+                "stop",
+                f"lumi-vm-fullsize-v1-{attempt}-parent.service",
+            ]
+        else:
+            entry = f"/var/lib/lumi-vm-fullsize/{attempt}/controller/parent.py"
+            remote = ["sudo", "-n", "/usr/bin/python3", "-I", "-B", entry, operation, attempt]
+            if operation == "dispatch":
+                remote.append(self.entry_sha)
+        self.budget.charge(len(" ".join(remote).encode()) + len(body))
+        return super().__call__(operation, body, timeout=timeout)
+
+
+class Retention(lifecycle.backup.SSH):
+    def __init__(self, *args, budget, deadline, clock):
+        super().__init__(*args, remaining_control_bytes=budget.remaining)
+        self.budget, self.deadline, self.clock = budget, deadline, clock
+
+    def __call__(self, operation, body=b"", *, timeout):
+        need(lifecycle.number(timeout) and 0 < timeout <= min(100, self.deadline - self.clock()))
+        before = self.budget.remaining
+        need(before > 0 and not self.budget.uncertain)
+        self.remaining_control_bytes = before
+        try:
+            return super().__call__(operation, body, timeout=timeout)
+        finally:
+            self.budget.charge(before - self.remaining_control_bytes)
+
+
+def _prepare_and_admit_once(
+    provisioned,
+    host_output,
+    output,
+    *,
+    cloud,
+    bucket_cloud,
+    proposal_raw,
+    budget,
+    clock=time.monotonic,
+    wait=time.sleep,
+):
+    authenticate()
+    need(bucket_cloud is not None)
+    need(type(budget) is Budget and budget.used == 0 and not budget.uncertain)
+    end = provisioned["host_deadline_monotonic"]
+    binding = dict(provisioned["binding"])
+    launch_clock = provisioned["launch_monotonic"]
+    need(lifecycle.number(end) and end == launch_clock + 14400)
+    need(0 <= clock() - launch_clock < 1350 and end - clock() > 12850)
+    prepare.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = lifecycle.acquisition.base.save
+    save(output / "started.json", dict(retry_allowed=False, gate_5_complete=False))
+    prepared_path = output / "preparation"
+    try:
+        prepared = prepare._prepare_native_admission_once(
+            provisioned, host_output, prepared_path, cloud=cloud, clock=clock, wait=wait
+        )
+        need(prepared["native_qualification_completed"] is True)
+        need(prepared["fresh_cloud_readback_verified"] is True)
+        budget.charge(prepared["total_control_content_bytes_charged"])
+    except BaseException:
+        budget.used, budget.uncertain = CAP, True
+        raise ValueError("native_preparation_failed_stop_required") from None
+    directory = prepared_path / "connection"
+    request = prepare.read_json(prepared_path / "qualification/original-request.json")
+    native_binding.readiness.validate_request(request, binding)
+    connection = prepare.read_json(directory / "result.json")
+    config_sha = connection["ssh_config_sha256"]
+    hosts_sha = hashlib.sha256(prepare.INPUTS.read(directory / "known_hosts", 4096)).hexdigest()
+    key = host_output / "connection-key"
+    args = (binding, key, directory, config_sha, hosts_sha, request)
+    bound = budget.phase(
+        lambda: native_binding._bind_prepared_channel_once(
+            output / "import-binding",
+            *args,
+            deadline=clock() + 350,
+            host_deadline=end,
+            remaining_control_bytes=budget.remaining,
+            clock=clock,
+            wait=wait,
+        )
+    )
+    need(bound["binding_delivery_completed"] is True)
+    prior_pin = native_binding.expected_binding_sha(request)
+    need(bound["observation"]["binding_sha256"] == prior_pin)
+    # Source staging has no completion dependency or authority. Stage it before
+    # import, preserving its existing host-minus-2560 reserve unchanged.
+    staged = budget.phase(
+        lambda: source._deliver_once(
+            output / "retention-source",
+            *args,
+            prior_pin,
+            deadline=clock() + 100,
+            host_deadline=end,
+            remaining_control_bytes=budget.remaining,
+            clock=clock,
+        )
+    )
+    need(staged["source_delivery_completed"] is True)
+    workflow_end = clock() + 9000
+    need(workflow_end <= end - 2700)
+    workflow = Workflow(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        ENTRY_SHA,
+        budget=budget,
+        deadline=workflow_end,
+        clock=clock,
+    )
+    launch = prepare.read_json(host_output / "launch.json")
+    retention_started = False
+
+    def admit_retention(actual_binding, actual_pin, host_deadline):
+        nonlocal retention_started
+        need(not retention_started and actual_binding == binding and actual_pin == prior_pin)
+        need(host_deadline == end and end - clock() >= 2560)
+        retention_started = True  # Consumed before observation; never retry cloud/native admission.
+        retention_path = output / "retention"
+        retention_path.mkdir(mode=0o700, exist_ok=False)
+        save(retention_path / "started.json", dict(retry_allowed=False, gate_5_complete=False))
+        try:
+            host = retained_host.inspect(
+                cloud,
+                binding,
+                proposal_raw,
+                launch,
+                deadline=clock() + 240,
+                host_deadline=end,
+                clock=clock,
+            )
+            bucket_result = bucket.inspect(
+                bucket_cloud, proposal_raw, deadline=clock() + 180, clock=clock
+            )
+            save(retention_path / "cloud-checks.json", dict(host=host, bucket=bucket_result))
+            retention_end = min(clock() + 1800, end - 700)
+            admitted = budget.phase(
+                lambda: retention_binding._bind_retention_channel_once(
+                    retention_path / "binding",
+                    *args,
+                    prior_pin,
+                    deadline=clock() + 350,
+                    retention_deadline=retention_end,
+                    host_deadline=end,
+                    remaining_control_bytes=budget.remaining,
+                    clock=clock,
+                    wait=wait,
+                )
+            )
+            need(admitted["binding_delivery_completed"] is True)
+            need(admitted["observation"]["prior_binding_sha256"] == prior_pin)
+            need(retention_end - clock() > 180)
+            channel = Retention(
+                binding,
+                key,
+                directory,
+                config_sha,
+                hosts_sha,
+                admitted["observation"]["retention_binding_sha256"],
+                budget=budget,
+                deadline=retention_end,
+                clock=clock,
+            )
+            save(
+                retention_path / "result.json",
+                dict(
+                    status="retention_channel_bound_not_executed",
+                    control_bytes_charged_or_reserved=budget.used,
+                    credentials_issued=False,
+                    gate_5_complete=False,
+                    retry_allowed=False,
+                ),
+            )
+            return channel, retention_end
+        except BaseException:
+            target = "failure.json" if (retention_path / "result.json").exists() else "result.json"
+            save(
+                retention_path / target,
+                dict(
+                    status="failed_preserve_stop_required",
+                    retry_allowed=False,
+                    gate_5_complete=False,
+                ),
+            )
+            raise ValueError("retention_admission_failed_stop_required") from None
+
+    save(
+        output / "result.json",
+        dict(
+            status="native_channels_bound_not_executed",
+            control_bytes_charged_or_reserved=budget.used,
+            retention_source_staged=True,
+            retention_admission_pending=True,
+            gate_5_complete=False,
+            retry_allowed=False,
+        ),
+    )
+    return dict(
+        workflow_exchange=workflow,
+        workflow_deadline=workflow_end,
+        prior_binding_sha=prior_pin,
+        admit_retention=admit_retention,
+    )
+
+
+def _provision_and_run_once(
+    output,
+    *,
+    selection_raw,
+    proposal_raw,
+    host_cloud,
+    bucket_cloud,
+    watchdog_cloud,
+    acquisition_cloud,
+    retention_cloud,
+    wall=time.time,
+    clock=time.monotonic,
+    wait=time.sleep,
+    now=lambda: dt.datetime.now(dt.UTC),
+):
+    """Private authorized-controller entry, not permission to launch from a report."""
+    authenticate()
+    need(bucket_cloud is not None)
+    lifecycle.inputs(selection_raw, proposal_raw)
+    prepare.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = lifecycle.acquisition.base.save
+    save(output / "started.json", dict(retry_allowed=False, gate_5_complete=False))
+    budget = Budget()
+
+    def admission(provisioned, host_output):
+        return _prepare_and_admit_once(
+            provisioned,
+            host_output,
+            output / "admission",
+            cloud=host_cloud,
+            bucket_cloud=bucket_cloud,
+            proposal_raw=proposal_raw,
+            budget=budget,
+            clock=clock,
+            wait=wait,
+        )
+
+    report = dict(
+        lifecycle_completed=False,
+        gate_5_complete=False,
+        real_4b_import=False,
+        training_authorized=False,
+        production_eligible=False,
+        retry_allowed=False,
+    )
+    try:
+        report["lifecycle"] = lifecycle._provision_then_run_once(
+            output / "execution",
+            admit_native=admission,
+            selection_raw=selection_raw,
+            proposal_raw=proposal_raw,
+            host_cloud=host_cloud,
+            watchdog_cloud=watchdog_cloud,
+            acquisition_cloud=acquisition_cloud,
+            retention_cloud=retention_cloud,
+            wall=wall,
+            clock=clock,
+            wait=wait,
+            now=now,
+        )
+        report["lifecycle_completed"] = report["lifecycle"]["lifecycle_completed"]
+    except BaseException:
+        # The existing lifecycle/provisioner remains authoritative for launch
+        # ambiguity and STOP. Never guess a target or issue a second STOP here.
+        report["failed_preserve_existing_stop_evidence"] = True
+    if not report["lifecycle_completed"] and budget.used == 0:
+        # A provisioner may have consumed control bytes before a lost return.
+        # Its own evidence stays authoritative; zero here is not zero usage.
+        budget.used, budget.uncertain = CAP, True
+    report.update(
+        control_bytes_charged_or_reserved=budget.used, control_accounting_uncertain=budget.uncertain
+    )
+    save(output / "result.json", report)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("explicit_host_bound_execution_authority_required") from None

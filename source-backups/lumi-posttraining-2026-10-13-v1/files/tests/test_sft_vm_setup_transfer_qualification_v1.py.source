@@ -1,0 +1,377 @@
+"""Offline full-controller replay; actual source frame/receipt, synthetic cloud/SSH."""
+
+import base64
+import copy
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import qualify_sft_vm_setup_transfer_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed, cls.receiver, cls.archive = m.authenticate()
+
+    def cloud(self, *, invalid=None, no_key=False, no_terminal=False, lost_launch=False):
+        now, calls = [0.0], []
+        instance = "i-00000000000000001"
+        state = ["running"]
+        tag = [dict(Key="LumiAttempt", Value=m.OWNER_ATTEMPT)]
+        diagnostic_tag = [dict(Key="LumiDiagnostic", Value=m.TOKEN)]
+        row = dict(
+            InstanceId=instance,
+            ClientToken=m.TOKEN,
+            ImageId=m.AMI,
+            InstanceType="t3.micro",
+            VpcId=m.VPC,
+            SubnetId=m.SUBNET,
+            KeyName=m.KEY_NAME,
+            SecurityGroups=[dict(GroupId=m.GROUP)],
+            MetadataOptions=dict(HttpTokens="required"),
+            Tags=diagnostic_tag,
+            PrivateIpAddress="172.31.97.40",
+        )
+
+        def invoke(op, **fields):
+            calls.append((op, copy.deepcopy(fields)))
+            if op == "get_caller_identity":
+                return dict(Account="wrong" if invalid == "account" else m.ACCOUNT)
+            if op == "describe_instances":
+                if fields.get("InstanceIds") == [m.RETAINED]:
+                    host = dict(
+                        InstanceId=m.RETAINED,
+                        Tags=tag,
+                        State=dict(Name="running" if invalid == "host" else "stopped"),
+                        BlockDeviceMappings=[dict(Ebs=dict(DeleteOnTermination=False))],
+                    )
+                    return dict(Reservations=[dict(OwnerId=m.ACCOUNT, Instances=[host])])
+                if "Filters" in fields and not cloud.launch_sent:
+                    return dict(Reservations=[])
+                value = copy.deepcopy(row)
+                value["State"] = dict(Name=state[0])
+                if state[0] == "terminated":
+                    for key in ("VpcId", "SubnetId", "KeyName", "SecurityGroups"):
+                        value.pop(key)
+                return dict(Reservations=[dict(OwnerId=m.ACCOUNT, Instances=[value])])
+            if op == "describe_volumes":
+                return dict(
+                    Volumes=[
+                        dict(
+                            VolumeId=v,
+                            Encrypted=invalid != "volume",
+                            State="in-use",
+                            Tags=tag,
+                            Attachments=[dict(InstanceId=m.RETAINED)],
+                        )
+                        for v in m.VOLUMES
+                    ]
+                )
+            if op == "describe_instance_connect_endpoints":
+                return dict(
+                    InstanceConnectEndpoints=[
+                        dict(
+                            InstanceConnectEndpointId=m.ENDPOINT,
+                            State="create-complete",
+                            SubnetId=m.SUBNET,
+                            VpcId=m.VPC,
+                            SecurityGroupIds=[m.ENDPOINT_GROUP],
+                            Tags=tag,
+                        )
+                    ]
+                )
+            if op == "describe_security_groups":
+                ingress = dict(
+                    IpProtocol="tcp",
+                    FromPort=22,
+                    ToPort=22,
+                    UserIdGroupPairs=[dict(GroupId=m.ENDPOINT_GROUP)],
+                    IpRanges=[dict(CidrIp="0.0.0.0/0")] if invalid == "ingress" else [],
+                )
+                return dict(
+                    SecurityGroups=[
+                        dict(
+                            GroupId=g,
+                            OwnerId=m.ACCOUNT,
+                            VpcId=m.VPC,
+                            Tags=tag,
+                            IpPermissions=[ingress],
+                        )
+                        for g in (m.GROUP, m.ENDPOINT_GROUP)
+                    ]
+                )
+            if op == "describe_subnets":
+                return dict(
+                    Subnets=[dict(SubnetId=m.SUBNET, VpcId=m.VPC, State="available", Tags=tag)]
+                )
+            if op == "describe_route_tables":
+                route = "0.0.0.0/0" if invalid == "route" else "172.31.0.0/16"
+                return dict(
+                    RouteTables=[
+                        dict(
+                            RouteTableId=m.TABLE,
+                            VpcId=m.VPC,
+                            Tags=tag,
+                            Associations=[dict(SubnetId=m.SUBNET)],
+                            Routes=[
+                                dict(DestinationCidrBlock=route, GatewayId="local", State="active")
+                            ],
+                        )
+                    ]
+                )
+            if op == "describe_key_pairs":
+                return dict(KeyPairs=[dict(KeyName=m.KEY_NAME, Tags=tag)])
+            if op == "describe_images":
+                return dict(
+                    Images=[
+                        dict(
+                            ImageId=m.AMI,
+                            State="available",
+                            OwnerId="099720109477",
+                            Architecture="x86_64",
+                        )
+                    ]
+                )
+            if op == "run_instances":
+                if lost_launch:
+                    raise TimeoutError("PRIVATE_EXCEPTION_SENTINEL")
+                return dict(Instances=[dict(InstanceId=instance)])
+            if op == "get_console_output":
+                key = base64.b64encode(b"x" * 51).decode()
+                return dict(Output="" if no_key else "LUMI_DIAG_HOSTKEY ssh-ed25519 " + key)
+            if op == "terminate_instances":
+                state[0] = "shutting-down" if no_terminal else "terminated"
+                return {}
+            raise AssertionError(op)
+
+        class Client:
+            def __getattr__(self, op):
+                return lambda **fields: invoke(op, **fields)
+
+        cloud = object.__new__(m.Cloud)
+        cloud.execute = True
+        cloud.clock = lambda: now[0]
+        cloud.started = 0.0
+        cloud.calls = 0
+        cloud.launch_sent = cloud.terminate_sent = False
+        cloud.instance = None
+        cloud.clients = {n: Client() for n in ("ec2", "sts")}
+        return cloud, now, calls
+
+    def replay(self, *, bad_receipt=False, seed_failure=False, **cloud_args):
+        cloud, now, calls = self.cloud(**cloud_args)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory).resolve() / "attempt"
+            identity = dict(
+                schema="lumi.vm-setup-seed.v0.1",
+                attempt=self.seed.ATTEMPT,
+                machine_id="a" * 32,
+                boot_id="a" * 8 + "-" + "-".join(["a" * 4] * 3) + "-" + "a" * 12,
+                observed_boottime=100,
+                setup_deadline_boottime=1800,
+                receipt_parents_created=True,
+                host_admitted=False,
+                expiry_enforced=False,
+                execution_permitted=False,
+                retry_allowed=False,
+            )
+            receipt = self.seed.sender.expected_receipt()
+            if bad_receipt:
+                receipt["files"] = 18
+            seed_mock = Mock(return_value=json.dumps(identity).encode())
+            if seed_failure:
+                seed_mock.side_effect = ValueError("PRIVATE_EXCEPTION_SENTINEL")
+            transfer_mock = Mock(return_value=json.dumps(receipt).encode())
+            with (
+                patch.object(m, "OUT", out),
+                patch.object(self.seed.sender.delivery, "pipe_exchange", seed_mock),
+                patch.object(self.seed.sender, "pipe_exchange", transfer_mock),
+            ):
+                result = m.execute(
+                    cloud,
+                    self.seed,
+                    self.receiver,
+                    self.archive,
+                    clock=lambda: now[0],
+                    sleep=lambda s: now.__setitem__(0, now[0] + s),
+                )
+                outputs = {p.name: p.read_bytes() for p in out.iterdir()}
+            return result, calls, seed_mock, transfer_mock, outputs
+
+    def test_success_exact_real_frame_and_full_receipt(self):
+        result, calls, seed, transfer, _ = self.replay()
+        self.assertEqual(result["status"], "source_only_native_transfer_passed")
+        self.assertTrue(result["native_19_files_readback_verified"])
+        self.assertTrue(result["terminated_verified"])
+        self.assertFalse(result["gate_5_complete"])
+        self.assertEqual(seed.call_count, 1)
+        self.assertEqual(transfer.call_count, 1)
+        argv, body, timeout = transfer.call_args.args
+        self.assertEqual(body, self.receiver + self.archive)
+        self.assertEqual(len(body), 17061196)
+        self.assertEqual(timeout, 100)
+        self.assertIn("signal.alarm(85)", argv[-1])
+        self.assertNotIn("StrictHostKeyChecking=no", str(argv))
+        self.assertEqual(sum(op == "run_instances" for op, _ in calls), 1)
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+        self.assertFalse(
+            any(
+                fields.get("InstanceIds") == [m.RETAINED]
+                for op, fields in calls
+                if op == "terminate_instances"
+            )
+        )
+
+    def test_receipt_mismatch_no_retry_and_cleanup(self):
+        result, _, seed, transfer, outputs = self.replay(bad_receipt=True)
+        self.assertEqual(result["failure_stage"], "receipt_contract")
+        self.assertTrue(result["remote_completion_unknown"])
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(seed.call_count, 1)
+        self.assertEqual(transfer.call_count, 1)
+        self.assertNotIn(b"PRIVATE_EXCEPTION_SENTINEL", b"".join(outputs.values()))
+
+    def test_seed_failure_prevents_large_transfer(self):
+        result, _, seed, transfer, outputs = self.replay(seed_failure=True)
+        self.assertEqual(result["failure_stage"], "seed")
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(seed.call_count, 1)
+        transfer.assert_not_called()
+        self.assertNotIn(b"PRIVATE_EXCEPTION_SENTINEL", b"".join(outputs.values()))
+
+    def test_preflight_rejects_before_paid_launch(self):
+        for invalid in ("account", "host", "volume", "ingress", "route"):
+            with self.subTest(invalid=invalid):
+                result, calls, seed, transfer, _ = self.replay(invalid=invalid)
+                self.assertFalse(result["launch_dispatched"])
+                self.assertFalse(
+                    any(op in {"run_instances", "terminate_instances"} for op, _ in calls)
+                )
+                seed.assert_not_called()
+                transfer.assert_not_called()
+
+    def test_missing_console_key_prevents_ssh_and_still_terminates(self):
+        result, calls, seed, transfer, _ = self.replay(no_key=True)
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(result["failure_stage"], "console_host_key")
+        self.assertEqual(sum(op == "get_console_output" for op, _ in calls), 21)
+        seed.assert_not_called()
+        transfer.assert_not_called()
+
+    def test_worst_poll_budget_preserves_cleanup_reserve(self):
+        result, calls, _, _, _ = self.replay(no_key=True, no_terminal=True)
+        self.assertLessEqual(len(calls), 100)
+        self.assertLess(result["elapsed_seconds"], 850)
+        self.assertTrue(result["cleanup_unresolved"])
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_ambiguous_launch_exact_token_reconcile_not_retry(self):
+        result, calls, _, _, _ = self.replay(lost_launch=True)
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(sum(op == "run_instances" for op, _ in calls), 1)
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_read_only_cloud_cannot_mutate(self):
+        cloud, _, calls = self.cloud()
+        cloud.execute = False
+        for op, fields in (
+            ("run_instances", m.launch_fields()),
+            ("terminate_instances", dict(InstanceIds=[m.RETAINED])),
+            ("start_instances", dict(InstanceIds=[m.RETAINED])),
+            ("put_bucket_policy", {}),
+        ):
+            with self.assertRaises(ValueError):
+                cloud.call(op, **fields)
+        self.assertFalse(calls)
+
+    def test_exact_launch_and_terminate_single_dispatch(self):
+        cloud, _, _ = self.cloud()
+        cloud.call("run_instances", **m.launch_fields())
+        with self.assertRaises(ValueError):
+            cloud.call("run_instances", **m.launch_fields())
+        cloud.instance = "i-00000000000000001"
+        with self.assertRaises(ValueError):
+            cloud.call("terminate_instances", cleanup=True, InstanceIds=[m.RETAINED])
+        cloud.call("terminate_instances", cleanup=True, InstanceIds=[cloud.instance])
+        with self.assertRaises(ValueError):
+            cloud.call("terminate_instances", cleanup=True, InstanceIds=[cloud.instance])
+
+    def test_cleanup_ownership_mismatch_rejects(self):
+        cloud, _, _ = self.cloud()
+        response = cloud.call("describe_instances", InstanceIds=["i-00000000000000001"])
+        response["Reservations"][0]["Instances"][0]["ClientToken"] = "other"
+        with self.assertRaises(ValueError):
+            m.owned(response, "i-00000000000000001")
+
+    def test_early_timer_and_disposable_disk_no_data_or_iam(self):
+        fields = m.launch_fields()
+        boot = json.loads(fields["UserData"].split("\n", 1)[1])
+        self.assertIn("--on-boot=600s", boot["bootcmd"][0][2])
+        self.assertIn("DefaultDependencies=no", boot["bootcmd"][0][2])
+        final = boot["runcmd"][0][2]
+        self.assertLess(final.index("is-active --quiet"), final.index("LUMI_DIAG_HOSTKEY"))
+        self.assertEqual(fields["InstanceInitiatedShutdownBehavior"], "terminate")
+        disk = fields["BlockDeviceMappings"][0]["Ebs"]
+        self.assertTrue(disk["Encrypted"] and disk["DeleteOnTermination"])
+        self.assertEqual(disk["VolumeSize"], 8)
+        self.assertNotIn("IamInstanceProfile", fields)
+        self.assertNotIn("apt", fields["UserData"])
+
+    def test_source_drift_rejected_before_credentials(self):
+        with patch.object(m, "PROOF_SHA", "0" * 64), patch.object(m.subprocess, "run") as creds:
+            with self.assertRaises(ValueError):
+                m.authenticate()
+            creds.assert_not_called()
+
+    def test_approval_missing_drift_false_all_rejected(self):
+        entry = m.sha(m.read(Path(m.__file__)))
+        plan = json.dumps(
+            dict(entry_sha256=entry, token=m.TOKEN, source_release_sha256=m.RELEASE_SHA)
+        ).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / "approval.json"
+            with patch.object(m, "APPROVAL", path):
+                with self.assertRaises(FileNotFoundError):
+                    m.approve(plan)
+                for approved, digest in ((False, m.sha(plan)), (True, "0" * 64)):
+                    m.save(
+                        path,
+                        dict(
+                            approved=approved,
+                            plan_sha256=digest,
+                            entry_sha256=entry,
+                            human_authorization="synthetic authorization " * 10,
+                        ),
+                    )
+                    with self.assertRaises(ValueError):
+                        m.approve(plan)
+                    path.unlink()
+
+    def test_expired_budget_refuses_dispatch(self):
+        cloud, now, calls = self.cloud()
+        now[0] = 850
+        with self.assertRaises(ValueError):
+            cloud.call("describe_instances", cleanup=True, InstanceIds=[m.RETAINED])
+        self.assertFalse(calls)
+
+    def test_existing_output_cannot_be_consumed_again(self):
+        cloud, _, calls = self.cloud()
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(m, "OUT", Path(directory).resolve()):
+                with self.assertRaises(ValueError):
+                    m.execute(cloud, self.seed, self.receiver, self.archive)
+            self.assertFalse(calls)
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

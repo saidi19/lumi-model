@@ -1,0 +1,187 @@
+"""Prepare the final v0.27 CPU proposal locally; never approve or execute it."""
+
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+from scripts import preflight_sft_vm_attempt022_v2 as preflight
+from scripts import prepare_sft_vm_attempt022_control_package_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+PROOF = "evidence/lumi-vm-attempt-022-readonly-preflight-verification-v0.2.json"
+PROOF_SHA = "ada826d1240f5b76645f8d2fd5d2d3dee276c35f7cbc996614b4ee18aa32231d"
+PLAN_DIR = "artifacts/lumi-vm-attempt-022-control-plan-v0.4"
+HELPER = "scripts/prepare_sft_vm_attempt022_deployment_bindings_v4.py"
+ENTRY = "scripts/execute_sft_vm_private_outer_v27.py"
+PROPOSAL = "configs/lumi-vm-private-outer-execution-proposal-v0.27.json"
+TEMPLATE = "configs/lumi-vm-private-outer-execution-approval-template-v0.27.json"
+BUDGET = "scripts/sft_vm_admission_budget_v1.py"
+BUDGET_SHA = "93b389a15ea8911ca9afb4d8124542b09470311065ccccd552806162ad7f781f"
+PREFLIGHT_SHA = "659f4ab23e021206ac4ff1232c2c8ce66d37a759410c45aa05671f65c00f0f00"
+need, sha, encode, read, write_new = (
+    source.need,
+    source.sha,
+    source.encode,
+    source.read,
+    source.write_new,
+)
+
+
+def build():
+    need(sha(Path(preflight.__file__).read_bytes()) == PREFLIGHT_SHA)
+    proof = json.loads(read(PROOF, PROOF_SHA))
+    for name, digest in proof["run_bindings"].items():
+        read(name, digest)
+    need(proof["status"] == "readonly_preflight_passed" and proof["attempt"] == source.ATTEMPT)
+    need(proof["network_admitted"] is True and proof["cpu_admitted"] is True)
+    need(proof["control_evidence"] == preflight.bindings.controls())
+    need(proof["execution_authority_created"] is False and proof["cpu_instance_launched"] is False)
+    read(BUDGET, BUDGET_SHA)
+    plan = preflight.bindings.build()
+    plan.update(
+        schema="lumi.vm-attempt-022-control-plan.v0.4",
+        status="readonly_admission_passed_final_cpu_approval_required",
+        successful_readonly_preflight=dict(path=PROOF, sha256=PROOF_SHA),
+        immediate_admission_accounting=dict(
+            implementation=BUDGET,
+            implementation_sha256=BUDGET_SHA,
+            maximum_sdk_read_dispatches=79,
+            maximum_seconds=1500,
+            credential_identity_dispatches_included=True,
+            failed_dispatches_consume_budget=True,
+            sdk_retries=0,
+            credential_export_provider_requests_metered=False,
+            ledger_saved_before_execution_marker=True,
+            guard_released_before_workload=True,
+        ),
+    )
+    plan["readiness_review"]["decision"] = "exact_final_one_shot_cpu_approval_required"
+    plan["unresolved_before_live_execution"] = [
+        "Approve the exact final v0.27 proposal/entry/plan bindings.",
+        "Pass immediate inclusive read-only admission before the execution marker.",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    raw = encode(plan)
+    release = dict(
+        schema="lumi.vm-attempt-022-control-plan-release.v0.4",
+        attempt=source.ATTEMPT,
+        plan_sha256=sha(raw),
+        plan_bytes=len(raw),
+        source_release_sha256=preflight.bindings.RELEASE_SHA,
+        successful_readonly_preflight_sha256=PROOF_SHA,
+        admission_budget_sha256=BUDGET_SHA,
+        execution_permitted=False,
+        live_controls_verified=True,
+        network_admitted=True,
+        cpu_admitted=True,
+    )
+    release_raw = encode(release)
+    helper = f'''"""Final attempt-022 bindings; no execution grant."""
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_deployment_bindings_v3 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = {preflight.BINDINGS_SHA!r}
+ATTEMPT, OLD, BUCKET = source.ATTEMPT, source.OLD, source.BUCKET
+RELEASE, RELEASE_SHA = source.RELEASE, source.RELEASE_SHA
+WATCH, WATCH_SHA, STORE, STORE_SHA = source.WATCH, source.WATCH_SHA, source.STORE, source.STORE_SHA
+PLAN = {PLAN_DIR + "/plan.json"!r}
+PLAN_SHA = {sha(raw)!r}
+PLAN_RELEASE = {PLAN_DIR + "/release.json"!r}
+PLAN_RELEASE_SHA = {sha(release_raw)!r}
+PREFLIGHT = {PROOF!r}
+PREFLIGHT_SHA = {PROOF_SHA!r}
+BUDGET = {BUDGET!r}
+BUDGET_SHA = {BUDGET_SHA!r}
+need, sha, encode, read = source.need, source.sha, source.encode, source.read
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    proof = json.loads(read(PREFLIGHT, PREFLIGHT_SHA))
+    release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    read(BUDGET, BUDGET_SHA)
+    for name, digest in proof["run_bindings"].items():
+        read(name, digest)
+    need(proof["attempt"] == ATTEMPT and proof["status"] == "readonly_preflight_passed")
+    need(proof["control_evidence"] == source.controls())
+    need(proof["cpu_admitted"] and proof["network_admitted"])
+    need(proof["execution_authority_created"] is False and proof["cpu_instance_launched"] is False)
+    need(release["attempt"] == ATTEMPT and release["plan_sha256"] == PLAN_SHA)
+    need(release["successful_readonly_preflight_sha256"] == PREFLIGHT_SHA)
+    need(release["execution_permitted"] is False)
+    return manifest
+
+def build():
+    verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(plan["attempt"] == ATTEMPT and plan["release_manifest_sha256"] == RELEASE_SHA)
+    need(plan["required_control_proofs"] == [WATCH, STORE])
+    need(plan["successful_readonly_preflight"] == dict(path=PREFLIGHT, sha256=PREFLIGHT_SHA))
+    need(plan["approval_record"] is None and plan["execution_permitted"] is False)
+    return plan
+
+def controls():
+    build()
+    return source.controls()
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None
+'''.encode()
+    entry = read(
+        "scripts/execute_sft_vm_private_outer_v26.py",
+        "dd9846ed307fc902dd763b215728cd1195c6b31ea2fdc87ba28f111b931f7b2b",
+    )
+    entry = source.rewrite(entry)
+    changes = {
+        "preflight_sft_vm_attempt022_v1": "preflight_sft_vm_attempt022_v2",
+        "prepare_sft_vm_attempt022_deployment_bindings_v3": Path(HELPER).stem,
+        "v0.26": "v0.27",
+        "72795717b6595ca4f18164be53e49b7eab1d7ffac55fc107f9b9eb0637d136b8": PREFLIGHT_SHA,
+        "50ca5ffb83acfd89c420f520d1a93f7af44e256ab3a3bc2679147234143f9af1": sha(helper),
+        "evidence/lumi-vm-attempt-022-readonly-preflight-verification-v0.1.json": PROOF,
+        "471fb7b010c332b7b2fd7afb53ae9df9ed5c09b794de8e22681dedb540024d66": PROOF_SHA,
+    }
+    for before, after in changes.items():
+        entry = entry.replace(before.encode(), after.encode())
+    compile(entry, ENTRY, "exec")
+    compile(helper, HELPER, "exec")
+    return [
+        (PLAN_DIR + "/plan.json", raw),
+        (PLAN_DIR + "/release.json", release_raw),
+        (HELPER, helper),
+        (ENTRY, entry),
+    ]
+
+
+def prepare():
+    bodies = build()
+    need(all(not (ROOT / name).exists() for name, _ in bodies))
+    need(not (ROOT / PROPOSAL).exists() and not (ROOT / TEMPLATE).exists())
+    (ROOT / PLAN_DIR).mkdir(mode=0o700)
+    for name, raw in bodies:
+        write_new(name, raw)
+    spec = importlib.util.spec_from_file_location("_prepared_cpu27", ROOT / ENTRY)
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    proposal = entry.encode(entry.expected_proposal())
+    write_new(PROPOSAL, proposal)
+    template = entry.expected_approval("")
+    template.update(status="pending_human_approval", approved_execution_count=0)
+    write_new(TEMPLATE, entry.encode(template))
+    return dict(
+        plan_sha256=sha(bodies[0][1]),
+        entry_sha256=sha(bodies[-1][1]),
+        proposal_sha256=sha(proposal),
+        cpu_launch_authorized=False,
+        aws_calls=0,
+    )
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--prepare-once"])
+    print(json.dumps(prepare(), sort_keys=True))

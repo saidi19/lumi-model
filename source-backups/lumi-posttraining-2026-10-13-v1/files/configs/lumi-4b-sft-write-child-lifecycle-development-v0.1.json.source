@@ -1,0 +1,111 @@
+{
+  "schema_version": "lumi.sft-write-child-lifecycle-development.v0.1",
+  "date": "2026-09-26",
+  "status": "PASS_local_pidfd_child_lifecycle_candidate_NOT_process_composition",
+  "scope": "Local, import-inert pidfd child ownership, termination, waitid reap and descriptor-close candidate with synthetic boundaries only. No fork, process, signal, waitid, poll, pidfd, socket, cgroup, listener, worker, payload, remote, GPU, inference or training execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_child_v1.py",
+      "bytes": 12523,
+      "sha256": "a45713c9d689daa2d547b4ebbbaf4ca16c2ca9a48d570b1d2e734012b87fe09c"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_child_v1.py",
+      "bytes": 15118,
+      "sha256": "dacec48b10878c1e96090a299524a2e3bd794d379d5edce516cd3a9c92d4f202"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_listener_v1.py",
+      "bytes": 20848,
+      "sha256": "46df3670f8921e06679b2978c7aecd70700dd71c67a44dcf84c7cd4bb034e64a"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_guardian_v1.py",
+      "bytes": 18831,
+      "sha256": "b8831ac5c43d4e1f58e5a56467b42d3ac2ef8b225210fbb9f472bf048e35896b"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-process-topology-development-v0.1.json",
+      "bytes": 5760,
+      "sha256": "7023ead421070e237ff3841433cce8d6f0272967cc6305241b05d01044695c45"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-process-topology-development-verification-v0.1.json",
+      "bytes": 7549,
+      "sha256": "b88b2d1d03b7839042aaf188638fecbf072ff7eb7ac22171b8eeb77a941fa7e8"
+    }
+  ],
+  "completed": [
+    "A numeric child PID is accepted only once at the immediate post-fork pidfd_open boundary; every later liveness, signal, wait and close operation is bound to the resulting generation-stable pidfd.",
+    "The private binder admits exactly one non-inheritable pidfd with a stable fdinfo identity, a fixed guardian, broker or worker role, one process/thread owner and one absolute deadline.",
+    "Initial admission proves the child has not already exited through non-consuming waitid(P_PIDFD) plus a zero-time pidfd readiness check. A child already exited during admission is terminated only if needed, consumed, reaped and closed before the original fixed failure is returned.",
+    "Termination is one-shot and uses pidfd_send_signal(SIGKILL) only. ProcessLookupError is treated only as a possible race and never as proof of exit; a real waitid observation and consuming reap remain mandatory.",
+    "Reap requires pidfd readiness before two matching waitid events: WEXITED|WNOHANG|WNOWAIT followed by WEXITED|WNOHANG. Only the exact bound child identity and a valid exited, killed or dumped event are accepted.",
+    "Successful exit means CLD_EXITED with status zero. Nonzero or signaled exit may be reaped for cleanup but cannot satisfy a success-required call.",
+    "Pidfd close is permitted only after reap. It consumes the close attempt before the final descriptor-identity check, never closes a replacement descriptor and never retries an ambiguous close.",
+    "All public entry paths remain closed. Snapshots retain only role and aggregate state, with no PID, pidfd, fdinfo identity, exit event detail or exception text."
+  ],
+  "fixed_lifecycle": {
+    "roles": [
+      "guardian",
+      "broker",
+      "worker"
+    ],
+    "pidfd_open_attempts_per_binding": 1,
+    "numeric_pid_uses_after_pidfd_open": 0,
+    "numeric_pid_signal_calls": 0,
+    "waitpid_calls": 0,
+    "popen_fallbacks": 0,
+    "termination_signal": "SIGKILL",
+    "termination_attempts_per_owner": 1,
+    "wait_api": "waitid(P_PIDFD)",
+    "wait_observation": "WEXITED|WNOHANG|WNOWAIT",
+    "wait_consumption": "WEXITED|WNOHANG",
+    "descriptor_close_attempts_per_owner": 1,
+    "retry_allowed": false
+  },
+  "verification": {
+    "new_child_lifecycle_tests": 21,
+    "prior_regressions": 857,
+    "unique_tests_per_runtime": 878,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ],
+    "all_pidfd_signal_wait_poll_clock_and_close_boundaries_synthetic": true,
+    "native_operations_performed": false
+  },
+  "remaining_integration_work": [
+    "Implement the actual private fork composition over the frozen six-pair topology: outer controller creates and pidfd-binds guardian; guardian adopts its prefork copy, creates the cgroup lease, then creates and pidfd-binds broker and worker; each child transitions to its exact final descriptor set.",
+    "Implement one controller event loop over control, ledger, broker-report and worker-report endpoints, including READY verification before guardian arm, aggregate reservation before each CONTINUE, CONSUMED verification, terminal reports and deadline cleanup through these pidfd owners.",
+    "Integrate listener handoff and adoption, worker privilege drop and final seal, guardian-v2 authority consumption, full-size bootstrap and entry, and authenticated source closure.",
+    "Run a separately authorized bounded Linux native qualification of fork, topology, pidfd, waitid, signal, cgroup and socket semantics before any real checkpoint payload read or import.",
+    "Re-run unchanged host, input, resource and real-import admission only after native qualification succeeds."
+  ],
+  "nonclaims": {
+    "public_execution_open": false,
+    "processes_spawned_or_reaped": false,
+    "fork_order_verified": false,
+    "inherited_copies_closed": false,
+    "peer_origin_or_exclusivity_verified": false,
+    "target_kernel_abi_qualified": false,
+    "native_pidfd_bound_or_signaled": false,
+    "native_waitid_or_reap_performed": false,
+    "native_listener_bound_or_transferred": false,
+    "parent_received_ready_or_consumed": false,
+    "guardian_armed_after_ready": false,
+    "ledger_exchanged": false,
+    "native_write_continuations_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "bootstrap_or_lifecycle_integration_verified": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "retry_allowed": false,
+    "publication": false
+  }
+}

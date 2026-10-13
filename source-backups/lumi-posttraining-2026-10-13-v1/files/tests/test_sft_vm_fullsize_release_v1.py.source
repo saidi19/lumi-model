@@ -1,0 +1,265 @@
+"""Offline archive/real temporary filesystem tests; no host, SDK or model IO."""
+
+import copy
+import importlib.util
+import io
+import json
+import os
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "a" * 32
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / (name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+b = load("prepare_sft_vm_fullsize_release_v1")
+s = load("stage_sft_vm_fullsize_release_v1")
+
+
+def fixture():
+    sources = {name: b"# synthetic source, never executed\n" for name in s.REQUIRED}
+    source_manifest = b.canonical({name: b.sha(raw) for name, raw in sources.items()})
+    bodies = {name: b'{"synthetic":true}' for name in s.CONTROL_NAMES}
+    pins = {
+        "entry_sha256": b.sha(sources[s.IMPORT_ENTRY]),
+        "source_manifest_sha256": b.sha(source_manifest),
+        "attempt_nonce_sha256": b.sha(b"lumi.vm-fullsize-attempt.v0.1\0" + ATTEMPT.encode()),
+    }
+    control = b.canonical(
+        {
+            "schema": "lumi.checkpoint-vm-fullsize-entry-control.v0.1",
+            "scope": "bound_vm_checkpoint_import_only",
+            **pins,
+            "files": [
+                {"path": name, "bytes": len(bodies[name]), "sha256": b.sha(bodies[name])}
+                for name in s.CONTROL_NAMES
+            ],
+        }
+    )
+    pins["control_sha256"] = b.sha(control)
+    descriptor = {
+        "schema": "lumi.vm-fullsize-prepared-attempt.v0.1",
+        "attempt": ATTEMPT,
+        "import_pins": pins,
+        "acquisition_pins": {
+            "entry_sha256": b.sha(sources[s.ACQUIRE_ENTRY]),
+            "source_manifest_sha256": b.sha(source_manifest),
+        },
+        "selection_sha256": b.sha(b"synthetic selection"),
+        "runtime_lock_sha256": b.sha(b"synthetic lock"),
+        "host_admitted": False,
+        "sdk_runtime_bound": False,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "training_authorized": False,
+    }
+    members = (
+        sources
+        | {"controls/" + name: raw for name, raw in bodies.items()}
+        | {
+            "release-manifest.json": source_manifest,
+            "runtime-lock.json": b"synthetic lock",
+            "prepared-attempt.json": b.canonical(descriptor),
+            "controls/control.json": control,
+            "controls/input-selection.json": b"synthetic selection",
+        }
+    )
+    return members, descriptor
+
+
+class ArchiveTests(unittest.TestCase):
+    def setUp(self):
+        self.members, self.descriptor = fixture()
+        self.enterContext(patch.object(s, "LOCK_SHA", self.descriptor["runtime_lock_sha256"]))
+        self.enterContext(patch.object(s, "SELECTION_SHA", self.descriptor["selection_sha256"]))
+
+    def validate(self, members=None):
+        raw = b.archive_bytes(self.members if members is None else members)
+        return s.validate(raw, b.sha(raw), ATTEMPT)
+
+    def test_reproducible_archive_and_exact_bindings(self):
+        self.assertEqual(b.archive_bytes(self.members), b.archive_bytes(self.members))
+        restored, descriptor = self.validate()
+        self.assertEqual(restored, self.members)
+        self.assertEqual(descriptor, self.descriptor)
+        self.assertFalse(descriptor["execution_permitted"])
+
+    def test_changed_archive_pin_rejected(self):
+        with self.assertRaises(ValueError):
+            s.validate(b.archive_bytes(self.members), "f" * 64, ATTEMPT)
+
+    def test_changed_source_detected_even_with_new_outer_hash(self):
+        self.members[s.IMPORT_ENTRY] += b"# changed\n"
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_changed_control_body_detected(self):
+        self.members["controls/plan.json"] += b" "
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_changed_selection_and_runtime_lock_rejected(self):
+        for name in ("controls/input-selection.json", "runtime-lock.json"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.validate(self.members | {name: b"changed"})
+
+    def test_attempt_or_approval_flags_cannot_change(self):
+        for field, value in (
+            ("attempt", "b" * 32),
+            ("host_admitted", True),
+            ("execution_permitted", True),
+            ("real_4b_import", 0),
+        ):
+            changed = copy.deepcopy(self.descriptor)
+            changed[field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(self.members | {"prepared-attempt.json": b.canonical(changed)})
+
+    def test_missing_dynamic_worker_dependency_rejected(self):
+        name = "src/lumi/posttraining_checkpoint_vm_loader_v1.py"
+        del self.members[name]
+        manifest = json.loads(self.members["release-manifest.json"])
+        del manifest[name]
+        self.members["release-manifest.json"] = b.canonical(manifest)
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_unmanifested_or_secret_file_rejected(self):
+        for name in ("src/lumi/unlisted.py", "credentials/aws-session.json", "model.safetensors"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.validate(self.members | {name: b"synthetic only"})
+
+    def test_duplicate_json_keys_rejected(self):
+        self.members["release-manifest.json"] = b'{"same":"a","same":"b"}'
+        with self.assertRaises(ValueError):
+            self.validate()
+
+    def test_links_and_duplicate_archive_members_rejected(self):
+        for kind in ("duplicate", "symlink", "hardlink", "directory", "traversal"):
+            target = io.BytesIO()
+            with tarfile.open(fileobj=target, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+                member = tarfile.TarInfo("prepared-attempt.json")
+                member.size = 2
+                tar.addfile(member, io.BytesIO(b"{}"))
+                if kind == "symlink":
+                    member.type, member.linkname, member.size = tarfile.SYMTYPE, "/etc/passwd", 0
+                elif kind == "hardlink":
+                    member.type, member.linkname, member.size = tarfile.LNKTYPE, "other", 0
+                elif kind == "directory":
+                    member.name, member.type, member.size = "directory", tarfile.DIRTYPE, 0
+                elif kind == "traversal":
+                    member.name = "../escape"
+                tar.addfile(member, io.BytesIO(b"{}"))
+            raw = target.getvalue()
+            with self.subTest(kind=kind), self.assertRaises(ValueError):
+                s.validate(raw, b.sha(raw), ATTEMPT)
+
+    def test_real_source_scanner_covers_fixed_and_dynamic_entries(self):
+        scanner = b.helper(ROOT, "prepare_sft_vm_coordinator_release_v3")
+        scanner.SEEDS = b.SEEDS
+        sources = scanner.source_closure(ROOT)
+        self.assertTrue(s.REQUIRED <= set(sources))
+        self.assertTrue(all(name.endswith(".py") for name in sources))
+        self.assertLessEqual(sum(map(len, sources.values())), 2 * 1024**2)
+
+    def test_builder_writes_fresh_private_archive_and_report(self):
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(b, "assemble", return_value=(self.members, self.descriptor)),
+        ):
+            output = Path(folder).resolve() / "fresh"
+            report = b.build(ROOT, output, ATTEMPT)
+            raw = (output / "source-controls.tar").read_bytes()
+            self.assertEqual(s.validate(raw, report["archive_sha256"], ATTEMPT)[0], self.members)
+            self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((output / "build.json").stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                b.build(ROOT, output, ATTEMPT)
+
+
+class StageTests(unittest.TestCase):
+    def setUp(self):
+        ArchiveTests.setUp(self)
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(s, "ROOT", self.directory / "attempts"))
+        self.enterContext(patch.object(s, "WORKER_UID", os.geteuid()))
+        self.enterContext(patch.object(s, "WORKER_GID", os.getegid()))
+        self.host = self.enterContext(patch.object(s, "host"))
+        self.enterContext(patch.object(s, "root_owned"))
+
+    def stage(self):
+        raw = b.archive_bytes(self.members)
+        return s.stage(raw, b.sha(raw), ATTEMPT, "b" * 32)
+
+    def test_real_layout_readback_and_preserved_private_files(self):
+        report = self.stage()
+        root = s.ROOT / ATTEMPT
+        self.assertTrue(report["staged_file_hashes_verified"])
+        for name, body in self.members.items():
+            path = root / "stage/release" / name
+            self.assertEqual(path.read_bytes(), body)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+        for name in ("stage", "stage/release", "stage/acquisition", "stage/outputs", "credentials"):
+            self.assertEqual((root / name).stat().st_mode & 0o777, 0o700)
+        self.assertEqual(list((root / "credentials").iterdir()), [])
+        self.assertFalse((root / "stage/inputs").exists())
+        self.assertFalse(report["host_admitted"])
+        self.assertFalse(report["acquisition_started"])
+
+    def test_replay_preserves_prior_bytes(self):
+        self.stage()
+        report = (s.ROOT / ATTEMPT / "source-staging.json").read_bytes()
+        with self.assertRaises(FileExistsError):
+            self.stage()
+        self.assertEqual((s.ROOT / ATTEMPT / "source-staging.json").read_bytes(), report)
+
+    def test_bad_archive_before_any_directory_creation(self):
+        self.members[s.IMPORT_ENTRY] += b"bad"
+        with self.assertRaises(ValueError):
+            self.stage()
+        self.assertFalse(s.ROOT.exists())
+
+    def test_bad_host_before_archive_validation_or_writes(self):
+        self.host.side_effect = ValueError("host")
+        with patch.object(s, "validate") as validate, self.assertRaises(ValueError):
+            self.stage()
+        validate.assert_not_called()
+        self.assertFalse(s.ROOT.exists())
+
+    def test_partial_failure_not_retried_or_deleted(self):
+        original = s.write_new
+        writes = []
+
+        def fail(path, raw, **kwargs):
+            writes.append(path)
+            if len(writes) == 2:
+                raise OSError("synthetic disk failure")
+            return original(path, raw, **kwargs)
+
+        with patch.object(s, "write_new", side_effect=fail), self.assertRaises(OSError):
+            self.stage()
+        self.assertTrue(writes[0].exists())
+        self.assertFalse((s.ROOT / ATTEMPT / "source-staging.json").exists())
+        with self.assertRaises(FileExistsError):
+            self.stage()
+
+
+class NativeBoundaryTests(unittest.TestCase):
+    def test_host_guard_rejects_this_local_process(self):
+        with self.assertRaises(ValueError):
+            s.host("b" * 32)
+
+
+if __name__ == "__main__":
+    unittest.main()

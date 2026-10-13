@@ -1,0 +1,398 @@
+"""One fresh cleanup-only bucket; no shared-bucket or object operations.
+
+One-shot setup, fixed names/requests, no retries or rollback. This is not CPU
+execution authority. Failed or ambiguous creation preserves the consumed output.
+"""
+
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+from scripts.diagnose_sft_vm_cleanup_identity_v1 import classify
+
+ROOT = Path(__file__).resolve().parents[1]
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+ATTEMPT = "3bef92a0d90b4d59aa3295da1f9d6ad4"
+BUCKET = "lumi-cleanup-3bef92a0d90b4d59aa3295da1f9d6ad4"
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/network-cleanup/"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-014-cleanup-bucket-v0.1"
+APPROVAL = ROOT / "configs/lumi-vm-attempt-014-cleanup-bucket-approval-v0.1.json"
+HELPER = ROOT / "scripts/prepare_sft_vm_deployment_bindings_v7.py"
+HELPER_SHA = "e2b79da1139fc271f61f9e0d025bdd1b752c04b5ee6ef7ac745e0e55cdc3a10a"
+PLAN = ROOT / "configs/lumi-vm-attempt-014-deployment-plan-v0.1.json"
+PLAN_SHA = "4d36f2656b79d4b85c96b526171dac1540d4dd97480a54172f5b723254ada6c0"
+MAX_CALLS, MAX_SECONDS, MAX_BYTES = 20, 300, 131072
+BLOCK = dict.fromkeys(
+    ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True
+)
+TAGS = [
+    {"Key": "LumiAttempt", "Value": ATTEMPT},
+    {"Key": "LumiPurpose", "Value": "cleanup-claims-only"},
+]
+ENCRYPTION = {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}
+
+
+def need(value):
+    if not value:
+        raise ValueError("dedicated_cleanup_bucket_rejected") from None
+
+
+def encode(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode()
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            need(key not in value)
+            value[key] = item
+        return value
+
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def policy():
+    resource = f"arn:aws:s3:::{BUCKET}/{PREFIX}*"
+    common = dict(Effect="Deny", Principal="*", Resource=resource)
+    return dict(
+        Version="2012-10-17",
+        Statement=[
+            dict(
+                Sid="DenyInsecureTransport",
+                Effect="Deny",
+                Principal="*",
+                Action="s3:*",
+                Resource=[f"arn:aws:s3:::{BUCKET}", f"arn:aws:s3:::{BUCKET}/*"],
+                Condition={"Bool": {"aws:SecureTransport": "false"}},
+            ),
+            dict(
+                common, Sid="PreserveClaims", Action=["s3:DeleteObject", "s3:DeleteObjectVersion"]
+            ),
+            dict(
+                common,
+                Sid="ConditionalClaimsOnly",
+                Action="s3:PutObject",
+                Condition={"StringNotEquals": {"s3:if-none-match": "*"}},
+            ),
+            dict(
+                common,
+                Sid="EncryptedClaimsOnly",
+                Action="s3:PutObject",
+                Condition={"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}},
+            ),
+            dict(
+                common,
+                Sid="NoClaimCopy",
+                Action="s3:PutObject",
+                Condition={"Null": {"s3:x-amz-copy-source": "false"}},
+            ),
+            dict(
+                Sid="NoOtherObjects",
+                Effect="Deny",
+                Principal="*",
+                Action="s3:PutObject",
+                NotResource=resource,
+            ),
+        ],
+    )
+
+
+def requests():
+    fields = dict(Bucket=BUCKET, ExpectedBucketOwner=ACCOUNT)
+    result = {("sts", "get-caller-identity"): {}}
+    for op in (
+        "head-bucket",
+        "get-bucket-location",
+        "get-public-access-block",
+        "get-bucket-ownership-controls",
+        "get-bucket-encryption",
+        "get-bucket-versioning",
+        "get-bucket-tagging",
+        "get-bucket-policy",
+        "get-bucket-policy-status",
+        "get-bucket-lifecycle-configuration",
+    ):
+        result["s3api", op] = fields
+    result["s3api", "create-bucket"] = dict(Bucket=BUCKET, ObjectOwnership="BucketOwnerEnforced")
+    for op, extra in (
+        ("put-public-access-block", dict(PublicAccessBlockConfiguration=BLOCK)),
+        ("put-bucket-encryption", dict(ServerSideEncryptionConfiguration=ENCRYPTION)),
+        ("put-bucket-versioning", dict(VersioningConfiguration={"Status": "Enabled"})),
+        ("put-bucket-tagging", dict(Tagging={"TagSet": TAGS})),
+        ("put-bucket-policy", dict(Policy=encode(policy()).decode())),
+    ):
+        result["s3api", op] = dict(fields, **extra)
+    return result
+
+
+class ControlFailure(ValueError):
+    def __init__(self, kind):
+        super().__init__("control_request_failed_no_retry")
+        self.kind = kind
+
+
+class Cloud:
+    def call(self, service, operation, **fields):
+        need(encode(fields) == encode(requests().get((service, operation))))
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("AWS_")
+            and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+        try:
+            response = subprocess.run(
+                [
+                    "/opt/homebrew/bin/aws",
+                    "--profile",
+                    "default",
+                    "--region",
+                    REGION,
+                    service,
+                    operation,
+                    "--cli-input-json",
+                    encode(fields).decode(),
+                    "--no-paginate",
+                    "--output",
+                    "json",
+                    "--cli-connect-timeout",
+                    "5",
+                    "--cli-read-timeout",
+                    "10",
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=20,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            raise ControlFailure("subprocess_deadline") from None
+        need(len(response.stdout) <= 32768 and len(response.stderr) <= 8192)
+        if response.returncode:
+            absent = {
+                "head-bucket": (b"(404)", b"(NoSuchBucket)"),
+                "get-bucket-lifecycle-configuration": (b"(NoSuchLifecycleConfiguration)",),
+            }
+            if any(code in response.stderr for code in absent.get(operation, ())):
+                raise LookupError("absent") from None
+            raise ControlFailure(classify(response.stderr)) from None
+        return decode(response.stdout) if response.stdout.strip() else {}
+
+
+def sources():
+    for path, digest in ((HELPER, HELPER_SHA), (PLAN, PLAN_SHA)):
+        need(not any(p.is_symlink() for p in (path, *path.parents)))
+        need(path.is_file() and 0 < path.stat().st_size <= 131072)
+        need(sha(path.read_bytes()) == digest)
+    spec = importlib.util.spec_from_file_location("_cleanup_attempt014_bindings", HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    plan = decode(PLAN.read_bytes())
+    need(encode(plan) == encode(helper.build()))
+    need(plan["attempt"] == helper.ATTEMPT == ATTEMPT)
+    need(plan["account"] == ACCOUNT and plan["region"] == REGION)
+    need(plan["cleanup_store"]["bucket"] == helper.BUCKET == BUCKET)
+    need(plan["cleanup_store"]["prefix"] == PREFIX)
+
+    def without_sid(rows):
+        return [{key: value for key, value in row.items() if key != "Sid"} for row in rows]
+
+    need(
+        without_sid(plan["cleanup_store"]["deny_statements"])
+        == without_sid(policy()["Statement"][1:5])
+    )
+    return plan
+
+
+def expected_approval(message):
+    return dict(
+        schema="lumi.attempt014-dedicated-cleanup-bucket-approval.v0.1",
+        human_message=message,
+        status="explicit_human_approval_recorded",
+        entry_sha256=sha(Path(__file__).read_bytes()),
+        bucket=BUCKET,
+        attempt=ATTEMPT,
+        plan_sha256=PLAN_SHA,
+        helper_sha256=HELPER_SHA,
+        policy_sha256=sha(encode(policy())),
+        approved_execution_count=1,
+        maximum_calls=MAX_CALLS,
+        maximum_seconds=MAX_SECONDS,
+        maximum_receipt_bytes=MAX_BYTES,
+        shared_bucket_mutation=False,
+        object_access=False,
+        iam_mutation=False,
+        instance_action=False,
+        training=False,
+        retry=False,
+        rollback=False,
+    )
+
+
+def authorize():
+    sources()
+    need(
+        sha((ROOT / "scripts/diagnose_sft_vm_cleanup_identity_v1.py").read_bytes())
+        == "d34636e17f292672ca6408f267ee26eeab6d935a89d08db5af91ae8ac37a0cf7"
+    )
+    need(not any(p.is_symlink() for p in (APPROVAL, *APPROVAL.parents)))
+    need(APPROVAL.is_file() and 0 < APPROVAL.stat().st_size <= 8192)
+    approval = decode(APPROVAL.read_bytes())
+    message = approval.get("human_message")
+    need(type(message) is str and 0 < len(message.strip()) <= 4096)
+    need(encode(approval) == encode(expected_approval(message)))
+    need(not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)) and not OUTPUT.exists())
+    return approval
+
+
+def run(*, cloud=None, clock=time.monotonic):
+    approval = authorize()
+    cloud = cloud or Cloud()
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = encode(value)
+        need(len(raw) <= 8192 and written + len(raw) <= MAX_BYTES)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    start = clock()
+    report = dict(
+        status="started",
+        bucket=BUCKET,
+        calls=0,
+        mutation_dispatches=0,
+        create_acknowledged=False,
+        privacy_readback_verified=False,
+        shared_bucket_mutation=False,
+        object_access=False,
+        iam_mutation=False,
+        instance_action=False,
+        gpu=False,
+        training=False,
+        retry=False,
+        gate_5_complete=False,
+        cpu_entry_bound=False,
+    )
+    save(
+        "started.json",
+        dict(approval_sha256=sha(encode(approval)), entry_sha256=sha(Path(__file__).read_bytes())),
+    )
+    used, response_bytes = set(), 0
+
+    def call(operation, service="s3api"):
+        nonlocal response_bytes
+        need(report["calls"] < MAX_CALLS and 0 <= clock() - start < MAX_SECONDS - 20)
+        key = service, operation
+        need(key not in used)
+        used.add(key)
+        fields = requests()[key]
+        report["calls"] += 1
+        mutation = operation.startswith(("create-", "put-"))
+        report["mutation_dispatches"] += int(mutation)
+        stem = f"call-{report['calls']:02d}"
+        receipt = dict(
+            service=service,
+            operation=operation,
+            mutation=mutation,
+            request_sha256=sha(encode(fields)),
+        )
+        save(stem + "-started.json", receipt)
+        try:
+            value = cloud.call(service, operation, **fields)
+        except LookupError:
+            save(stem + "-result.json", dict(receipt, status="absent"))
+            raise
+        except Exception:
+            save(stem + "-result.json", dict(receipt, status="unconfirmed_no_retry"))
+            raise
+        response_bytes += len(encode(value))
+        need(response_bytes <= MAX_BYTES and clock() - start < MAX_SECONDS)
+        save(stem + "-result.json", dict(receipt, status="acknowledged"))
+        return value
+
+    stage = "identity"
+    try:
+        need(call("get-caller-identity", "sts")["Account"] == ACCOUNT)
+        stage = "fresh_name_absence"
+        try:
+            call("head-bucket")
+        except LookupError:
+            pass
+        else:
+            need(False)
+        stage = "create_bucket"
+        call("create-bucket")
+        report["create_acknowledged"] = True
+        for operation in (
+            "put-public-access-block",
+            "put-bucket-encryption",
+            "put-bucket-versioning",
+            "put-bucket-tagging",
+            "put-bucket-policy",
+        ):
+            stage = operation
+            call(operation)
+        stage = "privacy_readback"
+        need(call("get-bucket-location")["LocationConstraint"] in {None, REGION})
+        need(call("get-public-access-block")["PublicAccessBlockConfiguration"] == BLOCK)
+        need(
+            call("get-bucket-ownership-controls")["OwnershipControls"]
+            == {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+        )
+        rules = call("get-bucket-encryption")["ServerSideEncryptionConfiguration"]["Rules"]
+        need(
+            len(rules) == 1
+            and rules[0]["ApplyServerSideEncryptionByDefault"] == {"SSEAlgorithm": "AES256"}
+        )
+        need(call("get-bucket-versioning").get("Status") == "Enabled")
+        need(
+            sorted(call("get-bucket-tagging")["TagSet"], key=lambda x: x["Key"])
+            == sorted(TAGS, key=lambda x: x["Key"])
+        )
+        need(decode(call("get-bucket-policy")["Policy"]) == policy())
+        need(call("get-bucket-policy-status")["PolicyStatus"]["IsPublic"] is False)
+        stage = "no_lifecycle"
+        try:
+            value = call("get-bucket-lifecycle-configuration")
+        except LookupError:
+            pass
+        else:
+            need(value.get("Rules") == [])
+        report.update(
+            status="created_private_cleanup_store_verified", privacy_readback_verified=True
+        )
+    except Exception as error:
+        report.update(
+            status="stopped_no_retry_preserve_partial",
+            failed_stage=stage,
+            failure_kind=error.kind
+            if type(error) is ControlFailure
+            else "validation_or_local_error",
+        )
+    report.update(elapsed_seconds=round(clock() - start, 3), response_bytes=response_bytes)
+    save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    print(encode(run()).decode(), end="")

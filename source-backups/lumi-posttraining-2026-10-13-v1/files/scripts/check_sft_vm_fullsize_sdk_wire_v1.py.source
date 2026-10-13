@@ -1,0 +1,126 @@
+"""Explicit optional SDK check, outside ordinary test discovery; no SDK install.
+
+Socket/file audit forbids network and AWS credential files. Only dummy explicit
+credentials and synthetic HTTP response bytes are used; HTTP send is doubled,
+but SDK signing, event dispatch, endpoint resolution and parsing are real.
+"""
+import importlib
+import io
+import os
+import sys
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+VIOLATIONS = {"network": 0, "payload_or_credentials": 0}
+
+
+def audit(event, args):
+    if event in {"socket.connect", "socket.getaddrinfo", "socket.bind"}:
+        VIOLATIONS["network"] += 1
+        raise AssertionError("network_forbidden")
+    if event == "open" and isinstance(args[0], (str, bytes, os.PathLike)):
+        name = os.fsdecode(args[0])
+        if any(s in name for s in ("/.aws/", "/lumi-artifacts/", "/inputs/", "/outputs/")):
+            VIOLATIONS["payload_or_credentials"] += 1
+            raise AssertionError("private_payload_or_credentials_forbidden")
+
+
+class SDKWireTests(unittest.TestCase):
+    @classmethod
+    def tearDownClass(cls):
+        if any(VIOLATIONS.values()):
+            raise AssertionError("forbidden_io_was_attempted:" + str(VIOLATIONS))
+
+    @classmethod
+    def setUpClass(cls):
+        sys.addaudithook(audit)
+        # The installed AWS CLI vendors botocore under this namespace. Ordinary
+        # CPython without an SDK must fail, not silently report a skipped proof.
+        # urllib3 otherwise probes IPv6 availability by binding ::1 during
+        # import. Disable just that capability probe in this offline test;
+        # the socket audit remains active and no production code is changed.
+        with patch("socket.has_ipv6", False):
+            import awscli  # noqa: F401
+            from botocore.awsrequest import AWSResponse
+            from botocore.config import Config
+            from botocore.session import Session
+        cls.Config, cls.Session, cls.AWSResponse = Config, Session, AWSResponse
+        root = Path(__file__).resolve().parents[1]
+        package = types.ModuleType("_vm_fullsize_sdk_wire")
+        package.__path__ = [str(root / "src/lumi")]
+        sys.modules[package.__name__] = package
+        cls.transport = importlib.import_module(package.__name__ +
+                                               ".posttraining_vm_fullsize_transport_v1")
+
+    def setUp(self):
+        self.t = self.transport
+        self.session = self.Session()
+        self.session.set_config_variable("config_file", "/dev/null")
+        self.session.set_config_variable("credentials_file", "/dev/null")
+        self.session.set_config_variable("profile", None)
+        options = self.t.client_options({"access_key": "ASIASYNTHETICEXAMPLE",
+            "secret_key": "synthetic-secret-not-real", "session_token": "synthetic-token"},
+            self.Config)
+        self.client = self.session.create_client("s3", **options)
+        self.addCleanup(lambda: self.client._endpoint.http_session.close())
+        self.key = "bound/synthetic/object"
+        self.selected = {"account": self.t.ACCOUNT, "region": self.t.REGION,
+            "bucket": self.t.BUCKET, "objects": [{"key": self.key, "bytes": 6}]}
+        # Double just the physical HTTP send; do not replace SDK event dispatch.
+        self.wire = self.enterContext(patch.object(self.client._endpoint.http_session, "send"))
+        self.responses = self.t._ExactResponses(self.client, self.selected, time.monotonic()+30)
+
+    def test_real_sdk_signs_exact_get_and_streams_success(self):
+        raw = io.BytesIO(b"opaque")
+        def wire(request):
+            self.assertEqual(request.url, self.t.OBJECT_ENDPOINT + self.key)
+            self.assertEqual(request.method, "GET")
+            self.assertIs(request.stream_output, True)
+            self.assertEqual(request.headers["x-amz-expected-bucket-owner"],
+                             self.t.ACCOUNT.encode())
+            return self.AWSResponse(request.url, 200, {"content-length": "6"}, raw)
+        self.wire.side_effect = wire
+        length, body = self.responses.open(self.t.BUCKET, self.key)
+        self.assertEqual(length, 6)
+        self.assertEqual(body.read(6), b"opaque")
+        self.assertEqual(body.read(1), b"")
+        body.close()
+        self.assertTrue(raw.closed)
+        self.assertEqual(self.wire.call_count, 1)
+
+    def test_sdk_error_body_never_read_or_retried(self):
+        raw = io.BytesIO(b"untrusted raw error body")
+        with patch.object(raw, "read", wraps=raw.read) as read:
+            self.wire.side_effect = lambda request: self.AWSResponse(
+                request.url, 503, {"content-length": "23"}, raw)
+            with self.assertRaises(self.t.TransportError):
+                self.responses.open(self.t.BUCKET, self.key)
+            read.assert_not_called()
+        self.assertTrue(raw.closed)
+        self.assertEqual(self.wire.call_count, 1)
+
+    def test_sdk_redirect_never_followed(self):
+        raw = io.BytesIO(b"")
+        self.wire.side_effect = lambda request: self.AWSResponse(request.url, 301,
+            {"content-length": "0", "location": "https://other.example/"}, raw)
+        with self.assertRaises(self.t.TransportError):
+            self.responses.open(self.t.BUCKET, self.key)
+        self.assertTrue(raw.closed)
+        self.assertEqual(self.wire.call_count, 1)
+
+    def test_success_wrong_size_rejected_before_parser(self):
+        raw = io.BytesIO(b"too much")
+        with patch.object(raw, "read", wraps=raw.read) as read:
+            self.wire.side_effect = lambda request: self.AWSResponse(request.url, 200,
+                {"content-length": "8"}, raw)
+            with self.assertRaises(self.t.TransportError):
+                self.responses.open(self.t.BUCKET, self.key)
+            read.assert_not_called()
+        self.assertTrue(raw.closed)
+
+
+if __name__ == "__main__":
+    unittest.main()

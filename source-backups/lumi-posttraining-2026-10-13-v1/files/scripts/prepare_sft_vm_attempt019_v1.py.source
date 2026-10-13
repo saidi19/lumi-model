@@ -1,0 +1,210 @@
+"""Create a fresh attempt-019 identity from the verified v0.5 repair."""
+from __future__ import annotations
+
+import ast
+import base64
+import hashlib
+import io
+import json
+import os
+import re
+import zipfile
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_v5 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.5"
+BASE_SHA = "8b66eff48b193009d4fc51761488deeb4c70488ead72e3e099838f9333cf5a5f"
+SOURCE_BUILDER_SHA = "e380e84fe92fabfc771c7a628c0951ff80a44102182ed4f91fe2ea4784a5992f"
+PROOF = ROOT / "evidence/lumi-vm-attempt-018-readonly-preflight-failure-v0.6.json"
+PROOF_SHA = "be410a1da527775221dcbc41b41ac5254cf1f68ab9a32fbbbd9fce609aeb0316"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-019-source-v0.1"
+OLD = "0532df93f0f2418bb6d467d3e5215759"
+NEW = "c7124d8fb1a244798d7e41b7b5dfad61"
+OLD_CIDR = "172.31.96.224/27"
+NEW_CIDR = "172.31.97.0/27"
+TAR = source.TAR
+SELECTION = source.SELECTION
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_v1_source_rejected") from None
+
+
+def package(raw):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        item = zipfile.ZipInfo("watchdog.py", (2026, 10, 1, 0, 0, 0))
+        item.external_attr = 0o100400 << 16
+        archive.writestr(item, raw)
+    return out.getvalue()
+
+
+def close(base, seed, preserved):
+    current = dict(seed)
+    for _ in range(64):
+        hash_map, binding_map = {}, {}
+        for name, raw in base.items():
+            if name in preserved:
+                continue
+            after = source.previous.sha(current[name])
+            for anchored in (raw, seed[name]):
+                before = source.previous.sha(anchored)
+                need(before not in hash_map or hash_map[before] == after)
+                hash_map[before] = after
+                binding_map[before] = (after, len(current[name]))
+        following = {}
+        for name, raw in seed.items():
+            if name in preserved or name == TAR:
+                following[name] = raw
+            elif name.endswith(".json"):
+                following[name] = source.previous.update_json(raw, hash_map, binding_map)
+            elif name.endswith(".py"):
+                following[name] = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda match, mapping=hash_map: mapping.get(
+                        match[0].decode(), match[0].decode()
+                    ).encode(),
+                    raw,
+                )
+            else:
+                following[name] = raw
+        following[TAR] = source.previous.previous.rebuild_tar(
+            base[TAR], following, following[SELECTION]
+        )
+        if following == current:
+            return current
+        current = following
+    raise ValueError("attempt019_v1_hash_cycle")
+
+
+def build():
+    need(source.previous.sha(Path(source.__file__).read_bytes()) == SOURCE_BUILDER_SHA)
+    proof = json.loads(source.previous.read(PROOF, PROOF_SHA))
+    need(
+        proof["attempt"] == OLD
+        and proof["result"]["status"] == "stopped_no_retry"
+        and proof["result"]["calls"] == 8
+        and proof["result"]["cloud_mutations"] == 0
+        and proof["result"]["object_access"] == 0
+        and proof["result"]["retry_performed"] is False
+        and proof["localization"]["same_identity_reuse_rejected"] is True
+        and proof["localization"]["fresh_attempt_identity_required"] is True
+    )
+    manifest = json.loads(source.previous.read(BASE / "release.json", BASE_SHA))
+    base = {
+        name: source.previous.read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    need(len(base) == 156)
+    preserved = {
+        name
+        for name in base
+        if name != TAR
+        and (
+            "/" not in name
+            or name.startswith("evidence/")
+            or name.endswith((".gz", ".tar", ".pem"))
+        )
+    }
+    seed = dict(base)
+    changes = (
+        (OLD, NEW),
+        ("attempt-018", "attempt-019"),
+        ("Attempt-018", "Attempt-019"),
+        ("attempt018", "attempt019"),
+        (OLD_CIDR, NEW_CIDR),
+    )
+    for name, raw in base.items():
+        if name not in preserved and name.endswith((".py", ".json")):
+            for before, after in changes:
+                raw = raw.replace(before.encode(), after.encode())
+            seed[name] = raw
+    worker = "scripts/sft_vm_external_watchdog_v1.py"
+    old_code = base64.b64encode(hashlib.sha256(package(base[worker])).digest())
+    new_code = base64.b64encode(hashlib.sha256(package(seed[worker])).digest())
+    need(old_code != new_code)
+    for name in (
+        "scripts/arm_sft_vm_external_watchdog_v2.py",
+        "scripts/prepare_sft_vm_private_host_sources_v4.py",
+    ):
+        need(seed[name].count(old_code) == 1)
+        seed[name] = seed[name].replace(old_code, new_code)
+    final = close(base, seed, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            need(raw == base[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name.startswith("scripts/"):
+            need(OLD.encode() not in raw and b"attempt-018" not in raw)
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        need(len(raw) == pin["bytes"] and source.previous.sha(raw) == pin["sha256"])
+    plan = json.loads(final["configs/lumi-vm-private-network-plan-v0.1.json"])
+    selection = json.loads(final[SELECTION])
+    members = source.previous.previous.tar_members(final[TAR])
+    embedded = json.loads(members["release-manifest.json"])
+    need(
+        plan["attempt"] == NEW
+        and plan["targets"]["new_private_subnet_cidr"] == NEW_CIDR
+        and selection["object_versions_bound"] is True
+        and selection["versioned_object_count"] == 22
+        and members["controls/input-selection.json"] == final[SELECTION]
+        and all(source.previous.sha(members[name]) == digest for name, digest in embedded.items())
+    )
+    report = {
+        "schema": "lumi.vm-attempt019-source.v0.1",
+        "attempt": NEW,
+        "operational_predecessor": OLD,
+        "attempt_label": "attempt-019",
+        "base_release_sha256": BASE_SHA,
+        "identity_reuse_failure_sha256": PROOF_SHA,
+        "cleanup_bucket": "lumi-cleanup-" + NEW,
+        "selected_cidr": NEW_CIDR,
+        "selected_cidr_live_absence_verified": False,
+        "bounded_transient_read_recovery_preserved": True,
+        "read_attempts_per_call_maximum": 3,
+        "read_retries_total_maximum": 8,
+        "write_attempts_per_operation": 1,
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "watchdog_code_sha256_base64": new_code.decode(),
+        "fresh_controls_required": True,
+        "execution_permitted": False,
+        "old_authorization_reused": False,
+        "old_timer_reused": False,
+        "consumed_attempt_retained": True,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "outputs": {
+            name: {"bytes": len(raw), "sha256": source.previous.sha(raw)}
+            for name, raw in sorted(final.items())
+        },
+    }
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in sorted((files | {"release.json": source.previous.encode(report)}).items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("fresh_source_preparation_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

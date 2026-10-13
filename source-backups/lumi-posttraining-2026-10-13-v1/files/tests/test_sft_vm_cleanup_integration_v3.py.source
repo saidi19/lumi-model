@@ -1,0 +1,204 @@
+"""Offline full-graph integration; no credential, network or subprocess access."""
+
+import ast
+import hashlib
+import importlib
+import json
+import socket
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+m = importlib.import_module("scripts.prepare_sft_vm_cleanup_integration_v3")
+
+
+def guard(event, args):
+    if event.startswith("socket."):
+        raise RuntimeError("external_execution_forbidden")
+    if event == "subprocess.Popen" and args[1] != ["/usr/bin/ssh", "-V"]:
+        raise RuntimeError("only_local_version_probe_allowed")
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        if "/.aws/" in str(args[0]) or "connection-key" in str(args[0]):
+            raise RuntimeError("private_credentials_forbidden")
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.root = Path(tmp.name).resolve() / "successor"
+        with patch.object(m, "OUTPUT", cls.root):
+            cls.report = m.prepare()
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        cls.outer.authenticate()
+        # Replay source specialization using saved non-secret metadata, not live resources.
+        path = ROOT / (
+            "artifacts/lumi-vm-private-outer-execution-v0.19/attempt-016/"
+            "host-preparation/binding/host-proposal-v0.2.json"
+        )
+        raw = m.closure.read(
+            path, "3c9c34b3b3452d3742cd4eb3ba866a4580000b845b68d4e5a345fabad971de34"
+        )
+        value = json.loads(raw)
+        value["private_network_binding"]["nonce"] = "1" * 32
+        proposal = cls.root / "test-proposal.json"
+        raw = cls.outer.loading.sources.binding.encoded(value)
+        cls.outer.loading.save(proposal, raw)
+        files, cls.manifest = cls.outer.loading.sources.build(raw, proposal)
+        for row in cls.manifest["modules"].values():
+            if row["changed"]:
+                cls.outer.loading.save(
+                    cls.root / "scripts" / row["filename"], files[row["filename"]]
+                )
+        cls.joined = importlib.import_module(cls.manifest["entry"])
+        cls.joined.authenticate()
+
+    def test_all_output_hashes(self):
+        self.assertEqual(len(self.report["outputs"]), 156)
+        for name, pin in self.report["outputs"].items():
+            raw = (self.root / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), pin["sha256"])
+
+    def test_outer_and_34_private_roles_authenticate(self):
+        self.outer.authenticate()
+        self.joined.authenticate()
+        self.assertEqual(len(self.manifest["modules"]), 34)
+        self.assertEqual(len(self.outer.loading.sources.inputs()), 34)
+
+    def test_actual_derived_transport_cleanup_attempts_all(self):
+        transport = self.joined.lifecycle.guard.provision.setup.delivery.seed.sender.delivery
+        source = Path(transport.__file__).read_text()
+        node = next(
+            n for n in ast.parse(source).body if getattr(n, "name", None) == "pipe_exchange"
+        )
+        cleanup = next(n.finalbody for n in node.body if isinstance(n, ast.Try) and n.finalbody)
+        code = compile(ast.Module(body=cleanup, type_ignores=[]), "<derived-cleanup>", "exec")
+        for failed in ("kill", "wait", "stdin", "stdout"):
+            with self.subTest(failed=failed):
+                process, os_mock = Mock(), Mock()
+                operations = dict(
+                    kill=os_mock.killpg,
+                    wait=process.wait,
+                    stdin=process.stdin.close,
+                    stdout=process.stdout.close,
+                )
+                operations[failed].side_effect = OSError("synthetic")
+                namespace = dict(
+                    transport.__dict__,
+                    process=process,
+                    os=os_mock,
+                    exit_kind="zero",
+                    remote_stage="none",
+                )
+                with self.assertRaises(transport.ExchangeFailure) as caught:
+                    exec(code, namespace)
+                self.assertEqual(
+                    transport.exchange_diagnostic(caught.exception)["exchange_stage"],
+                    "cleanup_kill_os" if failed == "kill" else "cleanup_" + failed,
+                )
+                for operation in operations.values():
+                    operation.assert_called_once()
+                process.wait.assert_called_once_with(timeout=2)
+
+    def test_derived_stop_check_codes_reach_provisioner(self):
+        provision = self.joined.lifecycle.guard.provision
+        source = Path(provision.__file__).read_text()
+        self.assertIn('self.stop_observation_check = "owner"', source)
+        self.assertIn('self.report["stop_observation_check"]', source)
+        self.assertEqual(provision.ATTEMPT, "3f3cb73e00434101943c82601a3fb3bc")
+        self.assertIn(str(self.root), provision.__file__)
+
+    def test_scope_and_evidence_preserved(self):
+        self.assertEqual(
+            self.report["semantic_source_changes"],
+            ["scripts/run_sft_vm_detached_delivery_v1.py"],
+        )
+        for name in self.report["outputs"]:
+            if name.startswith("evidence/") or name in {
+                "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json",
+                "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+                "configs/lumi-vm-private-network-plan-v0.1.json",
+            }:
+                self.assertEqual(
+                    (self.root / name).read_bytes(), (m.BASE / name).read_bytes()
+                )
+
+    def test_real_local_ssh_in_specialized_controller(self):
+        transport = self.joined.lifecycle.guard.provision.setup.delivery.seed.sender.delivery
+        self.assertEqual(transport.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3), b"")
+
+    def test_actual_derived_stop_uses_exact_id_even_in_reconciliation(self):
+        provision = self.joined.lifecycle.guard.provision
+        tx = object.__new__(provision.Transaction)
+        tx.binding = {"instance": "i-00000000000000001", "key_name": "synthetic"}
+        tx.host = dict(
+            account="573978149073",
+            ami="ami-test",
+            instance_type="r6i.4xlarge",
+            vpc="vpc-test",
+            subnet="subnet-test",
+        )
+        row = dict(
+            InstanceId=tx.binding["instance"],
+            ClientToken=provision.ATTEMPT,
+            ImageId="ami-test",
+            InstanceType="r6i.4xlarge",
+            VpcId="vpc-test",
+            SubnetId="subnet-test",
+            KeyName="synthetic",
+            Tags=[dict(Key="LumiAttempt", Value=provision.ATTEMPT)],
+        )
+        tx.cli = Mock(
+            return_value=dict(Reservations=[dict(OwnerId="573978149073", Instances=[row])])
+        )
+        self.assertEqual(tx.instance(reconcile=True), row)
+        tx.cli.assert_called_once_with(
+            "ec2", "describe-instances", InstanceIds=["i-00000000000000001"]
+        )
+
+    def test_no_overwrite_or_execution_authority(self):
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertTrue(self.report["consumed_identity_retained"])
+        self.assertFalse(self.manifest["live_execution_authorized"])
+        with patch.object(m, "OUTPUT", self.root), self.assertRaises(ValueError):
+            m.prepare()
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+    def test_derived_permission_reconciliation_is_fail_closed(self):
+        transport = self.joined.lifecycle.guard.provision.setup.delivery.seed.sender.delivery
+        source = Path(transport.__file__).read_text()
+        node = next(
+            n for n in ast.parse(source).body if getattr(n, "name", None) == "pipe_exchange"
+        )
+        body = next(n.finalbody for n in node.body if isinstance(n, ast.Try) and n.finalbody)
+        code = compile(ast.Module(body=body, type_ignores=[]), "<actual-derived>", "exec")
+        for outcome in (ProcessLookupError(3, "gone"), PermissionError(1, "denied"), None):
+            process, kernel = Mock(), Mock()
+            process.returncode = 0
+            kernel.killpg.side_effect = [PermissionError(1, "denied"), outcome]
+            ns = dict(transport.__dict__, process=process, os=kernel,
+                      exit_kind="zero", remote_stage="none")
+            if isinstance(outcome, ProcessLookupError):
+                exec(code, ns)
+            else:
+                with self.assertRaises(transport.ExchangeFailure):
+                    exec(code, ns)
+            self.assertEqual(kernel.killpg.call_count, 2)
+            self.assertEqual(kernel.killpg.call_args.args[1], 0)
+            process.wait.assert_called_once_with(timeout=2)
+            process.stdin.close.assert_called_once()
+            process.stdout.close.assert_called_once()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+    sys.addaudithook(guard)
+    unittest.main()

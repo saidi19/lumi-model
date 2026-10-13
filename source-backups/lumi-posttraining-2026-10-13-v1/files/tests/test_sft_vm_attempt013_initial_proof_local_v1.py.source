@@ -1,0 +1,112 @@
+"""No guest execution; diagnostic safety and exact proof-validator tests."""
+
+import ast
+import json
+import math
+import re
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import diagnose_sft_vm_attempt013_initial_proof_local_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_frozen_validator_accepts_valid_and_rejects_ten_invalid_proofs(self):
+        source = m.read(
+            m.ROOT
+            / "artifacts/lumi-vm-attempt-013-source-v0.1/scripts/build_sft_vm_initial_boot_v1.py"
+        )
+        nodes = [
+            n
+            for n in ast.parse(source).body
+            if isinstance(n, ast.FunctionDef) and n.name in {"need", "validate_proof"}
+        ]
+        namespace = dict(
+            math=math,
+            re=re,
+            ATTEMPT="a" * 32,
+            EARLY_SHA="b" * 64,
+            BASE=dict(
+                host_admitted=False,
+                binding_created=False,
+                gate_5_complete=False,
+                retry_allowed=False,
+            ),
+            delivery=types.SimpleNamespace(
+                seed=types.SimpleNamespace(
+                    sender=types.SimpleNamespace(delivery=types.SimpleNamespace(decode=json.loads))
+                )
+            ),
+        )
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<validator>", "exec"), namespace)
+        result = m.validator_probe(types.SimpleNamespace(**namespace))
+        self.assertTrue(result["valid_synthetic_proof_accepted"])
+        self.assertEqual(result["invalid_synthetic_proofs_rejected"], 10)
+
+    def fixture(self):
+        sender = types.SimpleNamespace(
+            command=Mock(return_value=["ssh", "synthetic"]),
+            delivery=types.SimpleNamespace(pipe_exchange=Mock()),
+        )
+        initial = types.SimpleNamespace(proof_launcher=Mock(return_value="pass"))
+        inputs = types.SimpleNamespace(read=Mock(return_value=b"synthetic public host key"))
+        seed = types.SimpleNamespace(sender=sender, INPUTS=inputs)
+        module = types.SimpleNamespace(initial=initial, delivery=types.SimpleNamespace(seed=seed))
+        return module
+
+    def probe(self, module):
+        return m.command_probe(
+            module, {}, Path("key"), Path("directory"), {"ssh_config_sha256": "a" * 64}
+        )
+
+    def test_command_reconstruction_never_calls_exchange(self):
+        module = self.fixture()
+        self.assertEqual(self.probe(module)["status"], "constructed_not_executed")
+        module.delivery.seed.sender.delivery.pipe_exchange.assert_not_called()
+
+    def test_local_errors_are_stage_only_never_exception_text(self):
+        for attribute, stage in (
+            ("read", "known_hosts_read"),
+            ("launcher", "launcher_build"),
+            ("command", "command_build"),
+        ):
+            module = self.fixture()
+            target = {
+                "read": module.delivery.seed.INPUTS.read,
+                "launcher": module.initial.proof_launcher,
+                "command": module.delivery.seed.sender.command,
+            }[attribute]
+            target.side_effect = ValueError("PRIVATE_SENTINEL")
+            result = self.probe(module)
+            self.assertEqual(result, dict(status="local_rejection", stage=stage))
+            self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_bad_launcher_is_not_executed(self):
+        module = self.fixture()
+        module.initial.proof_launcher.return_value = "def broken("
+        self.assertEqual(self.probe(module)["stage"], "launcher_compile")
+
+    def test_guard_rejects_network_subprocess_and_private_key_reads(self):
+        for event, args in [
+            ("socket.connect", ()),
+            ("subprocess.Popen", ()),
+            ("open", ("/private/connection-key", "r", 0)),
+            ("open", (b"/private/connection-key", "r", 0)),
+        ]:
+            with self.assertRaises(ValueError):
+                m.guard(event, args)
+        m.guard("open", ("/synthetic/known_hosts", "r", 0))
+
+    def test_proof_drift_fails_before_loading(self):
+        with patch.object(m, "PROOF_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.run()
+
+    def test_actual_frozen_graph_and_metadata_reconstruction(self):
+        result = m.run()
+        self.assertEqual(result["modules_verified"], 34)
+        self.assertEqual(result["prior_evidence_bindings_verified"], 85)
+        self.assertEqual(result["command"]["status"], "constructed_not_executed")
+        self.assertEqual(result["boundaries"]["network_calls"], 0)
+        self.assertIn("historical_remote_cause_unresolved", result["status"])

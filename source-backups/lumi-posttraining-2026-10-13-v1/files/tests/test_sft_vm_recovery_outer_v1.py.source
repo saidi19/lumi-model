@@ -1,0 +1,251 @@
+"""Real outer/binder/loader on generated EC2/S3 responses, never AWS."""
+
+import ast
+import copy
+import importlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_cleanup_store_v1 as store_fake
+from tests import test_sft_vm_network_cleanup_arming_v1 as expiry_fake
+from tests import test_sft_vm_private_host_loading_v1 as update_fake
+from tests import test_sft_vm_private_network_transaction_v1 as network_fake
+from tests import test_sft_vm_private_outer_v2 as outer_fake
+from tests import test_sft_vm_retention_admission_v1 as bucket_fake
+from tests import test_sft_vm_watchdog_launch_interlock_v1 as watchdog_fake
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+builder = importlib.import_module("prepare_sft_vm_recovery_outer_v1")
+
+
+class RecoveryOuterTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.guest, cls.extras, cls.pins = builder.inputs()
+        cls.files, cls.report = builder.build(cls.guest, cls.extras, cls.pins)
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-recovery-outer-fixture-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.package = Path(cls.temp.name)
+        for name, raw in cls.files.items():
+            path = cls.package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def setUp(self):
+        names = {Path(n).stem for n in self.files if n.startswith("scripts/")}
+        saved = {n: sys.modules.pop(n) for n in names if n in sys.modules}
+        directory = str(self.package / "scripts")
+        sys.path.insert(0, directory)
+        importlib.invalidate_caches()
+
+        def restore():
+            sys.path.remove(directory)
+            for n in names:
+                sys.modules.pop(n, None)
+            sys.modules.update(saved)
+
+        self.addCleanup(restore)
+        self.m = importlib.import_module("run_sft_vm_private_outer_v7")
+        proposal = self.files["configs/lumi-vm-fullsize-host-proposal-v0.1.json"]
+        plan = self.files["configs/lumi-vm-private-network-plan-v0.1.json"]
+        for module, attribute, value in (
+            (outer_fake, "m", self.m),
+            (network_fake, "m", self.m.network),
+            (network_fake, "PLAN", plan),
+            (store_fake, "m", self.m.store),
+            (store_fake, "PROPOSAL", proposal),
+            (bucket_fake, "PROPOSAL", proposal),
+            (expiry_fake, "m", self.m.store.armer),
+            (watchdog_fake, "a", self.m.loading.original_guard),
+            (update_fake, "m", self.m.loading),
+        ):
+            self.enterContext(patch.object(module, attribute, value))
+        self.case = outer_fake.OuterTests()
+        self.case.setUp()
+        self.addCleanup(self.case.doCleanups)
+        self.case.watchdog.code = self.m.loading.BASE_CODE
+
+    def test_outer_and_all_source_bindings_authenticate(self):
+        self.m.authenticate()
+        self.assertEqual(self.m.network.selection.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.loading.original_guard.worker.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.store.worker.ATTEMPT, builder.NEW)
+        self.assertNotIn(builder.OLD, self.m.store.worker.PREFIX)
+        self.assertFalse(hasattr(self.m.loading, "PREDECESSOR_PINS"))
+        self.assertFalse(hasattr(self.m.loading, "predecessor_evidence"))
+
+    def test_full_synthetic_outer_private_binding_update_and_cleanup(self):
+        result = self.case.run_once()
+        self.assertTrue(result["host_lifecycle_completed"], result)
+        self.assertTrue(result["network_cleanup_verified"], result)
+        self.assertEqual(len(self.case.host_calls), 1)
+        loaded = self.case.host_calls[0]
+        joined = loaded.joined
+        self.assertTrue(loaded.closed)
+        self.assertEqual(joined.lifecycle.guard.worker.ATTEMPT, builder.NEW)
+        self.assertEqual(joined.prepare.initial.ATTEMPT, builder.NEW)
+        self.assertNotEqual(
+            joined.lifecycle.guard.worker.SUBNET, self.m.network.selection.PUBLIC_SUBNET
+        )
+        self.assertEqual(self.case.watchdog.updates, 1)
+        self.assertEqual(result["watchdog_preflight"]["status"], "verified_fresh_inert_watchdog")
+        self.assertEqual(result["watchdog_preflight"]["api_calls"], 14)
+        self.assertTrue(all(op.startswith(("get-", "list-")) for _, op, _ in self.case.calls[:14]))
+        for service, operation, fields in self.case.calls:
+            if operation == "update-function-code":
+                self.assertEqual(fields["FunctionName"], "lumi-stop-" + builder.NEW)
+                self.assertFalse(fields["Publish"])
+            if service in {"iam", "lambda", "scheduler"}:
+                self.assertNotIn(builder.OLD, json.dumps(fields, default=str))
+        self.assertFalse(result["gate_5_complete"] or result["training_authorized"])
+
+    def test_consumed_watchdog_code_rejected_before_any_allocation(self):
+        self.case.watchdog.code = "OBHOrwe03MldxSaCl+5XKsKw0nmmpcgFVl601k+djMs="
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"])
+        self.assertFalse(self.case.net.rows or self.case.host_calls)
+        self.assertEqual(self.case.watchdog.updates, 0)
+        self.assertTrue(all(op.startswith(("get-", "list-")) for _, op, _ in self.case.calls))
+
+    def test_armed_fresh_watchdog_rejected_before_allocation(self):
+        self.case.watchdog.concurrency = 1
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"] or self.case.net.rows)
+        self.assertEqual(self.case.watchdog.updates, 0)
+
+    def test_missing_fresh_watchdog_fails_before_allocation(self):
+        original = self.case.watchdog.cli
+
+        def cli(service, operation, **fields):
+            if operation == "get-function-configuration":
+                raise LookupError("absent")
+            return original(service, operation, **fields)
+
+        self.case.watchdog.cli = cli
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"] or self.case.net.rows)
+        self.assertEqual(self.case.watchdog.updates, 0)
+
+    def test_old_resource_identity_rejected_before_host_handoff(self):
+        def corrupt(operation, value):
+            if operation == "describe-subnets" and self.case.net.rows:
+                value = copy.deepcopy(value)
+                for tag in value["Subnets"][0]["Tags"]:
+                    if tag["Key"] == "LumiAttempt":
+                        tag["Value"] = builder.OLD
+            return value
+
+        self.case.modify = corrupt
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"] or self.case.host_calls)
+        self.assertEqual(self.case.watchdog.updates, 0)
+
+    def test_uncertain_new_function_update_is_not_retried_and_network_cleans(self):
+        self.case.watchdog.fail = "update-function-code"
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"] or self.case.host_calls)
+        self.assertTrue(result["network_cleanup_verified"])
+        self.assertEqual(self.case.watchdog.updates, 1)
+        with self.assertRaises((ValueError, FileExistsError)):
+            self.case.run_once()
+        self.assertEqual(self.case.watchdog.updates, 1)
+
+    def test_completed_revision_drift_prevents_host_and_cleans_network(self):
+        original = self.case.watchdog.cli
+        polls = [0]
+
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if operation == "get-function-configuration" and self.case.watchdog.updates:
+                polls[0] += 1
+                if polls[0] > 1:
+                    value["RevisionId"] = "synthetic-competing-revision"
+            return value
+
+        self.case.watchdog.cli = cli
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"] or self.case.host_calls)
+        self.assertTrue(result["network_cleanup_verified"])
+        self.assertEqual(self.case.watchdog.updates, 1)
+
+    def test_sdk_transport_rejects_old_function_before_dispatch(self):
+        adapter = self.m.loading.WatchdogCloud(
+            {k: self.case.bundle.clients[k] for k in self.m.loading.original_guard.OPS}
+        )
+        before = len(self.case.calls)
+        with self.assertRaises(ValueError):
+            adapter.cli(
+                "lambda",
+                "update-function-code",
+                FunctionName="lumi-stop-" + builder.OLD,
+                RevisionId="synthetic",
+                ZipFile=b"synthetic",
+                Publish=False,
+            )
+        self.assertEqual(len(self.case.calls), before)
+
+    def test_old_function_arn_is_not_accepted_as_new_watchdog(self):
+        def old_arn(operation, value):
+            if operation == "get-function-configuration":
+                value["FunctionArn"] = value["FunctionArn"].replace(builder.NEW, builder.OLD)
+            return value
+
+        self.case.watchdog.change = old_arn
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"] or self.case.net.rows)
+        self.assertEqual(self.case.watchdog.updates, 0)
+
+    def test_stale_controller_window_cannot_be_restarted(self):
+        self.case.net.clock += 1500
+        with self.assertRaises(ValueError):
+            self.case.run_once()
+        self.assertFalse(self.case.calls or self.case.net.rows)
+
+    def test_inert_configuration_checks_unchanged(self):
+        def node(raw, name):
+            tree = ast.parse(raw)
+            return ast.dump(
+                next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
+            )
+
+        self.assertEqual(
+            node(self.files[builder.LOADER], "_inert_checks"),
+            node(self.extras[builder.LOADER], "_inert_checks"),
+        )
+
+    def test_previous_report_pins_not_rewritten_as_current_evidence(self):
+        self.assertEqual(self.files[builder.HISTORY], self.extras[builder.HISTORY])
+        self.assertEqual(
+            self.files["configs/lumi-vm-recovery-release-inputs-v0.1.json"],
+            self.extras["configs/lumi-vm-recovery-release-inputs-v0.1.json"],
+        )
+
+    def test_isolated_sdk_ca_path_is_present_and_keeps_frozen_digest(self):
+        path = Path(self.m.credentials.ca_path())
+        self.assertEqual(path, self.package / builder.CA)
+        self.assertEqual(path.read_bytes(), self.extras[builder.CA])
+        self.assertEqual(builder.sha(path.read_bytes()), self.m.credentials.acquisition.base.CA_SHA)
+
+    def test_guest_sources_and_archives_are_byte_identical(self):
+        self.assertEqual(self.report["guest_files_byte_identical"], 128)
+        for name, raw in self.guest.items():
+            self.assertEqual(self.files[name], raw, name)
+        self.assertEqual(
+            builder.build(self.guest, self.extras, self.pins), (self.files, self.report)
+        )
+
+    def test_extra_source_tamper_fails_before_assembly(self):
+        for name in self.extras:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                builder.build(self.guest, self.extras | {name: b"tampered"}, self.pins)
+
+    def test_source_only_bundle_has_no_execution_authority(self):
+        self.assertTrue(self.report["fresh_watchdog_deployment_required"])
+        self.assertFalse(self.report["old_watchdog_evidence_used"])
+        self.assertFalse(self.report["installed"] or self.report["live_execution_authorized"])
+        with self.assertRaises(ValueError):
+            builder.run(approved=True)

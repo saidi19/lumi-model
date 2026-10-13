@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""Generated-only rehearsal on a separately admitted Linux VM; never a downloader."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+
+def load_control_module(root):
+    """Do not import lumi.__init__: it eagerly registers the installed ML stack.
+
+    The controller/probes are stdlib-only. ML belongs exclusively in the fixed
+    chain child, after worker boundary checks and worker-owned source staging.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "lumi_vm_rehearsal_control_v3",
+        root / "src/lumi/posttraining_import_vm_rehearsal_v3.py",
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError("control_module_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    launch_parser = commands.add_parser("launch")
+    launch_parser.add_argument("--expected-machine-id", required=True)
+    launch_parser.add_argument("--attempt", required=True)
+    launch_parser.add_argument("--release-sha256", required=True)
+    worker_parser = commands.add_parser("worker")
+    worker_parser.add_argument("attempt")
+    worker_parser.add_argument("mode", choices=("chain", "timeout", "memory", "disk"))
+    args = parser.parse_args()
+    if sys.platform != "linux":
+        parser.exit(2, "host_rejected_linux_required\n")
+    root = Path("/opt/lumi-sft-rehearsal-v3")
+    if Path(__file__).resolve() != root / "scripts/run_sft_import_vm_rehearsal_v3.py":
+        parser.exit(2, "prepared_release_required\n")
+    module = load_control_module(root)
+    RehearsalError, launch, worker = module.RehearsalError, module.launch, module.worker
+
+    try:
+        if args.command == "worker":
+            worker(args.attempt, args.mode)
+        else:
+            result = launch(machine_id=args.expected_machine_id, attempt=args.attempt,
+                            release_sha256=args.release_sha256)
+            print(json.dumps(result, sort_keys=True))
+    except RehearsalError as error:
+        parser.exit(1, error.code + "\n")
+    except BaseException:
+        parser.exit(1, "rehearsal_failed\n")
+
+
+if __name__ == "__main__":
+    main()
+

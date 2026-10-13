@@ -1,0 +1,43 @@
+"""Offline tests; never repeat the consumed execution or readback."""
+
+import types
+import unittest
+
+from scripts import verify_sft_vm_attempt021_v026_execution_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def meter(self):
+        return m.Meter(types.SimpleNamespace(static_identity_client=None), clock=lambda: 1)
+
+    def test_local_consumed_evidence_closure(self):
+        _, ids, target, _ = m.local()
+        self.assertEqual(len(ids), 4)
+        self.assertTrue(target)
+        self.assertFalse((m.ROOT / m.BASE / "host").exists())
+
+    def test_twelve_read_limit_is_fail_closed(self):
+        meter = self.meter()
+        for _ in range(12):
+            meter.consume("ec2", model=types.SimpleNamespace(name="DescribeInstances"))
+        with self.assertRaises(ValueError):
+            meter.consume("ec2", model=types.SimpleNamespace(name="DescribeInstances"))
+        self.assertEqual(meter.calls, 12)
+
+    def test_mutation_and_object_access_are_rejected(self):
+        for name in ("RunInstances", "DeleteSubnet", "GetObject", "HeadObject"):
+            meter = self.meter()
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                meter.consume("ec2", model=types.SimpleNamespace(name=name))
+            self.assertEqual(meter.calls, 0)
+
+    def test_timeout_before_dispatch_is_rejected(self):
+        meter = self.meter()
+        meter.start = -160
+        with self.assertRaises(ValueError):
+            meter.consume("ec2", model=types.SimpleNamespace(name="DescribeInstances"))
+        self.assertEqual(meter.calls, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

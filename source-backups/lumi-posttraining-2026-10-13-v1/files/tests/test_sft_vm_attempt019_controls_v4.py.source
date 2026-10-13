@@ -1,0 +1,30 @@
+"""Offline tests for the attempt-019 admitted control plan."""
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt019_controls_v4 as m
+
+
+class Tests(unittest.TestCase):
+    def test_successful_admission_is_bound_without_execution_authority(self):
+        plan = m.build()
+        proof = plan["successful_readonly_preflight"]
+        self.assertEqual(proof, {"path": m.PREFLIGHT, "sha256": m.PREFLIGHT_SHA})
+        self.assertEqual(
+            plan["cpu_scope_reference"]["output"],
+            "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019",
+        )
+        self.assertIsNone(plan["cpu_scope_reference"]["execution_entry_sha256"])
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["gate_5_complete"])
+
+    def test_drift_and_public_execution_are_rejected(self):
+        with patch.object(m, "PREFLIGHT_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.build()
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,32 @@
+"""Offline tests for the attempt-020 unapproved control package."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt020_control_package_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_package_is_prepared_but_unapproved(self):
+        result = m.verify()
+        self.assertEqual(result["status"], "control_package_prepared_not_authorized")
+        self.assertFalse(result["approval_files_present"])
+        self.assertFalse(result["deployment_outputs_present"])
+        self.assertEqual(result["cloud_mutations"], 0)
+        self.assertFalse(result["execution_authority_created"])
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_proposal_drift_is_rejected(self):
+        original = m.read
+
+        def changed(name, digest):
+            if name == m.WATCH_PROPOSAL:
+                digest = "0" * 64
+            return original(name, digest)
+
+        with patch.object(m, "read", changed), self.assertRaises(ValueError):
+            m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

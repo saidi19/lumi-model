@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Offline exact metadata revalidation/selection only; no acquisition or execution."""
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import sys
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BACKUP = ('../lumi-artifacts/4b-80b-production-v0.1/418a113021da/'
+          'segment-3-s3-backup/backup-plan-v0.1.json')
+HANDOFF = ('../lumi-artifacts/4b-80b-production-v0.1/1f162717f199/'
+           'segment-3-finalization/5e656d6ea946/segment-3-checkpoint-handoff.json')
+FILES = {
+    'base.json': ('configs/lumi-4b-final-base-binding-v0.1.json',
+                 '1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172'),
+    'manifest.sha256': ('artifacts/lumi-sft-final-base-metadata-v0.1/manifest.sha256',
+                       '73c852095441a4246cea7bb97f7831c364137869e00e29c815b7e22a5972f8de'),
+    'state.json': ('artifacts/lumi-sft-final-base-metadata-v0.1/distributed-training-state.json',
+                   '819046f39176dc9fce677db69623265e83a5c6dbdd38bed78fec8adaff1fb3e6'),
+    'config.json': ('configs/lumi-4b-v0.2.json',
+                    '643e8da652577f802d959740d66a7e6bafc5b065aa45010c2d7e0340ed9509be'),
+    'handoff.json': (HANDOFF, '63788dfec4199ddcf908227db1bd6f6852da3500df1a4e4d8092e149579d4afa'),
+    'plan.json': ('configs/lumi-4b-sft-checkpoint-import-plan-v0.1.json',
+                  '3138f88ddb871c0a24134a5aae84cb28128581b8d943ca599f24553bd3c3cbd8'),
+    'envelope.json': ('configs/lumi-4b-sft-real-import-resource-envelope-proposal-v0.1.json',
+                      'a984a5e300199e2bed0a1763583c399735723b29451815d932da0fb2c476324a'),
+    'kernel-io.json': ('configs/lumi-4b-sft-real-import-kernel-io-proposal-v0.1.json',
+                       '826f577651d3c024fe738fa6336c9c0f4a3b31513c0403736688b65861fc78f4'),
+    'backup.json': (BACKUP, '6e2fd6dccccac816832b3d98aed20862a7d3cd501c63233f8888fab08d60dedc'),
+}
+
+
+def need(condition):
+    if not condition:
+        raise ValueError('metadata_binding_rejected') from None
+
+
+def read_bound(relative, pin):
+    path = ROOT / relative
+    need(path.is_file() and not path.is_symlink() and path.stat().st_size <= 131072)
+    raw = path.read_bytes()
+    need(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == pin)
+    return raw
+
+
+def select_objects(base, plan, backup):
+    """Select existing exact keys only. Never infer current versions/availability."""
+    need(backup['bucket'] == base['s3_backup']['bucket']
+         and backup['archive_prefix'] == base['s3_backup']['prefix'] + '/archive/'
+         and backup['run_fingerprint'] == base['run_fingerprint']
+         and backup['checkpoint_manifest_sha256'] == base['checkpoint']['manifest_sha256'])
+    rows = {r['relative_path']: r for r in backup['objects']}
+    need(len(rows) == len(backup['objects']))
+    selected = []
+    for role, inventory in (('checkpoint', 'checkpoint_inventory'),
+                             ('tokenizer', 'tokenizer_inventory')):
+        for item in plan[inventory]:
+            relative = (f"training/checkpoint-{base['checkpoint']['step']:08d}/" if
+                        role == 'checkpoint' else '') + item['path']
+            row = rows[relative]
+            need(row['key'] == backup['archive_prefix'] + relative
+                 and row['sha256'] == item['sha256'] and row['bytes'] == item['bytes'])
+            selected.append({'role':role, 'target_relative_path':item['path'],
+                             'key':row['key'], 'bytes':row['bytes'], 'sha256':row['sha256']})
+    need(len({r['key'] for r in selected}) == len(selected))
+    return selected
+
+
+def prepare():
+    bodies = {name: read_bound(*row) for name, row in FILES.items()}
+    # An inert namespace avoids eager ML registration and runs validators only.
+    name = '_lumi_vm_fullsize_metadata_prepare_v1'
+    need(name not in sys.modules and 'lumi' not in sys.modules)
+    package = types.ModuleType(name)
+    package.__path__ = [str(ROOT / 'src/lumi')]
+    sys.modules[name] = package
+    runner = importlib.import_module(name + '.posttraining_checkpoint_import_runner_v4')
+    base, backup = json.loads(bodies['base.json']), json.loads(bodies['backup.json'])
+    contract = json.loads(bodies['kernel-io.json'])
+    plan, envelope, limits, _ = runner._resource_inputs(
+        metadata=tuple(bodies[n] for n in ('base.json','manifest.sha256','state.json',
+                                         'config.json','handoff.json')),
+        expected_base_sha256=FILES['base.json'][1], plan_raw=bodies['plan.json'],
+        expected_plan_file_sha256=FILES['plan.json'][1], envelope_raw=bodies['envelope.json'],
+        expected_envelope_file_sha256=FILES['envelope.json'][1], kernel_io_contract=contract,
+        expected_kernel_io_contract_sha256=contract['contract_sha256'])
+    source_bytes = 0
+    for row in envelope['runtime_sources']:
+        raw = read_bound('src/lumi/' + row['path'], row['sha256'])
+        need(len(raw) == row['bytes'])
+        source_bytes += len(raw)
+    selected = select_objects(base, plan, backup)
+    trainers = [r for r in selected if r['role']=='checkpoint'
+                and r['target_relative_path'].startswith('trainer-rank-')]
+    need(len(selected) == 22 and sum(r['bytes'] for r in selected) == 48843765443
+         and len(trainers) == 8 and sum(r['bytes'] for r in trainers) == 32019583243)
+    need(not set(sys.modules) & {'torch','numpy','transformers','safetensors','tokenizers'})
+    return {'schema':'lumi.vm-fullsize-metadata-preparation.v0.1',
+        'status':'validated_local_metadata_only', 'source_bindings':FILES,
+        'metadata_bytes_read':sum(map(len,bodies.values())),
+        'runtime_source_bytes_read':source_bytes,
+        'account':backup['account'], 'region':backup['region'], 'bucket':backup['bucket'],
+        'objects':selected, 'object_count':len(selected), 'object_bytes':48843765443,
+        'opaque_trainer_files':len(trainers), 'opaque_trainer_bytes':32019583243,
+        'model_parameters':plan['model_parameters'], 'runner_limits_proposed':limits,
+        'worker_memory_max_bytes_proposed':envelope['worker_memory_max_bytes'],
+        'host_disk_capacity_bytes_proposed':envelope['host_disk_capacity_bytes'],
+        'object_versions_bound':False, 'remote_availability_verified':False,
+        'host_admitted':False, 'acquisition_authorized':False, 'execution_permitted':False,
+        'payload_reads':0, 'gpu':False, 'training_authorized':False,
+        'gate_5_complete':False, 'production_eligible':False}
+
+
+if __name__ == '__main__':
+    need(len(sys.argv) == 1)
+    try:
+        print(json.dumps(prepare(), sort_keys=True))
+    except BaseException:
+        raise SystemExit('local_metadata_preparation_failed') from None

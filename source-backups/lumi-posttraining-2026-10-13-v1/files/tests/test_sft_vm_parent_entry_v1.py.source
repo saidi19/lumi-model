@@ -1,0 +1,285 @@
+import importlib.util
+import io
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_detached_parent_v1 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+ID = "a" * 32
+MACHINE = "b" * 32
+BOOT = "12345678-1234-1234-1234-123456789012"
+
+
+def load():
+    spec = importlib.util.spec_from_file_location(
+        "parent_entry_test", ROOT / "scripts/run_sft_vm_parent_entry_v1.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class EntryTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load()
+        self.binding = dict(
+            schema="lumi.vm-root-host-binding.v0.1",
+            attempt=ID,
+            machine_id=MACHINE,
+            boot_id=BOOT,
+            host_started_boottime=100,
+            host_deadline_boottime=14500,
+            prepared_sha256="c" * 64,
+        )
+
+    def validate(self, value=None, op="dispatch", now=200):
+        return self.m.validate_binding(value or self.binding, ID, op, MACHINE, BOOT, now)
+
+    def test_host_boot_and_deadline_binding(self):
+        self.validate()
+        changes = [
+            dict(machine_id="d" * 32),
+            dict(boot_id="87654321-1234-1234-1234-123456789012"),
+            dict(attempt="f" * 32),
+            dict(host_started_boottime=201),
+            dict(host_deadline_boottime=14501),
+            dict(host_started_boottime=True),
+            dict(host_deadline_boottime=float("nan")),
+            dict(approved=True),
+        ]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.validate(self.binding | change)
+
+    def test_expiry_blocks_work_but_not_status_or_cleanup(self):
+        for op in ("dispatch", "submit", "serve"):
+            with self.assertRaises(ValueError):
+                self.validate(op=op, now=14501)
+        for op in ("stop", "status"):
+            self.validate(op=op, now=14501)
+
+    def test_remaining_window_does_not_reset_parent_budget(self):
+        with self.assertRaises(ValueError):
+            self.validate(now=14500 - 8435)
+        self.validate(now=14500 - 8435 - 180)
+
+    def test_descriptor_original_flags_and_nonce_preserved(self):
+        imp = dict(
+            entry_sha256="1" * 64,
+            source_manifest_sha256="2" * 64,
+            control_sha256="3" * 64,
+            attempt_nonce_sha256=self.m.sha(b"lumi.vm-fullsize-attempt.v0.1\0" + ID.encode()),
+        )
+        acq = dict(entry_sha256="4" * 64, source_manifest_sha256="2" * 64)
+        descriptor = dict(
+            schema="lumi.vm-fullsize-prepared-attempt.v0.1",
+            attempt=ID,
+            acquisition_pins=acq,
+            import_pins=imp,
+            host_admitted=False,
+            sdk_runtime_bound=False,
+            execution_permitted=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            training_authorized=False,
+        )
+
+        def check(value):
+            raw = json.dumps(value).encode()
+            return self.m.descriptor(raw, self.binding | {"prepared_sha256": self.m.sha(raw)}, ID)
+
+        self.assertEqual(check(descriptor), (acq, imp))
+        for changed in [
+            descriptor | {"execution_permitted": True},
+            descriptor | {"import_pins": imp | {"attempt_nonce_sha256": "0" * 64}},
+        ]:
+            with self.assertRaises(ValueError):
+                check(changed)
+
+    def test_duplicate_keys_and_unknown_operations_rejected(self):
+        with self.assertRaises(ValueError):
+            self.m.decode(b'{"same":1,"same":2}')
+        for args in (
+            ["approve", ID],
+            ["dispatch", ID],
+            ["submit", ID, "extra"],
+            ["status", "../bad"],
+        ):
+            with patch.object(self.m, "native_boundary") as boundary, self.assertRaises(ValueError):
+                self.m.execute(args)
+            boundary.assert_not_called()
+
+    def test_native_boundary_never_accepts_current_mac_or_repo_path(self):
+        with self.assertRaises(ValueError):
+            self.m.native_boundary(ID)
+
+    def test_submit_reads_stdin_only_then_zeroes_owned_buffer_on_failure(self):
+        parent = Mock()
+        raw = bytearray(b"synthetic-secret")
+        parent.setup._read_pipe.return_value = raw
+        parent._submit_admitted_once.side_effect = ValueError("private text")
+        with self.assertRaises(ValueError):
+            self.m.invoke(parent, "submit", ID, MACHINE, "d" * 64, {}, {})
+        self.assertEqual(set(raw), {0})
+        self.assertEqual(parent.setup._read_pipe.call_args.args[0], 0)
+
+    def test_status_and_stop_never_read_stdin_or_start_work(self):
+        parent = Mock()
+        for op in ("status", "stop"):
+            self.m.invoke(parent, op, ID, MACHINE, "d" * 64, {}, {})
+        parent.setup._read_pipe.assert_not_called()
+        parent._dispatch_admitted_once.assert_not_called()
+        parent._serve_admitted_once.assert_not_called()
+        parent._stop_children_admitted.assert_called_once_with(ID)
+
+    def test_cli_scrubs_exception_and_returns_nonzero(self):
+        output = types.SimpleNamespace(buffer=io.BytesIO())
+        with (
+            patch.object(self.m, "execute", side_effect=ValueError("synthetic-secret")),
+            patch.object(self.m.resource, "setrlimit"),
+            patch.object(self.m.os, "umask"),
+            patch.object(self.m.sys, "stdout", output),
+        ):
+            result = self.m.main()
+        self.assertEqual(result, 1)
+        self.assertEqual(output.buffer.getvalue(), b"")
+
+    def test_changed_root_binding_blocks_source_load_and_stdin(self):
+        root = Path("/fixed/controller")
+        files = {
+            "parent.py": b"synthetic entry",
+            "binding.sha256": b"a" * 64,
+            "binding.json": b"{}",
+        }
+        with (
+            patch.object(self.m, "native_boundary", return_value=root),
+            patch.object(self.m, "root_file", side_effect=lambda path, *a: files[path.name]),
+            patch.object(self.m, "load_parent") as loader,
+            self.assertRaises(ValueError),
+        ):
+            self.m.execute(["submit", ID])
+        loader.assert_not_called()
+
+    def test_complete_submit_route_checks_host_and_no_swap_before_read(self):
+        root = Path("/fixed/controller")
+        body = json.dumps(self.binding).encode()
+        files = {
+            "parent.py": b"synthetic entry",
+            "binding.sha256": self.m.sha(body).encode(),
+            "binding.json": body,
+            "prepared-attempt.json": b"synthetic descriptor",
+        }
+        parent = Mock()
+        events = []
+        parent.handoff.frozen.host_check.side_effect = lambda *a: events.append("host")
+        parent.setup.workflow._no_swap.side_effect = lambda: events.append("no_swap")
+        raw = bytearray(b"synthetic-secret")
+
+        def read(*args):
+            events.append("stdin")
+            return raw
+
+        parent.setup._read_pipe.side_effect = read
+        parent._submit_admitted_once.return_value = {
+            "delivery_sent": True,
+            "workflow_completed": False,
+        }
+        with (
+            patch.object(self.m, "native_boundary", return_value=root),
+            patch.object(self.m, "root_file", side_effect=lambda path, *a: files[path.name]),
+            patch(
+                "builtins.open",
+                side_effect=lambda path, *a: io.BytesIO(
+                    MACHINE.encode() if path == "/etc/machine-id" else BOOT.encode()
+                ),
+            ),
+            patch.object(self.m.time, "CLOCK_BOOTTIME", 123, create=True),
+            patch.object(self.m.time, "clock_gettime", return_value=200),
+            patch.object(self.m, "descriptor", return_value=({}, {})),
+            patch.object(self.m, "load_parent", return_value=parent),
+        ):
+            result = self.m.execute(["submit", ID])
+        self.assertTrue(result["delivery_sent"])
+        self.assertEqual(events, ["host", "no_swap", "stdin"])
+        self.assertEqual(set(raw), {0})
+
+
+class ClosureTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load()
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name)
+        for name in self.m.SOURCE_PINS:
+            (self.source / name).write_bytes((ROOT / "src/lumi" / name).read_bytes())
+        self.enterContext(patch.object(self.m, "root_file", side_effect=lambda p: p.read_bytes()))
+        self.addCleanup(self.unload)
+
+    def unload(self):
+        for name in list(sys.modules):
+            if name == self.m.PACKAGE or name.startswith(self.m.PACKAGE + "."):
+                del sys.modules[name]
+
+    def test_actual_hash_pinned_stdlib_closure_loads_without_lumi_init(self):
+        before = set(sys.modules)
+        parent = self.m.load_parent(self.source)
+        self.assertEqual(parent.RUNTIME, 8435)
+        self.assertEqual(parent.handoff.ROOT, self.m.ROOT)
+        self.assertFalse({"lumi", "torch", "numpy", "transformers"} & (set(sys.modules) - before))
+        with self.assertRaises(ValueError):
+            self.m.load_parent(self.source)
+
+    def test_changed_last_source_rejects_before_any_execution(self):
+        (self.source / "posttraining_vm_detached_parent_v1.py").write_bytes(
+            b"raise RuntimeError('untrusted')"
+        )
+        with self.assertRaises(ValueError):
+            self.m.load_parent(self.source)
+        self.assertFalse(self.m.CONSUMED)
+        self.assertNotIn(self.m.PACKAGE, sys.modules)
+
+    def test_extra_module_and_warm_package_rejected(self):
+        extra = self.source / "__init__.py"
+        extra.touch()
+        with self.assertRaises(ValueError):
+            self.m.load_parent(self.source)
+        extra.unlink()
+        with (
+            patch.dict(sys.modules, {"lumi": types.ModuleType("lumi")}),
+            self.assertRaises(ValueError),
+        ):
+            self.m.load_parent(self.source)
+
+
+class JoinedTests(unittest.TestCase):
+    def test_entry_dispatch_status_and_serve_join_existing_fifo_workflow(self):
+        entry = load()
+        fixture = previous.DetachedTests("test_fifo_end_to_end_into_existing_workflow")
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        parent = previous.m
+        fixture.dispatch = lambda: entry.invoke(
+            parent,
+            "dispatch",
+            previous.ID,
+            "b" * 32,
+            fixture.pin,
+            fixture.host.pins,
+            previous.prior.fixture.PINS,
+        )
+        fixture.serve = lambda: entry.invoke(
+            parent,
+            "serve",
+            previous.ID,
+            "b" * 32,
+            fixture.pin,
+            fixture.host.pins,
+            previous.prior.fixture.PINS,
+        )
+        fixture.test_fifo_end_to_end_into_existing_workflow()

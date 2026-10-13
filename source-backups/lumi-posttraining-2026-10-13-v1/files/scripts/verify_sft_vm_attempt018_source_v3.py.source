@@ -1,0 +1,141 @@
+"""Offline structural verification of the repaired attempt-018 v0.3 release."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_v3 as builder
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.3"
+RELEASE_SHA = "990e6f1630db21e64ee06034dce54c41beb84feb2548d7addb2f481b26da30cc"
+BUILDER_SHA = "8eb21dd059b13e40a154daf37c9e421e89967580ba1ff8553bb6d8bfd6bc2c8d"
+TEST_SHA = "7311c72988df5c678200d245cfe23316ba2a92e9fa88a982d9b34144324c16d9"
+DENIAL_SHA = builder.DENIAL_SHA
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-018-source-v0.3-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_v3_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, digest, size=None, maximum=32 * 1024**2):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= maximum)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def verify():
+    read(ROOT / "scripts/prepare_sft_vm_attempt018_v3.py", BUILDER_SHA)
+    read(ROOT / "tests/test_sft_vm_attempt018_v3.py", TEST_SHA)
+    denial = json.loads(read(builder.DENIAL, DENIAL_SHA))
+    need(denial["process_started"] is False and denial["cloud_mutations"] == 0)
+    release = json.loads(read(RELEASE / "release.json", RELEASE_SHA))
+    need(
+        release["schema"] == "lumi.vm-attempt018-source.v0.3"
+        and release["attempt"] == builder.ATTEMPT
+        and release["source_versions_bound"] is True
+        and release["versioned_object_count"] == 22
+        and release["iam_source_action"] == "s3:GetObjectVersion"
+        and release["transport_version_query_and_response_bound"] is True
+        and release["retention_implementation_preserved"] is True
+        and release["watchdog_launch_interlock_preserved"] is True
+        and release["network_quota_kind"] == "nftables_ip_packet_quota"
+        and release["wire_or_billing_byte_cap_claimed"] is False
+        and len(release["outputs"]) == 156
+    )
+    bodies = {}
+    for name, pin in release["outputs"].items():
+        path = RELEASE / name
+        body = read(path, pin["sha256"], pin["bytes"])
+        bodies[name] = body
+        if name.endswith(".py"):
+            ast.parse(body)
+    selection = json.loads(bodies[builder.SELECTION])
+    need(
+        selection["object_versions_bound"] is True
+        and selection["versioned_object_count"] == selection["object_count"] == 22
+        and all(
+            type(row["version_id"]) is str and row["version_id"]
+            for row in selection["objects"]
+        )
+        and selection["remote_availability_verified"] is False
+        and selection["execution_permitted"] is False
+    )
+    members = builder.tar_members(bodies[builder.TAR])
+    manifest = json.loads(members["release-manifest.json"])
+    need(
+        members["controls/input-selection.json"] == bodies[builder.SELECTION]
+        and members[builder.STAGING] == bodies[builder.STAGING]
+        and members[builder.TRANSPORT] == bodies[builder.TRANSPORT]
+        and all(sha(members[name]) == digest for name, digest in manifest.items())
+    )
+    descriptor = json.loads(members["prepared-attempt.json"])
+    need(
+        descriptor["selection_sha256"] == sha(bodies[builder.SELECTION])
+        and descriptor["execution_permitted"] is False
+        and descriptor["real_4b_import"] is False
+        and descriptor["gate_5_complete"] is False
+    )
+    proposal = json.loads(bodies[builder.PROPOSALS[0]])
+    need(
+        proposal["transport"]["source_versions_bound"] is True
+        and proposal["transport"]["hard_ip_packet_quotas_implemented"] is True
+        and proposal["transport"]["wire_or_billing_byte_cap_claimed"] is False
+        and proposal["controls"]["watchdog_launch_interlock_bound"] is True
+        and proposal["controls"]["cpu_execution_authorized"] is False
+        and proposal["nonclaims"]["gate_5_complete"] is False
+        and proposal["nonclaims"]["gpu"] is False
+    )
+    return {
+        "schema": "lumi.vm-attempt018-source-v0.3-verification.v0.1",
+        "attempt": builder.ATTEMPT,
+        "status": "offline_source_repair_verified",
+        "source_release_sha256": RELEASE_SHA,
+        "builder_sha256": BUILDER_SHA,
+        "test_sha256": TEST_SHA,
+        "prior_denial_sha256": DENIAL_SHA,
+        "outputs_verified": len(bodies),
+        "versioned_objects_verified": 22,
+        "embedded_archive_verified": True,
+        "version_only_iam_verified": True,
+        "version_query_and_response_binding_verified": True,
+        "retention_implementation_preserved": True,
+        "watchdog_launch_interlock_preserved": True,
+        "wire_or_billing_byte_cap_claimed": False,
+        "cloud_calls": 0,
+        "payload_reads": 0,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

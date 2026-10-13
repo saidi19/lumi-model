@@ -1,0 +1,278 @@
+import importlib
+import json
+import unittest
+from unittest.mock import patch
+
+from tests import test_sft_vm_setup_delivery_v3 as prior
+from tests.test_sft_vm_setup_detached_v1 import m as native
+from tests.test_sft_vm_setup_detached_v1 import seed_receipt
+
+m = importlib.import_module("run_sft_vm_setup_delivery_v1")
+
+
+class SetupDeliveryJoinTests(unittest.TestCase):
+    def setUp(self):
+        prior.SetupDeliveryTests.setUp(self)
+        self.now = 0
+        self.volumes = {k: self.binding[k] for k in ("root_volume", "work_volume")}
+        self.operations = []
+        self.responses = ["dispatch_requested", "running", "setup_returned", "completed"]
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def exchange(self, argv, body, timeout):
+        code = argv[-1]
+        operation = next(
+            op
+            for op, target in (
+                ("dispatch", "_deploy_and_dispatch_once"),
+                ("status", "_status"),
+                ("finish", "_finish_once"),
+                ("abort", "_abort_once"),
+            )
+            if target in code
+        )
+        self.operations.append(operation)
+        self.assertLessEqual(timeout, m.MAX_EXCHANGE)
+        self.assertEqual(body, m.source_bytes() if operation == "dispatch" else b"")
+        state = "shutdown_requested" if operation == "abort" else self.responses.pop(0)
+        return m.seed.INPUTS.canonical(native.result(state, reaped=state == "completed"))
+
+    def call(self):
+        return m._run_staged_admitted_once(
+            self.binding,
+            self.key,
+            self.root,
+            self.config_sha,
+            self.hosts_sha,
+            seed_receipt(),
+            self.volumes,
+            self.output,
+            original_host_deadline_boottime=14000,
+            deadline=self.deadline,
+            remaining_control_bytes=self.budget,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+        )
+
+    def combined(self):
+        return m._seed_send_and_setup_admitted_once(
+            self.binding,
+            self.key,
+            self.root,
+            self.config_sha,
+            self.hosts_sha,
+            self.receiver,
+            self.archive,
+            self.volumes,
+            self.output,
+            original_host_deadline_boottime=14000,
+            deadline=self.deadline,
+            remaining_control_bytes=self.budget,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+        )
+
+    def test_single_dispatch_status_finish_and_charged_control_bytes(self):
+        with patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=self.exchange):
+            result = self.call()
+        self.assertEqual(self.operations, ["dispatch", "status", "status", "finish"])
+        self.assertTrue(result["setup_completed"] and result["setup_unit_reaped"])
+        self.assertFalse(result["host_admitted"] or result["binding_created"])
+        self.assertGreater(result["control_content_bytes_charged"], m.SOURCE_BYTES)
+        self.assertLessEqual(result["control_content_bytes_charged"], self.budget)
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange") as again,
+            self.assertRaises(FileExistsError),
+        ):
+            self.call()
+        again.assert_not_called()
+
+    def test_every_launcher_compiles_and_pins_sources(self):
+        request = m.request_from(seed_receipt(), self.volumes, 14000)
+        for operation in ("dispatch", "status", "finish", "abort"):
+            code = m.launcher(operation, request)
+            compile(code, "pinned-native-launcher", "exec")
+            self.assertIn(m.SOURCE_SHA, code)
+            self.assertIn(m.BOOTSTRAP_SHA, code)
+            self.assertNotIn("aws_access_key", code)
+
+    def test_real_seed_sender_and_detached_driver_join(self):
+        # Use the actual old seed + control sender and new long-setup driver.
+        # Only SSH exchanges are doubled, not their framing/budget checks.
+        def exchange(argv, body, timeout):
+            if "names = (" in argv[-1]:
+                self.operations.append("seed")
+                return m.seed.INPUTS.canonical(seed_receipt())
+            return self.exchange(argv, body, timeout)
+
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=exchange),
+            patch.object(
+                m.seed.sender,
+                "pipe_exchange",
+                return_value=prior.m.inputs.canonical(prior.m.expected_receipt()),
+            ) as upload,
+        ):
+            result = self.combined()
+        self.assertEqual(upload.call_count, 1)
+        self.assertEqual(self.operations, ["seed", "dispatch", "status", "status", "finish"])
+        self.assertTrue(result["control_staging_confirmed"] and result["setup_completed"])
+        self.assertLessEqual(result["total_control_content_bytes_charged"], self.budget)
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_seed_failure_blocks_detached_dispatch(self):
+        with (
+            patch.object(m.seed, "_seed_and_send_admitted_once", side_effect=ValueError()),
+            patch.object(m, "_run_staged_admitted_once") as dispatch,
+            self.assertRaises(ValueError),
+        ):
+            self.combined()
+        dispatch.assert_not_called()
+
+    def test_ambiguous_dispatch_never_resends_and_requests_shutdown_once(self):
+        def exchange(argv, body, timeout):
+            if "_deploy_and_dispatch_once" in argv[-1]:
+                self.operations.append("dispatch")
+                raise TimeoutError("private text")
+            return self.exchange(argv, body, timeout)
+
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=exchange),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.assertEqual(self.operations, ["dispatch", "abort"])
+        result = json.loads((self.output / "result.json").read_text())
+        self.assertTrue(result["remote_completion_unknown"] and result["shutdown_requested"])
+        self.assertFalse(result["setup_completed"])
+        self.assertNotIn("private text", (self.output / "result.json").read_text())
+
+    def test_failed_status_never_finishes_or_retries_dispatch(self):
+        self.responses = ["dispatch_requested", "failed"]
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=self.exchange),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.assertEqual(self.operations, ["dispatch", "status", "abort"])
+
+    def test_ambiguous_reap_is_not_repeated(self):
+        self.responses = ["dispatch_requested", "setup_returned"]
+
+        def exchange(argv, body, timeout):
+            if "_finish_once" in argv[-1]:
+                self.operations.append("finish")
+                raise TimeoutError()
+            return self.exchange(argv, body, timeout)
+
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=exchange),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.assertEqual(self.operations, ["dispatch", "status", "finish", "abort"])
+
+    def test_expiry_keeps_abort_time_and_does_not_restart_deadline(self):
+        self.deadline = 75
+        self.responses = ["dispatch_requested"] + ["running"] * 20
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=self.exchange),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.assertEqual(self.operations.count("dispatch"), 1)
+        self.assertEqual(self.operations[-1], "abort")
+        self.assertLess(self.now, self.deadline)
+
+    def test_wrong_volume_or_invalid_deadline_rejected_before_seed(self):
+        with patch.object(m.seed, "_seed_and_send_admitted_once") as seed:
+            self.volumes["work_volume"] = "vol-" + "9" * 17
+            with self.assertRaises(ValueError):
+                self.combined()
+            self.volumes = {k: self.binding[k] for k in ("root_volume", "work_volume")}
+            self.deadline = float("nan")
+            with self.assertRaises(ValueError):
+                self.combined()
+        seed.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_slow_config_check_cannot_extend_original_deadline(self):
+        original = m.seed.sender.command
+        count = 0
+
+        def command(*args, **kwargs):
+            nonlocal count
+            count += 1
+            value = original(*args, **kwargs)
+            if count == 5:  # Four preflight commands, then first live exchange.
+                self.now = self.deadline - 10
+            return value
+
+        with (
+            patch.object(m.seed.sender, "command", side_effect=command),
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=self.exchange),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.assertEqual(self.operations, ["abort"])
+        self.assertFalse(json.loads((self.output / "result.json").read_text())["setup_completed"])
+
+    def test_changed_ssh_config_blocks_later_connections(self):
+        def exchange(argv, body, timeout):
+            answer = self.exchange(argv, body, timeout)
+            if self.operations[-1] == "dispatch":
+                path = self.root / "ssh_config"
+                path.chmod(0o600)
+                path.write_bytes(b"changed-config")
+            return answer
+
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange", side_effect=exchange),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.assertEqual(self.operations, ["dispatch"])
+        report = json.loads((self.output / "result.json").read_text())
+        self.assertTrue(report["remote_completion_unknown"])
+        self.assertFalse(report["shutdown_requested"])
+
+    def test_budget_reserves_abort_before_dispatch(self):
+        self.budget = m.SOURCE_BYTES + m.ABORT_RESERVE_BYTES
+        with (
+            patch.object(m.seed.sender.delivery, "pipe_exchange") as exchange,
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        exchange.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_modified_source_rejected_before_any_seed(self):
+        with (
+            patch.object(m, "SOURCE_SHA", "0" * 64),
+            patch.object(m.seed, "_seed_and_send_admitted_once") as seed,
+            self.assertRaises(ValueError),
+        ):
+            self.combined()
+        seed.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_claimed_host_admission_or_numeric_bool_reply_rejected(self):
+        for changed in (
+            {"host_admitted": True},
+            {"binding_created": True},
+            {"setup_unit_reaped": 1},
+            {"state": "completed", "setup_unit_reaped": False},
+            {"gate_5_complete": 0},
+        ):
+            with self.assertRaises(ValueError):
+                m.reply(m.seed.INPUTS.canonical(native.result("running") | changed))
+
+    def test_public_approval_flag_does_not_admit(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

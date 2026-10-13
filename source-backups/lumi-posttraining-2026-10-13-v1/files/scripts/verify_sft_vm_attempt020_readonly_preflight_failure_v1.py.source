@@ -1,0 +1,111 @@
+"""Offline verification of the attempt-020 read-only admission failure."""
+
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+PREDECESSOR = "c7124d8fb1a244798d7e41b7b5dfad61"
+ENTRY = "scripts/preflight_sft_vm_attempt020_v1.py"
+ENTRY_SHA = "788b2d5df9f013360596bd54fa635ac7374b63777e06173811618c189f6adb69"
+TEST = "tests/test_sft_vm_attempt020_readonly_preflight_v1.py"
+TEST_SHA = "21f511192432a3d287d7e94e4bb38b829a4db6fb580e28483a448fb1a9e11b41"
+BINDINGS = "scripts/prepare_sft_vm_deployment_bindings_v22.py"
+BINDINGS_SHA = "9fe6d5e67363ac1b5cbd23b65ea7b33d7cc9999b8ab5de9f7c2da0219f23054d"
+PREDECESSOR_PROOF = "evidence/lumi-vm-attempt-019-v024-execution-failure-verification-v0.1.json"
+PREDECESSOR_PROOF_SHA = "50b72551632cefd5c1f2af9382def5bef025002bf58ef66cb6f805ab252e50fc"
+FAILURE = "evidence/lumi-vm-attempt-020-readonly-preflight-failure-v0.1.json"
+FAILURE_SHA = "f371c5516c9a22d927e3acf1dd13da66fbe8c57f61654882f866a8310c742170"
+RUN = "artifacts/lumi-vm-attempt-020-readonly-preflight-v0.1"
+STARTED_SHA = "6015b1968da8641230e3276896a0d68014f16ed30fc1ed56a06c89d48fd387fd"
+RESULT_SHA = "1866c0b95815f9a18147a3c91ea6bc5bbc6472a83b2b3f8aa73a3127bffe4d95"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_preflight_failure_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest):
+    path = ROOT / name
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def verify():
+    for name, digest in (
+        (ENTRY, ENTRY_SHA),
+        (TEST, TEST_SHA),
+        (BINDINGS, BINDINGS_SHA),
+        (PREDECESSOR_PROOF, PREDECESSOR_PROOF_SHA),
+        (FAILURE, FAILURE_SHA),
+    ):
+        read(name, digest)
+    started = json.loads(read(RUN + "/started.json", STARTED_SHA))
+    result = json.loads(read(RUN + "/result.json", RESULT_SHA))
+    predecessor = json.loads(read(PREDECESSOR_PROOF, PREDECESSOR_PROOF_SHA))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    blocker = failure["localization"]["blocking_endpoint"]
+    need(
+        failure["attempt"] == ATTEMPT
+        and failure["bindings"]
+        == {
+            "bindings_sha256": BINDINGS_SHA,
+            "entry_sha256": ENTRY_SHA,
+            "result_sha256": RESULT_SHA,
+            "started_sha256": STARTED_SHA,
+            "test_sha256": TEST_SHA,
+        }
+        and started["execution_authorized"] is False
+        and started["max_calls"] == 79
+        and result["status"] == "stopped_no_retry"
+        and result["failed_stage"] == "network"
+        and result["calls"] == 34
+        and result["cloud_mutations"] == result["object_access"] == 0
+        and result["execution_marker_created"] is False
+        and result["outer_invoked"] is False
+        and predecessor["attempt"] == PREDECESSOR
+        and predecessor["live_verification"]["retained_endpoint_state"] == "create-complete"
+        and predecessor["cleanup"][
+            "private_subnet_route_table_endpoint_groups_key_preserved_for_stopped_host"
+        ]
+        is True
+        and failure["localization"]["predecessor_attempt"] == PREDECESSOR
+        and failure["localization"]["predecessor_failure_verification_sha256"]
+        == PREDECESSOR_PROOF_SHA
+        and failure["localization"]["classification"]
+        == "predecessor_retained_endpoint_occupies_vpc_wide_slot"
+        and failure["localization"]["target_cidr_occupied"] is False
+        and failure["localization"]["destructive_cleanup_performed"] is False
+        and failure["localization"]["retry_performed"] is False
+        and blocker["lumi_attempt_tag"] == PREDECESSOR
+        and blocker["state"] == "create-complete"
+        and blocker["vpc_id"] == "vpc-0905fbf9490a2dead"
+        and failure["result"]
+        == {
+            "calls": 34,
+            "cloud_mutations": 0,
+            "execution_marker_created": False,
+            "failed_stage": "network",
+            "gate_5_complete": False,
+            "gpu": False,
+            "object_access": 0,
+            "outer_invoked": False,
+            "retry_performed": False,
+            "status": "stopped_no_retry",
+            "training": False,
+        }
+    )
+    return failure
+
+
+if __name__ == "__main__":
+    print(json.dumps(verify(), sort_keys=True))

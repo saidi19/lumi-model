@@ -1,0 +1,43 @@
+import importlib.util
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+SPEC = importlib.util.spec_from_file_location(
+    "issuer_v2", ROOT / "scripts/check_sft_temporary_issuer_v2.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class AdapterTests(unittest.TestCase):
+    def test_cli_receives_real_json_not_stdin_reference(self):
+        def capture(argv, **kwargs):
+            self.assertEqual(json.loads(argv[argv.index("--cli-input-json") + 1]), {})
+            self.assertNotIn("input", kwargs)
+            self.assertTrue(kwargs["capture_output"])
+            return subprocess.CompletedProcess(argv, 0, '{"Account":"synthetic"}', "")
+
+        with patch.object(m.subprocess, "run", side_effect=capture):
+            self.assertEqual(m.Cloud().cli("sts", "get-caller-identity"), {"Account": "synthetic"})
+
+    def test_secret_input_rejected_before_process(self):
+        with patch.object(m.subprocess, "run") as run:
+            with self.assertRaises(m.base.CloudError):
+                m.Cloud().cli("iam", "anything", SecretAccessKey="dummy")
+            run.assert_not_called()
+
+    def test_error_body_not_propagated(self):
+        result = subprocess.CompletedProcess([], 1, "", "fake-secret-error")
+        with patch.object(m.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(m.base.CloudError, "^aws_call_failed$"):
+                m.Cloud().cli("sts", "get-caller-identity")
+
+
+if __name__ == "__main__":
+    unittest.main()

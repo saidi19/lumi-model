@@ -1,0 +1,135 @@
+{
+  "schema_version": "lumi.sft-write-process-composition-development.v0.1",
+  "date": "2026-09-26",
+  "status": "PASS_local_doubled_fork_composition_candidate_NOT_role_runtime_or_native_execution",
+  "scope": "Local, import-inert controller-guardian-broker-worker fork-composition candidate with synthetic boundaries only. Fixed role runtimes and the controller event loop remain closed. No process, socket, descriptor, pidfd, signal, waitid, cgroup, listener, payload, remote, GPU, inference or training execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_process_v1.py",
+      "bytes": 25517,
+      "sha256": "f15fe0378d395869f2ac7c45e921046b8b7d24fbe9b1ed970bc418af57a13538"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_process_v1.py",
+      "bytes": 24272,
+      "sha256": "992e1e9c9c6096a0a0a35d55ad8b520152b63553c0980abe3518390ea955be58"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_authority_v1.py",
+      "bytes": 8734,
+      "sha256": "efca44b66a5fd1402e66afbee9d400b02f02afdc17441fd3f20e66f118f32c30"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_child_v1.py",
+      "bytes": 12523,
+      "sha256": "a45713c9d689daa2d547b4ebbbaf4ca16c2ca9a48d570b1d2e734012b87fe09c"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_topology_v1.py",
+      "bytes": 14780,
+      "sha256": "6e4f271d213d926c2f90c9f0715444f13984545d8452b2e1fc2155e0bf9267dd"
+    },
+    {
+      "path": "src/lumi/posttraining_sft_cgroup_v1.py",
+      "bytes": 14117,
+      "sha256": "6ab54ebb721e9607457afb943fe1e120a35d114b38be11eed77969cb75603757"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-endpoint-authority-development-v0.1.json",
+      "bytes": 5985,
+      "sha256": "ae060962ba230101ee55ddc13ae089d0fae00e9daa709125eef9179b00846a92"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-endpoint-authority-development-verification-v0.1.json",
+      "bytes": 7755,
+      "sha256": "c949aa8d40851e2d0afa54eab28fb203435d19e52e77e27d41ba5a9ad08d545d"
+    }
+  ],
+  "completed": [
+    "The private compositor requires the frozen Linux/root runtimes, one main thread, fixed cgroup limits and name, a validated cgroup-parent descriptor, one workload deadline and a bounded cleanup suffix before consuming its one attempt.",
+    "The controller precreates the twelve-endpoint topology, forks guardian, immediately binds the fresh guardian PID to one child owner, closes its own cgroup-parent descriptor copy and transitions to the exact controller set while retaining only the guardian pidfd as extra authority.",
+    "The guardian child explicitly adopts the initial topology copy, transitions to guardian-prefork, verifies the inherited cgroup parent and creates the one owned cgroup lease before any nested fork.",
+    "Guardian forks broker first and immediately pidfd-binds it before forking worker. Worker closes the exact broker-pidfd copy inherited through its later fork before performing any role transition.",
+    "Broker and worker each adopt the guardian-prefork copy, transition to their exact final endpoint set, close the inherited cgroup-parent copy, enter the owned cgroup through its leaf descriptor and close that leaf copy.",
+    "After both child pidfds are bound and proven distinct from lease descriptors, guardian transitions to guardian-watch while retaining only its lease descriptors and the two owned child pidfds as extra authorities.",
+    "Controller, guardian and final-role wrappers retain only aggregate state, expose endpoint transfer solely through the v0.117 authority adapter, and enforce one owner, non-reentrancy and one cleanup attempt.",
+    "Guardian can create exactly one identity-checked independent CLOEXEC broker-pidfd duplicate for a later fixed watcher. A changed duplicate is retained and never closed as a replacement descriptor.",
+    "Partial failures consume ambiguous closes, continue all independently safe cleanup steps, terminate and waitid-reap every bound child through its pidfd owner, and report cleanup_unconfirmed if any authority cannot be proven retired.",
+    "Broker, worker and guardian role runtimes remain fixed closed stubs. Any premature private invocation exits children with failure after bounded cleanup rather than executing a payload."
+  ],
+  "fixed_fork_composition": {
+    "controller_children": 1,
+    "guardian_children": 2,
+    "fork_order": [
+      "guardian",
+      "broker",
+      "worker"
+    ],
+    "pidfd_bind_immediately_after_each_parent_fork": true,
+    "later_child_inherited_pidfd_copies_closed": 1,
+    "role_topology_paths": {
+      "controller": "initial_to_controller",
+      "guardian": "initial_to_guardian_prefork_to_guardian_watch",
+      "broker": "guardian_prefork_to_broker",
+      "worker": "guardian_prefork_to_worker"
+    },
+    "role_processes_enter_owned_cgroup": [
+      "broker",
+      "worker"
+    ],
+    "numeric_pid_signal_calls": 0,
+    "waitpid_calls": 0,
+    "popen_fallbacks": 0,
+    "cleanup_deadline_extension_maximum_ms": 10000,
+    "retry_allowed": false
+  },
+  "verification": {
+    "new_process_composition_tests": 28,
+    "prior_regressions": 896,
+    "unique_tests_per_runtime": 924,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ],
+    "all_fork_exit_pidfd_cgroup_descriptor_topology_clock_and_role_boundaries_synthetic": true,
+    "native_operations_performed": false
+  },
+  "remaining_integration_work": [
+    "Implement the fixed controller event loop and bind the three fixed role runtimes without adding caller callbacks or reopening any public path.",
+    "The controller must authenticate READY on the worker-report endpoint before sending ARM to guardian, then retain guardian-armed proof before allowing the worker release sequence to complete.",
+    "Bind the broker listener and ledger loop so every offer is durably accepted by the controller and exactly ACKed before the broker can issue CONTINUE; verify worker CONSUMED and terminal aggregate reports.",
+    "Transfer each role endpoint through the one-shot v0.117 authority, integrate listener handoff and adoption, worker privilege drop and final seal, guardian-v2 authority consumption, full-size bootstrap and authenticated source closure.",
+    "Run a separately authorized bounded Linux native qualification of fork, inherited descriptors, pidfd, waitid, cgroup and channel semantics before any real checkpoint payload read or import, then re-run unchanged admission."
+  ],
+  "nonclaims": {
+    "public_execution_open": false,
+    "processes_spawned_or_reaped": false,
+    "native_fork_order_verified": false,
+    "native_inherited_copies_closed": false,
+    "role_runtime_bound": false,
+    "controller_event_loop_verified": false,
+    "endpoint_peer_authenticated": false,
+    "endpoint_exclusivity_verified": false,
+    "target_kernel_abi_qualified": false,
+    "native_endpoint_transferred": false,
+    "native_pidfd_bound_or_signaled": false,
+    "native_waitid_or_reap_performed": false,
+    "native_cgroup_created_or_entered": false,
+    "native_listener_bound_or_transferred": false,
+    "parent_received_ready_or_consumed": false,
+    "guardian_armed_after_ready": false,
+    "ledger_exchanged": false,
+    "native_write_continuations_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "bootstrap_or_lifecycle_integration_verified": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "retry_allowed": false,
+    "publication": false
+  }
+}

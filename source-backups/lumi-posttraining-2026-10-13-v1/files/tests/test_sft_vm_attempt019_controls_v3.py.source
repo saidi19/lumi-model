@@ -1,0 +1,28 @@
+"""Offline tests for independently verified attempt-019 controls."""
+import unittest
+
+from scripts import prepare_sft_vm_attempt019_controls_v3 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_controls_are_bound_without_cpu_authority(self):
+        plan = m.build()
+        self.assertEqual(plan["required_control_proofs"], [m.WATCH, m.STORE])
+        self.assertEqual(
+            plan["watchdog"]["status"],
+            "deployed_unarmed_invocation_disabled_verified",
+        )
+        self.assertEqual(plan["cleanup_store"]["status"], "private_cleanup_store_verified")
+        self.assertEqual(len(plan["control_verification_failures_preserved"]), 2)
+        self.assertIsNone(plan["successful_readonly_preflight"])
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["gate_5_complete"])
+
+    def test_public_execution_entry_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

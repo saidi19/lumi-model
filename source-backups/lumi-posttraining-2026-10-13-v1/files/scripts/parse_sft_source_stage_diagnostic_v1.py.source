@@ -1,0 +1,148 @@
+"""Pure bounded diagnostic: fixed guard codes and exit integers, never raw text."""
+
+import io
+import re
+import zipfile
+import zlib
+
+MAXIMUM_LOG_BYTES = 131_072
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ")
+STARTUP_CODES = frozenset(
+    """
+root_mismatch scope_arguments environment_filters environment_plugins test_subset ini_scope
+assertions_disabled read_path platform file_shape file_size file_changed
+file_unreadable_or_symlink manifest_json manifest_schema baseline_hash baseline_binding
+manifest_not_bound manifest_hash entry_count bindings entry_schema unknown_node
+integration_not_closed classification historical_classification reason_code witness_schema
+witness_test witness_source witness_line witness_label required_path node_order_or_duplicate
+private_path_cannot_be_read missing_witness_binding binding_byte_limit binding_path
+binding_schema binding_size binding_hash historical_test_changed bound_file_changed
+""".split()
+)
+COLLECTION_CODES = frozenset(
+    """
+collection_node duplicate_collected_node missing_collected_node conflicting_route
+duplicate_current_node collection_changed final_collection_accounting collection_failed
+""".split()
+)
+GUARD_CODES = STARTUP_CODES | COLLECTION_CODES
+IGNORES = (
+    "test_sft_source_bundle_v1.py",
+    "test_sft_supervisor_v1.py",
+    "test_sft_worker_admission_v1.py",
+    "test_sft_launch_contract_v1.py",
+    "test_process_watchdog_v1.py",
+    "test_sft_guarded_bootstrap_v1.py",
+    "test_sft_ledger_protocol_v1.py",
+)
+HISTORY_PREFIX = (
+    "--deselect=tests/test_sft_checkpoint_import_torch_v1.py::CheckpointImportTorchTests::"
+)
+SOURCE_COMMAND = " ".join(
+    [
+        "python -B -m pytest -p scripts.ci_source_partition_v1 --lumi-source-suite tests",
+        *("--ignore=tests/" + name for name in IGNORES),
+        HISTORY_PREFIX + "test_real_bfloat16_roundtrip",
+        HISTORY_PREFIX + "test_real_adapter_bfloat16_and_worker_consumer",
+    ]
+)
+SOURCE_GROUP = "##[group]Run " + SOURCE_COMMAND
+EXIT = re.compile(r"##\[error\]Process completed with exit code ([0-9]{1,3})\.")
+GUARD = re.compile(r"(?:##\[error\])?ERROR: source partition: ([a-z][a-z0-9_]{2,99})")
+SUMMARY = re.compile(r"=+ short test summary info =+")
+
+
+def _decoded_streams(data):
+    """Decode in memory only; compressed and total expanded bytes are both capped."""
+    if data.startswith(b"\x1f\x8b"):
+        decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        value = decoder.decompress(data, MAXIMUM_LOG_BYTES)
+        if not decoder.eof or decoder.unused_data:
+            return "gzip_expansion_rejected", []
+        return "gzip_utf8", [value.decode("utf-8")]
+    if data.startswith(b"PK\x03\x04"):
+        values, total = [], 0
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = archive.infolist()
+            if not 1 <= len(entries) <= 64:
+                return "zip_shape_rejected", []
+            for entry in entries:
+                if entry.is_dir():
+                    continue
+                if entry.flag_bits & 1 or entry.file_size > MAXIMUM_LOG_BYTES - total:
+                    return "zip_expansion_rejected", []
+                with archive.open(entry) as stream:
+                    value = stream.read(entry.file_size)
+                total += len(value)
+                if len(value) != entry.file_size or total > MAXIMUM_LOG_BYTES:
+                    return "zip_expansion_rejected", []
+                values.append(value.decode("utf-8"))
+        return "zip_utf8", values
+    return "plain_utf8", [data.decode("utf-8")]
+
+
+def parse_diagnostic(data, _unused_paths=None):
+    result = {
+        "input_format": "rejected",
+        "summary_present": False,
+        "source_step_scope": "absent",
+        "code_scope": "none",
+        "process_exit_code": None,
+        "process_exit_conflict": False,
+        "allowlisted_guard_codes": [],
+    }
+    if type(data) is not bytes or not 0 < len(data) <= MAXIMUM_LOG_BYTES:
+        return result
+    try:
+        kind, streams = _decoded_streams(data)
+    except (
+        OSError,
+        EOFError,
+        ValueError,
+        UnicodeError,
+        zipfile.BadZipFile,
+        NotImplementedError,
+        zlib.error,
+    ):
+        result["input_format"] = "invalid_or_unsupported_encoding"
+        return result
+    result["input_format"] = kind
+    # Keep only in-memory line references. Never export lines or member names.
+    all_lines, source_sections = [], []
+    for stream in streams:
+        lines = [STAMP.sub("", ANSI.sub("", row)).strip() for row in stream.splitlines()]
+        all_lines.extend(lines)
+        section, header = None, False
+        for row in lines:
+            if row.startswith("##[group]"):
+                if section is not None:
+                    source_sections.append(section)
+                section = [] if row == SOURCE_GROUP else None
+                header = section is not None
+            elif row == "##[endgroup]" and section is not None:
+                header = False
+            elif section is not None and not header:
+                section.append(row)
+        if section is not None:
+            source_sections.append(section)
+    if len(source_sections) > 1:
+        result["source_step_scope"] = "ambiguous"
+        return result
+    selected = source_sections[0] if source_sections else all_lines
+    result["source_step_scope"] = "exact_command_group" if source_sections else "absent"
+    result["code_scope"] = "source_step" if source_sections else "unattributed_log"
+    result["summary_present"] = any(SUMMARY.fullmatch(row) is not None for row in selected)
+    exits, guards = set(), set()
+    for row in selected:
+        match = EXIT.fullmatch(row)
+        if match and 0 <= int(match.group(1)) <= 255:
+            exits.add(int(match.group(1)))
+        match = GUARD.fullmatch(row)
+        if match and match.group(1) in GUARD_CODES:
+            guards.add(match.group(1))
+    result["process_exit_conflict"] = len(exits) > 1
+    if len(exits) == 1:
+        result["process_exit_code"] = next(iter(exits))
+    result["allowlisted_guard_codes"] = sorted(guards)
+    return result

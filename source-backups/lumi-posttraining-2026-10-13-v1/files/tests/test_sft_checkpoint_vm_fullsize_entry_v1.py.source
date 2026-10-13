@@ -1,0 +1,62 @@
+"""Pure metadata/doubled full-size adapter checks; no native/model/data access."""
+import importlib
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_checkpoint_fullsize_entry_v1 as old
+
+_before = set(sys.modules)
+m = importlib.import_module(old.PACKAGE + '.posttraining_checkpoint_vm_fullsize_entry_v1')
+_imported = set(sys.modules) - _before
+
+
+class ControlTests(old.FullsizeControlTests):
+    def setUp(self):
+        self.enterContext(patch.object(old, 'm', m))
+        super().setUp()
+
+
+class OneShotTests(old.FullsizeOneShotTests):
+    def setUp(self):
+        self.enterContext(patch.object(old, 'm', m))
+        super().setUp()
+
+
+class VMRouteTests(unittest.TestCase):
+    def test_vm_coordinator_and_unique_scope_no_old_control_replay(self):
+        self.assertTrue(m.runner.__name__.endswith('posttraining_checkpoint_import_runner_v4'))
+        self.assertNotEqual(m.SCHEMA, old.m.SCHEMA)
+        self.assertNotEqual(m.CONTROL_SCHEMA, old.m.CONTROL_SCHEMA)
+        self.assertNotEqual(m.SCOPE, old.m.SCOPE)
+        bodies, sources = old.fixture(fullsize=True)
+        arguments = old.arguments(bodies, sources)
+        with self.assertRaises(m.FullsizeEntryError):
+            m.prepare_entry(**arguments)
+
+    def test_fixed_parent_satisfies_frozen_depth_without_filesystem_probe(self):
+        self.assertEqual(m.ATTEMPT, Path('/outputs/import/attempt-001'))
+        self.assertGreaterEqual(len(m.ATTEMPT.parent.parts), 3)
+        self.assertFalse(m.ATTEMPT.is_relative_to(m.CHECKPOINT))
+        self.assertFalse(m.ATTEMPT.is_relative_to(m.TOKENIZER))
+
+    def test_adapters_are_stdlib_only(self):
+        self.assertFalse({name.split('.')[0] for name in _imported} & {
+            'torch', 'numpy', 'transformers', 'safetensors'})
+
+    def test_fullsize_proposal_is_not_host_or_training_authority(self):
+        bodies, sources = old.fixture(fullsize=True)
+        with patch.object(old, 'm', m):
+            prepared = m.prepare_entry(**old.arguments(bodies, sources))
+        self.assertEqual(prepared['plan']['model_parameters'], 4002376704)
+        self.assertEqual(prepared['limits']['maximum_seconds'], 3600)
+        self.assertEqual(prepared['envelope']['worker_memory_max_bytes'], 64*1024**3)
+        with patch.object(m.runner, '_coordinate_admitted_import') as coordinate:
+            with self.assertRaisesRegex(m.FullsizeEntryError, 'host_guard_not_bound'):
+                m.run_import(approved=True, prepared=prepared)
+            coordinate.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

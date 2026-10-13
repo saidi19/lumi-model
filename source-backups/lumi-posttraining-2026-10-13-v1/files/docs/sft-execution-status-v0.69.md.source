@@ -1,0 +1,149 @@
+# SFT execution status v0.69
+
+Real-host/checkpoint/data handoff preflight, 2026-09-10. The user requested
+the next work and resumed it. **Local inventory and draft alignment are complete;
+real restore and GPU execution remain blocked.** The completed v0.68 CPU
+acceptance was not rerun. Repository HEAD remains
+`ecc545fc423650bf1089311915290523c10b3172`; no commit or GitHub publication occurs
+in this step, and no historical tracked source/evidence is changed.
+
+## Concrete work completed
+
+The v2 metadata compiler existed, but only its historical v0.1 launch JSON had
+been materialized. Added
+`configs/lumi-4b-sft-gpu-smoke-launch-contract-v0.2.json`, 5,475 bytes, SHA-256
+`c29388eaca59282a9d1ea4603b6d8881af26fa457bde00ab2c8d63e392b408c1`.
+Its only byte-level change from v0.1 is the required schema version. Existing
+base/data/profile/prohibition fields are unchanged; all six input/approval slots
+and execution adapter remain null. The exact existing `make_draft` reproduces
+it, and pure `analyze` returns local validation success **with execution blocked**.
+This fixes draft/compiler version alignment, not the historical profile mismatch.
+
+Internal contract SHA-256:
+`249540bde5d72edeb2ed7c3e682d921a051f020ffbd54cf1f8c262d9fe1d7a4a`.
+Bound v2 compiler SHA-256:
+`b792b4e75ff6c35066f9b1b80760bab23276d61a6047cb17672ed34837c74e5d`.
+All six bound input/source hashes were rechecked after pure validation.
+
+The existing launch-v2, import-v2 and WorkerRun-v1 regression suites passed
+**125 tests, zero failures/skips**, on Python 3.11.15 (0.162s), 3.13.7 (0.175s)
+and 3.14.6 (0.163s). These were stdlib/source/synthetic checks, not Linux-native,
+ML, real tensor import, network or GPU tests. No package installation occurred.
+
+## Original S3-backed base is preserved
+
+The exact base remains our `lumi-4b-base`, step 76,294, 80,000,000,000 pretraining
+tokens and historical eight-rank DCP. Base-binding file SHA-256:
+`1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172`.
+Its bucket/prefix were matched to the local backup inventory; no third-party or
+synthetic checkpoint substitutes for this base.
+
+Verified local historical metadata:
+
+| Metadata | SHA-256 |
+| --- | --- |
+| Segment-3 backup plan | `6e2fd6dccccac816832b3d98aed20862a7d3cd501c63233f8888fab08d60dedc` |
+| S3 backup receipt | `b826123e42ac71c3cb15f3a67d5e057507781286331f147fc0ab0fb584059ea5` |
+| Independent S3 verification | `d42475846f8ecb23d87f9be7964d769f285b034bebdd7112716ebbbea456c1f8` |
+| Final checkpoint handoff | `63788dfec4199ddcf908227db1bd6f6852da3500df1a4e4d8092e149579d4afa` |
+
+The first three live under
+`../lumi-artifacts/4b-80b-production-v0.1/418a113021da/segment-3-s3-backup/`;
+the final handoff under
+`../lumi-artifacts/4b-80b-production-v0.1/1f162717f199/segment-3-finalization/5e656d6ea946/`.
+Only small metadata was read, not model/trainer files.
+
+Inventory: 52 archive objects / 48,844,509,979 bytes; the complete checkpoint is
+19 files / 48,839,117,190 bytes. Nine model files contain 16,819,524,800 bytes;
+eight trainer files contain 32,019,583,243 bytes. The current importer validates
+the closed whole-checkpoint manifest, so the model-only subtotal is **not**
+permission to omit trainer files or claim a partial restore is complete.
+
+## First read-only AWS check stopped before S3
+
+The intended bounded check was at most five read-only AWS application commands:
+expected-account verification, then HEAD/GET for exactly two inventory-bound
+small objects. Combined checkpoint-metadata bodies would be 9,147 bytes:
+
+- `training/checkpoint-00076294/manifest.sha256`: 1,564 bytes, SHA-256
+  `73c852095441a4246cea7bb97f7831c364137869e00e29c815b7e22a5972f8de`.
+- `training/checkpoint-00076294/distributed-training-state.json`: 7,583 bytes,
+  SHA-256 `819046f39176dc9fce677db69623265e83a5c6dbdd38bed78fec8adaff1fb3e6`.
+
+The default AWS `GetCallerIdentity` command returned nonzero after approximately
+1.277 seconds. It stopped with fixed code `aws_auth_or_request_unavailable`.
+Exactly one application command was attempted; **zero S3 HEAD/GETs, zero
+checkpoint metadata bytes and zero model/data bytes** were read. No request was
+retried. Credentials and raw stderr were not printed or saved. Network bytes
+are not metered, so this failed network attempt is not described as zero network.
+
+The exact cause is unconfirmed: do not call it an expired login or assume a
+network outage. A local-only profile listing found `lumi-s3`, `lumi-s3-canary`
+and `default`; none was silently substituted after the failed default check.
+AWS CLI is 2.35.24. A working intended profile/account is needed before the next
+small read. Historical S3 verification is not current remote-availability proof.
+
+## Existing implementation limits, not new roadmap gates
+
+The earlier four-item user-facing summary was high-level. In particular,
+"restore/import" and "H100 validation" contain the following still-open source
+work; CPU composition success does not remove it:
+
+1. The current real-identity import entry deliberately rejects `lumi-4b-base`;
+   its tested converter is limited to one million synthetic parameters,
+   16 MiB per file and 64 MiB per tree. A separately resource-bounded real-sized
+   CPU import successor is required. It must preserve authenticated lineage,
+   closed inventories, DCP tensor/chunk/dtype checks, tied weights, exact HF
+   reload, distinct DCP/HF manifests and no-retry/private-output rules. Do not
+   raise the synthetic caps and treat that as a verified real importer.
+2. The historical smoke design says FSDP, 4,096 context and eight ranks. The
+   accepted WorkerRun currently admits DDP only, context at most 4,095 and
+   at least two ranks. With padding multiple eight, 4,095 is not a usable
+   substitute. Existing tests deliberately reject FSDP and 4,096; v0.48 already
+   documented these constraints. WorkerStep having an FSDP branch does not prove
+   the enclosing WorkerRun/optimizer/checkpoint/resume integration supports it.
+3. The accepted image/probe is CPU-only and the public real-worker entry remains
+   closed. Real input/host/approval binding and target-compatible runtime/device
+   integration are still required. Do not turn the synthetic flag into a real
+   worker permit or silently choose a one-GPU/DDP/lower-context fallback.
+
+No profile, context, strategy, rank count or safety cap changed in this step.
+Eight is the old design and checkpoint history, **not a new H100 purchase
+recommendation**. The user's preferred H100 count/host is not yet supplied.
+
+## Current data handoff
+
+The active learning lineage is private research/nonproduction contract v0.2 and
+source registry v0.24, not an old Be-DSTC2 attempt. Historical verified totals:
+329,200 records, 309,643 train and 19,557 validation; 11,855,217 train supervised
+tokens and 939,293 validation supervised tokens. Ten encoded shards accounted
+for 342,832,492 private written bytes. No candidate rows, tokenizer lexical
+values, token/index/label payloads or real test objects were opened here.
+
+After relocation, content inventory, manifest file/internal and seal hashes
+must remain fixed. The fifth `metadata_inventory_sha256` is host-local and must
+be regenerated only after target content/private-mode verification; it is not
+portable merely because the files have the same names. No relocation or fresh
+data-content validation occurred. Production eligibility remains false.
+
+## Handoff
+
+The next concrete operation is recovery/verification of the exact 9,147-byte
+checkpoint metadata through the intended working AWS profile. That resolves the
+source-config binding needed for the real CPU import plan. Configuration and
+tokenizer-manifest locations must be authenticated, not guessed. In parallel,
+the intended dedicated H100 geometry must be supplied before choosing the
+profile-specific worker/runtime successor; do not start billing a GPU yet.
+
+Then complete the bounded real importer and profile/real-input integration,
+bind the exact host/runtime/cost/storage limits, verify the actual import and
+relocated data, and freeze the CUDA smoke/approval. This is completion of existing
+conditions, not a new series of substitute canaries. No new CI, GPU, instance,
+weight download, training, registry/seal/promotion or unrelated action was run.
+
+Aggregate evidence:
+`evidence/lumi-4b-sft-real-handoff-preflight-v0.1.json`, 7,783 bytes, SHA-256
+`4c97aecd6f026a078e088c3235a33f1603e77ecc3d83bd40f4b2b0c2adf87563`.
+The new draft, aggregate evidence and this status are local-only/unpublished.
+`gate_5_complete=false`, `real_sft_execution_permitted=false` and
+`production_eligible=false` remain explicit.

@@ -1,0 +1,73 @@
+import base64
+import unittest
+
+from scripts import diagnose_sft_vm_transport_live_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def row(self):
+        return dict(
+            Reservations=[
+                dict(
+                    OwnerId=m.ACCOUNT,
+                    Instances=[
+                        dict(
+                            InstanceId="i-00000000000000001",
+                            ClientToken=m.TOKEN,
+                            ImageId=m.AMI,
+                            InstanceType="t3.micro",
+                            SubnetId=m.SUBNET,
+                            VpcId=m.VPC,
+                            KeyName=m.KEY_NAME,
+                            Tags=[dict(Key="LumiDiagnostic", Value=m.TOKEN)],
+                        )
+                    ],
+                )
+            ]
+        )
+
+    def test_owned_exact_only(self):
+        self.assertEqual(m.owned(self.row())["ClientToken"], m.TOKEN)
+        with self.assertRaises(ValueError):
+            m.owned(self.row(), "i-11111111111111111")
+
+    def test_foreign_ownership_rejected(self):
+        for field in ("ClientToken", "ImageId", "InstanceType", "SubnetId", "VpcId", "KeyName"):
+            value = self.row()
+            value["Reservations"][0]["Instances"][0][field] = "wrong"
+            with self.assertRaises(ValueError):
+                m.owned(value)
+
+    def test_public_or_iam_host_rejected(self):
+        for field in ("IamInstanceProfile", "PublicIpAddress"):
+            value = self.row()
+            value["Reservations"][0]["Instances"][0][field] = "present"
+            with self.assertRaises(ValueError):
+                m.owned(value)
+
+    def test_ambiguous_or_paginated_rejected(self):
+        value = self.row()
+        value["NextToken"] = "present"
+        with self.assertRaises(ValueError):
+            m.owned(value)
+        with self.assertRaises(ValueError):
+            m.owned(dict(Reservations=[]))
+
+    def test_console_requires_single_valid_key(self):
+        key = base64.b64encode(b"x" * 51).decode()
+        line = "LUMI_DIAG_HOSTKEY ssh-ed25519 " + key
+        self.assertEqual(m.console_key(line), key)
+        self.assertEqual(m.console_key(base64.b64encode(line.encode()).decode()), key)
+        with self.assertRaises(ValueError):
+            m.console_key(line + "\n" + line)
+
+    def test_guest_expiry_no_model_or_download(self):
+        source = m.user_data()
+        self.assertIn("--on-active=600s", source)
+        self.assertIn("lumi-diag-expiry.timer", source)
+        for word in ("curl", "wget", "s3://", "pip install", "checkpoint"):
+            self.assertNotIn(word, source)
+
+
+if __name__ == "__main__":
+    unittest.main()

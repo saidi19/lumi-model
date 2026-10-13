@@ -1,0 +1,255 @@
+"""Compose attempt-008 private binding/loader in an isolated source tree.
+
+Local source derivation only. Fresh watchdog deployment and live admission are
+external prerequisites; this builder cannot invoke a cloud client or launch.
+Never install over originals or use the consumed predecessor's watchdog.
+"""
+
+import ast
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+GUEST = "artifacts/lumi-vm-recovery-release-v0.8"
+GUEST_SHA = "2993948a32c8c301716a36352b83342fe625eb02c296b430d477d7f19bbfb0f0"
+INPUTS = "configs/lumi-vm-recovery-outer-inputs-v0.1.json"
+INPUTS_SHA = "798342693431e46167ae0436678f1ead27a3be2d187162dd4aec044a62ec0195"
+OUTPUT = "artifacts/lumi-vm-recovery-outer-v0.8"
+OLD = "606d788073f1f0b66a39eabeb4b32c2c"
+NEW = "242bd09f5fa84b1f9a4e46cb4592ad8b"
+LIMIT = 32 * 1024**2
+SOURCE = "scripts/prepare_sft_vm_private_host_sources_v4.py"
+LOADER = "scripts/load_sft_vm_private_host_v6.py"
+OUTER = "scripts/run_sft_vm_private_outer_v7.py"
+SOURCE_INPUTS = "configs/lumi-vm-private-host-source-inputs-v0.1.json"
+HISTORY = "evidence/lumi-vm-boot-smoke-closure-v0.5.json"
+CA = "artifacts/lumi-sft-import-runtime-v0.1/venv/lib/python3.13/site-packages/certifi/cacert.pem"
+RENAMES = {
+    "PREDECESSOR_CODE": "BASE_CODE",
+    "PredecessorConfiguration": "FreshBaseConfiguration",
+    "predecessor_evidence": "fresh_identity",
+    "preflight_predecessor_inert": "preflight_fresh_inert",
+    "PredecessorPreflightError": "FreshPreflightError",
+    "verified_inert_predecessor": "verified_fresh_inert_watchdog",
+    "predecessor_preflight_failed": "fresh_preflight_failed",
+    "predecessor_inert": "fresh_base_inert",
+    "revision_matches_predecessor": "revision_matches_base",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("recovery_outer_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encoded(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, pin, size=None):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= LIMIT)
+    raw = path.read_bytes()
+    need(sha(raw) == pin and (size is None or size == len(raw)))
+    return raw
+
+
+def inputs():
+    pins = json.loads(read(ROOT / INPUTS, INPUTS_SHA))["files"]
+    report = json.loads(read(ROOT / GUEST / "release.json", GUEST_SHA))
+    need(report["attempt"] == NEW and report["execution_permitted"] is False)
+    guest = {
+        n: read(ROOT / GUEST / n, p["sha256"], p["bytes"]) for n, p in report["outputs"].items()
+    }
+    extras = {n: read(ROOT / n, p["sha256"], p["bytes"]) for n, p in pins.items()}
+    need(len(guest) == 128 and len(extras) == 17)
+    need(sum(map(len, guest.values())) + sum(map(len, extras.values())) < LIMIT)
+    return guest, extras, pins
+
+
+def replace_once(text, before, after):
+    need(text.count(before) == 1)
+    return text.replace(before, after)
+
+
+def qualified_source(text):
+    start, end = text.index("def qualified_boot():"), text.index("\ndef inputs():")
+    # The old identity below is used ONLY to establish unchanged native control
+    # flow against the immutable qualification evidence, never for a resource.
+    replacement = '''def qualified_boot():
+    """Bind qualification evidence to the exact identity-only successor guard."""
+    blobs = {}
+    for name, pin in BOOT_PINS.items():
+        path = ROOT / name
+        need(not path.is_symlink() and path.stat().st_size <= 131072)
+        raw = path.read_bytes()
+        need(sha(raw) == pin)
+        blobs[name] = raw
+    proof = json.loads(blobs["evidence/lumi-vm-boot-smoke-closure-v0.5.json"])
+    need(proof["conclusion"]["native_early_boot_guard_qualified"] is True)
+    need(proof["conclusion"]["native_boot_passed"] is True)
+    need(proof["conclusion"]["cleanup_verified"] is True)
+    name = "scripts/run_sft_vm_early_stop_v2.py"
+    native = blobs[name]
+    new = binding.network.selection.ATTEMPT.encode()
+    old = b"606d788073f1f0b66a39eabeb4b32c2c"
+    need(native.count(new) == 1 and old not in native)
+    need(sha(native.replace(new, old)) == proof["bindings"][name])
+    return blobs["scripts/build_sft_vm_initial_boot_v2.py"]
+
+'''
+    text = text[:start] + replacement + text[end:]
+    text = replace_once(
+        text, "fresh_attempt_identity_bound=False", "fresh_attempt_identity_bound=True"
+    )
+    return text
+
+
+def fresh_loader(text):
+    start = text.index("PREDECESSOR_CODE =")
+    end = text.index("\nclass PredecessorConfiguration:")
+    replacement = '''PREDECESSOR_CODE = original_guard.CODE
+
+
+def predecessor_evidence():
+    """No historical cloud receipt: verify only this new identity's source graph."""
+    need(original_guard.worker.ATTEMPT == "242bd09f5fa84b1f9a4e46cb4592ad8b")
+    need(original_guard.worker.FUNCTION == "lumi-stop-" + original_guard.worker.ATTEMPT)
+    sources.inputs()
+
+'''
+    text = text[:start] + replacement + text[end:]
+    for old, new in RENAMES.items():
+        text = text.replace(old, new)
+    # Drop outdated documentation but retain the status-first updater logic.
+    tree = ast.parse(text)
+    doc = tree.body[0]
+    need(isinstance(doc, ast.Expr) and isinstance(doc.value, ast.Constant))
+    text = "\n".join(text.splitlines()[doc.end_lineno :])
+    return (
+        '"""Attempt-008-only private loader; fresh inert deployment required.\n'
+        "Never reuses historical watchdog evidence or consumed resources.\n"
+        "One revision-fenced code update is permitted only on its own new function.\n"
+        'No deployment, credential creation or public execution authority.\n"""\n' + text
+    )
+
+
+def build(guest, extras, pins):
+    need(set(extras) == set(pins))
+    need(
+        all(
+            sha(raw) == pins[n]["sha256"] and len(raw) == pins[n]["bytes"]
+            for n, raw in extras.items()
+        )
+    )
+    need(not set(guest).intersection(extras))
+    baseline = guest | extras
+    seeds = dict(baseline)
+    for name, raw in extras.items():
+        if name not in {HISTORY, CA}:
+            seeds[name] = raw.replace(OLD.encode(), NEW.encode())
+    seeds[SOURCE] = qualified_source(seeds[SOURCE].decode()).encode()
+    seeds[LOADER] = fresh_loader(seeds[LOADER].decode()).encode()
+    outer = seeds[OUTER].decode()
+    for old, new in RENAMES.items():
+        outer = outer.replace(old, new)
+    outer = outer.replace(
+        "Local v2-boot integration only; consumed attempt identity is not renewed here.",
+        "Isolated attempt-008 composition; a fresh inert watchdog is required first.",
+    )
+    seeds[OUTER] = outer.encode()
+    source_manifest = json.loads(extras[SOURCE_INPUTS])
+    for name in source_manifest["sources"]:
+        raw = guest["scripts/" + name + ".py"]
+        source_manifest["sources"][name] = dict(bytes=len(raw), sha256=sha(raw))
+    seeds[SOURCE_INPUTS] = encoded(source_manifest)
+    previous = json.loads(extras["configs/lumi-vm-recovery-release-inputs-v0.1.json"])["files"]
+    guest_mapping = {p["sha256"]: sha(guest[n]) for n, p in previous.items()}
+    # The source specializer must start from the new base watchdog ZIP, not the
+    # frozen old-attempt ZIP. Obtain it from the already-verified new guard source.
+    guard = ast.parse(guest["scripts/arm_sft_vm_external_watchdog_v2.py"])
+    code = next(
+        n.value.value
+        for n in guard.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == "CODE"
+    )
+    seeds[SOURCE] = seeds[SOURCE].replace(
+        b"gbk536fGHj4CPGuXO4BKvaqQ3rujDseS0JBedtqTRBg=", code.encode()
+    )
+    current = dict(seeds)
+    for _iteration in range(64):
+        mapping = guest_mapping | {sha(raw): sha(current[n]) for n, raw in extras.items()}
+        following = dict(guest)
+        for name, raw in seeds.items():
+            if name in guest:
+                continue
+            if name in {HISTORY, CA, "configs/lumi-vm-recovery-release-inputs-v0.1.json"}:
+                following[name] = raw
+                continue
+            following[name] = re.sub(
+                rb"\b[0-9a-f]{64}\b",
+                lambda match, mapping=mapping: mapping.get(
+                    match[0].decode(), match[0].decode()
+                ).encode(),
+                raw,
+            )
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("recovery_outer_hash_cycle") from None
+    need(all(current[n] == raw for n, raw in guest.items()))
+    for name, raw in current.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+    need(b"PREDECESSOR_PINS" not in current[LOADER])
+    need(b"attempt-006" not in current[LOADER] and b"attempt-007" not in current[LOADER])
+    need(sum(map(len, current.values())) < LIMIT)
+    report = dict(
+        schema="lumi.vm-recovery-outer.v0.1",
+        attempt=NEW,
+        guest_release_sha256=GUEST_SHA,
+        input_manifest_sha256=INPUTS_SHA,
+        iterations=_iteration + 1,
+        guest_files_byte_identical=len(guest),
+        outputs={n: dict(bytes=len(raw), sha256=sha(raw)) for n, raw in sorted(current.items())},
+        fresh_watchdog_deployment_required=True,
+        old_watchdog_evidence_used=False,
+        installed=False,
+        live_execution_authorized=False,
+        gate_5_complete=False,
+    )
+    return current, report
+
+
+def prepare():
+    files, report = build(*inputs())
+    destination = ROOT / OUTPUT
+    need(not destination.exists() and not destination.is_symlink())
+    need(not any(p.is_symlink() for p in destination.parents))
+    destination.mkdir(mode=0o700)
+    files = files | {"release.json": encoded(report)}
+    need(sum(map(len, files.values())) < LIMIT)
+    for name, raw in sorted(files.items()):
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+            stream.flush()
+            os.fsync(stream.fileno())
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("recovery_outer_is_not_execution_authority") from None

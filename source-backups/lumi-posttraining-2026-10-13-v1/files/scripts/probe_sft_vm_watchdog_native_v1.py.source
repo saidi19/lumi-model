@@ -1,0 +1,166 @@
+"""Prepared CPU-only native watchdog probe; not full bootstrap qualification.
+
+Invoke only on a separately admitted disposable root Linux host. Inputs must be
+deployed at their frozen production paths. No package acquisition or model access.
+"""
+
+import base64
+import hashlib
+import json
+import math
+import os
+import signal
+import sys
+import time
+import types
+from pathlib import Path
+
+BOOTSTRAP = Path("/opt/lumi-bootstrap-input/run_sft_vm_network_bootstrap_v2.py")
+BOOTSTRAP_SHA = "3034eca29487b089729aafb29748da2333a54f6ac4cc630d24a7cb3867c07202"
+POLICY_SHA = "caa0d6b551e9ee81599e3ed78f936e26705b2555e5e5b5716817160de6ea0833"
+
+
+def report(checks, status):
+    value = {
+        "schema": "lumi.watchdog-native-probe.v0.1",
+        "status": status,
+        "checks": checks,
+        "synthetic_receipt_only": True,
+        "complete_bootstrap_qualified": False,
+        "host_admitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu_inference_training": False,
+        "retry_allowed": False,
+    }
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    assert len(raw) <= 8192
+    encoded = base64.b64encode(raw).decode()
+    chunks = [encoded[i : i + 512] for i in range(0, len(encoded), 512)]
+    digest = hashlib.sha256(raw).hexdigest()
+    for index, chunk in enumerate(chunks, 1):
+        print(f"LUMI_WATCHDOG_PROBE_V1:{digest}:{index}/{len(chunks)}:{chunk}", flush=True)
+    return value
+
+
+def load_bootstrap():
+    # Native operations are unreachable on macOS or an unisolated invocation.
+    assert sys.platform == "linux" and sys.version_info[:2] == (3, 12)
+    assert sys.flags.isolated and sys.flags.dont_write_bytecode
+    assert os.getuid() == os.getgid() == 0
+    raw = BOOTSTRAP.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == BOOTSTRAP_SHA
+    module = types.ModuleType("_frozen_native_watchdog")
+    module.__file__ = str(BOOTSTRAP)
+    exec(compile(raw, str(BOOTSTRAP), "exec"), module.__dict__)
+    # Apply the frozen ownership, mode and stable-read checks before using it.
+    assert module.read(BOOTSTRAP) == raw
+    assert module.PINS["build_sft_vm_network_expiry_v3.py"] == POLICY_SHA
+    return module
+
+
+def native_once():
+    m = load_bootstrap()
+    signal.alarm(600)
+    checks = {}
+    phase = "identity"
+    try:
+        machine = Path("/etc/machine-id").read_text().strip()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        m.native_identity(machine, boot)
+        checks[phase] = True
+        p = m.load("build_sft_vm_network_expiry_v3.py")
+        # Fail closed if nft is missing; no apt or package download fallback.
+        m.command(["/usr/sbin/nft", "--version"])
+        now = math.floor(m.boot_time())
+        assert now < 1200
+        deadline = now + 300
+        units = p.expiry_units(original_deadline_boot_seconds=deadline, observed_boot_seconds=now)
+        units[m.WATCH] = m.watch_unit(BOOTSTRAP_SHA)
+        phase = "fresh_paths"
+        m.owned(m.INPUT)
+        m.owned(m.SYSTEMD)
+        assert not os.path.lexists(m.OUTPUT.parent)
+        assert not os.path.lexists(m.SETUP_RESULT.parent)
+        for name in units:
+            assert not os.path.lexists(m.SYSTEMD / name)
+            assert m.show(name, "LoadState") == b"not-found"
+        m.OUTPUT.mkdir(parents=True, mode=0o700)
+        m.OUTPUT.parent.chmod(0o700)
+        m.SETUP_RESULT.parent.mkdir(parents=True, mode=0o700)
+        m.owned(m.OUTPUT)
+        m.owned(m.SETUP_RESULT.parent)
+        checks[phase] = True
+        m.write(
+            m.OUTPUT / "context.json",
+            m.encode(
+                {
+                    "machine_id": machine,
+                    "boot_id": boot,
+                    "original_deadline_boot_seconds": deadline,
+                    "host_net_inode": m.host_network_inode(),
+                }
+            ),
+        )
+        for name, body in units.items():
+            m.write(m.SYSTEMD / name, body.encode())
+        phase = "units_verified"
+        m.command(
+            ["/usr/bin/systemd-analyze", "verify", *(str(m.SYSTEMD / name) for name in units)]
+        )
+        m.command(["/usr/bin/systemctl", "daemon-reload"])
+        m.command(["/usr/bin/systemctl", "start", p.TIMER])
+        checks[phase] = True
+        phase = "policy_installed"
+        m.command(
+            ["/usr/sbin/nft", "--check", "--json", "--file", "-"], body=m.encode(p.install_policy())
+        )
+        m.command(["/usr/sbin/nft", "--json", "--file", "-"], body=m.encode(p.install_policy()))
+        before = p.inspect(m.snapshot(p))
+        checks[phase] = True
+        phase = "watchdog_active"
+        m.command(["/usr/bin/systemctl", "start", m.WATCH])
+        ready_deadline = time.monotonic() + 5
+        while not (m.OUTPUT / "watch-ready").is_dir():
+            assert time.monotonic() < ready_deadline
+            time.sleep(0.05)
+        m.active(p)
+        for name, body in units.items():
+            assert m.read(m.SYSTEMD / name) == body.encode()
+            assert m.show(name, "FragmentPath") == str(m.SYSTEMD / name).encode()
+            assert m.show(name, "DropInPaths") == b""
+        for prop in ("FailureAction", "SuccessAction"):
+            assert m.show(m.WATCH, prop) == b"poweroff"
+        checks[phase] = True
+        phase = "synthetic_transition"
+        # This deliberately synthetic receipt grants no setup or import authority.
+        m.write(m.SETUP_RESULT, m.encode(m.EXPECTED_SETUP))
+        m.SETUP_RESULT.chmod(0o600)
+        (m.OUTPUT / "setup-finished").mkdir(mode=0o700)
+        m.sync(m.OUTPUT)
+        assert m.setup_finished(p)
+        transition, _ = p.setup_transition(m.snapshot(p))
+        m.command(["/usr/sbin/nft", "--json", "--file", "-"], body=m.encode(transition))
+        p.inspect(m.snapshot(p), setup=False, previous=before)
+        time.sleep(2)
+        m.active(p)
+        assert not (m.OUTPUT / "watch-failed.json").exists()
+        checks[phase] = True
+        phase = "fault_dispatched"
+        # Report BEFORE destructive test fault: this is not shutdown proof.
+        # The controller must independently observe STOP well before timer expiry.
+        assert m.boot_time() < deadline - 240
+        report(checks, "ready_for_deliberate_policy_fault")
+        m.command(["/usr/sbin/nft", "delete", "table", "inet", p.TABLE])
+        while True:
+            time.sleep(1)
+    except BaseException:
+        report({**checks, "failed_stage": phase}, "failed")
+        m.stop_host()
+        raise SystemExit(1) from None
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--native-once"]:
+        raise SystemExit("native_probe_requires_exact_entry")
+    native_once()

@@ -1,0 +1,282 @@
+import copy
+import importlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+a = importlib.import_module("arm_sft_vm_external_watchdog_v1")
+
+
+class Cloud:
+    def __init__(self):
+        self.calls = []
+        self.group = None
+        self.schedule = None
+        self.concurrency = 0
+        self.environment = copy.deepcopy(a.inert.UNARMED)
+        self.change = lambda op, value: value
+        self.fail = None
+
+    def cli(self, service, operation, **kw):
+        self.calls.append((service, operation, kw))
+        if operation == self.fail:
+            raise TimeoutError("private-secret-error")
+        if operation == "get-caller-identity":
+            value = {"Account": a.worker.ACCOUNT}
+        elif operation in {"get-role", "get-role-policy"}:
+            name, trust, policy = next(x for x in a.inert.policies() if x[0] == kw["RoleName"])
+            value = (
+                {"Role": {"Arn": a.inert.BASE + name, "AssumeRolePolicyDocument": trust}}
+                if operation == "get-role"
+                else {"PolicyDocument": policy}
+            )
+        elif operation == "list-role-policies":
+            value = {"PolicyNames": [a.inert.POLICY]}
+        elif operation == "list-attached-role-policies":
+            value = {"AttachedPolicies": []}
+        elif operation == "get-function-configuration":
+            value = dict(
+                FunctionArn=a.FUNCTION_ARN,
+                CodeSha256=a.CODE,
+                Role=a.inert.BASE + a.inert.WORKER_ROLE,
+                Runtime="python3.13",
+                Handler="watchdog.handler",
+                Timeout=180,
+                MemorySize=128,
+                Architectures=["arm64"],
+                EphemeralStorage={"Size": 512},
+                State="Active",
+                LastUpdateStatus="Successful",
+                RevisionId="revision",
+                Environment=self.environment,
+            )
+        elif operation == "get-function-concurrency":
+            value = {"ReservedConcurrentExecutions": self.concurrency}
+        elif operation == "get-function-event-invoke-config":
+            value = dict(MaximumRetryAttempts=0, MaximumEventAgeInSeconds=60)
+        elif operation == "update-function-configuration":
+            self.environment = kw["Environment"]
+            value = {}
+        elif operation == "put-function-concurrency":
+            self.concurrency = kw["ReservedConcurrentExecutions"]
+            value = {}
+        elif operation == "create-schedule-group":
+            self.group = {"Arn": a.GROUP_ARN, "State": "ACTIVE"}
+            value = {}
+        elif operation == "get-schedule-group":
+            if self.group is None:
+                raise LookupError("absent")
+            value = self.group
+        elif operation == "create-schedule":
+            self.schedule = {k: v for k, v in kw.items() if k != "ClientToken"}
+            self.schedule["Arn"] = a.SCHEDULE_ARN
+            value = {}
+        elif operation == "get-schedule":
+            if self.schedule is None:
+                raise LookupError("absent")
+            value = self.schedule
+        else:
+            raise AssertionError(operation)
+        value["ResponseMetadata"] = {"HTTPStatusCode": 200}
+        return self.change(operation, copy.deepcopy(value))
+
+
+class Host:
+    def __init__(self):
+        self.calls = []
+        self.fail = False
+
+    def cli(self, service, operation, **kw):
+        self.calls.append((service, operation, kw))
+        if self.fail:
+            raise TimeoutError("private-host-error")
+        return {"synthetic": True}
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.host, self.cloud = Host(), Cloud()
+        self.guard = a.GuardedCloud(
+            self.host,
+            self.cloud,
+            Path(self.temp.name).resolve() / "fresh",
+            wall=lambda: 2000000000,
+            clock=lambda: 100,
+            wait=lambda _: None,
+        )
+        binding = dict(
+            attempt=a.worker.ATTEMPT,
+            key_name="lumi-fullsize-" + a.worker.ATTEMPT,
+            vm_group="sg-" + "a" * 17,
+            endpoint_group="sg-" + "b" * 17,
+            endpoint="eice-" + "c" * 17,
+        )
+        self.request = a.provision.connection.launch_request(binding)
+        self.request["UserData"] = a.provision.initial.user_data()
+
+    def launch(self):
+        return self.guard.cli("ec2", "run-instances", **self.request)
+
+    def rejected(self):
+        with self.assertRaises((ValueError, RuntimeError)):
+            self.launch()
+        self.assertFalse(self.host.calls)
+
+    def test_exact_success_arms_before_one_launch(self):
+        self.assertEqual(self.launch(), {"synthetic": True})
+        self.assertEqual(len(self.host.calls), 1)
+        self.assertEqual(self.cloud.calls[-1][1], "get-schedule")
+        bound = json.loads((self.guard.output / "binding.json").read_text())
+        self.assertEqual(a.worker.binding(json.dumps(bound)), bound)
+        self.assertEqual(bound["stop_at"] % 60, 0)
+        self.assertLessEqual(bound["expires_at"], bound["launch_not_before"] + 14400)
+        with self.assertRaises(ValueError):
+            self.launch()
+        self.assertEqual(len(self.host.calls), 1)
+
+    def test_passthrough_read_does_not_arm(self):
+        self.guard.cli("ec2", "describe-instances", InstanceIds=["fixture"])
+        self.assertFalse(self.cloud.calls)
+        self.assertFalse(self.guard.output.exists())
+
+    def test_request_drift_rejected_before_aws(self):
+        self.request["InstanceType"] = "p5.48xlarge"
+        self.rejected()
+        self.assertFalse(self.cloud.calls)
+
+    def test_userdata_drift_rejected(self):
+        self.request["UserData"] = b"unsafe"
+        self.rejected()
+
+    def test_existing_output_not_reused(self):
+        self.guard.output.mkdir()
+        with self.assertRaises(FileExistsError):
+            self.launch()
+        self.assertFalse(self.cloud.calls)
+
+    def test_wrong_identity(self):
+        self.cloud.change = lambda op, v: {"Account": "wrong"} if op == "get-caller-identity" else v
+        self.rejected()
+
+    def test_foreign_or_extra_policy(self):
+        self.cloud.change = lambda op, v: (
+            {"AttachedPolicies": ["extra"]} if op == "list-attached-role-policies" else v
+        )
+        self.rejected()
+
+    def test_code_drift(self):
+        self.cloud.change = lambda op, v: (
+            v | {"CodeSha256": "wrong"} if op == "get-function-configuration" else v
+        )
+        self.rejected()
+
+    def test_existing_group_no_reuse(self):
+        self.cloud.group = {"Arn": a.GROUP_ARN, "State": "ACTIVE"}
+        self.rejected()
+
+    def test_lost_mutation_ack_no_retry_or_launch(self):
+        self.cloud.fail = "create-schedule"
+        self.rejected()
+        with self.assertRaises(ValueError):
+            self.launch()
+        self.assertEqual(sum(op == "create-schedule" for _, op, _ in self.cloud.calls), 1)
+        self.assertNotIn("private-secret", (self.guard.output / "failed.json").read_text())
+
+    def test_disabled_schedule_readback_rejects(self):
+        self.cloud.change = lambda op, v: v | {"State": "DISABLED"} if op == "get-schedule" else v
+        self.rejected()
+
+    def test_retry_policy_readback_rejects(self):
+        self.cloud.change = lambda op, v: (
+            v | {"MaximumRetryAttempts": 1} if op == "get-function-event-invoke-config" else v
+        )
+        self.rejected()
+
+    def test_schedule_target_drift_rejects(self):
+        def change(op, v):
+            if op == "get-schedule":
+                v["Target"]["Arn"] = "wrong"
+            return v
+
+        self.cloud.change = change
+        self.rejected()
+
+    def test_clock_jump_prevents_launch(self):
+        ticks = iter([2000000000, 2000000000, 2000000400])
+        self.guard.wall = lambda: next(ticks)
+        self.rejected()
+
+    def test_lost_launch_ack_consumes_attempt(self):
+        self.host.fail = True
+        with self.assertRaises(RuntimeError):
+            self.launch()
+        with self.assertRaises(ValueError):
+            self.launch()
+        self.assertEqual(len(self.host.calls), 1)
+
+    def test_public_entry_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "not_authorized"):
+            a.run(approved=True)
+
+    def test_existing_private_provisioner_receives_guard(self):
+        with patch.object(
+            a.provision, "_provision_and_setup_admitted_once", return_value={}
+        ) as old:
+            a._provision_guarded_once(
+                Path(self.temp.name) / "host", host_cloud=self.host, watchdog_cloud=self.cloud
+            )
+            self.assertIsInstance(old.call_args.kwargs["cloud"], a.GuardedCloud)
+        self.assertFalse(self.cloud.calls)
+
+    def test_api_fields_match_installed_offline_sdk_models(self):
+        import botocore.session
+        import botocore.validate
+
+        self.launch()
+        session = botocore.session.get_session()
+        for service, operation, fields in self.cloud.calls:
+            model = session.get_service_model(service).operation_model(
+                "".join(word.capitalize() for word in operation.split("-"))
+            )
+            botocore.validate.validate_parameters(fields, model.input_shape)
+
+    def test_elapsed_arming_budget_stops_before_launch(self):
+        now = [100]
+        self.guard.clock = lambda: now[0]
+
+        def slow(_op, value):
+            now[0] += 10
+            return value
+
+        self.cloud.change = slow
+        self.rejected()
+        self.assertLessEqual(len(self.cloud.calls), 6)
+
+    def test_full_existing_provision_setup_join_with_guard(self):
+        from tests.test_sft_vm_initial_provisioning_v1 import ProvisionTests
+
+        fixture = ProvisionTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        result = a._provision_guarded_once(
+            fixture.output,
+            host_cloud=fixture.cloud,
+            watchdog_cloud=self.cloud,
+            clock=lambda: fixture.now,
+            wait=fixture.sleep,
+        )
+        self.assertTrue(result["report"]["setup_completed"])
+        self.assertFalse(result["report"]["host_admitted"])
+        self.assertEqual(fixture.cloud.launch_count, 1)
+        self.assertEqual(fixture.cloud.stop_count, 0)
+        self.assertEqual(self.cloud.calls[-1][1], "get-schedule")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,206 @@
+import contextlib
+import copy
+import importlib
+import io
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("recover_sft_vm_attempt010_cost_resources_v4")
+
+
+class Missing(Exception):
+    response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class Tests(unittest.TestCase):
+    def test_transport_timeouts_preserve_single_attempt_and_no_proxy(self):
+        from botocore.config import Config
+
+        old = Config(
+            connect_timeout=3, read_timeout=5, retries={"total_max_attempts": 1}, proxies={}
+        )
+        new = m.recovery_transport_config(old)
+        self.assertEqual((new.connect_timeout, new.read_timeout), (10, 15))
+        self.assertEqual(new.retries, {"total_max_attempts": 1})
+        self.assertEqual(new.proxies, {})
+
+    def setUp(self):
+        tags = [
+            {"Key": "LumiAttempt", "Value": m.ATTEMPT},
+            {"Key": "LumiNetworkNonce", "Value": m.NONCE},
+        ]
+        self.nat = dict(
+            NatGatewayId=m.IDS["nat"],
+            VpcId=m.VPC,
+            SubnetId="subnet-0dc6039a6453f7c95",
+            ConnectivityType="public",
+            State="available",
+            NatGatewayAddresses=[{"AllocationId": m.IDS["address"]}],
+            Tags=tags,
+        )
+        self.address = dict(
+            AllocationId=m.IDS["address"], Domain="vpc", NetworkBorderGroup="us-east-1", Tags=tags
+        )
+        self.table = dict(
+            RouteTableId=m.IDS["table"],
+            VpcId=m.VPC,
+            OwnerId=m.ACCOUNT,
+            Tags=tags,
+            Associations=[{"Main": False, "SubnetId": m.IDS["subnet"]}],
+            Routes=[{"DestinationCidrBlock": "0.0.0.0/0", "NatGatewayId": m.IDS["nat"]}],
+        )
+        self.claims, self.calls, self.saved = {}, [], []
+        self.lost_nat = self.lost_eip = self.lost_claim = False
+        self.instance_state = "stopped"
+        client = types.SimpleNamespace(**{op: self.method(op) for op in m.READS | m.WRITES})
+        self.r = m.Recovery(
+            {"ec2": client, "s3": client},
+            lambda n, v: self.saved.append((n, v)),
+            lambda _: contextlib.nullcontext(),
+            wait=lambda _: None,
+        )
+
+    def method(self, op):
+        return lambda **kw: self.call(op, kw)
+
+    def call(self, op, kw):
+        self.calls.append((op, kw))
+        if op == "describe_instances":
+            return {
+                "Reservations": [
+                    {
+                        "OwnerId": m.ACCOUNT,
+                        "Instances": [
+                            dict(
+                                InstanceId=m.IDS["instance"],
+                                ClientToken=m.ATTEMPT,
+                                State={"Name": self.instance_state},
+                                SubnetId=m.IDS["subnet"],
+                                VpcId=m.VPC,
+                                InstanceType="r6i.4xlarge",
+                                BlockDeviceMappings=[
+                                    {"Ebs": {"VolumeId": v, "DeleteOnTermination": False}}
+                                    for v in m.VOLUMES
+                                ],
+                            )
+                        ],
+                    }
+                ]
+            }
+        if op == "describe_instance_connect_endpoints":
+            return {
+                "InstanceConnectEndpoints": [
+                    dict(
+                        InstanceConnectEndpointId=m.IDS["endpoint"],
+                        VpcId=m.VPC,
+                        OwnerId=m.ACCOUNT,
+                        State="create-complete",
+                    )
+                ]
+            }
+        if op == "describe_nat_gateways":
+            return {"NatGateways": [copy.deepcopy(self.nat)]}
+        if op == "describe_addresses":
+            return {"Addresses": [copy.deepcopy(self.address)] if self.address else []}
+        if op == "describe_route_tables":
+            return {"RouteTables": [copy.deepcopy(self.table)]}
+        if op == "get_object":
+            if kw["Key"] not in self.claims:
+                raise Missing()
+            raw = self.claims[kw["Key"]]
+            return {"ContentLength": len(raw), "Body": io.BytesIO(raw)}
+        if op == "put_object":
+            self.assertEqual(kw["IfNoneMatch"], "*")
+            self.assertEqual(kw["ServerSideEncryption"], "AES256")
+            self.assertNotIn(kw["Key"], self.claims)
+            self.claims[kw["Key"]] = kw["Body"]
+            if self.lost_claim:
+                raise TimeoutError("PRIVATE")
+            return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        if op == "delete_route":
+            self.table["Routes"] = []
+            return {}
+        if op == "delete_nat_gateway":
+            self.nat["State"] = "deleted"
+            if self.lost_nat:
+                raise TimeoutError("PRIVATE")
+            return {}
+        if op == "release_address":
+            self.address = None
+            if self.lost_eip:
+                raise TimeoutError("PRIVATE")
+            return {}
+        raise AssertionError(op)
+
+    def claim(self, op, kind):
+        self.claims[m.PREFIX + op + ".json"] = json.dumps(
+            dict(attempt=m.ATTEMPT, nonce=m.NONCE, operation=op, resource=m.IDS[kind])
+        ).encode()
+
+    def test_success_and_caps(self):
+        result = self.r.run()
+        self.assertEqual(result["status"], "cost_resources_released_verified")
+        self.assertEqual((self.r.ec2_writes, self.r.claim_writes), (3, 2))
+        self.assertLessEqual(self.r.calls, 79)
+
+    def test_existing_nat_claim_blocks_all_mutations(self):
+        self.claim("delete-nat-gateway", "nat")
+        with self.assertRaises(ValueError):
+            self.r.run()
+        self.assertEqual(self.r.ec2_writes + self.r.claim_writes, 0)
+
+    def test_existing_eip_claim_blocks_all_mutations(self):
+        self.claim("release-address", "address")
+        with self.assertRaises(ValueError):
+            self.r.run()
+        self.assertEqual(self.r.ec2_writes + self.r.claim_writes, 0)
+
+    def test_wrong_ownership_blocks(self):
+        self.nat["OwnerId"] = "wrong"
+        with self.assertRaises(ValueError):
+            self.r.run()
+        self.assertFalse(self.r.sent)
+
+    def test_running_instance_blocks(self):
+        self.instance_state = "running"
+        with self.assertRaises(ValueError):
+            self.r.run()
+        self.assertFalse(self.r.sent)
+
+    def test_ambiguous_mutation_readback_no_resend(self):
+        self.lost_nat = self.lost_eip = True
+        self.assertEqual(self.r.run()["status"], "cost_resources_released_verified")
+        for op in ["delete_nat_gateway", "release_address"]:
+            self.assertEqual(sum(n == op for n, _ in self.calls), 1)
+
+    def test_lost_claim_never_dispatches_nat_delete(self):
+        self.lost_claim = True
+        with self.assertRaises(ValueError):
+            self.r.run()
+        self.assertFalse(any(op == "delete_nat_gateway" for op, _ in self.calls))
+
+    def test_deadline_blocks_before_dispatch(self):
+        self.r.start -= 900
+        with self.assertRaises(ValueError):
+            self.r.run()
+        self.assertFalse(self.calls)
+
+    def test_sdk_request_shapes(self):
+        import botocore.session
+        import botocore.validate
+
+        self.r.run()
+        sdk = botocore.session.Session()
+        for op, kw in self.calls:
+            service = "s3" if op in {"get_object", "put_object"} else "ec2"
+            name = "".join(p.capitalize() for p in op.split("_"))
+            shape = sdk.get_service_model(service).operation_model(name).input_shape
+            botocore.validate.validate_parameters(kw, shape)
+
+
+if __name__ == "__main__":
+    unittest.main()

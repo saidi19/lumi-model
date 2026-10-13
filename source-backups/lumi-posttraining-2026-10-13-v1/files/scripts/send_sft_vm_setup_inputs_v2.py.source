@@ -1,0 +1,258 @@
+"""One bounded pinned-SSH setup-control delivery, not native host admission.
+
+Private API only. Caller must already authenticate the fresh host, machine/boot
+identity, original setup deadlines, remaining upload budget and receipt parents.
+No provisioner, credential issuer, package acquisition, setup or model execution.
+Preserves the frozen 64 KiB credential pipe; this channel carries public controls.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import re
+import selectors
+import shlex
+import signal
+import subprocess
+import time
+
+import run_sft_vm_detached_delivery_v1 as delivery
+import stage_sft_vm_setup_inputs_v2 as inputs
+
+RECEIVER_SHA = "598fbd16d79898f9188c08f4aafac0cdc0e695a7277fb6a1ed749fb388b68390"
+RECEIVER_BYTES = 11396
+ARCHIVE_SHA = "9051ee897c0661cf6fc44b875deee1c582f0e5802424379d0be493a956792cee"
+ARCHIVE_BYTES = 17039360
+MAX_BODY = RECEIVER_BYTES + ARCHIVE_BYTES
+MAX_REPLY = 4096
+REMOTE_SECONDS = 85
+LOCAL_SECONDS = 100
+SETUP_SECONDS = 1800
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_delivery_rejected") from None
+
+
+def native_launcher(machine_id, boot_id, boot_deadline):
+    need(type(machine_id) is str and re.fullmatch(r"[0-9a-f]{32}", machine_id))
+    need(
+        type(boot_id) is str
+        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id)
+    )
+    need(type(boot_deadline) in {int, float} and math.isfinite(boot_deadline) and boot_deadline > 0)
+    # This fixed launcher is authenticated by SSH; its expected source/content
+    # hashes are literals, never taken from the untrusted stdin stream.
+    return f"""import hashlib,json,os,signal,sys,time,types
+try:
+ signal.alarm({REMOTE_SECONDS})
+ assert sys.platform == "linux" and os.geteuid() == os.getegid() == 0
+ assert sys.version_info[:2] == (3,12) and sys.flags.isolated and sys.dont_write_bytecode
+ with open("/proc/sys/kernel/random/boot_id","rb") as f:
+  assert f.read(65).strip() == {boot_id.encode()!r}
+ remaining = {boot_deadline!r} - time.clock_gettime(time.CLOCK_BOOTTIME)
+ assert 0 < remaining <= {SETUP_SECONDS}
+ signal.setitimer(signal.ITIMER_REAL,min({REMOTE_SECONDS},remaining))
+ source = sys.stdin.buffer.read({RECEIVER_BYTES})
+ assert len(source) == {RECEIVER_BYTES}
+ assert hashlib.sha256(source).hexdigest() == {RECEIVER_SHA!r}
+ archive = sys.stdin.buffer.read({ARCHIVE_BYTES})
+ assert len(archive) == {ARCHIVE_BYTES} and sys.stdin.buffer.read(1) == b""
+ assert hashlib.sha256(archive).hexdigest() == {ARCHIVE_SHA!r}
+ assert time.clock_gettime(time.CLOCK_BOOTTIME) < {boot_deadline!r}
+ module = types.ModuleType("_verified_setup_receiver")
+ module.__file__ = "/opt/lumi-setup-receiver.py"
+ exec(compile(source,module.__file__,"exec"),module.__dict__)
+ result = module._stage_admitted_once(archive,{ARCHIVE_SHA!r},{machine_id!r})
+ assert time.clock_gettime(time.CLOCK_BOOTTIME) < {boot_deadline!r}
+ reply = json.dumps(result,sort_keys=True,separators=(",",":")).encode()+b"\\n"
+ assert len(reply) <= {MAX_REPLY}
+ sys.stdout.buffer.write(reply)
+ sys.stdout.buffer.flush()
+except BaseException:
+ sys.stdout.write('{{"status":"setup_delivery_failed","execution_permitted":false}}\\n')
+ sys.exit(2)
+"""
+
+
+def pipe_exchange(argv, body, timeout):
+    """Single process-group exchange; bounded stdin/stdout and null stderr."""
+    need(type(body) is bytes and 0 < len(body) <= MAX_BODY)
+    need(type(timeout) in {int, float} and 0 < timeout <= LOCAL_SECONDS)
+    env = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    env.update(
+        PATH="/usr/bin:/bin:/opt/homebrew/bin", LC_ALL="C", AWS_MAX_ATTEMPTS="1", AWS_PAGER=""
+    )
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + timeout
+        reply, offset = bytearray(), 0
+        with selectors.DefaultSelector() as selector:
+            for stream, events, tag in (
+                (process.stdout, selectors.EVENT_READ, "read"),
+                (process.stdin, selectors.EVENT_WRITE, "write"),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, events, tag)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                need(remaining > 0)
+                events = selector.select(remaining)
+                need(events)
+                for key, _ in events:
+                    if key.data == "write":
+                        try:
+                            size = os.write(key.fd, memoryview(body)[offset : offset + 65536])
+                        except BlockingIOError:
+                            continue
+                        need(size > 0)
+                        offset += size
+                        if offset == len(body):
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                    else:
+                        try:
+                            chunk = os.read(key.fd, MAX_REPLY + 1 - len(reply))
+                        except BlockingIOError:
+                            continue
+                        reply.extend(chunk)
+                        need(len(reply) <= MAX_REPLY)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+            need(offset == len(body))
+            need(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0)
+        return bytes(reply)
+    except BaseException:
+        raise ValueError("setup_ssh_exchange_failed") from None
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        finally:
+            process.stdin.close()
+            process.stdout.close()
+
+
+def command(binding, key, directory, config_sha, hosts_sha, launcher):
+    connection = delivery.connection
+    connection.targets(binding, {"prepared_attempt": inputs.ATTEMPT})
+    config, hosts = directory / "ssh_config", directory / "known_hosts"
+    expected = connection.ssh_config(binding, key, hosts).encode()
+    need(delivery.read_pinned(config, config_sha, 16384) == expected)
+    delivery.read_pinned(hosts, hosts_sha, 4096)
+    remote = "sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(launcher)
+    return [
+        "/usr/bin/ssh",
+        "-F",
+        str(config),
+        "-T",
+        "-o",
+        "LogLevel=QUIET",
+        "lumi-fullsize-" + inputs.ATTEMPT,
+        remote,
+    ]
+
+
+def expected_receipt():
+    return {
+        "schema": "lumi.vm-setup-inputs.v0.2",
+        "attempt": inputs.ATTEMPT,
+        "archive_sha256": ARCHIVE_SHA,
+        "archive_bytes": ARCHIVE_BYTES,
+        "files": 18,
+        "cpu_wheels_included": False,
+        "host_admitted": False,
+        "binding_created": False,
+        "execution_permitted": False,
+        "gate_5_complete": False,
+        "retry_allowed": False,
+        "staged_files_readback_match": True,
+        "readonly_mounts_established": False,
+    }
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _send_admitted_once(
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    receiver,
+    archive,
+    machine_id,
+    boot_id,
+    boot_deadline,
+    output,
+    *,
+    deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+):
+    need(
+        type(deadline) in {int, float} and LOCAL_SECONDS + 10 < deadline - clock() <= SETUP_SECONDS
+    )
+    launcher = native_launcher(machine_id, boot_id, boot_deadline)
+    source = inputs.read(receiver, RECEIVER_BYTES)
+    raw = inputs.read(archive, ARCHIVE_BYTES)
+    need(len(source) == RECEIVER_BYTES and hashlib.sha256(source).hexdigest() == RECEIVER_SHA)
+    need(len(raw) == ARCHIVE_BYTES and hashlib.sha256(raw).hexdigest() == ARCHIVE_SHA)
+    inputs.unpack(raw, ARCHIVE_SHA)
+    argv = command(binding, key, directory, config_sha, hosts_sha, launcher)
+    # Charge the full attempted content even when transmission is ambiguous.
+    # SSH/tunnel protocol bytes are not measured by this content counter.
+    charged = len(source) + len(raw) + len(argv[-1].encode())
+    need(type(remaining_control_bytes) is int and charged <= remaining_control_bytes <= inputs.CAP)
+    need(LOCAL_SECONDS + 10 < deadline - clock() <= SETUP_SECONDS)
+    delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    inputs.sync(output.parent)
+    report = {
+        "archive_sha256": ARCHIVE_SHA,
+        "receiver_sha256": RECEIVER_SHA,
+        "control_content_bytes_charged": charged,
+        "ssh_dispatch_attempted": False,
+        "remote_staging_confirmed": False,
+        "remote_completion_unknown": False,
+        "retry_allowed": False,
+        "host_admitted": False,
+        "gate_5_complete": False,
+        "execution_permitted": False,
+        "wire_byte_accounting_proven": False,
+    }
+    inputs.write(output / "started.json", inputs.canonical(report))
+    inputs.sync(output)
+    try:
+        need(LOCAL_SECONDS + 5 < deadline - clock() <= SETUP_SECONDS)
+        report["ssh_dispatch_attempted"] = True
+        reply = pipe_exchange(argv, source + raw, LOCAL_SECONDS)
+        need(clock() < deadline)
+        observed = delivery.decode(reply)
+        need(inputs.canonical(observed) == inputs.canonical(expected_receipt()))
+        report["remote_staging_confirmed"] = True
+    except BaseException:
+        # No second connection, resend or implicit cancellation/retry. Native
+        # receive/write has its own alarm; an ambiguous outcome is NOT success.
+        report["remote_completion_unknown"] = report["ssh_dispatch_attempted"]
+        inputs.write(output / "result.json", inputs.canonical(report))
+        inputs.sync(output)
+        raise ValueError("setup_delivery_failed") from None
+    inputs.write(output / "result.json", inputs.canonical(report))
+    inputs.sync(output)
+    return report

@@ -1,0 +1,133 @@
+"""Single four-read diagnostic through the exact frozen watchdog transport."""
+
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+from scripts import verify_sft_vm_attempt021_v026_execution_v1 as evidence
+
+ROOT = evidence.ROOT
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-021-watchdog-diagnostic-v0.1"
+REPORT = ROOT / "evidence/lumi-vm-attempt-021-watchdog-diagnostic-v0.1.json"
+need, encode, sha = evidence.need, evidence.encode, evidence.sha
+SAFE_CODES = {
+    "ResourceNotFoundException", "AccessDenied", "AccessDeniedException",
+    "ExpiredToken", "ExpiredTokenException", "ThrottlingException",
+    "TooManyRequestsException", "ServiceUnavailableException", "InternalServerException",
+}
+
+
+def classify(error):
+    code = getattr(error, "response", {}).get("Error", {}).get("Code")
+    if code is not None:
+        return dict(kind="aws", code=code if code in SAFE_CODES else "other")
+    if isinstance(error, LookupError):
+        return dict(kind="absence", code="none")
+    if isinstance(error, (TimeoutError, ConnectionError)) or type(error).__name__ in {
+        "ConnectTimeoutError", "ReadTimeoutError", "EndpointConnectionError",
+        "ConnectionClosedError", "HTTPClientError", "SSLError",
+    }:
+        return dict(kind="transport", code="none")
+    return dict(kind="validation" if isinstance(error, ValueError) else "other", code="none")
+
+
+class Meter(evidence.Meter):
+    def consume(self, service, **fields):
+        need(self.calls < 4)
+        return super().consume(service, **fields)
+
+
+class ObservedClient:
+    def __init__(self, client, observations):
+        self.client, self.meta, self.observations = client, client.meta, observations
+
+    def __getattr__(self, name):
+        need(name in {"get_schedule_group", "get_schedule"})
+
+        def call(**fields):
+            row = dict(operation=name, dispatch_attempted=True)
+            self.observations.append(row)
+            try:
+                reply = getattr(self.client, name)(**fields)
+                row["result"] = dict(kind="response", code="none")
+                return reply
+            except Exception as error:
+                row["result"] = classify(error)
+                raise
+
+        return call
+
+
+def run():
+    outer, _, target, _ = evidence.local()
+    need(not OUTPUT.exists() and not REPORT.exists())
+    OUTPUT.mkdir(mode=0o700)
+    outer.loading.save(OUTPUT / "started.json", encode(dict(
+        max_sdk_reads=4, max_seconds=180, mutations=0, retry=False,
+        entry_sha256=sha(Path(__file__).read_bytes()),
+    )))
+    result = dict(
+        status="started", observations=[], cloud_mutations=0, instance_actions=0,
+        object_access=0, no_retry=True, real_4b_import=False, gate_5_complete=False,
+        gpu=False, training=False, exact_original_failure_cause_proven=False,
+    )
+    bundle = None
+    with Meter(outer.credentials) as meter:
+        try:
+            start, first = float(math.floor(time.monotonic())), True
+
+            def clock():
+                nonlocal first
+                if first:
+                    first = False
+                    return start
+                return time.monotonic()
+
+            bundle = meter.clients(outer.credentials.Reader(start + 18000, clock=clock))
+            guard = outer.loading.original_guard
+            clients = {service: bundle.clients[service] for service in guard.OPS}
+            clients["scheduler"] = ObservedClient(clients["scheduler"], result["observations"])
+            transport = outer.loading.WatchdogCloud(clients)
+            for operation, fields in (
+                ("get-schedule-group", dict(Name=guard.inert.GROUP)),
+                ("get-schedule", dict(Name="stop", GroupName=guard.inert.GROUP)),
+            ):
+                try:
+                    transport.cli("scheduler", operation, **fields)
+                except LookupError:
+                    result["observations"][-1]["wrapper_result"] = "expected_absence"
+                    continue
+                except Exception as error:
+                    result["wrapper_failure"] = classify(error)
+                    raise
+                raise ValueError("unexpected_schedule_presence")
+            config = bundle.clients["lambda"].get_function_configuration(
+                FunctionName=guard.worker.FUNCTION
+            )
+            need(config["CodeSha256"] == target)
+            guard.configuration({**config, "CodeSha256": guard.CODE}, guard.inert.UNARMED)
+            result.update(status="current_transport_absence_checks_passed_original_not_reproduced",
+                          original_transport_failure_reproduced=False,
+                          current_watchdog_configuration_exact=True)
+        except BaseException as error:
+            result.update(status="diagnostic_stopped_no_retry", failure=classify(error))
+        finally:
+            if bundle is not None:
+                bundle.close()
+            result.update(read_budget=meter.report(), maximum_sdk_reads=4,
+                          maximum_seconds=180, elapsed_seconds=round(time.monotonic()-meter.start, 3))
+    result["source_bindings"] = evidence.PINS | {
+        "scripts/diagnose_sft_vm_attempt021_watchdog_v1.py": sha(Path(__file__).read_bytes())
+    }
+    raw = encode(result)
+    outer.loading.save(OUTPUT / "result.json", raw)
+    outer.loading.save(REPORT, raw)
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--diagnose-once"])
+    run()

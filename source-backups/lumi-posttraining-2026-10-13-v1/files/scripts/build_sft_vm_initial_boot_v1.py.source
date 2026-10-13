@@ -1,0 +1,125 @@
+"""Bind the initial shutdown source to EC2 user-data and pinned-SSH proof.
+
+No SDK/CLI invocation, cloud authority, native operation or model access here.
+"""
+
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import json
+import math
+import re
+import shlex
+
+import run_sft_vm_setup_delivery_v3 as delivery
+
+EARLY_SHA = "eba343f41c33bb54ed2838a4cc8acd423f6239ec6d0d2db481e7ca6b03337f84"
+EARLY_PATH = "/opt/lumi-early-stop/run_sft_vm_early_stop_v1.py"
+ATTEMPT = delivery.seed.ATTEMPT
+BASE = dict(host_admitted=False, binding_created=False, gate_5_complete=False, retry_allowed=False)
+
+
+def need(value):
+    if not value:
+        raise ValueError("initial_boot_rejected") from None
+
+
+def source_bytes():
+    raw = delivery.seed.INPUTS.read(
+        delivery.seed.INPUTS.REPO / "scripts/run_sft_vm_early_stop_v1.py", 32768
+    )
+    need(hashlib.sha256(raw).hexdigest() == EARLY_SHA)
+    return raw
+
+
+def user_data():
+    raw = source_bytes()
+    installer = f"""import base64,hashlib,os,stat,sys,types
+from pathlib import Path
+assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+for p in (Path('/opt'),Path('/')):
+ s=p.lstat();assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and not s.st_mode&0o022
+os.mkdir('/opt/lumi-early-stop',0o700)
+raw=base64.b64decode({base64.b64encode(raw).decode()!r},validate=True)
+assert hashlib.sha256(raw).hexdigest()=={EARLY_SHA!r}
+fd=os.open({EARLY_PATH!r},os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+with os.fdopen(fd,'wb') as f:
+ assert f.write(raw)==len(raw);f.flush();os.fsync(f.fileno())
+m=types.ModuleType('_initial_boot');m.__file__={EARLY_PATH!r}
+exec(compile(raw,m.__file__,'exec'),m.__dict__)
+m.sync(Path('/opt/lumi-early-stop'));m.sync(Path('/opt'))
+sys.exit(m._main(['install']))
+"""
+    shell = (
+        "umask 077; /usr/bin/timeout --signal=KILL 120s /usr/bin/python3 -I -B -c "
+        + shlex.quote(installer)
+        + " >/dev/null 2>&1 || /usr/bin/systemctl --no-block poweroff"
+    )
+    # JSON is valid YAML. bootcmd runs on every boot, so exclusive deployment
+    # forces STOP on reboot rather than silently restarting either deadline.
+    config = {"bootcmd": [["/bin/sh", "-c", shell]]}
+    payload = gzip.compress(b"#cloud-config\n" + json.dumps(config).encode() + b"\n", mtime=0)
+    need(0 < len(payload) <= 16384)
+    return payload
+
+
+def proof_launcher():
+    source_bytes()
+    return f"""import hashlib,os,signal,stat,sys,types,json
+from pathlib import Path
+try:
+ signal.alarm(20)
+ p=Path({EARLY_PATH!r})
+ for parent in (p.parent,*p.parent.parents):
+  s=parent.lstat();assert stat.S_ISDIR(s.st_mode) and s.st_uid==0 and not s.st_mode&0o022
+ fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,'rb') as f:
+  s=os.fstat(f.fileno());assert stat.S_ISREG(s.st_mode) and s.st_uid==s.st_gid==0
+  assert stat.S_IMODE(s.st_mode)==0o400 and s.st_nlink==1 and 0<s.st_size<=32768
+  raw=f.read(32769)
+ assert hashlib.sha256(raw).hexdigest()=={EARLY_SHA!r}
+ m=types.ModuleType('_early_guard');m.__file__=str(p)
+ exec(compile(raw,str(p),'exec'),m.__dict__)
+ assert m.read(p)==raw
+ result=m._proof()
+ sys.stdout.buffer.write(m.canonical(result));sys.stdout.buffer.flush()
+except BaseException:
+ sys.exit(2)
+"""
+
+
+def validate_proof(raw):
+    value = delivery.seed.sender.delivery.decode(raw)
+    need(
+        set(value)
+        == {
+            "attempt",
+            "source_sha256",
+            "machine_id",
+            "boot_id",
+            "early_timers_armed",
+            "setup_deadline_boottime",
+            "host_deadline_boottime",
+            "observed_boottime",
+            *BASE,
+        }
+    )
+    need(value["attempt"] == ATTEMPT and value["source_sha256"] == EARLY_SHA)
+    for key, pattern in (
+        ("machine_id", r"[0-9a-f]{32}"),
+        ("boot_id", r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}"),
+    ):
+        need(type(value[key]) is str and re.fullmatch(pattern, value[key]))
+    need(value["early_timers_armed"] is True and all(value[k] is v for k, v in BASE.items()))
+    for key, expected in (("setup_deadline_boottime", 1800), ("host_deadline_boottime", 14400)):
+        need(type(value[key]) is int and value[key] == expected)
+    now = value["observed_boottime"]
+    need(type(now) in {int, float} and math.isfinite(now) and 0 < now < 1350)
+    return value
+
+
+def run(**_arguments):
+    raise ValueError("fullsize_host_admission_not_bound") from None

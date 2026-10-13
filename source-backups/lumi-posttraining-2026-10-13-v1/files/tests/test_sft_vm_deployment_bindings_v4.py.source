@@ -1,0 +1,53 @@
+"""No live resources: source, saved controls and unchanged limits must agree."""
+
+import json
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v4 as m
+
+
+class Tests(unittest.TestCase):
+    def test_only_destination_binding_not_cpu_limits_changes(self):
+        plan = m.build()
+        old = json.loads(m.read(m.OLD_PLAN, m.OLD_PLAN_SHA))
+        expected = dict(old["cpu_scope_reference"])
+        expected["output"] = "artifacts/lumi-vm-private-outer-execution-v0.12/attempt-011"
+        self.assertEqual(plan["cpu_scope_reference"], expected)
+        self.assertEqual(plan["cost_disclosure"], old["cost_disclosure"])
+        self.assertEqual(plan["cleanup_store"]["bucket"], m.BUCKET)
+        self.assertNotEqual(plan["cpu_scope_reference"]["retention"]["bucket"], m.BUCKET)
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["watchdog"]["redeployment_authorized"])
+        self.assertFalse(plan["cleanup_store"]["policy_application_authorized"])
+
+    def test_frozen_controls_and_release_tamper_rejected(self):
+        for name in ("RELEASE_SHA", "BASE_SHA", "STORE_SHA", "WATCH_SHA", "OLD_PLAN_SHA"):
+            with self.subTest(name=name), patch.object(m, name, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def test_current_plan_is_exact_builder_output(self):
+        path = m.ROOT / "configs/lumi-vm-attempt-011-deployment-plan-v0.2.json"
+        self.assertEqual(m.encode(m.build()), path.read_bytes())
+
+    def test_guard_retained_and_cleanup_protection_not_reduced(self):
+        plan = m.build()
+        old = json.loads(m.read(m.OLD_PLAN, m.OLD_PLAN_SHA))
+        for field in (
+            "expected_code_sha256_base64",
+            "roles",
+            "environment",
+            "reserved_concurrency",
+        ):
+            self.assertEqual(plan["watchdog"][field], old["watchdog"][field])
+        expected = json.loads(
+            json.dumps(old["cleanup_store"]["deny_statements"]).replace(
+                old["cleanup_store"]["bucket"], m.BUCKET
+            )
+        )
+        self.assertEqual(plan["cleanup_store"]["deny_statements"], expected)
+
+    def test_no_public_execution_entry(self):
+        with self.assertRaises(ValueError):
+            m.run()

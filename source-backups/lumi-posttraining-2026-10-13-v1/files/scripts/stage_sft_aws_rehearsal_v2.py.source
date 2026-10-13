@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Stage one authenticated source bundle and hash-pinned CPU wheels on a new VM.
+
+Setup networking is explicit; this never runs the rehearsal or accesses S3/data.
+Ubuntu's signed system Python 3.12 is used, not the old OCI image identity.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tarfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path("/opt/lumi-sft-rehearsal-v3")
+RUNTIME = Path("/opt/lumi-sft-rehearsal")
+ARCHIVE = Path("/home/ubuntu/source-release.tar.gz")
+ARCHIVE_SHA = "5eabc244e1954429f1e071f2273a28326660912e6849a240335b609b0a959efd"
+MANIFEST_SHA = "c9571cc65128909a641195e7754995be62341a4d5a42c046dcb08eb936e4c49c"
+LOCK_SHA = "26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965"
+
+
+def need(condition):
+    if not condition:
+        raise ValueError("staging_check_failed")
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("redirect_rejected")
+
+
+def stage():
+    need(sys.platform == "linux" and os.geteuid() == 0 and sys.version_info[:2] == (3, 12))
+    need(ARCHIVE.stat().st_size == 161791 and digest(ARCHIVE.read_bytes()) == ARCHIVE_SHA)
+    ROOT.mkdir(mode=0o755, exist_ok=False)
+    RUNTIME.mkdir(mode=0o755, exist_ok=False)
+    with tarfile.open(ARCHIVE, "r:gz") as archive:
+        members = archive.getmembers()
+        names = [m.name for m in members]
+        need(len(names) == len(set(names)) == 43)
+        need(
+            all(
+                m.isfile()
+                and m.size <= 1024**2
+                and (
+                    re.fullmatch(r"(?:src/lumi|tests|scripts)/[A-Za-z0-9_]+\.py", m.name)
+                    or m.name in {"release-manifest.json", "runtime-lock.json"}
+                )
+                for m in members
+            )
+        )
+        need(sum(m.size for m in members) <= 2 * 1024**2)
+        archive.extractall(ROOT, filter="data")
+    raw = (ROOT / "release-manifest.json").read_bytes()
+    need(digest(raw) == MANIFEST_SHA)
+    manifest = json.loads(raw)
+    need(len(manifest) == 41)
+    need(set(names) == set(manifest) | {"release-manifest.json", "runtime-lock.json"})
+    for name, expected in manifest.items():
+        need(digest((ROOT / name).read_bytes()) == expected)
+    lock_raw = (ROOT / "runtime-lock.json").read_bytes()
+    need(digest(lock_raw) == LOCK_SHA)
+    lock = json.loads(lock_raw)
+    wheels = ROOT / "wheels"
+    wheels.mkdir(mode=0o700)
+    rows = lock["requirements"]
+    need(len(rows) == 34 and sum(r["bytes"] for r in rows) <= 512 * 1024**2)
+    opener = urllib.request.build_opener(NoRedirect())
+    acquired = 0
+    for row in rows:
+        url = urllib.parse.urlsplit(row["url"])
+        need(
+            url.scheme == "https"
+            and url.hostname in {"files.pythonhosted.org", "download.pytorch.org"}
+        )
+        need(re.fullmatch(r"[A-Za-z0-9_.+%-]+\.whl", row["filename"]) is not None)
+        request = urllib.request.Request(row["url"], headers={"Accept-Encoding": "identity"})
+        hasher, count = hashlib.sha256(), 0
+        with (
+            opener.open(request, timeout=30) as response,
+            (wheels / row["filename"]).open("xb") as output,
+        ):
+            need(response.status == 200)
+            while chunk := response.read(min(1024**2, row["bytes"] - count + 1)):
+                count += len(chunk)
+                need(count <= row["bytes"])
+                hasher.update(chunk)
+                output.write(chunk)
+        need(count == row["bytes"] and hasher.hexdigest() == row["sha256"])
+        acquired += count
+    requirements = "".join(
+        f"{r['name']}=={r['version']} --hash=sha256:{r['sha256']}\n" for r in rows
+    )
+    (ROOT / "offline-requirements.txt").write_text(requirements, encoding="ascii")
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/root",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+        "PIP_NO_CACHE_DIR": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    subprocess.run(
+        ["/usr/bin/python3", "-m", "venv", str(RUNTIME / "venv")],
+        check=True,
+        timeout=90,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    python = str(RUNTIME / "venv/bin/python")
+    subprocess.run(
+        [
+            python,
+            "-I",
+            "-B",
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--find-links=" + str(wheels),
+            "--only-binary=:all:",
+            "--require-hashes",
+            "--no-deps",
+            "--no-compile",
+            "-r",
+            str(ROOT / "offline-requirements.txt"),
+        ],
+        check=True,
+        timeout=300,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [python, "-I", "-B", "-m", "pip", "check"],
+        check=True,
+        timeout=30,
+        env=environment,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    versions = subprocess.check_output(
+        [
+            python,
+            "-I",
+            "-B",
+            "-c",
+            "import importlib.metadata as m,json;print(json.dumps({n:m.version(n) for n in "
+            '["torch","transformers","safetensors","tokenizers","numpy"]},sort_keys=True))',
+        ],
+        timeout=15,
+        env=environment,
+    )
+    need(len(versions) <= 4096)
+    report = {
+        "schema": "lumi.aws-rehearsal-staging.v0.2",
+        "status": "staged",
+        "archive_sha256": ARCHIVE_SHA,
+        "source_manifest_sha256": MANIFEST_SHA,
+        "software_lock_sha256": LOCK_SHA,
+        "wheel_count": len(rows),
+        "wheel_bytes": acquired,
+        "python": sys.version.split()[0],
+        "runtime_origin": "Canonical Ubuntu 24.04 signed apt Python plus hash-pinned wheels",
+        "old_oci_runtime_identity_claimed": False,
+        "versions": json.loads(versions),
+        "real_checkpoint_or_dataset_accessed": False,
+        "rehearsal_started": False,
+    }
+    with (ROOT / "staging.json").open("x", encoding="utf-8") as output:
+        json.dump(report, output, sort_keys=True)
+        output.write("\n")
+    print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    signal.signal(
+        signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError("staging_deadline"))
+    )
+    signal.alarm(900)
+    try:
+        stage()
+    except Exception as error:
+        # Setup only: no model data or secret strings retained.
+        print(json.dumps({"status": "staging_failed", "exception_type": type(error).__name__}))
+        raise SystemExit(1) from None
+

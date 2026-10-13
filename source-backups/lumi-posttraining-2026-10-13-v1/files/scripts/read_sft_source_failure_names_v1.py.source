@@ -1,0 +1,219 @@
+"""One approved 128 KiB Source-job read; no raw log output or persistence."""
+
+import ast
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import time
+import types
+import urllib.error
+import urllib.parse
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+HEAD = "6585a1e073a6a5302630ed63a3c1a3d81adda429"
+RUN_ID, JOB_ID = 34805106063, 103855350893
+MAX_LOG = 131_072
+PLAN = ROOT / "configs/lumi-4b-sft-source-failure-names-plan-v0.1.json"
+MARKER = ROOT / "artifacts/lumi-sft-source-failure-names-v0.1/fetch.started"
+PARSER = ROOT / "scripts/parse_sft_source_failure_names_v1.py"
+PARSER_SHA = "7c883d6d2792f6c2b1003756e99ec8e13a0140bc1bf895dfa8dcc83541878772"
+
+
+class Rejected(ValueError):
+    """Fixed public diagnostic code only."""
+
+
+def need(value, code):
+    if not value:
+        raise Rejected(code) from None
+
+
+def bound(path, digest):
+    payload = path.read_bytes()
+    need(hashlib.sha256(payload).hexdigest() == digest, "binding_rejected")
+    return payload
+
+
+def load_module(path, digest, name):
+    module = types.ModuleType(name)
+    module.__file__ = str(path)
+    exec(compile(bound(path, digest), str(path), "exec"), module.__dict__)
+    return module
+
+
+def git(*arguments):
+    value = subprocess.run(
+        ["/usr/bin/git", *arguments], cwd=ROOT, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, check=True,
+    )
+    return value.stdout.decode("utf-8")
+
+
+def static_nodes(paths):
+    """Read only tracked test source, without importing or executing any test."""
+    allowed, total = set(), 0
+    for name in paths:
+        need(re.fullmatch(r"tests/test_[A-Za-z0-9_]+\.py", name), "test_path")
+        path = ROOT / name
+        meta = path.lstat()
+        need(stat.S_ISREG(meta.st_mode) and 0 < meta.st_size <= 524_288, "test_source_shape")
+        total += meta.st_size
+        need(total <= 16_777_216, "test_source_byte_cap")
+        source = path.read_bytes()
+        need(len(source) == meta.st_size, "test_source_changed")
+        tree = ast.parse(source)
+        allowed.add(name)  # Collection errors can name the bound module alone.
+        classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("test_"):
+                    allowed.add(name + "::" + node.name)
+        def methods(class_name, seen):
+            if class_name in seen or class_name not in classes:
+                return set()
+            node = classes[class_name]
+            result = {
+                child.name for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name.startswith("test_")
+            }
+            for base in node.bases:
+                if isinstance(base, ast.Name):
+                    result |= methods(base.id, seen | {class_name})
+            return result
+        for class_name in classes:
+            for method in methods(class_name, set()):
+                allowed.add(name + "::" + class_name + "::" + method)
+    need(allowed, "empty_test_nodes")
+    return allowed
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+def main():
+    need(sys.argv[1:] in (["--preflight"], ["--read-approved-source-log"]), "arguments")
+    report = {
+        "schema": "lumi.source-failure-names.v0.1", "status": "STOP", "code": "local_preflight",
+        "commit": HEAD, "run_id": RUN_ID, "job_id": JOB_ID, "maximum_log_bytes": MAX_LOG,
+        "HTTP_requests": 0, "log_body_bytes_read": 0, "raw_log_retained": False,
+        "raw_exception_message_retained": False, "parameter_values_retained": False,
+        "remote_job_reruns": 0, "GPU_used": False, "observed_list_is_exhaustive": False,
+        "started_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    parser = None
+    try:
+        need(git("rev-parse", "HEAD").strip() == HEAD, "head_drift")
+        need(git("diff", "--name-only") == git("diff", "--cached", "--name-only") == "", "tracked_drift")
+        parser = load_module(PARSER, PARSER_SHA, "_source_names_pure_parser")
+        stage = load_module(ROOT / "scripts/parse_sft_source_stage_diagnostic_v1.py",
+            "9f5175aa75827a40cb791363bf4ea5c8f4235a2af37d490c93320e4855e5980d", "_bound_stage")
+        workflow = bound(ROOT / ".github/workflows/source-checks.yml",
+            "ed75ad40b262c47864e080fff9ff3551106201b9fe4002e8a665ab9a688bbb8e").decode()
+        tail = workflow.split("name: Source suite (private integrations stay blocked)")
+        need(len(tail) == 2, "workflow_binding")
+        command = " ".join(tail[1].split("run: >-\n")[1].split())
+        need(stage.SOURCE_GROUP == "##[group]Run " + command, "command_binding")
+        for previous in ("lumi-sft-source-failure-summary-v0.1", "lumi-sft-source-failure-summary-v0.2",
+                         "lumi-sft-source-stage-diagnostic-v0.1"):
+            need(len(bound(ROOT / "artifacts" / previous / "fetch.started",
+                "b639cc57bfefe4d26798abfe33cfcc35028761b250b2a5f921bc6d53a8d1c516")) == 37, "prior_marker")
+        bound(ROOT / "evidence/lumi-4b-sft-source-stage-diagnostic-v0.1.json",
+              "b904f19553448de68cb4787e8541327a947f5868378cb10c73b7cf1b1fd6e98b")
+        plan = json.loads(PLAN.read_bytes())
+        need(plan["runner_sha256"] == hashlib.sha256(Path(__file__).read_bytes()).hexdigest(), "runner_binding")
+        need(plan["parser_sha256"] == PARSER_SHA and plan["maximum_log_body_bytes"] == MAX_LOG
+             and plan["maximum_HTTP_GETs"] == 2 and plan["maximum_retries"] == 0, "plan_binding")
+        allowed = static_nodes(git("ls-files", "tests/test_*.py").splitlines())
+        need(not MARKER.parent.exists(), "attempt_already_started")
+        if sys.argv[1:] == ["--preflight"]:
+            fixture = (stage.SOURCE_GROUP + "\n##[endgroup]\n=== short test summary info ===\n"
+                       "FAILED tests/test_demo.py::test_a - ValueError: PRIVATE\n"
+                       "##[error]Process completed with exit code 1.\n").encode()
+            need(parser.parse_names(fixture, {"tests/test_demo.py::test_a"}, stage.SOURCE_GROUP)
+                 == [{"test":"tests/test_demo.py::test_a", "error_type":"ValueError"}], "parser_wiring")
+            print(json.dumps({"status":"PASS_local_preflight", "network_requests":0,
+                              "static_test_node_bindings":len(allowed), "fresh_marker_not_started":True}))
+            return 0
+        token_result = subprocess.run(["/opt/homebrew/bin/gh", "auth", "token", "--hostname", "github.com"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=15, stdin=subprocess.DEVNULL)
+        need(token_result.returncode == 0, "credential_unavailable")
+        token = token_result.stdout.decode().strip()
+        need(token and "\n" not in token and "\r" not in token, "credential_unavailable")
+        os.umask(0o077)
+        MARKER.parent.mkdir(mode=0o700, exist_ok=False)
+        with MARKER.open("xb") as marker:
+            marker.write(b"one approved Source-log read started\n")
+        deadline = time.monotonic() + 120
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        request = urllib.request.Request(
+            "https://api.github.com/repos/saidi19/lumi-model/actions/jobs/103855350893/logs",
+            headers={"Authorization":"Bearer " + token, "Accept":"application/vnd.github+json",
+                     "Accept-Encoding":"identity", "User-Agent":"lumi-bound-failure-names"}, method="GET")
+        report["code"], report["HTTP_requests"] = "job_log_redirect", 1
+        try:
+            response = opener.open(request, timeout=20)
+        except urllib.error.HTTPError as error:
+            response = error
+        with response:
+            need(response.code == 302, "job_log_redirect_rejected")
+            signed = response.headers["Location"]
+        parsed = urllib.parse.urlsplit(signed)
+        need(parsed.scheme == "https" and parsed.port in (None, 443) and not parsed.username
+             and not parsed.password and not parsed.fragment and parsed.hostname
+             and parsed.hostname.endswith((".blob.core.windows.net", ".actions.githubusercontent.com")), "signed_host_rejected")
+        report["code"], report["HTTP_requests"] = "bounded_log_body", 2
+        with opener.open(urllib.request.Request(signed, headers={"Accept-Encoding":"identity",
+                "Range":"bytes=-" + str(MAX_LOG)}, method="GET"), timeout=20) as response:
+            need(response.status in (200, 206) and response.headers.get("Content-Encoding") in (None, "identity"), "log_encoding")
+            size = response.headers.get("Content-Length")
+            need(size is None or size.isdigit() and 0 < int(size) <= MAX_LOG, "log_length_cap")
+            if response.status == 206:
+                selected = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", response.headers.get("Content-Range", ""))
+                need(selected is not None, "log_range")
+                start, stop, total = map(int, selected.groups())
+                need(0 <= start <= stop == total - 1 and stop - start + 1 <= MAX_LOG
+                     and (size is None or int(size) == stop - start + 1), "log_range")
+            data, complete = bytearray(), False
+            while len(data) < MAX_LOG:
+                need(time.monotonic() < deadline, "deadline")
+                chunk = response.read(min(65_536, MAX_LOG - len(data)))
+                report["log_body_bytes_read"] += len(chunk)
+                if not chunk:
+                    complete = True
+                    break
+                data.extend(chunk)
+                if size is not None and len(data) == int(size):
+                    complete = True
+                    break
+            need(complete and (size is None or len(data) == int(size)), "log_incomplete_or_cap")
+        report["observed_failures"] = parser.parse_names(bytes(data), allowed, stage.SOURCE_GROUP)
+        del data, chunk
+        report["status"], report["code"] = "PASS_observed_bound_failure_names_only", "ok"
+    except Rejected as error:
+        report["code"] = str(error)
+    except urllib.error.HTTPError as error:
+        report["HTTP_error_status"] = error.code
+    except BaseException as error:
+        if parser is not None and isinstance(error, parser.Rejected):
+            report["code"] = str(error)
+        else:
+            report["code"] = "local_or_transport_error"
+    report["completed_at_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    encoded = json.dumps(report, sort_keys=True)
+    need(len(encoded) <= 262_144, "report_bound")
+    print(encoded)
+    return 0 if report["status"].startswith("PASS_") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

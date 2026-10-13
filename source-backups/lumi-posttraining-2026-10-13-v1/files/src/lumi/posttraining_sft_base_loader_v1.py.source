@@ -1,0 +1,334 @@
+"""One-shot, hash-bound local HF base loader for ModelPreparation.load_model.
+
+No public CLI or authorization is introduced. The trusted host supplies verified
+inventory pins, admission, an owned private directory FD and a shared-ledger
+reserve callback. Root opening follows admission/runtime checks. All file bytes
+pass through the existing MeteredReader; native libraries see bytes/tensors,
+NEVER a checkpoint pathname. No pickle, mmap, download or source write path.
+
+Inventory is the selected config/index/weight subset of a verified import receipt,
+not a substitute for authenticating that receipt or the source lineage. The host
+must enforce immutable inputs, RAM/time/process limits and filesystem ownership.
+The conservative live-buffer estimate is not a native RSS or OS-quota proof.
+Old export/import components and evidence remain unchanged.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import sys
+import threading
+from types import ModuleType
+
+from .posttraining_checkpoint_hf_bytes_v1 import _json, validate_blob
+from .posttraining_checkpoint_import_torch_v5 import SOURCE_FIELDS, _validate_source_config
+from .posttraining_sft_checkpoint_worker_v1 import _directory_info
+from .posttraining_sft_metered_io_v1 import MAX_OPERATION_BYTES, MeteredReader
+
+WEIGHT = re.compile(r"model(?:-[0-9]{5}-of-[0-9]{5})?\.safetensors\Z")
+CONTROL = frozenset({"config.json", "model.safetensors.index.json"})
+CODES = frozenset({"invalid_arguments", "inventory_rejected", "admission_rejected",
+                   "runtime_rejected", "already_consumed", "owner_mismatch",
+                   "read_failed", "checksum_mismatch", "budget_rejected",
+                   "header_rejected", "model_rejected", "close_failed", "load_failed"})
+
+
+class BaseLoadError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in CODES else "load_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code):
+    if not value:
+        raise BaseLoadError(code) from None
+
+
+def _hash(value):
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _header(raw, maximum_header_bytes):
+    """Validate serialized extents before safetensors can allocate tensors."""
+    _need(type(raw) is bytes and len(raw) > 8, "header_rejected")
+    count = int.from_bytes(raw[:8], "little")
+    _need(0 < count <= maximum_header_bytes and 8 + count < len(raw), "header_rejected")
+    try:
+        value = _json(raw[8:8 + count])
+        _need(type(value) is dict and value.pop("__metadata__", None) == {"format": "pt"}
+              and 0 < len(value) <= 4096, "header_rejected")
+        shapes = {}
+        for name, row in value.items():
+            _need(type(name) is str and re.fullmatch(r"[A-Za-z0-9_.]{1,512}", name)
+                  and type(row) is dict and set(row) == {"dtype", "shape", "data_offsets"}
+                  and row["dtype"] in {"F32", "BF16"} and type(row["shape"]) is list
+                  and 0 < len(row["shape"]) <= 8, "header_rejected")
+            size = 4 if row["dtype"] == "F32" else 2
+            for dimension in row["shape"]:
+                _need(type(dimension) is int and 0 < dimension < 2**31, "header_rejected")
+                size *= dimension
+                _need(size <= len(raw), "header_rejected")
+            shapes[name] = {"dtype": row["dtype"], "shape": list(row["shape"]), "bytes": size}
+        validate_blob(raw, {"names": tuple(shapes), "serialized_bound": len(raw),
+                           "header_bound": maximum_header_bytes,
+                           "payload_bytes": len(raw) - 8 - count}, shapes)
+        return shapes
+    except BaseException:
+        raise BaseLoadError("header_rejected") from None
+
+
+def _runtime():
+    _need(sys.platform == "linux" and sys.flags.no_site == 1
+          and sys.dont_write_bytecode, "runtime_rejected")
+    names = ("torch", "safetensors.torch", "lumi.configuration_lumi",
+             "lumi.modeling_lumi", "transformers", "lumi.parameter_count")
+    modules = tuple(sys.modules.get(name) for name in names)
+    _need(all(type(module) is ModuleType for module in modules), "runtime_rejected")
+    return modules
+
+
+def _model_plan(config, modules, maximum_live_bytes, serialized_bytes):
+    """Check a bounded architecture on meta before weight/tensor allocation."""
+    torch, _, configuration, modeling, _, counter = modules
+    _need(set(config) <= SOURCE_FIELDS | {"auto_map", "transformers_version"},
+          "model_rejected")
+    if "auto_map" in config:
+        _need(config["auto_map"] == configuration.LUMI_AUTO_MAP, "model_rejected")
+    if "transformers_version" in config:
+        _need(type(config["transformers_version"]) is str
+              and len(config["transformers_version"]) <= 64, "model_rejected")
+    # Use the importer's closed scalar architecture rules, not HF loading switches.
+    scalar_config = {key: value for key, value in config.items() if key in SOURCE_FIELDS}
+    _validate_source_config(scalar_config)
+    actual_config = configuration.LumiConfig(**scalar_config)
+    actual_config._attn_implementation = "eager"
+    parameters = counter.parameter_breakdown(actual_config).total
+    _need(type(parameters) is int and parameters > 0
+          and parameters * 8 + serialized_bytes * 4 <= maximum_live_bytes,
+          "budget_rejected")
+    with torch.device("meta"):
+        model = modeling.LumiForCausalLM(actual_config)
+    _need(sum(parameter.numel() for parameter in model.parameters()) == parameters,
+          "model_rejected")
+    tensors = model.state_dict()
+    _need(0 < len(tensors) <= 4096 and all(t.device.type == "meta" for t in tensors.values()),
+          "model_rejected")
+    shapes = {name: list(tensor.shape) for name, tensor in tensors.items()}
+    if actual_config.tie_word_embeddings:
+        _need(shapes.get("lm_head.weight") == shapes.get("model.embed_tokens.weight")
+              and "lm_head.weight" in shapes, "model_rejected")
+        del shapes["lm_head.weight"]
+    del tensors, model
+    return actual_config, shapes
+
+
+def _decode(raw, shapes, modules):
+    torch, safe, *_ = modules
+    values = safe.load(raw)
+    _need(type(values) is dict and set(values) == set(shapes), "model_rejected")
+    for name, tensor in values.items():
+        expected = shapes[name]
+        _need(isinstance(tensor, torch.Tensor) and tensor.device.type == "cpu"
+              and tensor.dtype == (torch.float32 if expected["dtype"] == "F32" else torch.bfloat16)
+              and list(tensor.shape) == expected["shape"]
+              and bool(torch.isfinite(tensor).all().item()), "model_rejected")
+    return values
+
+
+def _build(config, state, modules):
+    torch, _, _, modeling, transformers, _ = modules
+    generation = transformers.GenerationConfig.from_model_config(config)
+    with torch.device("cpu"):
+        model, information = modeling.LumiForCausalLM.from_pretrained(
+            None, config=config, state_dict=state, generation_config=generation,
+            local_files_only=True, dtype=torch.float32, attn_implementation="eager",
+            device_map=None, use_safetensors=True, trust_remote_code=False,
+            output_loading_info=True)
+    _need(type(model) is modeling.LumiForCausalLM and type(information) is dict
+          and information and all(not value for value in information.values()), "model_rejected")
+    _need(all(parameter.device.type == "cpu" and parameter.dtype == torch.float32
+              for parameter in model.parameters()), "model_rejected")
+    return model
+
+
+class BoundedBaseLoader:
+    """Inert construction, one admitted invocation, transferred root FD always closed."""
+
+    def __init__(self, *, inventory, expected_inventory_sha256, rank, admit, open_root,
+                 reserve, check_budget, maximum_read_bytes, maximum_file_bytes,
+                 maximum_control_bytes, maximum_live_bytes):
+        if hasattr(self, "_owner"):
+            raise BaseLoadError("already_consumed") from None
+        _need(type(rank) is int and 0 <= rank < 8
+              and all(callable(fn) for fn in (admit, open_root, reserve, check_budget))
+              and all(type(n) is int and 0 < n < 2**63 for n in (
+                  maximum_read_bytes, maximum_file_bytes,
+                  maximum_control_bytes, maximum_live_bytes))
+              and maximum_file_bytes <= 2**31 and maximum_control_bytes <= 65536,
+              "invalid_arguments")
+        _need(type(inventory) is list and 2 <= len(inventory) <= 256
+              and _hash(expected_inventory_sha256), "inventory_rejected")
+        rows = {}
+        for row in inventory:
+            _need(type(row) is dict and set(row) == {"path", "bytes", "sha256"},
+                  "inventory_rejected")
+            name = row["path"]
+            _need(type(name) is str and (name in CONTROL or WEIGHT.fullmatch(name))
+                  and name not in rows and type(row["bytes"]) is int
+                  and 0 < row["bytes"] <= (maximum_control_bytes if name in CONTROL
+                                          else maximum_file_bytes)
+                  and _hash(row["sha256"]), "inventory_rejected")
+            rows[name] = dict(row)
+        _need("config.json" in rows and any(WEIGHT.fullmatch(name) for name in rows)
+              and hashlib.sha256(_canonical(inventory)).hexdigest() == expected_inventory_sha256,
+              "inventory_rejected")
+        weights = [row["bytes"] for name, row in rows.items() if WEIGHT.fullmatch(name)]
+        _need(sum(row["bytes"] for row in rows.values()) <= maximum_read_bytes
+              and 8 * sum(weights) + 4 * max(weights) + 4 * maximum_control_bytes
+              <= maximum_live_bytes, "budget_rejected")
+        self._rows, self._rank = rows, rank
+        self._admit, self._open_root, self._reserve, self._tick_callback = (
+            admit, open_root, reserve, check_budget)
+        self._read_cap, self._control_cap = maximum_read_bytes, maximum_control_bytes
+        self._live_cap, self._serialized_bytes = maximum_live_bytes, sum(weights)
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._failure, self._stage = "idle", None, "idle"
+        self._spent = self._files = 0
+        self._close_failed = False
+
+    def _tick(self):
+        _need(self._failure is None and self._tick_callback() is None
+              and self._failure is None, "budget_rejected")
+
+    def _debit(self, rank, *, checkpoint_read_bytes):
+        self._tick()
+        _need(rank == self._rank and self._spent + checkpoint_read_bytes <= self._read_cap,
+              "budget_rejected")
+        self._spent += checkpoint_read_bytes  # Nonrefundable even if shared reservation fails.
+        _need(self._reserve(rank, checkpoint_read_bytes=checkpoint_read_bytes) is None,
+              "budget_rejected")
+        self._tick()
+
+    def _read(self, root, root_identity, name):
+        self._tick()
+        _need(_directory_info(root) == root_identity, "read_failed")
+        row = self._rows[name]
+        fd, reader = None, None
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                         dir_fd=root)
+            _need(os.fstat(fd).st_size == row["bytes"], "read_failed")
+            reader = MeteredReader(fd, rank=self._rank, resource="checkpoint_read_bytes",
+                                   reserve=self._debit)
+            fd = None  # Reader owns the descriptor only after constructor success.
+            chunks, remaining, digest = [], row["bytes"], hashlib.sha256()
+            while remaining:
+                chunk = reader.read(min(remaining, MAX_OPERATION_BYTES))
+                chunks.append(chunk)
+                digest.update(chunk)
+                remaining -= len(chunk)
+            _need(digest.hexdigest() == row["sha256"], "checksum_mismatch")
+            _need(_directory_info(root) == root_identity, "read_failed")
+            self._files += 1
+            return b"".join(chunks)
+        finally:
+            if reader is not None:
+                reader.close()
+            elif fd is not None:
+                os.close(fd)
+
+    def __call__(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        if self._state != "idle":
+            if self._state == "running" and self._failure is None:
+                self._failure = "already_consumed"
+            raise BaseLoadError(self._failure or "already_consumed") from None
+        self._state, self._stage = "running", "admission"
+        root, result, root_identity = None, None, None
+        try:
+            _need(self._admit() is None and self._failure is None, "admission_rejected")
+            self._stage = "runtime"
+            modules = _runtime()
+            self._tick()
+            self._stage = "read"
+            root = self._open_root()
+            root_identity = _directory_info(root)
+            config = _json(self._read(root, root_identity, "config.json"))
+            _need(type(config) is dict, "model_rejected")
+            self._tick()
+            config, expected_shapes = _model_plan(
+                config, modules, self._live_cap, self._serialized_bytes)
+            self._tick()
+            weight_map = None
+            if "model.safetensors.index.json" in self._rows:
+                index = _json(self._read(root, root_identity, "model.safetensors.index.json"))
+                _need(type(index) is dict and set(index) == {"metadata", "weight_map"}
+                      and type(index["metadata"]) is dict and type(index["weight_map"]) is dict
+                      and 0 < len(index["weight_map"]) <= 4096, "model_rejected")
+                weight_map = index["weight_map"]
+                _need(all(type(key) is str and type(value) is str and value in self._rows
+                          and WEIGHT.fullmatch(value) for key, value in weight_map.items()),
+                      "model_rejected")
+            weights = sorted(name for name in self._rows if WEIGHT.fullmatch(name))
+            _need((weight_map is not None and set(weight_map.values()) == set(weights))
+                  or weight_map is None and weights == ["model.safetensors"], "model_rejected")
+            state = {}
+            for name in weights:
+                raw = self._read(root, root_identity, name)
+                shapes = _header(raw, self._control_cap)
+                _need(not set(state).intersection(shapes)
+                      and len(state) + len(shapes) <= 4096
+                      and all(key in expected_shapes and row["shape"] == expected_shapes[key]
+                              for key, row in shapes.items())
+                      and (weight_map is None or set(shapes)
+                           == {key for key, value in weight_map.items() if value == name}),
+                      "model_rejected")
+                self._tick()
+                state.update(_decode(raw, shapes, modules))
+                del raw, shapes
+                self._tick()
+            self._stage = "model"
+            _need(set(state) == set(expected_shapes), "model_rejected")
+            result = _build(config, state, modules)
+            del state
+            self._tick()
+            _need(_directory_info(root) == root_identity, "read_failed")
+        except BaseException as error:
+            if self._failure is None:
+                self._failure = error.code if type(error) is BaseLoadError else {
+                    "admission": "admission_rejected", "runtime": "runtime_rejected",
+                    "read": "read_failed", "model": "model_rejected",
+                }.get(self._stage, "load_failed")
+        finally:
+            if type(root) is int and root >= 3:
+                try:
+                    if root_identity is not None:
+                        current = os.fstat(root)
+                        # Do not close a descriptor reused for an unrelated object.
+                        _need((current.st_dev, current.st_ino) == root_identity[0][:2],
+                              "close_failed")
+                    os.close(root)
+                except BaseException:
+                    self._close_failed = True
+                    if self._failure is None:
+                        self._failure = "close_failed"
+        if self._failure is not None:
+            self._state = "failed"
+            raise BaseLoadError(self._failure) from None
+        self._state, self._stage = "complete", "complete"
+        return result
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-base-loader-summary.v0.1",
+                "state": self._state, "stage": self._stage, "failure_code": self._failure,
+                "checkpoint_read_bytes_reserved": self._spent, "files_verified": self._files,
+                "root_close_failed": self._close_failed, "real_execution_authorized": False,
+                "os_resource_enforcement_verified": False, "production_eligible": False}

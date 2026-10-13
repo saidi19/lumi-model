@@ -1,0 +1,335 @@
+"""Synthetic IAM/STS plus real FIFO delivery; no AWS or native admission."""
+
+import datetime as dt
+import fnmatch
+import hashlib
+import importlib
+import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_acquisition_issuer_v1 as old
+from tests import test_sft_vm_retention_parent_v1 as receiver
+
+m = importlib.import_module("issue_sft_vm_retention_credentials_v1")
+NOW = dt.datetime(2026, 10, 1, tzinfo=dt.UTC)
+RAW = json.dumps(
+    dict(
+        prepared_attempt=m.ATTEMPT,
+        retention_proposal=dict(bucket=m.BUCKET, prefix=m.PREFIX, region=m.base.REGION),
+    )
+).encode()
+
+
+class Fake(old.Fake):
+    def issue_retention_session(self, key, arn):
+        self.issues += 1
+        if self.fail == "issue":
+            raise RuntimeError("issuer-secret")
+        if self.fail == "owner_changed":
+            self.entities["role"]["Tags"] = [{"Key": "LumiOwnerNonce", "Value": "different"}]
+        if self.fail == "scope_changed":
+            self.policies[m.POLICY] = m.base.DENY
+        return dict(
+            AccessKeyId="ASIASYNTHETIC",
+            SecretAccessKey="session-secret",
+            SessionToken="session-token",
+            Expiration=NOW + dt.timedelta(seconds=1859 if self.fail == "short" else 3599),
+        )
+
+
+def decision(policy, action, arn, context):
+    """Test-only evaluator for exactly the operators emitted here, not AWS proof."""
+
+    def matches(patterns, value):
+        return any(
+            fnmatch.fnmatchcase(value, p)
+            for p in (patterns if isinstance(patterns, list) else [patterns])
+        )
+
+    allowed = False
+    for s in policy["Statement"]:
+        if "Action" in s and not matches(s["Action"], action):
+            continue
+        if "NotAction" in s and matches(s["NotAction"], action):
+            continue
+        if "Resource" in s and not matches(s["Resource"], arn):
+            continue
+        if "NotResource" in s and matches(s["NotResource"], arn):
+            continue
+        conditions = []
+        for op, values in s.get("Condition", {}).items():
+            for key, expected in values.items():
+                actual = context.get(key)
+                if op == "Bool":
+                    value = actual == expected
+                elif op == "DateGreaterThanEquals":
+                    value = actual is not None and dt.datetime.fromisoformat(
+                        actual
+                    ) >= dt.datetime.fromisoformat(expected)
+                elif op == "StringNotEquals":
+                    value = actual != expected
+                elif op == "Null":
+                    value = (actual is None) == (expected == "true")
+                else:
+                    raise AssertionError(op)
+                conditions.append(value)
+        if all(conditions):
+            if s["Effect"] == "Deny":
+                return "deny"
+            allowed = True
+    return "allow" if allowed else "deny"
+
+
+class PolicyTests(unittest.TestCase):
+    def test_prefix_action_header_and_expiry_matrix(self):
+        policy = m.policy_for_expiry(NOW + dt.timedelta(seconds=3600))
+        context = {
+            "aws:CurrentTime": NOW.isoformat(),
+            "aws:SecureTransport": "true",
+            "s3:if-none-match": "*",
+            "s3:x-amz-server-side-encryption": "AES256",
+        }
+        arn = f"arn:aws:s3:::{m.BUCKET}/{m.PREFIX}package/model.bin"
+        for kind in ("package/model.bin", "metadata/commit.json"):
+            for action in m.ACTIONS:
+                self.assertEqual(
+                    decision(policy, action, f"arn:aws:s3:::{m.BUCKET}/{m.PREFIX}{kind}", context),
+                    "allow",
+                )
+        for action in (
+            "s3:DeleteObject",
+            "s3:ListBucket",
+            "s3:GetObjectVersion",
+            "s3:PutObjectAcl",
+            "iam:CreateUser",
+            "sts:AssumeRole",
+        ):
+            self.assertEqual(decision(policy, action, arn, context), "deny")
+        for resource in (
+            arn.replace(m.ATTEMPT, "0" * 32),
+            arn.replace(m.BUCKET, "other"),
+            arn.replace("package/", "other/"),
+            f"arn:aws:s3:::{m.BUCKET}",
+        ):
+            self.assertEqual(decision(policy, "s3:GetObject", resource, context), "deny")
+        for change in (
+            {"aws:SecureTransport": "false"},
+            {"aws:CurrentTime": (NOW + dt.timedelta(seconds=3600)).isoformat()},
+            {"s3:if-none-match": None},
+            {"s3:if-none-match": "not-star"},
+            {"s3:x-amz-server-side-encryption": None},
+            {"s3:x-amz-server-side-encryption": "aws:kms"},
+            {"s3:x-amz-copy-source": "source"},
+        ):
+            self.assertEqual(decision(policy, "s3:PutObject", arn, context | change), "deny")
+        policy["Statement"].append(dict(Effect="Allow", Action="*", Resource="*"))
+        self.assertEqual(decision(policy, "s3:DeleteObject", arn, context), "deny")
+        self.assertEqual(
+            decision(policy, "s3:PutObject", arn, context | {"s3:if-none-match": None}), "deny"
+        )
+
+    def test_readback_needs_no_put_headers(self):
+        context = {"aws:CurrentTime": NOW.isoformat(), "aws:SecureTransport": "true"}
+        arn = f"arn:aws:s3:::{m.BUCKET}/{m.PREFIX}metadata/commit.json"
+        self.assertEqual(
+            decision(
+                m.policy_for_expiry(NOW + dt.timedelta(hours=1)), "s3:GetObject", arn, context
+            ),
+            "allow",
+        )
+
+    def test_bound_proposal_rejects_changes(self):
+        with self.assertRaises(ValueError):
+            m.build(RAW, NOW)
+        with patch.object(m, "PROPOSAL_SHA", hashlib.sha256(RAW).hexdigest()):
+            policy, expiry = m.build(RAW, NOW)
+            self.assertEqual(policy, m.policy_for_expiry(expiry))
+
+    def test_bad_credential_shapes_and_lifetimes(self):
+        value = Fake().issue_retention_session({}, "unused")
+        for changed in (
+            value | {"extra": 1},
+            value | {"AccessKeyId": "AKIAwrong"},
+            value | {"SessionToken": 1},
+            value | {"SecretAccessKey": "has space"},
+            value | {"Expiration": NOW.replace(tzinfo=None)},
+            value | {"Expiration": NOW + dt.timedelta(seconds=3601)},
+        ):
+            with self.assertRaises(ValueError):
+                m.credential_body(changed, NOW + dt.timedelta(hours=1), NOW)
+        with self.assertRaises(ValueError):
+            m.credential_body(value, NOW + dt.timedelta(seconds=1859), NOW)
+
+
+class IssuerTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(m, "PROPOSAL_SHA", hashlib.sha256(RAW).hexdigest()))
+
+    def execute(self, cloud=None, deliver=lambda body: None):
+        result = m._run_for_admitted_delivery(
+            RAW,
+            m.ATTEMPT,
+            self.root / "attempt",
+            deliver,
+            cloud=Fake() if cloud is None else cloud,
+            now=lambda: NOW,
+            wait=lambda _: None,
+        )
+        saved = (self.root / "attempt/result.json").read_text()
+        for secret in ("issuer-secret", "session-secret", "session-token", "ASIASYNTHETIC"):
+            self.assertNotIn(secret, saved)
+        return result
+
+    def test_success_key_removed_before_callback_and_buffers_cleared(self):
+        cloud, received = Fake(), []
+
+        def deliver(body):
+            self.assertEqual(cloud.keys, [])
+            self.assertIn("role", cloud.entities)
+            received.append(body)
+            receiver.p.continuation.normalize_retention_credentials(body, NOW.timestamp(), 1800)
+            return dict(
+                offhost_retention_verified=True,
+                retention_cgroup_reaped=True,
+                credential_source_cleanup_complete=True,
+                gate_5_complete=False,
+                production_eligible=False,
+                instance_termination_allowed=False,
+                commit_sha256="c" * 64,
+            )
+
+        result = self.execute(cloud, deliver)
+        self.assertTrue(result["delivery_returned"] and result["cleanup_verified"])
+        self.assertTrue(result["long_term_key_removed_before_delivery"])
+        self.assertTrue(result["retention_completion_reported"])
+        self.assertFalse(result["host_admitted_here"] or result["gate_5_complete"])
+        self.assertEqual(cloud.entities, {})
+        self.assertEqual(set(received[0]), {0})
+
+    def test_failure_paths_no_retry_and_secret_free_receipts(self):
+        for failure in (
+            "issue",
+            "short",
+            "scope_changed",
+            "lost_key_response",
+            "create-role",
+            "put-role-policy",
+        ):
+            with self.subTest(failure=failure):
+                self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                cloud = Fake(failure)
+                result = self.execute(cloud)
+                self.assertFalse(result["delivery_returned"])
+                self.assertLessEqual(cloud.issues, 1)
+                self.assertEqual(result["cleanup_verified"], failure != "put-role-policy")
+                if failure == "put-role-policy":
+                    self.assertEqual(result["cleanup_errors"], ["role"])
+
+    def test_changed_owner_is_preserved(self):
+        cloud = Fake("owner_changed")
+        result = self.execute(cloud)
+        self.assertFalse(result["cleanup_verified"] or result["delivery_returned"])
+        self.assertEqual(result["cleanup_errors"], ["role"])
+        self.assertNotIn("delete-role", cloud.calls)
+
+    def test_delete_key_failure_blocks_delivery(self):
+        result = self.execute(Fake("delete-access-key"))
+        self.assertFalse(result["delivery_returned"] or result["cleanup_verified"])
+
+    def test_callback_failure_cleanup_not_retry(self):
+        cloud = Fake()
+        callback = Mock(side_effect=RuntimeError("session-secret"))
+        result = self.execute(cloud, callback)
+        callback.assert_called_once()
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(result["failed_stage"], "deliver")
+
+    def test_send_ack_is_not_completion(self):
+        result = self.execute(deliver=lambda _: dict(delivery_sent=True))
+        self.assertTrue(result["delivery_returned"] and result["cleanup_verified"])
+        self.assertFalse(result["retention_completion_reported"])
+        self.assertEqual(result["failed_stage"], "deliver")
+
+    def test_wrong_readback_prevents_key_creation(self):
+        cloud = Fake()
+        original = cloud.cli
+
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            return {"PolicyDocument": {}} if operation == "get-user-policy" else value
+
+        cloud.cli = cli
+        self.assertFalse(self.execute(cloud)["delivery_returned"])
+        self.assertNotIn("create-access-key", cloud.calls)
+
+    def test_collision_and_consumed_directory(self):
+        cloud = Fake()
+        cloud.entities["user"] = {}
+        self.assertFalse(self.execute(cloud)["cleanup_verified"])
+        self.assertEqual(cloud.calls, ["get-caller-identity"])
+        with self.assertRaises(FileExistsError):
+            self.execute(Fake())
+
+    def test_public_entry_and_wrong_attempt_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True, execute=True)
+        with self.assertRaises(ValueError):
+            m._run_for_admitted_delivery(RAW, "0" * 32, self.root / "bad", lambda _: None)
+        self.assertFalse((self.root / "bad").exists())
+
+    def test_sdk_explicit_credentials_scoped_session_no_retry(self):
+        with patch("socket.socket.bind", side_effect=OSError("ipv6_probe_disabled")):
+            import botocore.session
+        client = Mock()
+        client.assume_role.return_value = {"Credentials": {"synthetic": True}}
+        factory = Mock(return_value=client)
+        with patch.object(
+            botocore.session, "Session", return_value=SimpleNamespace(create_client=factory)
+        ):
+            m.Cloud().issue_retention_session(
+                dict(AccessKeyId="synthetic", SecretAccessKey="dummy"), "synthetic-role"
+            )
+        self.assertEqual(factory.call_args.kwargs["config"].retries, {"total_max_attempts": 1})
+        self.assertEqual(factory.call_args.kwargs["config"].proxies, {})
+        self.assertIsNone(factory.call_args.kwargs["aws_session_token"])
+        self.assertEqual(client.assume_role.call_args.kwargs["DurationSeconds"], 3600)
+        self.assertEqual(
+            json.loads(client.assume_role.call_args.kwargs["Policy"]), m.SESSION_POLICY
+        )
+        client.assume_role.assert_called_once()
+        client.close.assert_called_once()
+
+    def test_issuer_through_real_fifo_into_existing_retention_worker(self):
+        fixture = receiver.ProtocolTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        fixture.dispatch()
+        fifo = fixture.state / "credential.fifo"
+        fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, fd)
+        cloud = Fake()
+
+        def deliver(body):
+            self.assertEqual(cloud.keys, [])
+            receiver.p._submit_admitted_once(body, fixture.binding, fixture.end)
+            receiver.p._serve_admitted_once(fixture.binding, fixture.end, "b" * 32, "a" * 64)
+            self.assertTrue((fixture.state / "result.json").exists())
+            self.assertIn("role", cloud.entities)
+            return json.loads(
+                (fixture.destination / "retention-continuation.result.json").read_bytes()
+            )
+
+        with patch.object(time, "time", return_value=NOW.timestamp()):
+            result = self.execute(cloud, deliver)
+        self.assertTrue(result["delivery_returned"] and result["cleanup_verified"])
+        self.assertTrue(result["retention_completion_reported"])
+        self.assertEqual(fixture.dispatches, 1)
+        self.assertEqual(len(fixture.store.calls), 20)
+        self.assertFalse(fifo.exists())

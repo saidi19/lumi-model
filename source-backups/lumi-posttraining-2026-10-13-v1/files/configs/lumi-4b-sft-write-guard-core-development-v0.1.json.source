@@ -1,0 +1,109 @@
+{
+  "schema_version": "lumi.sft-write-guard-core-development.v0.1",
+  "date": "2026-09-24",
+  "status": "PASS_local_policy_and_broker_invariants_NOT_native_enforcement",
+  "scope": "Fixed pure cBPF candidates and trusted-parent scalar reservation core, with synthetic interpreter/wire/callback tests only. No native filter, listener, transport, worker or import execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_policy_v1.py",
+      "bytes": 12666,
+      "sha256": "0b415b6951d9b0a7886158851a90464536fd42bd8716ae740a6361fc3cbf7690"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_broker_v1.py",
+      "bytes": 9293,
+      "sha256": "cfad51b8870bab8cd58ae35252aa932d49248dc44d64d779a359fa91d58e1716"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_policy_v1.py",
+      "bytes": 22140,
+      "sha256": "00625dd0ccaa8ab476dae0824ce0b789e83ff8a424269e4e4bdfe18df1b9d11b"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_broker_v1.py",
+      "bytes": 25844,
+      "sha256": "2f3bcab41e654909137e6d5f09fcacdc4a069cfcac9cd1d6a62fd222649b3e0c"
+    },
+    {
+      "path": "configs/lumi-4b-sft-fullsize-layout-development-v0.1.json",
+      "bytes": 6163,
+      "sha256": "171c6bc1d37a2bc2ab06852c616e76f1cd8eaafe67489341f110698bc7595933"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-fullsize-layout-development-verification-v0.1.json",
+      "bytes": 5842,
+      "sha256": "59779b9199d6fdab6ebf105d496c60997acbde8c50252ad9c53d5025cb478f17"
+    },
+    {
+      "path": "configs/lumi-4b-sft-checkpoint-host-contract-v0.1.json",
+      "bytes": 4583,
+      "sha256": "6d071e719f2f7477cef3336ef6b99ae92fd8481370758e38161c18bbc65d086f"
+    },
+    {
+      "path": "configs/lumi-4b-sft-real-import-resource-envelope-proposal-v0.1.json",
+      "bytes": 1076,
+      "sha256": "a984a5e300199e2bed0a1763583c399735723b29451815d932da0fb2c476324a"
+    }
+  ],
+  "completed": [
+    "Two immutable pure native-x86_64 cBPF candidates: bootstrap listener notifies all write/pwrite64 calls, and a separate closed final seal denies alternate data-write channels and policy replacement. Neither program alone constitutes the intended meter.",
+    "Architecture, tagged x32 and historical x32 rejection precede dispatch. Restricted scalar arguments inspect full width; all-descriptor writes have no FD/count-based exemptions.",
+    "Final seal denies vector/async/copy/splice/reflink/ioctl/truncation/shared-mapping/descriptor-import channels and unknown syscalls. clone3 receives a fixed ENOSYS refusal, with actual execution still denied; the finite legacy thread clone remains flag-restricted.",
+    "The broker parses exact candidate notification frames, retaining only private ID/syscall/count fields, and reserves requested bytes before ID-validation or response callbacks. Full unsigned scalar counts cannot wrap or become FD-dependent exemptions.",
+    "Zero-length requests consume notification capacity. Invalid IDs, duplicate notifications, callback ambiguity/cancellation, budget exhaustion, owner mismatch, reentry and deadline expiry terminally fail without refund or retry.",
+    "Only aggregate snapshots and fixed error codes are retention-safe. Exception objects/tracebacks may retain private frame values and must never be persisted. Public installer/server remain unconditionally closed."
+  ],
+  "candidate_programs": {
+    "listener_instructions": 14,
+    "listener_sha256": "986001785a4895ac1230472dbd1ac22bf8dd418b5573b72c88db5bbaba379d7a",
+    "final_seal_instructions": 393,
+    "final_seal_sha256": "12c42c3ca45eb06509a0879250dcbdc7db35445080932b74709772489c243cf8",
+    "listener_alone_unsafe": true,
+    "final_seal_alone_does_not_meter_writes": true,
+    "linux_abi_and_library_compatibility_qualified": false
+  },
+  "component_limits_not_approved_run_budget": {
+    "maximum_total_bytes": 137438953472,
+    "maximum_notifications": 262144,
+    "maximum_call_bytes": 1048576,
+    "maximum_deadline_seconds": 3600,
+    "notification_candidate_bytes": 80,
+    "response_candidate_bytes": 24,
+    "actual_sft_resource_envelope_modified": false,
+    "actual_native_budget_bound_or_authorized": false
+  },
+  "verification": {
+    "new_policy_tests": 37,
+    "new_broker_tests": 50,
+    "new_tests": 87,
+    "prior_regressions": 521,
+    "unique_tests_per_runtime": 608,
+    "runtimes": ["CPython 3.11.15", "CPython 3.13.7"],
+    "policy_to_broker_synthetic_integration": true,
+    "native_operations_performed": false
+  },
+  "remaining_native_adapter_work": [
+    "Verify expanded Linux syscall/flag/notification ABI candidates against authenticated target headers and runtime; do not infer kernel acceptance from the local interpreter.",
+    "Bind and transfer exactly one listener during trusted bootstrap, install/read back both filters, close listener authority in the worker, and seal all transport/policy-replacement paths before payload release.",
+    "Connect kernel notification ID-validation and response transmission to the precharge core, with terminal retirement of the owned workload on every ambiguity or failure.",
+    "Keep independently armed parent-loss/deadline protection while servicing notifications; poll readiness alone does not prove cancellation-race RECV cannot block.",
+    "Preserve RLIMIT_CORE=0, excluded inherited writable shared mappings/I/O authority, separate sparse-file/capacity bounds, and explicit setup/metadata/OS/scratch/report accounting.",
+    "Finish existing dispatcher/lifecycle integration and authenticate the successor source closure before bounded Linux qualification and unchanged host/input/resource/real-import admission."
+  ],
+  "nonclaims": {
+    "native_filters_installed": false,
+    "native_listener_bound": false,
+    "kernel_id_validation_verified": false,
+    "native_response_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "physical_disk_write_accounting": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "publication": false
+  }
+}

@@ -1,0 +1,117 @@
+"""Independent offline preparation check, including a real local large-frame pipe.
+
+No Linux/SSH claim. Socket creation is blocked and only the exact generated
+local hash-check child may be spawned. Cloud replay is entirely synthetic.
+"""
+
+import importlib.util
+import io
+import json
+import sys
+import time
+import unittest
+from pathlib import Path
+
+from scripts import qualify_sft_vm_setup_transfer_v1 as q
+from scripts import verify_sft_vm_attempt021_source_v1 as previous
+
+PLAN_SHA = "f1263a673a2e2b63b20d7d68d27a9b62bcf78582a573ba67ba03ce7922ac503d"
+ENTRY_SHA = "defcf6d6ca9e1c3aa6f503d4c8a3e05d7f07422b81bb05caa1d8194f47cbb77a"
+TEST_SHA = "ee1f73b7555142b0224675f2eff775d28fd582d5f52c1d09943749470ee6a6d3"
+TEST = q.ROOT / "tests/test_sft_vm_setup_transfer_qualification_v1.py"
+OUTPUT = q.ROOT / "evidence/lumi-setup-transfer-preparation-verification-v0.1.json"
+
+
+def verify():
+    q.need(q.sha(q.read(q.PLAN)) == PLAN_SHA)
+    q.need(q.sha(q.read(Path(q.__file__))) == ENTRY_SHA)
+    q.need(q.sha(q.read(TEST)) == TEST_SHA)
+    plan = json.loads(q.read(q.PLAN))
+    q.need(plan["entry_sha256"] == ENTRY_SHA and plan["test_sha256"] == TEST_SHA)
+    q.need(plan["source_release_sha256"] == q.RELEASE_SHA)
+    q.need(plan["new_explicit_paid_execution_approval_required"] is True)
+    q.need(plan["execution"]["sdk_dispatch_limit"] == 100)
+    q.need(plan["execution"]["maximum_ssh_processes"] == 2)
+    q.need(plan["execution"]["planned_worst_case_sdk_calls"] == 10 + 1 + 42 + 26)
+    q.need(plan["execution"]["total_aws_request_cap_claimed"] is False)
+    q.need(plan["execution"]["wire_byte_accounting_claimed"] is False)
+    q.need(plan["host"]["controller_maximum_seconds"] == 900)
+    q.need(q.sha(q.user_data().encode()) == plan["bootstrap_userdata_sha256"])
+    source = previous.verify()  # Complete predecessor bytes checked, no AWS.
+    q.need(source["prior_evidence_byte_for_byte_preserved"] is True)
+    seed, receiver, archive = q.authenticate()
+    body = receiver + archive
+    q.need(len(body) == plan["execution"]["source_only_frame_bytes"] == 17061196)
+    child = (
+        "import sys,hashlib; raw=sys.stdin.buffer.read(); "
+        "assert hashlib.sha256(raw).hexdigest()==" + repr(q.sha(body)) + "; "
+        "sys.stdout.buffer.write(b'LUMI_LOCAL_FRAME_OK')"
+    )
+    permitted_argv = [sys.executable, "-I", "-B", "-c", child]
+
+    def guard(event, args):
+        if event.startswith("socket."):
+            raise RuntimeError("offline_only")
+        if event == "subprocess.Popen":
+            q.need(args[0] == sys.executable and args[1] == permitted_argv)
+
+    sys.addaudithook(guard)
+    spec = importlib.util.spec_from_file_location("_setup_transfer_tests", TEST)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(module)
+    result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+    q.need(result.wasSuccessful() and result.testsRun == 15)
+    started = time.monotonic()
+    reply = seed.sender.pipe_exchange(permitted_argv, body, 10)
+    q.need(reply == b"LUMI_LOCAL_FRAME_OK")
+    local_seconds = round(time.monotonic() - started, 3)
+    q.need(not q.OUT.exists() and not q.APPROVAL.exists())
+    return {
+        "schema": "lumi.setup-transfer-preparation-verification.v0.1",
+        "status": "prepared_local_verified_pending_auth_and_paid_approval",
+        "source_bindings": {
+            str(q.PLAN.relative_to(q.ROOT)): PLAN_SHA,
+            str(Path(q.__file__).relative_to(q.ROOT)): ENTRY_SHA,
+            str(TEST.relative_to(q.ROOT)): TEST_SHA,
+            str(Path(__file__).relative_to(q.ROOT)): q.sha(q.read(Path(__file__))),
+            str(q.PROOF.relative_to(q.ROOT)): q.PROOF_SHA,
+        },
+        "synthetic_controller_tests_passed": result.testsRun,
+        "socket_creation_blocked": True,
+        "only_exact_local_hash_child_allowed": True,
+        "local_actual_large_frame_pipe": {
+            "passed": True,
+            "payload_bytes": len(body),
+            "payload_sha256": q.sha(body),
+            "elapsed_seconds": local_seconds,
+            "actual_frozen_sender_pipe_used": True,
+            "ssh": False,
+            "native_linux": False,
+            "file_staging": False,
+        },
+        "producer_receipt_files": 19,
+        "receipt_guards_before_remote_seed_and_paid_allocation": True,
+        "sdk_worst_case_planned_calls": 79,
+        "credential_provider_and_cli_tunnel_requests_not_metered": True,
+        "controller_sdk_call_cap_is_not_total_aws_request_cap": True,
+        "prior_evidence_byte_for_byte_preserved": True,
+        "live_linux_or_ssh_qualification": False,
+        "readiness_credential_export_failed_before_sdk": True,
+        "aws_sdk_calls": 0,
+        "cloud_mutations": 0,
+        "paid_execution_approved": False,
+        "paid_execution_started": False,
+        "gate_5_complete": False,
+        "real_4b_import": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+if __name__ == "__main__":
+    q.need(sys.argv[1:] in ([], ["--write"]))
+    report = verify()
+    if sys.argv[1:]:
+        q.save(OUTPUT, report)
+    print(json.dumps({"status": report["status"], "tests_passed": 15}, sort_keys=True))

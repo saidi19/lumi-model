@@ -1,0 +1,103 @@
+"""Attempt-018 plan and future control-evidence checks; never deploys."""
+
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD = "5732548d49854b278ef5ab18199560fc"
+BUCKET = "lumi-cleanup-" + ATTEMPT
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.1"
+RELEASE_SHA = "c63f773396dbee9e293615d24633d70039712cf1226de75225b7b66ce4d75809"
+PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.1/plan.json"
+PLAN_SHA = "f361d8c0e285ee4c1593d837c780719b5115d6877fb069122010712da13e0f77"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.1/release.json"
+PLAN_RELEASE_SHA = "fa66e5e8bd67f6b902a65624a644c5dcbd66efaba511e23b56c9732939bac308"
+WATCH = "evidence/lumi-vm-attempt-018-inert-watchdog-deployment-verification-v0.1.json"
+STORE = "evidence/lumi-vm-attempt-018-cleanup-bucket-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_binding_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verify():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    need(manifest["attempt"] == ATTEMPT and manifest["operational_predecessor"] == OLD)
+    need(manifest["execution_permitted"] is False and len(manifest["outputs"]) == 156)
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(plan_release["plan_sha256"] == PLAN_SHA)
+    need(plan_release["execution_permitted"] is False)
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(plan["attempt"] == ATTEMPT and plan["release_manifest_sha256"] == RELEASE_SHA)
+    need(plan["execution_permitted"] is False and plan["approval_record"] is None)
+    need(plan["readiness_review"]["no_old_approval_reuse"] is True)
+    need(plan["required_control_proofs"] == [WATCH, STORE])
+    need(plan["predecessor_state"]["execution_marker_consumed"] is True)
+    need(plan["predecessor_state"]["cpu_instance_launched"] is False)
+    need(plan["predecessor_state"]["temporary_network_removed"] is True)
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    """Validate fresh successful control evidence before CPU proposal assembly."""
+    plan = build()
+    values, pins = [], {}
+    for name in (WATCH, STORE):
+        raw = read(name)
+        value = json.loads(raw)
+        need(value["attempt"] == ATTEMPT)
+        bindings = value["source_bindings"]
+        need(bindings[RELEASE + "/release.json"]["sha256"] == RELEASE_SHA)
+        for source, pin in bindings.items():
+            read(source, pin["sha256"], pin["bytes"])
+        pins[name] = sha(raw)
+        values.append(value)
+    watch, store = values
+    need(watch["status"] == "verified_deployed_unarmed_invocation_disabled")
+    deployment = watch["result"]["deployment"]
+    need(deployment["unarmed_verified"] is True)
+    need(deployment["invocation_disabled_verified"] is True)
+    need(deployment["code_sha256"] == plan["watchdog"]["expected_code_sha256_base64"])
+    need(store["status"] == "verified_private_cleanup_bucket_created")
+    need(store["storage"]["bucket"] == BUCKET)
+    need(store["storage"]["prefix"] == plan["cleanup_store"]["prefix"])
+    need(store["result"]["privacy_readback_verified"] is True)
+    return pins
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

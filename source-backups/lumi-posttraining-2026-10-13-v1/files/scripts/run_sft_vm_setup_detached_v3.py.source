@@ -1,0 +1,351 @@
+"""Detach the frozen setup bootstrap from SSH; never create import authority.
+
+Private root API for an independently authenticated, fresh-volume-bound CPU host.
+No provisioning, credential delivery, import or binding creation.
+The successor bootstrap prepares only the bound blank work disk after guard readiness.
+The original boot deadlines and frozen installers/network policy are retained.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import stat
+import sys
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+INPUT = Path("/opt/lumi-bootstrap-input")
+SOURCE = INPUT / "run_sft_vm_setup_detached_v3.py"
+BOOTSTRAP_SHA = "804c5121c7aaab818c9d6f3e70fe7463b8963619617e1117cab5387997fb37b8"
+HELPER_SHA = "ac97b64072ccd1f3db702bbf32bf0ff3de410e566ae1dc708533cb147ea15d4c"
+OUTPUT = Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "detached-setup"
+UNIT = "lumi-fullsize-setup-v1.service"
+SETUP_DEADLINE = 1800
+EXPECTED = {
+    "wheel_and_offline_setup_verified": True,
+    "setup_gate_removed": True,
+    "watchdog_left_running": True,
+    "expiry_left_armed": True,
+    "host_admitted": False,
+    "gate_5_complete": False,
+    "retry_allowed": False,
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_setup_rejected") from None
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            need(key not in result)
+            result[key] = value
+        return result
+
+    value = json.loads(raw, object_pairs_hook=unique)
+    need(type(value) is dict)
+    return value
+
+
+def load_bootstrap():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(Path(__file__) == SOURCE)
+    path = INPUT / "run_sft_vm_network_bootstrap_v4.py"
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and 0 < info.st_size <= 131072)
+        raw = stream.read(131073)
+    need(digest(raw) == BOOTSTRAP_SHA)
+    module = types.ModuleType("_detached_frozen_setup")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    need(module.read(path) == raw)  # Frozen root ownership/mode/stable-read checks.
+    return module
+
+
+def helpers(bootstrap):
+    path = INPUT / "posttraining_import_vm_rehearsal_v3.py"
+    raw = bootstrap.read(path)
+    need(digest(raw) == HELPER_SHA)
+    module = types.ModuleType("_detached_setup_systemd")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def validate_request(request, bootstrap, *, starting):
+    need(
+        type(request) is dict
+        and set(request)
+        == {
+            "schema",
+            "attempt",
+            "machine_id",
+            "boot_id",
+            "volumes",
+            "setup_deadline_boottime",
+            "host_deadline_boottime",
+        }
+    )
+    need(request["schema"] == "lumi.vm-detached-setup-request.v0.1")
+    need(request["attempt"] == ATTEMPT)
+    need(
+        type(request["machine_id"]) is str and re.fullmatch(r"[0-9a-f]{32}", request["machine_id"])
+    )
+    need(
+        type(request["boot_id"]) is str
+        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request["boot_id"])
+    )
+    volumes = request["volumes"]
+    need(type(volumes) is dict and set(volumes) == {"root_volume", "work_volume"})
+    need(all(type(v) is str and re.fullmatch(r"vol-[0-9a-f]{17}", v) for v in volumes.values()))
+    need(volumes["root_volume"] != volumes["work_volume"])
+    need(
+        type(request["setup_deadline_boottime"]) is int
+        and request["setup_deadline_boottime"] == SETUP_DEADLINE
+    )
+    end = request["host_deadline_boottime"]
+    need(type(end) in {int, float} and math.isfinite(end) and SETUP_DEADLINE < end <= 14400)
+    bootstrap.native_identity(request["machine_id"], request["boot_id"])
+    if starting:
+        need(0 <= bootstrap.boot_time() < 1350)
+    seed = decode(bootstrap.read(OUTPUT.parent / "seed.json", 4096))
+    need(
+        set(seed)
+        == {
+            "schema",
+            "attempt",
+            "machine_id",
+            "boot_id",
+            "observed_boottime",
+            "setup_deadline_boottime",
+            "receipt_parents_created",
+            "host_admitted",
+            "expiry_enforced",
+            "execution_permitted",
+            "retry_allowed",
+        }
+    )
+    need(seed["schema"] == "lumi.vm-setup-seed.v0.1")
+    for key in ("attempt", "machine_id", "boot_id", "setup_deadline_boottime"):
+        need(type(seed[key]) is type(request[key]) and seed[key] == request[key])
+    need(type(seed["observed_boottime"]) in {int, float} and 0 <= seed["observed_boottime"] < 1670)
+    need(seed["observed_boottime"] <= bootstrap.boot_time())
+    need(seed["receipt_parents_created"] is True)
+    need(
+        all(
+            seed[k] is False
+            for k in ("host_admitted", "expiry_enforced", "execution_permitted", "retry_allowed")
+        )
+    )
+    return request
+
+
+def unit_command(request, source_sha, remaining):
+    need(type(remaining) is int and 0 < remaining <= SETUP_DEADLINE)
+    need(re.fullmatch(r"[0-9a-f]{64}", source_sha))
+    code = (
+        "import hashlib,runpy;from pathlib import Path;"
+        f"p=Path({str(SOURCE)!r});"
+        f"assert hashlib.sha256(p.read_bytes()).hexdigest()=={source_sha!r};"
+        "runpy.run_path(str(p),run_name='__setup__')['_serve_once']()"
+    )
+    props = {
+        "User": "root",
+        "Group": "root",
+        "UMask": "0077",
+        "Restart": "no",
+        "RemainAfterExit": "yes",
+        "RuntimeMaxSec": str(remaining),
+        "TimeoutStopSec": "10",
+        "KillMode": "control-group",
+        "SendSIGKILL": "yes",
+        "FailureAction": "poweroff",
+        "MemoryMax": "1G",
+        "MemorySwapMax": "0",
+        "TasksMax": "64",
+        "LimitCORE": "0",
+        "NoNewPrivileges": "yes",
+        "StandardInput": "null",
+        "StandardOutput": "null",
+        "StandardError": "null",
+    }
+    # This root orchestrator must share PID1's mount/network namespaces. The
+    # existing child installers/workers retain their own frozen isolation.
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + UNIT,
+        ]
+        + [f"--property={k}={v}" for k, v in props.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", "-c", code]
+    )
+
+
+def result(state, *, reaped=False):
+    return {
+        "state": state,
+        "setup_unit_reaped": reaped,
+        "host_admitted": False,
+        "binding_created": False,
+        "gate_5_complete": False,
+        "retry_allowed": False,
+    }
+
+
+def _deploy_and_dispatch_once(request, source):
+    bootstrap = load_bootstrap()
+    validate_request(request, bootstrap, starting=True)
+    need(type(source) is bytes and 0 < len(source) <= 32768)
+    need(not os.path.lexists(SOURCE) and not os.path.lexists(OUTPUT))
+    # The pinned SSH launcher has authenticated source before calling this API.
+    wheel = bootstrap.load("run_sft_vm_cpu_wheel_unit_v1.py")
+    bootstrap.load("prepare_sft_vm_work_disk_v1.py").preflight(
+        wheel.load_storage(), request["volumes"]
+    )
+    helper = helpers(bootstrap)
+    need(bootstrap.show(UNIT, "LoadState") == b"not-found" and helper.cgroup_empty(UNIT))
+    with open("/proc/swaps", "rb") as stream:
+        swaps = stream.read(4097)
+    need(len(swaps) <= 4096 and len(swaps.splitlines()) == 1 and swaps.startswith(b"Filename"))
+    bootstrap.owned(OUTPUT.parent)
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(OUTPUT.parent)
+    try:
+        bootstrap.write(OUTPUT / "request.json", bootstrap.encode(request))
+        bootstrap.write(SOURCE, source)
+        # Reserve the whole bounded dispatch call rather than restarting the
+        # original allowance after a slow systemd exchange.
+        remaining = math.floor(SETUP_DEADLINE - bootstrap.boot_time()) - 15
+        need(remaining >= 330)
+        bootstrap.write(OUTPUT / "dispatch.json", bootstrap.encode(result("dispatch_requested")))
+        bootstrap.command(unit_command(request, digest(source), remaining), seconds=15)
+        return result("dispatch_requested")
+    except BaseException:
+        try:
+            bootstrap.write(
+                OUTPUT / "failed.json",
+                bootstrap.encode({"failed_phase": "dispatch", "retry_allowed": False}),
+            )
+        finally:
+            bootstrap.stop_host()
+        raise ValueError("detached_setup_dispatch_failed") from None
+
+
+def _serve_once():
+    bootstrap = load_bootstrap()
+    request = validate_request(
+        decode(bootstrap.read(OUTPUT / "request.json", 4096)), bootstrap, starting=True
+    )
+    with open("/proc/self/cgroup", "rb") as stream:
+        need(stream.read(1025) == f"0::/system.slice/{UNIT}\n".encode())
+    (OUTPUT / "serve-started").mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(OUTPUT)
+    phase = "bootstrap"
+    try:
+        value = bootstrap._bootstrap_admitted_once(
+            request["machine_id"],
+            request["boot_id"],
+            request["volumes"],
+            original_deadline_boot_seconds=request["host_deadline_boottime"],
+        )
+        phase = "receipt"
+        need(bootstrap.encode(value) == bootstrap.encode(EXPECTED))
+        need(
+            bootstrap.encode(decode(bootstrap.read(bootstrap.OUTPUT / "result.json", 4096)))
+            == bootstrap.encode(value)
+        )
+        need(bootstrap.boot_time() < SETUP_DEADLINE)
+        bootstrap.write(OUTPUT / "result.json", bootstrap.encode(result("setup_returned")))
+    except BaseException:
+        try:
+            bootstrap.write(
+                OUTPUT / "failed.json",
+                bootstrap.encode({"failed_phase": phase, "retry_allowed": False}),
+            )
+        finally:
+            bootstrap.stop_host()
+        raise ValueError("detached_setup_failed") from None
+
+
+def _status(request):
+    bootstrap = load_bootstrap()
+    validate_request(request, bootstrap, starting=False)
+    need(
+        bootstrap.encode(decode(bootstrap.read(OUTPUT / "request.json", 4096)))
+        == bootstrap.encode(request)
+    )
+    if (OUTPUT / "failed.json").exists():
+        return result("failed")
+    helper = helpers(bootstrap)
+    observed = helper.observe(UNIT)
+    if (OUTPUT / "reaped.json").exists():
+        need(observed["ActiveState"] == "inactive" and observed["SubState"] == "dead")
+        need(helper.cgroup_empty(UNIT))
+        need(
+            bootstrap.encode(decode(bootstrap.read(OUTPUT / "reaped.json", 4096)))
+            == bootstrap.encode(result("completed", reaped=True))
+        )
+        return result("completed", reaped=True)
+    if (OUTPUT / "result.json").exists():
+        need(
+            bootstrap.encode(decode(bootstrap.read(OUTPUT / "result.json", 4096)))
+            == bootstrap.encode(result("setup_returned"))
+        )
+        if observed["ActiveState"] == "active" and observed["SubState"] == "running":
+            return result("running")  # Receipt can precede process exit.
+        helper.validate_terminal("chain", observed)
+        need(helper.cgroup_empty(UNIT))
+        return result("setup_returned")
+    if observed["ActiveState"] in {"activating", "active"}:
+        return result("running")
+    return result("failed_or_interrupted")
+
+
+def _finish_once(request):
+    need(_status(request) == result("setup_returned"))
+    bootstrap = load_bootstrap()
+    helper = helpers(bootstrap)
+    (OUTPUT / "reap-started").mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(OUTPUT)
+    bootstrap.command(["/usr/bin/systemctl", "stop", UNIT], seconds=10)
+    observed = helper.observe(UNIT)
+    need(observed["ActiveState"] == "inactive" and observed["SubState"] == "dead")
+    need(observed["Result"] == "success" and helper.cgroup_empty(UNIT))
+    bootstrap.write(OUTPUT / "reaped.json", bootstrap.encode(result("completed", reaped=True)))
+    return result("completed", reaped=True)
+
+
+def _abort_once(request):
+    bootstrap = load_bootstrap()
+    validate_request(request, bootstrap, starting=False)
+    need(
+        bootstrap.encode(decode(bootstrap.read(OUTPUT / "request.json", 4096)))
+        == bootstrap.encode(request)
+    )
+    (OUTPUT / "abort-started").mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(OUTPUT)
+    bootstrap.stop_host()
+    return result("shutdown_requested")  # Not independent STOP/cleanup evidence.
+
+
+def run(**_arguments):
+    raise ValueError("fullsize_host_admission_not_bound") from None

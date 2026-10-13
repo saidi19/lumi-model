@@ -1,0 +1,273 @@
+"""Offline-only diagnostic patch fragments for the consumed attempt-011 source.
+
+Not a deployment/recovery release: no hash closure, entry, approval or cloud call.
+The immutable predecessor remains the source of all operational policy.
+"""
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-dedicated-cleanup-source-v0.1"
+OUTPUT = ROOT / "artifacts/lumi-vm-network-diagnostics-source-v0.1"
+PINS = {
+    "sft_vm_safe_failure_v1.py": "5758485325cbfaf0010296e4ae9b16898f0f1d8096fc8fb8cddcdd600f098ab0",
+    "run_sft_vm_private_network_v1.py": (
+        "7336e7b00380052c686efae317099e5c188605d760e36c87afe511917ee18da2"
+    ),
+    "arm_sft_vm_network_cleanup_v1.py": (
+        "92faf726734a2f2fd1fbfc476a8812fbd4649fdb8cd55eb2641e696d0eff5b2f"
+    ),
+}
+STAGES = (
+    "network_admission",
+    "network_setup",
+    "network_workload",
+    "network_cleanup",
+    "expiry_arm",
+    "expiry_verify",
+    "expiry_control",
+)
+
+
+def replace(text, old, new):
+    if text.count(old) != 1:
+        raise ValueError("diagnostic_patch_anchor_rejected")
+    return text.replace(old, new)
+
+
+def build():
+    original = {}
+    for name, pin in PINS.items():
+        path = BASE / "scripts" / name
+        if any(p.is_symlink() for p in (path, *path.parents)):
+            raise ValueError("diagnostic_source_symlink")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != pin:
+            raise ValueError("diagnostic_source_drift")
+        original[name] = raw.decode()
+    f = original["sft_vm_safe_failure_v1.py"]
+    # Only the STAGES declaration: the same literal also exists in KINDS.
+    f = replace(
+        f,
+        "STAGES = frozenset(\n    {\n",
+        "STAGES = frozenset(\n    {\n" + "".join(f'        "{stage}",\n' for stage in STAGES),
+    )
+    operations = set()
+    for name in ("run_sft_vm_private_network_v1.py", "arm_sft_vm_network_cleanup_v1.py"):
+        tree = ast.parse(original[name])
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id in {"READS", "WRITES", "OPS"} for t in node.targets
+            ):
+                value = ast.literal_eval(node.value)
+                if isinstance(value, dict):
+                    for rows in value.values():
+                        operations.update(rows)
+                else:
+                    operations.update(value)
+    f = replace(
+        f,
+        'CHECKS = frozenset({"none", "closed", "deadline", "clock_drift"})',
+        "CHECKS = frozenset("
+        + repr(sorted(operations | {"none", "closed", "deadline", "clock_drift"}))
+        + ")",
+    )
+
+    n = original["run_sft_vm_private_network_v1.py"]
+    n = replace(n, "import hashlib\n", "import hashlib\nimport sft_vm_safe_failure_v1 as failure\n")
+    n = replace(
+        n,
+        '            raise RuntimeError("network_cloud_call_failed") from None',
+        '            raise failure.Failure("network_cloud_call_failed",\n'
+        '                failure.describe(error, "network_setup", operation)) from None',
+    )
+    n = replace(
+        n,
+        "        self.report = dict(\n",
+        '        self.diagnostic_stage = "network_setup"\n        self.report = dict(\n',
+    )
+    n = replace(
+        n,
+        "    def call(self, operation, **fields):\n",
+        "    def call(self, operation, **fields):\n"
+        "        try:\n            return self._call(operation, **fields)\n"
+        "        except LookupError:\n            raise\n"
+        "        except BaseException as error:\n"
+        '            stage = "network_cleanup" if self.cleaning else self.diagnostic_stage\n'
+        '            raise failure.Failure("network_call_failed",\n'
+        "                failure.describe(error, stage, operation)) from None\n\n"
+        "    def _call(self, operation, **fields):\n",
+    )
+    for method, stage in (("arm", "expiry_arm"), ("verify", "expiry_verify")):
+        line = (
+            f"        expiry.{method}(attempt=selection.ATTEMPT, "
+            "nonce=self.nonce, deadline=self.end)"
+        )
+        n = replace(n, line, f'        self.diagnostic_stage = "{stage}"\n' + line)
+    n = replace(
+        n,
+        '        self.created(\n            "address",',
+        '        self.diagnostic_stage = "network_setup"\n'
+        '        self.created(\n            "address",',
+    )
+    n = replace(
+        n,
+        "            except BaseException:\n                errors.append(label)\n",
+        "            except BaseException as error:\n"
+        "                errors.append(label)\n"
+        '                self.report.setdefault("cleanup_failure_diagnostic",\n'
+        '                    failure.describe(error, "network_cleanup"))\n',
+    )
+    n = replace(
+        n,
+        "                except Exception:\n"
+        "                    pass  # Observe a potentially successful delete; "
+        "never send it again.\n",
+        "                except Exception as error:\n"
+        '                    self.report.setdefault("cleanup_dispatch_diagnostics", {})[\n'
+        '                        "delete-nat-gateway"] = failure.describe('
+        'error, "network_cleanup")\n',
+    )
+    n = replace(
+        n,
+        "            except Exception:\n                pass\n",
+        "            except Exception as error:\n"
+        '                self.report.setdefault("cleanup_dispatch_diagnostics", {})[\n'
+        '                    "release-address"] = failure.describe(error, "network_cleanup")\n',
+    )
+    n = replace(
+        n,
+        "    success = False\n",
+        "    success = False\n    primary = cleanup_failure = None\n"
+        '    transaction.diagnostic_stage = "network_admission"\n',
+    )
+    n = replace(
+        n,
+        "        transaction.create(expiry)\n",
+        '        transaction.diagnostic_stage = "network_setup"\n'
+        "        transaction.create(expiry)\n",
+    )
+    n = replace(
+        n,
+        "        workload(dict(transaction.ids), deadline=transaction.end - 1800)\n",
+        '        transaction.diagnostic_stage = "network_workload"\n'
+        "        workload(dict(transaction.ids), deadline=transaction.end - 1800)\n",
+    )
+    n = replace(
+        n,
+        "    except BaseException:\n        pass\n    finally:\n"
+        "        transaction.cleanup()\n"
+        '        transaction.save("result", dict(transaction.report, '
+        "api_calls=transaction.calls))\n",
+        "    except BaseException as error:\n"
+        "        primary = failure.describe(error, transaction.diagnostic_stage)\n"
+        '        transaction.report["primary_failure_diagnostic"] = primary\n'
+        "    finally:\n"
+        "        try:\n            transaction.cleanup()\n"
+        '            cleanup_failure = transaction.report.get("cleanup_failure_diagnostic")\n'
+        "        except BaseException as error:\n"
+        '            cleanup_failure = failure.describe(error, "network_cleanup")\n'
+        '            transaction.report["cleanup_unresolved"] = True\n'
+        '            transaction.report["cleanup_failure_diagnostic"] = cleanup_failure\n'
+        "        try:\n"
+        '            transaction.save("result", dict(transaction.report, '
+        "api_calls=transaction.calls))\n"
+        "        except BaseException as error:\n"
+        '            cleanup_failure = failure.describe(error, "network_cleanup")\n'
+        "        if primary is not None or cleanup_failure is not None:\n"
+        '            raise failure.Failure("network_transaction_failed",\n'
+        "                primary if primary is not None else cleanup_failure) from None\n",
+    )
+
+    a = original["arm_sft_vm_network_cleanup_v1.py"]
+    a = replace(a, "import base64\n", "import base64\nimport sft_vm_safe_failure_v1 as failure\n")
+    a = replace(
+        a,
+        '            raise RuntimeError("network_expiry_cloud_failed") from None',
+        '            raise failure.Failure("network_expiry_cloud_failed",\n'
+        '                failure.describe(error, "expiry_control", operation)) from None',
+    )
+    a = replace(
+        a,
+        "        self.bound = self.original = None\n",
+        '        self.bound = self.original = None\n        self.last_operation = "none"\n',
+    )
+    a = replace(
+        a,
+        "    def call(self, service, operation, **fields):\n",
+        "    def call(self, service, operation, **fields):\n"
+        "        self.last_operation = operation if operation in "
+        'OPS.get(service, set()) else "none"\n'
+        "        try:\n            return self._call(service, operation, **fields)\n"
+        "        except LookupError:\n            raise\n"
+        "        except BaseException as error:\n"
+        '            raise failure.Failure("network_expiry_call_failed",\n'
+        '                failure.describe(error, "expiry_control", '
+        "self.last_operation)) from None\n\n"
+        "    def _call(self, service, operation, **fields):\n",
+    )
+    a = replace(
+        a,
+        "    def verify(self, *, attempt, nonce, deadline):\n",
+        "    def verify(self, *, attempt, nonce, deadline):\n"
+        '        self.last_operation = "none"\n'
+        "        try:\n            return self._verify("
+        "attempt=attempt, nonce=nonce, deadline=deadline)\n"
+        "        except BaseException as error:\n"
+        '            raise failure.Failure("network_expiry_verify_failed",\n'
+        '                failure.describe(error, "expiry_verify", '
+        "self.last_operation)) from None\n\n"
+        "    def _verify(self, *, attempt, nonce, deadline):\n",
+    )
+    a = replace(
+        a,
+        "        except BaseException:\n            self.save(\n",
+        "        except BaseException as error:\n"
+        '            diagnostic = failure.describe(error, "expiry_arm", self.last_operation)\n'
+        "            self.save(\n",
+    )
+    a = replace(
+        a,
+        '                    stage="arming_failed",\n',
+        '                    stage="arming_failed",\n'
+        "                    primary_failure_diagnostic=diagnostic,\n",
+    )
+    a = replace(
+        a,
+        '            raise RuntimeError("network_expiry_arming_failed") from None',
+        '            raise failure.Failure("network_expiry_arming_failed", diagnostic) from None',
+    )
+    files = dict(zip(PINS, (f, n, a), strict=True))
+    for text in files.values():
+        ast.parse(text)
+    return {name: text.encode() for name, text in files.items()}
+
+
+def prepare():
+    files = build()
+    if OUTPUT.exists() or any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)):
+        raise ValueError("diagnostic_output_not_fresh")
+    OUTPUT.mkdir(mode=0o700)
+    manifest = dict(
+        schema="lumi.vm-network-diagnostic-fragments.v0.1",
+        status="offline_patch_fragments_not_deployable",
+        base_source_sha256=PINS,
+        outputs={
+            name: dict(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+            for name, raw in files.items()
+        },
+        execution_permitted=False,
+        retry_authorized=False,
+        gate_5_complete=False,
+        limitation="No release hash closure, fresh identity, outer binding or live authority.",
+    )
+    files["manifest.json"] = (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+    for name, raw in files.items():
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+    return manifest

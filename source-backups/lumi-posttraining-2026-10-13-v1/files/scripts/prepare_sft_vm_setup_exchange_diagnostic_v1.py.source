@@ -1,0 +1,217 @@
+"""Prepare a diagnostic-only sender successor; no remote execution authority."""
+
+import ast
+import hashlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-022-source-v0.2/scripts/send_sft_vm_setup_inputs_v5.py"
+BASE_SHA = "5abb354bfadc607e7e4cb372589d58650c5ee0b4ad12fa3504fbfa5f23fd5e40"
+OUTPUT = ROOT / "scripts/send_sft_vm_setup_inputs_v6.py"
+
+SUPPORT = """
+EXCHANGE_PHASES = {
+    "validate", "spawn", "select", "write", "read", "body_complete", "exit",
+}
+REMOTE_PHASES = {
+    "platform", "boot", "deadline", "source_read", "source_hash",
+    "archive_read", "archive_hash", "receiver", "reply",
+}
+
+
+class SetupExchangeFailure(ValueError):
+    def __init__(self, diagnostic):
+        super().__init__("setup_ssh_exchange_failed")
+        self.diagnostic = diagnostic
+
+
+def exchange_diagnostic(error, phase, offset, reply, process):
+    kind = "other"
+    if isinstance(error, BrokenPipeError):
+        kind = "broken_pipe"
+    elif isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+        kind = "timeout"
+    elif isinstance(error, ValueError):
+        kind = "validation"
+    elif isinstance(error, OSError):
+        kind = "io"
+    native = None
+    try:
+        value = json.loads(reply)
+        if (type(value) is dict
+                and set(value) == {"status", "execution_permitted", "failure_code"}
+                and value["status"] == "setup_delivery_failed"
+                and value["execution_permitted"] is False
+                and type(value["failure_code"]) is str
+                and value["failure_code"] in REMOTE_PHASES):
+            native = value["failure_code"]
+    except Exception:
+        pass
+    code = process.poll()
+    return {
+        "schema": "lumi.setup-exchange-diagnostic.v0.1",
+        "phase": phase if phase in EXCHANGE_PHASES else "validate",
+        "kind": kind,
+        "stdin_bytes_written": offset if type(offset) is int and 0 <= offset <= MAX_BODY else 0,
+        "stdout_bytes_seen": len(reply),
+        "exit_code": code if type(code) is int and -64 <= code <= 255 else None,
+        "remote_failure_code": native,
+    }
+
+"""
+
+
+def replace_once(raw, before, after):
+    if raw.count(before) != 1:
+        raise ValueError("diagnostic_candidate_anchor_rejected") from None
+    return raw.replace(before, after)
+
+
+def build():
+    raw = BASE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("diagnostic_base_hash_rejected") from None
+    text = raw.decode()
+    text = replace_once(text, "import math\n", "import json\nimport math\n")
+    text = replace_once(text, "def native_launcher(", SUPPORT + "\ndef native_launcher(")
+    for before, after in (
+        (
+            " signal.alarm({REMOTE_SECONDS})",
+            ' diagnostic_stage = "platform"\n signal.alarm({REMOTE_SECONDS})',
+        ),
+        (
+            ' with open("/proc/sys/kernel/random/boot_id","rb") as f:',
+            ' diagnostic_stage = "boot"\n with open("/proc/sys/kernel/random/boot_id","rb") as f:',
+        ),
+        (
+            " remaining = {boot_deadline!r}",
+            ' diagnostic_stage = "deadline"\n remaining = {boot_deadline!r}',
+        ),
+        (
+            " source = sys.stdin.buffer.read({RECEIVER_BYTES})",
+            ' diagnostic_stage = "source_read"\n source = sys.stdin.buffer.read({RECEIVER_BYTES})',
+        ),
+        (
+            " assert hashlib.sha256(source).hexdigest()",
+            ' diagnostic_stage = "source_hash"\n assert hashlib.sha256(source).hexdigest()',
+        ),
+        (
+            " archive = sys.stdin.buffer.read({ARCHIVE_BYTES})",
+            ' diagnostic_stage = "archive_read"\n archive = sys.stdin.buffer.read({ARCHIVE_BYTES})',
+        ),
+        (
+            " assert hashlib.sha256(archive).hexdigest()",
+            ' diagnostic_stage = "archive_hash"\n assert hashlib.sha256(archive).hexdigest()',
+        ),
+        (
+            " module = types.ModuleType",
+            ' diagnostic_stage = "receiver"\n module = types.ModuleType',
+        ),
+        (" reply = json.dumps(result", ' diagnostic_stage = "reply"\n reply = json.dumps(result'),
+    ):
+        text = replace_once(text, before, after)
+    text = replace_once(
+        text,
+        next(
+            line
+            for line in text.splitlines()
+            if "sys.stdout.write" in line and "setup_delivery_failed" in line
+        ),
+        ' sys.stdout.write(json.dumps(dict(status="setup_delivery_failed",'
+        'execution_permitted=False,failure_code=diagnostic_stage))+"\\\\n")',
+    )
+    text = replace_once(
+        text,
+        "    process = subprocess.Popen(\n",
+        '    phase = "spawn"\n    process = subprocess.Popen(\n',
+    )
+    text = replace_once(
+        text,
+        "                events = selector.select(remaining)",
+        '                phase = "select"\n                events = selector.select(remaining)',
+    )
+    text = replace_once(
+        text,
+        "                            size = os.write(",
+        '                            phase = "write"\n                            size = os.write(',
+    )
+    text = replace_once(
+        text,
+        "                            chunk = os.read(",
+        '                            phase = "read"\n                            chunk = os.read(',
+    )
+    text = replace_once(
+        text,
+        "            need(offset == len(body))",
+        '            phase = "body_complete"\n            need(offset == len(body))',
+    )
+    text = replace_once(
+        text,
+        "            need(process.wait(",
+        '            phase = "exit"\n            need(process.wait(',
+    )
+    text = replace_once(
+        text,
+        '    except BaseException:\n'
+        '        raise ValueError("setup_ssh_exchange_failed") from None',
+        "    except BaseException as error:\n"
+        "        raise SetupExchangeFailure(exchange_diagnostic(\n"
+        "            error, phase, offset, bytes(reply), process)) from None",
+    )
+    text = replace_once(
+        text,
+        "    except BaseException:\n        # No second connection",
+        "    except BaseException as error:\n        # No second connection",
+    )
+    text = replace_once(
+        text,
+        '        report["failure_stage"] = phase',
+        '        report["failure_stage"] = phase\n'
+        "        if type(error) is SetupExchangeFailure:\n"
+        '            report["exchange_diagnostic"] = error.diagnostic',
+    )
+    compile(text, str(OUTPUT), "exec")
+    return text.encode()
+
+
+def test_namespace():
+    names = {
+        "need",
+        "SetupExchangeFailure",
+        "exchange_diagnostic",
+        "pipe_exchange",
+        "native_launcher",
+    }
+    raw = build()
+    tree = ast.parse(raw)
+    nodes = [node for node in tree.body if getattr(node, "name", None) in names]
+    values = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
+            try:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError):
+                pass
+    import json
+    import os
+    import selectors
+    import signal
+    import subprocess
+    import time
+
+    namespace = dict(
+        values,
+        json=json,
+        os=os,
+        selectors=selectors,
+        signal=signal,
+        subprocess=subprocess,
+        time=time,
+        math=__import__("math"),
+        re=__import__("re"),
+    )
+    namespace["MAX_BODY"] = values["RECEIVER_BYTES"] + values["ARCHIVE_BYTES"]
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), "<synthetic-exchange>", "exec"), namespace
+    )
+    return namespace

@@ -1,0 +1,92 @@
+"""Selector-corrected attempt-018 plan and control-evidence bindings."""
+
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v12 as qualified
+
+ROOT = Path(__file__).resolve().parents[1]
+QUALIFIED_SHA = "d87e4df415d39779433853ec8821df75b904f5ab927df741fe0abf7ed8f1408b"
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD = qualified.OLD
+BUCKET = qualified.BUCKET
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.2"
+RELEASE_SHA = "7ec91d363c3ab1422bb35c35757e8ae04fa166d5943c3bdc18aa2952d8b64602"
+PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.2/plan.json"
+PLAN_SHA = "e86366507eab51d23b76c19e04219a5d4a4e6aab87cedb9f6c1ffc92ba0f55b5"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.2/release.json"
+PLAN_RELEASE_SHA = "9b180978ffdd163fbd45481d034a68de5fc3f641fe9a9d215618e3d62fe0703f"
+WATCH = "evidence/lumi-vm-attempt-018-inert-watchdog-reverification-v0.2.json"
+STORE = "evidence/lumi-vm-attempt-018-cleanup-bucket-reverification-v0.2.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_binding_v13_rejected") from None
+
+
+def bind():
+    need(hashlib.sha256(Path(qualified.__file__).read_bytes()).hexdigest() == QUALIFIED_SHA)
+    for key, value in {
+        "ROOT": ROOT,
+        "ATTEMPT": ATTEMPT,
+        "OLD": OLD,
+        "BUCKET": BUCKET,
+        "RELEASE": RELEASE,
+        "RELEASE_SHA": RELEASE_SHA,
+        "PLAN": PLAN,
+        "PLAN_SHA": PLAN_SHA,
+        "PLAN_RELEASE": PLAN_RELEASE,
+        "PLAN_RELEASE_SHA": PLAN_RELEASE_SHA,
+        "WATCH": WATCH,
+        "STORE": STORE,
+        "verify": _verify,
+    }.items():
+        setattr(qualified, key, value)
+    return qualified
+
+
+def sha(raw):
+    return bind().sha(raw)
+
+
+def encode(value):
+    return bind().encode(value)
+
+
+def read(name, digest=None, size=None):
+    return bind().read(name, digest, size)
+
+
+def _verify():
+    manifest = json.loads(qualified.read(RELEASE + "/release.json", RELEASE_SHA))
+    need(manifest["attempt"] == ATTEMPT)
+    need(
+        manifest["base_release_sha256"]
+        == "c63f773396dbee9e293615d24633d70039712cf1226de75225b7b66ce4d75809"
+    )
+    need(manifest["execution_permitted"] is False and len(manifest["outputs"]) == 156)
+    for name, pin in manifest["outputs"].items():
+        qualified.read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    plan_release = json.loads(qualified.read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(plan_release["plan_sha256"] == PLAN_SHA)
+    need(plan_release["execution_permitted"] is False)
+    return manifest
+
+
+def verify():
+    bind()
+    return _verify()
+
+
+def build():
+    return bind().build()
+
+
+def controls():
+    return bind().controls()
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

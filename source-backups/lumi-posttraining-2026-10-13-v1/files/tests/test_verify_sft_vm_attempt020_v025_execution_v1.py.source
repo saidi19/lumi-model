@@ -1,0 +1,32 @@
+"""Reproduce the receipt mismatch and check read-only verification limits."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt020_v025_execution_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_receipt_mismatch_is_specific_and_does_not_claim_remote_cause(self):
+        diagnostic = m.local()
+        self.assertEqual(diagnostic["sender_expected_files"], 18)
+        self.assertEqual(diagnostic["receiver_produced_files"], 19)
+        self.assertEqual(diagnostic["differing_receipt_fields"], ["files"])
+        self.assertTrue(diagnostic["otherwise_equal_receipt_contract"])
+        self.assertFalse(diagnostic["exact_remote_failure_cause_proven"])
+
+    def test_verifier_rejects_mutations_or_more_than_twelve_reads_before_transport(self):
+        checker = m.live_checker()
+        cloud = checker["Cloud"]()
+        with patch.object(m.subprocess, "run") as transport:
+            for name in ("terminate-instances", "stop-instances", "get-object"):
+                with self.assertRaises(ValueError):
+                    cloud.call(name)
+            cloud.calls = 12
+            with self.assertRaises(ValueError):
+                cloud.call("identity")
+            transport.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,63 @@
+"""Offline verification for the corrected attempt-018 network target."""
+
+import hashlib
+import importlib
+import json
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt018_v2 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = json.loads((m.OUTPUT / "release.json").read_bytes())
+
+    def test_all_156_hashes_and_exact_rebuild(self):
+        files, report = m.build()
+        self.assertEqual(report, self.manifest)
+        self.assertEqual(len(files), 156)
+        for name, pin in report["outputs"].items():
+            raw = (m.OUTPUT / name).read_bytes()
+            self.assertEqual(raw, files[name])
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), pin["sha256"])
+
+    def test_target_matches_selector_diagnostic(self):
+        path = m.OUTPUT / "configs/lumi-vm-private-network-plan-v0.1.json"
+        plan = json.loads(path.read_bytes())
+        self.assertEqual(plan["targets"]["new_private_subnet_cidr"], m.NEW_CIDR)
+        self.assertTrue(self.manifest["selected_cidr_live_absence_verified"])
+
+    def test_deployed_watchdog_code_inputs_are_byte_identical(self):
+        for name in m.CONTROL_CODE:
+            self.assertEqual((m.OUTPUT / name).read_bytes(), (m.BASE / name).read_bytes())
+        self.assertTrue(self.manifest["watchdog_control_code_byte_identical"])
+
+    def test_full_graph_authenticates(self):
+        sys.path.insert(0, str(m.OUTPUT / "scripts"))
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        outer.authenticate()
+        outer.loading.fresh_identity()
+
+    def test_no_execution_authority_or_overwrite(self):
+        self.assertFalse(self.manifest["execution_permitted"])
+        self.assertFalse(self.manifest["gate_5_complete"])
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "OUTPUT", m.OUTPUT), self.assertRaises(ValueError):
+            m.prepare()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

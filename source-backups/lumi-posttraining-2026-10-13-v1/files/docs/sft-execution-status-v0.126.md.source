@@ -1,0 +1,59 @@
+# SFT execution status v0.126: one-shot native coordinator failure preserved
+
+2026-09-27. AWS login succeeded. The approved generated-only CPU rehearsal
+ran once on a fresh t3.large. Preparation succeeded; import exited 1.
+No retry occurred. Gate 5 is still incomplete. No real checkpoint, S3 model
+data, GPU, inference or training was used. Production eligibility is false.
+
+## Observed result
+
+- Exact source archive v0.2 and all 34 CPU wheels staged successfully.
+  The authenticated Ubuntu host ran Python 3.12.3 and systemd 255.
+- Before staging, the expiry timer, worker identity, cgroup controllers,
+  encrypted 20-GiB volume, pinned SSH host key and setup firewall were checked.
+  Bootstrap v0.2 added a shared non-resetting 1-GiB HTTPS inbound quota and
+  rejected HTTP and IPv6 HTTP(S); its three synthetic tests and Ruff passed.
+  This tightened setup controls without changing the approved source bundle.
+- Independent observation saw preparation exit 0, Result=success; import
+  exit 1, Result=exit-code. Sampled memory maxima were 284,258,304 and
+  19,898,368 bytes respectively; samples are not exhaustive peak telemetry.
+- Supervisor retained `case_failed`, retry_allowed=false. Both exact cgroups
+  were absent afterward. Stage mount was absent and its directory empty;
+  no cleanup-failure record existed. All 49 original staged source hashes
+  still matched after failure.
+- Setup quota accounted 289,970,136 inbound bytes, with zero quota drops.
+  This is the rule's packet accounting, not an exhaustive network invoice.
+
+## Diagnostic limitation — do not guess the cause
+
+The parent worker discards child stderr, and the entry/launcher reduce all
+exceptions to generic errors. The bounded journal therefore does not reveal
+the failing internal stage. Preparation passing is not proof that the import
+mount view, cold loader or runtime admission passed. No OOM was reported by
+the unit outcome, but the exact root cause is not established.
+
+Next work should expose only fixed allowlisted stage/error codes, with local
+synthetic regressions, before asking for a separately authorized fresh native
+attempt. Do not change a security gate based on speculation, reuse the
+consumed attempt, or claim the new entry has native qualification.
+
+## Resource closure
+
+Instance `i-0f81eea2dce2912f2` was confirmed terminated; its volume
+`vol-0a8a30b35f6dab237` was confirmed absent. Endpoint
+`eice-0a3c72d5b8fd419f2` reached delete-complete. Both newly created security
+groups and the temporary AWS SSH-key registration returned successful deletion.
+Existing instances were not changed. Generated VM payloads were ephemeral
+and are not recoverable; the bounded aggregate failure evidence remains local.
+No exact invoice cost is claimed.
+
+Private records: `artifacts/lumi-vm-coordinator-native-attempt-v0.1/`
+contains authorization, resource IDs, operator result, observer and cleanup
+records. Prior evidence and frozen source bundle were preserved unchanged.
+No commit or push was performed.
+
+Remaining roadmap: qualify the generated native coordinator; complete
+separate full-size host-bound admission and actual preserved-S3 4B CPU import
+with independent package verification; then Gate 6 GPU smoke/save/resume and
+SFT, Gate 7 evaluation, and Gate 8 serving. This failed tiny check does not
+authorize any of those later actions.

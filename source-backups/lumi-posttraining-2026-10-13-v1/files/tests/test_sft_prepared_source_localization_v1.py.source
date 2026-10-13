@@ -1,0 +1,208 @@
+"""Local fault injection only; the consumed native attempt is never rerun.
+
+Use the frozen harness's existing synthetic doubles. No archive, Docker, prctl,
+fork, model, dataset or network operation is permitted. These tests demonstrate
+which distinct failures have an identical retained report, not which one happened
+on the old Linux host. Frozen production sources and evidence stay unchanged.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import importlib.util
+import json
+import os
+import socket
+import subprocess
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+FIXTURE = ROOT / "tests/test_sft_checkpoint_prepared_qualification_v2.py"
+FIXTURE_PACKAGE = "_prepared_native_harness_pipeline_contract_v1"
+
+
+def load_fixture():
+    """Import the synthetic doubles without replacing another test's namespace."""
+    previous = {name: value for name, value in sys.modules.items()
+                if name == FIXTURE_PACKAGE or name.startswith(FIXTURE_PACKAGE + ".")}
+    try:
+        for name in previous:
+            sys.modules.pop(name)
+        spec = importlib.util.spec_from_file_location("_prepared_localization_fixture_v1", FIXTURE)
+        selected = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(selected)
+        return selected
+    finally:
+        for name in list(sys.modules):
+            if name == FIXTURE_PACKAGE or name.startswith(FIXTURE_PACKAGE + "."):
+                sys.modules.pop(name)
+        sys.modules.update(previous)
+
+
+fixture = load_fixture()
+m = fixture.m
+HISTORICAL_HARNESS_STDOUT_SHA256 = (
+    "6f5ddb353dc09cfc913e1de73f5d2d4aeb2eaec4cf1d110215e1c7c1705628dd"
+)
+
+
+class CoarseFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.synthetic = fixture.HarnessTests(
+            "test_success_single_pipeline_two_roots_all_cleanup_and_no_private_text")
+        # setUp installs the existing synthetic boundaries; no test method runs.
+        self.addCleanup(self.synthetic.doCleanups)
+        self.synthetic.setUp()
+        self.enterContext(patch.object(subprocess, "Popen", side_effect=AssertionError(
+            "native_process_forbidden")))
+        self.enterContext(patch.object(ctypes, "CDLL", side_effect=AssertionError(
+            "native_library_forbidden")))
+        self.copy = self.enterContext(patch.object(m, "copy_image", side_effect=AssertionError(
+            "image_boundary_reached")))
+
+    def report(self):
+        with patch.object(m.sys, "argv", ["entry", "--synthetic-only", "/never-read"]), \
+                patch.object(m.os, "write", side_effect=lambda _fd, raw: len(raw)) as write:
+            self.assertEqual(m.main(), 2)
+        write.assert_called_once()
+        raw = write.call_args.args[1]
+        self.assertNotIn(b"injected-private-detail", raw)
+        self.assertNotIn(b"/never-read", raw)
+        self.assertLessEqual(len(raw), m.MAXIMUM_REPORT_BYTES)
+        return json.loads(raw)
+
+    def assert_coarse_failure(self):
+        value = self.report()
+        self.assertEqual(value, {
+            "schema": m.SCHEMA, "status": "failed", "stage": "source_admission",
+            "code": "fixture_failed", **dict.fromkeys(m.NONCLAIMS, False),
+        })
+        self.copy.assert_not_called()
+        self.synthetic.command.assert_not_called()
+        self.synthetic.pipeline.run_prepared_pipeline.assert_not_called()
+        return value
+
+    def test_source_loader_oserror_is_coarse(self):
+        self.synthetic.loader.side_effect = OSError("injected-private-detail")
+        self.assert_coarse_failure()
+
+    def test_base_loader_oserror_is_coarse(self):
+        self.synthetic.helper.load_base.side_effect = OSError("injected-private-detail")
+        self.assert_coarse_failure()
+
+    def test_subreaper_error_is_coarse(self):
+        self.synthetic.base.subreaper.side_effect = RuntimeError("injected-private-detail")
+        self.assert_coarse_failure()
+
+    def test_admission_loader_oserror_is_coarse(self):
+        self.synthetic.helper.load_admission.side_effect = OSError("injected-private-detail")
+        self.assert_coarse_failure()
+
+    def test_missing_rootfs_attribute_is_coarse(self):
+        self.synthetic.pipeline.addon = types.SimpleNamespace()
+        self.assert_coarse_failure()
+
+    def test_parent_creation_oserror_is_coarse(self):
+        with patch.object(m.tempfile, "mkdtemp", side_effect=OSError("injected-private-detail")):
+            self.assert_coarse_failure()
+
+    def test_config_creation_oserror_is_coarse(self):
+        original = Path.mkdir
+
+        def mkdir(path, *args, **kwargs):
+            if path == self.synthetic.parent / "docker-config":
+                raise OSError("injected-private-detail")
+            return original(path, *args, **kwargs)
+
+        with patch.object(Path, "mkdir", mkdir):
+            self.assert_coarse_failure()
+        self.assertFalse(self.synthetic.parent.exists())
+
+    def test_disk_query_oserror_is_coarse(self):
+        with patch.object(m.os, "statvfs", side_effect=OSError("injected-private-detail")):
+            self.assert_coarse_failure()
+        self.assertFalse(self.synthetic.parent.exists())
+
+    def test_disk_one_byte_below_unchanged_floor_matches_retained_failure(self):
+        with patch.object(m.os, "statvfs", return_value=types.SimpleNamespace(
+                f_bavail=m.MINIMUM_FREE_DISK_BYTES - 1, f_frsize=1)):
+            raw = m.canonical(self.assert_coarse_failure())
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), HISTORICAL_HARNESS_STDOUT_SHA256)
+        self.assertEqual(m.MINIMUM_FREE_DISK_BYTES, 16 * 1024**3)
+        self.assertFalse(self.synthetic.parent.exists())
+
+    def test_disk_exact_floor_reaches_only_mocked_image_boundary(self):
+        with patch.object(m.os, "statvfs", return_value=types.SimpleNamespace(
+                f_bavail=m.MINIMUM_FREE_DISK_BYTES, f_frsize=1)):
+            value = self.report()
+        self.assertEqual(value["stage"], "copy_image")
+        self.copy.assert_called_once()
+        self.synthetic.command.assert_not_called()
+        self.assertFalse(self.synthetic.parent.exists())
+
+    def test_explicit_source_rejection_keeps_distinct_code(self):
+        self.synthetic.loader.side_effect = m.FixtureError("source_rejected")
+        value = self.report()
+        self.assertEqual((value["stage"], value["code"]),
+                         ("source_admission", "source_rejected"))
+        self.copy.assert_not_called()
+
+
+class InertSourceTests(unittest.TestCase):
+    def test_actual_helpers_load_without_native_or_model_execution(self):
+        before_modules, before_finders = dict(sys.modules), list(sys.meta_path)
+        try:
+            with patch.object(ctypes, "CDLL", side_effect=AssertionError(
+                    "native_library_forbidden")), \
+                    patch.object(subprocess, "Popen", side_effect=AssertionError(
+                        "native_process_forbidden")), \
+                    patch.object(os, "fork", side_effect=AssertionError("fork_forbidden")), \
+                    patch.object(socket, "socket", side_effect=AssertionError("socket_forbidden")):
+                helper, pipeline, workspace, bundles, count = m.load_sources()
+                base = helper.load_base()
+                admission = helper.load_admission()
+                self.assertTrue(callable(base.subreaper))  # Never invoke it on the Mac.
+                self.assertEqual(count, 78)
+                self.assertEqual(set(bundles), {"generator", "importer"})
+                self.assertIs(pipeline.addon.rootfs, pipeline.layout.rootfs)
+                self.assertEqual(workspace.__package__, pipeline.__package__)
+                self.assertEqual(admission.SoftwareBinding().image_id, admission.IMAGE_ID)
+                self.assertFalse({"torch", "numpy", "transformers", "safetensors", "lumi"}
+                                 & {name.split(".")[0]
+                                    for name in set(sys.modules) - set(before_modules)})
+        finally:
+            sys.meta_path[:] = before_finders
+            for name in list(sys.modules):
+                if name.startswith(("_lumi_prepared_qualification_", "_lumi_oci_")):
+                    if name in before_modules:
+                        sys.modules[name] = before_modules[name]
+                    else:
+                        sys.modules.pop(name)
+
+    def test_fixture_import_preserves_existing_package_and_children(self):
+        parent, child = types.ModuleType(FIXTURE_PACKAGE), types.ModuleType("sentinel")
+        names = {FIXTURE_PACKAGE: parent, FIXTURE_PACKAGE + ".sentinel": child}
+        with patch.dict(sys.modules, names):
+            expected = {name: value for name, value in sys.modules.items()
+                        if name == FIXTURE_PACKAGE or name.startswith(FIXTURE_PACKAGE + ".")}
+            load_fixture()
+            observed = {name: value for name, value in sys.modules.items()
+                        if name == FIXTURE_PACKAGE or name.startswith(FIXTURE_PACKAGE + ".")}
+            self.assertEqual(observed, expected)
+
+    def test_helper_import_restores_preexisting_module_objects(self):
+        names = {name: types.ModuleType(name) for name in (
+            "_lumi_oci_guardian_base_v1", "_lumi_oci_admission_v2")}
+        with patch.dict(sys.modules, names):
+            self.test_actual_helpers_load_without_native_or_model_execution()
+            for name, value in names.items():
+                self.assertIs(sys.modules[name], value)
+
+
+if __name__ == "__main__":
+    unittest.main()

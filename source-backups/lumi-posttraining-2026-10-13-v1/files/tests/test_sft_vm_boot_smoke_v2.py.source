@@ -1,0 +1,111 @@
+"""Bounded refresh regression plus inherited synthetic disposable lifecycle."""
+
+import ast
+import importlib
+import types
+import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_boot_smoke_v1.py").read_text()
+old = 'm = importlib.import_module("execute_sft_vm_boot_smoke_v1")'
+assert source.count(old) == 1
+inherited = types.ModuleType("_boot_smoke_v2_tests")
+exec(
+    compile(
+        source.replace(old, 'm = importlib.import_module("execute_sft_vm_boot_smoke_v2")'),
+        "<smoke-v2-inherited>",
+        "exec",
+    ),
+    inherited.__dict__,
+)
+m = inherited.m
+credentials = importlib.import_module("sft_vm_controller_credentials_v2")
+
+
+class LifecycleTests(inherited.SmokeTests):
+    pass
+
+
+class Reader:
+    def __init__(self):
+        self.calls, self.closed = 0, False
+
+    def active(self, **_):
+        assert not self.closed
+
+    def __call__(self):
+        assert not self.closed
+        self.calls += 1
+        seconds = 650 if self.calls == 1 else 900
+        return dict(
+            access_key="SYNTHETIC",
+            secret_key="SYNTHETIC",
+            token="SYNTHETIC",
+            expiry_time=(datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(),
+        )
+
+
+class RefreshTests(unittest.TestCase):
+    def open(self, sdk=None):
+        reader, sdk = Reader(), sdk or Mock()
+        with (
+            patch.object(credentials, "Reader", return_value=reader),
+            patch.object(credentials, "session", return_value=sdk),
+            patch.object(credentials, "ca_path", return_value="/dev/null"),
+        ):
+            clients, returned = m.open_clients()
+        self.assertIs(reader, returned)
+        return clients, reader, sdk
+
+    def test_cached_650_seconds_is_accepted_and_refreshes_before_expiry(self):
+        clients, reader, sdk = self.open()
+        self.assertEqual(set(clients), {"sts", "ec2"})
+        self.assertEqual(
+            [call.args[0] for call in sdk.create_client.call_args_list], ["sts", "ec2"]
+        )
+        self.assertEqual(reader.calls, 1)
+        provider = sdk._credentials
+        provider._expiry_time = datetime.now(UTC) + timedelta(seconds=120)
+        provider.get_frozen_credentials()
+        self.assertEqual(reader.calls, 2)
+        self.assertGreater((provider._expiry_time - datetime.now(UTC)).total_seconds(), 800)
+
+    def test_four_generation_cap_cannot_reset(self):
+        _, reader, sdk = self.open()
+        provider = sdk._credentials
+        for _ in range(3):
+            provider._expiry_time = datetime.now(UTC) + timedelta(seconds=120)
+            provider.get_frozen_credentials()
+        self.assertEqual(reader.calls, 4)
+        with self.assertRaises(ValueError):
+            provider._refresh_using()
+        self.assertEqual(reader.calls, 4)
+
+    def test_client_setup_failure_closes_reader_and_created_client(self):
+        reader, sdk, first = Reader(), Mock(), Mock()
+        sdk.create_client.side_effect = [first, ValueError("SYNTHETIC")]
+        with (
+            patch.object(credentials, "Reader", return_value=reader),
+            patch.object(credentials, "session", return_value=sdk),
+            patch.object(credentials, "ca_path", return_value="/dev/null"),
+            self.assertRaises(ValueError),
+        ):
+            m.open_clients()
+        self.assertTrue(reader.closed)
+        first.close.assert_called_once_with()
+
+    def test_resource_lifecycle_is_ast_identical_to_consumed_v1(self):
+        def body(name):
+            tree = ast.parse((ROOT / "scripts" / name).read_text())
+            return ast.dump(
+                next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Smoke")
+            )
+
+        self.assertEqual(
+            body("execute_sft_vm_boot_smoke_v1.py"), body("execute_sft_vm_boot_smoke_v2.py")
+        )
+        self.assertNotEqual(m.TOKEN, "lumi-boot-v2-smoke-20261008-01")
+        self.assertFalse(m.OUTPUT.exists())

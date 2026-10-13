@@ -1,0 +1,553 @@
+"""Synthetic seccomp frames and callbacks only; no native listener or model I/O."""
+
+from __future__ import annotations
+
+import importlib
+import json
+import struct
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_checkpoint_write_broker_test_namespace"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_broker_v1")
+IMPORTED = set(sys.modules) - before_import
+NOW = 1_000_000_000
+DEADLINE = NOW + 10_000_000_000
+PRIVATE = "PRIVATE_EXCEPTION_OR_PAYLOAD"
+ARCH = 0xC000003E
+WIRE = struct.Struct("<QIIiIQ6Q")
+RESPONSE = struct.Struct("<QqiI")
+FALSE_FLAGS = {
+    "native_listener_bound", "kernel_id_validation_verified", "native_response_verified",
+    "native_abi_qualified", "alternative_write_channels_closed",
+    "independent_deadline_enforced", "native_cumulative_write_enforcement_verified",
+    "metadata_or_physical_write_accounting", "host_admission_verified",
+    "execution_permitted", "real_import_permitted", "gate_5_complete",
+    "training_authorized", "production_eligible", "retry_allowed",
+}
+
+
+def notification(*, identifier=1, pid=42, flags=0, syscall=1, arch=ARCH,
+                 instruction_pointer=0, count=3, descriptor=7, buffer=0,
+                 other_args=(0, 0, 0)):
+    return WIRE.pack(identifier, pid, flags, syscall, arch, instruction_pointer,
+                     descriptor, buffer, count, *other_args)
+
+
+def budget(**overrides):
+    values = {"maximum_bytes": 100, "maximum_notifications": 10,
+              "maximum_call_bytes": 100, "precharged_bytes": 0}
+    if type(overrides.get("maximum_bytes")) is int and "maximum_call_bytes" not in overrides:
+        values["maximum_call_bytes"] = min(100, overrides["maximum_bytes"])
+    values.update(overrides)
+    return m.make_budget(**values)
+
+
+class ParserTests(unittest.TestCase):
+    def test_wire_sizes_are_explicit(self):
+        self.assertEqual(WIRE.size, 80)
+        self.assertEqual(RESPONSE.size, 24)
+
+    def test_write_and_pwrite64_parse_to_exact_private_shape(self):
+        for syscall in (1, 18):
+            with self.subTest(syscall=syscall):
+                self.assertEqual(m.parse_notification(notification(syscall=syscall)),
+                                 {"id": 1, "syscall": syscall, "requested_bytes": 3})
+
+    def test_zero_id_and_zero_requested_count_are_valid(self):
+        self.assertEqual(m.parse_notification(notification(identifier=0, count=0)),
+                         {"id": 0, "syscall": 1, "requested_bytes": 0})
+
+    def test_full_uint64_count_is_not_truncated(self):
+        for count in (2**32, 2**32 + 1, 2**63, 2**64 - 1):
+            with self.subTest(count=count):
+                self.assertEqual(m.parse_notification(notification(count=count))[
+                    "requested_bytes"], count)
+
+    def test_pointer_descriptor_and_unused_arguments_are_not_retained(self):
+        frame = notification(identifier=2**64 - 1, pid=2**31 - 1,
+            descriptor=2**64 - 1, buffer=2**63 + 1,
+            instruction_pointer=2**64 - 1, other_args=(1, 2**32, 2**64 - 1))
+        self.assertEqual(m.parse_notification(frame),
+                         {"id": 2**64 - 1, "syscall": 1, "requested_bytes": 3})
+
+    def test_only_exact_immutable_bytes_are_accepted(self):
+        class BytesSubclass(bytes):
+            pass
+
+        for raw in (None, "x" * 80, bytearray(notification()),
+                    memoryview(notification()), BytesSubclass(notification()),
+                    b"", notification()[:-1], notification() + b"x"):
+            with self.subTest(type=type(raw), size=len(raw) if raw is not None else None):
+                with self.assertRaises(m.WriteBrokerError):
+                    m.parse_notification(raw)
+
+    def test_nonzero_flags_rejected(self):
+        for flags in (1, 2, 2**31, 2**32 - 1):
+            with self.subTest(flags=flags), self.assertRaises(m.WriteBrokerError):
+                m.parse_notification(notification(flags=flags))
+
+    def test_pid_must_be_positive_signed_31_bit(self):
+        for pid in (0, 2**31, 2**32 - 1):
+            with self.subTest(pid=pid), self.assertRaises(m.WriteBrokerError):
+                m.parse_notification(notification(pid=pid))
+
+    def test_wrong_architecture_and_syscalls_rejected(self):
+        for arch in (0, 0x40000003, ARCH - 1, 2**32 - 1):
+            with self.subTest(arch=arch), self.assertRaises(m.WriteBrokerError):
+                m.parse_notification(notification(arch=arch))
+        for syscall in (-1, 0, 2, 19, 20, 296, 328, 0x40000001, 2**31 - 1):
+            with self.subTest(syscall=syscall), self.assertRaises(m.WriteBrokerError):
+                m.parse_notification(notification(syscall=syscall))
+
+
+class BudgetTests(unittest.TestCase):
+    def test_budget_has_closed_shape(self):
+        self.assertEqual(budget(), {"schema": "lumi.checkpoint-write-budget.v0.1",
+            "maximum_bytes": 100, "maximum_notifications": 10,
+            "maximum_call_bytes": 100, "precharged_bytes": 0})
+
+    def test_exact_upper_bounds_are_allowed(self):
+        value = budget(maximum_bytes=128 * 1024**3, maximum_notifications=262144,
+                       maximum_call_bytes=1048576, precharged_bytes=128 * 1024**3)
+        self.assertEqual(value["precharged_bytes"], value["maximum_bytes"])
+
+    def test_integer_counts_are_strict(self):
+        class IntSubclass(int):
+            pass
+
+        for name in ("maximum_bytes", "maximum_notifications", "maximum_call_bytes",
+                     "precharged_bytes"):
+            for value in (True, False, 1.0, "1", None, IntSubclass(1)):
+                with self.subTest(name=name, value=value), self.assertRaises(m.WriteBrokerError):
+                    budget(**{name: value})
+
+    def test_out_of_range_budget_values_rejected(self):
+        for name, values in {
+            "maximum_bytes": (-1, 0, 128 * 1024**3 + 1),
+            "maximum_notifications": (-1, 0, 262145),
+            "maximum_call_bytes": (-1, 0, 1048577),
+            "precharged_bytes": (-1, 101),
+        }.items():
+            for value in values:
+                with self.subTest(name=name, value=value), self.assertRaises(m.WriteBrokerError):
+                    budget(**{name: value})
+
+    def test_call_limit_cannot_exceed_entire_budget(self):
+        with self.assertRaises(m.WriteBrokerError):
+            budget(maximum_bytes=1, maximum_call_bytes=2)
+
+    def test_unrecognized_error_text_is_sanitized(self):
+        error = m.WriteBrokerError(PRIVATE)
+        self.assertNotIn(PRIVATE, str(error))
+        self.assertIn(error.code, m.ERROR_CODES)
+
+
+class BrokerTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = self.enterContext(patch.object(m.time, "monotonic_ns", return_value=NOW))
+        self.pid = self.enterContext(patch.object(m.os, "getpid", return_value=12345))
+        self.thread = self.enterContext(patch.object(m.threading, "get_ident", return_value=999))
+
+    def broker(self, **options):
+        return m._Broker(budget(**options), deadline_ns=DEADLINE)
+
+    def serve(self, broker, raw=None, *, validator=None, sender=None):
+        validator = Mock(return_value=True) if validator is None else validator
+        sender = Mock(return_value=None) if sender is None else sender
+        result = broker._service_admitted_once(
+            notification() if raw is None else raw, id_valid=validator, send_response=sender)
+        self.assertIsNone(result)
+        return validator, sender
+
+    def assert_failed(self, broker, *, reserved=None, notifications=None, continued=None):
+        report = broker.snapshot()
+        self.assertTrue(report["terminal_failed"])
+        for key, expected in (("reserved_bytes", reserved),
+                              ("notifications_reserved", notifications),
+                              ("continued_notifications", continued)):
+            if expected is not None:
+                self.assertEqual(report[key], expected)
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, notification(identifier=987654), validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        self.assertEqual(broker.snapshot(), report)
+
+    def test_initial_snapshot_closed_and_non_authorizing(self):
+        actual = self.broker(precharged_bytes=9).snapshot()
+        expected = {"schema": "lumi.checkpoint-write-broker.v0.1", "reserved_bytes": 9,
+            "notifications_reserved": 0, "continued_notifications": 0,
+            "terminal_failed": False, **dict.fromkeys(FALSE_FLAGS, False)}
+        self.assertEqual(actual, expected)
+        self.assertEqual(set(m.FALSE_FLAGS), FALSE_FLAGS)
+        self.assertNotIn("id", actual)
+        self.assertNotIn("pid", actual)
+        self.assertNotIn("path", actual)
+
+    def test_snapshot_mutation_does_not_change_authority(self):
+        broker = self.broker()
+        before = broker.snapshot()
+        altered = broker.snapshot()
+        altered["reserved_bytes"] = -100
+        altered["terminal_failed"] = True
+        altered["extra"] = PRIVATE
+        self.assertEqual(broker.snapshot(), before)
+
+    def test_constructor_copies_budget(self):
+        original = budget(maximum_bytes=3)
+        broker = m._Broker(original, deadline_ns=DEADLINE)
+        original["maximum_bytes"] = 100000
+        original["precharged_bytes"] = -100
+        self.serve(broker)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, notification(identifier=2, count=1))
+        self.assert_failed(broker, reserved=3, notifications=1, continued=1)
+
+    def test_constructor_rejects_noncanonical_budget(self):
+        class DictSubclass(dict):
+            pass
+
+        variants = [None, [], DictSubclass(budget()), {**budget(), "extra": True},
+                    {**budget(), "schema": "wrong"}]
+        incomplete = budget()
+        del incomplete["precharged_bytes"]
+        variants.append(incomplete)
+        for value in variants:
+            with self.subTest(value=type(value)), self.assertRaises(m.WriteBrokerError):
+                m._Broker(value, deadline_ns=DEADLINE)
+
+    def test_constructor_validates_absolute_deadline(self):
+        for value in (None, True, 1.0, NOW, NOW - 1, -1, NOW + 3600 * 10**9 + 1):
+            with self.subTest(value=value), self.assertRaises(m.WriteBrokerError):
+                m._Broker(budget(), deadline_ns=value)
+        self.assertIsNotNone(m._Broker(budget(), deadline_ns=NOW + 3600 * 10**9))
+
+    def test_noncanonical_clock_is_rejected(self):
+        for value in (True, 0.5, -1):
+            self.clock.return_value = value
+            with self.subTest(value=value), self.assertRaises(m.WriteBrokerError):
+                m._Broker(budget(), deadline_ns=DEADLINE)
+
+    def test_success_exact_continue_frame(self):
+        broker = self.broker(precharged_bytes=2)
+        validator, sender = self.serve(broker, notification(identifier=0, count=5, syscall=18))
+        validator.assert_called_once_with(0)
+        sender.assert_called_once_with(RESPONSE.pack(0, 0, 0, 1))
+        self.assertEqual(broker.snapshot()["reserved_bytes"], 7)
+        self.assertEqual(broker.snapshot()["notifications_reserved"], 1)
+        self.assertEqual(broker.snapshot()["continued_notifications"], 1)
+
+    def test_budget_is_precharged_before_validation_and_send(self):
+        broker = self.broker(precharged_bytes=2)
+        observed = []
+
+        def observe_validator(identifier):
+            observed.append(("validate", identifier, broker._reserved,
+                             broker._notifications))
+            return True
+
+        def observe_sender(frame):
+            observed.append(("send", frame, broker._reserved,
+                             broker._notifications))
+
+        self.serve(broker, notification(identifier=4, count=7),
+                   validator=observe_validator, sender=observe_sender)
+        self.assertEqual(observed, [("validate", 4, 9, 1),
+                                   ("send", RESPONSE.pack(4, 0, 0, 1), 9, 1)])
+
+    def test_exact_byte_cap_succeeds_then_fails_closed(self):
+        broker = self.broker(maximum_bytes=10, precharged_bytes=4)
+        self.serve(broker, notification(count=6))
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, notification(identifier=2, count=1))
+        self.assert_failed(broker, reserved=10, notifications=1, continued=1)
+
+    def test_per_call_limit_is_independent_of_total_budget(self):
+        broker = self.broker(maximum_call_bytes=4)
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, notification(count=5), validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=0, notifications=0, continued=0)
+
+    def test_large_64_bit_count_cannot_wrap_into_budget(self):
+        for count in (2**32, 2**32 + 1, 2**64 - 1):
+            broker = self.broker()
+            with self.subTest(count=count), self.assertRaises(m.WriteBrokerError):
+                self.serve(broker, notification(count=count))
+            self.assert_failed(broker, reserved=0, notifications=0, continued=0)
+
+    def test_zero_length_writes_consume_notification_budget(self):
+        broker = self.broker(maximum_bytes=1, maximum_notifications=2, precharged_bytes=1)
+        for identifier in (0, 1):
+            self.serve(broker, notification(identifier=identifier, count=0))
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, notification(identifier=2, count=0))
+        self.assert_failed(broker, reserved=1, notifications=2, continued=2)
+
+    def test_duplicate_identifier_is_terminal_and_not_sent_twice(self):
+        broker = self.broker()
+        self.serve(broker)
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=3, notifications=1, continued=1)
+
+    def test_invalid_id_never_sends_and_keeps_reservation(self):
+        broker = self.broker(precharged_bytes=2)
+        sender = Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=Mock(return_value=False), sender=sender)
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=5, notifications=1, continued=0)
+
+    def test_validation_requires_exact_true(self):
+        for result in (None, 1, 0, "true", [], object()):
+            broker = self.broker()
+            sender = Mock(return_value=None)
+            with self.subTest(result=type(result)), self.assertRaises(m.WriteBrokerError):
+                self.serve(broker, validator=Mock(return_value=result), sender=sender)
+            sender.assert_not_called()
+            self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_validation_exception_is_raw_text_free_and_not_refunded(self):
+        broker = self.broker()
+        sender = Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError) as context:
+            self.serve(broker, validator=Mock(side_effect=OSError(PRIVATE)), sender=sender)
+        sender.assert_not_called()
+        self.assertNotIn(PRIVATE, str(context.exception))
+        self.assertNotIn(PRIVATE, json.dumps(broker.snapshot()))
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_send_exception_is_not_refunded_or_retried(self):
+        broker = self.broker()
+        sender = Mock(side_effect=OSError(PRIVATE))
+        with self.assertRaises(m.WriteBrokerError) as context:
+            self.serve(broker, sender=sender)
+        sender.assert_called_once()
+        self.assertNotIn(PRIVATE, str(context.exception))
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_callback_cancellation_is_terminal_without_refund(self):
+        for stage in ("validate", "send"):
+            for exception in (KeyboardInterrupt(PRIVATE), SystemExit(PRIVATE)):
+                broker = self.broker()
+                validator, sender = Mock(return_value=True), Mock(return_value=None)
+                (validator if stage == "validate" else sender).side_effect = exception
+                with self.subTest(stage=stage, exception=type(exception)):
+                    with self.assertRaises(m.WriteBrokerError) as context:
+                        self.serve(broker, validator=validator, sender=sender)
+                    self.assertNotIn(PRIVATE, str(context.exception))
+                    if stage == "validate":
+                        sender.assert_not_called()
+                    self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_send_return_ambiguity_is_terminal_without_refund(self):
+        for result in (True, False, 0, 24, b"", object()):
+            broker = self.broker()
+            with self.subTest(result=type(result)), self.assertRaises(m.WriteBrokerError):
+                self.serve(broker, sender=Mock(return_value=result))
+            self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_malformed_frame_is_terminal_before_callbacks(self):
+        broker = self.broker()
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, notification()[:-1], validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=0, notifications=0, continued=0)
+
+    def test_bad_callback_types_fail_closed(self):
+        for validator, sender in ((None, lambda frame: None), (lambda identifier: True, None)):
+            broker = self.broker()
+            with self.subTest(validator=validator), self.assertRaises(m.WriteBrokerError):
+                broker._service_admitted_once(notification(), id_valid=validator,
+                                               send_response=sender)
+            self.assert_failed(broker)
+
+    def test_owner_pid_mismatch_blocks_callbacks(self):
+        broker = self.broker()
+        self.pid.return_value += 1
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        with self.assertRaises(m.WriteBrokerError):
+            broker.snapshot()
+        self.pid.return_value -= 1
+        self.assert_failed(broker)
+
+    def test_owner_thread_mismatch_blocks_callbacks(self):
+        broker = self.broker()
+        self.thread.return_value += 1
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        with self.assertRaises(m.WriteBrokerError):
+            broker.snapshot()
+        self.thread.return_value -= 1
+        self.assert_failed(broker)
+
+    def test_deadline_expiry_before_request_does_not_reach_callbacks(self):
+        broker = self.broker()
+        self.clock.return_value = DEADLINE
+        validator, sender = Mock(return_value=True), Mock(return_value=None)
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=validator, sender=sender)
+        validator.assert_not_called()
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=0, notifications=0, continued=0)
+
+    def test_deadline_expiry_in_validation_prevents_send(self):
+        broker = self.broker()
+        sender = Mock(return_value=None)
+
+        def expire(identifier):
+            self.clock.return_value = DEADLINE
+            return True
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=expire, sender=sender)
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_deadline_expiry_in_send_is_terminal_no_refund(self):
+        broker = self.broker()
+
+        def expire(frame):
+            self.clock.return_value = DEADLINE
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, sender=expire)
+        self.assert_failed(broker, reserved=3, notifications=1)
+
+    def test_owner_change_during_callback_is_terminal(self):
+        for callback in ("validate", "send"):
+            broker = self.broker()
+            sender = Mock(return_value=None)
+
+            def change_owner(value):
+                self.pid.return_value += 1
+                return True if callback == "validate" else None
+
+            with self.subTest(callback=callback), self.assertRaises(m.WriteBrokerError):
+                self.serve(broker,
+                    validator=change_owner if callback == "validate" else None,
+                    sender=change_owner if callback == "send" else sender)
+            if callback == "validate":
+                sender.assert_not_called()
+            self.pid.return_value -= 1
+            self.assert_failed(broker, reserved=3, notifications=1)
+
+    def test_thread_change_during_send_is_terminal_without_refund(self):
+        broker = self.broker()
+
+        def change_thread(frame):
+            self.thread.return_value += 1
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, sender=change_thread)
+        self.thread.return_value -= 1
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_recursive_service_cannot_bypass_one_pending_request(self):
+        broker = self.broker()
+        nested_validator, nested_sender = Mock(return_value=True), Mock(return_value=None)
+        sender = Mock(return_value=None)
+
+        def recurse(identifier):
+            with self.assertRaises(m.WriteBrokerError):
+                self.serve(broker, notification(identifier=2),
+                           validator=nested_validator, sender=nested_sender)
+            return True
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=recurse, sender=sender)
+        nested_validator.assert_not_called()
+        nested_sender.assert_not_called()
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_snapshot_inside_callback_is_reentry_and_terminal(self):
+        broker = self.broker()
+        sender = Mock(return_value=None)
+
+        def inspect(identifier):
+            with self.assertRaises(m.WriteBrokerError):
+                broker.snapshot()
+            return True
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, validator=inspect, sender=sender)
+        sender.assert_not_called()
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_swallowed_recursive_service_during_send_remains_terminal(self):
+        broker = self.broker()
+        nested_validator, nested_sender = Mock(return_value=True), Mock(return_value=None)
+
+        def recurse(frame):
+            with self.assertRaises(m.WriteBrokerError):
+                self.serve(broker, notification(identifier=2),
+                           validator=nested_validator, sender=nested_sender)
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, sender=recurse)
+        nested_validator.assert_not_called()
+        nested_sender.assert_not_called()
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_swallowed_snapshot_reentry_during_send_remains_terminal(self):
+        broker = self.broker()
+        frames = []
+
+        def inspect(frame):
+            frames.append(frame)
+            with self.assertRaises(m.WriteBrokerError):
+                broker.snapshot()
+
+        with self.assertRaises(m.WriteBrokerError):
+            self.serve(broker, sender=inspect)
+        self.assertEqual(frames, [RESPONSE.pack(1, 0, 0, 1)])
+        self.assert_failed(broker, reserved=3, notifications=1, continued=0)
+
+    def test_offset_descriptor_and_buffer_do_not_exempt_request_accounting(self):
+        broker = self.broker()
+        self.serve(broker, notification(syscall=18, descriptor=2**64 - 1,
+            buffer=2**64 - 1, count=7, other_args=(2**64 - 1, 0, 0)))
+        self.assertEqual(broker.snapshot()["reserved_bytes"], 7)
+
+    def test_public_entry_is_unconditionally_closed(self):
+        for options in ({}, {"approved": True}, {"native_qualified": True},
+                        {"listener": object(), "budget": budget(), "deadline_ns": DEADLINE}):
+            with self.subTest(options=list(options)), \
+                    self.assertRaises(m.WriteBrokerError) as context:
+                m.serve_write_notifications(**options)
+            self.assertEqual(context.exception.code, "host_guard_not_bound")
+
+    def test_definition_import_has_no_ml_or_primary_lumi(self):
+        self.assertFalse(any(name == "lumi" or name.startswith("lumi.")
+                             or name.split(".")[0] in {"torch", "transformers", "safetensors"}
+                             for name in IMPORTED))
+
+
+if __name__ == "__main__":
+    unittest.main()

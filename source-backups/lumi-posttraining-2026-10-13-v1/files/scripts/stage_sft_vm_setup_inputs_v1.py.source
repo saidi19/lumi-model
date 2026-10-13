@@ -1,0 +1,304 @@
+"""Prepare and stage the exact existing setup controls, without running them.
+
+No SSH, downloader, mount, runtime install, model access or execution binding.
+The private native staging call belongs to a future authenticated bootstrap.
+CPU wheels are deliberately separate from the 32 MiB control-upload allowance.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import stat
+import sys
+import tarfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+OPT = Path("/opt")
+RECEIPTS = Path("/var/lib/lumi-vm-input-deployment")
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+CAP = 32 * 1024**2
+SMALL = 131072
+SDK_INSTALL = "0326195c9ca27b98471699d85571d1f85ef2f7f8fc1282e58004ac01738aa38c"
+# Destination relative to /opt -> existing repository source, frozen SHA, size cap.
+FILES = {
+    "lumi-bootstrap-input/posttraining_import_vm_rehearsal_v3.py": (
+        "src/lumi/posttraining_import_vm_rehearsal_v3.py",
+        "ac97b64072ccd1f3db702bbf32bf0ff3de410e566ae1dc708533cb147ea15d4c",
+        SMALL,
+    ),
+    "lumi-bootstrap-input/cpu.service": (
+        "configs/lumi-vm-cpu-runtime-install-v0.1.service",
+        "10cae88406d0fbf6ad04992f78ea4bd56a310f61c05ff437fa60363669fbcb19",
+        SMALL,
+    ),
+    "lumi-bootstrap-input/sdk.service": (
+        "configs/lumi-vm-acquisition-sdk-install-v0.1.service",
+        "3fccaea0689e6e81f51cdb62064e8227fda227d66277642d9432d274c8bce89c",
+        SMALL,
+    ),
+    "lumi-bootstrap-input/stage_sft_vm_fullsize_release_v1.py": (
+        "scripts/stage_sft_vm_fullsize_release_v1.py",
+        "625c53b3c50762d36d7fdafb08158ed413933437eac388df7bfc3f15e9755b07",
+        SMALL,
+    ),
+    "lumi-bootstrap-input/stage_sft_vm_root_controller_v1.py": (
+        "scripts/stage_sft_vm_root_controller_v1.py",
+        "bf04b2a5350b609a56c06be1b25c70ec27101027a2a077c2cca73bad85fd61cd",
+        SMALL,
+    ),
+    "lumi-bootstrap-input/source-controls.tar": (
+        "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar",
+        "4317d6c87b51bf8caeea5b94cc97db305811035201ede29d38a4a9221e4100a6",
+        4 * 1024**2,
+    ),
+    "lumi-bootstrap-input/root-controller.tar": (
+        "artifacts/lumi-vm-root-controller-release-v0.1/root-controller.tar",
+        "74d84d4b2b8bb14ecb0481c843ae9c28410b9311e07d294f00de9528613b069d",
+        2 * 1024**2,
+    ),
+    "lumi-bootstrap-input/run_sft_vm_setup_sequence_v1.py": (
+        "scripts/run_sft_vm_setup_sequence_v1.py",
+        "47d3b59e116b83cc479104e9d26eac55545470d304cd73114980ab42d4d43688",
+        SMALL,
+    ),
+    "lumi-bootstrap-input/check_sft_vm_storage_v1.py": (
+        "scripts/check_sft_vm_storage_v1.py",
+        "ed6aa6456b31d5d9f32f7ebdf51c46ff60f56bdac212b0459ecb6fb9c05dc9c8",
+        SMALL,
+    ),
+    "lumi-cpu-input/install_sft_vm_cpu_runtime_v1.py": (
+        "scripts/install_sft_vm_cpu_runtime_v1.py",
+        "4697253d149bb10fbf2c51128f49dc525bd51841d9eb1bee21cb325c841a89a9",
+        SMALL,
+    ),
+    "lumi-cpu-input/install_sft_vm_acquisition_sdk_v1.py": (
+        "scripts/install_sft_vm_acquisition_sdk_v1.py",
+        SDK_INSTALL,
+        SMALL,
+    ),
+    "lumi-cpu-input/runtime-lock.json": (
+        "configs/lumi-sft-linux-cpu-release-v0.1.lock.json",
+        "26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965",
+        SMALL,
+    ),
+    "lumi-sdk-input/install_sft_vm_acquisition_sdk_v1.py": (
+        "scripts/install_sft_vm_acquisition_sdk_v1.py",
+        SDK_INSTALL,
+        SMALL,
+    ),
+    "lumi-sdk-input/sdk-release.tar": (
+        "artifacts/lumi-vm-acquisition-sdk-release-v0.1/sdk-release.tar",
+        "fa53d59f93d234d29fcb602ba12a82dcd4d7572660c59bb58456c31902efd2ed",
+        20 * 1024**2,
+    ),
+}
+DIRECTORIES = tuple(sorted({name.split("/")[0] for name in FILES}))
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_input_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def read(path, cap):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(before.st_size + 1)
+        after = os.fstat(stream.fileno())
+    fields = (
+        "st_dev",
+        "st_ino",
+        "st_mode",
+        "st_nlink",
+        "st_uid",
+        "st_gid",
+        "st_size",
+        "st_mtime_ns",
+        "st_ctime_ns",
+    )
+    need(len(raw) == before.st_size)
+    need(all(getattr(before, k) == getattr(after, k) for k in fields))
+    return raw
+
+
+def pack(members):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in sorted(members.items()):
+            item = tarfile.TarInfo(name)
+            item.size, item.mode = len(body), 0o400
+            archive.addfile(item, io.BytesIO(body))
+    return output.getvalue()
+
+
+def unpack(raw, expected):
+    need(type(raw) is bytes and 0 < len(raw) <= CAP)
+    need(type(expected) is str and re.fullmatch(r"[0-9a-f]{64}", expected))
+    need(sha(raw) == expected)
+    members = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for item in archive:
+            need(item.name in FILES and item.name not in members)
+            need(item.type == tarfile.REGTYPE and not item.linkname and not item.pax_headers)
+            need(item.mode == 0o400 and item.uid == item.gid == 0)
+            _, pin, cap = FILES[item.name]
+            need(0 < item.size <= cap)
+            with archive.extractfile(item) as stream:
+                body = stream.read(item.size + 1)
+            need(len(body) == item.size and sha(body) == pin)
+            members[item.name] = body
+    need(set(members) == set(FILES))
+    need(pack(members) == raw)  # Reject appended/hidden members and noncanonical headers.
+    return members
+
+
+def assemble(repo=REPO):
+    members = {name: read(repo / source, cap) for name, (source, _, cap) in FILES.items()}
+    raw = pack(members)
+    unpack(raw, sha(raw))
+    return raw
+
+
+def sync(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write(path, raw):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def receipt(raw):
+    return {
+        "schema": "lumi.vm-setup-inputs.v0.1",
+        "attempt": ATTEMPT,
+        "archive_sha256": sha(raw),
+        "archive_bytes": len(raw),
+        "files": len(FILES),
+        "cpu_wheels_included": False,
+        "host_admitted": False,
+        "binding_created": False,
+        "execution_permitted": False,
+        "gate_5_complete": False,
+        "retry_allowed": False,
+    }
+
+
+def prepare(destination):
+    raw = assemble()
+    need(not any(p.is_symlink() for p in (destination, *destination.parents)))
+    destination.mkdir(mode=0o700, exist_ok=False)
+    sync(destination.parent)
+    write(destination / "setup-inputs.tar", raw)
+    need(read(destination / "setup-inputs.tar", CAP) == raw)
+    result = receipt(raw) | {"native_staged": False, "uploaded": False}
+    write(destination / "build.json", canonical(result))
+    sync(destination)
+    return result
+
+
+def owned_directory(path):
+    for p in (path, *path.parents):
+        info = p.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+
+
+def boundary(machine_id):
+    need(sys.platform == "linux" and os.geteuid() == os.getegid() == 0)
+    need(sys.version_info[:2] == (3, 12) and sys.flags.isolated and sys.dont_write_bytecode)
+    need(type(machine_id) is str and re.fullmatch(r"[0-9a-f]{32}", machine_id))
+    need(read(Path("/etc/machine-id"), 65).strip() == machine_id.encode())
+    need(os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino)
+    owned_directory(OPT)
+    owned_directory(RECEIPTS)
+
+
+def _stage_admitted_once(raw, expected, machine_id):
+    boundary(machine_id)
+    members = unpack(raw, expected)  # Authenticate all paths/content before any writes.
+    for name in DIRECTORIES:
+        need(not os.path.lexists(OPT / name))
+    attempt = RECEIPTS / ATTEMPT
+    attempt.mkdir(mode=0o700, exist_ok=False)  # Failure consumes the attempt.
+    sync(RECEIPTS)
+    try:
+        write(attempt / "started.json", canonical(receipt(raw)))
+        sync(attempt)
+        for name in DIRECTORIES:
+            (OPT / name).mkdir(mode=0o700, exist_ok=False)
+            sync(OPT)
+        for name, body in sorted(members.items()):
+            write(OPT / name, body)
+        for name, body in members.items():
+            path = OPT / name
+            info = path.lstat()
+            need(info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == 0o400)
+            need(read(path, FILES[name][2]) == body)
+        for name in DIRECTORIES:
+            sync(OPT / name)
+        result = receipt(raw) | {
+            "staged_files_readback_match": True,
+            "readonly_mounts_established": False,
+        }
+        write(attempt / "result.json", canonical(result))
+        sync(attempt)
+        return result
+    except BaseException:
+        write(
+            attempt / "failed.json",
+            canonical(
+                {
+                    "partial_files_preserved": True,
+                    "retry_allowed": False,
+                    "execution_permitted": False,
+                }
+            ),
+        )
+        sync(attempt)
+        raise ValueError("setup_input_stage_failed") from None
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prepare", type=Path, required=True)
+    args = parser.parse_args()
+    try:
+        result = prepare(args.prepare)
+    except Exception:
+        print('{"status":"rejected","execution_permitted":false}')
+        return 2
+    print(canonical(result).decode(), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

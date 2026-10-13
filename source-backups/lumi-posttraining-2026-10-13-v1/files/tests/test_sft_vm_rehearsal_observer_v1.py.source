@@ -1,0 +1,44 @@
+"""Small generated-only tests for aggregate observer output."""
+import importlib.util
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+class ObserverTests(unittest.TestCase):
+    def setUp(self):
+        path = Path(__file__).resolve().parents[1] / 'scripts/observe_sft_vm_rehearsal_v1.py'
+        spec = importlib.util.spec_from_file_location('observer_test', path)
+        self.module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.module)
+
+    def test_rejects_path_or_arbitrary_name_before_reads(self):
+        with patch.object(Path, 'read_bytes') as read:
+            with self.assertRaisesRegex(ValueError, 'attempt_invalid'):
+                self.module.observe('../bad')
+        read.assert_not_called()
+
+    def test_keeps_counts_never_process_identifiers(self):
+        def raw(path):
+            return {'cgroup.procs': b'12345\n67890\n', 'memory.current': b'1048576',
+                    'memory.stat': b'anon 10\nshmem 8192\n',
+                    'memory.events': b'oom 1\noom_kill 1\n'}[path.name]
+        with patch.object(Path, 'read_bytes', raw), patch.object(Path, 'exists', return_value=True):
+            result = self.module.observe('a'*32)
+        self.assertTrue(result['terminal_record_seen'])
+        self.assertNotIn('12345', repr(result))
+        self.assertNotIn('67890', repr(result))
+        for row in result['cases'].values():
+            self.assertEqual(row, {'observations': 1, 'max_process_count': 2,
+                                  'max_memory_bytes': 1048576, 'max_shmem_bytes': 8192,
+                                  'max_oom_kill_count': 1})
+
+    def test_missing_cgroups_not_counted_as_observations(self):
+        with (patch.object(Path, 'read_bytes', side_effect=FileNotFoundError),
+              patch.object(Path, 'exists', return_value=True)):
+            result = self.module.observe('a'*32)
+        self.assertTrue(all(row['observations'] == 0 for row in result['cases'].values()))
+
+
+if __name__ == '__main__':
+    unittest.main()

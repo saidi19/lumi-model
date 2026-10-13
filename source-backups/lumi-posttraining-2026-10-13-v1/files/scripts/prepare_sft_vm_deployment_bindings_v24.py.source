@@ -1,0 +1,83 @@
+"""Attempt-020 final proposal bindings after full read-only admission."""
+
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v23 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = "34715dc6858d36ff749d1cd73785b77c22322f39d9865da8bc9f40615e5a2f9e"
+ATTEMPT, OLD, BUCKET = source.ATTEMPT, source.OLD, source.BUCKET
+RELEASE, RELEASE_SHA = source.RELEASE, source.RELEASE_SHA
+WATCH, WATCH_SHA = source.WATCH, source.WATCH_SHA
+STORE, STORE_SHA = source.STORE, source.STORE_SHA
+PLAN = "artifacts/lumi-vm-attempt-020-control-plan-v0.4/plan.json"
+PLAN_SHA = "35eaefcdcbe67f38d32ec5d9da3f1f16f6de0b230f79c61510d0def6b27879b2"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-020-control-plan-v0.4/release.json"
+PLAN_RELEASE_SHA = "7d1fb113084bbb8365d82752c5b64dfe447eb46c9016f546cccfd963baa79b85"
+PREFLIGHT = "evidence/lumi-vm-attempt-020-readonly-preflight-verification-v0.2.json"
+PREFLIGHT_SHA = "92cf448261b74fe14e74ea123b0c61bfe630c2df0dee5decc4a9cf3e4d5de881"
+BUDGET = "scripts/sft_vm_admission_budget_v1.py"
+BUDGET_SHA = "93b389a15ea8911ca9afb4d8124542b09470311065ccccd552806162ad7f781f"
+need, sha, encode, read = source.need, source.sha, source.encode, source.read
+
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    preflight = json.loads(read(PREFLIGHT, PREFLIGHT_SHA))
+    read(BUDGET, BUDGET_SHA)
+    need(
+        release["attempt"] == preflight["attempt"] == ATTEMPT
+        and release["plan_sha256"] == PLAN_SHA
+        and release["source_release_sha256"] == RELEASE_SHA
+        and release["successful_readonly_preflight_sha256"] == PREFLIGHT_SHA
+        and release["admission_budget_sha256"] == BUDGET_SHA
+        and release["execution_permitted"] is False
+        and preflight["status"] == "readonly_preflight_passed"
+        and preflight["control_evidence"] == source.controls()
+        and preflight["cpu_admitted"] is True
+        and preflight["network_admitted"] is True
+        and preflight["execution_authority_created"] is False
+        and preflight["cpu_instance_launched"] is False
+        and preflight["checkpoint_access"] is False
+        and preflight["consumed_v01_preserved"] is True
+    )
+    for key in ("run_bindings", "consumed_bindings", "source_bindings", "control_evidence"):
+        for name, digest in preflight[key].items():
+            read(name, digest)
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["required_control_proofs"] == [WATCH, STORE]
+        and plan["successful_readonly_preflight"] == {"path": PREFLIGHT, "sha256": PREFLIGHT_SHA}
+        and plan["cpu_scope_reference"]["output"]
+        == "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020"
+        and plan["cpu_scope_reference"]["execution_entry_sha256"] is None
+        and plan["immediate_admission_accounting"]["implementation_sha256"] == BUDGET_SHA
+        and plan["immediate_admission_accounting"]["credential_identity_dispatches_included"]
+        is True
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    build()
+    return {WATCH: WATCH_SHA, STORE: STORE_SHA}
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

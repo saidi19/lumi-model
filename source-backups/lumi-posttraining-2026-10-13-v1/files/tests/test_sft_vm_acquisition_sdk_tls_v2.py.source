@@ -1,0 +1,112 @@
+"""TLS trust selection and bounded preparation; synthetic bytes, no network."""
+
+import importlib.util
+import io
+import json
+import ssl
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "sdk_prepare_tls", ROOT / "scripts/prepare_sft_vm_acquisition_sdk_v2.py"
+)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class TrustTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.ca = self.root / "ca.pem"
+        self.ca.write_bytes(b"synthetic trust bundle")
+        self.enterContext(patch.object(m, "CA_FILE", self.ca))
+        self.enterContext(patch.object(m, "CA_SHA", m.sha(self.ca.read_bytes())))
+        self.context = Mock(check_hostname=True, verify_mode=ssl.CERT_REQUIRED)
+        self.context.cert_store_stats.return_value = {"x509_ca": 121}
+        self.make = self.enterContext(
+            patch.object(m.ssl, "create_default_context", return_value=self.context)
+        )
+
+    def test_validated_ca_bytes_and_strict_tls(self):
+        self.assertIs(m.tls_context(), self.context)
+        self.make.assert_called_once_with(cadata="synthetic trust bundle")
+
+    def test_changed_ca_rejected_before_ssl(self):
+        self.ca.write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            m.tls_context()
+        self.make.assert_not_called()
+
+    def test_symlink_ca_rejected(self):
+        link = self.root / "alias.pem"
+        link.symlink_to(self.ca)
+        with patch.object(m, "CA_FILE", link), self.assertRaises(ValueError):
+            m.tls_context()
+
+    def test_empty_trust_hostname_or_chain_checks_never_disabled(self):
+        for hostname, verify, roots in (
+            (False, ssl.CERT_REQUIRED, 121),
+            (True, ssl.CERT_NONE, 121),
+            (True, ssl.CERT_REQUIRED, 0),
+        ):
+            self.context.check_hostname, self.context.verify_mode = hostname, verify
+            self.context.cert_store_stats.return_value = {"x509_ca": roots}
+            with self.assertRaises(ValueError):
+                m.tls_context()
+
+    def test_trust_failure_precedes_attempt_directory(self):
+        self.ca.write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            m.fetch(self.root / "attempt", m.LOCK.read_bytes(), m.PRIOR.read_bytes())
+        self.assertFalse((self.root / "attempt").exists())
+
+
+class FetchTests(unittest.TestCase):
+    def test_five_synthetic_wheels_written_once_and_bound_to_ca(self):
+        rows = [
+            {
+                "name": f"synthetic{i}",
+                "version": "1",
+                "filename": f"wheel{i}.whl",
+                "bytes": 3,
+                "sha256": m.sha(b"abc"),
+                "url": f"https://example.invalid/{i}",
+            }
+            for i in range(5)
+        ]
+        bodies = []
+
+        def response(*_a, **_kw):
+            body = io.BytesIO(b"abc")
+            body.status, body.headers = 200, {"Content-Length": "3"}
+            bodies.append(body)
+            return body
+
+        opener = Mock()
+        opener.open.side_effect = response
+        with (
+            tempfile.TemporaryDirectory() as folder,
+            patch.object(m, "tls_context") as context,
+            patch.object(m, "validate", return_value={"requirements": rows}),
+            patch.object(m.urllib.request, "build_opener", return_value=opener) as build,
+        ):
+            path = Path(folder).resolve() / "fresh"
+            result = m.fetch(path, b"synthetic lock", b"synthetic prior")
+            self.assertEqual(result["wheels_verified"], 5)
+            self.assertFalse(result["installed"])
+            self.assertFalse(result["linux_sdk_qualified"])
+            self.assertEqual(opener.open.call_count, 5)
+            self.assertTrue(all(body.closed for body in bodies))
+            self.assertEqual(
+                json.loads((path / "started.json").read_bytes())["ca_bundle_sha256"], m.CA_SHA
+            )
+            self.assertIs(build.call_args.args[-1]._context, context.return_value)
+            with self.assertRaises(FileExistsError):
+                m.fetch(path, b"synthetic lock", b"synthetic prior")
+
+
+if __name__ == "__main__":
+    unittest.main()

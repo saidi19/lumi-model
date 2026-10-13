@@ -1,0 +1,254 @@
+"""Private parent wiring for one isolated retention child; no live admission.
+
+Keeps the frozen retention core unchanged by projecting its expected paths into
+a fresh writable view with separate read-only payload mounts. Requires a pinned
+release, authenticated SDK, scoped credential tmpfs and host/egress admission.
+No source copy, retry, instance action or deletion of package/evidence occurs.
+"""
+
+from __future__ import annotations
+
+import math
+import stat
+import time
+
+from . import posttraining_vm_fullsize_credential_handoff_v1 as credentials
+from . import posttraining_vm_fullsize_retention_v1 as retention
+
+completion, handoff = retention.completion, retention.completion.handoff
+ROOT = handoff.ROOT
+PYTHON = "/opt/lumi-sft-acquisition/venv/bin/python"
+SCRIPT = "/work/release/scripts/retain_sft_vm_package_v1.py"
+READONLY = ("retained", "stage/verification", "completion.json")
+TEARDOWN_MARGIN = 45
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_unit_rejected") from None
+
+
+def unit_name(attempt):
+    need(attempt == retention.ATTEMPT)
+    return f"lumi-vm-fullsize-v1-{attempt}-retain.service"
+
+
+def properties(attempt, seconds):
+    unit_name(attempt)
+    need(type(seconds) is int and 1 <= seconds <= 1780)
+    root = ROOT / attempt
+    view = root / "retention-worker/view"
+    props = handoff.controls._base()
+    props.update(
+        {
+            "User": "0",
+            "Group": "0",
+            # Required only to READ unchanged worker-owned mode-0600 package files.
+            # No DAC_OVERRIDE, SYS_ADMIN, CHOWN, SETUID or write-bypass capability.
+            "CapabilityBoundingSet": "CAP_DAC_READ_SEARCH",
+            "MemoryMax": str(1024**3),
+            "RuntimeMaxSec": str(seconds),
+            "PrivateNetwork": "no",
+            "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
+            "RestrictNamespaces": "yes",
+            "ProtectProc": "invisible",
+            "TemporaryFileSystem": "/work:ro,nosuid,nodev,noexec,size=1048576,mode=0700 "
+            "/var:ro,nosuid,nodev,noexec,size=1048576,mode=0755 "
+            "/run:ro,nosuid,nodev,noexec,size=1048576,mode=0755",
+            "BindPaths": f"{view}:{root}",
+            "BindReadOnlyPaths": " ".join(
+                [f"{root}/{name}:{root}/{name}" for name in READONLY]
+                + [
+                    f"{root}/retention-worker/admission.json:{root}/admission.json",
+                    f"{root}/retention-release:/work/release",
+                    "-/run/systemd/resolve:/run/systemd/resolve",
+                ]
+            ),
+            "ReadOnlyPaths": "/opt/lumi-sft-acquisition/venv",
+            "LoadCredential": f"aws-session.json:{root}/retention-credentials/aws-session.json",
+            "InaccessiblePaths": "/tmp /var/tmp -/inputs -/outputs -/dev/shm",
+        }
+    )
+    return props
+
+
+def command(attempt, entry_sha256, seconds):
+    need(retention.pin(entry_sha256))
+    result = [
+        "/usr/bin/systemd-run",
+        "--quiet",
+        "--no-ask-password",
+        "--service-type=exec",
+        "--unit=" + unit_name(attempt),
+    ]
+    result += [f"--property={k}={v}" for k, v in properties(attempt, seconds).items()]
+    result += [f"--setenv={k}={v}" for k, v in handoff.frozen.ENV.items()]
+    return result + ["--", PYTHON, "-I", "-B", SCRIPT, "--entry-sha256", entry_sha256]
+
+
+def _identity(path):
+    # Parent/child bind identity, not a replacement for immutable mount checks.
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    row = path.lstat()
+    need(stat.S_ISDIR(row.st_mode) or stat.S_ISREG(row.st_mode))
+    return [row.st_dev, row.st_ino]
+
+
+def _validate_result(report, completed):
+    fixed = dict(
+        schema="lumi.vm-fullsize-retention.v0.1",
+        attempt=retention.ATTEMPT,
+        **retention.FALSE,
+        offhost_retention_verified=True,
+        commit_readback_verified=True,
+    )
+    counts = {"puts_attempted", "gets_attempted", "objects", "eof_probe_count"}
+    sizes = {
+        "uploaded_content_bytes",
+        "readback_content_bytes",
+        "package_bytes",
+        "metadata_bytes",
+        "initial_manifest_read_bytes",
+    }
+    pins = {"commit_sha256", "package_manifest_sha256", "source_manifest_sha256"}
+    need(type(report) is dict and set(report) == set(fixed) | counts | sizes | pins)
+    need(all(type(report[k]) is type(v) and report[k] == v for k, v in fixed.items()))
+    need(all(type(report[k]) is int and report[k] > 0 for k in counts | sizes))
+    need(len({report[k] for k in counts}) == 1 and 10 <= report["objects"] <= 519)
+    need(report["package_bytes"] <= retention.PACKAGE_CAP)
+    commit_size = (
+        report["uploaded_content_bytes"] - report["package_bytes"] - report["metadata_bytes"]
+    )
+    need(0 < commit_size <= retention.COMMIT_CAP)
+    need(report["metadata_bytes"] + commit_size <= retention.META_CAP)
+    need(report["uploaded_content_bytes"] == report["readback_content_bytes"])
+    need(report["initial_manifest_read_bytes"] <= 131072)
+    need(all(retention.pin(report[k]) for k in pins))
+    need(all(report[k] == completed[k] for k in pins - {"commit_sha256"}))
+
+
+def run_retention(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _run_admitted_once(attempt, completed, *, entry_sha256, machine_id, deadline):
+    """Admitted host only. Deadline includes dispatch/stop; never renew host time.
+
+    Credential tmpfs is separately provisioned and scope/expiry checked by the
+    caller. This parent never reads it. Cleanup unlinks only that exact source
+    AFTER stopping/reaping the retention unit; no secure-erasure claim.
+    """
+    unit = unit_name(attempt)
+    now = time.monotonic()
+    need(type(deadline) in {int, float} and math.isfinite(deadline) and 60 < deadline - now <= 1800)
+    seconds = int(deadline - now - TEARDOWN_MARGIN)
+    launch = command(attempt, entry_sha256, seconds)
+    handoff.frozen.host_check(machine_id)
+    retention.policy()
+    retention._runtime(attempt)
+    destination = ROOT / attempt
+    raw = retention.small(destination / "completion.json", "root", 0o600)
+    need(retention.canonical(retention.decode(raw)) == retention.canonical(completed))
+    need(completed["status"] == "verified_package_preserved_locally_offhost_retention_pending")
+    source = destination / "retention-credentials"
+    snapshot = credentials._snapshot(source)
+    previous = handoff.frozen.run_command(
+        ["/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value"], 5, capture=True
+    )
+    need(previous.returncode in {0, 1, 4} and previous.stdout.strip() == b"not-found")
+    state = destination / "retention-worker"
+    state.mkdir(mode=0o700, exist_ok=False)  # Consumes this parent attempt even on setup failure.
+    dispatched = reaped = cleaned = cleanup_started = False
+    phase = "view_setup"
+    try:
+        completion._fsync_directory(destination)
+        view = state / "view"
+        view.mkdir(mode=0o700)
+        admission = dict(
+            schema="lumi.vm-retention-admission.v0.1",
+            attempt=attempt,
+            completion_sha256=retention.sha(raw),
+            readonly_identities={n: _identity(destination / n) for n in READONLY},
+            view_identity=_identity(view),
+            deadline_boottime=time.clock_gettime(time.CLOCK_BOOTTIME)
+            + max(0, deadline - time.monotonic() - TEARDOWN_MARGIN),
+        )
+        handoff.frozen.write_new(state / "admission.json", admission)
+        (state / "admission.json").chmod(0o400)
+        completion._fsync_directory(state)
+        phase = "dispatch"
+        need(time.monotonic() < deadline - TEARDOWN_MARGIN)
+        dispatched = True  # Ambiguous launch still receives exactly one stop attempt.
+        need(
+            handoff.frozen.run_command(launch, min(15, deadline - time.monotonic() - 10)).returncode
+            == 0
+        )
+        phase = "terminal"
+        while time.monotonic() < deadline - 35:
+            observed = handoff.frozen.observe(unit)
+            if observed["SubState"] in {"exited", "failed", "dead"}:
+                handoff.frozen.validate_terminal("chain", observed)
+                break
+            time.sleep(0.2)
+        else:
+            raise ValueError("retention_deadline")
+    except BaseException:
+        phase = "failed_" + phase
+    finally:
+        if dispatched:
+            try:
+                handoff._stop_and_reap(unit)
+                reaped = True
+            except BaseException:
+                phase = "failed_cleanup"
+        else:
+            try:
+                reaped = handoff.frozen.cgroup_empty(unit)
+            except BaseException:
+                phase = "failed_cleanup"
+        if reaped:
+            try:
+                cleanup_started = True
+                credentials._remove_source(source, snapshot, unit)
+                cleaned = True
+            except BaseException:
+                phase = "failed_cleanup"
+    try:
+        need(reaped and cleaned and not phase.startswith("failed_") and dispatched)
+        phase = "receipt"
+        result = retention.decode(
+            retention.small(state / "view/retention/result.json", "root", 0o600, 4096)
+        )
+        _validate_result(result, completed)
+        report = dict(
+            schema="lumi.vm-retention-unit.v0.1",
+            retention=result,
+            retention_cgroup_reaped=True,
+            credential_source_unlinked=True,
+            credential_tmpfs_unmounted=True,
+            cryptographic_erasure_claimed=False,
+            host_admitted=False,
+            gate_5_complete=False,
+            instance_termination_allowed=False,
+        )
+        handoff.frozen.write_new(state / "result.json", report)
+        completion._fsync_directory(state)
+        return report
+    except BaseException:
+        try:
+            handoff.frozen.write_new(
+                state / "failed.json",
+                dict(
+                    stage=phase,
+                    retention_cgroup_reaped=reaped,
+                    credential_cleanup_attempted=cleanup_started,
+                    credential_source_cleanup_complete=cleaned,
+                    retry_allowed=False,
+                    output_deletion_allowed=False,
+                    instance_termination_allowed=False,
+                ),
+            )
+            completion._fsync_directory(state)
+        except BaseException:
+            pass
+        raise ValueError("retention_unit_failed") from None

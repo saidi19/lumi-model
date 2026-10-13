@@ -1,0 +1,101 @@
+# SFT execution status v0.91
+
+2026-09-14. The exact approved publication completed. The one native CPU
+qualification failed, the full Source test suite failed, and Spark passed.
+Gate 5 remains incomplete. No native retry, GPU, real-checkpoint import or
+training was performed.
+
+## Published and actually checked
+
+Commit `6585a1e073a6a5302630ed63a3c1a3d81adda429` has the single parent
+`781d4c9de9d6acf9f2161855a6089914b980a294`: exactly 61 additions, no modifications
+or deletions, and 1,029,174 content bytes. One non-force push was made to
+`saidi19/lumi-model`, branch `codex/lumi-posttraining-product-v0.1`.
+
+The immutable approved execution-plan SHA-256 is
+`1b7cc9e0b3973f4966773c8a4f723031a44ac2b5547e89c273847a164d556bf6`.
+Its preparation-time false flags were not edited to imply an authorization or
+result. Separate approval/publication/result records preserve the sequence.
+
+Actual GitHub results:
+
+| Check | Result |
+| --- | --- |
+| Frozen lint integrity | Pass |
+| Isolated SFT controls | Pass |
+| Source-only validators | Pass |
+| Full Source test suite | Fail |
+| Spark source checks | Pass |
+| Prepared importer CPU qualification | Fail |
+
+The lint correction therefore passed actual Ubuntu CI. It did not establish
+full-suite or native-runtime success. Source dependencies installed successfully
+and its BF16 reproduction/successor acceptance step passed. Failure is in
+`Source suite (private integrations stay blocked)`; metadata alone does not name
+the individual failing test or exception. Raw job logs were not read.
+
+Source run: https://github.com/saidi19/lumi-model/actions/runs/34805106063
+
+Spark run: https://github.com/saidi19/lumi-model/actions/runs/34805106069
+
+## Native failure and limits of the evidence
+
+Native run: https://github.com/saidi19/lumi-model/actions/runs/34805106054
+
+Its checkout, executable/source pins, portable contracts and accepted-software
+acquisition passed. Supervisor reports `process_failed`; the closed harness
+report says `source_admission / fixture_failed`. The receipt verifier correctly
+rejects the attempt as `qualification_rejected`.
+
+This is a coarse stage, not an exact diagnosis. It spans source/bundle and helper
+loading, subreaper setup, temporary-parent setup and the free-disk check. Generic
+exceptions are also mapped to `fixture_failed`. A source-hash mismatch, import
+error or disk shortage has not been established. Under the hash-bound code path,
+image copying, Docker image loading/export, extraction and both guardian stages
+were not reached.
+
+Verified cleanup is limited to the outer harness being reaped with no adopted
+children, and retirement of this acquisition's input archive and its parent.
+No TERM/KILL or guardian/process-group signal was attempted. The failed receipt
+does not prove whole-harness private cleanup, guardian cleanup, source
+immutability or whole-job teardown.
+
+## Evidence closure and resource accounting
+
+The exact 1,981-byte aggregate ZIP matched its published SHA-256. Only its four
+closed receipts were retained, totaling 3,048 bytes. Two sequential zero-network
+receipt-verification passes completed on Python 3.11.15 and 3.13.7; all 146 prior
+bindings and 78 source-admission bindings matched. Their success means failure
+evidence is structurally valid, not that the qualification passed.
+
+One earlier local checker attempt was stopped by its audit hook during stdlib
+`ctypes` initialization. The checker setup was corrected before the two completed
+passes; no published code or remote attempt was retried. The structural checker
+is not comprehensive filesystem or whole-CI telemetry. Source/Spark's synthetic
+forward/optimizer and dependency-download counters were not measured.
+
+Prepublication used 8 of 8 metadata GETs. Post-run retrieval/metadata used 13 of
+16 allowed GETs. Accepted software acquisition used its four responses once.
+No raw job log, model/dataset payload, S3 or GPU request was made in the bounded
+native/retrieval workflow. The configured 96 aggregate runner-minute ceiling is
+not a billing estimate.
+
+A prior approval-service credit error prevented a Source metadata request from
+starting. After the user resumed, the same bounded read-only request passed the
+ordinary approval path; no workaround was used.
+
+## Next work; no retry is authorized by this result
+
+The current attempt is finished and failed. Before changing or launching a new
+native successor, establish the individual Source failure and precisely localize
+the coarse native setup stage. Reading a bounded failed-test summary requires a
+separate authorization beyond the current aggregate-only scope. Do not rerun the
+failed workflows, weaken a floor or guard, or start a GPU based on these reports.
+
+Execution result:
+`evidence/lumi-4b-sft-prepared-qualification-execution-result-v0.1.json`
+
+Verification:
+`evidence/lumi-4b-sft-prepared-qualification-result-verification-v0.1.json`
+
+These local reports have not been pushed. Prior evidence remains unchanged.

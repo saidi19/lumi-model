@@ -1,0 +1,75 @@
+{
+  "authorization": {
+    "cpu_sft_smoke_authorized": false,
+    "gpu_authorized": false,
+    "network_authorized": false,
+    "production_sft_authorized": false,
+    "source_checkpoint_download_authorized": false
+  },
+  "bindings": {
+    "encoded_manifest": {
+      "path": "artifacts/lumi-sft-token-consistent-shards-v0.1/attempt-001/private/encoded/manifest.json",
+      "sha256": "92dc09947ae149d3f4727b125d5ab4251f7fd84f397738b3c43d95a9912e6565"
+    },
+    "encoded_shard_receipt": {
+      "path": "evidence/lumi-4b-sft-token-consistent-shards-v0.1.json",
+      "sha256": "76947716ad0d36d0032e3765a6ef8610edd061662f58fe4fbf69fdd60dcd67ec"
+    },
+    "encoded_shard_verification": {
+      "path": "evidence/lumi-4b-sft-token-consistent-shards-verification-v0.1.json",
+      "sha256": "16731ccd1d74d9951f03c864033f46a612e928d154119dc77ffc355fc0dd628c"
+    },
+    "final_base_binding": {
+      "path": "configs/lumi-4b-final-base-binding-v0.1.json",
+      "sha256": "1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172"
+    },
+    "model_implementation": {
+      "path": "src/lumi/modeling_lumi.py",
+      "sha256": "bf7b908d282a752132918dddad648fd8435d3f8ad9db41eac1c2e64715926fad"
+    },
+    "runtime": {
+      "path": "src/lumi/posttraining_sft_runtime.py",
+      "sha256": "6940238db74f7c79c06b2b4d8098314e10879601242b3987932dfda90ba0cced"
+    },
+    "runner": {
+      "path": "scripts/run_sft_cpu_canary.py",
+      "sha256": "b0b8edd3c77eb544d19d152c622f4977e1f4d8797f95ab999f9b320ae2b54d91"
+    },
+    "test": {
+      "path": "tests/test_posttraining_sft_runtime.py",
+      "sha256": "723bde4b40c23371d18ed13bd1679623b6b7114a34104bd3ba3855fec523f7f4"
+    },
+    "token_consistent_seal": {
+      "path": "evidence/lumi-4b-sft-learning-candidate-token-consistent-seal-v0.1.json",
+      "sha256": "d72fc9bcec4e716f302c7498498e7779c822567c049892f3372ad956be1e860f"
+    }
+  },
+  "exact_successor_authorization_text": "I approve one bounded local-only Lumi encoded-shard-bound CPU SFT correctness smoke and fresh-resume successor. Bind token-consistent smoke-only seal file SHA-256 d72fc9bcec4e716f302c7498498e7779c822567c049892f3372ad956be1e860f and internal seal SHA-256 6dc5da1579e8a25f6ab5d61fda43ac39fdaa7586067e9d579b5320bd22801b17, encoded-shard manifest file SHA-256 92dc09947ae149d3f4727b125d5ab4251f7fd84f397738b3c43d95a9912e6565 and internal manifest SHA-256 f159cbaeeeb5877078127804a138f65c32bb30e8c6870008a2402472c4a00108, shard receipt file SHA-256 76947716ad0d36d0032e3765a6ef8610edd061662f58fe4fbf69fdd60dcd67ec and internal receipt SHA-256 292881ddb01548618bf8825fe0a94098ac3221dd70d0a827f19cc17c0c91f76c, shard verification file SHA-256 16731ccd1d74d9951f03c864033f46a612e928d154119dc77ffc355fc0dd628c and internal verification SHA-256 459e7b3723bea889b0fe7d60e00f154b5e667c0db0f3f7f716d0a01f3f3f90b2, SFT runtime SHA-256 6940238db74f7c79c06b2b4d8098314e10879601242b3987932dfda90ba0cced, CPU runner SHA-256 b0b8edd3c77eb544d19d152c622f4977e1f4d8797f95ab999f9b320ae2b54d91, model implementation SHA-256 bf7b908d282a752132918dddad648fd8435d3f8ad9db41eac1c2e64715926fad, runtime test SHA-256 723bde4b40c23371d18ed13bd1679623b6b7114a34104bd3ba3855fec523f7f4, and final-base binding SHA-256 1faaf5398f554b4708948b3298405a0451a31fe60027da359b54685a876b9172. Create only a deterministic tiny local correctness checkpoint, not the 4B model, with torch seed 11, vocabulary 65,536, hidden size 16, intermediate size 32, one layer, two attention heads, one key-value head, head dimension 8, and maximum positions 4,096. Use the exact encoded train split with cursor seed 2027, whose first four bound record lengths are 69, 20, 29, and 38 tokens, target two optimizer steps, batch size 1, gradient accumulation 2, learning rate 1e-4, weight decay 0.01, gradient norm 1.0, no warmup, and CPU eager attention. Run once uninterrupted to step 2 and once as step 1 plus a fresh-process resume to step 2. Require exact equality of final model tensors, loss sequence, data cursor, records seen, supervised tokens seen, optimizer state continuity, RNG state continuity, checkpoint manifests, shard identity, assistant-and-tool-only masking, and resume run fingerprint. Maximum 30 local runtime-minutes / 12 encoded record reads / 256 MiB additional private writes / 0 network bytes / 0 GPU use. It may create only the versioned plan, deterministic tiny source checkpoint, uninterrupted and resumed smoke outputs, raw-text-free report, and independent verification. No full 4B checkpoint restore, production SFT, dataset or shard mutation, registry or data-contract change, external API, download, S3 action, remote access, instance action, production promotion, or unrelated access.",
+  "planned_smoke": {
+    "batch_size": 1,
+    "cpu_only": true,
+    "cursor_seed": 2027,
+    "first_four_record_lengths": [
+      69,
+      20,
+      29,
+      38
+    ],
+    "gradient_accumulation_steps": 2,
+    "learning_rate": 0.0001,
+    "target_steps": 2,
+    "tiny_model": {
+      "head_dim": 8,
+      "hidden_size": 16,
+      "intermediate_size": 32,
+      "max_position_embeddings": 4096,
+      "num_attention_heads": 2,
+      "num_hidden_layers": 1,
+      "num_key_value_heads": 1,
+      "torch_seed": 11,
+      "vocab_size": 65536
+    }
+  },
+  "schema_version": "lumi.sft-cpu-smoke-preflight.v0.1",
+  "status": "PASS_cpu_smoke_ready_training_not_authorized"
+}

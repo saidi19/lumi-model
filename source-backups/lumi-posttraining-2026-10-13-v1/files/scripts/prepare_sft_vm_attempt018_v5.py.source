@@ -1,0 +1,278 @@
+"""Build the v0.5 source successor with bounded read-only transport recovery."""
+from __future__ import annotations
+
+import ast
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_v4 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.4"
+BASE_SHA = "29b71cbaf944c97867bc8466e19aa8ff3e89834ec12641ff0744f651b70d9bfb"
+PREVIOUS_BUILDER_SHA = "75e7eed96e4dc373bffbf79722903720ed1ae43508a77262d19332ccb0f39f8d"
+PREVIOUS_VERIFICATION = ROOT / "evidence/lumi-vm-attempt-018-source-v0.4-verification-v0.1.json"
+PREVIOUS_VERIFICATION_SHA = "51e9601a927d7e183e2c8006c625e8435e592bcf93905f3eb7288945532f8150"
+EXECUTION_RECOVERY = (
+    ROOT / "evidence/lumi-vm-attempt-018-v022-execution-cleanup-verification-v0.1.json"
+)
+EXECUTION_RECOVERY_SHA = "3b5c425666588bb7ef24c24599ad523bd411f68db1ee57526a0fdb4ea4c9c36f"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.5"
+ATTEMPT = previous.ATTEMPT
+TAR = previous.TAR
+SELECTION = previous.SELECTION
+
+
+OLD = b'''class SDKCloud:
+    """One-shot authenticated SDK transport; caller supplies existing clients.
+
+    Binary UserData/PublicKeyMaterial stay in memory, unlike JSON CLI argv.
+    Credential issuance/refresh is not supplied by this development component.
+    """
+
+    def __init__(self, clients):
+        need(type(clients) is dict and set(clients) == {"ec2", "sts"})
+        for service, client in clients.items():
+            meta = client.meta
+            need(meta.region_name == "us-east-1")
+            need(meta.endpoint_url == f"https://{service}.us-east-1.amazonaws.com")
+            need(meta.config.retries.get("total_max_attempts") == 1)
+            need(0 < meta.config.connect_timeout <= 3 and 0 < meta.config.read_timeout <= 5)
+            need(meta.config.proxies == {})
+        self.clients = clients
+
+    def cli(self, service, operation, **fields):
+        need((service, operation) in READS | WRITES)
+        with timeout(20):
+            return getattr(self.clients[service], operation.replace("-", "_"))(**fields)
+'''
+
+NEW = b'''READ_RETRY_DELAYS = (1, 2)
+MAX_READ_RETRIES = 8
+TRANSIENT_CODES = {
+    "InternalError",
+    "InvalidInstanceID.NotFound",
+    "PriorRequestNotComplete",
+    "RequestLimitExceeded",
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "ServiceUnavailable",
+    "Throttling",
+    "ThrottlingException",
+}
+TRANSIENT_EXCEPTIONS = {
+    "ConnectTimeoutError",
+    "ConnectionClosedError",
+    "EndpointConnectionError",
+    "ReadTimeoutError",
+}
+
+
+def transient_read_error(error):
+    response = getattr(error, "response", None)
+    if type(response) is dict:
+        details = response.get("Error", {})
+        metadata = response.get("ResponseMetadata", {})
+        if details.get("Code") in TRANSIENT_CODES:
+            return True
+        if metadata.get("HTTPStatusCode") in {500, 502, 503, 504}:
+            return True
+    return (
+        error.__class__.__module__ == "botocore.exceptions"
+        and error.__class__.__name__ in TRANSIENT_EXCEPTIONS
+    )
+
+
+class SDKCloud:
+    """One-shot writes with bounded retries for transient read-only failures."""
+
+    def __init__(self, clients, *, sleep=time.sleep):
+        need(type(clients) is dict and set(clients) == {"ec2", "sts"})
+        need(callable(sleep))
+        for service, client in clients.items():
+            meta = client.meta
+            need(meta.region_name == "us-east-1")
+            need(meta.endpoint_url == f"https://{service}.us-east-1.amazonaws.com")
+            need(meta.config.retries.get("total_max_attempts") == 1)
+            need(0 < meta.config.connect_timeout <= 3 and 0 < meta.config.read_timeout <= 5)
+            need(meta.config.proxies == {})
+        self.clients, self.sleep = clients, sleep
+        self.read_attempts = self.read_retries = 0
+
+    def cli(self, service, operation, **fields):
+        key = (service, operation)
+        need(key in READS | WRITES)
+        write = key in WRITES
+        delays = () if write else READ_RETRY_DELAYS
+        for attempt in range(len(delays) + 1):
+            if not write:
+                self.read_attempts += 1
+            try:
+                with timeout(20):
+                    return getattr(self.clients[service], operation.replace("-", "_"))(**fields)
+            except BaseException as error:
+                if (
+                    write
+                    or attempt == len(delays)
+                    or self.read_retries >= MAX_READ_RETRIES
+                    or not transient_read_error(error)
+                ):
+                    raise
+                self.read_retries += 1
+                self.sleep(delays[attempt])
+        need(False)
+'''
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_v5_source_rejected") from None
+
+
+def patch_transport(raw):
+    need(raw.count(OLD) == 1 and NEW not in raw)
+    return raw.replace(OLD, NEW)
+
+
+def close(base, seed, preserved):
+    current = dict(seed)
+    for _ in range(64):
+        hash_map, binding_map = {}, {}
+        for name, raw in base.items():
+            if name in preserved:
+                continue
+            after = previous.sha(current[name])
+            for anchored in (raw, seed[name]):
+                before = previous.sha(anchored)
+                need(before not in hash_map or hash_map[before] == after)
+                hash_map[before] = after
+                binding_map[before] = (after, len(current[name]))
+        following = {}
+        for name, raw in seed.items():
+            if name in preserved or name == TAR:
+                following[name] = raw
+            elif name.endswith(".json"):
+                following[name] = previous.update_json(raw, hash_map, binding_map)
+            elif name.endswith(".py"):
+                following[name] = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda match, mapping=hash_map: mapping.get(
+                        match[0].decode(), match[0].decode()
+                    ).encode(),
+                    raw,
+                )
+            else:
+                following[name] = raw
+        following[TAR] = previous.previous.rebuild_tar(base[TAR], following, base[SELECTION])
+        if following == current:
+            return current
+        current = following
+    raise ValueError("attempt018_v5_hash_cycle")
+
+
+def build():
+    need(previous.sha(Path(previous.__file__).read_bytes()) == PREVIOUS_BUILDER_SHA)
+    prior = json.loads(previous.read(PREVIOUS_VERIFICATION, PREVIOUS_VERIFICATION_SHA))
+    recovery = json.loads(previous.read(EXECUTION_RECOVERY, EXECUTION_RECOVERY_SHA))
+    need(
+        prior["source_release_sha256"] == BASE_SHA
+        and recovery["execution"]["attempt"] == ATTEMPT
+        and recovery["execution"]["run_instances_dispatch_count"] == 1
+        and recovery["execution"]["failed_stage"] == "launch"
+        and recovery["execution"]["primary_failure_diagnostic"]
+        == {"check": "none", "kind": "aws_service", "stage": "cloud_call"}
+        and recovery["execution"]["retry_allowed"] is False
+        and recovery["execution"]["real_4b_import"] is False
+        and recovery["cleanup_recovery"]["public_cost_resources_released"] is True
+        and recovery["retained"]["instance_state"] == "stopped"
+    )
+    manifest = json.loads(previous.read(BASE / "release.json", BASE_SHA))
+    base = {
+        name: previous.read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    candidates = [name for name in base if name == "scripts/provision_sft_vm_host_v5.py"]
+    need(candidates == ["scripts/provision_sft_vm_host_v5.py"])
+    seed = dict(base)
+    for name in candidates:
+        seed[name] = patch_transport(seed[name])
+    preserved = {
+        name
+        for name in base
+        if name != TAR
+        and (
+            "/" not in name
+            or name.startswith("evidence/")
+            or name.endswith((".gz", ".tar", ".pem"))
+        )
+    }
+    final = close(base, seed, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            need(raw == base[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    members = previous.previous.tar_members(final[TAR])
+    embedded = json.loads(members["release-manifest.json"])
+    need(
+        all(previous.sha(members[name]) == digest for name, digest in embedded.items())
+        and members["controls/input-selection.json"] == final[SELECTION]
+        and all(NEW in final[name] and OLD not in final[name] for name in candidates)
+    )
+    report = {
+        "schema": "lumi.vm-attempt018-source.v0.5",
+        "attempt": ATTEMPT,
+        "base_release_sha256": BASE_SHA,
+        "v022_execution_cleanup_verification_sha256": EXECUTION_RECOVERY_SHA,
+        "repair": "bounded_transient_read_only_transport_recovery",
+        "application_read_attempts_per_call_maximum": 3,
+        "application_read_retries_total_maximum": 8,
+        "sdk_attempts_per_call": 1,
+        "write_attempts_per_operation": 1,
+        "run_instances_attempts": 1,
+        "stop_instances_attempts": 1,
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "iam_source_action": "s3:GetObjectVersion",
+        "retention_implementation_preserved": True,
+        "watchdog_launch_interlock_preserved": True,
+        "network_quota_kind": "nftables_ip_packet_quota",
+        "wire_or_billing_byte_cap_claimed": False,
+        "changed_source_files": sorted(candidates),
+        "prior_evidence_byte_identical": True,
+        "cloud_calls": 0,
+        "payload_reads": 0,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "outputs": {
+            name: {"bytes": len(raw), "sha256": previous.sha(raw)}
+            for name, raw in sorted(final.items())
+        },
+    }
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in sorted((files | {"release.json": previous.encode(report)}).items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("read_transport_repair_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

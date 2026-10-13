@@ -1,0 +1,198 @@
+"""Synthetic failure paths only; never creates SDK clients or real credentials."""
+
+import importlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+f = importlib.import_module("sft_vm_safe_failure_v1")
+c = importlib.import_module("sft_vm_controller_credentials_v3")
+p = importlib.import_module("provision_sft_vm_host_v5")
+prior = importlib.import_module("tests.test_sft_vm_controller_credentials_v2")
+
+
+class CredentialRegression(prior.CredentialTests):
+    def setUp(self):
+        self.enterContext(patch.object(prior, "m", c))
+        super().setUp()
+
+    def test_clock_drift_diagnostic_survives_refresh_wrapper(self):
+        self.wall += 6
+        with self.assertRaises(f.Failure) as caught:
+            self.reader()
+        self.assertEqual(
+            caught.exception.diagnostic,
+            dict(stage="credential_active", kind="validation", check="clock_drift"),
+        )
+        self.export.assert_not_called()
+
+    def test_export_timeout_and_no_raw_error_text(self):
+        self.export.side_effect = TimeoutError("PRIVATE_SENTINEL")
+        with self.assertRaises(f.Failure) as caught:
+            self.reader()
+        self.assertEqual(caught.exception.diagnostic["stage"], "credential_export")
+        self.assertEqual(caught.exception.diagnostic["kind"], "timeout")
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(self.reader.last_diagnostic))
+        self.assertEqual(self.export.call_count, 1)
+
+    def test_identity_read_timeout_not_credential_schema_error(self):
+        from botocore.exceptions import ReadTimeoutError
+
+        self.client.get_caller_identity.side_effect = ReadTimeoutError(endpoint_url="PRIVATE_URL")
+        with self.assertRaises(f.Failure) as caught:
+            self.reader()
+        self.assertEqual(
+            caught.exception.diagnostic,
+            dict(stage="credential_identity", kind="read_timeout", check="none"),
+        )
+        self.assertNotIn("PRIVATE_URL", json.dumps(caught.exception.diagnostic))
+
+    def test_identity_account_validation_distinguished(self):
+        self.identity["Account"] = "PRIVATE_WRONG_ACCOUNT"
+        with self.assertRaises(f.Failure) as caught:
+            self.reader()
+        self.assertEqual(caught.exception.diagnostic["stage"], "credential_identity")
+        self.assertEqual(caught.exception.diagnostic["kind"], "validation")
+
+
+class ClassifierTests(unittest.TestCase):
+    def test_client_setup_preserves_credential_diagnostic(self):
+        reader = c.Reader(18100, clock=lambda: 100, wall=lambda: 100)
+        diagnostic = dict(stage="credential_export", kind="timeout", check="none")
+        with patch.object(c.Reader, "__call__", side_effect=f.Failure("redacted", diagnostic)):
+            with self.assertRaises(f.Failure) as caught:
+                c.Clients(reader)
+        self.assertEqual(caught.exception.diagnostic, diagnostic)
+        self.assertTrue(reader.closed)
+
+    def test_deadline_and_closed_codes(self):
+        now = [100]
+        reader = c.Reader(18100, clock=lambda: now[0], wall=lambda: now[0])
+        now[0] = 18100
+        with self.assertRaises(f.Failure) as caught:
+            reader.active()
+        self.assertEqual(caught.exception.diagnostic["check"], "deadline")
+        reader.closed = True
+        with self.assertRaises(f.Failure) as caught:
+            reader.active()
+        self.assertEqual(caught.exception.diagnostic["check"], "closed")
+
+    def test_exception_text_repr_and_response_never_accessed(self):
+        class Hostile(Exception):
+            def __str__(self):
+                raise AssertionError("do not format")
+
+            __repr__ = __str__
+
+            @property
+            def response(self):
+                raise AssertionError("do not inspect")
+
+        value = f.describe(Hostile("SECRET"), "launch")
+        self.assertEqual(value, dict(stage="launch", kind="unknown", check="none"))
+
+    def test_no_unbounded_external_stage_or_code(self):
+        result = f.describe(ValueError("SECRET"), "SECRET_STAGE", "SECRET_CHECK")
+        self.assertEqual(result, dict(stage="unknown", kind="validation", check="none"))
+        bad = f.Failure("SECRET", dict(stage="SECRET", kind="SECRET", check="SECRET"))
+        self.assertNotIn("SECRET", json.dumps(f.describe(bad)))
+
+    def test_supported_sdk_categories_without_request_data(self):
+        from botocore.exceptions import ClientError, ConnectTimeoutError, ReadTimeoutError, SSLError
+
+        cases = [
+            (
+                ClientError({"Error": {"Code": "SECRET", "Message": "SECRET"}}, "SECRET"),
+                "aws_service",
+            ),
+            (ReadTimeoutError(endpoint_url="SECRET"), "read_timeout"),
+            (ConnectTimeoutError(endpoint_url="SECRET"), "connect_timeout"),
+            (SSLError(endpoint_url="SECRET", error="SECRET"), "tls"),
+        ]
+        for error, kind in cases:
+            value = f.describe(error, "cloud_call")
+            self.assertEqual(value["kind"], kind)
+            self.assertNotIn("SECRET", json.dumps(value))
+            self.assertLess(len(json.dumps(value)), 128)
+
+
+class ProvisionTests(unittest.TestCase):
+    def transaction(self):
+        value = object.__new__(p.Transaction)
+        value.calls = 0
+        value.clock = lambda: 0
+        value.deadline = 1000
+        value.mutations = set()
+        value.save = lambda *args: None
+        return value
+
+    def test_cloud_call_one_dispatch_and_sanitized_diagnostic(self):
+        t = self.transaction()
+        calls = []
+
+        def fail(*args, **kw):
+            calls.append(1)
+            raise TimeoutError("SECRET")
+
+        t.cloud = types.SimpleNamespace(cli=fail)
+        with self.assertRaises(f.Failure) as caught:
+            t.cli("ec2", "describe-instances", InstanceIds=["synthetic"])
+        self.assertEqual(calls, [1])
+        self.assertEqual(caught.exception.diagnostic["kind"], "timeout")
+
+    def test_stop_failure_does_not_overwrite_primary(self):
+        t = self.transaction()
+        primary = dict(stage="launch", kind="timeout", check="none")
+        t.report = dict(primary_failure_diagnostic=primary, stopped_verified=False)
+
+        def fail(**kw):
+            raise ValueError("SECRET")
+
+        t.instance = fail
+        t.stop_failed_launch()
+        self.assertEqual(t.report["primary_failure_diagnostic"], primary)
+        self.assertEqual(t.report["stop_observation_diagnostic"]["stage"], "stop_observation")
+        self.assertTrue(t.report["stop_verification_unresolved"])
+
+    def test_primary_saved_before_stop_recovery(self):
+        # Simulate the orchestration to ensure recording cannot skip STOP.
+        report = {}
+        tx = types.SimpleNamespace(report=report, launched=True, binding={}, launch={})
+        tx.save = lambda *args: None
+        tx.preflight = lambda: None
+        tx.resources = lambda: b"synthetic"
+
+        def fail():
+            raise TimeoutError("SECRET")
+
+        tx.launch_and_wait = fail
+        tx.observations = lambda: {}
+        observed = []
+        tx.stop_failed_launch = lambda: observed.append(dict(report))
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "new"
+            with (
+                patch.object(p, "Transaction", return_value=tx),
+                patch.object(p, "PINS", {"synthetic": p.hashlib.sha256(b"ok").hexdigest()}),
+                patch.object(p.INPUTS, "read", return_value=b"ok"),
+                patch.object(p.INPUTS, "sync"),
+                patch.object(p.initial, "source_bytes"),
+                patch.object(p.setup.delivery, "source_bytes"),
+                patch.object(p.connection, "safe_path"),
+            ):
+                with self.assertRaises(ValueError):
+                    p._provision_and_setup_admitted_once(output, cloud=None)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["primary_failure_diagnostic"]["stage"], "launch")
+        self.assertEqual(observed[0]["primary_failure_diagnostic"]["kind"], "timeout")
+        self.assertNotIn("SECRET", json.dumps(report))
+
+
+if __name__ == "__main__":
+    unittest.main()

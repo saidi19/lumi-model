@@ -1,0 +1,88 @@
+"""Synthetic public-key readback correction; no AWS or real keys."""
+
+import base64
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_initial_provisioning_v2.py").read_text()
+old = 'm = importlib.import_module("provision_sft_vm_host_v2")'
+assert source.count(old) == 1
+inherited = types.ModuleType("_initial_provisioning_v3_inherited")
+inherited.__file__ = str(ROOT / "tests/test_sft_vm_initial_provisioning_v2.py")
+exec(compile(source.replace(old, 'm = importlib.import_module("provision_sft_vm_host_v3")'),
+             inherited.__file__, "exec"), inherited.__dict__)
+m = inherited.m
+
+
+class InitialV3Tests(inherited.InitialTests):
+    pass
+
+
+class PublicKeyTests(unittest.TestCase):
+    key = b"ssh-ed25519 " + base64.b64encode(
+        b"\0\0\0\x0bssh-ed25519\0\0\0\x20" + b"s" * 32)
+
+    def test_optional_comment_and_single_line_endings(self):
+        for tail in (b"", b" fixture-comment", b" comment with spaces", b"\tcomment",
+                     b"\n", b" comment\r\n"):
+            with self.subTest(tail=tail):
+                self.assertEqual(m.readback_public_key(self.key + tail), self.key)
+
+    def test_local_generated_key_parser_remains_strict(self):
+        with self.assertRaises(ValueError):
+            m.public_key(self.key + b" comment")
+        self.assertEqual(m.public_key(self.key), self.key)
+
+    def test_reject_multiline_controls_options_wrong_algorithm_and_bad_blob(self):
+        cases = [self.key + b"\n" + self.key, self.key + b"\n\n", self.key + b"\r",
+                 self.key + b" \x00comment", self.key + b" \x1bcomment",
+                 self.key + b" \xffcomment", b'command="bad" ' + self.key,
+                 self.key.replace(b"ssh-ed25519", b"ssh-rsa", 1),
+                 b"ssh-ed25519 !!!! comment", b"ssh-ed25519 AAAA comment",
+                 b"", self.key.decode(), self.key + b" " + b"x" * 1024]
+        for value in cases:
+            with self.subTest(kind=type(value).__name__), self.assertRaises(ValueError):
+                m.readback_public_key(value)
+
+    def test_different_valid_blob_never_compares_equal(self):
+        other = b"ssh-ed25519 " + base64.b64encode(
+            b"\0\0\0\x0bssh-ed25519\0\0\0\x20" + b"t" * 32)
+        self.assertNotEqual(m.readback_public_key(other + b" comment"), self.key)
+
+
+class ProvisionV3Tests(inherited.ProvisionTests):
+    def readback(self, transform):
+        original = self.cloud.cli
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if operation == "describe-key-pairs":
+                transform(value["KeyPairs"][0])
+            return value
+        self.cloud.cli = cli
+
+    def test_comment_readback_reaches_synthetic_setup_once(self):
+        self.readback(lambda row: row.update(PublicKey=row["PublicKey"] + " fixture-comment"))
+        value = self.call()
+        self.assertTrue(value["report"]["setup_completed"])
+        self.assertEqual(self.cloud.launch_count, 1)
+        self.assertEqual(sum(op == "import-key-pair" for _, op, _ in self.cloud.calls), 1)
+        for path in self.output.rglob("*.json"):
+            self.assertNotIn(b"fixture-comment", path.read_bytes())
+
+    def test_wrong_material_with_comment_never_launches(self):
+        other = (b"ssh-ed25519 " + base64.b64encode(
+            b"\0\0\0\x0bssh-ed25519\0\0\0\x20" + b"t" * 32)).decode()
+        self.readback(lambda row: row.update(PublicKey=other + " comment"))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.launch_count, 0)
+        self.assertFalse(any(op == "create-instance-connect-endpoint"
+                             for _, op, _ in self.cloud.calls))
+
+    def test_ownership_still_rejected_with_valid_commented_key(self):
+        self.readback(lambda row: row.update(PublicKey=row["PublicKey"] + " comment", Tags=[]))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.launch_count, 0)

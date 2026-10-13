@@ -1,0 +1,221 @@
+"""ProcessPeers -> private bootstrap -> SocketTransport acquisition adapter.
+
+Construction is inert. A trusted authorize(tuple_of_canonical_packet_bytes)
+must authenticate the exact source/target/data/attempt and all eight packets
+before ProcessPeers can spawn. This callback, ProcessPeers.admit and each cold
+child's authenticator are external capabilities, NOT implemented authority or
+an approval inferred from packet hashes. Public launch remains disabled.
+
+Use acquire/check_health/retire as SocketTransport callbacks. Until all eight
+ACKs and a final health check, this adapter owns the parent sockets. Failure
+retires its fresh backend and closes only still-identified sockets. Successful
+acquire transfers endpoints to SocketTransport, which closes them. No retry.
+
+Bootstrap traffic has one cumulative externally supplied byte/read budget,
+separate from subsequent protocol/model I/O; the outer admission must account
+for both. The backend's independent guardian covers the shared deadline. This
+adapter does not install host/RAM/disk/network/GPU controls or issue authority.
+No private packet, token, source path, exception text or receipt is logged.
+"""
+
+import os
+import threading
+import time
+
+from .posttraining_sft_private_bootstrap_v1 import BootstrapWire, decode_packet, encode_packet
+from .posttraining_sft_process_peers_v1 import ProcessPeers
+from .posttraining_sft_worker_client_v2 import ANCILLARY_BYTES, _socket_identity
+
+ERRORS = frozenset({"invalid_arguments", "packet_rejected", "owner_mismatch",
+                    "already_consumed", "reentry", "deadline_exhausted",
+                    "authority_rejected", "acquisition_failed", "health_failed",
+                    "handoff_failed", "cleanup_failed"})
+
+
+class BootstrappedPeersError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "handoff_failed"
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise BootstrappedPeersError(code) from None
+
+
+def positive(value):
+    return type(value) is int and 0 < value < 2**63
+
+
+class BootstrappedPeers:
+    """One invocation, eight ordered packets, one same-owner ProcessPeers.
+
+authorize() returns exactly None on success. The caller must supply real
+authentication, not a fixture callback. No callback can reset consumed state.
+retire() is idempotent only after verified cleanup, never a cleanup retry.
+"""
+
+    def __init__(self, *, peers, packets, maximum_wire_bytes, maximum_reads, authorize):
+        need(not hasattr(self, "_owner") and type(peers) is ProcessPeers
+             and peers._owner == (os.getpid(), threading.get_ident())
+             and peers._state == "idle" and not peers._retired
+             and type(packets) is tuple and len(packets) == 8
+             and positive(maximum_wire_bytes) and positive(maximum_reads)
+             and callable(authorize), "invalid_arguments")
+        try:
+            raw = tuple(encode_packet(packet) for packet in packets)
+            values = tuple(decode_packet(item) for item in raw)
+            shared = {k: v for k, v in values[0].items() if k not in {"rank", "token"}}
+            need(all(value["rank"] == rank
+                     and value["runtime_metadata"]["deadline_ns"] == peers._deadline
+                     and {k: v for k, v in value.items() if k not in {"rank", "token"}} == shared
+                     for rank, value in enumerate(values)), "packet_rejected")
+            need(len({value["token"] for value in values}) == 8, "packet_rejected")
+            # At least one recvmsg per fixed ACK, including ancillary capacity.
+            minimum = sum(4 + len(item) + len(BootstrapWire._ack(None, item))
+                          + ANCILLARY_BYTES for item in raw)
+            need(maximum_wire_bytes >= minimum and maximum_reads >= 8, "invalid_arguments")
+        except BootstrappedPeersError:
+            raise
+        except BaseException:
+            raise BootstrappedPeersError("packet_rejected") from None
+        self._owner = os.getpid(), threading.get_ident()
+        self._peers, self._raw, self._authorize = peers, raw, authorize
+        self._deadline = peers._deadline
+        self._wire_cap, self._read_cap = maximum_wire_bytes, maximum_reads
+        self._state, self._failure, self._busy = "idle", None, False
+        self._pairs, self._identities = (), {}
+        self._wire = self._reads = self._acked = self._last = 0
+        self._retired = self._cleanup_failed = False
+
+    def __repr__(self):
+        return "<BootstrappedPeers: private acquisition>"
+
+    def _owned(self):
+        need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        if self._busy:
+            self._failure = self._failure or "reentry"
+            raise BootstrappedPeersError(self._failure) from None
+
+    def _live(self):
+        need(self._failure is None, self._failure or "handoff_failed")
+        now = time.monotonic_ns()
+        need(type(now) is int and self._last <= now < self._deadline, "deadline_exhausted")
+        self._last = now
+
+    def _health(self):
+        self._live()
+        need(self._peers.check_health(False) is None, "health_failed")
+        self._live()
+
+    def _retire(self, success):
+        if self._retired:
+            need(not self._cleanup_failed, "cleanup_failed")
+            return
+        self._retired = True
+        try:
+            need(self._peers.retire(success) is None, "cleanup_failed")
+        except BaseException:
+            self._cleanup_failed = True
+        finally:
+            # Empty after successful transfer; never close transport-owned sockets.
+            for pair in self._pairs:
+                for sock in pair:
+                    try:
+                        if _socket_identity(sock) != self._identities[id(sock)]:
+                            raise ValueError()
+                        sock.close()
+                    except BaseException:
+                        self._cleanup_failed = True
+                        try:
+                            sock.detach()  # Do not close a reused numeric descriptor later.
+                        except BaseException:
+                            pass
+            self._pairs, self._identities, self._raw = (), {}, ()
+        need(not self._cleanup_failed, "cleanup_failed")
+
+    def acquire(self):
+        self._owned()
+        need(self._state == "idle", "already_consumed")
+        self._state, self._busy = "starting", True
+        stage = "authority_rejected"
+        try:
+            self._live()
+            need(self._authorize(self._raw) is None, "authority_rejected")
+            self._live()
+            stage = "acquisition_failed"
+            # Exact backend owns partial failure cleanup, transfers all or none.
+            self._pairs = self._peers.acquire()
+            self._identities = {id(sock): _socket_identity(sock)
+                                for pair in self._pairs for sock in pair}
+            for raw, (_, control) in zip(self._raw, self._pairs, strict=True):
+                stage = "health_failed"
+                self._health()
+                stage = "handoff_failed"
+                sender = BootstrapWire(control, deadline_ns=self._deadline,
+                                       maximum_wire_bytes=self._wire_cap-self._wire,
+                                       maximum_reads=self._read_cap-self._reads)
+                try:
+                    sender.send(decode_packet(raw), admit=lambda: None)
+                finally:
+                    counts = sender.summary()
+                    self._wire += counts["wire_bytes_reserved"]
+                    self._reads += counts["read_calls"]
+                self._acked += 1
+            stage = "health_failed"
+            self._health()
+            result, self._pairs = self._pairs, ()
+            self._identities, self._raw = {}, ()
+            self._state = "active"
+            return result
+        except BaseException as error:
+            self._failure = self._failure or (error.code if type(error) is BootstrappedPeersError
+                                              else stage)
+            self._state = "failed"
+            try:
+                self._retire(False)
+            except BaseException:
+                self._cleanup_failed = True
+            raise BootstrappedPeersError(self._failure) from None
+        finally:
+            self._busy = False
+
+    def check_health(self, retiring):
+        self._owned()
+        need(type(retiring) is bool and self._state == "active", "health_failed")
+        self._busy = True
+        try:
+            self._live()
+            need(self._peers.check_health(retiring) is None, "health_failed")
+            self._live()
+        except BaseException as error:
+            self._failure = self._failure or (error.code if type(error) is BootstrappedPeersError
+                                              else "health_failed")
+            self._state = "failed"
+            raise BootstrappedPeersError(self._failure) from None
+        finally:
+            self._busy = False
+
+    def retire(self, success):
+        self._owned()
+        need(type(success) is bool and (not success or self._state == "active" or self._retired),
+             "invalid_arguments")
+        self._busy = True
+        try:
+            self._retire(success and self._failure is None)
+            need(self._failure is None or not success, self._failure or "cleanup_failed")
+            self._state = "retired" if self._failure is None else "failed"
+        except BaseException:
+            self._state = "failed"
+            self._failure = self._failure or "cleanup_failed"
+            raise BootstrappedPeersError(self._failure) from None
+        finally:
+            self._busy = False
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-bootstrapped-peers-summary.v0.1",
+                "state": self._state, "failure_code": self._failure,
+                "handoffs_acknowledged": self._acked, "wire_bytes_reserved": self._wire,
+                "read_calls": self._reads, "cleanup_attempted": self._retired,
+                "cleanup_failed": self._cleanup_failed, "execution_authorized": False,
+                "os_resource_enforcement": False, "production_eligible": False}

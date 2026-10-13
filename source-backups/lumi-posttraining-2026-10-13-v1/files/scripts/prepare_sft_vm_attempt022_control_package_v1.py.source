@@ -1,0 +1,384 @@
+"""Prepare exact fresh control proposals locally, without approvals or deployment."""
+
+import ast
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_v1 as source
+from scripts import verify_sft_vm_attempt022_source_v1 as verifier
+
+ROOT = source.ROOT
+ATTEMPT, OLD, CIDR = source.NEW, source.OLD, source.NEW_CIDR
+RELEASE = "artifacts/lumi-vm-attempt-022-source-v0.1"
+RELEASE_SHA = "5cd83aa6c3ce497e45170a5e3165ae28705bf08a92b191098b6b4f66c48f7a8a"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-022-source-verification-v0.1.json"
+SOURCE_PROOF_SHA = "9a152480ad7a8b04866b47e7bf648f7ce7a8dae4aee9273e0d0e832c11be5f66"
+ABSENCE = "evidence/lumi-vm-attempt-022-control-target-absence-v0.1.json"
+ABSENCE_SHA = "0fae9b018c0565050952bd3f277a94d1c2e544d2d5cb033f2f00165df6f2ca18"
+ABSENCE_PROOF = "evidence/lumi-vm-attempt-022-control-target-absence-verification-v0.1.json"
+ABSENCE_PROOF_SHA = "8258b2b924aabb1baa158f532e933e820e636c66b00343c6e2503ff0eca28860"
+BASE_PLAN = "artifacts/lumi-vm-attempt-021-control-plan-v0.2/plan.json"
+BASE_PLAN_SHA = "0eaa303701eeb464e7a65826b455e90efc398828c29999f5613fe56dcf2ab1e1"
+PLAN_DIR = "artifacts/lumi-vm-attempt-022-control-plan-v0.1"
+HELPER = "scripts/prepare_sft_vm_attempt022_deployment_bindings_v1.py"
+WATCH = "scripts/execute_sft_vm_inert_watchdog_v15.py"
+BUCKET = "scripts/sft_vm_dedicated_cleanup_bucket_v13.py"
+WATCH_TEST = "tests/test_sft_vm_inert_watchdog_v15.py"
+BUCKET_TEST = "tests/test_sft_vm_dedicated_cleanup_bucket_v13.py"
+WATCH_PROPOSAL = "configs/lumi-vm-attempt-022-watchdog-execution-proposal-v0.1.json"
+BUCKET_PROPOSAL = "configs/lumi-vm-attempt-022-cleanup-bucket-proposal-v0.1.json"
+OUTPUT = "artifacts/lumi-vm-attempt-022-control-package-v0.1/release.json"
+PINS = {
+    "scripts/verify_sft_vm_attempt022_source_v1.py":
+        "bdd584cbeec093fddb085e557242aeb5a030040a65acb25ca023601e003b7a1f",
+    "scripts/prepare_sft_vm_attempt021_deployment_bindings_v1.py":
+        "f6457f1d7b25d52eeaf8627236f4e3931c222e6c7d57495cae206bfdc6b5ceab",
+    "scripts/execute_sft_vm_inert_watchdog_v14.py":
+        "f0dd214fce4857f5ffde1b2fad57daccf4447ad69645724999c9215cc3f0804f",
+    "scripts/sft_vm_dedicated_cleanup_bucket_v12.py":
+        "fe4ec9ac97ca0c79c9a275ffd46dd15b9a4de3ec45c194636cc17aea61455271",
+    "tests/test_sft_vm_inert_watchdog_v14.py":
+        "1d0c1ad1802f533e09baf6152464bb4438a066864c1a6f8d2e1b12da990bd635",
+    "tests/test_sft_vm_dedicated_cleanup_bucket_v12.py":
+        "6dc790d396f2ae2c061c094fbf870902bad0bf748b110a54ed7aab18db4ed249",
+}
+need, sha, encode = source.need, source.sha, source.encode
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def write_new(name, raw):
+    path = ROOT / name
+    need(not path.exists() and not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+
+
+def rewrite(raw):
+    for before, after in (
+        (OLD, ATTEMPT),
+        ("attempt-021", "attempt-022"),
+        ("attempt021", "attempt022"),
+        ("Attempt-021", "Attempt-022"),
+        (source.OLD_CIDR, CIDR),
+        ("lumi-vm-private-outer-execution-v0.26", "lumi-vm-private-outer-execution-v0.27"),
+    ):
+        raw = raw.replace(before.encode(), after.encode())
+    return raw
+
+
+def build_plan():
+    for name, digest in PINS.items():
+        read(name, digest)
+    verifier.verify()
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    absence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    absence_proof = json.loads(read(ABSENCE_PROOF, ABSENCE_PROOF_SHA))
+    for name, digest in absence_proof["bindings"].items():
+        read(name, digest)
+    need(absence["attempt"] == ATTEMPT and absence["target_names_absent"])
+    need(absence["status"] == "fresh_targets_absent_network_slot_free")
+    need(absence["frozen_vpc_endpoint_gate_passed"] and not absence["blocking_vpc_endpoints"])
+    need(absence["observations"]["selected_cidr"] == CIDR)
+    need(absence["cloud_mutations"] == absence["object_access"] == absence["instance_actions"] == 0)
+    need(absence_proof["source_release_sha256"] == RELEASE_SHA)
+    need(proof["new_execution_authorized"] is False)
+    base = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    plan = json.loads(rewrite(encode(base)))
+    for key in (
+        "host_key_repair",
+        "initial_proof_diagnostics",
+        "network_selector_correction_evidence",
+        "v021_launch_denial_evidence",
+        "v03_authentication_failure_evidence",
+        "predecessor_endpoint_cleanup",
+        "integration_report_sha256",
+    ):
+        plan[key] = base[key]
+    plan["setup_transfer_native_qualification"] = dict(
+        base["setup_transfer_native_qualification"],
+        historical_only=True,
+        fresh_identity_native_transfer_qualified=False,
+    )
+    bindings = [
+        name.removeprefix("artifacts/lumi-vm-attempt-021-source-v0.1/")
+        for name in base["source_bindings"]
+    ]
+    bindings.append(source.LOADER)
+    plan.update(
+        schema="lumi.vm-attempt-022-control-plan.v0.1",
+        status="control_package_prepared_separate_deployment_approval_required",
+        attempt=ATTEMPT,
+        release_manifest_sha256=RELEASE_SHA,
+        source_preparation_evidence=dict(path=SOURCE_PROOF, sha256=SOURCE_PROOF_SHA),
+        source_bindings={RELEASE + "/" + name: manifest["outputs"][name] for name in bindings},
+        control_target_absence_evidence=dict(path=ABSENCE, sha256=ABSENCE_SHA),
+        control_target_absence_verification=dict(path=ABSENCE_PROOF, sha256=ABSENCE_PROOF_SHA),
+        network_candidate_cidr=CIDR,
+        network_candidate_live_availability_verified=True,
+        network_candidate_verification_scope="Scoped CIDR overlap and VPC endpoint-slot snapshot "
+        "only; full quota/route/network/CPU admission still required.",
+        frozen_endpoint_gate_clearance=dict(
+            readonly_snapshot_passed=True, fresh_full_network_admission_passed=False
+        ),
+        watchdog_diagnostic_fix_evidence=dict(
+            path=str(source.PROOF.relative_to(ROOT)), sha256=source.PROOF_SHA
+        ),
+        required_control_proofs=[],
+        successful_readonly_preflight=None,
+        approval_record=None,
+        execution_permitted=False,
+        gate_5_complete=False,
+        deployment_sequence=["unarmed_watchdog", "dedicated_private_cleanup_bucket"],
+        stop_on_either_failure=True,
+        maximum_control_calls_combined=65,
+        maximum_control_runtime_seconds_combined=900,
+    )
+    plan["watchdog"].update(
+        status="prepared_not_deployed",
+        expected_code_sha256_base64=manifest["watchdog_code_sha256_base64"],
+    )
+    plan["cpu_scope_reference"].update(
+        execution_entry_sha256=None, status="fresh_final_cpu_entry_not_prepared_not_authorized"
+    )
+    plan["predecessor_state"] = dict(
+        operational_predecessor_attempt=OLD,
+        execution_evidence=str(source.FAILURE.relative_to(ROOT)),
+        execution_evidence_sha256=source.FAILURE_SHA,
+        execution_marker_consumed=True,
+        cpu_instance_launched=False,
+        temporary_network_cleanup_verified=True,
+        predecessor_resources_mutated=False,
+        retained_host_attempt=absence["predecessor_retention"]["attempt"],
+        retained_host_snapshot=dict(path=ABSENCE, sha256=ABSENCE_SHA),
+        deletion_authorized=False,
+        retry_allowed=False,
+        real_4b_import=False,
+    )
+    plan["source_repair"].update(
+        allowlisted_watchdog_error_codes_bound=True,
+        watchdog_failure_cause_proven=False,
+        qualified_fix_implementation_sha256=source.FIX_SHA,
+    )
+    plan["readiness_review"].update(
+        decision="exact_two_control_deployment_approval_required",
+        risk="Fresh target absence and local fixed source are proved. New identity controls, "
+        "full admission, checkpoint acquisition and import remain unproved.",
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Approve and deploy only the two bounded controls sequentially; stop on either failure.",
+        "Verify new controls independently and pass fresh read-only CPU/network/store admission.",
+        "Prepare and separately approve the final one-shot CPU import/private-retention entry.",
+    ]
+    return plan
+
+
+def helper_source(plan_sha, release_sha):
+    name = "scripts/prepare_sft_vm_attempt021_deployment_bindings_v1.py"
+    raw = rewrite(read(name, PINS[name]))
+    values = dict(
+        OLD=OLD,
+        RELEASE=RELEASE,
+        RELEASE_SHA=RELEASE_SHA,
+        SOURCE_PROOF=SOURCE_PROOF,
+        SOURCE_PROOF_SHA=SOURCE_PROOF_SHA,
+        ABSENCE=ABSENCE,
+        ABSENCE_SHA=ABSENCE_SHA,
+        PLAN=PLAN_DIR + "/plan.json",
+        PLAN_SHA=plan_sha,
+        PLAN_RELEASE=PLAN_DIR + "/release.json",
+        PLAN_RELEASE_SHA=release_sha,
+    )
+    for name, value in values.items():
+        row = next(
+            node
+            for node in ast.parse(raw).body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        lines = raw.splitlines(keepends=True)
+        lines[row.lineno - 1 : row.end_lineno] = [f"{name} = {value!r}\n".encode()]
+        raw = b"".join(lines)
+    start, end = raw.index(b"def verify():"), raw.index(b"\ndef build():")
+    validation = f"""def verify():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    absence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    checked = json.loads(read(
+        {ABSENCE_PROOF!r},
+        {ABSENCE_PROOF_SHA!r}))
+    need(manifest["attempt"] == ATTEMPT and manifest["operational_predecessor"] == OLD)
+    need(manifest["receipt_file_count"] == 19 and len(manifest["outputs"]) == 156)
+    need(manifest["execution_permitted"] is False)
+    need(proof["attempt"] == ATTEMPT and proof["source_release_sha256"] == RELEASE_SHA)
+    need(proof["qualified_fix_only_loader_ast_verified"]
+         and proof["new_execution_authorized"] is False)
+    need(absence["attempt"] == ATTEMPT and absence["target_names_absent"])
+    need(absence["status"] == "fresh_targets_absent_network_slot_free")
+    need(absence["frozen_vpc_endpoint_gate_passed"] and not absence["blocking_vpc_endpoints"])
+    need(absence["cloud_mutations"] == absence["object_access"] == absence["instance_actions"] == 0)
+    need(absence["predecessor_retention"]["instance_state"] == "stopped")
+    need(absence["predecessor_retention"]["encrypted_volume_count"] == 2)
+    need(checked["attempt"] == ATTEMPT and checked["source_release_sha256"] == RELEASE_SHA)
+    need(checked["control_deployment_authorized"] is False)
+    need(plan_release["attempt"] == ATTEMPT and plan_release["plan_sha256"] == PLAN_SHA)
+    need(plan_release["source_release_sha256"] == RELEASE_SHA)
+    need(plan_release["control_target_absence_sha256"] == ABSENCE_SHA)
+    need(
+        plan_release["target_verification_sha256"]
+        == {ABSENCE_PROOF_SHA!r}
+    )
+    need(plan_release["fresh_control_deployment_required"] is True)
+    need(plan_release["execution_permitted"] is False)
+    for name, digest in checked["bindings"].items():
+        read(name, digest)
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    return manifest
+
+""".encode()
+    return raw[:start] + validation + raw[end:]
+
+
+def control_source(name, helper_sha, plan_sha):
+    raw = rewrite(read(name, PINS[name]))
+    for before, after in (
+        ("prepare_sft_vm_attempt022_deployment_bindings_v1.py", Path(HELPER).name),
+        (PINS["scripts/prepare_sft_vm_attempt021_deployment_bindings_v1.py"], helper_sha),
+        (BASE_PLAN_SHA, plan_sha),
+        ("control-plan-v0.2/plan.json", "control-plan-v0.1/plan.json"),
+    ):
+        need(before.encode() in raw)
+        raw = raw.replace(before.encode(), after.encode())
+    return raw
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare():
+    names = [
+        PLAN_DIR + "/plan.json",
+        PLAN_DIR + "/release.json",
+        HELPER,
+        WATCH,
+        BUCKET,
+        WATCH_TEST,
+        BUCKET_TEST,
+        WATCH_PROPOSAL,
+        BUCKET_PROPOSAL,
+        OUTPUT,
+    ]
+    need(all(not (ROOT / name).exists() for name in names))
+    raw = encode(build_plan())
+    release = dict(
+        schema="lumi.vm-attempt-022-control-plan-release.v0.1",
+        attempt=ATTEMPT,
+        plan_sha256=sha(raw),
+        plan_bytes=len(raw),
+        source_release_sha256=RELEASE_SHA,
+        control_target_absence_sha256=ABSENCE_SHA,
+        target_verification_sha256=ABSENCE_PROOF_SHA,
+        fresh_control_deployment_required=True,
+        execution_permitted=False,
+    )
+    released = encode(release)
+    helper = helper_source(sha(raw), sha(released))
+    watch = control_source("scripts/execute_sft_vm_inert_watchdog_v14.py", sha(helper), sha(raw))
+    bucket = control_source("scripts/sft_vm_dedicated_cleanup_bucket_v12.py", sha(helper), sha(raw))
+    bodies = [
+        (PLAN_DIR + "/plan.json", raw),
+        (PLAN_DIR + "/release.json", released),
+        (HELPER, helper),
+        (WATCH, watch),
+        (BUCKET, bucket),
+    ]
+    for original, destination in (
+        ("tests/test_sft_vm_inert_watchdog_v14.py", WATCH_TEST),
+        ("tests/test_sft_vm_dedicated_cleanup_bucket_v12.py", BUCKET_TEST),
+    ):
+        body = rewrite(read(original, PINS[original]))
+        body = body.replace(
+            b"execute_sft_vm_inert_watchdog_v14", b"execute_sft_vm_inert_watchdog_v15"
+        )
+        body = body.replace(
+            b"sft_vm_dedicated_cleanup_bucket_v12", b"sft_vm_dedicated_cleanup_bucket_v13"
+        )
+        body = body.replace(b"3179537f150b45548946f8114e8b73ca", OLD.encode())
+        bodies.append((destination, body))
+    for name, body in bodies:
+        if name.endswith(".py"):
+            compile(body, name, "exec")
+    (ROOT / PLAN_DIR).mkdir(mode=0o700)
+    for name, body in bodies:
+        write_new(name, body)
+    watch_module, bucket_module = (
+        load_module("_prepared_watchdog22", WATCH),
+        load_module("_prepared_cleanup22", BUCKET),
+    )
+    watch_module.sources()
+    bucket_module.sources()
+    for name, module in ((WATCH_PROPOSAL, watch_module), (BUCKET_PROPOSAL, bucket_module)):
+        body = module.encode(module.expected_proposal())
+        write_new(name, body)
+        bodies.append((name, body))
+    record = dict(
+        schema="lumi.vm-attempt022-control-package-release.v0.1",
+        attempt=ATTEMPT,
+        status="prepared_not_authorized",
+        plan_sha256=sha(raw),
+        helper_sha256=sha(helper),
+        outputs={name: dict(bytes=len(body), sha256=sha(body)) for name, body in bodies},
+        qualified_deployment_mechanics_unchanged=True,
+        prior_evidence_preserved=True,
+        deployment_sequence=["unarmed_watchdog", "dedicated_private_cleanup_bucket"],
+        stop_on_either_failure=True,
+        approvals_created=False,
+        deployments_created=False,
+        aws_calls=0,
+        cloud_mutations=0,
+        cpu_launch_authorized=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    (ROOT / OUTPUT).parent.mkdir(mode=0o700)
+    write_new(OUTPUT, encode(record))
+    return record
+
+
+def run(**_arguments):
+    raise ValueError("local_preparation_is_not_deployment_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--prepare-once"])
+    result = prepare()
+    print(
+        json.dumps(
+            {k: result[k] for k in ("status", "plan_sha256", "helper_sha256", "aws_calls")},
+            sort_keys=True,
+        )
+    )

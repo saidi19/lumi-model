@@ -1,0 +1,415 @@
+"""Offline attempt-018 source repair: immutable S3 versions and accurate controls.
+
+This creates a fresh source release only.  It performs no AWS request, payload
+read, instance action, credential issuance, import, training, or retry of v0.21.
+"""
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import re
+import tarfile
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as old_closure
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.2"
+BASE_SHA = "7ec91d363c3ab1422bb35c35757e8ae04fa166d5943c3bdc18aa2952d8b64602"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.3"
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+DENIAL = ROOT / "evidence/lumi-vm-attempt-018-v021-launch-denial-v0.1.json"
+DENIAL_SHA = "d74b741f9e20f44307c6c3bcf6e9d8399819918fdc1b9839d88437cc5f67ab64"
+METADATA = ROOT / "scripts/prepare_sft_vm_fullsize_metadata_v2.py"
+METADATA_SHA = "4295f5bfffddd4de3e7d7f94742dfc74fb53a05db1d107968f651fc8bc0a0a9c"
+METADATA_TEST = ROOT / "tests/test_sft_vm_fullsize_metadata_v2.py"
+METADATA_TEST_SHA = "8b2f05c1a98b1be9738dd1418f77a52ae58e33c4c23ed22ccbc567e70c25627f"
+TAR = "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar"
+SELECTION = "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"
+STAGING = "src/lumi/posttraining_vm_fullsize_staging_v1.py"
+TRANSPORT = "src/lumi/posttraining_vm_fullsize_transport_v1.py"
+PERMISSIONS = "scripts/prepare_sft_vm_acquisition_permissions_v2.py"
+ISSUER = "scripts/issue_sft_vm_acquisition_credentials_v1.py"
+PROPOSALS = (
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+    "identity/host-proposal.json",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_v3_source_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    body = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return body.encode() + b"\n"
+
+
+def pretty(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def replace_once(raw, before, after):
+    before, after = before.encode(), after.encode()
+    need(raw.count(before) == 1)
+    return raw.replace(before, after)
+
+
+def metadata_selection():
+    old_closure.read(METADATA, METADATA_SHA)
+    old_closure.read(METADATA_TEST, METADATA_TEST_SHA)
+    spec = importlib.util.spec_from_file_location("_attempt018_metadata_v2", METADATA)
+    module = importlib.util.module_from_spec(spec)
+    need(spec.loader is not None)
+    spec.loader.exec_module(module)
+    value = module.prepare()
+    need(
+        value["object_versions_bound"] is True
+        and value["object_count"] == value["versioned_object_count"] == 22
+        and value["object_bytes"] == 48_843_765_443
+        and value["remote_availability_verified"] is False
+        and value["execution_permitted"] is False
+    )
+    return (json.dumps(value, sort_keys=True) + "\n").encode()
+
+
+def patch_staging(raw, selection_sha):
+    old_selection = "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42"
+    raw = replace_once(
+        raw,
+        f'SELECTION_SHA256 = "{old_selection}"',
+        f'SELECTION_SHA256 = "{selection_sha}"',
+    )
+    raw = replace_once(
+        raw,
+        '{"role", "target_relative_path", "key", "bytes", "sha256"}',
+        '{"role", "target_relative_path", "key", "version_id", "bytes", "sha256"}',
+    )
+    raw = replace_once(
+        raw,
+        'and type(row["key"]) is str and 1 <= len(row["key"]) <= 1024\n'
+        '                 and type(row["sha256"]) is str',
+        'and type(row["key"]) is str and 1 <= len(row["key"]) <= 1024\n'
+        '                 and type(row["version_id"]) is str\n'
+        '                 and re.fullmatch(r"[A-Za-z0-9._=-]{1,1024}", row["version_id"])\n'
+        '                 and type(row["sha256"]) is str',
+    )
+    raw = replace_once(
+        raw,
+        'length, body = open_response(selected["bucket"], row["key"])',
+        'length, body = open_response(selected["bucket"], row["key"], row["version_id"])',
+    )
+    raw = replace_once(
+        raw,
+        'return {"schema": "lumi.vm-fullsize-staging.v0.1", "status": "copied_hash_verified",',
+        'return {"schema": "lumi.vm-fullsize-staging.v0.2", "status": "copied_hash_verified",',
+    )
+    raw = replace_once(
+        raw,
+        '"selection_sha256": SELECTION_SHA256, "objects": len(selected["objects"]),',
+        '"selection_sha256": SELECTION_SHA256, "objects": len(selected["objects"]),\n'
+        '                "object_versions_bound": True,',
+    )
+    return raw
+
+
+def patch_transport(raw):
+    raw = replace_once(
+        raw,
+        'and request.url == OBJECT_ENDPOINT + quote(self.active, safe="/"),',
+        'and request.url == OBJECT_ENDPOINT + quote(self.active, safe="/")\n'
+        '             + "?versionId=" + quote(self.rows[self.active]["version_id"], safe=""),',
+    )
+    raw = replace_once(
+        raw,
+        'def open(self, bucket, key):',
+        'def open(self, bucket, key, version_id):',
+    )
+    raw = replace_once(
+        raw,
+        'need(bucket == BUCKET and key in self.rows and key not in self.used\n'
+        '             and self.active is None, "request_rejected")',
+        'need(bucket == BUCKET and key in self.rows and key not in self.used\n'
+        '             and version_id == self.rows[key]["version_id"]\n'
+        '             and self.active is None, "request_rejected")',
+    )
+    raw = replace_once(
+        raw,
+        'response = self.client.get_object(Bucket=BUCKET, Key=key,\n'
+        '                                             ExpectedBucketOwner=ACCOUNT)',
+        'response = self.client.get_object(Bucket=BUCKET, Key=key, VersionId=version_id,\n'
+        '                                             ExpectedBucketOwner=ACCOUNT)',
+    )
+    raw = replace_once(
+        raw,
+        'and response["ContentLength"] == self.rows[key]["bytes"]\n'
+        '                 and "ContentRange" not in response',
+        'and response["ContentLength"] == self.rows[key]["bytes"]\n'
+        '                 and response.get("VersionId") == version_id\n'
+        '                 and "ContentRange" not in response',
+    )
+    raw = replace_once(
+        raw,
+        'need(headers.get("content-length") == str(owner.rows[owner.active]["bytes"])\n'
+        '                 and "content-range" not in headers',
+        'need(headers.get("content-length") == str(owner.rows[owner.active]["bytes"])\n'
+        '                 and headers.get("x-amz-version-id")\n'
+        '                 == owner.rows[owner.active]["version_id"]\n'
+        '                 and "content-range" not in headers',
+    )
+    raw = raw.replace(b'"schema": "lumi.vm-fullsize-acquisition.v0.1"',
+                      b'"schema": "lumi.vm-fullsize-acquisition.v0.2"')
+    return raw
+
+
+def swap_object_action(raw):
+    marker = b"s3:__LUMI_OLD_VERSION_ACTION__"
+    need(marker not in raw)
+    raw = raw.replace(b"s3:GetObjectVersion", marker)
+    raw = raw.replace(b"s3:GetObject", b"s3:GetObjectVersion")
+    raw = raw.replace(marker, b"s3:GetObject")
+    return raw
+
+
+def patch_proposal(raw):
+    value = json.loads(raw)
+    value["status"] = "offline_repaired_not_authorized"
+    transport = value["transport"]
+    transport["source_versions_bound"] = True
+    transport.pop("wire_caps_not_yet_implemented", None)
+    transport["setup_ip_packet_inbound_quota_bytes"] = transport.pop(
+        "setup_https_inbound_cap_bytes"
+    )
+    transport["source_control_upload_body_cap_bytes"] = transport.pop(
+        "source_control_upload_cap_bytes"
+    )
+    transport["combined_vm_ip_packet_inbound_quota_bytes"] = transport.pop(
+        "proposed_combined_vm_https_inbound_cap_bytes"
+    )
+    transport["backup_ip_packet_outbound_quota_bytes"] = transport.pop(
+        "proposed_backup_https_outbound_cap_bytes"
+    )
+    transport["network_quota_kind"] = "nftables_ip_packet_quota"
+    transport["hard_ip_packet_quotas_implemented"] = True
+    transport["wire_or_billing_byte_cap_claimed"] = False
+    transport["source_version_response_header_required"] = True
+    transport["source_content_length_and_sha256_required"] = True
+    retention = value["retention_proposal"]
+    retention["status"] = "implemented_requires_admitted_one_shot_credentials_and_readback"
+    value["controls"] = {
+        "watchdog_launch_interlock_bound": True,
+        "watchdog_exact_attempt_and_instance_scope": True,
+        "cpu_execution_authorized": False,
+        "fresh_readonly_preflight_required": True,
+    }
+    value["remaining_before_execution"] = [
+        "Freeze and pass a fresh read-only v0.22 preflight over the repaired source release.",
+        "Obtain explicit v0.22 paid CPU execution approval bound to the final hashes; "
+        "then recheck identity, image, offering, quota, disk settings and prices "
+        "immediately before one launch.",
+    ]
+    return pretty(value)
+
+
+def tar_members(raw):
+    result = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for member in archive:
+            need(member.type == tarfile.REGTYPE and member.name not in result)
+            with archive.extractfile(member) as stream:
+                result[member.name] = stream.read()
+    return result
+
+
+def tar_bytes(members):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, raw in sorted(members.items()):
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(raw), 0o400
+            member.uid = member.gid = member.mtime = 0
+            archive.addfile(member, io.BytesIO(raw))
+    need(len(output.getvalue()) <= 4 * 1024**2)
+    return output.getvalue()
+
+
+def rebuild_tar(original_tar, current, selection):
+    members = tar_members(original_tar)
+    manifest = json.loads(members["release-manifest.json"])
+    for name in manifest:
+        if name in current:
+            members[name] = current[name]
+    members["controls/input-selection.json"] = selection
+    manifest = {name: sha(members[name]) for name in manifest}
+    members["release-manifest.json"] = canonical(manifest)
+    manifest_sha = sha(members["release-manifest.json"])
+    control = json.loads(members["controls/control.json"])
+    control["entry_sha256"] = manifest["scripts/run_sft_vm_fullsize_entry_v1.py"]
+    control["source_manifest_sha256"] = manifest_sha
+    members["controls/control.json"] = canonical(control)
+    descriptor = json.loads(members["prepared-attempt.json"])
+    descriptor["selection_sha256"] = sha(selection)
+    descriptor["import_pins"]["entry_sha256"] = control["entry_sha256"]
+    descriptor["import_pins"]["source_manifest_sha256"] = manifest_sha
+    descriptor["import_pins"]["control_sha256"] = sha(members["controls/control.json"])
+    descriptor["acquisition_pins"]["entry_sha256"] = manifest[
+        "scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+    ]
+    descriptor["acquisition_pins"]["source_manifest_sha256"] = manifest_sha
+    descriptor["execution_permitted"] = False
+    descriptor["real_4b_import"] = False
+    descriptor["gate_5_complete"] = False
+    members["prepared-attempt.json"] = canonical(descriptor)
+    return tar_bytes(members)
+
+
+def close(original, seeds, preserved, selection):
+    current = dict(seeds)
+    original_tar = original[TAR]
+    for _ in range(64):
+        mapping = {}
+        for name, raw in original.items():
+            if name not in preserved:
+                before, after = sha(raw), sha(current[name])
+                need(before not in mapping or mapping[before] == after)
+                mapping[before] = after
+        following = {}
+        for name, raw in seeds.items():
+            if name not in preserved and name != TAR and name.endswith((".py", ".json")):
+                raw = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda match, mapping=mapping: mapping.get(
+                        match[0].decode(), match[0].decode()
+                    ).encode(),
+                    raw,
+                )
+            following[name] = raw
+        following[TAR] = rebuild_tar(original_tar, following, selection)
+        if following == current:
+            return current
+        current = following
+    raise ValueError("attempt018_v3_hash_cycle")
+
+
+def build():
+    denial = json.loads(old_closure.read(DENIAL, DENIAL_SHA))
+    need(
+        denial["process_started"] is False
+        and denial["cloud_mutations"] == 0
+        and denial["cpu_instance_launched"] is False
+        and denial["checkpoint_access"] is False
+        and denial["retry_performed"] is False
+    )
+    manifest = json.loads(old_closure.read(BASE / "release.json", BASE_SHA))
+    original = {
+        name: old_closure.read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    need(len(original) == 156 and TAR in original)
+    selection = metadata_selection()
+    selection_sha = sha(selection)
+    seeds = dict(original)
+    seeds[SELECTION] = selection
+    seeds[STAGING] = patch_staging(original[STAGING], selection_sha)
+    seeds[TRANSPORT] = patch_transport(original[TRANSPORT])
+    seeds[PERMISSIONS] = swap_object_action(original[PERMISSIONS]).replace(
+        b"HEAD shares s3:GetObjectVersion permission: frozen transport, not IAM, forbids HEAD.",
+        b"HEAD remains forbidden; only exact versioned GET is authorized by IAM and transport.",
+    )
+    seeds[ISSUER] = original[ISSUER].replace(b"s3:GetObject", b"s3:GetObjectVersion")
+    need(seeds[ISSUER] != original[ISSUER])
+    for name in PROPOSALS:
+        seeds[name] = patch_proposal(original[name])
+    preserved = {
+        name
+        for name in original
+        if name != TAR
+        and (
+            "/" not in name
+            or name.startswith("evidence/")
+            or name.endswith((".gz", ".tar", ".pem"))
+        )
+    }
+    final = close(original, seeds, preserved, selection)
+    for name, raw in final.items():
+        if name in preserved:
+            need(raw == original[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    # Verify the rebuilt archive contains the exact repaired runtime and bindings.
+    members = tar_members(final[TAR])
+    need(
+        members["controls/input-selection.json"] == selection
+        and members[STAGING] == final[STAGING]
+        and members[TRANSPORT] == final[TRANSPORT]
+    )
+    embedded_manifest = json.loads(members["release-manifest.json"])
+    need(all(sha(members[name]) == pin for name, pin in embedded_manifest.items()))
+    descriptor = json.loads(members["prepared-attempt.json"])
+    need(
+        descriptor["selection_sha256"] == selection_sha
+        and descriptor["execution_permitted"] is False
+        and descriptor["gate_5_complete"] is False
+    )
+    direct = sorted(name for name in seeds if seeds[name] != original[name])
+    report = {
+        "schema": "lumi.vm-attempt018-source.v0.3",
+        "attempt": ATTEMPT,
+        "base_release_sha256": BASE_SHA,
+        "v021_denial_evidence_sha256": DENIAL_SHA,
+        "metadata_v2_sha256": METADATA_SHA,
+        "metadata_v2_test_sha256": METADATA_TEST_SHA,
+        "selection_sha256": selection_sha,
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "iam_source_action": "s3:GetObjectVersion",
+        "transport_version_query_and_response_bound": True,
+        "retention_implementation_preserved": True,
+        "watchdog_launch_interlock_preserved": True,
+        "network_quota_kind": "nftables_ip_packet_quota",
+        "wire_or_billing_byte_cap_claimed": False,
+        "direct_source_changes": direct,
+        "consequent_hash_changes": sorted(name for name in final if final[name] != original[name]),
+        "prior_evidence_byte_identical": True,
+        "cloud_calls": 0,
+        "payload_reads": 0,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "outputs": {
+            name: {"bytes": len(raw), "sha256": sha(raw)} for name, raw in sorted(final.items())
+        },
+    }
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in sorted((files | {"release.json": pretty(report)}).items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("repaired_source_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

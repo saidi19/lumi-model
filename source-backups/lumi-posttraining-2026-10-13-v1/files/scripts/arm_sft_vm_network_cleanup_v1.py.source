@@ -1,0 +1,536 @@
+"""Private, single-use AWS-hosted expiry deployment; not execution authority.
+
+The trusted outer controller must admit the control-claim store and its extra
+write scope first. This module never creates NAT/EIP/VMs or changes bucket policy.
+It arms and reads back an independent timer before the caller may allocate.
+AWS delivery/cleanup is best-effort, not a hard bill cap. Keep partial evidence.
+"""
+
+import base64
+import datetime as dt
+import hashlib
+import io
+import json
+import math
+import os
+import time
+import zipfile
+from pathlib import Path
+
+import provision_sft_vm_host_v2 as host
+import sft_vm_network_cleanup_v1 as worker
+
+WORKER_SHA = "4c8e49497651b132c5df8b5baef90b6cceb96d5abca80fbbe36f7b5695434799"
+POLICY = "ExactNetworkCleanup"
+ROLE_PATH = "/lumi/temporary/"
+OPS = {
+    "sts": {"get-caller-identity"},
+    "iam": {
+        "get-role",
+        "create-role",
+        "put-role-policy",
+        "get-role-policy",
+        "list-role-policies",
+        "list-attached-role-policies",
+    },
+    "lambda": {
+        "get-function-configuration",
+        "create-function",
+        "put-function-concurrency",
+        "get-function-concurrency",
+        "put-function-event-invoke-config",
+        "get-function-event-invoke-config",
+        "get-policy",
+        "get-function-url-config",
+        "list-event-source-mappings",
+    },
+    "scheduler": {"get-schedule-group", "create-schedule-group", "get-schedule", "create-schedule"},
+}
+WRITES = {
+    "create-role",
+    "put-role-policy",
+    "create-function",
+    "put-function-concurrency",
+    "put-function-event-invoke-config",
+    "create-schedule-group",
+    "create-schedule",
+}
+
+
+def compact(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def names(token):
+    worker.nonce(token)
+    function = "lumi-net-" + token
+    base = f"arn:aws:iam::{worker.ACCOUNT}:role{ROLE_PATH}"
+    return dict(
+        function=function,
+        group=function,
+        worker="lumi-net-worker-" + token,
+        scheduler="lumi-net-schedule-" + token,
+        role_base=base,
+        function_arn=f"arn:aws:lambda:{worker.REGION}:{worker.ACCOUNT}:function:{function}",
+        group_arn=f"arn:aws:scheduler:{worker.REGION}:{worker.ACCOUNT}:schedule-group/{function}",
+    )
+
+
+def package():
+    raw = Path(worker.__file__).read_bytes()
+    worker.need(hashlib.sha256(raw).hexdigest() == WORKER_SHA)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as archive:
+        info = zipfile.ZipInfo("cleanup.py", (2026, 10, 3, 0, 0, 0))
+        info.external_attr = 0o100400 << 16
+        archive.writestr(info, raw)
+    body = out.getvalue()
+    worker.need(len(body) < 32768)
+    return body
+
+
+def policies(bound):
+    n = names(bound["nonce"])
+    expiry = dt.datetime.fromtimestamp(bound["expires_at"], dt.UTC).isoformat()
+    reads = ["ec2:DescribeNatGateways", "ec2:DescribeAddresses"]
+    mutations = ["ec2:DeleteNatGateway", "ec2:ReleaseAddress"]
+    logs = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+    statement = [
+        dict(
+            Effect="Allow",
+            Action=reads,
+            Resource="*",
+            Condition={"StringEquals": {"aws:RequestedRegion": worker.REGION}},
+        )
+    ]
+    for action, kind in zip(mutations, ("natgateway", "elastic-ip"), strict=True):
+        arn = f"arn:aws:ec2:{worker.REGION}:{worker.ACCOUNT}:{kind}/*"
+        statement.append(
+            dict(
+                Effect="Allow",
+                Action=action,
+                Resource=arn,
+                Condition={
+                    "StringEquals": {
+                        "aws:RequestedRegion": worker.REGION,
+                        "ec2:ResourceTag/LumiAttempt": worker.ATTEMPT,
+                        "ec2:ResourceTag/LumiNetworkNonce": bound["nonce"],
+                    }
+                },
+            )
+        )
+        statement.append(dict(Effect="Deny", Action=action, NotResource=arn))
+    keys = [
+        f"arn:aws:s3:::{worker.BUCKET}/{worker.claim_key(bound['nonce'], op)}"
+        for op in worker.OPERATIONS
+    ]
+    statement.extend(
+        [
+            dict(
+                Effect="Allow",
+                Action="s3:PutObject",
+                Resource=keys,
+                Condition={
+                    "StringEquals": {
+                        "s3:if-none-match": "*",
+                        "s3:x-amz-server-side-encryption": "AES256",
+                    },
+                    "Bool": {"aws:SecureTransport": "true"},
+                    "Null": {"s3:x-amz-copy-source": "true"},
+                },
+            ),
+            dict(Effect="Deny", Action="s3:PutObject", NotResource=keys),
+            dict(
+                Effect="Allow",
+                Action=logs,
+                Resource=[
+                    f"arn:aws:logs:{worker.REGION}:{worker.ACCOUNT}:log-group:/aws/lambda/{n['function']}",
+                    f"arn:aws:logs:{worker.REGION}:{worker.ACCOUNT}:log-group:/aws/lambda/{n['function']}:*",
+                ],
+            ),
+            dict(
+                Effect="Deny", NotAction=reads + mutations + ["s3:PutObject"] + logs, Resource="*"
+            ),
+            dict(
+                Effect="Deny",
+                Action="*",
+                Resource="*",
+                Condition={"DateGreaterThanEquals": {"aws:CurrentTime": expiry}},
+            ),
+        ]
+    )
+    # Explicit denies keep a future broader policy from bypassing claim/tag guards.
+    for key, value in (
+        ("ec2:ResourceTag/LumiAttempt", worker.ATTEMPT),
+        ("ec2:ResourceTag/LumiNetworkNonce", bound["nonce"]),
+        ("aws:RequestedRegion", worker.REGION),
+    ):
+        statement.append(
+            dict(
+                Effect="Deny",
+                Action=mutations,
+                Resource="*",
+                Condition={"StringNotEquals": {key: value}},
+            )
+        )
+    for key, value in (("s3:if-none-match", "*"), ("s3:x-amz-server-side-encryption", "AES256")):
+        statement.append(
+            dict(
+                Effect="Deny",
+                Action="s3:PutObject",
+                Resource="*",
+                Condition={"StringNotEquals": {key: value}},
+            )
+        )
+    statement.extend(
+        [
+            dict(
+                Effect="Deny",
+                Action="s3:PutObject",
+                Resource="*",
+                Condition={"Null": {"s3:x-amz-copy-source": "false"}},
+            ),
+            dict(
+                Effect="Deny",
+                Action="*",
+                Resource="*",
+                Condition={"Bool": {"aws:SecureTransport": "false"}},
+            ),
+        ]
+    )
+    sender = [
+        dict(Effect="Allow", Action="lambda:InvokeFunction", Resource=n["function_arn"]),
+        dict(Effect="Deny", NotAction="lambda:InvokeFunction", Resource="*"),
+        dict(Effect="Deny", Action="lambda:InvokeFunction", NotResource=n["function_arn"]),
+        dict(
+            Effect="Deny",
+            Action="*",
+            Resource="*",
+            Condition={"DateGreaterThanEquals": {"aws:CurrentTime": expiry}},
+        ),
+    ]
+    result = []
+    for role, service, statements, extra in (
+        (n["worker"], "lambda.amazonaws.com", statement, {}),
+        (
+            n["scheduler"],
+            "scheduler.amazonaws.com",
+            sender,
+            {
+                "Condition": {
+                    "StringEquals": {"aws:SourceAccount": worker.ACCOUNT},
+                    "ArnEquals": {"aws:SourceArn": n["group_arn"]},
+                }
+            },
+        ),
+    ):
+        trust = dict(
+            Version="2012-10-17",
+            Statement=[
+                dict(
+                    Effect="Allow", Principal={"Service": service}, Action="sts:AssumeRole", **extra
+                )
+            ],
+        )
+        policy = dict(Version="2012-10-17", Statement=statements)
+        worker.need(len(compact(policy)) < 10240)
+        result.append((role, trust, policy))
+    return result
+
+
+def schedule(bound):
+    n = names(bound["nonce"])
+    stamp = dt.datetime.fromtimestamp(bound["not_before"], dt.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    event = {k: v for k, v in bound.items() if k != "armed"}
+    return dict(
+        Name="cleanup",
+        GroupName=n["group"],
+        State="ENABLED",
+        ScheduleExpression=f"at({stamp})",
+        ScheduleExpressionTimezone="UTC",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        ActionAfterCompletion="NONE",
+        Target=dict(
+            Arn=n["function_arn"],
+            RoleArn=n["role_base"] + n["scheduler"],
+            Input=compact(event),
+            RetryPolicy=dict(MaximumRetryAttempts=0, MaximumEventAgeInSeconds=60),
+        ),
+    )
+
+
+class SDKCloud:
+    def __init__(self, clients):
+        worker.need(set(clients) == set(OPS))
+        for service, client in clients.items():
+            meta = client.meta
+            endpoint = (
+                "https://iam.amazonaws.com"
+                if service == "iam"
+                else (f"https://{service}.{worker.REGION}.amazonaws.com")
+            )
+            worker.need(meta.endpoint_url == endpoint)
+            worker.need(service == "iam" or meta.region_name == worker.REGION)
+            worker.need(
+                meta.config.proxies == {} and meta.config.retries.get("total_max_attempts") == 1
+            )
+            worker.need(0 < meta.config.connect_timeout <= 3 and 0 < meta.config.read_timeout <= 5)
+        self.clients = clients
+
+    def cli(self, service, operation, **fields):
+        worker.need(operation in OPS.get(service, set()))
+        try:
+            with host.timeout(20):
+                return getattr(self.clients[service], operation.replace("-", "_"))(**fields)
+        except Exception as error:
+            code = getattr(error, "response", {}).get("Error", {}).get("Code")
+            if operation not in WRITES and code in {"NoSuchEntity", "ResourceNotFoundException"}:
+                raise LookupError("absent") from None
+            raise RuntimeError("network_expiry_cloud_failed") from None
+
+
+class Expiry:
+    def __init__(
+        self,
+        output,
+        cloud,
+        *,
+        admit_claim_store,
+        clock=time.monotonic,
+        wall=time.time,
+        wait=time.sleep,
+    ):
+        worker.need(callable(admit_claim_store))
+        self.output, self.cloud, self.admit = Path(output), cloud, admit_claim_store
+        self.clock, self.wall, self.wait = clock, wall, wait
+        self.used, self.calls, self.writes = False, 0, set()
+        self.role_ids = {}
+        self.bound = self.original = None
+
+    def save(self, name, value):
+        raw = (compact(value) + "\n").encode()
+        worker.need(len(raw) <= 16384)
+        fd = os.open(self.output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def call(self, service, operation, **fields):
+        worker.need(operation in OPS.get(service, set()) and self.calls < 100)
+        elapsed = self.clock() - self.started
+        worker.need(0 <= elapsed < 580)
+        worker.need(abs((self.wall() - self.wall_start) - elapsed) <= 5)
+        if operation in WRITES:
+            key = (service, operation, fields.get("RoleName", ""))
+            worker.need(key not in self.writes)
+            self.writes.add(key)
+            self.save(
+                f"write-{len(self.writes):02d}.json", dict(service=service, operation=operation)
+            )
+        self.calls += 1
+        value = self.cloud.cli(service, operation, **fields)
+        worker.need(self.clock() - self.started < 600)
+        worker.need(abs((self.wall() - self.wall_start) - (self.clock() - self.started)) <= 5)
+        worker.need(type(value) is dict and len(json.dumps(value, default=str)) <= 262144)
+        worker.need(
+            not any(value.get(k) for k in ("NextToken", "NextMarker", "Marker", "IsTruncated"))
+        )
+        return value
+
+    def absent(self, service, operation, **fields):
+        try:
+            self.call(service, operation, **fields)
+        except LookupError:
+            return
+        worker.need(False)
+
+    def verify(self, *, attempt, nonce, deadline):
+        worker.need(self.original == dict(attempt=attempt, nonce=nonce, deadline=deadline))
+        worker.need(self.bound is not None)
+        n = names(nonce)
+        for name, trust, policy in policies(self.bound):
+            role = self.call("iam", "get-role", RoleName=name)["Role"]
+            worker.need(role["Arn"] == n["role_base"] + name)
+            worker.need(
+                role["RoleId"] == self.role_ids[name] and not role.get("PermissionsBoundary")
+            )
+            worker.need(role["AssumeRolePolicyDocument"] == trust)
+            worker.need(
+                self.call("iam", "get-role-policy", RoleName=name, PolicyName=POLICY)[
+                    "PolicyDocument"
+                ]
+                == policy
+            )
+            worker.need(
+                self.call("iam", "list-role-policies", RoleName=name)["PolicyNames"] == [POLICY]
+            )
+            worker.need(
+                self.call("iam", "list-attached-role-policies", RoleName=name)["AttachedPolicies"]
+                == []
+            )
+        cfg = self.call("lambda", "get-function-configuration", FunctionName=n["function"])
+        expected = dict(
+            FunctionArn=n["function_arn"],
+            CodeSha256=self.code_sha,
+            Role=n["role_base"] + n["worker"],
+            Runtime="python3.13",
+            Handler="cleanup.handler",
+            Timeout=840,
+            MemorySize=128,
+            Architectures=["arm64"],
+            EphemeralStorage={"Size": 512},
+            State="Active",
+            LastUpdateStatus="Successful",
+            Environment={"Variables": {"LUMI_NETWORK_CLEANUP_BINDING": compact(self.bound)}},
+        )
+        worker.need(all(cfg.get(k) == v for k, v in expected.items()))
+        worker.need(not cfg.get("Layers") and not cfg.get("VpcConfig", {}).get("VpcId"))
+        worker.need(not cfg.get("FileSystemConfigs") and not cfg.get("DeadLetterConfig"))
+        worker.need(
+            self.call("lambda", "get-function-concurrency", FunctionName=n["function"])[
+                "ReservedConcurrentExecutions"
+            ]
+            == 1
+        )
+        retry = self.call("lambda", "get-function-event-invoke-config", FunctionName=n["function"])
+        worker.need(retry["MaximumRetryAttempts"] == 0 and retry["MaximumEventAgeInSeconds"] == 60)
+        worker.need(not any(retry.get("DestinationConfig", {}).values()))
+        self.absent("lambda", "get-policy", FunctionName=n["function"])
+        self.absent("lambda", "get-function-url-config", FunctionName=n["function"])
+        worker.need(
+            self.call(
+                "lambda", "list-event-source-mappings", FunctionName=n["function"], MaxItems=1
+            )["EventSourceMappings"]
+            == []
+        )
+        actual = self.call("scheduler", "get-schedule", Name="cleanup", GroupName=n["group"])
+        worker.need(
+            actual.get("Arn")
+            == f"arn:aws:scheduler:{worker.REGION}:{worker.ACCOUNT}:schedule/{n['group']}/cleanup"
+        )
+        worker.need(all(actual.get(k) == v for k, v in schedule(self.bound).items()))
+
+    def arm(self, *, attempt, nonce, deadline):
+        worker.need(not self.used)
+        self.used = True
+        worker.need(attempt == worker.ATTEMPT)
+        n = names(nonce)
+        self.started, self.wall_start = self.clock(), self.wall()
+        worker.need(type(deadline) in {int, float} and math.isfinite(deadline))
+        remaining = deadline - self.started
+        worker.need(16200 <= remaining <= 18000 and math.isfinite(self.wall_start))
+        end = math.floor(self.wall_start + remaining)
+        self.bound = worker.binding(
+            compact(
+                dict(armed=True, attempt=attempt, nonce=nonce, not_before=end - 900, expires_at=end)
+            )
+        )
+        self.original = dict(attempt=attempt, nonce=nonce, deadline=deadline)
+        host.connection.safe_path(self.output)
+        self.output.mkdir(mode=0o700, exist_ok=False)
+        self.save(
+            "started.json", dict(binding=self.bound, retry_allowed=False, worker_sha=WORKER_SHA)
+        )
+        try:
+            # Trusted outer control-store verifier: an approval flag is not a verifier.
+            worker.need(self.admit(dict(self.bound)) is None)
+            worker.need(self.call("sts", "get-caller-identity")["Account"] == worker.ACCOUNT)
+            for role in (n["worker"], n["scheduler"]):
+                self.absent("iam", "get-role", RoleName=role)
+            self.absent("lambda", "get-function-configuration", FunctionName=n["function"])
+            self.absent("scheduler", "get-schedule-group", Name=n["group"])
+            body = package()
+            self.code_sha = base64.b64encode(hashlib.sha256(body).digest()).decode()
+            for role, trust, policy in policies(self.bound):
+                created = self.call(
+                    "iam",
+                    "create-role",
+                    RoleName=role,
+                    Path=ROLE_PATH,
+                    AssumeRolePolicyDocument=compact(trust),
+                    MaxSessionDuration=3600,
+                    Tags=[
+                        dict(Key="LumiAttempt", Value=attempt),
+                        dict(Key="LumiNetworkNonce", Value=nonce),
+                    ],
+                )["Role"]
+                worker.need(created["Arn"] == n["role_base"] + role)
+                worker.need(type(created.get("RoleId")) is str and created["RoleId"])
+                self.role_ids[role] = created["RoleId"]
+                self.call(
+                    "iam",
+                    "put-role-policy",
+                    RoleName=role,
+                    PolicyName=POLICY,
+                    PolicyDocument=compact(policy),
+                )
+            self.wait(15)  # One propagation allowance; never retry a failed create.
+            self.call(
+                "lambda",
+                "create-function",
+                FunctionName=n["function"],
+                Role=n["role_base"] + n["worker"],
+                Runtime="python3.13",
+                Handler="cleanup.handler",
+                Timeout=840,
+                MemorySize=128,
+                Architectures=["arm64"],
+                EphemeralStorage={"Size": 512},
+                Code={"ZipFile": body},
+                Environment={"Variables": {"LUMI_NETWORK_CLEANUP_BINDING": compact(self.bound)}},
+                Tags={"LumiAttempt": attempt, "LumiNetworkNonce": nonce},
+            )
+            for _ in range(30):
+                cfg = self.call("lambda", "get-function-configuration", FunctionName=n["function"])
+                worker.need(cfg.get("State") in {"Pending", "Active"})
+                if cfg.get("State") == "Active":
+                    break
+                self.wait(5)
+            else:
+                worker.need(False)
+            self.call(
+                "lambda",
+                "put-function-concurrency",
+                FunctionName=n["function"],
+                ReservedConcurrentExecutions=1,
+            )
+            self.call(
+                "lambda",
+                "put-function-event-invoke-config",
+                FunctionName=n["function"],
+                MaximumRetryAttempts=0,
+                MaximumEventAgeInSeconds=60,
+            )
+            self.call(
+                "scheduler",
+                "create-schedule-group",
+                Name=n["group"],
+                ClientToken=nonce,
+                Tags=[
+                    dict(Key="LumiAttempt", Value=attempt),
+                    dict(Key="LumiNetworkNonce", Value=nonce),
+                ],
+            )
+            group = self.call("scheduler", "get-schedule-group", Name=n["group"])
+            worker.need(group["Arn"] == n["group_arn"] and group["State"] == "ACTIVE")
+            self.call("scheduler", "create-schedule", ClientToken=nonce, **schedule(self.bound))
+            self.verify(**self.original)
+            self.save(
+                "armed.json", dict(armed_readback=True, api_calls=self.calls, gate_5_complete=False)
+            )
+        except BaseException:
+            self.save(
+                "failed.json",
+                dict(
+                    stage="arming_failed",
+                    api_calls=self.calls,
+                    retry_allowed=False,
+                    gate_5_complete=False,
+                ),
+            )
+            raise RuntimeError("network_expiry_arming_failed") from None
+
+
+def run(**_arguments):
+    raise ValueError("network_expiry_outer_admission_required") from None

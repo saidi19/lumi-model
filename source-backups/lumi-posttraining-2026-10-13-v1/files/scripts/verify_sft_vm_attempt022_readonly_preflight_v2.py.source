@@ -1,0 +1,150 @@
+"""Offline verification of the fresh inclusive read-only admission evidence."""
+
+import json
+import sys
+from pathlib import Path
+
+from scripts import preflight_sft_vm_attempt022_v2 as entry
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+
+ROOT = Path(__file__).resolve().parents[1]
+ENTRY_SHA = "659f4ab23e021206ac4ff1232c2c8ce66d37a759410c45aa05671f65c00f0f00"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-readonly-preflight-verification-v0.2.json"
+
+
+def load(path):
+    return json.loads(files.read(path))
+
+
+def verify():
+    recovery_plan_path = ROOT / "configs/lumi-vm-attempt-022-cidr-recovery-plan-v0.1.json"
+    recovery = load(recovery_plan_path)
+    for name, digest in recovery["source_bindings"].items():
+        entry.need(entry.sha(files.read(ROOT / name)) == digest)
+    entry.need(entry.sha(files.read(Path(entry.__file__))) == ENTRY_SHA)
+    entry.runtime()
+    entry.bindings.verify()
+    controls = entry.bindings.controls()
+    started, admission, result = [
+        load(entry.OUTPUT / name) for name in ("started.json", "admission.json", "result.json")
+    ]
+    entry.need(started["entry_sha256"] == ENTRY_SHA)
+    entry.need(started["control_evidence"] == controls and started["execution_authorized"] is False)
+    entry.need(started["max_calls"] == 79 and started["max_seconds"] == 1500)
+    entry.need(started["credential_identity_calls_included"] is True)
+    entry.need(result["status"] == "readonly_preflight_passed" and result["admission"] == admission)
+    entry.need(admission["status"] == "all_readonly_admission_passed_before_execution_marker")
+    cpu, watch, network, store = [
+        admission[k] for k in ("cpu", "watchdog", "network", "cleanup_store")
+    ]
+    entry.need(cpu["status"] == "fresh_cpu_and_exact_attempt_preflight_passed")
+    entry.need(watch["status"] == "verified_fresh_inert_watchdog")
+    entry.need(network["fresh_network_admitted"] is True)
+    entry.need(store["private_owner_versioning_encryption_verified"] is True)
+    entry.need(store["claim_protection_verified_at_observation"] is True)
+    entry.need(store["write_authority_granted"] is False)
+    entry.need(store["object_reads"] == store["object_lists"] == store["object_writes"] == 0)
+    component_calls = (
+        cpu["calls"] + watch["api_calls"] + network["calls"] + store["observation_calls"]
+    )
+    ledger = admission["admission_call_budget"]
+    entry.need(ledger == result["admission_call_budget"])
+    entry.need(
+        component_calls == admission["total_control_calls"] == ledger["admission_read_dispatches"]
+    )
+    entry.need(
+        ledger["sdk_read_dispatches"] == component_calls + ledger["credential_identity_dispatches"]
+    )
+    entry.need(
+        0 < ledger["sdk_read_dispatches"] <= 79 and ledger["credential_identity_dispatches"] >= 1
+    )
+    entry.need(ledger["credential_identity_included"] is True)
+    entry.need(0 <= admission["elapsed_seconds"] <= result["elapsed_seconds"] < 1500)
+    entry.need(result["cloud_mutations"] == admission["cloud_mutations"] == 0)
+    entry.need(result["object_access"] == admission["object_access"] == 0)
+    entry.need(admission["host_launch_authorized"] is False)
+    for key in (
+        "execution_marker_created",
+        "cpu_launch_authorized",
+        "outer_invoked",
+        "gate_5_complete",
+        "gpu",
+        "training",
+        "retry_performed",
+    ):
+        entry.need(result[key] is False)
+    run_bindings = {
+        str((entry.OUTPUT / name).relative_to(ROOT)): entry.sha(files.read(entry.OUTPUT / name))
+        for name in ("started.json", "admission.json", "result.json")
+    }
+    source_bindings = {
+        str(Path(entry.__file__).relative_to(ROOT)): ENTRY_SHA,
+        str(Path(entry.bindings.__file__).relative_to(ROOT)): entry.BINDINGS_SHA,
+        str(Path(entry.budget.__file__).relative_to(ROOT)): entry.BUDGET_SHA,
+        str(entry.SOURCE.relative_to(ROOT)): entry.SOURCE_SHA,
+        entry.bindings.PLAN: entry.bindings.PLAN_SHA,
+        entry.bindings.PLAN_RELEASE: entry.bindings.PLAN_RELEASE_SHA,
+        entry.bindings.RELEASE + "/release.json": entry.bindings.RELEASE_SHA,
+    }
+    source_bindings.update(recovery["source_bindings"])
+    source_bindings[str(recovery_plan_path.relative_to(ROOT))] = entry.sha(
+        files.read(recovery_plan_path))
+    source_bindings[str(Path(__file__).relative_to(ROOT))] = entry.sha(files.read(Path(__file__)))
+    test_name = "tests/test_sft_vm_attempt022_admission_verification_v2.py"
+    source_bindings[test_name] = entry.sha(files.read(ROOT / test_name))
+    return dict(
+        schema="lumi.vm-attempt022-readonly-preflight-verification.v0.2",
+        attempt=entry.ATTEMPT,
+        status="readonly_preflight_passed",
+        entry_sha256=ENTRY_SHA,
+        bindings_sha256=entry.BINDINGS_SHA,
+        run_bindings=run_bindings,
+        source_bindings=source_bindings,
+        cidr_corrected_to="172.31.97.64/27",
+        watchdog_or_cleanup_bucket_redeployed=False,
+        frozen_selector_unchanged=True,
+        previous_failed_preflight_preserved=True,
+        control_evidence=controls,
+        admission_calls=component_calls,
+        inclusive_sdk_read_calls=ledger["sdk_read_dispatches"],
+        credential_identity_calls=ledger["credential_identity_dispatches"],
+        admission_call_budget=ledger,
+        elapsed_seconds=result["elapsed_seconds"],
+        network_admitted=True,
+        cpu_admitted=True,
+        inert_watchdog_verified=True,
+        cleanup_store_verified=True,
+        cloud_mutations=0,
+        object_access=0,
+        instance_actions=0,
+        execution_authority_created=False,
+        cpu_instance_launched=False,
+        checkpoint_access=False,
+        prior_evidence_preserved=True,
+        retry=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+
+
+if __name__ == "__main__":
+    entry.need(sys.argv[1:] == ["--write-once"] and not OUTPUT.exists())
+    result = verify()
+    files.save(OUTPUT, result)
+    print(
+        json.dumps(
+            {
+                k: result[k]
+                for k in (
+                    "status",
+                    "inclusive_sdk_read_calls",
+                    "credential_identity_calls",
+                    "network_admitted",
+                    "cpu_admitted",
+                )
+            },
+            sort_keys=True,
+        )
+    )

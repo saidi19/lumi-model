@@ -1,0 +1,357 @@
+"""One explicitly approved ephemeral CPU-only native firewall/timer probe."""
+
+import base64
+import gzip
+import hashlib
+import json
+import os
+import re
+import secrets
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "artifacts/lumi-vm-network-native-attempt-v0.1"
+ACCOUNT = "573978149073"
+AMI = "ami-0045d7fc2ad003464"
+SUBNET = "subnet-0dc6039a6453f7c95"
+VPC = "vpc-0905fbf9490a2dead"
+POLICY_SHA = "1e4ae4078af9fd024d2ae2988b3f265010acd6c4d65d126f60e574960c4d99f7"
+
+
+def save(name, value):
+    with (OUT / name).open("x") as stream:
+        json.dump(value, stream, sort_keys=True, indent=2)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def aws(service, operation, **parameters):
+    argv = [
+        "/opt/homebrew/bin/aws",
+        service,
+        operation,
+        "--region",
+        "us-east-1",
+        "--no-cli-pager",
+        "--output",
+        "json",
+        "--cli-connect-timeout",
+        "5",
+        "--cli-read-timeout",
+        "15",
+    ]
+    if parameters:
+        argv += ["--cli-input-json", json.dumps(parameters)]
+    env = dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER="")
+    result = subprocess.run(argv, capture_output=True, env=env, timeout=25)
+    if result.returncode:
+        found = re.search(rb"\(([A-Za-z0-9._-]+)\)", result.stderr)
+        raise RuntimeError(found.group(1).decode() if found else "aws_call_failed")
+    assert len(result.stdout) <= 262144
+    return json.loads(result.stdout or b"{}")
+
+
+def cloud_config():
+    source = (ROOT / "scripts/probe_sft_vm_network_native_v1.py").read_bytes()
+    frozen = (ROOT / "scripts/build_sft_vm_network_expiry_v1.py").read_bytes()
+    assert hashlib.sha256(frozen).hexdigest() == POLICY_SHA
+    files = []
+    for name, body in (("probe.py", source), ("policy.py", frozen)):
+        files.append(
+            dict(
+                path="/opt/lumi-network-probe/" + name,
+                permissions="0400",
+                encoding="gz+b64",
+                content=base64.b64encode(gzip.compress(body, mtime=0)).decode(),
+            )
+        )
+    config = dict(
+        package_update=False,
+        package_upgrade=False,
+        apt=dict(
+            preserve_sources_list=False,
+            primary=[dict(arches=["default"], uri="https://archive.ubuntu.com/ubuntu")],
+            security=[dict(arches=["default"], uri="https://security.ubuntu.com/ubuntu")],
+        ),
+        write_files=files,
+        runcmd=[["/usr/bin/python3", "-I", "-B", "/opt/lumi-network-probe/probe.py", "--outer"]],
+    )
+    raw = ("#cloud-config\n" + json.dumps(config)).encode()
+    assert len(raw) <= 16384
+    return raw, hashlib.sha256(source).hexdigest()
+
+
+def main():
+    assert aws("sts", "get-caller-identity")["Account"] == ACCOUNT
+    raw, probe_sha = cloud_config()
+    OUT.mkdir(mode=0o700, exist_ok=False)
+    token = secrets.token_hex(16)
+    group_name = "lumi-network-probe-" + token
+    tags = [dict(Key="LumiAttempt", Value=token), dict(Key="Name", Value=group_name)]
+    save(
+        "authorization.json",
+        dict(
+            user_approval="ok shuru kor; AWS login done",
+            scope=(
+                "One fresh CPU VM, maximum 30 minutes, synthetic firewall/timer only; "
+                "cleanup only newly created resources"
+            ),
+            account=ACCOUNT,
+            region="us-east-1",
+            attempt=token,
+            instance_type="t3.small",
+            max_instance_seconds=1800,
+            controller_cleanup_start_seconds=1500,
+            guest_fallback_shutdown_boottime_seconds=1200,
+            real_model_or_s3_access=False,
+            gpu=False,
+            probe_sha256=probe_sha,
+            controller_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            policy_sha256=POLICY_SHA,
+            user_data_sha256=hashlib.sha256(raw).hexdigest(),
+            retry_allowed=False,
+        ),
+    )
+    with (OUT / "user-data.txt").open("xb") as stream:
+        stream.write(raw)
+    group = instance = None
+    volume_ids = []
+    launched = False
+    launch_start = None
+    result = {
+        "native_report": None,
+        "stopped_observed": False,
+        "gate_5_complete": False,
+        "real_4b_import": False,
+        "gpu": False,
+    }
+    try:
+        group = aws(
+            "ec2",
+            "create-security-group",
+            GroupName=group_name,
+            Description="Temporary approved Lumi synthetic network probe",
+            VpcId=VPC,
+            TagSpecifications=[dict(ResourceType="security-group", Tags=tags)],
+        )["GroupId"]
+        save("network.json", dict(group=group, attempt=token))
+        aws(
+            "ec2",
+            "revoke-security-group-egress",
+            GroupId=group,
+            IpPermissions=[dict(IpProtocol="-1", IpRanges=[dict(CidrIp="0.0.0.0/0")])],
+        )
+        aws(
+            "ec2",
+            "authorize-security-group-egress",
+            GroupId=group,
+            IpPermissions=[
+                dict(
+                    IpProtocol="tcp", FromPort=443, ToPort=443, IpRanges=[dict(CidrIp="0.0.0.0/0")]
+                )
+            ],
+        )
+        # No ingress, key pair, IAM profile, S3 permissions or GPU. Standard CPU credits.
+        launch = dict(
+            ImageId=AMI,
+            InstanceType="t3.small",
+            MinCount=1,
+            MaxCount=1,
+            ClientToken=token,
+            CreditSpecification=dict(CpuCredits="standard"),
+            MetadataOptions=dict(HttpTokens="required", HttpEndpoint="enabled"),
+            InstanceInitiatedShutdownBehavior="stop",
+            NetworkInterfaces=[
+                dict(DeviceIndex=0, SubnetId=SUBNET, Groups=[group], AssociatePublicIpAddress=True)
+            ],
+            BlockDeviceMappings=[
+                dict(
+                    DeviceName="/dev/sda1",
+                    Ebs=dict(
+                        VolumeSize=8, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True
+                    ),
+                )
+            ],
+            TagSpecifications=[dict(ResourceType=k, Tags=tags) for k in ("instance", "volume")],
+        )
+        save("launch-request.json", launch)
+        # File argument lets AWS CLI perform its documented UserData encoding.
+        argv = [
+            "/opt/homebrew/bin/aws",
+            "ec2",
+            "run-instances",
+            "--region",
+            "us-east-1",
+            "--no-cli-pager",
+            "--output",
+            "json",
+            "--cli-input-json",
+            json.dumps(launch),
+            "--user-data",
+            "file://" + str(OUT / "user-data.txt"),
+            "--cli-connect-timeout",
+            "5",
+            "--cli-read-timeout",
+            "15",
+        ]
+        launch_start = time.monotonic()
+        launched = True  # Ambiguity is resolved by client token, never by launching again.
+        response = subprocess.run(
+            argv,
+            capture_output=True,
+            timeout=25,
+            env=dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER=""),
+        )
+        if response.returncode:
+            found = re.search(rb"\(([A-Za-z0-9._-]+)\)", response.stderr)
+            raise RuntimeError(found.group(1).decode() if found else "launch_failed_or_unknown")
+        rows = json.loads(response.stdout)["Instances"]
+        assert len(rows) == 1
+        instance = rows[0]["InstanceId"]
+        save(
+            "instance.json",
+            dict(instance=instance, launch_time=rows[0]["LaunchTime"], attempt=token),
+        )
+        print(json.dumps(dict(event="launched", instance=instance, attempt=token)), flush=True)
+        last_state = None
+        while time.monotonic() - launch_start < 1500:
+            description = aws("ec2", "describe-instances", InstanceIds=[instance])["Reservations"][
+                0
+            ]["Instances"][0]
+            assert description["ClientToken"] == token
+            volume_ids = [x["Ebs"]["VolumeId"] for x in description["BlockDeviceMappings"]]
+            state = description["State"]["Name"]
+            if state != last_state:
+                print(json.dumps(dict(event="state", state=state)), flush=True)
+                last_state = state
+            if state == "pending":
+                time.sleep(10)
+                continue
+            console = aws("ec2", "get-console-output", InstanceId=instance, Latest=True).get(
+                "Output", ""
+            )
+            if "LUMI_NETWORK_PROBE_V1=" not in console:
+                try:
+                    console = base64.b64decode(console, validate=True).decode(errors="replace")
+                except Exception:
+                    console = ""
+            matches = re.findall(r"LUMI_NETWORK_PROBE_V1=([A-Za-z0-9+/=]+)", console)
+            if matches and result["native_report"] is None:
+                native = json.loads(base64.b64decode(matches[-1], validate=True))
+                assert native["schema"] == "lumi.network-native-probe.v0.1"
+                result["native_report"] = native
+                save("native-report.json", native)
+                print(
+                    json.dumps(
+                        dict(
+                            event="native_report",
+                            status=native["status"],
+                            failed_phase=native.get("failed_phase"),
+                            firewall=native.get("firewall", {}).get("failed_phase"),
+                            inspector=native.get("firewall", {}).get("exact_inspector_accepts"),
+                        )
+                    ),
+                    flush=True,
+                )
+            if state == "stopped":
+                result["stopped_observed"] = True
+                break
+            if state in {"terminated", "shutting-down"}:
+                break
+            if result["native_report"] and result["native_report"]["status"] == "failed":
+                break
+            time.sleep(10)
+    except BaseException as error:
+        result["controller_error"] = type(error).__name__
+        if isinstance(error, RuntimeError) and re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(error)):
+            result["controller_error_code"] = str(error)
+    finally:
+        # Resolve an ambiguous create only by this fresh unique token/name.
+        if not instance and launched:
+            found = aws(
+                "ec2", "describe-instances", Filters=[dict(Name="client-token", Values=[token])]
+            )
+            rows = [i for r in found["Reservations"] for i in r["Instances"]]
+            assert len(rows) <= 1
+            if rows:
+                instance = rows[0]["InstanceId"]
+        if instance:
+            own = aws("ec2", "describe-instances", InstanceIds=[instance])["Reservations"][0][
+                "Instances"
+            ][0]
+            assert own["ClientToken"] == token
+            volume_ids = [x["Ebs"]["VolumeId"] for x in own["BlockDeviceMappings"]]
+            aws("ec2", "terminate-instances", InstanceIds=[instance])
+            limit = time.monotonic() + 180
+            while time.monotonic() < limit:
+                state = aws("ec2", "describe-instances", InstanceIds=[instance])["Reservations"][0][
+                    "Instances"
+                ][0]["State"]["Name"]
+                if state == "terminated":
+                    result["terminated_verified"] = True
+                    break
+                time.sleep(5)
+            assert result.get("terminated_verified")
+            for volume in volume_ids:
+                volume_deadline = time.monotonic() + 45
+                while True:
+                    remaining = aws(
+                        "ec2", "describe-volumes", Filters=[dict(Name="volume-id", Values=[volume])]
+                    )["Volumes"]
+                    if not remaining or time.monotonic() >= volume_deadline:
+                        break
+                    time.sleep(3)
+                assert not remaining
+            result["volumes_absent_verified"] = True
+        if not group:
+            found = aws(
+                "ec2",
+                "describe-security-groups",
+                Filters=[
+                    dict(Name="group-name", Values=[group_name]),
+                    dict(Name="vpc-id", Values=[VPC]),
+                ],
+            )["SecurityGroups"]
+            assert len(found) <= 1
+            group = found[0]["GroupId"] if found else None
+        if group:
+            own = aws("ec2", "describe-security-groups", GroupIds=[group])["SecurityGroups"][0]
+            assert any(
+                t["Key"] == "LumiAttempt" and t["Value"] == token for t in own.get("Tags", [])
+            )
+            group_deadline = time.monotonic() + 45
+            while True:
+                try:
+                    aws("ec2", "delete-security-group", GroupId=group)
+                    break
+                except RuntimeError as error:
+                    if str(error) != "DependencyViolation" or time.monotonic() >= group_deadline:
+                        raise
+                    time.sleep(3)
+            remaining = aws(
+                "ec2", "describe-security-groups", Filters=[dict(Name="group-id", Values=[group])]
+            )["SecurityGroups"]
+            assert not remaining
+            result["security_group_absent_verified"] = True
+        result["instance"] = instance
+        result["volume_ids"] = volume_ids
+        result["instance_elapsed_seconds"] = time.monotonic() - launch_start if launch_start else 0
+        save("result.json", result)
+        print(
+            json.dumps(
+                dict(
+                    event="cleanup_complete",
+                    instance=instance,
+                    terminated=result.get("terminated_verified"),
+                    stopped_observed=result["stopped_observed"],
+                    elapsed_seconds=result["instance_elapsed_seconds"],
+                )
+            ),
+            flush=True,
+        )
+
+
+if __name__ == "__main__":
+    main()

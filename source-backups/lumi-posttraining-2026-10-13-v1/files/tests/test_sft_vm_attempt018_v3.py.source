@@ -1,0 +1,179 @@
+"""Offline source-repair and exact-version transport tests; no AWS calls."""
+import hashlib
+import io
+import json
+import os
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+from urllib.parse import quote
+
+from scripts import prepare_sft_vm_attempt018_v3 as m
+
+
+def modules(files):
+    package_name = "_attempt018_v3_runtime"
+    for name in list(sys.modules):
+        if name == package_name or name.startswith(package_name + "."):
+            del sys.modules[name]
+    package = types.ModuleType(package_name)
+    package.__path__ = []
+    sys.modules[package_name] = package
+    loaded = {}
+    for short, path in (("posttraining_vm_fullsize_staging_v1", m.STAGING),
+                        ("posttraining_vm_fullsize_transport_v1", m.TRANSPORT)):
+        module = types.ModuleType(package_name + "." + short)
+        module.__package__ = package_name
+        module.__file__ = path
+        sys.modules[module.__name__] = module
+        setattr(package, short, module)
+        exec(compile(files[path], path, "exec"), module.__dict__)
+        loaded[short] = module
+    return loaded
+
+
+class ReleaseTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.report = m.build()
+
+    def test_versioned_selection_and_nonclaims(self):
+        selected = json.loads(self.files[m.SELECTION])
+        self.assertTrue(selected["object_versions_bound"])
+        self.assertEqual(len(selected["objects"]), 22)
+        self.assertTrue(all(row["version_id"] for row in selected["objects"]))
+        self.assertFalse(selected["remote_availability_verified"])
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertFalse(self.report["gate_5_complete"])
+        self.assertFalse(self.report["gpu"])
+
+    def test_archive_rebuilt_from_exact_repaired_runtime(self):
+        members = m.tar_members(self.files[m.TAR])
+        self.assertEqual(members[m.STAGING], self.files[m.STAGING])
+        self.assertEqual(members[m.TRANSPORT], self.files[m.TRANSPORT])
+        self.assertEqual(members["controls/input-selection.json"], self.files[m.SELECTION])
+        manifest = json.loads(members["release-manifest.json"])
+        self.assertTrue(all(hashlib.sha256(members[name]).hexdigest() == pin
+                            for name, pin in manifest.items()))
+        descriptor = json.loads(members["prepared-attempt.json"])
+        self.assertEqual(descriptor["selection_sha256"],
+                         hashlib.sha256(self.files[m.SELECTION]).hexdigest())
+        self.assertFalse(descriptor["execution_permitted"])
+
+    def test_permissions_are_version_only(self):
+        scripts = str(m.ROOT / "scripts")
+        sys.path.insert(0, scripts)
+        self.addCleanup(lambda: sys.path.remove(scripts))
+        module = types.ModuleType("_attempt018_v3_permissions")
+        module.__file__ = m.PERMISSIONS
+        exec(compile(self.files[m.PERMISSIONS], m.PERMISSIONS, "exec"), module.__dict__)
+        now = module.dt.datetime(2026, 1, 1, tzinfo=module.dt.UTC)
+        keys = [f"prefix/{i}" for i in range(22)]
+        policy, _ = module.policy_for_keys(keys, now)
+        self.assertEqual(policy["Statement"][0]["Action"], "s3:GetObjectVersion")
+        self.assertEqual(policy["Statement"][2]["NotAction"], "s3:GetObjectVersion")
+        self.assertIn("s3:GetObject", self.files[m.PERMISSIONS].decode())
+
+    def test_proposal_states_implemented_controls_without_wire_claim(self):
+        proposal = json.loads(self.files[m.PROPOSALS[0]])
+        self.assertTrue(proposal["transport"]["source_versions_bound"])
+        self.assertTrue(proposal["transport"]["hard_ip_packet_quotas_implemented"])
+        self.assertFalse(proposal["transport"]["wire_or_billing_byte_cap_claimed"])
+        self.assertTrue(proposal["controls"]["watchdog_launch_interlock_bound"])
+        self.assertFalse(proposal["controls"]["cpu_execution_authorized"])
+        self.assertIn("implemented_requires", proposal["retention_proposal"]["status"])
+
+
+class TransportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, _ = m.build()
+
+    def setUp(self):
+        loaded = modules(self.files)
+        self.s = loaded["posttraining_vm_fullsize_staging_v1"]
+        self.t = loaded["posttraining_vm_fullsize_transport_v1"]
+        self.temp = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(self.temp)
+        self.fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
+        self.data = {"bound/model/a": b"opaque", "bound/tokenizer/a": b"{}"}
+        self.rows = [
+            {"key": key, "version_id": version, "role": role,
+             "target_relative_path": name, "bytes": len(self.data[key]),
+             "sha256": hashlib.sha256(self.data[key]).hexdigest()}
+            for key, version, role, name in (
+                ("bound/model/a", "version.A", "checkpoint", "model/a"),
+                ("bound/tokenizer/a", "version_B", "tokenizer", "tokenizer/a"),
+            )
+        ]
+        self.selected = {"objects": self.rows, "object_count": 2, "object_bytes": 8,
+                         "bucket": self.t.BUCKET, "account": self.t.ACCOUNT,
+                         "region": self.t.REGION}
+        self.raw = json.dumps(self.selected).encode()
+        self.enterContext(patch.object(self.s, "SELECTION_SHA256",
+                                       hashlib.sha256(self.raw).hexdigest()))
+        self.enterContext(patch.object(self.s, "_runtime"))
+        self.client, self.session = Mock(), Mock()
+        self.session.create_client.return_value = self.client
+        self.client.get_object.side_effect = self.respond
+        self.config = Mock(side_effect=lambda **kwargs: kwargs)
+
+    def before(self, request):
+        guard = self.client.meta.events.register_first.call_args.args[1]
+        guard(request=request)
+
+    def respond(self, **kwargs):
+        self.assertEqual(set(kwargs), {"Bucket", "Key", "VersionId", "ExpectedBucketOwner"})
+        row = next(row for row in self.rows if row["key"] == kwargs["Key"])
+        self.assertEqual(kwargs["VersionId"], row["version_id"])
+        url = (self.t.OBJECT_ENDPOINT + quote(row["key"], safe="/") + "?versionId="
+               + quote(row["version_id"], safe=""))
+        self.before(types.SimpleNamespace(method="GET", url=url))
+        return {"ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 0},
+                "ContentLength": row["bytes"], "VersionId": row["version_id"],
+                "Body": io.BytesIO(self.data[row["key"]])}
+
+    def execute(self):
+        credentials = {"access_key": "synthetic", "secret_key": "synthetic",
+                       "session_token": "synthetic"}
+        return self.t._acquire_admitted_once(
+            self.fd, self.raw, session=self.session, config_type=self.config,
+            credentials=credentials, deadline=time.monotonic() + 30)
+
+    def test_exact_version_query_and_parsed_version(self):
+        result = self.execute()
+        self.assertEqual(result["http_sends"], 2)
+        self.assertTrue(result["staging"]["object_versions_bound"])
+        self.assertEqual(self.client.get_object.call_count, 2)
+
+    def test_wrong_staging_version_rejected_before_sdk_call(self):
+        transport = self.t._ExactResponses(self.client, self.selected, time.monotonic() + 30)
+        with self.assertRaises(self.t.TransportError):
+            transport.open(self.t.BUCKET, self.rows[0]["key"], "wrong")
+        self.client.get_object.assert_not_called()
+
+    def test_raw_version_header_is_mandatory_and_exact(self):
+        owner = types.SimpleNamespace(active=self.rows[0]["key"], sent=True,
+                                      deadline=time.monotonic() + 30,
+                                      rows={row["key"]: row for row in self.rows})
+        response = types.SimpleNamespace(
+            status_code=200,
+            headers={"content-length": str(self.rows[0]["bytes"]),
+                     "x-amz-version-id": "wrong"},
+            raw=Mock(),
+        )
+        underlying = Mock()
+        underlying.send.return_value = response
+        gate = self.t._RawResponseGate(underlying, owner)
+        with self.assertRaises(self.t.TransportError):
+            gate.send(Mock())
+        response.raw.close.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

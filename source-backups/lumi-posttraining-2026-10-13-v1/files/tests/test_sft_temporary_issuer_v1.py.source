@@ -1,0 +1,141 @@
+import datetime as dt
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/check_sft_temporary_issuer_v1.py"
+SPEC = importlib.util.spec_from_file_location("issuer_check", PATH)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class FakeCloud:
+    def __init__(self, fail=None, seconds=7199):
+        self.fail = fail
+        self.seconds = seconds
+        self.user = self.role = False
+        self.keys = []
+        self.calls = []
+        self.issued = 0
+
+    def absent(self, kind, name):
+        return not getattr(self, kind)
+
+    def cli(self, service, operation, **fields):
+        self.calls.append((service, operation, fields))
+        if operation == self.fail:
+            raise m.CloudError("synthetic_failure")
+        if operation == "get-caller-identity":
+            return {"Account": m.ACCOUNT, "Arn": f"arn:aws:iam::{m.ACCOUNT}:root"}
+        if operation == "create-user":
+            self.user = True
+        if operation == "create-role":
+            self.role = True
+        if operation == "get-role-policy":
+            return {"PolicyDocument": m.DENY}
+        if operation == "create-access-key":
+            self.keys.append("AKIASYNTHETIC")
+            return {
+                "AccessKey": {"AccessKeyId": self.keys[0], "SecretAccessKey": "synthetic-secret"}
+            }
+        if operation == "list-access-keys":
+            return {"AccessKeyMetadata": [{"AccessKeyId": k} for k in self.keys]}
+        if operation == "delete-access-key":
+            self.keys.remove(fields["AccessKeyId"])
+        if operation == "delete-user":
+            if self.keys:
+                raise m.CloudError("keys_remain")
+            self.user = False
+        if operation == "delete-role":
+            self.role = False
+        return {}
+
+    def issue(self, key, arn):
+        self.issued += 1
+        if self.fail == "issue":
+            raise RuntimeError("synthetic-secret must not appear in report")
+        return {
+            "AccessKeyId": "ASIASYNTHETIC",
+            "SecretAccessKey": "synthetic-secret",
+            "SessionToken": "synthetic-token",
+            "Expiration": dt.datetime.now(dt.UTC) + dt.timedelta(seconds=self.seconds),
+        }
+
+
+class Tests(unittest.TestCase):
+    def run_case(self, cloud):
+        result = m.qualify(cloud, "synthetic-test", wait=lambda _: None)
+        self.assertNotIn("synthetic-secret", json.dumps(result))
+        self.assertNotIn("synthetic-token", json.dumps(result))
+        self.assertFalse(result["gate_5_complete"])
+        self.assertEqual(result["s3_requests"], 0)
+        self.assertTrue(all(service in {"iam", "sts"} for service, _, _ in cloud.calls))
+        return result
+
+    def test_success_tears_down_all_and_no_profile(self):
+        cloud = FakeCloud()
+        result = self.run_case(cloud)
+        self.assertTrue(result["contract_expiry_pass"])
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(cloud.issued, 1)
+        self.assertEqual(cloud.keys, [])
+        self.assertFalse(cloud.user or cloud.role)
+        self.assertNotIn("create-login-profile", [call[1] for call in cloud.calls])
+        policy = next(c[2] for c in cloud.calls if c[1] == "put-role-policy")
+        self.assertEqual(json.loads(policy["PolicyDocument"]), m.DENY)
+
+    def test_no_retry_after_sts_failure(self):
+        cloud = FakeCloud(fail="issue")
+        result = self.run_case(cloud)
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(cloud.issued, 1)
+        self.assertFalse(result["session_issued"])
+
+    def test_default_hour_rejected(self):
+        result = self.run_case(FakeCloud(seconds=3600))
+        self.assertFalse(result["contract_expiry_pass"])
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_long_session_rejected(self):
+        self.assertFalse(self.run_case(FakeCloud(seconds=7300))["contract_expiry_pass"])
+
+    def test_failed_deletion_not_success(self):
+        cloud = FakeCloud(fail="delete-access-key")
+        result = self.run_case(cloud)
+        self.assertFalse(result["cleanup_verified"])
+        self.assertIn("keys", result["cleanup_errors"])
+        self.assertIn("user", result["cleanup_errors"])
+
+    def test_collision_never_mutates(self):
+        cloud = FakeCloud()
+        cloud.user = True
+        result = self.run_case(cloud)
+        self.assertFalse(result["contract_expiry_pass"])
+        self.assertTrue(cloud.user)
+        self.assertEqual(len(cloud.calls), 1)
+
+    def test_policy_failure_never_mints_key(self):
+        cloud = FakeCloud(fail="put-role-policy")
+        result = self.run_case(cloud)
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(cloud.issued, 0)
+        self.assertNotIn("create-access-key", [c[1] for c in cloud.calls])
+
+    def test_lost_key_response_still_inventories_cleanup(self):
+        cloud = FakeCloud()
+        original = cloud.cli
+
+        def lost(service, operation, **fields):
+            result = original(service, operation, **fields)
+            if operation == "create-access-key":
+                raise m.CloudError("response_lost")
+            return result
+
+        cloud.cli = lost
+        self.assertTrue(self.run_case(cloud)["cleanup_verified"])
+        self.assertEqual(cloud.keys, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

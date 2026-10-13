@@ -1,0 +1,369 @@
+"""Inert AWS watchdog deployment. No schedule/VM creation or function invocation.
+
+Creates only two exact fresh IAM roles, one log group and one Lambda function;
+concurrency zero and unarmed environment are read back. Preserve partial results
+on failure; never overwrite/retry an existing deployment or delete resources.
+"""
+
+import base64
+import hashlib
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+import sft_vm_external_watchdog_v1 as worker
+
+ACCOUNT, REGION, ATTEMPT = worker.ACCOUNT, worker.REGION, worker.ATTEMPT
+FUNCTION = worker.FUNCTION
+WORKER_ROLE = "lumi-stop-worker-" + ATTEMPT
+SCHEDULER_ROLE = "lumi-stop-schedule-" + ATTEMPT
+GROUP = "lumi-stop-" + ATTEMPT
+LOG_GROUP = "/aws/lambda/" + FUNCTION
+PATH = "/lumi/temporary/"
+POLICY = "OnlyBoundWatchdog"
+UNARMED = {"Variables": {"LUMI_WATCHDOG_BINDING": '{"armed":false}'}}
+BASE = f"arn:aws:iam::{ACCOUNT}:role{PATH}"
+
+
+def need(value):
+    if not value:
+        raise ValueError("watchdog_deployment_rejected")
+
+
+def compact(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def policies():
+    instance = f"arn:aws:ec2:{REGION}:{ACCOUNT}:instance/*"
+    logs = f"arn:aws:logs:{REGION}:{ACCOUNT}:log-group:{LOG_GROUP}:*"
+    function = f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{FUNCTION}"
+    worker_policy = dict(
+        Version="2012-10-17",
+        Statement=[
+            dict(
+                Effect="Allow",
+                Action="ec2:DescribeInstances",
+                Resource="*",
+                Condition={"StringEquals": {"aws:RequestedRegion": REGION}},
+            ),
+            dict(
+                Effect="Allow",
+                Action="ec2:StopInstances",
+                Resource=instance,
+                Condition={
+                    "StringEquals": {
+                        "ec2:ResourceTag/LumiAttempt": ATTEMPT,
+                        "aws:RequestedRegion": REGION,
+                    }
+                },
+            ),
+            dict(
+                Effect="Allow", Action=["logs:CreateLogStream", "logs:PutLogEvents"], Resource=logs
+            ),
+            dict(Effect="Deny", Action="ec2:StopInstances", NotResource=instance),
+            dict(
+                Effect="Deny",
+                Action="ec2:StopInstances",
+                Resource="*",
+                Condition={"StringNotEquals": {"ec2:ResourceTag/LumiAttempt": ATTEMPT}},
+            ),
+            dict(
+                Effect="Deny",
+                Action=["ec2:DescribeInstances", "ec2:StopInstances"],
+                Resource="*",
+                Condition={"StringNotEquals": {"aws:RequestedRegion": REGION}},
+            ),
+            dict(
+                Effect="Deny",
+                NotAction=[
+                    "ec2:DescribeInstances",
+                    "ec2:StopInstances",
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents",
+                ],
+                Resource="*",
+            ),
+        ],
+    )
+    scheduler_policy = dict(
+        Version="2012-10-17",
+        Statement=[
+            dict(Effect="Allow", Action="lambda:InvokeFunction", Resource=function),
+            dict(Effect="Deny", NotAction="lambda:InvokeFunction", Resource="*"),
+            dict(Effect="Deny", Action="lambda:InvokeFunction", NotResource=function),
+        ],
+    )
+    trusts = [
+        dict(
+            Version="2012-10-17",
+            Statement=[
+                dict(
+                    Effect="Allow", Principal={"Service": service}, Action="sts:AssumeRole", **extra
+                )
+            ],
+        )
+        for service, extra in (
+            ("lambda.amazonaws.com", {}),
+            (
+                "scheduler.amazonaws.com",
+                {
+                    "Condition": {
+                        "StringEquals": {"aws:SourceAccount": ACCOUNT},
+                        "ArnEquals": {
+                            "aws:SourceArn": (
+                                f"arn:aws:scheduler:{REGION}:{ACCOUNT}:schedule-group/{GROUP}"
+                            )
+                        },
+                    }
+                },
+            ),
+        )
+    ]
+    return [(WORKER_ROLE, trusts[0], worker_policy), (SCHEDULER_ROLE, trusts[1], scheduler_policy)]
+
+
+def package():
+    raw = Path(worker.__file__).read_bytes()
+    need(0 < len(raw) < 32768)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as z:
+        item = zipfile.ZipInfo("watchdog.py", (2026, 10, 1, 0, 0, 0))
+        item.external_attr = 0o100400 << 16
+        z.writestr(item, raw)
+    return out.getvalue()
+
+
+class Cloud:
+    def cli(self, service, operation, **fields):
+        allowed = {
+            "sts": {"get-caller-identity"},
+            "iam": {"get-role", "create-role", "put-role-policy", "get-role-policy"},
+            "logs": {"describe-log-groups", "create-log-group", "put-retention-policy"},
+            "lambda": {
+                "get-function-configuration",
+                "create-function",
+                "put-function-concurrency",
+                "get-function-concurrency",
+                "put-function-event-invoke-config",
+                "get-function-event-invoke-config",
+            },
+        }
+        need(operation in allowed.get(service, set()))
+        env = {k: v for k, v in os.environ.items() if not k.startswith("AWS_")}
+        env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="")
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                service,
+                operation,
+                "--cli-input-json",
+                compact(fields),
+                "--region",
+                REGION,
+                "--cli-binary-format",
+                "base64",
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            env=env,
+        )
+        if result.returncode:
+            if "(NoSuchEntity)" in result.stderr or "(ResourceNotFoundException)" in result.stderr:
+                raise LookupError("absent")
+            raise RuntimeError("aws_call_failed")
+        need(len(result.stdout) <= 131072)
+        return json.loads(result.stdout) if result.stdout.strip() else {}
+
+
+def deploy(output, cloud, *, wait=time.sleep):
+    proposal = (
+        Path(__file__).resolve().parents[1] / "configs/lumi-vm-fullsize-host-proposal-v0.1.json"
+    )
+    need(
+        hashlib.sha256(proposal.read_bytes()).hexdigest()
+        == "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061"
+    )
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+
+    def save(name, value):
+        fd = os.open(output / name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(compact(value) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    body = package()
+    digest = base64.b64encode(hashlib.sha256(body).digest()).decode()
+    save(
+        "started.json",
+        dict(
+            attempt=ATTEMPT,
+            function=FUNCTION,
+            worker_sha256=hashlib.sha256(Path(worker.__file__).read_bytes()).hexdigest(),
+            deployment_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            zip_sha256=hashlib.sha256(body).hexdigest(),
+            retry_allowed=False,
+        ),
+    )
+    report = dict(
+        status="started",
+        roles_created=[],
+        function_created=False,
+        log_group_created=False,
+        invocation_disabled_verified=False,
+        unarmed_verified=False,
+        schedule_created=False,
+        instance_created=False,
+        gate_5_complete=False,
+        production_eligible=False,
+        api_calls=0,
+    )
+
+    def call(service, operation, **kw):
+        need(report["api_calls"] < 45)
+        report["api_calls"] += 1
+        return cloud.cli(service, operation, **kw)
+
+    stage = "identity"
+    try:
+        need(call("sts", "get-caller-identity")["Account"] == ACCOUNT)
+        stage = "absence_preflight"
+        for service, operation, fields in [
+            ("iam", "get-role", {"RoleName": n}) for n, _, _ in policies()
+        ] + [("lambda", "get-function-configuration", {"FunctionName": FUNCTION})]:
+            try:
+                call(service, operation, **fields)
+            except LookupError:
+                continue
+            raise ValueError("preexisting_resource")
+        logs = call("logs", "describe-log-groups", logGroupNamePrefix=LOG_GROUP, limit=50)
+        need(
+            not logs.get("nextToken")
+            and not any(x["logGroupName"] == LOG_GROUP for x in logs["logGroups"])
+        )
+        stage = "create_roles"
+        for name, trust, policy in policies():
+            created = call(
+                "iam",
+                "create-role",
+                RoleName=name,
+                Path=PATH,
+                AssumeRolePolicyDocument=compact(trust),
+                MaxSessionDuration=3600,
+                Tags=[dict(Key="LumiAttempt", Value=ATTEMPT)],
+            )["Role"]
+            report["roles_created"].append(name)
+            need(created["Arn"] == BASE + name)
+            call(
+                "iam",
+                "put-role-policy",
+                RoleName=name,
+                PolicyName=POLICY,
+                PolicyDocument=compact(policy),
+            )
+            actual = call("iam", "get-role", RoleName=name)["Role"]
+            need(
+                actual["Arn"] == BASE + name
+                and actual["RoleId"] == created["RoleId"]
+                and actual["AssumeRolePolicyDocument"] == trust
+            )
+            need(
+                call("iam", "get-role-policy", RoleName=name, PolicyName=POLICY)["PolicyDocument"]
+                == policy
+            )
+        stage = "create_log_group"
+        call("logs", "create-log-group", logGroupName=LOG_GROUP, tags={"LumiAttempt": ATTEMPT})
+        report["log_group_created"] = True
+        call("logs", "put-retention-policy", logGroupName=LOG_GROUP, retentionInDays=7)
+        stage = "role_propagation_allowance"
+        wait(15)  # One allowance, no mutation retry.
+        stage = "create_function"
+        call(
+            "lambda",
+            "create-function",
+            FunctionName=FUNCTION,
+            Runtime="python3.13",
+            Role=BASE + WORKER_ROLE,
+            Handler="watchdog.handler",
+            Code={"ZipFile": base64.b64encode(body).decode()},
+            Description="Unarmed stop-only guard for one Lumi attempt; no model data access",
+            Timeout=180,
+            MemorySize=128,
+            Publish=False,
+            Environment=UNARMED,
+            Architectures=["arm64"],
+            EphemeralStorage={"Size": 512},
+            Tags={"LumiAttempt": ATTEMPT},
+        )
+        report["function_created"] = True
+        stage = "disable_invocation"
+        call(
+            "lambda",
+            "put-function-concurrency",
+            FunctionName=FUNCTION,
+            ReservedConcurrentExecutions=0,
+        )
+        call(
+            "lambda",
+            "put-function-event-invoke-config",
+            FunctionName=FUNCTION,
+            MaximumRetryAttempts=0,
+            MaximumEventAgeInSeconds=60,
+        )
+        stage = "readback"
+        value = call("lambda", "get-function-configuration", FunctionName=FUNCTION)
+        need(value["CodeSha256"] == digest and value["Role"] == BASE + WORKER_ROLE)
+        need(value["Runtime"] == "python3.13" and value["Handler"] == "watchdog.handler")
+        need(
+            value["Timeout"] == 180
+            and value["MemorySize"] == 128
+            and value["Environment"] == UNARMED
+        )
+        need(value["Architectures"] == ["arm64"] and value["EphemeralStorage"] == {"Size": 512})
+        report["unarmed_verified"] = True
+        need(
+            call("lambda", "get-function-concurrency", FunctionName=FUNCTION)[
+                "ReservedConcurrentExecutions"
+            ]
+            == 0
+        )
+        report["invocation_disabled_verified"] = True
+        event = call("lambda", "get-function-event-invoke-config", FunctionName=FUNCTION)
+        need(event["MaximumRetryAttempts"] == 0 and event["MaximumEventAgeInSeconds"] == 60)
+        groups = call("logs", "describe-log-groups", logGroupNamePrefix=LOG_GROUP, limit=50)
+        need(not groups.get("nextToken"))
+        exact = [x for x in groups["logGroups"] if x["logGroupName"] == LOG_GROUP]
+        need(len(exact) == 1 and exact[0]["retentionInDays"] == 7)
+        report.update(
+            status="deployed_unarmed_invocation_disabled",
+            code_sha256=digest,
+            runtime_state=value["State"],
+            function_arn=value["FunctionArn"],
+        )
+    except Exception:
+        report.update(status="stopped_no_retry_preserve_partial", failed_stage=stage)
+    save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    need(len(sys.argv) == 2)
+    result = deploy(Path(sys.argv[1]), Cloud())
+    print(compact(result))
+    sys.exit(0 if result["status"] == "deployed_unarmed_invocation_disabled" else 1)

@@ -1,0 +1,142 @@
+"""Bind independently verified attempt-019 live controls."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt019_controls_v2 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "c52421fde551b0110dc399fa52826017071aad5f6f7465f90cd539814545ff56"
+BASE_PLAN = "artifacts/lumi-vm-attempt-019-control-plan-v0.2/plan.json"
+BASE_PLAN_SHA = "07b44f0281e4ee07009ce93aeb433cf92aeaaf845f37dc71a6570d03197cb6ec"
+WATCH = "evidence/lumi-vm-attempt-019-inert-watchdog-deployment-verification-v0.1.json"
+WATCH_SHA = "6df0a83a3488e23f3f909e17c102ef15ab09b35f66789328245e4127e1e92049"
+STORE = "evidence/lumi-vm-attempt-019-cleanup-bucket-verification-v0.1.json"
+STORE_SHA = "604ec15088b122421af33c882c3983376c3a891b6497ab03eea31a35cc7f15f0"
+FAILURE_V1 = "evidence/lumi-vm-attempt-019-control-verification-failure-v0.1.json"
+FAILURE_V1_SHA = "29c6641187abf985165d3518a235bac788de25f05af7bb38b14895b63aebe1dc"
+FAILURE_V2 = "evidence/lumi-vm-attempt-019-control-verification-failure-v0.2.json"
+FAILURE_V2_SHA = "e829a6943a1533fba6895dd5afd4928363e1ac2025551846e71159f53bb9c267"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-019-control-plan-v0.3"
+ATTEMPT = previous.ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_plan_v3_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 256 * 1024)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    previous.build()
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    watch = json.loads(read(WATCH, WATCH_SHA))
+    store = json.loads(read(STORE, STORE_SHA))
+    failure_v1 = json.loads(read(FAILURE_V1, FAILURE_V1_SHA))
+    failure_v2 = json.loads(read(FAILURE_V2, FAILURE_V2_SHA))
+    need(
+        watch["attempt"] == ATTEMPT
+        and watch["status"] == "verified_deployed_unarmed_invocation_disabled"
+        and watch["independent_live_readback"]["reserved_concurrency"] == 0
+        and watch["independent_live_readback"]["schedule_group_absent"] is True
+        and watch["cloud_mutations"] == 0
+        and watch["object_access"] is False
+        and store["attempt"] == ATTEMPT
+        and store["status"] == "verified_private_cleanup_bucket_created"
+        and store["storage"]["public"] is False
+        and store["storage"]["object_access"] is False
+        and store["independent_readback"]["deny_only_policy_verified"] is True
+        and store["cloud_mutations"] == 0
+        and failure_v1["verification_outputs_created"] is False
+        and failure_v2["verification_outputs_created"] is False
+        and failure_v1["control_deployments_retried"] is False
+        and failure_v2["control_deployments_retried"] is False
+    )
+    plan["schema"] = "lumi.vm-attempt-019-control-plan.v0.3"
+    plan["status"] = "live_controls_verified_fresh_readonly_preflight_required"
+    plan["required_control_proofs"] = [WATCH, STORE]
+    plan["watchdog"]["status"] = "deployed_unarmed_invocation_disabled_verified"
+    plan["watchdog"]["redeployment_authorized"] = False
+    plan["cleanup_store"]["status"] = "private_cleanup_store_verified"
+    plan["control_verification_failures_preserved"] = [
+        {"path": FAILURE_V1, "sha256": FAILURE_V1_SHA},
+        {"path": FAILURE_V2, "sha256": FAILURE_V2_SHA},
+    ]
+    plan["successful_readonly_preflight"] = None
+    plan["readiness_review"]["decision"] = "fresh_full_readonly_preflight_required"
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Fresh full read-only CPU/network/watchdog/cleanup-store admission passes",
+        "A separate v0.24 one-shot CPU proposal and explicit approval bind that admission",
+        "Immediate pre-launch read-only admission passes before the execution marker",
+    ]
+    plan["readiness_review"]["risk"] = (
+        "Live inert controls are independently verified, but CPU capacity, fresh network "
+        "admission, remote boot and import remain unproved."
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Pass the fresh full read-only CPU/network/store/watchdog admission.",
+        "Bind a separate one-shot CPU proposal and exact human approval.",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-019-control-plan-release.v0.3",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": previous.previous.RELEASE_SHA,
+        "watchdog_verification_sha256": WATCH_SHA,
+        "cleanup_store_verification_sha256": STORE_SHA,
+        "failed_verification_evidence_preserved": True,
+        "live_controls_verified": True,
+        "fresh_readonly_preflight_required": True,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

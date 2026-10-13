@@ -1,0 +1,219 @@
+"""Bounded streaming input staging for the full-size VM route.
+
+Not a host launcher or AWS client. The admitted acquisition child must run as
+10001 inside a bounded unit, with a private disk-backed directory supplied by
+its root parent. The transport must disable retries, enforce socket deadlines,
+and return one exact-key response; this module checks size and SHA-256 while
+copying opaque bytes. No deserialization, listing, resume, cleanup or retry.
+
+Success closes every writer, but is NOT proof of a read-only mount or exclusion
+of other writers. The parent must reap the entire acquisition cgroup and drop
+its credentials before exposing inputs read-only to the separate cold worker.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import time
+
+SELECTION_SHA256 = "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42"
+MAX_INPUT_BYTES = 48_843_765_443
+CHUNK = 1024 * 1024
+ERROR_CODES = frozenset({"selection_rejected", "runtime_rejected", "directory_rejected",
+    "attempt_used", "deadline", "response_rejected", "stream_rejected", "hash_mismatch",
+    "write_failed", "close_failed", "staging_failed", "host_guard_not_bound"})
+
+
+class StagingError(ValueError):
+    def __init__(self, code):
+        self.code = code if code in ERROR_CODES else "staging_failed"
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise StagingError(code) from None
+
+
+def selection(raw):
+    """Read an already supplied pinned control, never a path or payload."""
+    try:
+        need(type(raw) is bytes and len(raw) <= 131072
+             and hashlib.sha256(raw).hexdigest() == SELECTION_SHA256, "selection_rejected")
+        value = json.loads(raw)
+        rows = value["objects"]
+        need(type(rows) is list and 1 <= len(rows) <= 22, "selection_rejected")
+        keys, targets, total = set(), set(), 0
+        for row in rows:
+            need(type(row) is dict and set(row) ==
+                 {"role", "target_relative_path", "key", "bytes", "sha256"}, "selection_rejected")
+            name = row["target_relative_path"]
+            need(row["role"] in {"checkpoint", "tokenizer"}
+                 and type(name) is str and len(name) <= 256
+                 and all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) and p not in {".", ".."}
+                         for p in name.split("/"))
+                 and type(row["bytes"]) is int and 0 < row["bytes"] <= MAX_INPUT_BYTES
+                 and type(row["key"]) is str and 1 <= len(row["key"]) <= 1024
+                 and type(row["sha256"]) is str
+                 and re.fullmatch(r"[0-9a-f]{64}", row["sha256"]), "selection_rejected")
+            target = row["role"] + "/" + name
+            need(row["key"] not in keys and target not in targets, "selection_rejected")
+            keys.add(row["key"])
+            targets.add(target)
+            total += row["bytes"]
+        need(total <= MAX_INPUT_BYTES and total == value["object_bytes"]
+             and len(rows) == value["object_count"]
+             and {r["role"] for r in rows} == {"checkpoint", "tokenizer"}, "selection_rejected")
+        need(not any(a.startswith(b + "/") for a in targets for b in targets), "selection_rejected")
+        return value
+    except StagingError:
+        raise
+    except Exception:
+        raise StagingError("selection_rejected") from None
+
+
+def _runtime():
+    need(sys.platform == "linux" and os.geteuid() == os.getegid() == 10001
+         and os.getgroups() in ([], [10001]), "runtime_rejected")
+
+
+def _directory(fd):
+    info = os.fstat(fd)
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.geteuid()
+         and info.st_gid == os.getegid()
+         and stat.S_IMODE(info.st_mode) == 0o700, "directory_rejected")
+
+
+def _open_directory(parent, name):
+    fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                 dir_fd=parent)
+    try:
+        _directory(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _tick(deadline):
+    need(time.monotonic() < deadline, "deadline")
+
+
+def _copy(body, fd, row, deadline):
+    """Request at most size+1 bytes, write at most size; read buffers <= 1 MiB.
+
+    The one-byte EOF probe detects an overlong response. It is included in the
+    separate acquisition bound, not charged to coordinator source-read limits.
+    The transport still owns TLS/header/retry accounting and blocking timeouts.
+    """
+    remaining, digest = row["bytes"], hashlib.sha256()
+    while remaining:
+        _tick(deadline)
+        limit = min(CHUNK, remaining)
+        block = body.read(limit)
+        need(type(block) is bytes and 0 < len(block) <= limit, "stream_rejected")
+        _tick(deadline)
+        view = memoryview(block)
+        while view:
+            _tick(deadline)
+            count = os.write(fd, view)
+            need(type(count) is int and 0 < count <= len(view), "write_failed")
+            view = view[count:]
+        digest.update(block)
+        remaining -= len(block)
+    _tick(deadline)
+    tail = body.read(1)
+    need(type(tail) is bytes and tail == b"", "stream_rejected")
+    _tick(deadline)
+    need(digest.hexdigest() == row["sha256"], "hash_mismatch")
+    os.fchmod(fd, 0o400)
+    os.fsync(fd)
+
+
+def stage_inputs(**_arguments):
+    raise StagingError("host_guard_not_bound") from None
+
+
+def _stage_admitted_once(parent_fd, raw, open_response, *, deadline):
+    """Actual one-shot copy primitive; admission/transport are NOT supplied here.
+
+    open_response(bucket, key) returns (ContentLength, binary-body-with-close).
+    Exact keys come only from the pinned selection. A surviving started marker
+    consumes the supplied attempt on success or failure, including close errors.
+    Caller must never reset/delete markers or promote an incomplete input tree.
+    """
+    _runtime()
+    selected = selection(raw)
+    try:
+        _directory(parent_fd)
+    except StagingError:
+        raise
+    except Exception:
+        raise StagingError("directory_rejected") from None
+    need(type(deadline) in {int, float} and 0 < deadline - time.monotonic() <= 3600,
+         "deadline")
+    _tick(deadline)
+    try:
+        marker = os.open("acquisition.started", os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         os.O_NOFOLLOW | os.O_CLOEXEC, 0o400, dir_fd=parent_fd)
+    except FileExistsError:
+        raise StagingError("attempt_used") from None
+    except Exception:
+        raise StagingError("staging_failed") from None
+    try:
+        os.close(marker)
+        os.fsync(parent_fd)
+        os.mkdir("inputs", 0o700, dir_fd=parent_fd)
+        inputs = _open_directory(parent_fd, "inputs")
+        try:
+            for role in ("checkpoint", "tokenizer"):
+                os.mkdir(role, 0o700, dir_fd=inputs)
+            for row in selected["objects"]:
+                _tick(deadline)
+                directory = _open_directory(inputs, row["role"])
+                try:
+                    parts = row["target_relative_path"].split("/")
+                    for part in parts[:-1]:
+                        try:
+                            os.mkdir(part, 0o700, dir_fd=directory)
+                        except FileExistsError:
+                            pass
+                        child = _open_directory(directory, part)
+                        os.close(directory)
+                        directory = child
+                    fd = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                 os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=directory)
+                    try:
+                        length, body = open_response(selected["bucket"], row["key"])
+                        try:
+                            need(type(length) is int and length == row["bytes"],
+                                 "response_rejected")
+                            _copy(body, fd, row, deadline)
+                        finally:
+                            try:
+                                body.close()
+                            except BaseException:
+                                raise StagingError("close_failed") from None
+                    finally:
+                        os.close(fd)
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            os.fsync(inputs)
+        finally:
+            os.close(inputs)
+        os.fsync(parent_fd)
+        return {"schema": "lumi.vm-fullsize-staging.v0.1", "status": "copied_hash_verified",
+                "selection_sha256": SELECTION_SHA256, "objects": len(selected["objects"]),
+                "content_bytes_written": selected["object_bytes"],
+                "maximum_body_bytes_returned": selected["object_bytes"] + len(selected["objects"]),
+                "readonly_mount_verified": False, "acquisition_cgroup_reaped": False,
+                "real_4b_import": False, "gate_5_complete": False}
+    except StagingError:
+        raise
+    except BaseException:
+        raise StagingError("staging_failed") from None

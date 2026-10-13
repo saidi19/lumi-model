@@ -1,0 +1,127 @@
+"""Fresh-interpreter source loading tests; no native host admission claim."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+COLD_SETUP = r'''
+import importlib.abc, importlib.util, json, sys, types
+from pathlib import Path
+root = Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location('vm_loader',
+    root/'src/lumi/posttraining_checkpoint_vm_loader_v1.py')
+loader = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(loader)
+# Test source location only. The installed VM location remains fixed in code.
+loader.SOURCE = root/'src/lumi'
+'''
+
+
+class ColdLoaderTests(unittest.TestCase):
+    def child(self, body):
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", COLD_SETUP + body, str(ROOT)],
+                                capture_output=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return json.loads(result.stdout)
+
+    def test_coordinator_load_is_stdlib_only_without_package_autoregistration(self):
+        self.assertEqual(self.child(r'''
+class DenyML(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] in loader.ML_ROOTS:
+            raise AssertionError('ML loaded before runtime gate')
+sys.meta_path.insert(0, DenyML())
+coordinator = loader.load_coordinator()
+assert not hasattr(sys.modules['lumi'], 'register_lumi')
+assert not any(n.split('.')[0] in loader.ML_ROOTS for n in sys.modules)
+try:
+    coordinator.run_import(approval=True)
+except coordinator.ImportRunnerError as error:
+    assert error.code == 'host_guard_not_bound'
+else:
+    raise AssertionError('public entry opened')
+try:
+    loader.load_coordinator()
+except loader.VMLoaderError as error:
+    assert error.code == 'already_attempted'
+else:
+    raise AssertionError('second load allowed')
+print(json.dumps({'stdlib_only':True, 'public_entry_closed':True, 'no_reload':True}))
+'''), {"stdlib_only": True, "public_entry_closed": True, "no_reload": True})
+
+    def test_preloaded_lumi_and_ml_are_rejected_without_replacing_modules(self):
+        for name in ("lumi", "lumi.modeling_lumi", "torch", "numpy", "transformers"):
+            with self.subTest(name=name):
+                body = "name = " + repr(name) + "\n" + r'''
+original = types.ModuleType(name)
+sys.modules[name] = original
+try:
+    loader.load_coordinator()
+except loader.VMLoaderError as error:
+    assert error.code == 'cold_runtime_required'
+else:
+    raise AssertionError('preloaded module accepted')
+assert sys.modules[name] is original
+assert not loader._ATTEMPTED
+print(json.dumps({'rejected_before_load':True}))
+'''
+                self.assertEqual(self.child(body), {"rejected_before_load": True})
+
+    def test_load_failure_is_scrubbed_and_consumes_interpreter(self):
+        self.assertEqual(self.child(r'''
+def fail(*args, **kwargs):
+    raise ValueError('private detail must not escape')
+loader.importlib.import_module = fail
+try:
+    loader.load_coordinator()
+except loader.VMLoaderError as error:
+    assert str(error) == 'load_failed'
+else:
+    raise AssertionError('failed load accepted')
+assert loader._ATTEMPTED
+print(json.dumps({'fixed_error':True,'consumed':True}))
+'''), {"fixed_error": True, "consumed": True})
+
+    def test_missing_relative_or_writable_sources_reject_before_import(self):
+        self.assertEqual(self.child(r'''
+import tempfile
+with tempfile.TemporaryDirectory(prefix='lumi-generated-loader-') as directory:
+    path = Path(directory).resolve()
+    path.chmod(0o777)
+    for source in (Path('relative'), path/'missing', path):
+        loader.SOURCE = source
+        try:
+            loader.load_coordinator()
+        except loader.VMLoaderError as error:
+            assert error.code == 'source_rejected'
+        else:
+            raise AssertionError('invalid source accepted')
+        assert not loader._ATTEMPTED and 'lumi' not in sys.modules
+print(json.dumps({'source_rejected_before_import':True}))
+'''), {"source_rejected_before_import": True})
+
+    def test_symlink_source_rejects_before_import(self):
+        self.assertEqual(self.child(r'''
+import tempfile
+with tempfile.TemporaryDirectory(prefix='lumi-generated-loader-link-') as directory:
+    path = Path(directory).resolve()/'source'
+    path.symlink_to(loader.SOURCE, target_is_directory=True)
+    loader.SOURCE = path
+    try:
+        loader.load_coordinator()
+    except loader.VMLoaderError as error:
+        assert error.code == 'source_rejected'
+    else:
+        raise AssertionError('symlink accepted')
+    assert not loader._ATTEMPTED and 'lumi' not in sys.modules
+print(json.dumps({'symlink_rejected_before_import':True}))
+'''), {"symlink_rejected_before_import": True})
+
+
+if __name__ == "__main__":
+    unittest.main()

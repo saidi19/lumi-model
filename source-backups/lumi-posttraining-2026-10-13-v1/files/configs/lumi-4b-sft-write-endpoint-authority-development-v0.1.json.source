@@ -1,0 +1,108 @@
+{
+  "schema_version": "lumi.sft-write-endpoint-authority-development.v0.1",
+  "date": "2026-09-26",
+  "status": "PASS_local_finalized_endpoint_authority_candidate_NOT_process_composition",
+  "scope": "Local, import-inert one-shot descriptor-authority transfer from a finalized write topology with synthetic boundaries only. No socket, descriptor, process, thread, pidfd, signal, waitid, cgroup, listener, payload, remote, GPU, inference or training execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_authority_v1.py",
+      "bytes": 8734,
+      "sha256": "efca44b66a5fd1402e66afbee9d400b02f02afdc17441fd3f20e66f118f32c30"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_authority_v1.py",
+      "bytes": 14638,
+      "sha256": "634f5e1ec91c4ce8eef30d58294142525de5e41dd8c9c42266cfe0f83140131b"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_topology_v1.py",
+      "bytes": 14780,
+      "sha256": "6e4f271d213d926c2f90c9f0715444f13984545d8452b2e1fc2155e0bf9267dd"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-child-lifecycle-development-v0.1.json",
+      "bytes": 6278,
+      "sha256": "0ca43a41df8296d299868bf63e9c6091db30a9b1b93298e014ec0cb6c5edef8d"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-child-lifecycle-development-verification-v0.1.json",
+      "bytes": 7764,
+      "sha256": "1c7dd6fae9364466543a8d96fcbbe3b25e593c44e93c51255cd5f4be0c99ab22"
+    }
+  ],
+  "completed": [
+    "Only an exact frozen topology object that has reached controller, broker, worker or guardian-watch final state may transfer an endpoint, and only an endpoint assigned to that final role may be selected.",
+    "The topology lock, process/thread owner, absolute deadline and socket identity are revalidated immediately before mutation.",
+    "The endpoint is removed from the topology before the one detach attempt, so the topology can never close it after ownership transfer and cannot retry an ambiguous detach.",
+    "A detach failure retains the socket object. A post-detach identity failure retains the raw descriptor and recorded identity. Neither ambiguity is closed as a possible replacement descriptor.",
+    "A successful detach produces one private authority object with an exact descriptor identity and process/thread owner. Its snapshot contains no descriptor, socket identity or endpoint name.",
+    "The authority can either transfer the descriptor once or close it once. Transfer validates identity before removing prior ownership; close removes ownership and consumes the close attempt before the final identity check.",
+    "A changed descriptor is never returned or closed. Failed, transferred or close-attempted authorities cannot be reused or retried.",
+    "All endpoints assigned to every final role were exercised through the synthetic transfer path without changing the frozen v0.115 topology source or any prior evidence."
+  ],
+  "fixed_transfer": {
+    "accepted_topology_stages": [
+      "broker",
+      "controller",
+      "guardian_watch",
+      "worker"
+    ],
+    "detach_attempts_per_endpoint": 1,
+    "authority_dispositions": [
+      "transfer_once",
+      "close_once"
+    ],
+    "descriptor_identity_checks_before_detach": 1,
+    "descriptor_identity_checks_before_transfer": 1,
+    "descriptor_identity_checks_after_close_ownership_revocation": 1,
+    "ambiguous_socket_objects_retained": true,
+    "ambiguous_raw_descriptors_retained": true,
+    "retry_allowed": false
+  },
+  "verification": {
+    "new_endpoint_authority_tests": 18,
+    "prior_regressions": 878,
+    "unique_tests_per_runtime": 896,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ],
+    "all_runtime_socket_descriptor_process_identity_and_clock_boundaries_synthetic": true,
+    "native_operations_performed": false
+  },
+  "remaining_integration_work": [
+    "Implement the fully doubled private fork composition using the frozen topology, endpoint authorities and pidfd child owners, including one identity-checked duplicate of each child pidfd needed by another component.",
+    "The controller must fork and pidfd-bind guardian; guardian must adopt its prefork copy, create the lease, fork and pidfd-bind broker and worker; each final role must transfer only its assigned endpoints and close every other inherited copy.",
+    "Implement one controller event loop for READY verification before guardian arm, parent reservation and ACK before every CONTINUE, CONSUMED verification, terminal reports and absolute-deadline cleanup.",
+    "Integrate listener handoff and adoption, worker privilege drop and final seal, guardian-v2 authority consumption, full-size bootstrap and entry, and authenticated source closure.",
+    "Run a separately authorized bounded Linux native qualification before any real checkpoint payload read or import, then re-run unchanged host, input, resource and real-import admission."
+  ],
+  "nonclaims": {
+    "public_execution_open": false,
+    "processes_spawned_or_reaped": false,
+    "fork_order_verified": false,
+    "inherited_copies_closed": false,
+    "endpoint_peer_authenticated": false,
+    "endpoint_exclusivity_verified": false,
+    "target_kernel_abi_qualified": false,
+    "native_endpoint_transferred": false,
+    "native_pidfd_bound_or_signaled": false,
+    "native_waitid_or_reap_performed": false,
+    "native_listener_bound_or_transferred": false,
+    "parent_received_ready_or_consumed": false,
+    "guardian_armed_after_ready": false,
+    "ledger_exchanged": false,
+    "native_write_continuations_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "bootstrap_or_lifecycle_integration_verified": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "retry_allowed": false,
+    "publication": false
+  }
+}

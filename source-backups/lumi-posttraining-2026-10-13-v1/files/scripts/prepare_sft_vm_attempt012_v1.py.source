@@ -1,0 +1,283 @@
+"""Fresh CPU recovery source, diagnostics and isolated expiry read timeouts.
+
+Offline composition only. Never renews attempt-011, deploys controls or reads a
+checkpoint. Existing qualified guest/identity builders preserve archive lineage.
+"""
+
+import ast
+import hashlib
+import json
+import os
+import re
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+NEW = "58907eb20ec649a7bc340a144541ee32"
+OLD = "ad7b734ba7894916b25d795ac3dab31c"
+BUCKET = "lumi-cleanup-" + NEW
+BASE = ROOT / "artifacts/lumi-vm-dedicated-cleanup-source-v0.1"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-012-source-v0.1"
+BASE_SHA = "f80873927a33724d37932560238352d524e744744ab4c98a9a5bd8cec65768d1"
+PROOFS = {
+    "evidence/lumi-vm-retained-expiry-inspection-verification-v0.2.json": (
+        "396ca10e3db4605c88289ff97338398aff5c189408c1fcba8b9dcfacb4d0c695"
+    ),
+    "evidence/lumi-vm-network-diagnostic-repair-verification-v0.1.json": (
+        "7326ff5b53c753e054f9df220ac0f1a4951535824d72797bd064f852027b5f6e"
+    ),
+}
+HELPERS = {
+    "prepare_sft_vm_attempt011_v1.py": (
+        "09a51e88693ba0b9f19e9c22522265cabf4aef679d757077b6d2c23395803ea0"
+    ),
+    "prepare_sft_vm_dedicated_cleanup_source_v1.py": (
+        "fb73554804bfd5948e33b175fb24ee6700d54b2c86f6fabc4f96ec8423046eae"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt012_source_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, pin, size=None):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == pin and (size is None or len(raw) == size))
+    return raw
+
+
+def replace(raw, old, new):
+    old, new = old.encode(), new.encode()
+    need(raw.count(old) == 1)
+    return raw.replace(old, new)
+
+
+def helper(name, substitutions=()):
+    path = ROOT / "scripts" / name
+    raw = read(path, HELPERS[name])
+    for old, new in substitutions:
+        need(old.encode() in raw)
+        raw = raw.replace(old.encode(), new.encode())
+    value = types.ModuleType("_attempt012_" + name[:-3])
+    value.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), value.__dict__)
+    return value
+
+
+def evidence():
+    for name, pin in PROOFS.items():
+        proof = json.loads(read(ROOT / name, pin))
+        for source, binding in proof["source_bindings"].items():
+            need(not Path(source).is_absolute() and ".." not in Path(source).parts)
+            read(ROOT / source, binding["sha256"], binding["bytes"])
+    completed = json.loads(read(ROOT / next(iter(PROOFS)), next(iter(PROOFS.values()))))
+    need(completed["result"]["status"] == "current_retained_timer_configuration_verified")
+    need(completed["result"]["mutations"] == 0)
+    manifest = json.loads(read(BASE / "release.json", BASE_SHA))
+    original = {
+        name: read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    return original
+
+
+def closure(original, seeds, ancillary):
+    current = dict(seeds)
+    for _ in range(64):
+        mapping = {}
+        for name, raw in original.items():
+            if name in ancillary:
+                continue
+            before, after = sha(raw), sha(current[name])
+            need(before not in mapping or mapping[before] == after)
+            mapping[before] = after
+        following = {}
+        for name, raw in seeds.items():
+            if (
+                name not in ancillary
+                and name.endswith((".py", ".json"))
+                and not name.startswith("evidence/")
+            ):
+                raw = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda m, mapping=mapping: mapping.get(m[0].decode(), m[0].decode()).encode(),
+                    raw,
+                )
+            following[name] = raw
+        if following == current:
+            return current
+        current = following
+    raise ValueError("attempt012_hash_cycle")
+
+
+def build():
+    old = evidence()
+    base = helper(
+        "prepare_sft_vm_attempt011_v1.py",
+        (
+            (OLD, NEW),
+            ("attempt-011", "attempt-012"),
+            ("Attempt-011", "Attempt-012"),
+            ("attempt011", "attempt012"),
+            ("v0.11", "v0.13"),
+        ),
+    )
+    files, ancillary, identity, _ = base.build()
+    split = helper("prepare_sft_vm_dedicated_cleanup_source_v1.py")
+    split.inputs = lambda: (files | ancillary, identity)
+    split.control = types.SimpleNamespace(BUCKET=BUCKET, ATTEMPT=NEW)
+    split.BASE_SHA = sha(encode(identity))
+    original, _ = split.build()
+    need(set(original) == set(old) and len(original) == 156)
+    mapping = {sha(old[n]): sha(original[n]) for n in original if n not in ancillary}
+    seeds = dict(original)
+    diagnostics = (
+        "sft_vm_safe_failure_v1.py",
+        "run_sft_vm_private_network_v1.py",
+        "arm_sft_vm_network_cleanup_v1.py",
+    )
+    proof = json.loads(read(ROOT / list(PROOFS)[1], list(PROOFS.values())[1]))
+    for name in diagnostics:
+        path = "artifacts/lumi-vm-network-diagnostics-source-v0.1/" + name
+        pin = proof["source_bindings"][path]
+        raw = read(ROOT / path, pin["sha256"], pin["bytes"])
+        raw = raw.replace(OLD.encode(), NEW.encode())
+        raw = re.sub(
+            rb"\b[0-9a-f]{64}\b", lambda m: mapping.get(m[0].decode(), m[0].decode()).encode(), raw
+        )
+        seeds["scripts/" + name] = raw
+    armer = "scripts/arm_sft_vm_network_cleanup_v1.py"
+    seeds[armer] = replace(
+        seeds[armer], "0 < meta.config.read_timeout <= 5", "0 < meta.config.read_timeout <= 15"
+    )
+    credentials = "scripts/sft_vm_controller_credentials_v2.py"
+    raw = seeds[credentials]
+    raw = replace(
+        raw,
+        "        self.reader, self.clients = reader, {}",
+        "        self.reader, self.clients, self.expiry_clients = reader, {}, {}",
+    )
+    raw = replace(
+        raw,
+        '                self.clients[name].meta.events.register("before-call", reader.active)',
+        '                self.clients[name].meta.events.register("before-call", reader.active)\n'
+        "            from botocore.config import Config\n"
+        '            self.expiry_clients["sts"] = self.clients["sts"]\n'
+        '            for name in ("iam", "lambda", "scheduler"):\n'
+        "                self.expiry_clients[name] = sdk.create_client(\n"
+        '                    name, region_name="us-east-1", endpoint_url=endpoint(name),\n'
+        "                    config=legacy.config(name).merge(Config(read_timeout=15)),\n"
+        "                    verify=ca_path())\n"
+        '                self.expiry_clients[name].meta.events.register('
+        '"before-call", reader.active)',
+    )
+    raw = replace(
+        raw,
+        "        for client in self.clients.values():\n",
+        "        for name, client in self.expiry_clients.items():\n"
+        '            if name != "sts":\n                client.close()\n'
+        "        self.expiry_clients.clear()\n"
+        "        for client in self.clients.values():\n",
+    )
+    seeds[credentials] = raw
+    store = "scripts/check_sft_vm_cleanup_store_v1.py"
+    raw = replace(
+        seeds[store],
+        "    output, clients, proposal_raw, *, "
+        "clock=time.monotonic, wall=time.time, wait=time.sleep",
+        "    output, clients, proposal_raw, *, expiry_clients=None,\n"
+        "    clock=time.monotonic, wall=time.time, wait=time.sleep",
+    )
+    raw = replace(
+        raw,
+        "        armer.SDKCloud({k: clients[k] for k in armer.OPS}),",
+        "        armer.SDKCloud({k: "
+        "(expiry_clients if expiry_clients is not None else clients)[k]\n"
+        "                        for k in armer.OPS}),",
+    )
+    seeds[store] = raw
+    outer = "scripts/run_sft_vm_private_outer_v7.py"
+    seeds[outer] = replace(
+        seeds[outer],
+        '            output / "network-expiry",\n            c,\n            proposal_raw,',
+        '            output / "network-expiry",\n            c,\n            proposal_raw,\n'
+        "            expiry_clients=bundle.expiry_clients,",
+    )
+    final = closure(original, seeds, ancillary)
+    logical = {"scripts/" + n for n in diagnostics} | {credentials, store, outer}
+    for name, raw in final.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name not in logical:
+            need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if (
+            name in ancillary
+            or name.startswith("configs/")
+            or name.endswith((".tar", ".gz", ".pem"))
+        ):
+            need(raw == original[name])
+    need(sum(map(len, final.values())) < 32 * 1024**2)
+    report = dict(
+        schema="lumi.vm-attempt012-source.v0.1",
+        attempt=NEW,
+        attempt_label="attempt-012",
+        operational_predecessor=OLD,
+        outputs={n: dict(bytes=len(r), sha256=sha(r)) for n, r in sorted(final.items())},
+        identity_composition=identity,
+        ancestor_manifest_scope="Fresh identity before controller diagnostic integration",
+        logical_changes=sorted(logical),
+        consequent_hash_changes=sorted(n for n in final if final[n] != original[n]),
+        proof_bindings=PROOFS,
+        builder_bindings=HELPERS,
+        cleanup_bucket=BUCKET,
+        source_identity_bound=True,
+        new_identity_live_absence_verified=False,
+        fresh_watchdog_deployment_required=True,
+        fresh_cleanup_bucket_required=True,
+        old_timer_reused=False,
+        old_authorization_reused=False,
+        sdk_expiry_read_timeout_seconds=15,
+        other_sdk_timeouts_unchanged=True,
+        expiry_call_alarm_seconds_unchanged=20,
+        controller_deadline_unchanged=True,
+        checkpoint_selection_unchanged=True,
+        qualified_guest_preserved_after_identity_change=True,
+        execution_permitted=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in sorted((files | {"release.json": encode(report)}).items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("source_preparation_is_not_execution_authority") from None

@@ -1,0 +1,404 @@
+"""Create a local attempt-021 source successor with setup receipt contract repair."""
+
+from __future__ import annotations
+
+import ast
+import base64
+import hashlib
+import io
+import json
+import os
+import re
+import tarfile
+import zipfile
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt019_v1 as source
+from scripts import repair_sft_vm_setup_receipt_v1 as repair
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-020-source-v0.1"
+BASE_SHA = "059fbed8faf317fdf778cba3e29af02c5271ce4f4d76e2961381b76010a5ce52"
+SOURCE_BUILDER_SHA = "050b933aa9da5714571fd48838daabf7c5352fecd439c801957029ae1a76fdd8"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-020-v025-execution-verification-v0.1.json"
+FAILURE_SHA = "f18eae3048a52d319e6cf8c4d57e151be798f43a9505ce15af9ff3b4f92c42e1"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-021-source-v0.1"
+OLD = "3179537f150b45548946f8114e8b73ca"
+NEW = "07be75c955dc43fe8818192e8a9e3fc1"
+OLD_CIDR = "172.31.97.32/27"
+NEW_CIDR = "172.31.97.64/27"
+REPAIR_SHA = "5304446d561e9e041b0ced4578e0296be2e9bef3a0d7489ea89f0486020af41a"
+TAR = source.TAR
+SELECTION = source.SELECTION
+SETUP_TAR = "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar"
+SETUP_STAGE = "scripts/stage_sft_vm_setup_inputs_v5.py"
+SETUP_SEND = "scripts/send_sft_vm_setup_inputs_v5.py"
+SETUP_MEMBERS = dict(
+    (
+        (
+            "lumi-bootstrap-input/prepare_sft_vm_work_disk_v1.py",
+            "scripts/prepare_sft_vm_work_disk_v1.py",
+        ),
+        (
+            "lumi-bootstrap-input/acquire_sft_vm_cpu_wheels_v1.py",
+            "scripts/acquire_sft_vm_cpu_wheels_v1.py",
+        ),
+        (
+            "lumi-bootstrap-input/run_sft_vm_cpu_wheel_unit_v1.py",
+            "scripts/run_sft_vm_cpu_wheel_unit_v1.py",
+        ),
+        (
+            "lumi-bootstrap-input/build_sft_vm_network_expiry_v3.py",
+            "scripts/build_sft_vm_network_expiry_v3.py",
+        ),
+        (
+            "lumi-bootstrap-input/run_sft_vm_network_bootstrap_v4.py",
+            "scripts/run_sft_vm_network_bootstrap_v4.py",
+        ),
+        (
+            "lumi-bootstrap-input/posttraining_import_vm_rehearsal_v3.py",
+            "src/lumi/posttraining_import_vm_rehearsal_v3.py",
+        ),
+        ("lumi-bootstrap-input/cpu.service", "configs/lumi-vm-cpu-runtime-install-v0.1.service"),
+        (
+            "lumi-bootstrap-input/sdk.service",
+            "configs/lumi-vm-acquisition-sdk-install-v0.1.service",
+        ),
+        (
+            "lumi-bootstrap-input/stage_sft_vm_fullsize_release_v1.py",
+            "scripts/stage_sft_vm_fullsize_release_v1.py",
+        ),
+        (
+            "lumi-bootstrap-input/stage_sft_vm_root_controller_v1.py",
+            "scripts/stage_sft_vm_root_controller_v1.py",
+        ),
+        (
+            "lumi-bootstrap-input/source-controls.tar",
+            "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar",
+        ),
+        (
+            "lumi-bootstrap-input/root-controller.tar",
+            "artifacts/lumi-vm-root-controller-release-v0.1/root-controller.tar",
+        ),
+        (
+            "lumi-bootstrap-input/run_sft_vm_setup_sequence_v1.py",
+            "scripts/run_sft_vm_setup_sequence_v1.py",
+        ),
+        ("lumi-bootstrap-input/check_sft_vm_storage_v1.py", "scripts/check_sft_vm_storage_v1.py"),
+        (
+            "lumi-cpu-input/install_sft_vm_cpu_runtime_v1.py",
+            "scripts/install_sft_vm_cpu_runtime_v1.py",
+        ),
+        (
+            "lumi-cpu-input/install_sft_vm_acquisition_sdk_v1.py",
+            "scripts/install_sft_vm_acquisition_sdk_v1.py",
+        ),
+        ("lumi-cpu-input/runtime-lock.json", "configs/lumi-sft-linux-cpu-release-v0.1.lock.json"),
+        (
+            "lumi-sdk-input/install_sft_vm_acquisition_sdk_v1.py",
+            "scripts/install_sft_vm_acquisition_sdk_v1.py",
+        ),
+        (
+            "lumi-sdk-input/sdk-release.tar",
+            "artifacts/lumi-vm-acquisition-sdk-release-v0.1/sdk-release.tar",
+        ),
+    )
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt021_v1_source_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, digest, size=None, maximum=64 * 1024**2):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= maximum)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def package(raw):
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        item = zipfile.ZipInfo("watchdog.py", (2026, 10, 1, 0, 0, 0))
+        item.external_attr = 0o100400 << 16
+        archive.writestr(item, raw)
+    return output.getvalue()
+
+
+def pack_setup(files, fallback):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for destination, origin in sorted(SETUP_MEMBERS.items()):
+            body = files.get(origin, fallback[destination])
+            item = tarfile.TarInfo(destination)
+            item.size, item.mode = len(body), 0o400
+            archive.addfile(item, io.BytesIO(body))
+    return output.getvalue()
+
+
+def setup_members(raw):
+    members = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for item in archive:
+            need(
+                item.name in SETUP_MEMBERS
+                and item.name not in members
+                and item.type == tarfile.REGTYPE
+                and not item.linkname
+                and not item.pax_headers
+                and item.mode == 0o400
+                and item.uid == item.gid == 0
+            )
+            stream = archive.extractfile(item)
+            need(stream is not None)
+            members[item.name] = stream.read()
+    need(set(members) == set(SETUP_MEMBERS))
+    return members
+
+
+def stage_contract(raw):
+    namespace = {
+        "__name__": "_lumi_attempt021_stage_contract",
+        "__file__": str(BASE / SETUP_STAGE),
+    }
+    exec(compile(raw, namespace["__file__"], "exec"), namespace)
+    files = namespace["FILES"]
+    need(
+        type(files) is dict
+        and set(files) == set(SETUP_MEMBERS)
+        and all(files[name][0] == origin for name, origin in SETUP_MEMBERS.items())
+    )
+    return files
+
+
+def close(base, seed, preserved):
+    fallback = setup_members(base[SETUP_TAR])
+    current = dict(seed)
+    for _ in range(64):
+        hash_map, binding_map = {}, {}
+        for name, raw in base.items():
+            if name in preserved:
+                continue
+            after = sha(current[name])
+            for anchored in (raw, seed[name]):
+                before = sha(anchored)
+                need(before not in hash_map or hash_map[before] == after)
+                hash_map[before] = after
+                binding_map[before] = (after, len(current[name]))
+        following = {}
+        for name, raw in seed.items():
+            if name in preserved or name in (TAR, SETUP_TAR):
+                following[name] = raw
+            elif name.endswith(".json"):
+                following[name] = source.source.previous.update_json(raw, hash_map, binding_map)
+            elif name.endswith(".py"):
+                following[name] = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda match, mapping=hash_map: mapping.get(
+                        match[0].decode(), match[0].decode()
+                    ).encode(),
+                    raw,
+                )
+            else:
+                following[name] = raw
+        following[SETUP_TAR] = pack_setup(following, fallback)
+        following[TAR] = source.source.previous.previous.rebuild_tar(
+            base[TAR], following, following[SELECTION]
+        )
+        if following == current:
+            return current
+        current = following
+    raise ValueError("attempt021_v1_hash_cycle")
+
+
+def constants(raw):
+    values = {}
+    for key in ("RECEIVER_SHA", "RECEIVER_BYTES", "ARCHIVE_SHA", "ARCHIVE_BYTES"):
+        match = re.search(rb"^" + key.encode() + rb" = (.+)$", raw, re.MULTILINE)
+        need(match is not None)
+        values[key] = ast.literal_eval(match[1].decode())
+    return values
+
+
+def build():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BUILDER_SHA)
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    need(sha(Path(repair.__file__).read_bytes()) == REPAIR_SHA)
+    need(
+        failure["attempt"] == OLD
+        and failure["status"] == "failed_setup_preserved_no_retry_cleanup_independently_verified"
+        and failure["execution"]["seed_confirmed"] is True
+        and failure["execution"]["control_staging_confirmed"] is False
+        and failure["execution"]["checkpoint_download_started"] is False
+        and failure["execution"]["retry"] is False
+        and failure["execution"]["real_4b_import"] is False
+        and failure["live_verification"]["instance_state"] == "stopped"
+        and failure["cleanup"]["nat_deleted_verified"] is True
+        and failure["cleanup"]["eip_released_verified"] is True
+        and failure["local_receipt_contract_diagnostic"]["sender_expected_files"] == 18
+        and failure["local_receipt_contract_diagnostic"]["receiver_produced_files"] == 19
+        and failure["verification_cloud_mutations"] == 0
+        and failure["verification_object_access"] == 0
+    )
+    manifest = json.loads(read(BASE / "release.json", BASE_SHA))
+    base = {
+        name: read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    need(len(base) == 156 and SETUP_TAR in base)
+    preserved = {
+        name
+        for name in base
+        if name not in (TAR, SETUP_TAR)
+        and (
+            "/" not in name
+            or name.startswith("evidence/")
+            or name.endswith((".gz", ".tar", ".pem"))
+        )
+    }
+    seed = dict(base)
+    changes = (
+        (OLD, NEW),
+        ("attempt-020", "attempt-021"),
+        ("Attempt-020", "Attempt-021"),
+        ("attempt020", "attempt021"),
+        (OLD_CIDR, NEW_CIDR),
+    )
+    for name, raw in base.items():
+        if name not in preserved and name.endswith((".py", ".json")):
+            for before, after in changes:
+                raw = raw.replace(before.encode(), after.encode())
+            seed[name] = raw
+    seed[SETUP_SEND] = repair.repair_sender(seed[SETUP_SEND])
+    bootstrap = "scripts/start_sft_vm_setup_bootstrap_v5.py"
+    seed[bootstrap] = repair.repair_bootstrap(seed[bootstrap])
+    outer = "scripts/run_sft_vm_private_outer_v7.py"
+    seed[outer] = repair.repair_outer(seed[outer], sha(seed[SETUP_SEND]))
+    worker = "scripts/sft_vm_external_watchdog_v1.py"
+    old_code = base64.b64encode(hashlib.sha256(package(base[worker])).digest())
+    new_code = base64.b64encode(hashlib.sha256(package(seed[worker])).digest())
+    need(old_code != new_code)
+    for name in (
+        "scripts/arm_sft_vm_external_watchdog_v2.py",
+        "scripts/prepare_sft_vm_private_host_sources_v4.py",
+    ):
+        need(seed[name].count(old_code) == 1)
+        seed[name] = seed[name].replace(old_code, new_code)
+    final = close(base, seed, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            need(raw == base[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name.startswith("scripts/"):
+            need(OLD.encode() not in raw and b"attempt-020" not in raw)
+    members = setup_members(final[SETUP_TAR])
+    contract = stage_contract(final[SETUP_STAGE])
+    need(
+        all(
+            members[destination] == final.get(origin, setup_members(base[SETUP_TAR])[destination])
+            and sha(members[destination]) == contract[destination][1]
+            and 0 < len(members[destination]) <= contract[destination][2]
+            for destination, origin in SETUP_MEMBERS.items()
+        )
+        and len(members) == 19
+    )
+    pins = constants(final[SETUP_SEND])
+    need(
+        pins["ARCHIVE_SHA"] == sha(final[SETUP_TAR])
+        and pins["ARCHIVE_BYTES"] == len(final[SETUP_TAR])
+        and pins["RECEIVER_SHA"] == sha(final[SETUP_STAGE])
+        and pins["RECEIVER_BYTES"] == len(final[SETUP_STAGE])
+    )
+    receipt = repair.check(
+        final[SETUP_SEND], final[SETUP_STAGE], final[SETUP_TAR], OUTPUT / SETUP_STAGE
+    )
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        need(len(raw) == pin["bytes"] and sha(raw) == pin["sha256"])
+    plan = json.loads(final["configs/lumi-vm-private-network-plan-v0.1.json"])
+    selection = json.loads(final[SELECTION])
+    outer_members = source.source.previous.previous.tar_members(final[TAR])
+    embedded = json.loads(outer_members["release-manifest.json"])
+    need(
+        plan["attempt"] == NEW
+        and plan["targets"]["new_private_subnet_cidr"] == NEW_CIDR
+        and selection["object_versions_bound"] is True
+        and selection["versioned_object_count"] == 22
+        and outer_members["controls/input-selection.json"] == final[SELECTION]
+        and all(sha(outer_members[name]) == digest for name, digest in embedded.items())
+    )
+    report = {
+        "schema": "lumi.vm-attempt021-source.v0.1",
+        "attempt": NEW,
+        "operational_predecessor": OLD,
+        "attempt_label": "attempt-021",
+        "base_release_sha256": BASE_SHA,
+        "predecessor_failure_sha256": FAILURE_SHA,
+        "predecessor_failure_preserved": True,
+        "cleanup_bucket": "lumi-cleanup-" + NEW,
+        "selected_cidr": NEW_CIDR,
+        "selected_cidr_live_absence_verified": False,
+        "nested_setup_archive_rebuilt": True,
+        "nested_setup_members_verified": 19,
+        "sender_receiver_receipts_equal": True,
+        "receipt_file_count": receipt["files"],
+        "receipt_count_derived_from_manifest": True,
+        "receipt_contract_guard_before_remote_seed": True,
+        "receipt_contract_guard_before_paid_allocation": True,
+        "allowlisted_control_failure_stage_recorded": True,
+        "repair_implementation_sha256": REPAIR_SHA,
+        "real_linux_or_remote_transfer_qualified": False,
+        "nested_setup_loose_members_rebuilt": 16,
+        "nested_setup_frozen_members_preserved": 3,
+        "bounded_transient_read_recovery_preserved": True,
+        "read_attempts_per_call_maximum": 3,
+        "read_retries_total_maximum": 8,
+        "write_attempts_per_operation": 1,
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "watchdog_code_sha256_base64": new_code.decode(),
+        "fresh_controls_required": True,
+        "execution_permitted": False,
+        "old_authorization_reused": False,
+        "old_timer_reused": False,
+        "consumed_attempt_retained": True,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "outputs": {
+            name: {"bytes": len(raw), "sha256": sha(raw)} for name, raw in sorted(final.items())
+        },
+    }
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in sorted(
+        (files | {"release.json": source.source.previous.encode(report)}).items()
+    ):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("fresh_source_preparation_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

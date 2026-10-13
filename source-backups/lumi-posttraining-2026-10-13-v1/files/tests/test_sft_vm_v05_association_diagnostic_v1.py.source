@@ -1,0 +1,48 @@
+"""Aggregate-only fixtures; no live APIs or raw response retention."""
+
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/diagnose_sft_vm_v05_associations_v1.py"
+spec = importlib.util.spec_from_file_location("association_diagnostic_test", PATH)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class AggregateTests(unittest.TestCase):
+    def test_missing_null_empty_and_wrong_type_distinguished(self):
+        for value, present, label in (({}, False, "null"),
+            ({"SecurityGroupVpcAssociations": None}, True, "null"),
+            ({"SecurityGroupVpcAssociations": []}, True, "array"),
+            ({"SecurityGroupVpcAssociations": "not retained"}, True, "string")):
+            result = m.summarize(value)
+            self.assertEqual(result["association_field_present"], present)
+            self.assertEqual(result["association_field_type"], label)
+
+    def test_original_vpc_owner_and_target_counts(self):
+        rows = [dict(GroupId=group, VpcId=m.VPC, VpcOwnerId=m.ACCOUNT,
+                     GroupOwnerId=m.ACCOUNT, State="associated") for group in m.GROUPS]
+        result = m.summarize({"SecurityGroupVpcAssociations": rows})
+        self.assertEqual(result["row_count"], 2)
+        for field in ("original_vpc_matches", "vpc_owner_matches", "group_owner_matches"):
+            self.assertEqual(result[field], 2)
+        self.assertEqual(result["vm_rows"], 1)
+        self.assertEqual(result["endpoint_rows"], 1)
+        self.assertEqual(result["state_counts"]["associated"], 2)
+
+    def test_unknown_values_and_pagination_never_leak(self):
+        result = m.summarize({"NextToken": "SECRET_CURSOR", "SecurityGroupVpcAssociations": [
+            {"GroupId": "SECRET_GROUP", "VpcId": "SECRET_VPC", "State": "SECRET_STATE",
+             "StateReason": "SECRET_REASON"}, None, {}]})
+        self.assertTrue(result["pagination_present"])
+        self.assertEqual(result["nonobject_row_count"], 1)
+        self.assertEqual(result["unknown_group_count"], 2)
+        self.assertEqual(result["state_counts"]["unknown_or_missing"], 2)
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_unhashable_state_and_nonobject_response(self):
+        result = m.summarize({"SecurityGroupVpcAssociations": [{"State": []}]})
+        self.assertEqual(result["state_counts"]["unknown_or_missing"], 1)
+        self.assertEqual(m.summarize(None), {"response_type": "null"})

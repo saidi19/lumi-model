@@ -1,0 +1,125 @@
+# SFT execution status v0.122: AWS native attempt, localized entry bug
+
+2026-09-27 (Dhaka). **Gate 5 is still incomplete.** One generated-only native
+attempt ran on a dedicated AWS CPU VM. The four-case tiny import/package chain
+passed; full resource-probe acceptance failed. No real checkpoint/dataset was
+acquired, no GPU was used, and no training or inference occurred.
+
+The successor launcher now avoids an eager ML import before its resource
+checks/probes. Its **42 local tests pass** (37 supervisor/source-copy tests,
+2 fresh-entry regressions, 3 bootstrap regressions), with no skips. Ruff passes.
+This corrected v3 launcher has **not run on Linux**. No retry of the started
+native attempt was made, and no successful native acceptance is claimed.
+
+## What actually ran
+
+The user authorized using AWS credits and refreshed the default CLI login.
+Only dedicated `t3.large` CPU instances were used in `us-east-1`: 2 vCPU, 8 GiB,
+20-GiB encrypted gp3 root volume, standard CPU credits, no IAM instance profile,
+IMDSv2 required, terminate-on-shutdown, delete-on-termination disk. AWS Pricing
+API returned USD 0.0832 per Linux instance-hour; that is a rate, not a final bill.
+
+Two bootstrap-only instances stalled before SSH/workload startup. The early
+`systemd-run` call was the likely boot dependency problem; `--no-block` alone
+did not resolve it. Both were terminated. The final v0.3 bootstrap has no early
+boot command: it arms a boot-relative one-hour timer during cloud-init's final
+stage, with a 15-second command timeout. That VM finished cloud-init and its
+timer was directly observed `active/waiting` before staging and dispatch.
+Final-stage boot succeeded; an exact trace of the earlier deadlocks was not
+captured, so the report does not claim more precise proof of their mechanism.
+
+Public SSH timed out despite the narrow operator-IP rule and an allowing route/
+ACL configuration. A temporary AWS Instance Connect endpoint provided an
+authenticated HTTPS tunnel. Its SG permitted SSH only to the new VM's SG.
+The SSH ED25519 key was pinned from authenticated EC2 console output. No broad
+public SSH rule, S3 permission or existing-instance change was used.
+
+The VM used Canonical Ubuntu 24.04, systemd 255, signed-apt Python 3.12.3, and
+34 exact hash/size-pinned CPU wheels (248,715,637 downloaded software bytes).
+Versions included torch 2.14.0+cpu, transformers 5.15.1, safetensors 0.8.0,
+tokenizers 0.22.2 and numpy 2.5.3. This is **not** the old OCI Python 3.12.14
+image identity; the runtime difference is recorded, not silently equated.
+
+## Source ownership correction before the native attempt
+
+The immutable staged source is root-owned, while the unchanged import kernel's
+`ContentIO.read_control` requires source-control files to share the worker UID.
+This conflict was identified before native dispatch. v2 therefore makes exact,
+hash-checked worker-owned copies of the source closure under its private
+64-MiB `/work` tmpfs, then launches the fixed four-test child interpreter.
+Original source files are neither chowned nor modified; importer checks stay
+unchanged. The copy is exclusive, flat-path-allowlisted, bounded to 2 MiB, and
+read back for hash verification. The source-copy/supervisor tests passed 37/37.
+
+The first source bundle also independently ran the four actual integration
+tests from extracted files, without reading the repository's original modules.
+An initial local audit harness misinterpreted relative dir-fd opens against the
+old cwd; switching the harness cwd to the extracted stage fixed that false
+rejection. No application code or test assertions were relaxed for it.
+
+## Native outcome and correction to intermediate status
+
+Attempt: `67f4ec061b9f4728a1cfb14c52a4f112`, v2 manifest
+`2acf79b7bec358aa643e04df5cd200c1dc9cab976a0c781a7fd1d3876a9e3420`.
+The retained failure record says `case_failed`, `completed_cases=3`,
+`retry_allowed=false`. This is a controller observation, **not three fully
+qualified containment probes**.
+
+| Case | Observation | Accepted interpretation |
+| --- | --- | --- |
+| Import/package chain | Controller accepted fixed four-test child success | Generated-only tiny chain passed |
+| Timeout | systemd `timeout`, signal 15, empty cgroup | Deadline acted; descendant probe readiness not established |
+| Memory | systemd `oom-kill`, signal 9, empty cgroup | RAM cap acted; intended allocation probe readiness not established |
+| Disk | `oom-kill`, not expected ENOSPC success, empty cgroup | Failed; no disk-capacity acceptance |
+
+All four cgroups were confirmed absent after controller cleanup. Worker stdout/
+stderr remained null. Only fixed result fields and kernel memory counters were
+retained. Disk OOM showed 260,764 KiB anonymous RSS and zero shared-memory RSS;
+this was not evidence of filling the intended 64-MiB tmpfs.
+
+The root cause in the entry path is concrete: importing the control module as
+`lumi.posttraining_import_vm_rehearsal_v2` executes `lumi/__init__.py`, which
+auto-registers the installed Transformers/PyTorch stack before `worker_check`.
+Small probe limits can therefore fire during ML imports rather than during
+their intended probes. The intermediate user update calling three cases passed
+was corrected when this was discovered.
+
+v3 loads its stdlib-only control file with `importlib.util` without importing
+the `lumi` package. Only the fixed chain child imports ML, after boundary checks
+and worker-owned staging. A fresh-interpreter regression explicitly rejects
+any `lumi`, torch, transformers, numpy or safetensors import while loading the
+control entry. The original model package and all import/kernel/package/SFT
+runtime sources remain byte-for-byte unchanged. The memory/disk/time ceilings
+are unchanged. This addresses the identified bug but still needs native proof.
+
+## Cleanup and retained evidence
+
+All three created instances are confirmed `terminated`, all three temporary
+EBS volumes are absent, the Instance Connect endpoint is `delete-complete`,
+and the two temporary security groups and AWS SSH-key registration are absent.
+Ephemeral VM files are no longer recoverable; the source archives, exact
+started/failure records and aggregate diagnostics are retained locally under
+`artifacts/lumi-sft-aws-rehearsal-attempt-v0.1/` and the versioned source bundles.
+The local SSH private key is mode 0600 under a mode-0700 git-ignored artifact
+directory; its AWS key registration has been deleted. No secret was printed.
+
+## Next step, without expanding the roadmap
+
+Obtain approval for **one fresh generated-only AWS CPU native attempt with the
+corrected v3 launcher**, preserving this failed attempt and forbidding an
+automatic retry. Use the working final-stage bootstrap and HTTPS tunnel, the
+same resource ceilings, one-hour expiry and immediate cleanup. The prepared
+source bundle is `artifacts/lumi-sft-aws-rehearsal-source-v0.3/` (161,791 bytes).
+
+After successful native acceptance, remaining Gate-5 work is the real-input/
+full-size coordinator adapter and independently verified real checkpoint
+import. Those are not authorized or demonstrated by this generated rehearsal.
+Gate 6 still needs its training-specific pre-dispatch approval, GPU smoke/
+save/resume acceptance and SFT run; later evaluation and serving gates remain.
+Production eligibility remains false. Nothing was committed or pushed.
+
+References for the setup behavior:
+[systemd timer dependencies](https://raw.githubusercontent.com/systemd/systemd/v255/man/systemd.timer.xml),
+[cloud-init boot stages](https://docs.cloud-init.io/en/latest/explanation/boot.html),
+[AWS authenticated tunnel](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/connect-using-eice.html),
+[EC2 shutdown/termination semantics](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/how-ec2-instance-termination-works.html).

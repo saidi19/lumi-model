@@ -1,0 +1,337 @@
+"""Native observations are doubled; authentic source loading stays real."""
+
+import hashlib
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("inspect_sft_vm_native_readiness_v1")
+REPO = Path(__file__).resolve().parents[1]
+REQUEST = dict(
+    machine_id="a" * 32,
+    boot_id="b" * 36,
+    host_deadline_boottime=14300,
+    volumes=dict(root_volume="vol-" + "1" * 17, work_volume="vol-" + "2" * 17),
+)
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.b = types.SimpleNamespace(
+            OUTPUT=Path("/synthetic/guard"),
+            SYSTEMD=Path("/synthetic/units"),
+            WATCH="watch.service",
+            native_identity=Mock(),
+            host_network_inode=lambda: 42,
+            boot_time=lambda: 1000,
+            setup_finished=lambda _: True,
+            snapshot=lambda _: b"snapshot",
+            active=Mock(),
+            watch_unit=lambda _: "watch",
+            command=Mock(),
+        )
+        self.context = dict(
+            machine_id=REQUEST["machine_id"],
+            boot_id=REQUEST["boot_id"],
+            original_deadline_boot_seconds=14300,
+            host_net_inode=42,
+        )
+        self.b.read = lambda path, *_a: (
+            json.dumps(self.context).encode()
+            if path.name == "context.json"
+            else b"watch"
+            if path.name == "watch.service"
+            else b"timer"
+        )
+        self.b.show = lambda name, field: {
+            "FragmentPath": str(self.b.SYSTEMD / name).encode(),
+            "DropInPaths": b"",
+            "FailureAction": b"poweroff",
+            "SuccessAction": b"poweroff",
+        }[field]
+        self.policy = types.SimpleNamespace(
+            inspect=Mock(return_value={"used": 1}),
+            expiry_units=lambda **_: {"expiry.timer": "timer"},
+        )
+        self.sequence = types.SimpleNamespace(UNITS={"cpu": "cpu.service"})
+        self.helper = types.SimpleNamespace(cgroup_empty=lambda _: True)
+
+    def test_guards_checks_live_units_and_original_context(self):
+        self.assertEqual(m.guards(self.b, self.policy, REQUEST), {"used": 1})
+        self.b.native_identity.assert_called_once_with(REQUEST["machine_id"], REQUEST["boot_id"])
+        self.policy.inspect.assert_called_once_with(b"snapshot", setup=False)
+
+    def test_other_boot_rejected(self):
+        self.context["boot_id"] = "other"
+        with self.assertRaises(ValueError):
+            m.guards(self.b, self.policy, REQUEST)
+
+    def test_renewed_deadline_rejected(self):
+        self.context["original_deadline_boot_seconds"] = 14400
+        with self.assertRaises(ValueError):
+            m.guards(self.b, self.policy, REQUEST)
+
+    def test_insufficient_time_before_work_rejected(self):
+        self.b.boot_time = lambda: 3000
+        with self.assertRaises(ValueError):
+            m.guards(self.b, self.policy, REQUEST)
+
+    def test_timer_file_drift_rejected(self):
+        old = self.b.read
+        self.b.read = lambda p, *a: b"altered" if p.name.endswith("timer") else old(p, *a)
+        with self.assertRaises(ValueError):
+            m.guards(self.b, self.policy, REQUEST)
+
+    def test_unit_dropin_rejected(self):
+        old = self.b.show
+        self.b.show = lambda n, p: b"foreign.conf" if p == "DropInPaths" else old(n, p)
+        with self.assertRaises(ValueError):
+            m.guards(self.b, self.policy, REQUEST)
+
+    def test_guard_failure_action_change_rejected(self):
+        old = self.b.show
+        self.b.show = lambda n, p: b"none" if p == "FailureAction" else old(n, p)
+        with self.assertRaises(ValueError):
+            m.guards(self.b, self.policy, REQUEST)
+
+    def test_idle_rejects_old_worker_and_old_binding(self):
+        self.b.show = lambda _n, p: b"inactive" if p == "ActiveState" else b"not-found"
+        with patch.object(m.os.path, "lexists", return_value=False):
+            m.idle(self.helper, self.b, self.sequence)
+            self.helper.cgroup_empty = lambda _: False
+            with self.assertRaises(ValueError):
+                m.idle(self.helper, self.b, self.sequence)
+        self.helper.cgroup_empty = lambda _: True
+        with patch.object(m.os.path, "lexists", return_value=True):
+            with self.assertRaises(ValueError):
+                m.idle(self.helper, self.b, self.sequence)
+
+    def test_stale_worker_unit_even_empty_rejected(self):
+        self.b.show = lambda _n, p: b"inactive" if p == "ActiveState" else b"loaded"
+        with self.assertRaises(ValueError):
+            m.idle(self.helper, self.b, self.sequence)
+
+    def test_package_metadata_is_requeried_not_a_receipt_boolean(self):
+        self.b.command.return_value = b'{"synthetic":"1"}'
+        lock = {"requirements": [{"name": "synthetic", "version": "1"}]}
+        self.assertEqual(m.versions(self.b, Path("/opt/runtime"), lock), 1)
+        args = self.b.command.call_args.args[0]
+        self.assertEqual(args[:4], ["/opt/runtime/venv/bin/python", "-I", "-B", "-c"])
+        self.assertNotIn("import torch", args[-1])
+        self.assertNotIn("pip", args[-1])
+        self.b.command.return_value = b'{"synthetic":"2"}'
+        with self.assertRaises(ValueError):
+            m.versions(self.b, Path("/opt/runtime"), lock)
+
+    def test_duplicate_json_keys_rejected(self):
+        with self.assertRaises(ValueError):
+            m.decode(b'{"a":1,"a":2}')
+
+    def test_entire_helper_set_is_authenticated_before_execution(self):
+        def source(path, *_args):
+            name = "run_sft_vm_parent_entry_v2.py" if path.name == "parent.py" else path.name
+            return (REPO / "scripts" / name).read_bytes()
+
+        with patch.object(m, "read", side_effect=source):
+            loaded = m.modules()
+            self.assertEqual(set(loaded), set(m.PINS))
+            self.assertEqual(loaded["parent.py"].__file__, str(m.CONTROLLER / "parent.py"))
+        with patch.object(m, "read", return_value=b"raise RuntimeError('must-not-execute')"):
+            with self.assertRaisesRegex(ValueError, "native_readiness_rejected"):
+                m.modules()
+
+    def test_mac_boundary_fails_before_any_artifact_reads(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "modules") as load:
+            with self.assertRaises(ValueError):
+                m._inspect_same_host(REQUEST)
+            load.assert_not_called()
+
+    def test_public_entry_remains_closed(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+    def test_join_rechecks_guards_storage_and_idle_and_never_grants_admission(self):
+        import prepare_sft_vm_fullsize_release_v1 as release
+        import run_sft_vm_setup_sequence_v1 as seq
+
+        cpu = (REPO / "configs/lumi-sft-linux-cpu-release-v0.1.lock.json").read_bytes()
+        sdk = (REPO / "configs/lumi-vm-acquisition-sdk-v0.1.lock.json").read_bytes()
+        detached = types.SimpleNamespace(
+            validate_request=Mock(),
+            _status=lambda _: "completed",
+            result=lambda *a, **k: "completed",
+            helpers=lambda _: self.helper,
+        )
+        self.helper.host_check = Mock()
+        self.b.load = lambda _: self.policy
+        self.sequence.LOCK_SHA = seq.LOCK_SHA
+        self.sequence.CPU = Path("/opt/cpu")
+        self.sequence.SDK = Path("/opt/sdk")
+        self.sequence.receipt = Mock()
+        storage = types.SimpleNamespace(inspect=Mock())
+        mods = {
+            "run_sft_vm_network_bootstrap_v4.py": self.b,
+            "run_sft_vm_setup_detached_v3.py": detached,
+            "run_sft_vm_setup_sequence_v1.py": self.sequence,
+            "check_sft_vm_storage_v1.py": storage,
+            "parent.py": object(),
+            "stage_sft_vm_fullsize_release_v1.py": release,
+        }
+        with (
+            patch.object(m, "boundary"),
+            patch.object(m, "modules", return_value=mods),
+            patch.object(m, "guards", return_value={"used": 1}) as guards,
+            patch.object(m, "idle") as idle,
+            patch.object(
+                m, "read", side_effect=lambda p, *a: cpu if p.name == "runtime-lock.json" else sdk
+            ),
+            patch.object(m, "sources", return_value=(62, 9)),
+            patch.object(m, "versions", side_effect=[34, 5]),
+        ):
+            result = m._inspect_same_host(REQUEST)
+        self.assertEqual(guards.call_count, 2)
+        self.assertEqual(idle.call_count, 2)
+        self.assertEqual(storage.inspect.call_count, 2)
+        self.assertFalse(
+            any(
+                result[k]
+                for k in (
+                    "host_admitted",
+                    "binding_created",
+                    "execution_permitted",
+                    "native_ml_runtime_qualified",
+                )
+            )
+        )
+        self.assertEqual(result["staged_source_files_verified"], 62)
+
+
+class ChannelTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_sft_vm_retention_delivery_v1 import BINDING
+
+        self.d = importlib.import_module("run_sft_vm_native_readiness_delivery_v1")
+        self.binding = dict(BINDING)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.key = self.root / "synthetic-key"
+        self.key.write_bytes(b"SYNTHETIC-NOT-KEY")
+        self.key.chmod(0o600)
+        conn = self.d.sender.delivery.connection
+        config = conn.ssh_config(self.binding, self.key, self.root / "known_hosts").encode()
+        hosts = b"SYNTHETIC-PINNED-HOST"
+        for name, raw in (("ssh_config", config), ("known_hosts", hosts)):
+            (self.root / name).write_bytes(raw)
+            (self.root / name).chmod(0o600)
+        self.config_pin, self.hosts_pin = map(
+            lambda b: hashlib.sha256(b).hexdigest(), (config, hosts)
+        )
+        self.request = dict(
+            REQUEST,
+            schema="lumi.vm-detached-setup-request.v0.1",
+            attempt=m.ATTEMPT,
+            setup_deadline_boottime=1800,
+            boot_id="12345678-1234-1234-1234-123456789012",
+            volumes={k: self.binding[k] for k in ("root_volume", "work_volume")},
+        )
+        self.reply = dict(
+            schema="lumi.vm-native-readiness.v0.1",
+            attempt=m.ATTEMPT,
+            **{k: True for k in self.d.TRUE},
+            **{k: False for k in self.d.FALSE},
+            **self.d.COUNTS,
+        )
+        self.exchange = self.enterContext(
+            patch.object(
+                self.d.sender.delivery,
+                "pipe_exchange",
+                side_effect=lambda *a: json.dumps(self.reply).encode(),
+            )
+        )
+
+    def call(self, **changes):
+        kw = dict(deadline=1000, remaining_control_bytes=100000, clock=lambda: 0)
+        return self.d._inspect_channel_once(
+            self.root / "inspection",
+            self.binding,
+            self.key,
+            self.root,
+            self.config_pin,
+            self.hosts_pin,
+            self.request,
+            **(kw | changes),
+        )
+
+    def test_pinned_inspection_source_only_single_exchange(self):
+        result = self.call()
+        self.assertEqual(result["status"], "readiness_observed_not_admission")
+        argv, body, timeout = self.exchange.call_args.args
+        self.assertEqual(timeout, 100)
+        self.assertEqual(hashlib.sha256(body).hexdigest(), self.d.SOURCE_SHA)
+        self.assertIn("signal.alarm(90)", argv[-1])
+        self.assertNotIn("ASIA", argv[-1])
+        self.assertFalse(result["binding_created"] or result["host_admitted"])
+        self.assertEqual(
+            result["control_content_bytes_charged"], len(body) + len(argv[-1].encode())
+        )
+
+    def test_lost_reply_not_retried_and_exception_text_not_saved(self):
+        self.exchange.side_effect = TimeoutError("private-secret")
+        with self.assertRaises(ValueError):
+            self.call()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.exchange.assert_called_once()
+        self.assertNotIn("private-secret", (self.root / "inspection/result.json").read_text())
+
+    def test_foreign_boot_or_volume_request_rejected_before_exchange(self):
+        self.request["volumes"]["work_volume"] = "vol-" + "9" * 17
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_changed_ssh_pin_rejects_before_exchange(self):
+        (self.root / "known_hosts").write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_forged_admission_flag_rejected(self):
+        self.reply["host_admitted"] = True
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_source_count_drift_rejected(self):
+        self.reply["staged_source_files_verified"] = 61
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_raw_text_or_extra_response_field_rejected(self):
+        self.reply["exception_text"] = "private-secret"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertNotIn("private-secret", (self.root / "inspection/result.json").read_text())
+
+    def test_deadline_and_control_budget_before_exchange(self):
+        for change in (
+            {"deadline": 100},
+            {"deadline": float("nan")},
+            {"remaining_control_bytes": 1},
+            {"remaining_control_bytes": True},
+        ):
+            with self.assertRaises(ValueError):
+                self.call(**change)
+        self.exchange.assert_not_called()
+
+    def test_public_entry_stays_closed(self):
+        with self.assertRaises(ValueError):
+            self.d.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

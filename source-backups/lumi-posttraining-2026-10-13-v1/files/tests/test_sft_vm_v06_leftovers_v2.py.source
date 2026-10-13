@@ -1,0 +1,527 @@
+"""Synthetic AWS state machine and installed SDK shapes; never calls credentials/cloud."""
+
+import copy
+import importlib.util
+import io
+import tempfile
+import unittest
+from pathlib import Path
+
+from botocore.session import Session
+from botocore.validate import validate_parameters
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/cleanup_sft_vm_v06_leftovers_v2.py"
+spec = importlib.util.spec_from_file_location("cleanup_v06_test_v2", PATH)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+MODELS = {n: Session().get_service_model(n) for n in ("ec2", "s3", "sts")}
+ENI = "eni-0123456789abcdef0"
+KEY = "key-0123456789abcdef0"
+ASSOC = "rtbassoc-0123456789abcdef0"
+
+
+def tags(network=False):
+    rows = [dict(Key="LumiAttempt", Value=m.ATTEMPT)]
+    if network:
+        rows.append(dict(Key="LumiNetworkNonce", Value=m.NONCE))
+    return rows
+
+
+class Cloud:
+    def __init__(self):
+        self.groups = {}
+        for group, role, rules in ((m.VM, "vm", ([m.ssh(m.EP)], [m.HTTPS])),
+                                  (m.EP, "endpoint", ([], [m.ssh(m.VM)]))):
+            self.groups[group] = dict(GroupId=group, GroupName=m.KEY_NAME + "-" + role,
+                OwnerId=m.ACCOUNT, VpcId=m.VPC, Tags=tags(),
+                IpPermissions=copy.deepcopy(rules[0]), IpPermissionsEgress=copy.deepcopy(rules[1]))
+        self.key = dict(KeyPairId=KEY, KeyName=m.KEY_NAME, KeyType="ed25519",
+                        PublicKey="synthetic", Tags=tags())
+        self.endpoint = dict(InstanceConnectEndpointId=m.ENDPOINT, OwnerId=m.ACCOUNT,
+            VpcId=m.VPC, SubnetId=m.SUBNET, SecurityGroupIds=[m.EP],
+            PreserveClientIp=False, State="create-complete", Tags=tags(), NetworkInterfaceIds=[ENI])
+        self.eni = dict(NetworkInterfaceId=ENI, OwnerId=m.ACCOUNT, VpcId=m.VPC,
+                        SubnetId=m.SUBNET, Groups=[dict(GroupId=m.EP)])
+        self.subnet = dict(SubnetId=m.SUBNET, OwnerId=m.ACCOUNT, VpcId=m.VPC,
+            Tags=tags(True), CidrBlock="172.31.96.0/27", AvailabilityZone="us-east-1a",
+            State="available")
+        self.table = dict(RouteTableId=m.TABLE, OwnerId=m.ACCOUNT, VpcId=m.VPC,
+            Tags=tags(True), Routes=[copy.deepcopy(m.LOCAL_ROUTE)], PropagatingVgws=[],
+            Associations=[dict(Main=False, SubnetId=m.SUBNET, RouteTableId=m.TABLE,
+                RouteTableAssociationId=ASSOC, AssociationState=dict(State="associated"))])
+        self.calls, self.writes, self.hook, self.fail = [], [], None, None
+        self.uncertain, self.pending_polls, self.deleting = False, 0, False
+        self.streams = []
+
+    def __getattr__(self, operation):
+        def call(**fields):
+            service = "sts" if operation == "get_caller_identity" else (
+                "s3" if operation == "get_object" else "ec2")
+            name = "".join(p.title() for p in operation.split("_"))
+            model = MODELS[service].operation_model(name)
+            validate_parameters(fields, model.input_shape)
+            if operation == "describe_instance_connect_endpoints":
+                assert 1 <= fields["MaxResults"] <= 50
+            self.calls.append((operation, copy.deepcopy(fields)))
+            if operation in m.WRITES:
+                self.writes.append((operation, copy.deepcopy(fields)))
+                failing = self.fail == len(self.writes)
+                if failing and not self.uncertain:
+                    raise RuntimeError("sensitive synthetic error")
+                if operation == "delete_instance_connect_endpoint":
+                    self.deleting = True
+                    self.endpoint["State"] = "delete-in-progress"
+                    result = {"InstanceConnectEndpoint": copy.deepcopy(self.endpoint)}
+                elif operation == "revoke_security_group_ingress":
+                    self.groups[fields["GroupId"]]["IpPermissions"] = []
+                    result = {"Return": True}
+                elif operation == "revoke_security_group_egress":
+                    self.groups[fields["GroupId"]]["IpPermissionsEgress"] = []
+                    result = {"Return": True}
+                elif operation == "delete_security_group":
+                    del self.groups[fields["GroupId"]]
+                    result = {"Return": True, "GroupId": fields["GroupId"]}
+                elif operation == "delete_key_pair":
+                    assert fields == dict(KeyPairId=KEY)
+                    self.key = None
+                    result = {"Return": True, "KeyPairId": KEY}
+                elif operation == "disassociate_route_table":
+                    assert fields == dict(AssociationId=ASSOC)
+                    self.table["Associations"] = []
+                    result = {}
+                elif operation == "delete_route_table":
+                    assert fields == dict(RouteTableId=m.TABLE)
+                    self.table = None
+                    result = {}
+                elif operation == "delete_subnet":
+                    assert fields == dict(SubnetId=m.SUBNET)
+                    self.subnet = None
+                    result = {}
+                if failing:
+                    raise RuntimeError("uncertain response contains secret")
+            elif operation == "get_caller_identity":
+                result = {"Account": m.ACCOUNT}
+            elif operation == "describe_security_groups":
+                filters = fields["Filters"]
+                if filters[0]["Name"] == "group-id":
+                    rows = list(self.groups.values())
+                else:
+                    field = ("IpPermissionsEgress" if filters[1]["Name"].startswith("egress")
+                             else "IpPermissions")
+                    rows = [r for r in self.groups.values() if any(
+                        rule.get("UserIdGroupPairs") for rule in r[field])]
+                result = {"SecurityGroups": copy.deepcopy(rows)}
+            elif operation == "describe_key_pairs":
+                result = {"KeyPairs": [copy.deepcopy(self.key)] if self.key else []}
+            elif operation == "describe_instance_connect_endpoints":
+                if self.deleting and self.pending_polls <= 0:
+                    self.endpoint, self.eni = None, None
+                elif self.deleting:
+                    self.pending_polls -= 1
+                result = {"InstanceConnectEndpoints": [copy.deepcopy(self.endpoint)]
+                          if self.endpoint else []}
+            elif operation == "describe_network_interfaces":
+                result = {"NetworkInterfaces": [copy.deepcopy(self.eni)] if self.eni else []}
+            elif operation == "describe_subnets":
+                result = {"Subnets": [copy.deepcopy(self.subnet)] if self.subnet else []}
+            elif operation == "describe_route_tables":
+                rows = [copy.deepcopy(self.table)] if self.table else []
+                if "Filters" in fields:
+                    rows = [r for r in rows if r["Associations"]]
+                result = {"RouteTables": rows}
+            elif operation == "describe_nat_gateways":
+                rows = [dict(NatGatewayId=m.NAT, State="deleted", VpcId=m.VPC,
+                             SubnetId=m.PUBLIC_SUBNET)] if "NatGatewayIds" in fields else []
+                result = {"NatGateways": rows}
+            elif operation == "get_object":
+                assert fields["Bucket"] == m.BUCKET and fields["ExpectedBucketOwner"] == m.ACCOUNT
+                assert fields["Key"] in {m.PREFIX + x + ".json"
+                                        for x in ("delete-nat-gateway", "release-address")}
+                op = fields["Key"].removeprefix(m.PREFIX).removesuffix(".json")
+                raw = m.canonical(dict(attempt=m.ATTEMPT, nonce=m.NONCE, operation=op,
+                    resource=m.NAT if op == "delete-nat-gateway" else m.EIP))
+                stream = io.BytesIO(raw)
+                self.streams.append(stream)
+                result = {"Body": stream, "ContentLength": len(raw)}
+            else:
+                result = {dict(describe_instances="Reservations",
+                    describe_security_group_references="SecurityGroupReferenceSet",
+                    describe_security_group_vpc_associations="SecurityGroupVpcAssociations",
+                    describe_nat_gateways="NatGateways", describe_addresses="Addresses"
+                    )[operation]: []}
+            # Validate actual SDK response members/types, not made-up Return fields.
+            if model.output_shape is not None:
+                validate_parameters(result, model.output_shape)
+            else:
+                assert result == {}
+            result["ResponseMetadata"] = {"HTTPStatusCode": 200}
+            if self.hook:
+                self.hook(operation, fields, result)
+            return result
+        return call
+
+
+class CleanupTests(unittest.TestCase):
+    def setup_worker(self, cloud=None):
+        self.cloud, self.saved, self.now = cloud or Cloud(), {}, 0.0
+        def save(name, value):
+            self.assertNotIn(name, self.saved)
+            self.saved[name] = copy.deepcopy(value)
+        def wait(seconds):
+            self.now += seconds
+        return m.Cleanup(dict(sts=self.cloud, ec2=self.cloud, s3=self.cloud), save,
+                         b"synthetic", lambda raw: raw, clock=lambda: self.now, wait=wait)
+
+    def test_full_cleanup_real_sdk_shapes_and_exact_order(self):
+        w = self.setup_worker()
+        w.run()
+        self.assertEqual(w.stage, "cleanup_verified")
+        self.assertEqual(w.writes, 9)
+        self.assertLessEqual(w.calls, 115)
+        self.assertEqual([op for op, _ in self.cloud.writes], [
+            "delete_instance_connect_endpoint", "revoke_security_group_ingress",
+            "revoke_security_group_egress", "delete_security_group", "delete_security_group",
+            "delete_key_pair", "disassociate_route_table", "delete_route_table", "delete_subnet"])
+        self.assertNotIn(b"synthetic", m.canonical(self.saved))
+        self.assertNotIn(b"PublicKey", m.canonical(self.saved))
+        self.assertTrue(all(s.closed for s in self.cloud.streams))
+        self.assertEqual(len([x for x in self.cloud.calls if x[0] == "get_object"]), 2)
+
+    def test_no_association_at_admission_skips_only_disassociation(self):
+        c = Cloud()
+        c.table["Associations"] = []
+        w = self.setup_worker(c)
+        w.run()
+        self.assertEqual(w.writes, 8)
+        self.assertNotIn("disassociate_route_table", [o for o, _ in c.writes])
+
+    def test_endpoint_pending_wait_then_full_success(self):
+        c = Cloud()
+        c.pending_polls = 3
+        w = self.setup_worker(c)
+        w.run()
+        self.assertEqual(w.endpoint_polls, 4)
+        self.assertEqual(self.now, 15)
+        self.assertLessEqual(w.calls, 128)
+
+    def test_endpoint_poll_exhaustion_never_advances_or_reissues(self):
+        c = Cloud()
+        c.pending_polls = 100
+        w = self.setup_worker(c)
+        with self.assertRaises(ValueError):
+            w.run()
+        self.assertEqual(w.endpoint_polls, 30)
+        self.assertEqual(len(c.writes), 1)
+
+    def test_all_nine_uncertain_or_failed_mutations_consumed_without_retry(self):
+        for index in range(1, 10):
+            for uncertain in (False, True):
+                with self.subTest(index=index, uncertain=uncertain):
+                    c = Cloud()
+                    c.fail, c.uncertain = index, uncertain
+                    w = self.setup_worker(c)
+                    with self.assertRaises(ValueError):
+                        w.run()
+                    self.assertEqual(len(c.writes), index)
+                    self.assertIn("uncertain-mutation", self.saved)
+                    self.assertNotIn(b"secret", m.canonical(self.saved))
+
+    def test_initial_owner_rules_endpoint_key_and_network_drift_blocks_writes(self):
+        changes = [
+            lambda c: c.groups[m.VM].update(OwnerId="wrong"),
+            lambda c: c.groups[m.EP].update(GroupName="wrong"),
+            lambda c: c.groups[m.EP]["IpPermissions"].append(m.HTTPS),
+            lambda c: c.groups.pop(m.VM),
+            lambda c: c.key.update(PublicKey="other"),
+            lambda c: c.key.update(Tags=[]),
+            lambda c: c.key.update(KeyType="rsa"),
+            lambda c: c.endpoint.update(PreserveClientIp=True),
+            lambda c: c.endpoint.update(SubnetId="subnet-other"),
+            lambda c: c.endpoint.update(State="create-in-progress"),
+            lambda c: c.endpoint.update(NetworkInterfaceIds=[]),
+            lambda c: c.subnet.update(CidrBlock="172.31.97.0/27"),
+            lambda c: c.subnet["Tags"][1].update(Value="other"),
+            lambda c: c.table.update(Routes=[]),
+            lambda c: c.table["Routes"][0].update(NatGatewayId=m.NAT),
+            lambda c: c.table["Associations"][0].update(Main=True),
+            lambda c: c.table["Associations"][0].update(SubnetId="subnet-other"),
+            lambda c: c.table.update(PropagatingVgws=[dict(GatewayId="vgw-other")]),
+        ]
+        for change in changes:
+            c = Cloud()
+            change(c)
+            w = self.setup_worker(c)
+            with self.assertRaises((ValueError, KeyError)):
+                w.run()
+            self.assertEqual(c.writes, [])
+
+    def test_unknown_eni_and_other_endpoint_block(self):
+        for op, key, extra in [
+            ("describe_network_interfaces", "NetworkInterfaces",
+             dict(NetworkInterfaceId="eni-fffffffffffffffff")),
+            ("describe_instance_connect_endpoints", "InstanceConnectEndpoints",
+             dict(InstanceConnectEndpointId="eice-fffffffffffffffff")),
+        ]:
+            c = Cloud()
+            def hook(operation, fields, response, op=op, key=key, extra=extra):
+                if operation == op:
+                    response[key].append(extra)
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises(ValueError):
+                w.run()
+            self.assertEqual(c.writes, [])
+
+    def test_each_instance_query_independently_blocks(self):
+        for target in ("tag:LumiAttempt", "key-name", "instance.group-id", "subnet-id"):
+            c = Cloud()
+            def hook(op, fields, r, target=target):
+                if op == "describe_instances" and fields["Filters"][0]["Name"] == target:
+                    r["Reservations"] = [dict(Instances=[dict(State=dict(Name="running"))])]
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises(ValueError):
+                w.run()
+            self.assertEqual(c.writes, [])
+
+    def test_same_vpc_external_and_cross_vpc_references_block(self):
+        for target in ("ip-permission.group-id", "egress.ip-permission.group-id", "cross"):
+            c = Cloud()
+            def hook(op, fields, r, target=target):
+                if (op == "describe_security_groups" and len(fields["Filters"]) == 2
+                        and fields["Filters"][1]["Name"] == target):
+                    r["SecurityGroups"].append(dict(GroupId="sg-unrelated"))
+                if op == "describe_security_group_references" and target == "cross":
+                    r["SecurityGroupReferenceSet"] = [{}]
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises((ValueError, KeyError)):
+                w.run()
+            self.assertEqual(c.writes, [])
+
+    def test_association_pagination_complete_empty_only(self):
+        for variant in ("empty_two", "nonempty_second", "cycle", "eight_more", "badtoken"):
+            c = Cloud()
+            count = [0]
+            def hook(op, fields, r, variant=variant, count=count):
+                if op != "describe_security_group_vpc_associations":
+                    return
+                count[0] += 1
+                if variant == "empty_two":
+                    if "NextToken" not in fields:
+                        r["NextToken"] = "opaque"
+                elif variant == "nonempty_second":
+                    if "NextToken" not in fields:
+                        r["NextToken"] = "opaque"
+                    else:
+                        r["SecurityGroupVpcAssociations"] = [{}]
+                elif variant == "cycle":
+                    r["NextToken"] = "same"
+                elif variant == "eight_more":
+                    r["NextToken"] = str(count[0])
+                else:
+                    r["NextToken"] = 12
+            c.hook = hook
+            w = self.setup_worker(c)
+            if variant == "empty_two":
+                w.run()
+                self.assertLessEqual(w.calls, 128)
+            else:
+                with self.assertRaises(ValueError):
+                    w.run()
+                self.assertEqual(c.writes, [])
+                self.assertLessEqual(count[0], 8)
+
+    def test_unexpected_pagination_or_partial_shape_stops(self):
+        for operation, key, value in [
+            ("describe_key_pairs", "NextToken", "opaque"),
+            ("describe_subnets", "Subnets", None),
+            ("get_caller_identity", "Account", "other"),
+            ("describe_addresses", "Addresses", [{}]),
+            ("describe_nat_gateways", "NatGateways", [dict(NatGatewayId=m.NAT, State="available")]),
+        ]:
+            c = Cloud()
+            def hook(op, fields, r, operation=operation, key=key, value=value):
+                if op == operation:
+                    r[key] = value
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises((ValueError, KeyError)):
+                w.run()
+            self.assertEqual(c.writes, [])
+
+    def test_claim_mismatch_oversize_and_duplicate_keys(self):
+        for variant in ("mismatch", "oversize", "duplicate"):
+            c = Cloud()
+            def hook(op, fields, r, variant=variant):
+                if op == "get_object":
+                    r["Body"].close()
+                    if variant == "mismatch":
+                        raw = b'{"attempt":"wrong"}'
+                    elif variant == "oversize":
+                        raw = b"x" * 513
+                    else:
+                        raw = b'{"attempt":"x","attempt":"y"}'
+                    r["Body"] = io.BytesIO(raw)
+                    r["ContentLength"] = len(raw)
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises(ValueError):
+                w.run()
+            self.assertEqual(c.writes, [])
+
+    def test_rechecks_detect_new_dependency_after_endpoint_delete(self):
+        c = Cloud()
+        def hook(op, fields, r):
+            if c.writes and op == "describe_instances":
+                r["Reservations"] = [dict(Instances=[dict(State=dict(Name="pending"))])]
+        c.hook = hook
+        w = self.setup_worker(c)
+        with self.assertRaises(ValueError):
+            w.run()
+        self.assertEqual(len(c.writes), 1)
+
+    def test_key_id_drift_after_resolution_stops_key_delete(self):
+        c = Cloud()
+        def hook(op, fields, r):
+            if c.writes and op == "describe_key_pairs":
+                r["KeyPairs"][0]["KeyPairId"] = "key-fffffffffffffffff"
+        c.hook = hook
+        w = self.setup_worker(c)
+        with self.assertRaises(ValueError):
+            w.run()
+        self.assertEqual(len(c.writes), 5)
+
+    def test_association_identity_drift_stops_disassociation(self):
+        c = Cloud()
+        def hook(op, fields, r):
+            if c.writes and op == "describe_route_tables" and "RouteTableIds" in fields:
+                r["RouteTables"][0]["Associations"][0]["RouteTableAssociationId"] = (
+                    "rtbassoc-fffffffffffffffff")
+        c.hook = hook
+        w = self.setup_worker(c)
+        with self.assertRaises(ValueError):
+            w.run()
+        self.assertEqual(len(c.writes), 6)
+
+    def test_malformed_success_response_stops_after_consumption(self):
+        for target in ("delete_subnet", "delete_instance_connect_endpoint",
+                       "revoke_security_group_ingress"):
+            c = Cloud()
+            def hook(op, fields, r, target=target):
+                if op == target:
+                    r.clear()
+                    r["ResponseMetadata"] = {"HTTPStatusCode": 500}
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises(ValueError):
+                w.run()
+            self.assertIn("uncertain-mutation", self.saved)
+            self.assertEqual(sum(op == target for op, _ in c.writes), 1)
+
+    def test_caps_and_clock_reject_before_dispatch(self):
+        w = self.setup_worker()
+        w.calls = 128
+        with self.assertRaises(ValueError):
+            w.call("get_caller_identity")
+        self.assertEqual(self.cloud.calls, [])
+        for now in (890, float("nan"), -1):
+            w = self.setup_worker()
+            self.now = now
+            with self.assertRaises(ValueError):
+                w.call("get_caller_identity")
+            self.assertEqual(self.cloud.calls, [])
+        w = self.setup_worker()
+        with self.assertRaises(ValueError):
+            w.account_response({"x": "x" * 262144})
+        w.response_bytes = 4194304
+        with self.assertRaises(ValueError):
+            w.account_response({})
+        w = self.setup_worker()
+        w.writes = 9
+        with self.assertRaises(ValueError):
+            w.mutate("delete_subnet", dict(SubnetId=m.SUBNET), lambda: None)
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_deadline_shortens_never_refreshes_or_extends(self):
+        self.assertEqual(m.effective_deadline(0, 20, 500), 460)
+        self.assertEqual(m.effective_deadline(0, 20, 5000), 890)
+        for value in (360, -1, float("nan")):
+            with self.assertRaises(ValueError):
+                m.effective_deadline(0, 20, value)
+
+    def test_nat_public_private_subnets_distinct_and_not_deletion_targets(self):
+        w = self.setup_worker()
+        w.run()
+        self.assertNotEqual(m.PUBLIC_SUBNET, m.SUBNET)
+        self.assertNotIn(m.PUBLIC_SUBNET.encode(), m.canonical(self.cloud.writes))
+        self.assertNotIn(m.NAT.encode(), m.canonical(self.cloud.writes))
+        self.assertNotIn(m.EIP.encode(), m.canonical(self.cloud.writes))
+
+    def test_wrong_nat_subnet_vpc_identity_state_rejected_before_writes(self):
+        for key, value in (("SubnetId", m.SUBNET), ("SubnetId", "subnet-other"),
+                           ("VpcId", "vpc-other"), ("NatGatewayId", "nat-other"),
+                           ("State", "available")):
+            c = Cloud()
+            def hook(op, fields, r, key=key, value=value):
+                if op == "describe_nat_gateways" and "NatGatewayIds" in fields:
+                    r["NatGateways"][0][key] = value
+            c.hook = hook
+            w = self.setup_worker(c)
+            with self.assertRaises(ValueError):
+                w.run()
+            self.assertEqual(c.writes, [])
+            self.assertIn(w.check, {"released_nat_identity_and_state",
+                                   "released_nat_vpc_and_public_subnet"})
+
+    def test_observed_three_empty_association_pages_and_endpoint_wait(self):
+        c = Cloud()
+        c.pending_polls = 3
+        def hook(op, fields, r):
+            if op == "describe_security_group_vpc_associations":
+                token = fields.get("NextToken")
+                if token != "second":
+                    r["NextToken"] = "first" if token is None else "second"
+        c.hook = hook
+        w = self.setup_worker(c)
+        w.run()
+        self.assertLessEqual(w.calls, 128)
+
+    def test_only_released_nat_comparator_behavior_changed(self):
+        import ast
+        old = ast.parse(PATH.with_name("cleanup_sft_vm_v06_leftovers_v1.py").read_text())
+        new = ast.parse(PATH.read_text())
+        def methods(tree):
+            cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Cleanup")
+            return {n.name: ast.dump(n) for n in cls.body if isinstance(n, ast.FunctionDef)}
+        a, b = methods(old), methods(new)
+        self.assertEqual(set(a), set(b))
+        self.assertEqual([k for k in a if a[k] != b[k]], ["released_and_claims"])
+
+    def test_exact_notfound_only_read_normalization(self):
+        class CloudError(Exception):
+            response = {"Error": {"Code": "InvalidSubnetID.NotFound"}}
+        class C:
+            def describe_subnets(self, **fields):
+                raise CloudError()
+        w = self.setup_worker()
+        w.clients["ec2"] = C()
+        self.assertEqual(w.call("describe_subnets", SubnetIds=[m.SUBNET]), {"Subnets": []})
+
+    def test_exclusive_protected_journal_and_write_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "attempt"
+            j = m.Journal(path)
+            j.save("started", {"fixed": True})
+            self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((path / "started.json").stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                m.Journal(path)
+            with self.assertRaises(FileExistsError):
+                j.save("started", {})
+            with self.assertRaises(ValueError):
+                j.save("oversized", {"x": "x" * 262144})
+
+
+if __name__ == "__main__":
+    unittest.main()

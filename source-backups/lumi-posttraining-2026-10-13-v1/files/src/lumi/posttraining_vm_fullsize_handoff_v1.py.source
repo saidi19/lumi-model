@@ -1,0 +1,175 @@
+"""Native systemd acquisition-to-import handoff, not host admission/provisioning.
+
+Private caller must authenticate host/runtime/source/control identity, stage
+release/output on bounded dedicated disk, and install the acquisition unit.
+This component supervises only the transition and import unit. No callback or
+success flag can replace acquisition terminal/cgroup readback. Credentials use
+an acquisition-only systemd credential mount; their root source must remain
+under the private attempt ancestor, never inside release/inputs/outputs.
+
+No cleanup deletes output/evidence or terminates the host. Verification and
+durable retention remain required before claiming real-import completion.
+"""
+from __future__ import annotations
+
+import importlib.util
+import os
+import re
+import stat
+import sys
+import time
+from pathlib import Path
+
+from . import posttraining_vm_fullsize_controls_v1 as controls
+
+spec = importlib.util.spec_from_file_location("_fullsize_handoff_systemd",
+    Path(__file__).with_name("posttraining_import_vm_rehearsal_v3.py"))
+frozen = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(frozen)
+PINS = ("control_sha256", "entry_sha256", "source_manifest_sha256", "attempt_nonce_sha256")
+ROOT = Path("/var/lib/lumi-vm-fullsize")
+PYTHON = "/opt/lumi-sft-rehearsal/venv/bin/python"
+SCRIPT = "/work/release/scripts/run_sft_vm_fullsize_entry_v1.py"
+ERRORS = frozenset({"arguments", "host", "deadline", "acquisition_failed", "cleanup",
+                    "attempt_used", "dispatch", "import_failed", "host_guard_not_bound"})
+
+
+class HandoffError(ValueError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "dispatch"
+        self.worker_stage = None
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise HandoffError(code) from None
+
+
+def unit_name(attempt, phase):
+    need(type(attempt) is str and re.fullmatch(r"[0-9a-f]{32}", attempt)
+         and phase in {"acquire", "import"}, "arguments")
+    return f"lumi-vm-fullsize-v1-{attempt}-{phase}.service"
+
+
+def import_command(attempt, pins):
+    unit = unit_name(attempt, "import")
+    need(type(pins) is dict and set(pins) == set(PINS)
+         and all(type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value)
+                 for value in pins.values()), "arguments")
+    command = ["/usr/bin/systemd-run", "--quiet", "--no-ask-password",
+               "--service-type=exec", "--unit=" + unit]
+    command += [f"--property={key}={value}"
+                for key, value in controls.import_properties(attempt).items()]
+    command += [f"--setenv={key}={value}" for key, value in frozen.ENV.items()]
+    command += ["--", PYTHON, "-I", "-B", SCRIPT, "--attempt", attempt]
+    for key in PINS:
+        command += ["--" + key.replace("_", "-"), pins[key]]
+    return command
+
+
+def _import_failure(observed):
+    error = HandoffError("import_failed")
+    names = {40: "boundary", 41: "cold_loader", 42: "runtime", 43: "mounts",
+             44: "controls", 45: "contract", 46: "output_parent", 47: "import",
+             48: "result", 49: "summary"}
+    if (observed.get("Result") == "exit-code" and observed.get("ExecMainCode") == "1"
+            and observed.get("ActiveState") == observed.get("SubState") == "failed"):
+        error.worker_stage = next((name for number, name in names.items()
+                                   if observed.get("ExecMainStatus") == str(number)), None)
+    return error
+
+
+def _stop_and_reap(unit):
+    try:
+        stopped = frozen.run_command(["/usr/bin/systemctl", "stop", unit], 10)
+        need(stopped.returncode == 0 and frozen.cgroup_empty(unit), "cleanup")
+    except BaseException:
+        raise HandoffError("cleanup") from None
+
+
+def _finish_acquisition(attempt):
+    unit = unit_name(attempt, "acquire")
+    try:
+        frozen.validate_terminal("chain", frozen.observe(unit))
+    except BaseException:
+        raise HandoffError("acquisition_failed") from None
+    finally:
+        # Stop even on a failed/unknown terminal. Never proceed if cleanup fails.
+        _stop_and_reap(unit)
+
+
+def dispatch_import(**_arguments):
+    raise HandoffError("host_guard_not_bound") from None
+
+
+def _dispatch_admitted_once(attempt, pins, *, machine_id, deadline):
+    """One acquisition->import transition on an independently admitted host.
+
+    Private attempt marker also consumes ambiguous systemd dispatch failures;
+    existing unit lookup is not relied on as the only replay protection.
+    """
+    need(sys.platform == "linux" and os.geteuid() == 0, "host")
+    command = import_command(attempt, pins)
+    need(type(deadline) in {int, float} and 0 < deadline-time.monotonic() <= 3615, "deadline")
+    try:
+        frozen.host_check(machine_id)
+        destination = ROOT / attempt
+        frozen.root_owned(destination)
+        need(stat.S_IMODE(destination.stat().st_mode) == 0o700, "host")
+    except BaseException:
+        raise HandoffError("host") from None
+    try:
+        fd = os.open(destination / "import-dispatch.started",
+                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    except FileExistsError:
+        raise HandoffError("attempt_used") from None
+    except BaseException:
+        raise HandoffError("dispatch") from None
+    try:
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        directory_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        raise HandoffError("dispatch") from None
+    _finish_acquisition(attempt)  # No import access before actual process teardown.
+    unit = unit_name(attempt, "import")
+    try:
+        observed = frozen.run_command(["/usr/bin/systemctl", "show", unit,
+            "--property=LoadState", "--value"], 5, capture=True)
+        need(observed.returncode in {0, 1, 4} and observed.stdout.strip() == b"not-found",
+             "attempt_used")
+        need(time.monotonic() < deadline, "deadline")
+    except HandoffError:
+        raise
+    except BaseException:
+        raise HandoffError("dispatch") from None
+    try:
+        need(frozen.run_command(command, 15).returncode == 0, "dispatch")
+        while time.monotonic() < deadline:
+            observed = frozen.observe(unit)
+            if observed["SubState"] in {"exited", "failed", "dead"}:
+                try:
+                    frozen.validate_terminal("chain", observed)
+                except BaseException:
+                    raise _import_failure(observed) from None
+                break
+            time.sleep(0.2)
+        else:
+            raise HandoffError("deadline") from None
+    except HandoffError:
+        raise
+    except BaseException:
+        raise HandoffError("dispatch") from None
+    finally:
+        _stop_and_reap(unit)  # Also after ambiguous dispatch, OOM, timeout or signal.
+    return {"schema": "lumi.vm-fullsize-handoff.v0.1", "both_cgroups_empty": True,
+            "import_unit_success": True, "independent_package_verified": False,
+            "durable_retention_verified": False, "real_4b_import": False,
+            "gate_5_complete": False, "training_authorized": False}

@@ -1,0 +1,342 @@
+"""One bounded read-only fresh-target/retention check; no deployment authority."""
+
+import datetime as dt
+import ipaddress
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from scripts import inspect_sft_vm_attempt019_control_targets_v1 as transport
+from scripts import verify_sft_vm_attempt022_source_v1 as source
+
+ROOT = source.ROOT
+ATTEMPT = source.source.NEW
+ACCOUNT, REGION, VPC = "573978149073", "us-east-1", "vpc-0905fbf9490a2dead"
+CIDR = source.source.NEW_CIDR
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-022-target-inspection-v0.1"
+REPORT = ROOT / "evidence/lumi-vm-attempt-022-control-target-absence-v0.1.json"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-022-source-verification-v0.1.json"
+SOURCE_PROOF_SHA = "9a152480ad7a8b04866b47e7bf648f7ce7a8dae4aee9273e0d0e832c11be5f66"
+SOURCE_VERIFIER_SHA = "bdd584cbeec093fddb085e557242aeb5a030040a65acb25ca023601e003b7a1f"
+TRANSPORT_SHA = "393a72b5c74aedb4666df2afd95c5b5faf852e9d0de0cf160699d74bdd447970"
+RETAINED_PROOF = "evidence/lumi-vm-attempt-020-v025-execution-verification-v0.1.json"
+RETAINED_PROOF_SHA = "f18eae3048a52d319e6cf8c4d57e151be798f43a9505ce15af9ff3b4f92c42e1"
+RETAINED_BINDING = (
+    "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/binding.json"
+)
+RETAINED_BINDING_SHA = "643d962d424b073536d2f871a835aeaf5e6a4ca2477598949c769b0a23302663"
+MAX_CALLS, MAX_SECONDS = 20, 300
+OPS = {
+    "sts": {"get_caller_identity"},
+    "ec2": {
+        "describe_subnets",
+        "describe_instance_connect_endpoints",
+        "describe_instances",
+        "describe_key_pairs",
+        "describe_security_groups",
+        "describe_volumes",
+    },
+    "lambda": {"get_function_configuration"},
+    "iam": {"get_role", "get_user"},
+    "scheduler": {"get_schedule_group"},
+    "logs": {"describe_log_groups"},
+    "s3": {"head_bucket"},
+}
+SAFE_CODES = {
+    "AccessDenied",
+    "AccessDeniedException",
+    "NoSuchEntity",
+    "ResourceNotFoundException",
+    "ExpiredToken",
+    "ExpiredTokenException",
+    "InvalidClientTokenId",
+    "RequestLimitExceeded",
+    "ThrottlingException",
+    "InternalError",
+    "ServiceUnavailable",
+    "NoSuchBucket",
+    "NotFound",
+    "404",
+}
+need, sha, read, encode = source.need, source.sha, source.source.read, source.encode
+
+
+def local():
+    read(Path(source.__file__), SOURCE_VERIFIER_SHA)
+    read(Path(transport.__file__), TRANSPORT_SHA)
+    proof = json.loads(read(ROOT / SOURCE_PROOF, SOURCE_PROOF_SHA))
+    need(proof["attempt"] == ATTEMPT and proof["source_release_sha256"] == source.RELEASE_SHA)
+    need(proof["nested_setup_receipt_file_count"] == 19)
+    need(proof["new_execution_authorized"] is False)
+    source.verify()
+    retention = json.loads(read(ROOT / RETAINED_PROOF, RETAINED_PROOF_SHA))
+    binding = json.loads(read(ROOT / RETAINED_BINDING, RETAINED_BINDING_SHA))
+    need(retention["attempt"] == binding["attempt"])
+    need(retention["live_verification"]["instance_state"] == "stopped")
+    need(
+        set(retention["live_verification"]["encrypted_retained_volumes"])
+        == {binding["root_volume"], binding["work_volume"]}
+    )
+    return binding
+
+
+class BoundedClients:
+    def __init__(self, clients, *, clock=time.monotonic, started=None):
+        need(set(clients) == set(OPS))
+        self.clients, self.clock = clients, clock
+        self.start = clock() if started is None else started
+        self.calls = self.content_bytes = 0
+
+    def __getitem__(self, service):
+        need(service in OPS)
+        owner = self
+
+        class Reader:
+            def __getattr__(self, operation):
+                need(operation in OPS[service])
+
+                def call(**fields):
+                    need(
+                        owner.calls < MAX_CALLS
+                        and 0 <= owner.clock() - owner.start < MAX_SECONDS - 20
+                    )
+                    owner.calls += 1
+                    value = getattr(owner.clients[service], operation)(**fields)
+                    need(type(value) is dict)
+                    size = len(json.dumps(value, default=str).encode())
+                    owner.content_bytes += size
+                    need(size <= 524288 and owner.content_bytes <= 2097152)
+                    need(
+                        not any(
+                            value.get(k)
+                            for k in ("NextToken", "nextToken", "Marker", "IsTruncated")
+                        )
+                    )
+                    return value
+
+                return call
+
+        return Reader()
+
+
+def inspect(cloud, binding):
+    reads = transport.Reads(cloud)
+    need(reads.call("sts", "get_caller_identity")["Account"] == ACCOUNT)
+    key, function = "lumi-fullsize-" + ATTEMPT, "lumi-stop-" + ATTEMPT
+    subnets = reads.call(
+        "ec2", "describe_subnets", Filters=[dict(Name="vpc-id", Values=[VPC])], MaxResults=100
+    )["Subnets"]
+    need(all(row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC for row in subnets))
+    overlaps = [
+        row
+        for row in subnets
+        if ipaddress.IPv4Network(CIDR, strict=True).overlaps(
+            ipaddress.IPv4Network(row["CidrBlock"], strict=True)
+        )
+    ]
+    endpoints = reads.call(
+        "ec2",
+        "describe_instance_connect_endpoints",
+        Filters=[dict(Name="tag:LumiAttempt", Values=[ATTEMPT])],
+    )["InstanceConnectEndpoints"]
+    instances = reads.call(
+        "ec2",
+        "describe_instances",
+        MaxResults=100,
+        Filters=[dict(Name="tag:LumiAttempt", Values=[ATTEMPT])],
+    )["Reservations"]
+    keys = reads.call("ec2", "describe_key_pairs", Filters=[dict(Name="key-name", Values=[key])])[
+        "KeyPairs"
+    ]
+    groups = reads.call(
+        "ec2",
+        "describe_security_groups",
+        Filters=[dict(Name="group-name", Values=[key + "-vm", key + "-endpoint"])],
+    )["SecurityGroups"]
+    observations = dict(
+        selected_cidr=CIDR,
+        selected_cidr_subnets=len(overlaps),
+        attempt_instance_connect_endpoints=len(endpoints),
+        attempt_tagged_instances=sum(len(row["Instances"]) for row in instances),
+        attempt_key_pairs=len(keys),
+        attempt_security_groups=len(groups),
+    )
+    for label, service, operation, fields in (
+        (
+            "watchdog_function_exists",
+            "lambda",
+            "get_function_configuration",
+            dict(FunctionName=function),
+        ),
+        (
+            "watchdog_worker_role_exists",
+            "iam",
+            "get_role",
+            dict(RoleName="lumi-stop-worker-" + ATTEMPT),
+        ),
+        (
+            "watchdog_schedule_role_exists",
+            "iam",
+            "get_role",
+            dict(RoleName="lumi-stop-schedule-" + ATTEMPT),
+        ),
+        ("acquisition_user_exists", "iam", "get_user", dict(UserName="lumi-acquire-" + ATTEMPT)),
+        ("retention_user_exists", "iam", "get_user", dict(UserName="lumi-retain-" + ATTEMPT)),
+        ("acquisition_role_exists", "iam", "get_role", dict(RoleName="lumi-acquire-" + ATTEMPT)),
+        ("retention_role_exists", "iam", "get_role", dict(RoleName="lumi-retain-" + ATTEMPT)),
+        ("watchdog_schedule_group_exists", "scheduler", "get_schedule_group", dict(Name=function)),
+    ):
+        observations[label] = not reads.absent(service, operation, **fields)
+    logs = reads.call(
+        "logs", "describe_log_groups", logGroupNamePrefix="/aws/lambda/" + function, limit=10
+    )["logGroups"]
+    observations["watchdog_log_group_exists"] = any(
+        row["logGroupName"] == "/aws/lambda/" + function for row in logs
+    )
+    observations["dedicated_cleanup_bucket_exists"] = not reads.absent(
+        "s3", "head_bucket", Bucket="lumi-cleanup-" + ATTEMPT, ExpectedBucketOwner=ACCOUNT
+    )
+    rows = reads.call("ec2", "describe_instances", InstanceIds=[binding["instance"]])[
+        "Reservations"
+    ]
+    items = [item for reservation in rows for item in reservation["Instances"]]
+    volumes = reads.call(
+        "ec2", "describe_volumes", VolumeIds=[binding["root_volume"], binding["work_volume"]]
+    )["Volumes"]
+    need(len(items) == 1 and items[0]["State"]["Name"] == "stopped")
+    need(items[0]["InstanceType"] == "r6i.4xlarge")
+    need({row["VolumeId"] for row in volumes} == {binding["root_volume"], binding["work_volume"]})
+    need(all(row["Encrypted"] is True for row in volumes))
+    need(all(row["Ebs"]["DeleteOnTermination"] is False for row in items[0]["BlockDeviceMappings"]))
+    need(
+        all(
+            value == 0
+            for key, value in observations.items()
+            if key.endswith(("_subnets", "_endpoints", "_instances", "_pairs", "_groups"))
+        )
+    )
+    need(all(value is False for key, value in observations.items() if key.endswith("_exists")))
+    rows = reads.call(
+        "ec2",
+        "describe_instance_connect_endpoints",
+        Filters=[dict(Name="vpc-id", Values=[VPC])],
+        MaxResults=20,
+    )["InstanceConnectEndpoints"]
+    need(type(rows) is list and len(rows) <= 20)
+    need(all(row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC for row in rows))
+    blockers = [
+        dict(endpoint=row["InstanceConnectEndpointId"], state=row["State"], subnet=row["SubnetId"])
+        for row in rows
+        if row["State"] != "delete-complete"
+    ]
+    return dict(
+        status="fresh_targets_absent_network_slot_blocked"
+        if blockers
+        else "fresh_targets_absent_network_slot_free",
+        observations=observations,
+        frozen_vpc_endpoint_gate_passed=not blockers,
+        blocking_vpc_endpoints=blockers,
+        target_names_absent=True,
+        predecessor_retention=dict(
+            attempt=binding["attempt"],
+            instance_state="stopped",
+            encrypted_volume_count=2,
+            delete_on_termination=False,
+            mutated=False,
+        ),
+        read_only_aws_calls=reads.calls,
+        bounded_transient_read_retries=reads.retries,
+        cpu_network_admitted=False,
+        endpoint_deletion_authorized=False,
+    )
+
+
+def run():
+    binding = local()
+    need(not OUTPUT.exists() and not REPORT.exists())
+    need(not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents, REPORT)))
+    OUTPUT.mkdir(mode=0o700)
+    started = time.monotonic()
+    result = dict(
+        schema="lumi.vm-attempt022-control-target-absence.v0.1",
+        attempt=ATTEMPT,
+        status="started",
+        maximum_read_calls=20,
+        maximum_seconds=300,
+        cloud_mutations=0,
+        object_access=0,
+        instance_actions=0,
+        pass_retry=False,
+        execution_permitted=False,
+        cpu_launch_authorized=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        source_bindings={
+            SOURCE_PROOF: SOURCE_PROOF_SHA,
+            RETAINED_PROOF: RETAINED_PROOF_SHA,
+            RETAINED_BINDING: RETAINED_BINDING_SHA,
+            "scripts/inspect_sft_vm_attempt019_control_targets_v1.py": TRANSPORT_SHA,
+            "scripts/verify_sft_vm_attempt022_source_v1.py": SOURCE_VERIFIER_SHA,
+            "scripts/inspect_sft_vm_attempt022_targets_v1.py": sha(Path(__file__).read_bytes()),
+        },
+    )
+
+    def save(path, value):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        raw = encode(value)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+
+    save(OUTPUT / "started.json", result)
+    clients, bounded = {}, None
+    try:
+        clients = transport.clients()
+        bounded = BoundedClients(clients, started=started)
+        result.update(inspect(bounded, binding))
+        need(result["read_only_aws_calls"] == bounded.calls)
+        need(time.monotonic() - started < MAX_SECONDS)
+    except BaseException as error:
+        response = getattr(error, "response", None)
+        details = response.get("Error") if type(response) is dict else None
+        code = details.get("Code") if type(details) is dict else None
+        result.update(
+            status="stopped_preserve_no_retry",
+            target_names_absent=False,
+            failure_code=code if type(code) is str and code in SAFE_CODES else "other",
+        )
+    finally:
+        for client in clients.values():
+            client.close()
+        result.update(
+            read_only_aws_calls=bounded.calls if bounded else 0,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+            credential_identity_reads_included=True,
+            credential_export_provider_requests_metered=False,
+        )
+        result["observed_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+        save(OUTPUT / "result.json", result)
+        save(REPORT, result)
+    print(
+        json.dumps(
+            {
+                key: result[key]
+                for key in (
+                    "status",
+                    "read_only_aws_calls",
+                    "cloud_mutations",
+                    "cpu_launch_authorized",
+                )
+            },
+            sort_keys=True,
+        )
+    )
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--inspect-once"])
+    run()

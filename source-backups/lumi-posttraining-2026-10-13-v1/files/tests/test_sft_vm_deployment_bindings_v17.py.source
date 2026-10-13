@@ -1,0 +1,33 @@
+"""Offline verification for repaired-source preflight bindings."""
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v17 as m
+
+
+class Tests(unittest.TestCase):
+    def test_repaired_source_and_plan_verify(self):
+        manifest = m.verify()
+        plan = m.build()
+        self.assertEqual(len(manifest["outputs"]), 156)
+        self.assertTrue(plan["source_repair"]["bounded_transient_read_recovery"])
+        self.assertEqual(plan["source_repair"]["write_attempts_per_operation"], 1)
+        self.assertIsNone(plan["successful_readonly_preflight"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_prior_controls_still_verify(self):
+        self.assertEqual(set(m.controls()), {m.WATCH, m.STORE})
+
+    def test_drift_rejected(self):
+        for key in ("SOURCE_BINDINGS_SHA", "RELEASE_SHA", "PLAN_SHA", "PLAN_RELEASE_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,200 @@
+"""Bounded control-client I/O; real socket parent/ledger, no ML/model work."""
+
+import importlib
+import json
+import socket
+import struct
+import time
+import unittest
+from unittest.mock import Mock, patch
+
+from . import test_sft_smoke_bridge_v1 as bridge_fixture
+from . import test_sft_socket_transport_v1 as transport_fixture
+
+client_module = importlib.import_module(
+    bridge_fixture.PACKAGE + ".posttraining_sft_worker_control_v2")
+
+
+class WorkerControlTests(unittest.TestCase):
+    def setUp(self):
+        self.left, self.right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.events, self.clients = [], []
+
+    def tearDown(self):
+        for client in self.clients:
+            try:
+                client.close()
+            except client_module.ControlError:
+                pass
+        self.left.close()
+        self.right.close()
+
+    def make(self, **changes):
+        values = dict(invocation_index=0, deadline_ns=time.monotonic_ns()+2_000_000_000,
+                      maximum_exchange_ns=1_000_000_000, maximum_wire_bytes=65536,
+                      maximum_reads=128, interrupt=lambda: self.events.append("interrupt"))
+        client = client_module.WorkerControlClient(self.left, **{**values, **changes})
+        self.clients.append(client)
+        return client
+
+    def error(self, code, operation):
+        with self.assertRaises(client_module.ControlError) as caught:
+            operation()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def reply(self, value):
+        self.right.sendall(client_module.control_frame(value))
+
+    def ready_to_report(self, client):
+        for phase, step in client._phases:
+            self.reply(dict(status="phase_committed", phase=phase, step=step))
+            client.phase(phase, step)
+            transport_fixture.receive(self.right)
+
+    def test_constructor_no_wire_and_invalid_arguments(self):
+        client = self.make()
+        self.assertEqual(client.summary()["bytes_sent"], 0)
+        for changes in ({"invocation_index": True}, {"maximum_reads": 0}, {"interrupt": None}):
+            self.error("invalid_arguments", lambda changes=changes: self.make(**changes))
+
+    def test_all_phases_report_release_cleanup_closed(self):
+        client = self.make()
+        self.ready_to_report(client)
+        self.reply({"status": "release"})
+        client.report_and_wait(dict(client._expected), 4)
+        self.assertEqual(transport_fixture.receive(self.right)["requests"], 4)
+        client.retire(lambda: self.events.append("cleanup"))
+        self.assertEqual(transport_fixture.receive(self.right), {"status": "closed"})
+        self.assertEqual(self.right.recv(1), b"")
+        self.assertEqual(self.events, ["cleanup"])
+        self.error("already_consumed", lambda: client.phase("inputs", 0))
+        self.assertEqual(self.events, ["cleanup"])
+
+    def test_reserved_before_input_phase_is_rejected(self):
+        client = self.make()
+        self.error("phase_rejected", lambda: client.phase("reserved", 1))
+        self.assertEqual(client.summary()["bytes_sent"], 0)
+
+    def test_wrong_phase_order_and_bool_step(self):
+        client = self.make()
+        self.error("phase_rejected", lambda: client.phase("inputs", False))
+        self.error("terminal_failure", lambda: client.phase("inputs", 0))
+        self.assertEqual(self.events, ["interrupt"])
+
+    def test_report_before_last_phase_rejected(self):
+        client = self.make()
+        self.error("report_rejected", lambda: client.report_and_wait(dict(client._expected), 2))
+
+    def test_report_cannot_include_raw_extra_field(self):
+        client = self.make()
+        self.ready_to_report(client)
+        before = client.summary()["bytes_sent"]
+        self.error("report_rejected", lambda: client.report_and_wait(
+            {**client._expected, "source": "PRIVATE"}, 4))
+        self.assertEqual(client.summary()["bytes_sent"], before)
+        self.assertNotIn("PRIVATE", json.dumps(client.summary()))
+
+    def test_bad_release_rejected(self):
+        client = self.make()
+        self.ready_to_report(client)
+        self.reply({"status": "closed"})
+        self.error("response_rejected", lambda: client.report_and_wait(dict(client._expected), 4))
+
+    def test_partial_phase_response_reassembled(self):
+        client = self.make()
+        raw = client_module.control_frame(dict(status="phase_committed", phase="inputs", step=0))
+        self.right.sendall(raw)
+        original = client._sock
+        class FragmentSocket:
+            def fileno(self):
+                return original.fileno()
+
+            def settimeout(self, value):
+                original.settimeout(value)
+
+            def send(self, raw):
+                return original.send(raw[:7])
+
+            def recvmsg(self, n, *args):
+                return original.recvmsg(min(n, 3), *args)
+        with patch.object(client_module, "_socket_identity", return_value=client._identity):
+            client._sock = FragmentSocket()
+            try:
+                client.phase("inputs", 0)
+            finally:
+                client._sock = original
+        self.assertGreater(client.summary()["read_calls"], 1)
+
+    def test_wire_prepaid_before_send(self):
+        client = self.make(maximum_wire_bytes=1)
+        self.error("wire_exhausted", lambda: client.phase("inputs", 0))
+        self.assertEqual(client.summary()["bytes_sent"], 0)
+
+    def test_read_cap_on_fragmented_reply(self):
+        client = self.make(maximum_reads=1)
+        self.right.sendall(b"\x00")
+        self.error("wire_exhausted", lambda: client.phase("inputs", 0))
+        self.assertEqual(client.summary()["read_calls"], 1)
+
+    def test_timeout_is_terminal_and_never_resends(self):
+        client = self.make(maximum_exchange_ns=5_000_000)
+        self.error("deadline_exhausted", lambda: client.phase("inputs", 0))
+        before = client.summary()["bytes_sent"]
+        self.error("terminal_failure", lambda: client.phase("inputs", 0))
+        self.assertEqual(client.summary()["bytes_sent"], before)
+
+    def test_rights_closed_before_response_rejection(self):
+        client = self.make()
+        self.right.sendmsg([b"x"], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                   struct.pack("i", self.right.fileno()))])
+        original = client_module._close_received_rights
+        observed = []
+        def close(items):
+            result = original(items)
+            observed.append(result)
+            return result
+        with patch.object(client_module, "_close_received_rights", side_effect=close):
+            self.error("response_rejected", lambda: client.phase("inputs", 0))
+        self.assertEqual(observed, [(1, False)])
+
+    def test_cleanup_failure_never_sends_closed(self):
+        client = self.make()
+        self.ready_to_report(client)
+        self.reply({"status": "release"})
+        client.report_and_wait(dict(client._expected), 4)
+        transport_fixture.receive(self.right)
+        before = client.summary()["bytes_sent"]
+        self.error("cleanup_failed", lambda: client.retire(Mock(side_effect=OSError("PRIVATE"))))
+        self.assertEqual(client.summary()["bytes_sent"], before)
+
+    def test_early_retire_never_calls_resource_cleanup(self):
+        client = self.make()
+        cleanup = Mock()
+        self.error("already_consumed", lambda: client.retire(cleanup))
+        cleanup.assert_not_called()
+
+    def test_owner_mismatch(self):
+        client = self.make()
+        with patch.object(client_module.os, "getpid", return_value=-1):
+            self.error("owner_mismatch", lambda: client.phase("inputs", 0))
+
+    def test_clock_regression(self):
+        now = [5]
+        client = self.make(clock_ns=lambda: now[0], deadline_ns=100)
+        now[0] = 4
+        self.error("clock_rejected", lambda: client.phase("inputs", 0))
+
+    def test_cleanup_cannot_swallow_reentry_and_send_closed(self):
+        client = self.make()
+        self.ready_to_report(client)
+        self.reply({"status": "release"})
+        client.report_and_wait(dict(client._expected), 4)
+        before = client.summary()["bytes_sent"]
+        def cleanup():
+            try:
+                client.close()
+            except client_module.ControlError:
+                pass
+        self.error("terminal_failure", lambda: client.retire(cleanup))
+        self.assertEqual(client.summary()["bytes_sent"], before)

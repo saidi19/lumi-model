@@ -1,0 +1,667 @@
+"""Pure full-size controller/guardian doubles; no native, payload, network or ML work."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import importlib.util
+import sys
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_fullsize_composition_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_fullsize_composition_v1")
+IMPORTED = set(sys.modules) - before
+
+
+def fixtures_module(name):
+    spec = importlib.util.spec_from_file_location("_fullsize_composition_" + name,
+        ROOT / "tests" / ("test_sft_checkpoint_" + name + "_v1.py"))
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    return fixtures
+
+
+ENTRY_FIXTURES = fixtures_module("fullsize_entry")
+GUARD_FIXTURES = fixtures_module("fullsize_guard")
+
+
+class ExitNative(BaseException):
+    def __init__(self, code):
+        self.code = code
+
+
+def exit_native(code):
+    raise ExitNative(code)
+
+
+class Lease:
+    def __init__(self):
+        self.populated = 0
+        self.kills = self.closes = 0
+        self.close_error = self.kill_error = False
+
+    def verify_limits(self):
+        pass
+
+    def snapshot(self):
+        return {"populated": self.populated, "pids_current": self.populated}
+
+    def fileno(self):
+        return 61
+
+    def kill(self):
+        self.kills += 1
+        self.populated = 0
+        if self.kill_error:
+            raise OSError("secret native kill failure")
+
+    def close(self):
+        self.closes += 1
+        if self.close_error:
+            raise OSError("secret native close failure")
+
+
+class FullsizeCompositionTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(m, "_ATTEMPTED", False))
+        self.entry_arguments = ENTRY_FIXTURES.arguments(*ENTRY_FIXTURES.fixture(fullsize=True))
+        self.entry = m.entry.prepare_entry(**self.entry_arguments)
+        self.mounts = GUARD_FIXTURES.mount_arguments()
+        self.mounts["inventories"] = copy.deepcopy(self.entry["inventories"])
+        self.prepared = m.preparation.prepare_guard(entry_arguments=self.entry_arguments,
+                                                    mount_arguments=self.mounts)
+        self.environment = {**m.child_bootstrap.FIXED_ENV,
+            "LUMI_IMPORT_SOURCE_MANIFEST_SHA256": self.entry["bindings"]["source_manifest_sha256"],
+            "LUMI_FULLSIZE_ENTRY_SHA256": self.entry["bindings"]["entry_sha256"],
+            "LUMI_FULLSIZE_CONTROL_SHA256": self.entry["bindings"]["control_sha256"],
+            "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256": self.entry["bindings"]["attempt_nonce_sha256"]}
+        self.worker = m.entry._result(ENTRY_FIXTURES.coordinator_result(self.entry), self.entry)
+        self.deadline = 3_600_000_000_000
+
+    def final(self, worker=None):
+        return {"status": "passed", "case": "worker_run", "reason": "workload_empty",
+                "empty_and_removed": True, "workload_processes_reaped": 1,
+                "kill_attempts": 1, "worker": self.worker if worker is None else worker}
+
+    def invoke(self, **overrides):
+        arguments = dict(entry_arguments=self.entry_arguments, mount_arguments=self.mounts,
+            environment=self.environment, base_script_path="/release/run_sft_cgroup_fixture_v1.py",
+            expected_base_sha256=m.BASE_SHA256, deadline_ns=self.deadline)
+        arguments.update(overrides)
+        return m._run_admitted_once(**arguments)
+
+    def api_doubles(self, result=None):
+        runtime = self.stack.enter_context(patch.object(m.child_bootstrap, "_runtime"))
+        self.stack.enter_context(patch.object(m.time, "monotonic_ns", return_value=100))
+        base = types.SimpleNamespace(subreaper=Mock(), run_case=Mock(), wait_statuses=Mock())
+        self.run_case = self.stack.enter_context(patch.object(m, "_run_case",
+            return_value=self.final() if result is None else result))
+        loader = self.stack.enter_context(patch.object(m, "_load_base", return_value=base))
+        return base, loader, runtime
+
+    def native_doubles(self, *, ready=None, report=None, eof=b"", statuses=None,
+                       watch_reason="workload_empty", watch_error=False, close_error=False,
+                       kill_error=False, duplicate_release=False, descriptor_close_error=False,
+                       short_release=False, ready_error=False, worker_alive=False,
+                       worker_pidfd_error=False, worker_signal_error=False,
+                       expired_before_start=False):
+        events, lease, outer_result = [], Lease(), []
+        lease.close_error, lease.kill_error = close_error, kill_error
+        outer, parent, child = Mock(), Mock(), Mock()
+        outer.fileno.return_value = 80
+        parent.send.side_effect = lambda raw: events.append(("release", raw)) or (
+            0 if short_release and raw == b"G" else len(raw))
+
+        def send(channel, value):
+            self.assertIs(channel, outer)
+            events.append(("send", value.get("phase", value.get("status"))))
+            outer_result.append(copy.deepcopy(value))
+
+        def receive(_channel, _deadline):
+            if "ready" not in events:
+                events.append("ready")
+                if ready_error:
+                    raise OSError("secret bootstrap stuck before entering cgroup")
+                lease.populated = 1
+                return copy.deepcopy(m.child_bootstrap.READY if ready is None else ready)
+            return copy.deepcopy(self.worker if report is None else report)
+
+        def watch(passed, *, expected_parent_pid, deadline_ns, cleanup_timeout_ms, release):
+            self.assertIs(passed, lease)
+            self.assertEqual(expected_parent_pid, 77)
+            self.assertEqual(deadline_ns, self.deadline)
+            self.assertEqual(cleanup_timeout_ms, 10000)
+            events.append("watch_installed")
+            release()
+            if duplicate_release:
+                release()
+            lease.kill()
+            if watch_error:
+                raise OSError("secret watch failure")
+            return {"reason": watch_reason, "kill_attempted": True, "empty_verified": True,
+                    "parent_pidfd_bound": True, "release_called": True, "pidfd_closed": True}
+
+        factory = Mock(return_value=lease)
+        modules = {"posttraining_sft_cgroup_v1": types.SimpleNamespace(CgroupLease=factory),
+                   "posttraining_sft_cgroup_guardian_v1": types.SimpleNamespace(watch_parent=watch)}
+        base = types.SimpleNamespace(close_except=Mock(), subreaper=Mock(),
+            module=modules.__getitem__, send=send,
+            wait_statuses=Mock(return_value={123: 0} if statuses is None else statuses))
+        self.native_base = base
+        self.stack.enter_context(patch.object(m.os, "open", return_value=51))
+        closing = self.stack.enter_context(patch.object(m.os, "close"))
+        if descriptor_close_error:
+            closing.side_effect = OSError("secret descriptor close failure")
+        fork = self.stack.enter_context(patch.object(m.os, "fork", return_value=123))
+        self.worker_pidfd = self.stack.enter_context(patch.object(m.os, "pidfd_open",
+            side_effect=lambda *_: events.append("worker_pidfd") or 62, create=True))
+        if worker_pidfd_error:
+            self.worker_pidfd.side_effect = OSError("secret pidfd acquisition failure")
+        self.worker_signal = self.stack.enter_context(patch.object(m.signal, "pidfd_send_signal",
+            side_effect=lambda *_: events.append("owned_worker_kill"), create=True))
+        if worker_signal_error:
+            self.worker_signal.side_effect = OSError("secret owned worker kill failure")
+        self.stack.enter_context(patch.object(m.select, "select",
+            return_value=([] if worker_alive else [62], [], [])))
+        self.stack.enter_context(patch.object(m.os, "_exit", side_effect=exit_native))
+        self.stack.enter_context(patch.object(m.socket, "socketpair", return_value=(parent, child)))
+        self.stack.enter_context(patch.object(m, "_receive", side_effect=receive))
+        self.stack.enter_context(patch.object(m, "_packet", return_value=eof))
+        self.stack.enter_context(patch.object(m.time, "monotonic_ns",
+            return_value=self.deadline if expired_before_start else 100))
+        bootstrap = self.stack.enter_context(patch.object(m.child_bootstrap, "_bootstrap_admitted"))
+        context = {"prepared": self.prepared, "environment": self.environment}
+        with self.assertRaises(ExitNative) as captured:
+            m._guard(base, context, "worker_run", outer, 77, 10001, 10001,
+                     m.child_bootstrap.RUNTIME, self.deadline)
+        bootstrap.assert_not_called()
+        fork.assert_called_once_with()
+        return outer_result[-1], lease, events, captured.exception.code, factory, parent, child
+
+    def test_imports_no_native_ml_runtime_or_primary_package(self):
+        self.assertFalse({name.split(".")[0] for name in IMPORTED}
+                         & {"lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers"})
+
+    def test_public_entry_is_closed_before_preparation_or_native_effects(self):
+        forbidden = Mock(side_effect=AssertionError("must not run"))
+        with patch.object(m.preparation, "prepare_guard", forbidden), \
+                patch.object(m.child_bootstrap, "_runtime", forbidden), \
+                patch.object(m, "_load_base", forbidden), patch("os.open", forbidden), \
+                patch("os.fork", forbidden), patch("socket.socket", forbidden):
+            for kwargs in ({}, {"approved": True}, {"entry_arguments": object()}):
+                with self.assertRaisesRegex(m.FullsizeCompositionError, "^host_guard_not_bound$"):
+                    m.run_fullsize_guard(**kwargs)
+        forbidden.assert_not_called()
+
+    def test_success_orders_watch_before_release_then_reaps_and_closes(self):
+        result, lease, events, code, factory, parent, child = self.native_doubles()
+        self.assertEqual(result, self.final())
+        self.assertEqual((lease.kills, lease.closes, code), (1, 1, 0))
+        self.assertLess(events.index("ready"), events.index("watch_installed"))
+        self.assertLess(events.index("worker_pidfd"), events.index(("release", b"S")))
+        self.assertLess(events.index(("release", b"S")), events.index("ready"))
+        self.assertLess(events.index("watch_installed"), events.index(("release", b"G")))
+        self.assertEqual(factory.call_args.kwargs["limits"], {
+            "memory_max_bytes": 64 * 1024**3, "pids_max": 256,
+            "cpu_quota_us": 200000, "cpu_period_us": 100000})
+        parent.close.assert_called_once()
+        child.close.assert_called_once()
+
+    def test_changed_or_extra_ready_fields_reject_before_release(self):
+        for ready in ({**m.child_bootstrap.READY, "isolation_installed": 1},
+                      {**m.child_bootstrap.READY, "extra": True}):
+            result, lease, events, code, *_ = self.native_doubles(ready=ready)
+            self.assertEqual((result["status"], lease.kills, lease.closes, code),
+                             ("failed", 1, 1, 2))
+            self.assertNotIn("watch_installed", events)
+            self.assertNotIn(("release", b"G"), events)
+
+    def test_controller_loss_and_deadline_kill_cleanup_but_never_pass(self):
+        for reason in ("parent_lost", "deadline_exhausted"):
+            with self.subTest(reason=reason):
+                result, lease, _, code, *_ = self.native_doubles(watch_reason=reason)
+                self.assertEqual((result["status"], lease.kills, lease.closes, code),
+                                 ("failed", 1, 1, 2))
+                self.assertTrue(result["empty_and_removed"])
+                self.assertEqual(result["code"], reason)
+
+    def test_worker_exit_status_requires_exact_success_and_expected_pid(self):
+        for statuses in ({123: 256}, {}, {124: 0}, {123: True},
+                         {123: 0, 124: 0, 125: 0, 126: 0, 127: 0}):
+            with self.subTest(statuses=statuses):
+                result, lease, _, code, *_ = self.native_doubles(statuses=statuses)
+                self.assertEqual((result["status"], lease.kills, lease.closes, code),
+                                 ("failed", 1, 1, 2))
+
+    def test_worker_report_requires_eof_and_cannot_change_bound_inventory(self):
+        for options in ({"eof": b"extra"},
+                        {"report": self.worker | {"input_files": self.worker["input_files"] + 1}},
+                        {"report": self.worker | {"input_bytes": self.worker["input_bytes"] + 1}}):
+            with self.subTest(options=tuple(options)):
+                result, lease, *_ = self.native_doubles(**options)
+                self.assertEqual((result["status"], lease.kills, lease.closes), ("failed", 1, 1))
+
+    def test_watch_failure_and_ambiguous_kill_are_not_retried(self):
+        for options in ({"watch_error": True}, {"kill_error": True}):
+            with self.subTest(options=options):
+                result, lease, *_ = self.native_doubles(**options)
+                self.assertEqual((result["status"], lease.kills), ("failed", 1))
+
+    def test_worker_pidfd_failure_cannot_release_bootstrap(self):
+        result, lease, events, _, *_ = self.native_doubles(worker_pidfd_error=True)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(lease.kills, 1)
+        self.assertNotIn(("release", b"S"), events)
+        self.assertNotIn(("release", b"G"), events)
+        self.worker_pidfd.assert_called_once_with(123, 0)
+        self.worker_signal.assert_not_called()
+
+    def test_stalled_unattached_bootstrap_is_killed_by_owned_pidfd_once(self):
+        result, lease, events, _, *_ = self.native_doubles(ready_error=True, worker_alive=True)
+        self.assertEqual((result["status"], lease.kills, lease.closes), ("failed", 1, 1))
+        self.assertIn(("release", b"S"), events)
+        self.assertNotIn(("release", b"G"), events)
+        self.worker_signal.assert_called_once_with(62, m.signal.SIGKILL, None, 0)
+        self.native_base.wait_statuses.assert_called_once()
+
+    def test_ambiguous_unattached_worker_kill_is_not_retried_or_called_success(self):
+        result, _, events, _, *_ = self.native_doubles(
+            ready_error=True, worker_alive=True, worker_signal_error=True)
+        self.assertEqual((result["status"], result["code"]), ("failed", "cleanup_unconfirmed"))
+        self.worker_signal.assert_called_once_with(62, m.signal.SIGKILL, None, 0)
+        self.assertNotIn(("release", b"G"), events)
+
+    def test_expired_deadline_before_worker_start_never_releases_bootstrap(self):
+        result, lease, events, _, *_ = self.native_doubles(
+            expired_before_start=True, worker_alive=True)
+        self.assertEqual((result["status"], result["code"]), ("failed", "deadline_exhausted"))
+        self.assertEqual((lease.kills, lease.closes), (1, 1))
+        self.assertNotIn(("release", b"S"), events)
+        self.assertNotIn(("release", b"G"), events)
+        self.worker_signal.assert_called_once_with(62, m.signal.SIGKILL, None, 0)
+
+    def test_ambiguous_close_and_descriptor_cleanup_cannot_claim_success(self):
+        for options in ({"close_error": True}, {"descriptor_close_error": True}):
+            with self.subTest(options=options):
+                result, lease, *_ = self.native_doubles(**options)
+                self.assertEqual((result["code"], lease.kills, lease.closes),
+                                 ("cleanup_unconfirmed", 1, 1))
+
+    def test_release_is_exactly_one_byte_and_cannot_repeat(self):
+        for options in ({"duplicate_release": True}, {"short_release": True}):
+            with self.subTest(options=options):
+                result, lease, events, *_ = self.native_doubles(**options)
+                self.assertEqual((result["status"], lease.kills), ("failed", 1))
+                self.assertEqual(events.count(("release", b"G")), 1)
+
+    def test_success_api_uses_fullsize_envelope_limits_not_frozen_tiny_constants(self):
+        base, loader, runtime = self.api_doubles()
+        result = self.invoke()
+        runtime.assert_called_once_with()
+        loader.assert_called_once_with("/release/run_sft_cgroup_fixture_v1.py", m.BASE_SHA256)
+        self.run_case.assert_called_once_with(base, self.deadline)
+        base.run_case.assert_not_called()
+        self.assertEqual(result["worker"], self.worker)
+        self.assertEqual(result["memory_max_bytes"], 64 * 1024**3)
+        self.assertEqual(result["maximum_seconds"], 3600)
+        self.assertEqual(result["tmpfs_capacity_bytes"], self.mounts["scratch_bytes"])
+        self.assertEqual(result["shm_capacity_bytes"], self.mounts["shm_bytes"])
+        self.assertTrue(all(result[key] is False for key in m.NONCLAIMS))
+        self.assertIs(base.receive, m._receive)
+        self.assertTrue(callable(base.guardian))
+
+    def test_native_runtime_precedes_all_preparation_and_io(self):
+        forbidden = Mock(side_effect=AssertionError("must not run"))
+        with patch.object(m.child_bootstrap, "_runtime", side_effect=RuntimeError("secret")), \
+                patch.object(m.preparation, "prepare_guard", forbidden), \
+                patch.object(m, "_load_base", forbidden), patch("os.open", forbidden):
+            with self.assertRaisesRegex(m.FullsizeCompositionError, "^runtime_rejected$"):
+                self.invoke()
+        forbidden.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_validated_scratch_and_shm_capacities_are_preserved_without_tiny_clamp(self):
+        self.api_doubles()
+        mounts = self.mounts | {"scratch_bytes": 16 * 1024**2, "shm_bytes": 2 * 1024**2}
+        result = self.invoke(mount_arguments=mounts)
+        self.assertEqual(result["tmpfs_capacity_bytes"], 16 * 1024**2)
+        self.assertEqual(result["shm_capacity_bytes"], 2 * 1024**2)
+
+    def test_prepared_context_is_detached_and_callbacks_only_touch_fresh_base(self):
+        base, loader, _ = self.api_doubles()
+        original_mounts, original_environment = copy.deepcopy(self.mounts), dict(self.environment)
+        observed = []
+
+        def load(*_args):
+            self.mounts["inventories"]["checkpoint"]["model/.metadata"] = 99
+            self.environment["LUMI_FULLSIZE_CONTROL_SHA256"] = "f" * 64
+            return base
+
+        def run(fresh, deadline):
+            self.assertIs(fresh, base)
+            fresh.guardian("worker_run", Mock(), 77, 10001, 10001,
+                           m.child_bootstrap.RUNTIME, deadline)
+            return self.final()
+
+        loader.side_effect, self.run_case.side_effect = load, run
+        with patch.object(m, "_guard", side_effect=lambda *args: observed.append(args)):
+            self.invoke()
+        self.assertEqual(set(observed[0][1]), {"prepared", "environment"})
+        self.assertEqual(observed[0][1]["prepared"]["mount_arguments"], original_mounts)
+        self.assertEqual(observed[0][1]["environment"], original_environment)
+        self.assertIs(observed[0][0], base)
+
+    def test_independent_environment_pins_must_match_prepared_bindings(self):
+        _, loader, _ = self.api_doubles()
+        for key in set(self.environment) - set(m.child_bootstrap.FIXED_ENV):
+            changed = self.environment | {key: "f" * 64}
+            with self.subTest(key=key), self.assertRaises(m.FullsizeCompositionError):
+                self.invoke(environment=changed)
+        with self.assertRaises(m.FullsizeCompositionError):
+            self.invoke(environment=self.environment | {"LD_PRELOAD": "/secret/code"})
+        loader.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_invalid_deadline_denied_before_attempt_and_load(self):
+        _, loader, _ = self.api_doubles()
+        for value in (True, 100, -1, 0, 1.0, 3_600_000_000_101):
+            with self.subTest(value=value), self.assertRaises(m.FullsizeCompositionError):
+                self.invoke(deadline_ns=value)
+        loader.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_deadline_upper_bound_is_inclusive_at_validated_seconds(self):
+        self.api_doubles()
+        deadline = 3_600_000_000_100
+        self.invoke(deadline_ns=deadline)
+        self.assertEqual(self.run_case.call_args.args[-1], deadline)
+
+    def test_entry_mount_disagreement_denies_before_load(self):
+        _, loader, _ = self.api_doubles()
+        mounts = copy.deepcopy(self.mounts)
+        key = next(iter(mounts["inventories"]["checkpoint"]))
+        mounts["inventories"]["checkpoint"][key] += 1
+        with self.assertRaises(m.FullsizeCompositionError):
+            self.invoke(mount_arguments=mounts)
+        loader.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_bad_base_pin_and_path_types_reject_before_attempt(self):
+        _, loader, _ = self.api_doubles()
+        for overrides in ({"expected_base_sha256": "a" * 64}, {"base_script_path": None},
+                          {"base_script_path": ""}, {"base_script_path": "x" * 4097}):
+            with self.subTest(overrides=tuple(overrides)), \
+                    self.assertRaises(m.FullsizeCompositionError):
+                self.invoke(**overrides)
+        loader.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_base_load_failure_consumes_attempt_and_cannot_retry(self):
+        _, loader, _ = self.api_doubles()
+        loader.side_effect = OSError("secret source path")
+        for expected in ("guard_failed", "already_attempted"):
+            with self.assertRaises(m.FullsizeCompositionError) as caught:
+                self.invoke()
+            self.assertEqual(caught.exception.args, (expected,))
+        loader.assert_called_once()
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_successful_attempt_also_cannot_retry(self):
+        base, loader, _ = self.api_doubles()
+        self.invoke()
+        with self.assertRaisesRegex(m.FullsizeCompositionError, "^already_attempted$"):
+            self.invoke()
+        loader.assert_called_once()
+        self.run_case.assert_called_once()
+        base.run_case.assert_not_called()
+
+    def test_failed_case_reaps_without_claiming_cleanup_and_never_exposes_text(self):
+        base, _, _ = self.api_doubles()
+        self.run_case.side_effect = OSError("secret native failure")
+        with self.assertRaises(m.FullsizeCompositionError) as caught:
+            self.invoke()
+        self.assertEqual(caught.exception.args, ("guard_failed",))
+        self.assertTrue(caught.exception.__suppress_context__)
+        base.wait_statuses.assert_called_once()
+
+    def test_failed_case_and_ambiguous_outer_cleanup_has_closed_code(self):
+        base, _, _ = self.api_doubles()
+        self.run_case.side_effect = OSError("secret native failure")
+        base.wait_statuses.side_effect = OSError("secret cleanup failure")
+        with self.assertRaisesRegex(m.FullsizeCompositionError, "^cleanup_unconfirmed$"):
+            self.invoke()
+        base.wait_statuses.assert_called_once()
+
+    def test_late_deadline_denies_even_success_shaped_result(self):
+        self.api_doubles()
+        self.stack.enter_context(patch.object(m.time, "monotonic_ns",
+            side_effect=[100, self.deadline + 1, self.deadline + 2]))
+        with self.assertRaisesRegex(m.FullsizeCompositionError, "^deadline_exhausted$"):
+            self.invoke()
+
+    def test_worker_exact_schema_bindings_counters_and_false_flags(self):
+        self.assertEqual(m._worker(self.worker, self.entry), self.worker)
+        changes = {"coordinator_passes": True, "input_files": self.worker["input_files"] + 1,
+            "input_bytes": self.worker["input_bytes"] + 1, "checkpoint_full_audits": 3,
+            "tokenizer_full_audits": 3, "coordinator_result_sha256": "0" * 64,
+            "unapproved_field": True, "schema": "tiny-fixture", "status": "passed"}
+        changes.update(dict.fromkeys(m.entry.FALSE_FLAGS, True))
+        changes.update(dict.fromkeys(self.entry["bindings"], "f" * 64))
+        for key in ("coordinator_read_bytes_reserved", "private_write_bytes_reserved"):
+            changes[key] = self.worker[key] + 1
+        for key, value in changes.items():
+            with self.subTest(key=key), self.assertRaisesRegex(m.FullsizeCompositionError,
+                                                                   "^worker_rejected$"):
+                m._worker(self.worker | {key: value}, self.entry)
+        for key in self.worker:
+            report = dict(self.worker)
+            del report[key]
+            with self.subTest(missing=key), self.assertRaisesRegex(m.FullsizeCompositionError,
+                                                                       "^worker_rejected$"):
+                m._worker(report, self.entry)
+
+    def case_doubles(self, *, packets=None, statuses=None, controller_alive=False,
+                     eof=b"", close_error=False, signal_error=None, fork_pid=123,
+                     pidfd_error=False, start=b"C", short_start=False):
+        channel, child = Mock(), Mock()
+        self.case_events = []
+        channel.send.side_effect = lambda raw: self.case_events.append(("start", raw)) or (
+            0 if short_start else len(raw))
+        base = types.SimpleNamespace(controller=Mock(), run_case=Mock(), close_except=Mock(),
+            wait_statuses=Mock(return_value={123: 0} if statuses is None else statuses))
+        self.stack.enter_context(patch.object(m.socket, "socketpair",
+                                              return_value=(channel, child)))
+        self.stack.enter_context(patch.object(m.os, "fork", return_value=fork_pid))
+        self.stack.enter_context(patch.object(m.os, "getpid", return_value=77))
+        self.stack.enter_context(patch.object(m.os, "_exit", side_effect=exit_native))
+        self.case_pidfd = self.stack.enter_context(patch.object(m.os, "pidfd_open",
+            side_effect=lambda *_: self.case_events.append("pidfd") or 61, create=True))
+        if pidfd_error:
+            self.case_pidfd.side_effect = OSError("secret pidfd failure")
+        close = self.stack.enter_context(patch.object(m.os, "close"))
+        if close_error:
+            close.side_effect = OSError("secret pidfd close")
+        signal = self.stack.enter_context(patch.object(m.signal, "pidfd_send_signal", create=True))
+        signal.side_effect = signal_error
+        self.stack.enter_context(patch.object(m.time, "monotonic_ns", return_value=100))
+
+        def ready(readers, _writers, _errors, _seconds):
+            if fork_pid == 0 and readers == [child]:
+                return ([], [], [])
+            return ([] if readers == [61] and controller_alive else readers, [], [])
+
+        self.stack.enter_context(patch.object(m.select, "select", side_effect=ready))
+        receive = self.stack.enter_context(patch.object(m, "_receive", side_effect=(
+            [{"phase": "armed", "case": "worker_run"}, self.final()]
+            if packets is None else packets)))
+        packet = self.stack.enter_context(patch.object(m, "_packet",
+            return_value=start if fork_pid == 0 else eof))
+        return base, channel, child, receive, packet, signal, close
+
+    def test_controller_child_receives_exact_hour_deadline_without_220_second_clamp(self):
+        base, channel, child, receive, _, signal, close = self.case_doubles(fork_pid=0)
+        with self.assertRaises(ExitNative) as caught:
+            m._run_case(base, self.deadline)
+        self.assertEqual(caught.exception.code, 2)
+        base.controller.assert_called_once_with("worker_run", child, 77, 10001, 10001,
+                                               m.child_bootstrap.RUNTIME, self.deadline)
+        base.run_case.assert_not_called()
+        receive.assert_not_called()
+        signal.assert_not_called()
+        close.assert_not_called()
+        channel.close.assert_called_once()
+        child.close.assert_called_once()
+
+    def test_controller_parent_preserves_hour_deadline_and_accepts_exact_armed_final_eof(self):
+        base, channel, child, receive, packet, signal, close = self.case_doubles()
+        self.assertEqual(m._run_case(base, self.deadline), self.final())
+        self.assertEqual(self.case_events, ["pidfd", ("start", b"C")])
+        self.assertEqual([call.args[1] for call in receive.call_args_list],
+                         [self.deadline + 12_000_000_000] * 2)
+        base.wait_statuses.assert_called_once_with(10_000_000_100)
+        packet.assert_called_once_with(channel, 10_000_000_100)
+        base.run_case.assert_not_called()
+        signal.assert_not_called()
+        close.assert_called_once_with(61)
+        channel.close.assert_called_once()
+        child.close.assert_called_once()
+
+    def test_controller_pidfd_failure_never_sends_start_or_waits_for_armed(self):
+        base, channel, child, receive, _, signal, close = self.case_doubles(pidfd_error=True)
+        with self.assertRaises(OSError):
+            m._run_case(base, self.deadline)
+        channel.send.assert_not_called()
+        receive.assert_not_called()
+        signal.assert_not_called()
+        close.assert_not_called()
+        channel.close.assert_called_once()
+        child.close.assert_called_once()
+
+    def test_controller_child_bad_prestart_cannot_enter_base_controller(self):
+        for start in (b"", b"CC", b"G"):
+            with self.subTest(start=start):
+                base, _, _, receive, _, signal, close = self.case_doubles(fork_pid=0, start=start)
+                with self.assertRaises(ExitNative):
+                    m._run_case(base, self.deadline)
+                base.controller.assert_not_called()
+                receive.assert_not_called()
+                signal.assert_not_called()
+                close.assert_not_called()
+
+    def test_partial_controller_start_send_is_terminal_and_kills_only_owned_pidfd(self):
+        base, channel, _, receive, _, signal, close = self.case_doubles(
+            short_start=True, controller_alive=True)
+        with self.assertRaises(m.FullsizeCompositionError):
+            m._run_case(base, self.deadline)
+        channel.send.assert_called_once_with(b"C")
+        receive.assert_not_called()
+        signal.assert_called_once_with(61, m.signal.SIGKILL, None, 0)
+        close.assert_called_once_with(61)
+
+    def test_owned_live_controller_is_killed_once_on_bad_packet_and_pidfd_closed(self):
+        base, _, _, _, _, signal, close = self.case_doubles(
+            packets=[{"phase": "armed", "case": "other"}], controller_alive=True)
+        with self.assertRaisesRegex(m.FullsizeCompositionError, "^packet_rejected$"):
+            m._run_case(base, self.deadline)
+        signal.assert_called_once_with(61, m.signal.SIGKILL, None, 0)
+        close.assert_called_once_with(61)
+
+    def test_duplicate_extra_or_missing_armed_packet_cannot_pass(self):
+        armed = {"phase": "armed", "case": "worker_run"}
+        variants = [[self.final()], [armed, armed, self.final()],
+                    [armed | {"extra": True}, self.final()]]
+        for packets in variants:
+            with self.subTest(packets=packets):
+                base, _, _, _, _, signal, close = self.case_doubles(
+                    packets=packets, controller_alive=True)
+                with self.assertRaises(m.FullsizeCompositionError):
+                    m._run_case(base, self.deadline)
+                signal.assert_called_once()
+                close.assert_called_once_with(61)
+
+    def test_controller_reaping_requires_owned_pid_exact_zero_status(self):
+        for statuses in ({}, {123: True}, {123: 256}, {124: 0}, {123: 0, 124: 0}):
+            with self.subTest(statuses=statuses):
+                base, _, _, _, _, _, close = self.case_doubles(statuses=statuses)
+                with self.assertRaises(m.FullsizeCompositionError):
+                    m._run_case(base, self.deadline)
+                close.assert_called_once_with(61)
+
+    def test_controller_extra_packet_after_final_is_rejected(self):
+        base, _, _, _, _, _, close = self.case_doubles(eof=b"extra")
+        with self.assertRaisesRegex(m.FullsizeCompositionError, "^packet_rejected$"):
+            m._run_case(base, self.deadline)
+        close.assert_called_once_with(61)
+
+    def test_controller_cleanup_ambiguous_close_or_kill_is_not_retried(self):
+        for options in ({"close_error": True},
+                        {"controller_alive": True, "signal_error": OSError("secret kill")}):
+            with self.subTest(options=tuple(options)):
+                base, _, _, _, _, signal, close = self.case_doubles(**options)
+                with self.assertRaisesRegex(m.FullsizeCompositionError, "^cleanup_unconfirmed$"):
+                    m._run_case(base, self.deadline)
+                close.assert_called_once_with(61)
+                self.assertLessEqual(signal.call_count, 1)
+
+    def test_controller_already_gone_is_not_a_signal_retry(self):
+        base, _, _, _, _, signal, close = self.case_doubles(
+            controller_alive=True, signal_error=ProcessLookupError())
+        self.assertEqual(m._run_case(base, self.deadline), self.final())
+        signal.assert_called_once_with(61, m.signal.SIGKILL, None, 0)
+        close.assert_called_once_with(61)
+
+    def test_controller_clock_exhaustion_never_reads_or_renews_deadline(self):
+        base, _, _, receive, _, signal, close = self.case_doubles(controller_alive=True)
+        self.stack.enter_context(patch.object(m.time, "monotonic_ns",
+                                              return_value=self.deadline + 12_000_000_001))
+        with self.assertRaises(m.FullsizeCompositionError):
+            m._run_case(base, self.deadline)
+        receive.assert_not_called()
+        self.assertNotIn(("start", b"C"), self.case_events)
+        signal.assert_called_once_with(61, m.signal.SIGKILL, None, 0)
+        close.assert_called_once_with(61)
+
+    def test_start_barrier_uses_exact_token_and_no_more_than_ten_seconds(self):
+        channel = Mock()
+        with patch.object(m.time, "monotonic_ns", return_value=100), \
+                patch.object(m, "_packet", return_value=b"S") as packet, \
+                patch.object(m.select, "select", return_value=([], [], [])):
+            m._await_start(channel, b"S", self.deadline)
+        packet.assert_called_once_with(channel, 10_000_000_100)
+
+    def test_start_barrier_does_not_extend_short_remaining_deadline(self):
+        channel = Mock()
+        with patch.object(m.time, "monotonic_ns", return_value=100), \
+                patch.object(m, "_packet", return_value=b"C") as packet, \
+                patch.object(m.select, "select", return_value=([], [], [])):
+            m._await_start(channel, b"C", 500)
+        packet.assert_called_once_with(channel, 500)
+
+    def test_start_barrier_rejects_extra_packets_or_expired_deadline(self):
+        channel = Mock()
+        with patch.object(m.time, "monotonic_ns", return_value=100), \
+                patch.object(m, "_packet", return_value=b"S"), \
+                patch.object(m.select, "select", return_value=([channel], [], [])):
+            with self.assertRaisesRegex(m.FullsizeCompositionError, "^packet_rejected$"):
+                m._await_start(channel, b"S", 500)
+        with patch.object(m.time, "monotonic_ns", return_value=500), \
+                patch.object(m, "_packet", return_value=b"S"), \
+                patch.object(m.select, "select") as select:
+            with self.assertRaisesRegex(m.FullsizeCompositionError, "^deadline_exhausted$"):
+                m._await_start(channel, b"S", 500)
+        select.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

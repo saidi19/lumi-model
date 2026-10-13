@@ -1,0 +1,216 @@
+"""Actual tiny CPU HF byte save/reload, never real payloads or a forward pass."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import unittest
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_hf_bytes_v1 as hf
+from lumi import posttraining_checkpoint_import_torch_v5 as m
+from tests import test_sft_checkpoint_import_torch_v4 as fixtures
+
+
+class HFByteKernelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.MeteredKernelTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.MeteredKernelTests.tearDownClass()
+
+    def setUp(self):
+        self.fixture = fixtures.MeteredKernelTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.f = self.fixture.fixture
+        self.io_limits = dict(maximum_read_bytes=8 * 1024**2, maximum_write_bytes=4 * 1024**2,
+                              maximum_file_bytes=4 * 1024**2, maximum_control_bytes=65536,
+                              target_shard_bytes=268435456)
+
+    def checkpoint(self, mutate=None):
+        self.fixture.checkpoint(mutate)
+
+    def execute(self, dtype="bfloat16", **changes):
+        f = self.f
+        with patch.object(f.model_class, "forward", side_effect=AssertionError("forward")):
+            return m.convert_and_verify(f.config_path, f.checkpoint_path, f.output_path, dtype,
+                **f.limits, checkpoint_read_contract=self.fixture.contract,
+                hf_io_contract=self.io_limits | changes)
+
+    def test_actual_bfloat16_roundtrip_preserves_buffer_and_closed_flags(self):
+        self.checkpoint()
+        result = self.execute()
+        self.assertEqual(set(result), set(m.EVIDENCE_KEYS))
+        self.assertEqual(result["schema_version"], "lumi.sft-checkpoint-import-kernel.v0.5")
+        self.assertEqual(result["cast_tensor_sha256"], result["reload_tensor_sha256"])
+        self.assertTrue(result["dcp_read_verification"]["dcp_reads_metered"])
+        for name in ("real_4b_import", "training_authorized", "production_eligible",
+                     "os_resource_limits_enforced"):
+            self.assertIs(result[name], False)
+        self.f._assert_exported_buffer_policy()
+        counts = result["hf_content_verification"]
+        self.assertEqual(counts["hf_content_write_bytes_reserved"], result["output_bytes"])
+
+    def test_actual_float32_roundtrip(self):
+        self.checkpoint()
+        result = self.execute("float32")
+        self.assertEqual(result["source_tensor_sha256"], result["reload_tensor_sha256"])
+
+    def test_sharded_export_reloads_in_native_filename_HF_consumer(self):
+        self.checkpoint()
+        result = self.execute(target_shard_bytes=512)
+        self.assertGreater(result["safetensor_file_count"], 1)
+        self.assertTrue((self.f.output_path / "model.safetensors.index.json").is_file())
+        # Independent compatibility check is test-only, outside the IO receipt.
+        with self.f.torch.device("cpu"):
+            loaded = self.f.model_class.from_pretrained(self.f.output_path, local_files_only=True,
+                dtype=self.f.torch.bfloat16, attn_implementation="eager", device_map=None,
+                use_safetensors=True, trust_remote_code=False)
+        self.assertEqual(m._tensor_digest(loaded.state_dict(), lambda: None),
+                         result["reload_tensor_sha256"])
+
+    def test_native_path_save_and_safetensors_open_are_never_used(self):
+        self.checkpoint()
+        import safetensors.torch
+        import transformers.modeling_utils
+
+        with (patch.object(self.f.model_class, "save_pretrained",
+                           side_effect=AssertionError()) as save,
+              patch.object(safetensors.torch, "save_file",
+                           side_effect=AssertionError()) as file_save,
+              patch.object(transformers.modeling_utils, "safe_open",
+                           side_effect=AssertionError()) as opened):
+            self.execute()
+            save.assert_not_called()
+            file_save.assert_not_called()
+            opened.assert_not_called()
+
+    def test_write_budget_rejected_before_output_or_serialization(self):
+        self.checkpoint()
+        import safetensors.torch
+
+        with patch.object(safetensors.torch, "save", side_effect=AssertionError()) as save:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_limit_exceeded"):
+                self.execute(maximum_write_bytes=1)
+            save.assert_not_called()
+        self.assertFalse(self.f.output_path.exists())
+
+    def test_read_budget_rejected_before_output(self):
+        self.checkpoint()
+        with self.assertRaises(m.ImportKernelError):
+            self.execute(maximum_read_bytes=1)
+        self.assertFalse(self.f.output_path.exists())
+
+    def test_shard_buffer_budget_rejected_before_output_or_serialization(self):
+        self.checkpoint()
+        import safetensors.torch
+
+        with patch.object(safetensors.torch, "save", side_effect=AssertionError()) as save:
+            with self.assertRaisesRegex(m.ImportKernelError, "hf_io_failed"):
+                self.execute(maximum_file_bytes=100)
+            save.assert_not_called()
+        self.assertFalse(self.f.output_path.exists())
+
+    def test_scratch_projection_is_checked_before_output_and_serialization(self):
+        self.checkpoint()
+        original = m.prepare_export
+
+        def enlarged(*args, **kwargs):
+            plan = original(*args, **kwargs)
+            plan["serialization_scratch_bytes"] = 64 * 1024**2
+            return plan
+
+        import safetensors.torch
+        with (patch.object(m, "prepare_export", side_effect=enlarged),
+              patch.object(safetensors.torch, "save", side_effect=AssertionError()) as save):
+            with self.assertRaisesRegex(m.ImportKernelError, "tensor_limit_exceeded"):
+                self.execute()
+            save.assert_not_called()
+        self.assertFalse(self.f.output_path.exists())
+
+    def test_tied_alias_disagreement_still_rejected(self):
+        self.checkpoint(lambda state: state.update({"lm_head.weight": state["lm_head.weight"] + 1}))
+        with self.assertRaisesRegex(m.ImportKernelError, "tied_alias_mismatch"):
+            self.execute()
+
+    def test_untied_model_roundtrip(self):
+        self.f.payload["tie_word_embeddings"] = False
+        self.f.config_path.write_text(json.dumps(self.f.payload))
+        self.checkpoint()
+        result = self.execute()
+        self.assertIs(result["tied_aliases_verified"], False)
+
+    def test_corrupt_shard_after_write_is_not_deserialized(self):
+        self.checkpoint()
+        original = m.write_export
+
+        def corrupt(content, *args, **kwargs):
+            original(content, *args, **kwargs)
+            path = next(self.f.output_path.glob("*.safetensors"))
+            raw = path.read_bytes()
+            path.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+
+        import safetensors.torch
+        with (patch.object(m, "write_export", side_effect=corrupt),
+              patch.object(safetensors.torch, "load", side_effect=AssertionError()) as load):
+            with self.assertRaisesRegex(m.ImportKernelError, "hf_io_failed"):
+                self.execute()
+            load.assert_not_called()
+
+    def test_output_content_byte_counts_match_actual_pread_pwrite(self):
+        self.checkpoint()
+        original_pread, original_pwrite = os.pread, os.pwrite
+        reads, writes = [], []
+        source_inodes = set()
+        for path in self.f.checkpoint_path.rglob("*"):
+            if path.is_file():
+                info = path.stat()
+                source_inodes.add((info.st_dev, info.st_ino))
+
+        def read(fd, size, offset):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) not in source_inodes:
+                reads.append(size)
+            return original_pread(fd, size, offset)
+
+        def write(fd, raw, offset):
+            writes.append(len(raw))
+            return original_pwrite(fd, raw, offset)
+
+        with (patch.object(os, "pread", side_effect=read),
+              patch.object(os, "pwrite", side_effect=write)):
+            result = self.execute()
+        counts = result["hf_content_verification"]
+        self.assertEqual(sum(reads), counts["hf_content_read_bytes_reserved"])
+        self.assertEqual(sum(writes), counts["hf_content_write_bytes_reserved"])
+        self.assertTrue(all(size <= 1048576 for size in reads + writes))
+
+    def test_close_failure_cannot_return_success(self):
+        self.checkpoint()
+        original = m.ContentIO.close
+
+        def close(content):
+            original(content)
+            raise OSError("synthetic private failure")
+
+        with patch.object(m.ContentIO, "close", side_effect=close, autospec=True):
+            with self.assertRaisesRegex(m.ImportKernelError, "hf_io_failed"):
+                self.execute()
+
+    def test_serialized_state_header_contains_no_hidden_alias(self):
+        self.checkpoint()
+        self.execute()
+        raw = (self.f.output_path / "model.safetensors").read_bytes()
+        header = hf._json(raw[8:8 + int.from_bytes(raw[:8], "little")])
+        self.assertNotIn("lm_head.weight", header)
+        self.assertIn("model.embed_tokens.weight", header)
+        self.assertEqual(header["__metadata__"], {"format": "pt"})
+        self.assertEqual(len(hashlib.sha256(raw).hexdigest()), 64)
+
+
+if __name__ == "__main__":
+    unittest.main()

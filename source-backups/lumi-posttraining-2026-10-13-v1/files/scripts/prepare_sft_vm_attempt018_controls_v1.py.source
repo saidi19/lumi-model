@@ -1,0 +1,198 @@
+"""Build the fresh attempt-018 control plan; offline preparation only."""
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD = "5732548d49854b278ef5ab18199560fc"
+OLD_RELEASE = "artifacts/lumi-vm-attempt-017-source-v0.2"
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.1"
+RELEASE_SHA = "c63f773396dbee9e293615d24633d70039712cf1226de75225b7b66ce4d75809"
+BASE_PLAN = "configs/lumi-vm-attempt-017-deployment-plan-v0.2.json"
+BASE_PLAN_SHA = "510684f745f17b64de59e52f99aa2c8dcd8f6cb49813ad19ec0b7bbffc50f10e"
+PREPARATION = "evidence/lumi-vm-attempt-018-preparation-verification-v0.1.json"
+PREPARATION_SHA = "8b3da379e83ed849f328b833b31d9c3817493b18b6f73f0265fcb2524afbac8e"
+ABSENCE = "evidence/lumi-vm-attempt-018-control-target-absence-v0.1.json"
+ABSENCE_SHA = "445e79c6abfe47eae1ed49e5089b5afc05d51e00f092c0c7032efcc36378cc2d"
+FAILURE = "evidence/lumi-vm-attempt-017-cpu-execution-verification-v0.1.json"
+FAILURE_SHA = "cc1a0131cf70231389bf301ac3c4cda0958406958e6bd77f9459772fcc0602c7"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.1"
+WATCH = "evidence/lumi-vm-attempt-018-inert-watchdog-deployment-verification-v0.1.json"
+STORE = "evidence/lumi-vm-attempt-018-cleanup-bucket-verification-v0.1.json"
+CIDR = "172.31.97.0/27"
+BINDINGS = (
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+    "configs/lumi-vm-private-network-plan-v0.1.json",
+    "scripts/arm_sft_vm_external_watchdog_v2.py",
+    "scripts/check_sft_vm_cleanup_store_v1.py",
+    "scripts/prepare_sft_vm_external_watchdog_v1.py",
+    "scripts/sft_vm_external_watchdog_v1.py",
+    "scripts/sft_vm_network_cleanup_v1.py",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_control_plan_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verified_inputs():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    need(manifest["attempt"] == ATTEMPT and manifest["operational_predecessor"] == OLD)
+    need(manifest["execution_permitted"] is False and len(manifest["outputs"]) == 156)
+    for name, pin in manifest["outputs"].items():
+        raw = read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    preparation = json.loads(read(PREPARATION, PREPARATION_SHA))
+    need(preparation["attempt"] == ATTEMPT and preparation["tests_passed"] == 6)
+    need(preparation["execution_permitted"] is False)
+    absence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    need(absence["attempt"] == ATTEMPT and absence["cloud_mutations"] == 0)
+    need(absence["collision_free_for_control_preparation"] is True)
+    observations = absence["observations"]
+    need(observations["selected_cidr"] == CIDR)
+    need(observations["selected_cidr_subnets"] == 0)
+    need(observations["vpc_instance_connect_endpoints"] == 0)
+    need(observations["attempt_tagged_instances"] == 0)
+    need(all(value is False for key, value in observations.items() if key.endswith("exists")))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    need(failure["attempt"] == OLD and failure["run"]["execution_marker_consumed"] is True)
+    need(failure["run"]["cpu_instance_launched"] is False)
+    need(failure["network_cleanup"]["cost_resources_released"] is True)
+    need(failure["network_cleanup"]["empty_network_removed"] is True)
+    need(failure["network_cleanup"]["cleanup_unresolved"] is False)
+    return manifest
+
+
+def build():
+    manifest = verified_inputs()
+    base = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    raw = encode(base)
+    replacements = (
+        (OLD_RELEASE, RELEASE),
+        (OLD, ATTEMPT),
+        ("attempt-017", "attempt-018"),
+        ("Attempt-017", "Attempt-018"),
+        ("172.31.96.224/27", CIDR),
+        ("lumi-vm-private-outer-execution-v0.20", "lumi-vm-private-outer-execution-v0.21"),
+    )
+    for old, new in replacements:
+        raw = raw.replace(old.encode(), new.encode())
+    plan = json.loads(raw)
+    plan["schema"] = "lumi.vm-attempt-018-control-plan.v0.1"
+    plan["release_manifest_sha256"] = RELEASE_SHA
+    plan["network_candidate_live_availability_verified"] = True
+    plan["control_target_absence_evidence"] = {"path": ABSENCE, "sha256": ABSENCE_SHA}
+    plan["source_preparation_evidence"] = {
+        "path": PREPARATION,
+        "sha256": PREPARATION_SHA,
+    }
+    plan["required_control_proofs"] = [WATCH, STORE]
+    plan["source_bindings"] = {
+        RELEASE + "/" + name: manifest["outputs"][name] for name in BINDINGS
+    }
+    plan["predecessor_state"] = {
+        "operational_predecessor_attempt": OLD,
+        "execution_evidence": FAILURE,
+        "execution_evidence_sha256": FAILURE_SHA,
+        "execution_marker_consumed": True,
+        "cpu_instance_launched": False,
+        "temporary_network_created": True,
+        "temporary_network_cost_resources_released": True,
+        "temporary_network_removed": True,
+        "cleanup_unresolved": False,
+        "predecessor_resources_mutated": False,
+        "deletion_authorized": False,
+        "retained_attempt016_instance_and_ebs_untouched": True,
+    }
+    plan["initial_proof_diagnostics"]["historical_failure_root_cause_resolved"] = True
+    plan["initial_proof_diagnostics"]["exact_source_staging_defect"] = (
+        "watchdog ZIP digest baseline corrected in both private specialization consumers"
+    )
+    plan["readiness_review"].update(
+        decision="fresh_controls_then_readonly_preflight_no_cpu_execution",
+        confirmed_defect=(
+            "Attempt-017 private-host staging used an obsolete watchdog ZIP baseline; "
+            "attempt-018 corrects and regression-tests both consumers."
+        ),
+        historical_uncertainty=[
+            "Offline repair does not prove a successful remote boot, checkpoint download or import."
+        ],
+    )
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Fresh attempt-018 inert watchdog and dedicated cleanup bucket verified",
+        "Fresh one-shot CPU proposal and explicit approval bound to their evidence",
+        "Current CPU, network, cleanup-store, watchdog and price admissions pass",
+    ]
+    plan["unresolved_before_live_execution"] = [
+        "Deploy and verify the fresh inert stop watchdog and dedicated cleanup bucket.",
+        "Bind their evidence in a fresh attempt-018 CPU proposal and approval.",
+        "Pass the current read-only CPU/network/store/watchdog admission.",
+    ]
+    plan["watchdog"]["expected_code_sha256_base64"] = manifest[
+        "watchdog_code_sha256_base64"
+    ]
+    plan["watchdog"]["deployment_output"] = (
+        "artifacts/lumi-vm-attempt-018-watchdog-deployment-v0.1"
+    )
+    plan["watchdog"]["status"] = "fresh_deployment_required_authorized_separately"
+    plan["cleanup_store"]["status"] = "fresh_private_bucket_required_authorized_separately"
+    plan["status"] = "control_prepared_not_deployed"
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-018-control-plan-release.v0.1",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": RELEASE_SHA,
+        "target_absence_sha256": ABSENCE_SHA,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None

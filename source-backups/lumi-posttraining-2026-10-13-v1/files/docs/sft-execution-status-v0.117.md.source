@@ -1,0 +1,69 @@
+# SFT execution status v0.117
+
+2026-09-26. Finalized write-topology endpoints can now move into consuming
+guardian, broker, worker and controller components through one-shot descriptor
+authorities. **This fixes the socket-object/double-close gap discovered during
+composition review, but it does not yet fork or run the process composition;
+Gate 5 remains incomplete.** No real socket, descriptor, process, thread,
+pidfd, signal, waitid, cgroup, listener, payload, remote mutation, GPU
+operation, inference or training occurred.
+
+## Completed
+
+- Only an exact frozen topology in `controller`, `broker`, `worker` or
+  `guardian_watch` final state can transfer an endpoint, and only an endpoint
+  assigned to that role is eligible.
+- The topology owner, lock, deadline and socket identity are revalidated before
+  mutation. The endpoint is removed before its single detach attempt, so the
+  topology cannot later close the transferred descriptor or retry ambiguity.
+- A failed detach retains the socket object. A failed identity check after
+  detach retains the raw descriptor and expected identity; it is not closed as
+  a possible reused descriptor.
+- A successful detach creates one private authority with no FD or identity in
+  its snapshot. It can either transfer the descriptor once or close it once.
+- Transfer checks identity before releasing prior ownership. Close revokes
+  ownership and consumes the attempt before its final identity check, so a
+  changed descriptor is never closed and an ambiguous close cannot be retried.
+- Every endpoint assigned to all four final roles was exercised. The frozen
+  topology and all v0.115/v0.116 evidence remain byte-for-byte unchanged.
+
+## Verification
+
+**896 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 18 new authority-transfer tests plus the previous 878
+regressions. All new runtime, socket, descriptor, process-identity, clock and
+close boundaries are synthetic.
+
+Syntax/AST checks pass for both new files on both runtimes; maximum line length
+is 84 and trailing whitespace is zero. Tests used `-B`, and no bytecode file
+for the new component is present. The six predecessor-plan bindings and all
+five new-plan bindings match their recorded sizes and SHA-256 values.
+
+Development record:
+`configs/lumi-4b-sft-write-endpoint-authority-development-v0.1.json`.
+
+SHA-256: `ae060962ba230101ee55ddc13ae089d0fae00e9daa709125eef9179b00846a92`.
+
+Verification:
+`evidence/lumi-4b-sft-write-endpoint-authority-development-verification-v0.1.json`.
+
+SHA-256: `c949aa8d40851e2d0afa54eab28fb203435d19e52e77e27d41ba5a9ad08d545d`.
+
+## Exact next work and unchanged boundary
+
+The next successor can now implement the fully doubled private composition:
+controller forks and pidfd-binds guardian; guardian adopts its prefork topology,
+creates the lease, forks and pidfd-binds broker and worker; each process moves
+to its exact final set and transfers only the endpoints its fixed component
+will consume. One identity-checked duplicate is still required when another
+component must borrow a child owner's pidfd.
+
+After the fork composition, one fixed controller event loop must verify READY
+before guardian arm, reserve aggregate bytes and receive ACK before each broker
+CONTINUE, verify CONSUMED, collect terminal reports and enforce deadline
+cleanup. Listener/drop/seal/full-size bootstrap integration and separately
+authorized Linux native qualification still follow.
+
+GPU is still unnecessary. No S3 or other remote availability check was made.
+Real import, training and production remain disabled. The new source, test and
+three records are local and untracked; nothing was staged, committed or pushed.

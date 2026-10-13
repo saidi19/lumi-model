@@ -1,0 +1,128 @@
+"""Actual candidate binder/loader/controller; synthetic transports and failures only."""
+
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_diagnostics_candidate_v1 as builder
+from tests import test_sft_vm_endpoint_successor_v1 as prior
+from tests import test_sft_vm_safe_failure_v1 as components
+
+
+class Tests(prior.Tests):
+    @classmethod
+    def setUpClass(cls):
+        cls.base, _ = builder.inputs()
+        cls.files, cls.report = builder.build()
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-diagnostics-candidate-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.package = Path(cls.temp.name).resolve()
+        for name, raw in cls.files.items():
+            path = cls.package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def test_helper_is_bound_by_outer_and_dynamic_source_builder(self):
+        self.m.authenticate()
+        helper = self.files[builder.HELPER]
+        self.assertEqual(self.m.PINS[Path(builder.HELPER).name], builder.sha(helper))
+        self.assertEqual(self.m.loading.sources.BOOT_PINS[builder.HELPER], builder.sha(helper))
+        path = self.package / builder.HELPER
+        path.write_bytes(helper + b"\n")
+        try:
+            with self.assertRaises(ValueError):
+                self.m.authenticate()
+            with self.assertRaises(ValueError):
+                self.m.loading.sources.inputs()
+        finally:
+            path.write_bytes(helper)
+
+    def test_reader_failure_survives_read_transport(self):
+        diagnostic = dict(stage="credential_active", kind="validation", check="clock_drift")
+        client = self.case.bundle.clients["sts"]
+        with patch.object(
+            client,
+            "get_caller_identity",
+            side_effect=self.m.failure.Failure("SECRET", diagnostic),
+            create=True,
+        ):
+            cloud = self.m.ReadCloud(
+                {
+                    k: self.case.bundle.clients[k]
+                    for k in ("sts", "ec2", "service-quotas", "pricing")
+                },
+                clock=lambda: 100,
+            )
+            with self.assertRaises(self.m.failure.Failure) as caught:
+                cloud.cli("sts", "get-caller-identity")
+        self.assertEqual(caught.exception.diagnostic, diagnostic)
+        self.assertEqual(cloud.calls, 1)
+        self.assertNotIn("SECRET", str(caught.exception))
+
+    def test_actual_dynamic_provisioner_preserves_primary_and_stop_codes(self):
+        self.assertTrue(self.case.run_once()["host_lifecycle_completed"])
+        provision = next(
+            module
+            for name, module in self.case.host_calls[0].modules.items()
+            if name.startswith("provision_sft_vm_host_v2_private_")
+        )
+        self.assertTrue(provision.__name__.startswith("provision_sft_vm_host_v2_private_"))
+        test = components.ProvisionTests()
+        with (
+            patch.object(components, "p", provision),
+            patch.object(components, "f", self.m.failure),
+        ):
+            test.test_cloud_call_one_dispatch_and_sanitized_diagnostic()
+            test.test_stop_failure_does_not_overwrite_primary()
+            test.test_primary_saved_before_stop_recovery()
+
+    def test_bound_credential_provider_preserves_failure_without_export(self):
+        provider = self.m.credentials
+        reader = provider.Reader(18100, clock=lambda: 100, wall=lambda: 100)
+        reader.closed = True
+        with self.assertRaises(self.m.failure.Failure) as caught:
+            reader.active()
+        self.assertEqual(caught.exception.diagnostic["check"], "closed")
+
+    def test_no_new_authority_and_unchanged_function_bodies(self):
+        self.assertTrue(self.report["source_identity_consumed"])
+        with self.assertRaises(ValueError):
+            builder.run()
+        allowed = {
+            "scripts/sft_vm_controller_credentials_v2.py": {
+                "Reader.active",
+                "Reader.__call__",
+                "Clients.__init__",
+            },
+            "scripts/provision_sft_vm_host_v5.py": {
+                "Transaction.cli",
+                "Transaction.stop_failed_launch",
+                "_provision_and_setup_admitted_once",
+            },
+        }
+        import ast
+
+        for name, changed in allowed.items():
+            base_name = name.replace("provision_sft_vm_host_v5", "provision_sft_vm_host_v4")
+            before, after = (
+                builder.functions(self.base[base_name]),
+                builder.functions(self.files[name]),
+            )
+            self.assertEqual(set(before), set(after))
+            for function in before.keys() - changed:
+                self.assertEqual(ast.dump(before[function]), ast.dump(after[function]))
+        self.assertFalse(self.report["execution_permitted"])
+
+    def test_workload_failure_saved_before_network_wrapper_and_cleanup(self):
+        diagnostic = dict(stage="credential_identity", kind="read_timeout", check="none")
+
+        def fail(*args, **kwargs):
+            raise self.m.failure.Failure("SECRET", diagnostic)
+
+        with patch.object(self.m, "_host_once", side_effect=fail):
+            result = self.case.run_once()
+        self.assertEqual(result["primary_failure_diagnostic"], diagnostic)
+        self.assertFalse(result["host_lifecycle_completed"])
+        self.assertTrue(result["network_cleanup_verified"])
+        self.assertNotIn("SECRET", json.dumps(result))

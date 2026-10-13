@@ -1,0 +1,415 @@
+"""Offline v2 boot repair regression; no real Linux/systemd or cloud authority."""
+
+import ast
+import builtins
+import configparser
+import gzip
+import hashlib
+import importlib
+import io
+import json
+import shlex
+import stat
+import tempfile
+import types
+import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from unittest.mock import patch
+
+from tests.test_sft_vm_initial_boot_ordering_review_v1 import process_result
+from tests.test_sft_vm_initial_provisioning_v2 import IDS
+
+native = importlib.import_module("run_sft_vm_early_stop_v2")
+builder = importlib.import_module("build_sft_vm_initial_boot_v2")
+prior = importlib.import_module("run_sft_vm_early_stop_v1")
+
+
+def parse(body):
+    cfg = configparser.ConfigParser(interpolation=None, strict=True)
+    cfg.read_string(body.decode())
+    return cfg
+
+
+@contextmanager
+def guest(*, fault=None, drift=None, old_ordering=False):
+    """Explicit pending-sysinit model; real command adapter, synthetic children."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        source = root / "source.py"
+        source.write_bytes(builder.source_bytes())
+        source.chmod(0o400)
+        systemd = root / "systemd"
+        systemd.mkdir()
+        commands, markers, active = [], [], set()
+        original_units, original_command = native.units, native.command
+        loaded = False
+
+        def units():
+            result = original_units()
+            if old_ordering:
+                result = {k: v.replace(b"DefaultDependencies=no\n", b"") for k, v in result.items()}
+            return result
+
+        def read(path, cap=32768, *, mode=0o400):
+            if fault == "read":
+                raise ValueError("PRIVATE_SYNTHETIC_EXCEPTION")
+            raw = path.read_bytes()
+            assert path.stat().st_mode & 0o777 == mode and len(raw) <= cap
+            return raw
+
+        def command(argv):
+            nonlocal loaded
+            commands.append(argv)
+            raw, code, timeout = b"", 0, False
+            if argv[:2] == ["/usr/bin/systemctl", "show"]:
+                name, prop = argv[2], argv[3].removeprefix("--property=")
+                if not loaded:
+                    assert prop == "LoadState"
+                    raw = b"not-found\n"
+                else:
+                    cfg = parse((systemd / name).read_bytes())
+                    properties = {
+                        "FragmentPath": str(systemd / name),
+                        "DropInPaths": "",
+                        "LoadState": "loaded",
+                        "DefaultDependencies": "no",
+                        "Before": cfg.get("Unit", "Before"),
+                        "Conflicts": cfg.get("Unit", "Conflicts"),
+                        "After": "",
+                        "Requires": "",
+                        "ActiveState": "active" if name in active else "inactive",
+                        "SubState": "waiting" if name in active else "dead",
+                        "FailureAction": "poweroff",
+                    }
+                    if drift:
+                        properties.update(drift)
+                    raw = (properties[prop] + "\n").encode()
+            elif argv[:2] == ["/usr/bin/systemd-analyze", "verify"]:
+                code = int(fault == "verify")
+            elif argv == ["/usr/bin/systemctl", "daemon-reload"]:
+                loaded = True
+                code = int(fault == "reload")
+            elif argv[:2] == ["/usr/bin/systemctl", "start"]:
+                name = argv[2]
+                cfg = parse((systemd / name).read_bytes())
+                # Pending cloud-init holds sysinit: default timers cannot start.
+                timeout = cfg.getboolean("Unit", "DefaultDependencies", fallback=True)
+                start_stage = "host_timer" if name == native.HOST + ".timer" else "setup_timer"
+                code = int(fault == start_stage)
+                if not timeout and code == 0:
+                    active.add(name)
+            else:
+                assert argv == ["/usr/bin/systemctl", "--no-block", "poweroff"]
+                code = int(fault == "stop")
+            with process_result(raw, None if timeout else code, timeout=timeout):
+                return original_command(argv)
+
+        original_write = native.os.write
+
+        def write(fd, raw):
+            if fd == 2:
+                markers.append(raw)
+                return len(raw)
+            return original_write(fd, raw)
+
+        with (
+            patch.object(native, "SOURCE", source),
+            patch.object(native, "OUTPUT", root / "receipts" / native.ATTEMPT),
+            patch.object(native, "SYSTEMD", systemd),
+            patch.object(native, "identity", return_value=IDS),
+            patch.object(native, "boot_time", return_value=100),
+            patch.object(native, "owned"),
+            patch.object(native, "read", side_effect=read),
+            patch.object(native, "units", side_effect=units),
+            patch.object(native, "command", side_effect=command),
+            patch.object(native.os, "write", side_effect=write),
+        ):
+            yield types.SimpleNamespace(commands=commands, markers=markers, active=active)
+
+
+class BootV2Tests(unittest.TestCase):
+    def test_early_ordering_and_shutdown_safeguards_on_all_four_units(self):
+        for name, body in native.units().items():
+            with self.subTest(unit=name):
+                cfg = parse(body)
+                self.assertFalse(cfg.getboolean("Unit", "DefaultDependencies"))
+                self.assertIn("shutdown.target", cfg.get("Unit", "Before").split())
+                self.assertEqual(cfg.get("Unit", "Conflicts"), "shutdown.target")
+                self.assertNotIn(b"sysinit.target", body)
+                self.assertNotIn(b"basic.target", body)
+                if name.endswith(".timer"):
+                    self.assertIn("timers.target", cfg.get("Unit", "Before").split())
+                    seconds = "1800s" if name == native.SETUP + ".timer" else "14400s"
+                    self.assertEqual(cfg.get("Timer", "OnBootSec"), seconds)
+                    self.assertEqual(cfg.get("Timer", "WakeSystem"), "yes")
+                else:
+                    self.assertEqual(cfg.get("Unit", "FailureAction"), "poweroff")
+                    self.assertEqual(cfg.get("Service", "TimeoutStartSec"), "20s")
+                    self.assertEqual(cfg.get("Service", "Restart"), "no")
+                    self.assertEqual(cfg.get("Service", "MemoryMax"), "64M")
+
+    def test_real_adapter_install_and_proof_before_sysinit(self):
+        with guest() as g:
+            self.assertEqual(native._main(["install"]), 0)
+            starts = [a[-1] for a in g.commands if a[1] == "start"]
+            self.assertEqual(starts, [native.HOST + ".timer", native.SETUP + ".timer"])
+            self.assertEqual(len(g.active), 2)
+            self.assertFalse(any("poweroff" in a for a in g.commands))
+            self.assertEqual(g.markers[-1], b"LUMI_BOOT_V2:ready\n")
+            self.assertLess(sum(map(len, g.markers)), 1024)
+            proof = native._proof()
+            self.assertTrue(proof["early_timers_armed"])
+            self.assertFalse(proof["gate_5_complete"])
+            self.assertFalse(proof["host_admitted"])
+            self.assertEqual(builder.validate_proof(native.canonical(proof)), proof)
+
+    def test_same_model_reproduces_old_deadlock_and_stops(self):
+        with guest(old_ordering=True) as g:
+            self.assertEqual(native._main(["install"]), 2)
+            self.assertEqual(
+                g.markers[-2:], [b"LUMI_BOOT_V2:host_timer\n", b"LUMI_BOOT_V2:rejected\n"]
+            )
+            self.assertEqual(g.commands[-1], ["/usr/bin/systemctl", "--no-block", "poweroff"])
+            self.assertEqual(g.active, set())
+
+    def test_injected_failures_localize_and_fail_closed_without_exception_text(self):
+        expected = {
+            "read": "source",
+            "verify": "verify",
+            "reload": "reload",
+            "host_timer": "host_timer",
+            "setup_timer": "setup_timer",
+        }
+        for fault, stage in expected.items():
+            with self.subTest(stage=stage), guest(fault=fault) as g:
+                self.assertEqual(native._main(["install"]), 2)
+                self.assertEqual(g.markers[-2], ("LUMI_BOOT_V2:" + stage + "\n").encode())
+                self.assertEqual(g.markers[-1], b"LUMI_BOOT_V2:rejected\n")
+                self.assertNotIn(b"PRIVATE_SYNTHETIC_EXCEPTION", b"".join(g.markers))
+                self.assertEqual(g.commands[-1], ["/usr/bin/systemctl", "--no-block", "poweroff"])
+
+    def test_effective_ordering_drift_and_inactive_timers_rejected(self):
+        for drift in (
+            {"DefaultDependencies": "yes"},
+            {"Before": "shutdown.target"},
+            {"Before": "timers.target"},
+            {"Conflicts": ""},
+            {"After": "sysinit.target"},
+            {"Requires": "basic.target"},
+            {"SubState": "dead"},
+            {"ActiveState": "inactive"},
+            {"DropInPaths": "/synthetic/override.conf"},
+        ):
+            with self.subTest(drift=drift), guest(drift=drift) as g:
+                self.assertEqual(native._main(["install"]), 2)
+                self.assertIn(b"LUMI_BOOT_V2:proof\n", g.markers)
+                self.assertNotIn(b"LUMI_BOOT_V2:ready\n", g.markers)
+
+    def test_replay_does_not_overwrite_or_restart_deadlines(self):
+        with guest() as g:
+            self.assertEqual(native._main(["install"]), 0)
+            before = {p: p.read_bytes() for p in native.SYSTEMD.iterdir()}
+            g.commands.clear()
+            self.assertEqual(native._main(["install"]), 2)
+            self.assertEqual(before, {p: p.read_bytes() for p in native.SYSTEMD.iterdir()})
+            self.assertEqual(g.commands, [["/usr/bin/systemctl", "--no-block", "poweroff"]])
+
+    def test_logging_failure_never_prevents_stop(self):
+        with (
+            patch.object(native.os, "write", side_effect=OSError("PRIVATE_SYNTHETIC")),
+            patch.object(native, "_install_once", side_effect=ValueError("PRIVATE_SYNTHETIC")),
+            patch.object(native, "stop") as stop,
+        ):
+            self.assertEqual(native._main(["install"]), 2)
+            stop.assert_called_once_with()
+
+    def test_stage_allowlist_and_stop_failure_marker(self):
+        with patch.object(native.os, "write") as write:
+            for code in ("secret", "\n", 1, None):
+                with self.assertRaises(ValueError):
+                    native.stage(code)
+            write.assert_not_called()
+            with patch.object(native, "stop", side_effect=OSError("PRIVATE_SYNTHETIC")):
+                self.assertEqual(native._main(["invalid"]), 2)
+            self.assertEqual(write.call_args.args, (2, b"LUMI_BOOT_V2:stop_failed\n"))
+
+    def test_unchanged_sensitive_helpers_are_ast_identical(self):
+        def functions(module):
+            return {
+                n.name: ast.dump(n)
+                for n in ast.parse(Path(module.__file__).read_text()).body
+                if isinstance(n, ast.FunctionDef)
+            }
+
+        old, new = functions(prior), functions(native)
+        for name in (
+            "need",
+            "canonical",
+            "unique",
+            "owned",
+            "read",
+            "write",
+            "sync",
+            "command",
+            "identity",
+            "boot_time",
+            "stop",
+            "_setup_complete",
+            "run",
+        ):
+            with self.subTest(function=name):
+                self.assertEqual(old[name], new[name])
+        with self.assertRaises(ValueError):
+            native.run()
+        with self.assertRaises(ValueError):
+            builder.run()
+
+
+class BuilderV2Tests(unittest.TestCase):
+    def installer(self):
+        payload = builder.user_data()
+        self.assertEqual(payload, builder.user_data())
+        self.assertLessEqual(len(payload), 16384)
+        cfg = json.loads(gzip.decompress(payload).removeprefix(b"#cloud-config\n"))
+        words = shlex.split(cfg["bootcmd"][0][-1])
+        return words[words.index("-c") + 1]
+
+    def test_source_binding_and_generated_wrapper_syntax(self):
+        raw = builder.source_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), builder.EARLY_SHA)
+        self.assertEqual(builder.EARLY_PATH, str(native.SOURCE))
+        compile(self.installer(), "<v2-installer>", "exec")
+        compile(builder.proof_launcher(), "<v2-proof>", "exec")
+        with patch.object(builder, "EARLY_SHA", "0" * 64), self.assertRaises(ValueError):
+            builder.user_data()
+
+    def test_proof_rejects_old_binding_and_authority_injection(self):
+        with guest():
+            self.assertEqual(native._main(["install"]), 0)
+            proof = native._proof()
+        for delta in (
+            {"source_sha256": "eba343f41c33bb54ed2838a4cc8acd423f6239ec6d0d2db481e7ca6b03337f84"},
+            {"host_admitted": True},
+            {"gate_5_complete": True},
+            {"retry_allowed": True},
+            {"observed_boottime": 1350},
+            {"setup_deadline_boottime": 1801},
+            {"host_deadline_boottime": 14401},
+        ):
+            with self.subTest(delta=delta), self.assertRaises(ValueError):
+                builder.validate_proof(native.canonical(dict(proof, **delta)))
+
+    def execute_wrapper(self, *, rejected=False, native_rc=0):
+        """Execute generated wrapper with virtual filesystem and native handoff.
+
+        No patched process-global root/platform, real /opt I/O, or native call.
+        The inner source is authenticated but handoff is stubbed here; native
+        installation/command behavior is covered separately by guest().
+        """
+        code = self.installer()
+        markers, calls = [], []
+        stream = io.BytesIO()
+
+        class File:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def write(self, raw):
+                return stream.write(raw)
+
+            def flush(self):
+                pass
+
+            def fileno(self):
+                return 101
+
+        class VirtualPath:
+            def __init__(self, name):
+                self.name = name
+
+            def lstat(self):
+                return types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+        def mkdir(path, mode):
+            calls.append(("mkdir", path, mode))
+            if rejected:
+                raise OSError("PRIVATE_SYNTHETIC_EXCEPTION")
+
+        def open_file(path, flags, mode):
+            self.assertEqual(path, builder.EARLY_PATH)
+            self.assertEqual(mode, 0o400)
+            calls.append(("open", path, flags))
+            return 101
+
+        fake_os = types.SimpleNamespace(
+            geteuid=lambda: 0,
+            getegid=lambda: 0,
+            mkdir=mkdir,
+            open=open_file,
+            fdopen=lambda *_: File(),
+            fsync=lambda _: None,
+            write=lambda fd, raw: markers.append(raw) or len(raw),
+            O_WRONLY=1,
+            O_CREAT=2,
+            O_EXCL=4,
+            O_NOFOLLOW=8,
+        )
+
+        def exit_code(code):
+            raise SystemExit(code)
+
+        fake_sys = types.SimpleNamespace(
+            platform="linux",
+            version_info=(3, 12),
+            flags=types.SimpleNamespace(isolated=True),
+            dont_write_bytecode=True,
+            exit=exit_code,
+        )
+        real_import = builtins.__import__
+
+        def import_module(name, *args, **kwargs):
+            return {
+                "os": fake_os,
+                "sys": fake_sys,
+                "pathlib": types.SimpleNamespace(Path=VirtualPath),
+            }.get(name) or real_import(name, *args, **kwargs)
+
+        def handoff(compiled, namespace):
+            self.assertEqual(compiled.co_filename, builder.EARLY_PATH)
+            self.assertEqual(stream.getvalue(), builder.source_bytes())
+            namespace["sync"] = lambda path: None
+
+            def main(argv):
+                self.assertEqual(argv, ["install"])
+                calls.append(("native",))
+                return native_rc
+
+            namespace["_main"] = main
+
+        sandbox = dict(vars(builtins), __import__=import_module, exec=handoff)
+        with self.assertRaises(SystemExit) as caught:
+            exec(compile(code, "<v2-wrapper-fixture>", "exec"), {"__builtins__": sandbox})
+        return caught.exception.code, markers, calls
+
+    def test_generated_wrapper_handoff_success(self):
+        code, markers, calls = self.execute_wrapper()
+        self.assertEqual(code, 0)
+        self.assertIn(("native",), calls)
+        self.assertEqual(markers, [b"LUMI_BOOT_V2:wrapper_entry\n"])
+
+    def test_generated_wrapper_rejection_never_prints_exception(self):
+        code, markers, calls = self.execute_wrapper(rejected=True)
+        self.assertEqual(code, 2)
+        self.assertNotIn(("native",), calls)
+        self.assertEqual(
+            markers, [b"LUMI_BOOT_V2:wrapper_entry\n", b"LUMI_BOOT_V2:wrapper_rejected\n"]
+        )
+
+    def test_generated_wrapper_preserves_native_failure(self):
+        code, _, calls = self.execute_wrapper(native_rc=2)
+        self.assertEqual(code, 2)
+        self.assertIn(("native",), calls)

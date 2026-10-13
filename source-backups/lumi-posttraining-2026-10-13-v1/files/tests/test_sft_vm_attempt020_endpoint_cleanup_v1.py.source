@@ -1,0 +1,34 @@
+"""Replay qualified cleanup tests against fresh attempt-020 bindings, offline."""
+
+import sys
+import unittest
+
+from scripts import cleanup_sft_vm_attempt020_endpoint_v1 as entry
+from tests import test_sft_vm_attempt019_endpoint_cleanup_v1 as original
+
+
+class Tests(original.Tests):
+    def setUp(self):
+        # Qualified test methods resolve their globals in the original module.
+        # Rebind the fixture only; production cleanup mechanics are unmodified.
+        previous = original.m
+        original.m = entry.qualified
+        self.addCleanup(setattr, original, "m", previous)
+
+    def test_only_the_approved_endpoint_is_a_mutation_target(self):
+        requests = entry.qualified.REQUESTS
+        mutations = [op for op in requests if not op.startswith(("get-", "describe-"))]
+        self.assertEqual(mutations, ["delete-instance-connect-endpoint"])
+        self.assertEqual(requests[mutations[0]], dict(InstanceConnectEndpointId=entry.ENDPOINT))
+        self.assertEqual(entry.qualified.MAX_READS, 30)
+        self.assertEqual(entry.qualified.MAX_SECONDS, 600)
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

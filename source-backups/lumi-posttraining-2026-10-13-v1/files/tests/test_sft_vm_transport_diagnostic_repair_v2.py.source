@@ -1,0 +1,102 @@
+import base64
+import unittest
+
+from scripts import sft_vm_transport_diagnostic_repair_v2 as m
+
+
+class Tests(unittest.TestCase):
+    def response(self):
+        return {
+            "Reservations": [
+                {
+                    "OwnerId": m.original.ACCOUNT,
+                    "Instances": [
+                        {
+                            "InstanceId": "i-0ba44ffe8bac31575",
+                            "State": {"Name": "terminated"},
+                            "ClientToken": m.original.TOKEN,
+                            "ImageId": m.original.AMI,
+                            "InstanceType": "t3.micro",
+                            "Tags": [{"Key": "LumiDiagnostic", "Value": m.original.TOKEN}],
+                        }
+                    ],
+                }
+            ]
+        }
+
+    def test_terminal_missing_network_fields_is_valid(self):
+        result = m.terminal_owned(self.response(), "i-0ba44ffe8bac31575")
+        self.assertTrue(result["terminated_verified"])
+        self.assertFalse(result["mutation_authorized"])
+
+    def test_old_validator_reproduces_missing_subnet_defect(self):
+        with self.assertRaises(KeyError):
+            m.original.owned(self.response(), "i-0ba44ffe8bac31575")
+
+    def test_nonterminal_rejected(self):
+        for state in ("running", "stopped", "shutting-down", "pending"):
+            value = self.response()
+            value["Reservations"][0]["Instances"][0]["State"]["Name"] = state
+            with self.assertRaises(ValueError):
+                m.terminal_owned(value, "i-0ba44ffe8bac31575")
+
+    def test_identity_mismatches_rejected(self):
+        for field in ("InstanceId", "ClientToken", "ImageId", "InstanceType"):
+            value = self.response()
+            value["Reservations"][0]["Instances"][0][field] = "wrong"
+            with self.assertRaises(ValueError):
+                m.terminal_owned(value, "i-0ba44ffe8bac31575")
+
+    def test_owner_mismatch_rejected(self):
+        value = self.response()
+        value["Reservations"][0]["OwnerId"] = "wrong"
+        with self.assertRaises(ValueError):
+            m.terminal_owned(value, "i-0ba44ffe8bac31575")
+
+    def test_duplicate_tags_rejected(self):
+        value = self.response()
+        tags = value["Reservations"][0]["Instances"][0]["Tags"]
+        tags.append(dict(tags[0]))
+        with self.assertRaises(ValueError):
+            m.terminal_owned(value, "i-0ba44ffe8bac31575")
+
+    def test_pagination_rejected(self):
+        value = self.response() | {"NextToken": "more"}
+        with self.assertRaises(ValueError):
+            m.terminal_owned(value, "i-0ba44ffe8bac31575")
+
+    def test_old_poll_budget_cannot_cover_48_cycles(self):
+        self.assertGreater(6 + 2 * 48, 70)
+
+    def test_separate_cleanup_reserve_fits_cap(self):
+        result = m.budget()
+        self.assertEqual(result["maximum_planned_calls"], 78)
+        self.assertEqual(result["unallocated_call_reserve"], 22)
+        self.assertTrue(result["wall_deadline_must_override_poll_count"])
+
+    def test_acpi_error_not_boot_failure(self):
+        line = "acpi PNP0A03:00: _OSC: platform retains control of PCIe features (AE_ERROR)"
+        result = m.console_summary(line)
+        self.assertEqual(result["status"], "marker_not_observed")
+        self.assertFalse(result["boot_failure_proven"])
+
+    def test_encoded_and_decoded_console_equivalent(self):
+        line = "LUMI_DIAG_HOSTKEY ssh-ed25519 synthetic\n"
+        self.assertEqual(
+            m.console_summary(line), m.console_summary(base64.b64encode(line.encode()).decode())
+        )
+        self.assertNotIn("synthetic", str(m.console_summary(line)))
+
+    def test_empty_console_not_failure(self):
+        self.assertFalse(m.console_summary("")["boot_failure_proven"])
+
+    def test_preserved_evidence(self):
+        self.assertFalse(m.verify_evidence()["findings"]["ssh_probe_reached"])
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

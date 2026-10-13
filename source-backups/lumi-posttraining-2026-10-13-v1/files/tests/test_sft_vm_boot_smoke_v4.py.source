@@ -1,0 +1,123 @@
+"""Exact AMI shape regression and inherited offline disposable-host lifecycle."""
+
+import ast
+import base64
+import copy
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_boot_smoke_v1.py").read_text()
+old = 'm = importlib.import_module("execute_sft_vm_boot_smoke_v1")'
+assert source.count(old) == 1
+inherited = types.ModuleType("_smoke_v4_tests")
+exec(
+    compile(
+        source.replace(old, 'm = importlib.import_module("execute_sft_vm_boot_smoke_v4")'),
+        "<v4-inherited>",
+        "exec",
+    ),
+    inherited.__dict__,
+)
+m = inherited.m
+EXTRA = [
+    dict(DeviceName="/dev/sdb", VirtualName="ephemeral0"),
+    dict(DeviceName="/dev/sdc", VirtualName="ephemeral1"),
+]
+
+
+class LifecycleTests(inherited.SmokeTests):
+    pass
+
+
+class ImageTests(unittest.TestCase):
+    def fixture(self):
+        return dict(
+            RootDeviceName="/dev/sda1",
+            BlockDeviceMappings=[
+                dict(DeviceName="/dev/sda1", Ebs=dict(VolumeSize=8, SnapshotId="snap-synthetic")),
+                *copy.deepcopy(EXTRA),
+            ],
+        )
+
+    def test_observed_shape_and_reordering_pass(self):
+        image = self.fixture()
+        self.assertEqual(m.validate_image_mappings(image), "/dev/sda1")
+        image["BlockDeviceMappings"].reverse()
+        self.assertEqual(m.validate_image_mappings(image), "/dev/sda1")
+
+    def test_unknown_extra_ebs_alias_duplicate_partial_and_size_rejected(self):
+        for extra in (
+            [dict(DeviceName="/dev/sdb", Ebs=dict(VolumeSize=8))],
+            [dict(DeviceName="/dev/sdb", VirtualName="ephemeral9"), EXTRA[1]],
+            [EXTRA[0]],
+            [EXTRA[0], EXTRA[0]],
+            [EXTRA[0], dict(EXTRA[1], NoDevice="")],
+        ):
+            image = self.fixture()
+            image["BlockDeviceMappings"] = image["BlockDeviceMappings"][:1] + extra
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                m.validate_image_mappings(image)
+        for size in (0, 17, True, "8"):
+            image = self.fixture()
+            image["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"] = size
+            with self.subTest(size=size), self.assertRaises(ValueError):
+                m.validate_image_mappings(image)
+
+    def test_single_root_and_explicit_suppression_request_validate_against_sdk(self):
+        from botocore.session import Session
+        from botocore.validate import validate_parameters
+
+        request = m.launch_request(inherited.GROUP, "/dev/sda1", m.user_data())
+        blocks = request["BlockDeviceMappings"]
+        self.assertEqual(sum("Ebs" in b for b in blocks), 1)
+        self.assertEqual(
+            blocks[1:],
+            [dict(DeviceName="/dev/sdb", NoDevice=""), dict(DeviceName="/dev/sdc", NoDevice="")],
+        )
+        self.assertEqual(
+            blocks[0]["Ebs"],
+            dict(VolumeSize=16, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True),
+        )
+        request["UserData"] = base64.b64encode(request["UserData"]).decode()
+        shape = Session().get_service_model("ec2").operation_model("RunInstances").input_shape
+        validate_parameters(request, shape)
+
+    def test_observed_three_mapping_shape_reaches_synthetic_boot_and_cleanup(self):
+        class Cloud(inherited.Cloud):
+            def __getattr__(self, operation):
+                original = super().__getattr__(operation)
+
+                def call(**fields):
+                    value = original(**fields)
+                    if operation == "describe_images":
+                        value["Images"][0]["BlockDeviceMappings"].extend(copy.deepcopy(EXTRA))
+                    return value
+
+                return call
+
+        case = inherited.SmokeTests()
+        result, _ = case.run_smoke(Cloud())
+        self.assertEqual(result["status"], "boot_passed_cleanup_verified")
+
+    def test_credentials_observation_cleanup_and_native_payload_unchanged(self):
+        def nodes(version):
+            tree = ast.parse(
+                (ROOT / f"scripts/execute_sft_vm_boot_smoke_v{version}.py").read_text()
+            )
+            out = {n.name: ast.dump(n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+            cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Smoke")
+            out.update({n.name: ast.dump(n) for n in cls.body if isinstance(n, ast.FunctionDef)})
+            return out
+
+        old, new = nodes(3), nodes(4)
+        for name in (
+            "open_clients",
+            "console_summary",
+            "user_data",
+            "volume_check",
+            "cleanup",
+            "observe",
+        ):
+            self.assertEqual(old[name], new[name])

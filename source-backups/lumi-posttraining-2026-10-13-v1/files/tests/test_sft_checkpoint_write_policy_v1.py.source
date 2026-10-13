@@ -1,0 +1,434 @@
+"""Independent cBPF interpretation of candidates; no native filter installation."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import random
+import struct
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("_write_policy_test",
+    ROOT / "src/lumi/posttraining_checkpoint_write_policy_v1.py")
+m = importlib.util.module_from_spec(SPEC)
+BEFORE = set(sys.modules)
+SPEC.loader.exec_module(m)
+IMPORTED = set(sys.modules) - BEFORE
+
+# Literal ABI encoding here is independent of the candidate's assembly helpers.
+ALLOW, DENY, KILL, NOTIFY = 0x7FFF0000, 0x00050001, 0x80000000, 0x7FC00000
+ENOSYS = 0x00050026
+ARCH = 0xC000003E
+MASK64 = (1 << 64) - 1
+
+
+def interpret(program, number, args=(), architecture=ARCH, loads=None):
+    """Model only the emitted cBPF subset against a packed seccomp_data record."""
+    values = tuple(args) + (0,) * (6 - len(args))
+    if len(values) != 6:
+        raise AssertionError("six arguments required")
+    data = struct.pack("<IIQ6Q", number & 0xFFFFFFFF, architecture, 0,
+                       *(value & MASK64 for value in values))
+    accumulator, pc, steps = 0, 0, 0
+    while 0 <= pc < len(program) and steps <= len(program):
+        code, yes, no, value = program[pc]
+        steps += 1
+        if code == 0x20:
+            accumulator = struct.unpack_from("<I", data, value)[0]
+            if loads is not None:
+                loads.append(value)
+        elif code == 0x54:
+            accumulator &= value
+        elif code == 0x15:
+            pc += yes if accumulator == value else no
+        elif code == 0x35:
+            pc += yes if accumulator >= value else no
+        elif code == 0x06:
+            return value
+        else:
+            raise AssertionError("unsupported interpreter instruction")
+        pc += 1
+    raise AssertionError("unterminated candidate")
+
+
+def seal(name, *args):
+    return interpret(m.FILTER, m.SYSCALLS[name], args)
+
+
+def composed(number, args=(), architecture=ARCH):
+    # Linux action precedence for only these four actions, not numeric ordering.
+    precedence = {KILL: 0, DENY & 0xFFFF0000: 1, NOTIFY: 2, ALLOW: 3}
+    values = [interpret(program, number, args, architecture)
+              for program in (m.LISTENER_FILTER, m.FILTER)]
+    return min(values, key=lambda value: precedence[value & 0xFFFF0000])
+
+
+class CandidateStructureTests(unittest.TestCase):
+    def test_import_only_stdlib_no_primary_lumi_or_ml(self):
+        self.assertFalse(any(name == "lumi" or name.startswith(("lumi.", "torch",
+            "safetensors", "numpy", "transformers")) for name in IMPORTED))
+
+    def test_public_admission_always_fixed_closed_error(self):
+        for arguments in ({}, {"approved": True}, {"native_abi_qualified": True},
+                          {"filter": object(), "listener": object()},
+                          {"private_text": "not retained"}):
+            with self.subTest(keys=tuple(arguments)):
+                with self.assertRaises(m.WritePolicyError) as caught:
+                    m.install_write_policy(**arguments)
+                self.assertEqual(str(caught.exception), "host_guard_not_bound")
+                self.assertEqual(caught.exception.code, "host_guard_not_bound")
+
+    def test_error_codes_are_closed_and_no_exception_text(self):
+        for value in (None, {}, object(), "private exception", True):
+            self.assertEqual(str(m.WritePolicyError(value)), "program_rejected")
+
+    def test_compilation_deterministic_and_immutable(self):
+        self.assertIsInstance(m.FILTER, tuple)
+        self.assertEqual(m.build_filter(), m.FILTER)
+        self.assertEqual(m.build_listener_filter(), m.LISTENER_FILTER)
+        with self.assertRaises(TypeError):
+            m.SYSCALLS["write"] = 999
+        with self.assertRaises(TypeError):
+            m.POLICY_SUMMARY["real_import_permitted"] = True
+
+    def test_hashes_bind_actual_packed_programs(self):
+        for rows, digest in ((m.FILTER, m.FILTER_SHA256),
+                             (m.LISTENER_FILTER, m.LISTENER_FILTER_SHA256)):
+            packed = b"".join(struct.pack("<HBBI", *row) for row in rows)
+            self.assertEqual(hashlib.sha256(packed).hexdigest(), digest)
+            self.assertLessEqual(len(rows), 4096)
+
+    def test_summary_does_not_claim_native_enforcement(self):
+        for key in ("metadata_and_physical_write_accounting", "native_abi_qualified",
+                    "native_filters_installed", "listener_transport_verified",
+                    "inherited_authority_closed", "native_importer_compatibility_verified",
+                    "cumulative_write_limit_enforced", "host_guard_bound",
+                    "real_import_permitted", "real_sft_execution_permitted",
+                    "production_eligible"):
+            self.assertIs(m.POLICY_SUMMARY[key], False)
+        self.assertIs(m.POLICY_SUMMARY["two_filter_composition_required"], True)
+        self.assertIs(m.POLICY_SUMMARY["shared_mapping_exclusion_required"], True)
+
+    def test_instruction_validator_rejects_malformed_rows(self):
+        bad = [[], [(6, 0, 0, ALLOW)] * 4097, [[6, 0, 0, ALLOW]],
+               [(6, False, 0, ALLOW)], [(6, 0, 0, -1)], [(6, 0, 0, 1 << 32)],
+               [(6, 256, 0, ALLOW)], [(6, 0, 1, ALLOW)], [(0, 0, 0, 0)],
+               [(0x20, 0, 0, 2), (6, 0, 0, ALLOW)],
+               [(0x20, 0, 0, 64), (6, 0, 0, ALLOW)],
+               [(0x15, 1, 0, 0), (6, 0, 0, ALLOW)],
+               [(0x20, 0, 0, 0)]]
+        for rows in bad:
+            with self.subTest(rows=rows[:2]):
+                with self.assertRaises(m.WritePolicyError):
+                    m._finish(rows)
+
+    def test_oversized_dispatch_body_is_rejected(self):
+        with patch.object(m, "_open", return_value=[(0x20, 0, 0, 0)] * 255):
+            with self.assertRaises(m.WritePolicyError):
+                m.build_filter()
+
+
+class ArchitectureAndDispatchTests(unittest.TestCase):
+    def test_foreign_architectures_killed_before_dispatch_in_both_stages(self):
+        for program in (m.LISTENER_FILTER, m.FILTER):
+            for arch in (0, 3, 0x40000003, 0xC00000B7, 0x4000003E, 0xFFFFFFFF):
+                for number in (0, 1, 18, 257, 999):
+                    self.assertEqual(interpret(program, number, architecture=arch), KILL)
+
+    def test_negative_tagged_and_historical_x32_killed(self):
+        for program in (m.LISTENER_FILTER, m.FILTER):
+            for number in (*range(512, 548), -1, -2, -(1 << 31),
+                           0x40000000, 0x40000001, 0x40000012, 0x7FFFFFFF):
+                self.assertEqual(interpret(program, number), KILL)
+
+    def test_architecture_boundary_preserves_number(self):
+        for number in (511, 548, 549, 0x3FFFFFFF):
+            self.assertEqual(interpret(m.LISTENER_FILTER, number), ALLOW)
+            self.assertEqual(interpret(m.FILTER, number), DENY)
+        self.assertEqual(interpret(m.FILTER, 0), ALLOW)
+        self.assertEqual(interpret(m.LISTENER_FILTER, 1), NOTIFY)
+
+    def test_every_unconditional_syscall_reaches_allow_with_poison_arguments(self):
+        # These occur after every restricted body, so this detects accidental
+        # accumulator destruction in skipped dispatches, not just first-row hits.
+        self.assertEqual(len(set(m.UNCONDITIONAL_SYSCALLS)),
+                         len(m.UNCONDITIONAL_SYSCALLS))
+        for name in m.UNCONDITIONAL_SYSCALLS:
+            with self.subTest(name=name):
+                self.assertEqual(seal(name, *([MASK64] * 6)), ALLOW)
+
+    def test_every_restricted_dispatch_reaches_its_own_body(self):
+        cases = {"open": (0, 0), "openat": (0, 0, 0),
+            "mmap": (0, 4096, 3, 2), "mprotect": (0, 4096, 3),
+            "mremap": (0, 4096, 4096, 1), "clone": (0x10F00,),
+            "fcntl": (0, 1), "dup3": (0, 1, 0), "mkdir": (0, 0o700),
+            "mkdirat": (0, 0, 0o700), "chmod": (0, 0o600),
+            "fchmod": (0, 0o600), "fchmodat": (0, 0, 0o600),
+            "prlimit64": (0, 0, 0), "arch_prctl": (0x1002,), "prctl": (21,)}
+        for name, arguments in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(seal(name, *arguments), ALLOW)
+
+    def test_unknown_numbers_default_deny_only_final_seal(self):
+        declared = set(m.SYSCALLS.values())
+        for number in range(600):
+            if number in declared or 512 <= number <= 547:
+                continue
+            self.assertEqual(interpret(m.LISTENER_FILTER, number), ALLOW)
+            self.assertEqual(interpret(m.FILTER, number), DENY)
+
+    def test_all_known_nonallowlisted_syscalls_denied(self):
+        restrictions = {"open", "openat", "mmap", "mprotect", "mremap", "clone",
+            "fcntl", "dup3", "mkdir", "mkdirat", "chmod", "fchmod", "fchmodat",
+            "prlimit64", "arch_prctl", "prctl"}
+        for name in set(m.SYSCALLS) - set(m.UNCONDITIONAL_SYSCALLS) - restrictions:
+            self.assertEqual(seal(name), ENOSYS if name == "clone3" else DENY, name)
+
+    def test_write_bypass_and_import_families_are_denied(self):
+        # Literal syscall numbers keep this check independent of the table.
+        denied = (16, 20, 29, 30, 31, 40, 41, 42, 43, 44, 45, 46, 47, 53,
+            57, 58, 62, 64, 65, 66, 67, 68, 69, 70, 71, 73, 75, 76, 77,
+            82, 84, 85, 86, 87, 88, 92, 93, 94, 101, 160, 165, 166, 188,
+            189, 190, 197, 198, 199, 206, 207, 208, 209, 210, 235, 246,
+            247, 248, 249, 250, 251, 252, 263, 264, 272, 275, 276, 278,
+            280, 285, 296, 299, 301, 303, 304, 308, 310, 311, 312, 313,
+            316, 317, 319, 321, 322, 323, 324, 325, 326, 328, 335,
+            424, 425, 426, 427, 428, 429, 430, 431, 432, 433, 434,
+            436, 437, 438, 440, 441, 442, 443, 444, 445, 446,
+            447, 448, 449, 450, 451, 452, 453, 454, 455, 456, 457,
+            458, 459, 460, 461, 462, 463, 464, 465, 466, 467)
+        for number in denied:
+            self.assertEqual(composed(number, (MASK64,) * 6), DENY, number)
+
+
+class ScalarWriteTests(unittest.TestCase):
+    def test_composed_policy_to_actual_broker_wire_and_precharge_integration(self):
+        spec = importlib.util.spec_from_file_location("_write_policy_broker_integration",
+            ROOT / "src/lumi/posttraining_checkpoint_write_broker_v1.py")
+        broker_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(broker_module)
+        with patch.object(broker_module.time, "monotonic_ns", return_value=100):
+            broker = broker_module._Broker(broker_module.make_budget(
+                maximum_bytes=16 * 1024**2, maximum_notifications=16,
+                maximum_call_bytes=1024**2, precharged_bytes=9), deadline_ns=200)
+            responses, charges = [], []
+            expected_reserved = 9
+            identifier = 0
+            for number in (1, 18):
+                for descriptor in (0, 1, 2, 37, 1 << 32, MASK64):
+                    count = (0, 1, 1024, 1024**2)[identifier % 4]
+                    identifier += 1
+                    instruction_pointer = MASK64 - identifier
+                    arguments = (descriptor, MASK64 - identifier * 3, count,
+                                 MASK64 - identifier * 7, 0, MASK64)
+                    self.assertEqual(composed(number, arguments), NOTIFY)
+                    raw = struct.pack("<QIIiIQ6Q", identifier, 10001, 0, number,
+                                      ARCH, instruction_pointer, *arguments)
+                    self.assertEqual(len(raw), 80)
+                    self.assertEqual(broker_module.parse_notification(raw), {
+                        "id": identifier, "syscall": number, "requested_bytes": count})
+                    expected_reserved += count
+
+                    def valid(value):
+                        self.assertEqual(value, identifier)
+                        # Snapshot itself acquires the broker lock; inspect only
+                        # the private aggregate here to verify pre-callback debit.
+                        charges.append(broker._reserved)
+                        self.assertEqual(broker._reserved, expected_reserved)
+                        return True
+
+                    self.assertIsNone(broker._service_admitted_once(raw,
+                        id_valid=valid, send_response=responses.append))
+                    self.assertEqual(responses[-1], struct.pack("<QqiI", identifier, 0, 0, 1))
+                    self.assertEqual(len(responses[-1]), 24)
+            summary = broker.snapshot()
+            self.assertEqual(len(responses), 12)
+            self.assertEqual(len(charges), 12)
+            self.assertEqual(summary["reserved_bytes"], expected_reserved)
+            self.assertEqual(summary["notifications_reserved"], 12)
+            self.assertEqual(summary["continued_notifications"], 12)
+            self.assertIs(summary["terminal_failed"], False)
+            self.assertFalse({"id", "pid", "ip", "fd", "raw", "response"} & set(summary))
+            for key in broker_module.FALSE_FLAGS:
+                self.assertIs(summary[key], False)
+
+    def test_write_paths_load_no_arguments_so_no_fd_or_count_can_change_action(self):
+        for number in (1, 18):
+            for program, expected in ((m.LISTENER_FILTER, NOTIFY), (m.FILTER, ALLOW)):
+                loaded = []
+                self.assertEqual(interpret(program, number, loads=loaded), expected)
+                self.assertEqual(loaded, [4, 0])
+
+    def test_listener_alone_and_seal_alone_are_not_closed_meter(self):
+        self.assertEqual(interpret(m.LISTENER_FILTER, 20), ALLOW)
+        self.assertEqual(interpret(m.FILTER, 1), ALLOW)
+        self.assertEqual(composed(20), DENY)
+        self.assertEqual(composed(1), NOTIFY)
+
+    def test_every_descriptor_and_complete_uint64_count_notifies(self):
+        descriptors = (0, 1, 2, 3, 4096, (1 << 31) - 1, 1 << 31,
+                       (1 << 32) - 1, 1 << 32, MASK64)
+        counts = (0, 1, (1 << 31) - 1, 1 << 31, (1 << 32) - 1,
+                  1 << 32, (1 << 63) - 1, 1 << 63, MASK64)
+        for number in (1, 18):
+            for fd in descriptors:
+                for count in counts:
+                    args = (fd, MASK64, count, MASK64, MASK64, MASK64)
+                    self.assertEqual(interpret(m.LISTENER_FILTER, number, args), NOTIFY)
+                    self.assertEqual(interpret(m.FILTER, number, args), ALLOW)
+                    self.assertEqual(composed(number, args), NOTIFY)
+
+    def test_generated_64bit_arguments_cannot_bypass_notification(self):
+        generator = random.Random(73261)
+        for _ in range(256):
+            args = tuple(generator.getrandbits(64) for _ in range(6))
+            for number in (1, 18):
+                self.assertEqual(composed(number, args), NOTIFY)
+
+
+class ArgumentRestrictionTests(unittest.TestCase):
+    def test_open_and_openat_flags_all_bits_and_full_width(self):
+        allowed = (0x40, 0x80, 0x400, 0x800, 0x10000, 0x20000, 0x80000)
+        for name, index in (("open", 1), ("openat", 2)):
+            for access in range(3):
+                args = [0] * 6
+                args[index], args[index + 1] = access, MASK64
+                self.assertEqual(seal(name, *args), ALLOW)
+                for bit in range(64):
+                    args[index], args[index + 1] = access | (1 << bit), 0o600
+                    expected = ALLOW if ((1 << bit) in allowed or
+                        (bit < 2 and (access | (1 << bit)) != 3)) else DENY
+                    self.assertEqual(seal(name, *args), expected, (name, access, bit))
+            args[index] = 3
+            self.assertEqual(seal(name, *args), DENY)
+
+    def test_open_truncation_tmpfile_and_path_only_are_not_allowed(self):
+        for name, index in (("open", 1), ("openat", 2)):
+            for flags in (0x200, 0x201, 0x241, 0x410000, 0x200000):
+                args = [0] * 6
+                args[index], args[index + 1] = flags, 0o600
+                self.assertEqual(seal(name, *args), DENY)
+
+    def test_open_creation_checks_complete_mode_only_when_used(self):
+        for name, index in (("open", 1), ("openat", 2)):
+            for mode in (0, 0o400, 0o600, 0o700, 0o644, 0o777, MASK64,
+                         (1 << 32) | 0o600):
+                args = [0] * 6
+                args[index], args[index + 1] = 0x41, mode
+                self.assertEqual(seal(name, *args), ALLOW if mode in
+                                 (0o400, 0o600, 0o700) else DENY)
+                args[index] = 1
+                self.assertEqual(seal(name, *args), ALLOW)
+
+    def test_mmap_only_private_mappings_all_flag_bits(self):
+        for protection in range(8):
+            self.assertEqual(seal("mmap", 0, 4096, protection, 2), ALLOW)
+            for flags in (0, 1, 3, 0x21, 0x23, 0x11, 0x13):
+                self.assertEqual(seal("mmap", 0, 4096, protection, flags), DENY)
+        accepted = (1, 4, 5, 11, 14, 17, 20)
+        for bit in range(64):
+            self.assertEqual(seal("mmap", 0, 4096, 3, 2 | (1 << bit)),
+                             ALLOW if bit in accepted else DENY, bit)
+
+    def test_mmap_mprotect_reject_high_and_unknown_protection_bits(self):
+        for name in ("mmap", "mprotect"):
+            for protection in range(8):
+                self.assertEqual(seal(name, 0, 4096, protection, 2), ALLOW)
+            for bit in range(3, 64):
+                self.assertEqual(seal(name, 0, 4096, 3 | (1 << bit), 2), DENY)
+
+    def test_mremap_allows_only_no_flags_or_maymove(self):
+        for flags in (0, 1, 2, 3, 4, 5, 1 << 32, MASK64):
+            self.assertEqual(seal("mremap", 0, 4096, 8192, flags),
+                             ALLOW if flags in (0, 1) else DENY)
+
+    def test_clone_requires_thread_sharing_flags_and_only_declared_options(self):
+        required = 0x10F00
+        self.assertEqual(m.CLONE_REQUIRED, required)
+        allowed_bits = (8, 9, 10, 11, 16, 18, 19, 20, 21, 24)
+        for bit in range(64):
+            self.assertEqual(seal("clone", required | (1 << bit)),
+                             ALLOW if bit in allowed_bits else DENY, bit)
+        for bit in (8, 9, 10, 11, 16):
+            self.assertEqual(seal("clone", m.CLONE_FLAGS & ~(1 << bit)), DENY)
+        for flags in (0, 17, required | 17, 0x800000, MASK64):
+            self.assertEqual(seal("clone", flags), DENY)
+
+    def test_clone3_is_refused_with_fixed_enosys_not_executed_or_notified(self):
+        self.assertEqual(m.SYSCALLS["clone3"], 435)
+        self.assertEqual(m.DENY_ENOSYS, ENOSYS)
+        for arguments in ((0,) * 6, (MASK64,) * 6, (1, 88, 0, 0, 0, 0)):
+            self.assertEqual(interpret(m.LISTENER_FILTER, 435, arguments), ALLOW)
+            self.assertEqual(interpret(m.FILTER, 435, arguments), ENOSYS)
+            self.assertEqual(composed(435, arguments), ENOSYS)
+        self.assertEqual(seal("clone", 0x10F00), ALLOW)
+        self.assertEqual(seal("clone", 0x10F00 | 17), DENY)
+
+    def test_fcntl_getters_ignore_unused_argument_setfd_is_exact(self):
+        for command in (1, 3):
+            self.assertEqual(seal("fcntl", MASK64, command, MASK64), ALLOW)
+            self.assertEqual(seal("fcntl", 0, command | (1 << 32)), DENY)
+        for value in (0, 1, 2, 3, 1 << 32, MASK64):
+            self.assertEqual(seal("fcntl", 0, 2, value),
+                             ALLOW if value in (0, 1) else DENY)
+
+    def test_fcntl_duplicates_require_nonnegative_complete_int(self):
+        for command in (0, 1030):
+            for value in (0, 1, 1024, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF,
+                          1 << 32, MASK64):
+                self.assertEqual(seal("fcntl", 0, command, value),
+                                 ALLOW if value < 0x80000000 else DENY)
+            self.assertEqual(seal("fcntl", 0, command | (1 << 32), 0), DENY)
+
+    def test_fcntl_other_commands_closed(self):
+        for command in (*range(4, 64), *range(1024, 1041), 1 << 32, MASK64):
+            if command != 1030:
+                self.assertEqual(seal("fcntl", 0, command, 0), DENY)
+
+    def test_dup3_flags_complete_and_exact(self):
+        for value in (0, 0x80000, 1, 0x80001, 1 << 32, (1 << 32) | 0x80000):
+            self.assertEqual(seal("dup3", 0, 1, value),
+                             ALLOW if value in (0, 0x80000) else DENY)
+
+    def test_permission_modes_are_exact_full_width(self):
+        for name, index, accepted in (("mkdir", 1, (0o700,)),
+            ("mkdirat", 2, (0o700,)), ("chmod", 1, (0o400, 0o600, 0o700)),
+            ("fchmod", 1, (0o400, 0o600, 0o700)),
+            ("fchmodat", 2, (0o400, 0o600, 0o700))):
+            for value in (0, 0o400, 0o600, 0o700, 0o644, 0o755, 0o1700,
+                          0o4700, (1 << 32) | 0o700, MASK64):
+                args = [0] * 6
+                args[index] = value
+                self.assertEqual(seal(name, *args), ALLOW if value in accepted else DENY)
+
+    def test_prlimit_can_only_query_current_process(self):
+        self.assertEqual(seal("prlimit64", 0, MASK64, 0, MASK64), ALLOW)
+        for pid in (1, 1 << 32, MASK64):
+            self.assertEqual(seal("prlimit64", pid, 0, 0, 0), DENY)
+        for pointer in (1, 1 << 32, MASK64):
+            self.assertEqual(seal("prlimit64", 0, 0, pointer, 0), DENY)
+
+    def test_arch_prctl_exact_commands_full_width(self):
+        for command in (0, 0x1001, 0x1002, 0x1003, 0x1004, 0x1011, 0x1012,
+                        (1 << 32) | 0x1002, MASK64):
+            self.assertEqual(seal("arch_prctl", command, MASK64),
+                             ALLOW if command in (0x1002, 0x1003, 0x1004) else DENY)
+
+    def test_prctl_exact_queries_all_unused_arguments_zero(self):
+        for command in (21, 39):
+            self.assertEqual(seal("prctl", command), ALLOW)
+            for index in range(1, 5):
+                for value in (1, 1 << 32, MASK64):
+                    args = [command, 0, 0, 0, 0, 0]
+                    args[index] = value
+                    self.assertEqual(seal("prctl", *args), DENY)
+        for command in (0, 1, 15, 22, 38, (1 << 32) | 21, MASK64):
+            self.assertEqual(seal("prctl", command), DENY)
+
+
+if __name__ == "__main__":
+    unittest.main()

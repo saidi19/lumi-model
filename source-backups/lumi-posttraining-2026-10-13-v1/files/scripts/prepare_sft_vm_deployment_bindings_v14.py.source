@@ -1,0 +1,103 @@
+"""Attempt-018 immutable-version source, plan, and prior-control bindings."""
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v13 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "188232d67a5ec00cace0fe6104d2c957e44ae8b365e3ba2a9c04410e17f27894"
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD = previous.OLD
+BUCKET = previous.BUCKET
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.3"
+RELEASE_SHA = "990e6f1630db21e64ee06034dce54c41beb84feb2548d7addb2f481b26da30cc"
+PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.3/plan.json"
+PLAN_SHA = "d9706bea0c43d123aee74bd27f707ed8d3b497c64b7ddee80dc5242b0af924a2"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.3/release.json"
+PLAN_RELEASE_SHA = "6be94fabee1dead6c967eff096de438134240a5aae7ceef8f5fa0aafd3e29e0c"
+WATCH = previous.WATCH
+STORE = previous.STORE
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_binding_v14_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verify():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    need(
+        manifest["attempt"] == ATTEMPT
+        and manifest["base_release_sha256"] == previous.RELEASE_SHA
+        and manifest["source_versions_bound"] is True
+        and manifest["versioned_object_count"] == 22
+        and manifest["iam_source_action"] == "s3:GetObjectVersion"
+        and manifest["execution_permitted"] is False
+        and len(manifest["outputs"]) == 156
+    )
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(
+        plan_release["plan_sha256"] == PLAN_SHA
+        and plan_release["source_release_sha256"] == RELEASE_SHA
+        and plan_release["source_versions_bound"] is True
+        and plan_release["execution_permitted"] is False
+    )
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["source_repair"]["versioned_object_count"] == 22
+        and plan["source_repair"]["s3_action"] == "s3:GetObjectVersion"
+        and plan["source_repair"]["wire_or_billing_byte_cap_claimed"] is False
+        and plan["execution_permitted"] is False
+        and plan["approval_record"] is None
+        and plan["readiness_review"]["no_old_approval_reuse"] is True
+        and plan["required_control_proofs"] == [WATCH, STORE]
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    """Verify preserved prior control evidence without rebinding it to new source."""
+    build()
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    pins = previous.controls()
+    need(set(pins) == {WATCH, STORE})
+    return pins
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

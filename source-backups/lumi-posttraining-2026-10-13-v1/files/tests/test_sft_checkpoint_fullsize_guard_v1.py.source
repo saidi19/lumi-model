@@ -1,0 +1,270 @@
+"""Pure full-size guard bindings: synthetic metadata, no native/payload actions."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import importlib.util
+import stat
+import sys
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_fullsize_guard_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_fullsize_guard_v1")
+IMPORTED = set(sys.modules) - before
+
+
+def mount_arguments():
+    parent = "/tmp/lumi-fullsize-pure-guard"
+    identities = {}
+    for index, role in enumerate(m.mount.input_mount.ROLES, 1):
+        uid = 10001 if role in {"checkpoint", "tokenizer", "output"} else 0
+        mode = 0o755 if role in {"root", "inputs"} else 0o700
+        identities[role] = (1, index, stat.S_IFDIR | mode, uid, uid, 2, 0, 1, 1)
+    return {
+        "rootfs_path": parent + "/rootfs", "mountpoint_path": parent + "/mount",
+        "checkpoint_path": parent + "/checkpoint", "tokenizer_path": parent + "/tokenizer",
+        "output_path": parent + "/output", "expected_identities": identities,
+        "expected_mountpoint_identity": (1, 100, stat.S_IFDIR | 0o700, 0, 0, 2, 0, 1, 1),
+        "inventories": {
+            "checkpoint": {"manifest.sha256": 10, "model/.metadata": 20,
+                           "model/__0_0.distcp": 30, "trainer/__0_0.distcp": 40},
+            "tokenizer": {"tokenizer/generated": 50},
+        },
+        "scratch_bytes": 536870912, "shm_bytes": 67108864,
+    }
+
+
+def prepared_entry():
+    return {
+        "arguments": {"metadata": (b"generated",)}, "plan": {"plan_sha256": "a" * 64},
+        "envelope": {"worker_memory_max_bytes": 64 * 1024**3, "maximum_seconds": 3600},
+        "limits": {"maximum_seconds": 3600},
+        "inventories": mount_arguments()["inventories"],
+        "bindings": {"control_sha256": "b" * 64},
+    }
+
+
+def actual_entry_arguments():
+    # Reuse only the neighbouring test's generated metadata factory. Its source
+    # read happens before the no-I/O assertions; no model or payload is opened.
+    spec = importlib.util.spec_from_file_location("_lumi_fullsize_guard_entry_fixture",
+        ROOT / "tests/test_sft_checkpoint_fullsize_entry_v1.py")
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    return fixtures.arguments(*fixtures.fixture())
+
+
+class FullsizeGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.entry_arguments = dict.fromkeys(m.ENTRY_ARGUMENT_FIELDS, b"generated-control")
+        self.mount_arguments = mount_arguments()
+        self.prepared = prepared_entry()
+
+    def check(self, *, entry_arguments=None, mount_args=None):
+        with patch.object(m.entry, "prepare_entry", return_value=self.prepared):
+            return m.prepare_guard(
+                entry_arguments=(self.entry_arguments
+                                 if entry_arguments is None else entry_arguments),
+                mount_arguments=self.mount_arguments if mount_args is None else mount_args)
+
+    def rejected(self, code):
+        return self.assertRaisesRegex(m.FullsizeGuardError, "^" + code + "$")
+
+    def test_exact_binding_carries_envelope_limits_without_starting_clock(self):
+        result = self.check()
+        self.assertEqual(result["status"], m.STATUS)
+        self.assertEqual(result["prepared_entry"], self.prepared)
+        self.assertEqual(result["mount_arguments"], self.mount_arguments)
+        self.assertEqual(result["proposed_guard_limits"], {
+            "memory_max_bytes": 64 * 1024**3, "swap_max_bytes": 0, "maximum_seconds": 3600,
+        })
+        self.assertFalse(result["deadline_clock_started"])
+        self.assertTrue(result["exact_plan_mount_inventory_binding"])
+
+    def test_never_claims_native_execution_or_admission(self):
+        result = self.check()
+        self.assertTrue(all(result[key] is False for key in m.FALSE_FLAGS))
+        self.assertEqual(result["unresolved"], dict.fromkeys(m.UNRESOLVED_HOST_REQUIREMENTS))
+        self.assertTrue(result["resource_envelope_is_planning_only"])
+        self.assertEqual(result["write_overhead_outside_coordinator_budget_unresolved"],
+                         list(m.UNRESOLVED_WRITE_SCOPES))
+        self.assertIn("scratch_and_shared_memory_writes", m.UNRESOLVED_WRITE_SCOPES)
+        self.assertIn("source_staging", m.UNRESOLVED_WRITE_SCOPES)
+
+    def test_result_is_detached_from_all_mutable_inputs_and_entry_result(self):
+        expected_mount = copy.deepcopy(self.mount_arguments)
+        expected_prepared = copy.deepcopy(self.prepared)
+        result = self.check()
+        result["prepared_entry"]["inventories"]["checkpoint"]["manifest.sha256"] += 1
+        result["prepared_entry"]["envelope"]["maximum_seconds"] += 1
+        result["prepared_entry"]["arguments"]["extra"] = b"not-shared"
+        result["mount_arguments"]["inventories"]["tokenizer"]["tokenizer/generated"] += 1
+        result["mount_arguments"]["expected_identities"]["root"] = (0,) * 9
+        self.assertEqual(self.prepared, expected_prepared)
+        self.assertEqual(self.mount_arguments, expected_mount)
+        self.assertEqual(self.check()["prepared_entry"], expected_prepared)
+
+    def test_missing_opaque_trainer_file_rejected(self):
+        del self.mount_arguments["inventories"]["checkpoint"]["trainer/__0_0.distcp"]
+        with self.rejected("inventory_binding_rejected"):
+            self.check()
+
+    def test_changed_same_count_same_total_inventory_rejected(self):
+        checkpoint = self.mount_arguments["inventories"]["checkpoint"]
+        checkpoint["model/other.distcp"] = checkpoint.pop("model/__0_0.distcp")
+        with self.rejected("inventory_binding_rejected"):
+            self.check()
+
+    def test_wrong_size_or_extra_inventory_rejected(self):
+        for role, path in (("checkpoint", "model/.metadata"),
+                           ("tokenizer", "tokenizer/generated")):
+            with self.subTest(role=role):
+                arguments = mount_arguments()
+                arguments["inventories"][role][path] += 1
+                with self.rejected("inventory_binding_rejected"):
+                    self.check(mount_args=arguments)
+                arguments = mount_arguments()
+                arguments["inventories"][role]["extra"] = 1
+                with self.rejected("inventory_binding_rejected"):
+                    self.check(mount_args=arguments)
+
+    def test_mount_validator_rejects_aliases_traversal_bool_sizes_and_extra_keys(self):
+        variants = []
+        arguments = mount_arguments()
+        arguments["output_path"] = arguments["checkpoint_path"]
+        variants.append(arguments)
+        arguments = mount_arguments()
+        arguments["checkpoint_path"] += "/../checkpoint"
+        variants.append(arguments)
+        arguments = mount_arguments()
+        arguments["inventories"]["tokenizer"]["tokenizer/generated"] = True
+        variants.append(arguments)
+        arguments = mount_arguments()
+        arguments["expected_mountpoint_identity"] = arguments["expected_identities"]["root"]
+        variants.append(arguments)
+        arguments = mount_arguments()
+        arguments["approved"] = True
+        variants.append(arguments)
+        for arguments in variants:
+            with self.subTest(arguments=arguments), self.rejected("mount_rejected"):
+                self.check(mount_args=arguments)
+
+    def test_extra_or_missing_entry_fields_rejected_before_entry_validation(self):
+        variants = [None, (), {}]
+        for key in m.ENTRY_ARGUMENT_FIELDS:
+            arguments = dict(self.entry_arguments)
+            del arguments[key]
+            variants.append(arguments)
+        variants.append({**self.entry_arguments, "approval": True})
+        for arguments in variants:
+            validator = Mock(side_effect=AssertionError("entry validator must not run"))
+            with self.subTest(arguments=arguments), \
+                    patch.object(m.entry, "prepare_entry", validator):
+                with self.rejected("arguments_rejected"):
+                    m.prepare_guard(entry_arguments=arguments, mount_arguments=self.mount_arguments)
+                validator.assert_not_called()
+
+    def test_entry_failure_has_fixed_code_and_precedes_mount_validation(self):
+        validator = Mock(side_effect=AssertionError("mount must not run"))
+        with patch.object(m.entry, "prepare_entry", side_effect=ValueError("PRIVATE CONTROL")), \
+                patch.object(m.mount, "validate_arguments", validator):
+            with self.rejected("entry_rejected"):
+                m.prepare_guard(entry_arguments=self.entry_arguments,
+                                mount_arguments=self.mount_arguments)
+        validator.assert_not_called()
+
+    def test_memory_and_seconds_are_derived_not_synthetic_guard_constants(self):
+        self.prepared["envelope"].update(worker_memory_max_bytes=32 * 1024**3, maximum_seconds=1800)
+        self.prepared["limits"]["maximum_seconds"] = 1800
+        self.assertEqual(self.check()["proposed_guard_limits"], {
+            "memory_max_bytes": 32 * 1024**3, "swap_max_bytes": 0, "maximum_seconds": 1800,
+        })
+
+    def test_invalid_prepared_internal_results_cannot_masquerade_as_bindings(self):
+        for key, value in (("worker_memory_max_bytes", True), ("worker_memory_max_bytes", 0),
+                           ("worker_memory_max_bytes", 2**63), ("maximum_seconds", True),
+                           ("maximum_seconds", 86401), ("maximum_seconds", 1.5)):
+            self.prepared = prepared_entry()
+            self.prepared["envelope"][key] = value
+            with self.subTest(key=key, value=value), self.rejected("prepared_result_rejected"):
+                self.check()
+        self.prepared = prepared_entry()
+        self.prepared["limits"]["maximum_seconds"] += 1
+        with self.rejected("prepared_result_rejected"):
+            self.check()
+
+    def test_preparation_is_repeatable_and_has_no_file_clock_network_or_native_io(self):
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("native or I/O operation must not run")
+        targets = ("builtins.open", "os.open", "os.fork", "os.execve", "socket.socket",
+                   "time.monotonic", "time.monotonic_ns", "time.sleep")
+        with ExitStack() as stack:
+            for target in targets:
+                stack.enter_context(patch(target, side_effect=forbidden))
+            stack.enter_context(patch.object(m.mount, "enter_import_rootfs", side_effect=forbidden))
+            first = self.check()
+            second = self.check()
+        self.assertEqual(first, second)
+
+    def test_public_run_unconditionally_closed_before_any_validation_or_effect(self):
+        explosive = Mock(side_effect=AssertionError("public boundary must be inert"))
+        class Uninspectable:
+            def __getattribute__(self, _name):
+                raise AssertionError("must not inspect caller objects")
+        with patch.object(m, "prepare_guard", explosive), \
+                patch.object(m.entry, "prepare_entry", explosive), \
+                patch.object(m.mount, "validate_arguments", explosive), \
+                patch("builtins.open", explosive), patch("os.open", explosive), \
+                patch("os.fork", explosive), patch("socket.socket", explosive):
+            for arguments in ({}, {"approved": True}, {"receipt": {"status": "passed"}},
+                              {"entry_arguments": Uninspectable(), "callback": explosive}):
+                with self.rejected("host_guard_not_bound"):
+                    m.run_fullsize_guard(**arguments)
+        explosive.assert_not_called()
+
+    def test_actual_entry_and_frozen_mount_bind_generated_controls_without_io(self):
+        arguments = actual_entry_arguments()
+        prepared = m.entry.prepare_entry(**arguments)
+        mounts = mount_arguments()
+        mounts["inventories"] = copy.deepcopy(prepared["inventories"])
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("os.fork", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError), \
+                patch.object(m.mount, "enter_import_rootfs", side_effect=AssertionError), \
+                patch.object(m.entry, "_run_admitted_once", side_effect=AssertionError):
+            result = m.prepare_guard(entry_arguments=arguments, mount_arguments=mounts)
+        self.assertEqual(result["prepared_entry"], prepared)
+        self.assertEqual(result["prepared_entry"]["plan"]["model_parameters"], 736)
+        self.assertEqual(result["mount_arguments"]["inventories"], prepared["inventories"])
+        self.assertEqual(result["proposed_guard_limits"]["memory_max_bytes"],
+                         prepared["envelope"]["worker_memory_max_bytes"])
+        self.assertTrue(all(result[key] is False for key in m.FALSE_FLAGS))
+
+    def test_actual_entry_controls_cannot_authorize_different_mount_contents(self):
+        arguments = actual_entry_arguments()
+        prepared = m.entry.prepare_entry(**arguments)
+        mounts = mount_arguments()
+        mounts["inventories"] = copy.deepcopy(prepared["inventories"])
+        name = next(iter(mounts["inventories"]["checkpoint"]))
+        mounts["inventories"]["checkpoint"][name] += 1
+        with self.rejected("inventory_binding_rejected"):
+            m.prepare_guard(entry_arguments=arguments, mount_arguments=mounts)
+
+    def test_imports_no_ml_runtime(self):
+        self.assertFalse({name.split(".")[0] for name in IMPORTED}
+                         & {"lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers"})
+
+
+if __name__ == "__main__":
+    unittest.main()

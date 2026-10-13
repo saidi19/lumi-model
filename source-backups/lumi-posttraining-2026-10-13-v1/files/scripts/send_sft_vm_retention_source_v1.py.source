@@ -1,0 +1,150 @@
+"""One source-only transfer on the existing pinned SSH channel; never retry.
+
+Only source staging is invoked. No native admission, credentials or workers.
+The caller retains original-deadline host STOP supervision even when the reply
+is lost or a local report save fails. Public launch stays closed.
+"""
+
+import hashlib
+import math
+import time
+from pathlib import Path
+
+import run_sft_vm_native_readiness_delivery_v1 as readiness
+import stage_sft_vm_retention_source_v1 as receiver
+
+sender = readiness.sender
+SOURCE = Path(__file__).with_name("stage_sft_vm_retention_source_v1.py")
+SOURCE_SHA = "572aa2f7cb433ce17d9bca2ac84c646facc722071f59885e48e9ee65ff1c9aa8"
+ARCHIVE = SOURCE.parents[1] / "artifacts/lumi-vm-retention-source-release-v0.2/retention-source.tar"
+CAP = 32 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_source_delivery_rejected") from None
+
+
+def payload():
+    source = SOURCE.read_bytes()
+    need(0 < len(source) <= 32768 and hashlib.sha256(source).hexdigest() == SOURCE_SHA)
+    bodies = {name: SOURCE.with_name(name).read_bytes() for name in receiver.PINS}
+    archive = ARCHIVE.read_bytes()
+    receiver.unpack(archive, receiver.sources(bodies))
+    return [source, *bodies.values(), archive]
+
+
+def launcher(request, prior_pin, lengths):
+    need(
+        type(prior_pin) is str
+        and len(prior_pin) == 64
+        and all(c in "0123456789abcdef" for c in prior_pin)
+    )
+    need(len(lengths) == 5 and all(type(n) is int and 0 < n <= 32768 for n in lengths[:4]))
+    need(lengths[4] == receiver.ARCHIVE_BYTES)
+    return f"""import hashlib,json,os,signal,sys,types
+try:
+ signal.alarm(75)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ raw=sys.stdin.buffer.read({sum(lengths) + 1})
+ assert len(raw)=={sum(lengths)}
+ lengths={lengths!r}
+ pieces=[];offset=0
+ for size in lengths:
+  pieces.append(raw[offset:offset+size]);offset+=size
+ source=pieces[0]
+ assert hashlib.sha256(source).hexdigest()=={SOURCE_SHA!r}
+ m=types.ModuleType('_authenticated_retention_source')
+ m.__file__='/opt/lumi-bootstrap-input/stage_sft_vm_retention_source_v1.py'
+ exec(compile(source,m.__file__,'exec'),m.__dict__)
+ bodies=dict(zip({list(receiver.PINS)!r},pieces[1:4],strict=True))
+ answer=m._stage_once({request!r},{prior_pin!r},bodies,pieces[4])
+ encoded=json.dumps(answer,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+ assert len(encoded)<=4096
+ sys.stdout.buffer.write(encoded)
+except BaseException:
+ sys.exit(1)
+"""
+
+
+def validate_reply(value, prior_pin):
+    expected = receiver.report(prior_pin)
+    need(type(value) is dict and set(value) == set(expected))
+    need(all(type(value[k]) is type(v) and value[k] == v for k, v in expected.items()))
+    return value
+
+
+def _deliver_once(
+    output,
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    request,
+    prior_pin,
+    *,
+    deadline,
+    host_deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+):
+    readiness.validate_request(request, binding)
+    need(all(type(t) in {int, float} and math.isfinite(t) for t in (deadline, host_deadline)))
+    need(80 < deadline - clock() <= 100 and deadline <= host_deadline - 2560)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= CAP)
+    pieces = payload()
+    code = launcher(request, prior_pin, list(map(len, pieces)))
+    argv = sender.command(binding, key, directory, config_sha, hosts_sha, code)
+    need(len(argv[-1].encode()) <= 16384)
+    body = b"".join(pieces)
+    charge = len(argv[-1].encode()) + len(body)
+    need(charge <= remaining_control_bytes)
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = sender.delivery.connection.issuer.base.save
+    report = dict(
+        status="started",
+        source_delivery_attempted=False,
+        source_delivery_completed=False,
+        control_content_bytes_charged=0,
+        release_state="not_dispatched",
+        binding_created=False,
+        host_admitted=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+        outer_stop_required_on_failure=True,
+    )
+    save(output / "started.json", report)
+    try:
+        need(deadline - clock() > 80)
+        report.update(
+            source_delivery_attempted=True,
+            control_content_bytes_charged=charge,
+            release_state="unknown_after_transfer",
+        )
+        value = sender.delivery.decode(sender.pipe_exchange(argv, body, 80))
+        validate_reply(value, prior_pin)
+        need(clock() < deadline)
+        report.update(
+            status="retention_sources_staged_not_admitted",
+            source_delivery_completed=True,
+            release_state="staged_verified",
+            observation=value,
+        )
+        save(output / "result.json", report)
+    except BaseException:
+        report.update(
+            status="failed_preserve_no_retry",
+            source_delivery_completed=False,
+            release_state="unknown_after_transfer",
+        )
+        target = "failure.json" if (output / "result.json").exists() else "result.json"
+        save(output / target, report)
+        raise ValueError("retention_source_delivery_failed_outer_stop_required") from None
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_source_channel_required") from None

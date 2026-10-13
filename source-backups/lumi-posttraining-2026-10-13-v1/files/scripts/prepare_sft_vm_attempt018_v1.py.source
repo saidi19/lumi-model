@@ -1,0 +1,104 @@
+"""Fresh identity from the repaired consumed graph; offline preparation only."""
+
+import ast
+import base64
+import hashlib
+import io
+import json
+import os
+import zipfile
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-017-source-v0.3"
+BASE_SHA = "c5b99b02d91f7eafef8fbb178644a0b95d1096b59c4dc8b4d89805abae9f42a1"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.1"
+OLD = "5732548d49854b278ef5ab18199560fc"
+NEW = "0532df93f0f2418bb6d467d3e5215759"
+OLD_CIDR, NEW_CIDR = "172.31.96.224/27", "172.31.97.0/27"
+OLD_CODE = "r1qUvs60xU03/SA6sEeux5AUwnjSNjxsLSyv0vz+jyw="
+PROOF = "evidence/lumi-vm-attempt-017-private-host-binding-repair-v0.1.json"
+PROOF_SHA = "dba032fb65682a7db6eaf266d3d8328d9e25c7cb4c718d8f5f27247dc73dc2cd"
+
+
+def package(raw):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        item = zipfile.ZipInfo("watchdog.py", (2026, 10, 1, 0, 0, 0))
+        item.external_attr = 0o100400 << 16
+        archive.writestr(item, raw)
+    return out.getvalue()
+
+
+def build():
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt012_v1.py",
+                 "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc")
+    proof = json.loads(closure.read(ROOT / PROOF, PROOF_SHA))
+    for name, digest in proof["source_sha256"].items():
+        closure.read(ROOT / name, digest)
+    closure.need(proof["tests_passed"] == 5 and proof["fresh_identity_required"] is True)
+    manifest = json.loads(closure.read(BASE / "release.json", BASE_SHA))
+    original = {n: closure.read(BASE / n, p["sha256"], p["bytes"])
+                for n, p in manifest["outputs"].items()}
+    preserved = {n for n in original if "/" not in n or n.startswith("evidence/")
+                 or n.endswith((".gz", ".tar", ".pem"))}
+    seeds = dict(original)
+    for name, raw in original.items():
+        if name not in preserved and name.endswith((".py", ".json")):
+            for before, after in ((OLD, NEW), ("attempt-017", "attempt-018"),
+                                  ("Attempt-017", "Attempt-018"),
+                                  ("attempt017", "attempt018"),
+                                  (OLD_CIDR, NEW_CIDR)):
+                raw = raw.replace(before.encode(), after.encode())
+            seeds[name] = raw
+    worker = "scripts/sft_vm_external_watchdog_v1.py"
+    new_code = base64.b64encode(hashlib.sha256(package(seeds[worker])).digest()).decode()
+    for name in ("scripts/arm_sft_vm_external_watchdog_v2.py",
+                 "scripts/prepare_sft_vm_private_host_sources_v4.py"):
+        closure.need(seeds[name].count(OLD_CODE.encode()) == 1)
+        seeds[name] = seeds[name].replace(OLD_CODE.encode(), new_code.encode())
+    final = closure.closure(original, seeds, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            closure.need(raw == original[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name.startswith("scripts/"):
+            closure.need(OLD.encode() not in raw)
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        closure.need(len(raw) == pin["bytes"] and closure.sha(raw) == pin["sha256"])
+    report = dict(
+        schema="lumi.vm-attempt018-source.v0.1", attempt=NEW,
+        operational_predecessor=OLD, attempt_label="attempt-018",
+        cleanup_bucket="lumi-cleanup-" + NEW, selected_cidr=NEW_CIDR,
+        selected_cidr_live_absence_verified=False,
+        base_release_sha256=BASE_SHA, repair_proof_sha256=PROOF_SHA,
+        watchdog_code_sha256_base64=new_code,
+        fresh_controls_required=True, execution_permitted=False,
+        old_authorization_reused=False, old_timer_reused=False,
+        consumed_attempt_retained=True, gate_5_complete=False, gpu=False, training=False,
+        outputs={n: dict(bytes=len(b), sha256=closure.sha(b))
+                 for n, b in sorted(final.items())},
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_kwargs):
+    raise ValueError("fresh_source_preparation_is_not_execution_authority")

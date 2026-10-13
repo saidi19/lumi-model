@@ -1,0 +1,432 @@
+"""One fresh data-free AWS diagnostic, explicitly approved 2026-10-11."""
+
+import base64
+import hashlib
+import importlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import sft_cleanup_candidate_binding_v1 as candidate
+from scripts import sft_vm_diagnostic_bootstrap_v3 as bootstrap
+from scripts import sft_vm_transport_diagnostic_repair_v2 as repair
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "artifacts/lumi-transport-diagnostic-v0.6"
+TOKEN = "lumi-diag-20261011-repair-v6"
+ACCOUNT = "573978149073"
+ENDPOINT = "eice-064320cd523dd05e8"
+SUBNET = "subnet-0092d2454f0d114fd"
+VPC = "vpc-0905fbf9490a2dead"
+GROUP = "sg-0897b7057a4086434"
+AMI = "ami-0045d7fc2ad003464"
+OLD = ROOT / "artifacts/lumi-vm-private-outer-execution-v0.19/attempt-016"
+KEY = OLD / "host/execution/host/connection-key"
+KEY_NAME = "lumi-fullsize-3f3cb73e00434101943c82601a3fb3bc"
+BASE = ROOT / "artifacts/lumi-vm-attempt-016-source-v0.1"
+
+
+def need(value):
+    if not value:
+        raise ValueError("diagnostic_rejected")
+
+
+def save(name, value):
+    raw = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+    need(len(raw) < 32768)
+    fd = os.open(OUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+
+
+def owned(response, instance=None):
+    need(not response.get("NextToken"))
+    reservations = response["Reservations"]
+    need(len(reservations) == 1 and reservations[0]["OwnerId"] == ACCOUNT)
+    rows = reservations[0]["Instances"]
+    need(len(rows) == 1)
+    row = rows[0]
+    need(re.fullmatch(r"i-[0-9a-f]{17}", row["InstanceId"]) is not None)
+    need(instance is None or row["InstanceId"] == instance)
+    need(row["ClientToken"] == TOKEN and row["ImageId"] == AMI)
+    need(row["InstanceType"] == "t3.micro" and row["SubnetId"] == SUBNET)
+    need(row["VpcId"] == VPC and row["KeyName"] == KEY_NAME)
+    need({t["Key"]: t["Value"] for t in row["Tags"]}.get("LumiDiagnostic") == TOKEN)
+    need("IamInstanceProfile" not in row and "PublicIpAddress" not in row)
+    return row
+
+
+def user_data():
+    return bootstrap.user_data()
+
+
+def verify_bootstrap():
+    raw = (ROOT / "evidence/lumi-diagnostic-bootstrap-repair-v0.3.json").read_bytes()
+    need(
+        hashlib.sha256(raw).hexdigest()
+        == "d9f662e4c9c6d47459f1a175ce6b315ad850ef4ad81b26c866a63c7728f8113f"
+    )
+    evidence = json.loads(raw)
+    for path, binding in evidence["source_bindings"].items():
+        content = (ROOT / path).read_bytes()
+        need(len(content) == binding["bytes"])
+        need(hashlib.sha256(content).hexdigest() == binding["sha256"])
+    need(hashlib.sha256(user_data().encode()).hexdigest() == evidence["userdata_sha256"])
+
+
+def console_key(output):
+    # SDK versions may expose console Output decoded or base64 encoded.
+    if "LUMI_DIAG_HOSTKEY " not in output:
+        output = base64.b64decode(output, validate=True).decode("utf-8", "replace")
+    matches = re.findall(r"LUMI_DIAG_HOSTKEY ssh-ed25519 ([A-Za-z0-9+/=]+)", output)
+    need(len(matches) == 1)
+    key = matches[0]
+    need(len(base64.b64decode(key, validate=True)) == 51)
+    return key
+
+
+def cleanup_observation(response, instance):
+    rows = [
+        row
+        for reservation in response.get("Reservations", [])
+        for row in reservation.get("Instances", [])
+    ]
+    if len(rows) == 1 and rows[0].get("State", {}).get("Name") == "terminated":
+        need(type(instance) is str and re.fullmatch(r"i-[0-9a-f]{17}", instance))
+        need(not response.get("NextToken"))
+        reservations = response["Reservations"]
+        need(len(reservations) == 1 and reservations[0]["OwnerId"] == ACCOUNT)
+        row = rows[0]
+        need(row["InstanceId"] == instance and row["ClientToken"] == TOKEN)
+        need(row["ImageId"] == AMI and row["InstanceType"] == "t3.micro")
+        tags = row["Tags"]
+        need(len({t["Key"] for t in tags}) == len(tags))
+        need({t["Key"]: t["Value"] for t in tags}.get("LumiDiagnostic") == TOKEN)
+        return rows[0], True
+    return owned(response, instance), False
+
+
+def main():
+    need(sys.argv[1:] == ["--execute-once"])
+    _offline_flow()
+
+
+def _offline_flow():
+    import botocore.session
+    from botocore.config import Config
+
+    verify_bootstrap()
+    repair.verify_evidence()
+    repair.budget()
+    need(not OUT.exists() and not OUT.is_symlink())
+    # Authenticate the exact consumed transport before any launch.
+    raw = (BASE / "release.json").read_bytes()
+    need(
+        hashlib.sha256(raw).hexdigest()
+        == "15c53333374277ecd9bee8e00f08ad29598e60637850732f8517adde4474b1df"
+    )
+    manifest = json.loads((OLD / "host-preparation/staged/manifest.json").read_bytes())
+    sys.path.insert(0, str(BASE / "scripts"))
+    joined = importlib.import_module(manifest["entry"])
+    joined.authenticate()
+    transport = candidate.bind(joined.lifecycle.guard.provision.setup.delivery.seed.sender.delivery)
+    need(KEY.is_file() and not KEY.is_symlink() and KEY.stat().st_mode & 0o777 == 0o600)
+    OUT.mkdir(mode=0o700)
+    started = time.monotonic()
+    report = dict(
+        status="started",
+        aws_calls=0,
+        launch_dispatched=False,
+        terminate_dispatched=False,
+        terminated_verified=False,
+        gpu=False,
+        training=False,
+        checkpoint_access=False,
+        gate_5_complete=False,
+    )
+    save(
+        "started.json",
+        dict(
+            token=TOKEN,
+            max_seconds=900,
+            human_message=(
+                "ok tahole kor; approved new bounded AWS CPU boot/SSH diagnostic, "
+                "no GPU, training or checkpoint download"
+            ),
+        ),
+    )
+    instance = None
+    stage = "credentials"
+    try:
+        creds = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "configure",
+                "export-credentials",
+                "--profile",
+                "default",
+                "--format",
+                "process",
+            ],
+            capture_output=True,
+            timeout=20,
+            check=True,
+        )
+        need(len(creds.stdout) < 32768)
+        c = json.loads(creds.stdout)
+        session = botocore.session.get_session()
+        session.set_credentials(c["AccessKeyId"], c["SecretAccessKey"], c["SessionToken"])
+        session.set_config_variable("region", "us-east-1")
+        config = Config(
+            retries={"total_max_attempts": 1}, connect_timeout=3, read_timeout=5, proxies={}
+        )
+        ec2 = session.create_client("ec2", config=config)
+        sts = session.create_client("sts", config=config)
+
+        def call(client, op, **fields):
+            # Reserve 30 calls for exact-instance termination and readback.
+            limit = 100 if stage == "cleanup" else 70
+            need(report["aws_calls"] < limit and time.monotonic() - started < 850)
+            report["aws_calls"] += 1
+            return getattr(client, op)(**fields)
+
+        stage = "preflight"
+        need(call(sts, "get_caller_identity")["Account"] == ACCOUNT)
+        endpoint = call(
+            ec2, "describe_instance_connect_endpoints", InstanceConnectEndpointIds=[ENDPOINT]
+        )["InstanceConnectEndpoints"]
+        need(len(endpoint) == 1 and endpoint[0]["State"] == "create-complete")
+        need(endpoint[0]["SubnetId"] == SUBNET and endpoint[0]["VpcId"] == VPC)
+        groups = call(ec2, "describe_security_groups", GroupIds=[GROUP])["SecurityGroups"]
+        need(len(groups) == 1 and groups[0]["OwnerId"] == ACCOUNT and groups[0]["VpcId"] == VPC)
+        collision = call(
+            ec2, "describe_instances", Filters=[dict(Name="client-token", Values=[TOKEN])]
+        )
+        need(not collision.get("NextToken") and not collision["Reservations"])
+        image = call(ec2, "describe_images", ImageIds=[AMI])["Images"]
+        need(len(image) == 1 and image[0]["State"] == "available")
+        need(image[0]["OwnerId"] == "099720109477" and image[0]["Architecture"] == "x86_64")
+        stage = "launch"
+        save("launch-dispatch.json", dict(token=TOKEN, type="t3.micro", maximum=1))
+        report["launch_dispatched"] = True
+        launched = call(
+            ec2,
+            "run_instances",
+            ImageId=AMI,
+            InstanceType="t3.micro",
+            MinCount=1,
+            MaxCount=1,
+            ClientToken=TOKEN,
+            KeyName=KEY_NAME,
+            UserData=user_data(),
+            InstanceInitiatedShutdownBehavior="terminate",
+            MetadataOptions=dict(HttpTokens="required", HttpEndpoint="enabled"),
+            CreditSpecification=dict(CpuCredits="standard"),
+            NetworkInterfaces=[
+                dict(
+                    DeviceIndex=0,
+                    SubnetId=SUBNET,
+                    Groups=[GROUP],
+                    AssociatePublicIpAddress=False,
+                    DeleteOnTermination=True,
+                )
+            ],
+            BlockDeviceMappings=[
+                dict(
+                    DeviceName="/dev/sda1",
+                    Ebs=dict(
+                        VolumeSize=8, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True
+                    ),
+                )
+            ],
+            TagSpecifications=[
+                dict(ResourceType=kind, Tags=[dict(Key="LumiDiagnostic", Value=TOKEN)])
+                for kind in ("instance", "volume")
+            ],
+        )
+        instance = launched["Instances"][0]["InstanceId"]
+        save("launch.json", dict(instance=instance, token=TOKEN))
+        stage = "console_host_key"
+        key = None
+        for _ in range(repair.BOOT_POLLS):
+            need(time.monotonic() - started < 472)
+            row = owned(call(ec2, "describe_instances", InstanceIds=[instance]), instance)
+            need(row["State"]["Name"] in ("pending", "running"))
+            console = call(ec2, "get_console_output", InstanceId=instance, Latest=True)
+            report["console_observation"] = repair.console_summary(console.get("Output", ""))
+            raw_console = console.get("Output", "")
+            if "LUMI_DIAG_STAGE:" not in raw_console:
+                try:
+                    raw_console = base64.b64decode(raw_console, validate=True).decode(
+                        "utf-8", "replace"
+                    )
+                except ValueError:
+                    raw_console = ""
+            report["boot_stages"] = {
+                name: ("LUMI_DIAG_STAGE:" + name) in raw_console
+                for name in (
+                    "bootcmd_enter", "expiry_queued", "expiry_rejected",
+                    "final_enter", "expiry_not_active",
+                )
+            }
+            if console.get("Output"):
+                try:
+                    key = console_key(console["Output"])
+                except (ValueError, UnicodeError):
+                    pass
+            if key:
+                break
+            time.sleep(
+                min(repair.BOOT_INTERVAL_SECONDS, max(0, 472 - (time.monotonic() - started)))
+            )
+        need(key is not None)
+        stage = "ssh_probe"
+        hosts = OUT / "known_hosts"
+        fd = os.open(hosts, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(f"{instance} ssh-ed25519 {key}\n")
+        proxy = (
+            f"/opt/homebrew/bin/aws --profile default --region us-east-1 "
+            f"ec2-instance-connect open-tunnel --instance-id {instance} "
+            f"--instance-connect-endpoint-id {ENDPOINT} --remote-port 22 --max-tunnel-duration 120"
+        )
+        argv = ["/usr/bin/ssh", "-F", "/dev/null", "-T", "-i", str(KEY)]
+        for option in (
+            f"ProxyCommand={proxy}",
+            f"UserKnownHostsFile={hosts}",
+            "GlobalKnownHostsFile=/dev/null",
+            "StrictHostKeyChecking=yes",
+            "BatchMode=yes",
+            "IdentityAgent=none",
+            "IdentitiesOnly=yes",
+            "ConnectTimeout=20",
+            "ConnectionAttempts=1",
+            "LogLevel=QUIET",
+        ):
+            argv += ["-o", option]
+        argv += [f"ubuntu@{instance}"]
+        observations = []
+        killpg = transport.os.killpg
+
+        def observed(group, sig):
+            try:
+                return killpg(group, sig)
+            except BaseException as error:
+                if isinstance(error, PermissionError):
+                    ownership = {"snapshot_available": False}
+                    try:
+                        snap = subprocess.run(
+                            ["/bin/ps", "-axo", "pgid=,uid="],
+                            capture_output=True, timeout=3, check=True,
+                        )
+                        need(len(snap.stdout) <= 262144)
+                        members = [
+                            int(parts[1]) for line in snap.stdout.splitlines()
+                            if len(parts := line.split()) == 2 and int(parts[0]) == group
+                        ]
+                        ownership = dict(
+                            snapshot_available=True, group_members=len(members),
+                            same_uid_members=sum(uid == os.geteuid() for uid in members),
+                            other_uid_members=sum(uid != os.geteuid() for uid in members),
+                        )
+                    except Exception:
+                        pass
+                    observations.append(dict(ownership=ownership))
+                observations.append(
+                    dict(
+                        kind=type(error).__name__
+                        if type(error)
+                        in (
+                            ProcessLookupError,
+                            PermissionError,
+                            OSError,
+                            TimeoutError,
+                            RuntimeError,
+                        )
+                        else "other",
+                        errno=getattr(error, "errno", None) if isinstance(error, OSError) else None,
+                        signal_number=int(sig),
+                    )
+                )
+                raise
+
+        report["probes"] = []
+        for label, remote, body in (
+            ("printf", "/usr/bin/printf LUMI_DIAG_OK", b""),
+            ("sudo_python_stdin", "sudo -n /usr/bin/python3 -I -B -",
+             b'import sys; sys.stdout.write("LUMI_DIAG_OK")\n'),
+        ):
+            need(time.monotonic() - started < 550)
+            row = dict(case=label, reply_matches=False)
+            with patch.object(transport.os, "killpg", side_effect=observed):
+                try:
+                    reply = transport.pipe_exchange(argv + [remote], body, 25)
+                    row["reply_matches"] = reply == b"LUMI_DIAG_OK"
+                except transport.ExchangeFailure as error:
+                    row["failure"] = transport.exchange_diagnostic(error)
+            report["probes"].append(row)
+            if not row["reply_matches"]:
+                break
+        report["probe_reply_matches"] = (
+            len(report["probes"]) == 2 and all(p["reply_matches"] for p in report["probes"])
+        )
+        report["cleanup_observations"] = observations
+        report["status"] = "probe_completed"
+    except BaseException as error:
+        report.update(
+            status="failed_no_retry",
+            failed_stage=stage,
+            error_kind=type(error).__name__
+            if type(error) in (ValueError, TimeoutError, subprocess.TimeoutExpired)
+            else "other",
+        )
+    finally:
+        stage = "cleanup"
+        if report["launch_dispatched"]:
+            try:
+                fields = (
+                    dict(InstanceIds=[instance])
+                    if instance
+                    else dict(Filters=[dict(Name="client-token", Values=[TOKEN])])
+                )
+                response = call(ec2, "describe_instances", **fields)
+                row, terminal = cleanup_observation(response, instance)
+                instance = row["InstanceId"]
+                report["instance"] = instance
+                if terminal:
+                    report["terminated_verified"] = True
+                if not terminal and row["State"]["Name"] != "shutting-down":
+                    save("terminate-dispatch.json", dict(instance=instance, token=TOKEN))
+                    report["terminate_dispatched"] = True
+                    call(ec2, "terminate_instances", InstanceIds=[instance])
+                for _ in range(repair.CLEANUP_POLLS):
+                    if report["terminated_verified"]:
+                        break
+                    need(time.monotonic() - started < 812)
+                    response = call(ec2, "describe_instances", InstanceIds=[instance])
+                    row, terminal = cleanup_observation(response, instance)
+                    if terminal:
+                        report["terminated_verified"] = True
+                        break
+                    time.sleep(
+                        min(
+                            repair.CLEANUP_INTERVAL_SECONDS,
+                            max(0, 812 - (time.monotonic() - started)),
+                        )
+                    )
+                if not report["terminated_verified"]:
+                    report["cleanup_unresolved"] = True
+            except BaseException:
+                report["cleanup_unresolved"] = True
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        save("result.json", report)
+        print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

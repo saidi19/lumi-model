@@ -1,0 +1,253 @@
+"""Offline regression for terminal EC2 shape and bounded console observation."""
+
+import ast
+import base64
+import copy
+import gzip
+import json
+import shlex
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_boot_smoke_v1.py").read_text()
+old = 'm = importlib.import_module("execute_sft_vm_boot_smoke_v1")'
+assert source.count(old) == 1
+inherited = types.ModuleType("_smoke_v5_tests")
+exec(
+    compile(
+        source.replace(old, 'm = importlib.import_module("execute_sft_vm_boot_smoke_v5")'),
+        "<v5-inherited>",
+        "exec",
+    ),
+    inherited.__dict__,
+)
+m = inherited.m
+
+
+class TerminalCloud(inherited.Cloud):
+    """AWS removes detached networking after termination, unlike the old fake."""
+
+    def __getattr__(self, operation):
+        original = super().__getattr__(operation)
+
+        def call(**fields):
+            result = original(**fields)
+            if operation == "terminate_instances":
+                for key in ("VpcId", "SubnetId", "SecurityGroups", "NetworkInterfaces"):
+                    self.instance.pop(key, None)
+                self.instance["BlockDeviceMappings"] = []
+            return result
+
+        return call
+
+
+class LifecycleTests(inherited.SmokeTests):
+    def test_empty_console_is_not_pass_and_still_cleans_up(self):
+        cloud = TerminalCloud()
+        cloud.console = ""
+        result, records = self.run_smoke(cloud)
+        self.assertFalse(result["boot_passed"])
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(result["console_observations"], 30)
+        self.assertEqual(result["boot_observation_outcome"], "empty_console")
+        self.assertEqual(result["elapsed_seconds"], 240)
+        self.assertEqual(sum(n.startswith("state-") for n in records), 24)
+        self.assertLess(result["calls"], 128)
+        self.assertEqual([op for op, _ in cloud.calls].count("terminate_instances"), 1)
+
+
+class RepairTests(unittest.TestCase):
+    def run_smoke(self, cloud):
+        return inherited.SmokeTests().run_smoke(cloud)
+
+    def bound_terminal(self):
+        cloud = TerminalCloud()
+        result, _ = self.run_smoke(cloud)
+        self.assertTrue(result["cleanup_verified"])
+        smoke = m.Smoke(dict(ec2=cloud), lambda *_: None, clock=lambda: 0)
+        smoke.instance = inherited.INSTANCE
+        return cloud, smoke
+
+    def test_observed_terminal_shape_cleans_up_in_one_run(self):
+        cloud = TerminalCloud()
+        result, records = self.run_smoke(cloud)
+        self.assertEqual(result["status"], "boot_passed_cleanup_verified")
+        self.assertTrue(
+            all(
+                result[k]
+                for k in ("instance_terminated", "root_volume_deleted", "security_group_deleted")
+            )
+        )
+        ops = [op for op, _ in cloud.calls]
+        self.assertEqual(ops.count("run_instances"), 1)
+        self.assertEqual(ops.count("terminate_instances"), 1)
+        self.assertEqual(ops.count("delete_security_group"), 1)
+        self.assertNotIn("cleanup_failed", records["result"])
+
+    def test_terminal_identity_must_have_been_bound_before_network_disappears(self):
+        _, smoke = self.bound_terminal()
+        smoke.instance = None
+        with self.assertRaises(ValueError):
+            smoke.instance_row()
+
+    def test_terminal_foreign_identity_or_conflicting_network_rejected(self):
+        cloud, smoke = self.bound_terminal()
+        original = copy.deepcopy(cloud.instance)
+        changes = {
+            "InstanceId": "i-" + "d" * 17,
+            "ClientToken": "foreign",
+            "ImageId": "ami-foreign",
+            "InstanceType": "r6i.4xlarge",
+            "Tags": [],
+            "VpcId": "vpc-foreign",
+            "SubnetId": "subnet-foreign",
+            "KeyName": "foreign",
+            "IamInstanceProfile": {"Arn": "foreign"},
+        }
+        for field, value in changes.items():
+            cloud.instance = dict(copy.deepcopy(original), **{field: value})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                smoke.instance_row()
+
+    def test_nonterminal_missing_network_still_rejected(self):
+        cloud, smoke = self.bound_terminal()
+        for state in ("pending", "running", "stopping", "stopped", "shutting-down"):
+            cloud.instance["State"]["Name"] = state
+            with self.subTest(state=state), self.assertRaises((KeyError, ValueError)):
+                smoke.instance_row()
+
+    def test_terminal_owner_and_unknown_state_rejected(self):
+        cloud, smoke = self.bound_terminal()
+        cloud.instance["State"]["Name"] = "unknown"
+        with self.assertRaises(ValueError):
+            smoke.instance_row()
+        cloud.instance["State"]["Name"] = "terminated"
+
+        class WrongOwner:
+            def describe_instances(self, **_):
+                return dict(Reservations=[dict(OwnerId="foreign", Instances=[cloud.instance])])
+
+        smoke.clients["ec2"] = WrongOwner()
+        with self.assertRaises(ValueError):
+            smoke.instance_row()
+
+    def test_cached_snapshot_fallback_passes_without_merging(self):
+        class Cloud(TerminalCloud):
+            def __getattr__(self, op):
+                original = super().__getattr__(op)
+
+                def call(**kw):
+                    value = original(**kw)
+                    if op == "get_console_output" and kw["Latest"]:
+                        value["Output"] = ""
+                    return value
+
+                return call
+
+        cloud = Cloud()
+        result, records = self.run_smoke(cloud)
+        self.assertTrue(result["boot_passed"])
+        self.assertEqual(result["console_observations"], 2)
+        self.assertTrue(records["console-cached-00"]["passed"])
+
+    def test_delayed_console_after_six_observations_not_discarded(self):
+        class Cloud(TerminalCloud):
+            count = 0
+
+            def __getattr__(self, op):
+                original = super().__getattr__(op)
+
+                def call(**kw):
+                    value = original(**kw)
+                    if op == "get_console_output":
+                        self.count += 1
+                        if self.count <= 8:
+                            value["Output"] = ""
+                    return value
+
+                return call
+
+        result, _ = self.run_smoke(Cloud())
+        self.assertTrue(result["boot_passed"])
+        self.assertGreater(result["console_observations"], 6)
+
+    def test_rejection_never_overridden_by_cached_success(self):
+        cloud = TerminalCloud()
+        cloud.console = "LUMI_BOOT_V2:rejected"
+        result, _ = self.run_smoke(cloud)
+        self.assertFalse(result["boot_passed"])
+        self.assertEqual(result["boot_observation_outcome"], "markers_not_accepted")
+        self.assertFalse(
+            any(kw.get("Latest") is False for op, kw in cloud.calls if op == "get_console_output")
+        )
+
+    def test_cleanup_failure_has_fixed_stage_operation_without_exception(self):
+        class Cloud(TerminalCloud):
+            def __getattr__(self, op):
+                original = super().__getattr__(op)
+
+                def call(**kw):
+                    if op == "describe_volumes" and self.instance["State"]["Name"] == "terminated":
+                        raise ValueError("PRIVATE_EXCEPTION")
+                    return original(**kw)
+
+                return call
+
+        result, records = self.run_smoke(Cloud())
+        self.assertTrue(result["cleanup_failed"])
+        self.assertEqual(result["cleanup_failed_stage"], "cleanup")
+        self.assertEqual(result["cleanup_failed_operation"], "describe_volumes")
+        self.assertNotIn("PRIVATE_EXCEPTION", json.dumps(records))
+
+    def test_payload_routes_exact_native_command_to_serial_with_existing_timeout(self):
+        cfg = json.loads(gzip.decompress(m.user_data()).removeprefix(b"#cloud-config\n"))
+        shell = cfg["bootcmd"][0][-1]
+        argv = shlex.split(shell)
+        self.assertEqual(argv[:5], ["/usr/bin/timeout", "--signal=KILL", "180s", "/bin/sh", "-c"])
+        self.assertTrue(argv[5].startswith("exec >/dev/ttyS0 2>&1; "))
+        frozen = json.loads(gzip.decompress(m.boot.user_data()).removeprefix(b"#cloud-config\n"))
+        self.assertIn(frozen["bootcmd"][0][-1], argv[5])
+        self.assertIn("|| /usr/bin/systemctl --no-block poweroff", shell)
+        self.assertLessEqual(len(m.user_data()), 16384)
+
+    def test_sdk_already_decodes_console_do_not_decode_twice(self):
+        from botocore.handlers import decode_console_output
+
+        response = dict(
+            InstanceId=inherited.INSTANCE,
+            Output=base64.b64encode(inherited.console().encode()).decode(),
+        )
+        decode_console_output(response)
+        self.assertTrue(m.console_summary(response, inherited.INSTANCE)["passed"])
+
+    def test_unchanged_cloud_scope_and_caps_and_no_execution_approval(self):
+        def nodes(version):
+            tree = ast.parse(
+                (ROOT / f"scripts/execute_sft_vm_boot_smoke_v{version}.py").read_text()
+            )
+            result = {n.name: ast.dump(n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+            cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Smoke")
+            result.update({n.name: ast.dump(n) for n in cls.body if isinstance(n, ast.FunctionDef)})
+            return result
+
+        old_nodes, new_nodes = nodes(4), nodes(5)
+        for name in (
+            "open_clients",
+            "call",
+            "cleanup",
+            "volume_check",
+            "launch_request",
+            "launch",
+            "preflight",
+            "validate_image_mappings",
+            "console_summary",
+            "main",
+        ):
+            self.assertEqual(old_nodes[name], new_nodes[name], name)
+        self.assertNotEqual(m.PLAN.name, "lumi-vm-boot-smoke-approval-v0.4.json")
+
+
+if __name__ == "__main__":
+    unittest.main()

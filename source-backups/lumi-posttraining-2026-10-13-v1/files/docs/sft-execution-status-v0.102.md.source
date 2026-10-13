@@ -1,0 +1,32 @@
+# SFT execution status v0.102
+
+2026-09-22. The read-only census result is complete and the final Source CI
+metadata is now `success` (run `35635788165`, attempt 1). Spark CI also passed.
+No remote action was started in this turn.
+
+## Safe next design, not yet authorized for publication
+
+The exact SDK census reached the existing 250,000-descendant-node cap. Raising
+that cap or rerunning the cleanup would weaken the reviewed bound and would not
+be safe. The cleanup also cannot proceed from a partial map because it needs a
+complete, stable descriptor census before any mutation.
+
+The minimal safe successor is a **sharded, read-only metadata census**:
+
+1. Enumerate only the exact SDK root's immediate child entries by metadata.
+2. Census each child subtree independently, retaining the existing per-shard
+   limits: 250,000 nodes, depth 48, 32 MiB cumulative relative-name bytes,
+   and 64 GiB allocated blocks.
+3. Retain only aggregate shard counts, cumulative allocated bytes, and fixed
+   `shard_budget_hit`/identity/tree codes—never names, paths, payloads or
+   exceptions.
+4. Stop on any shard bound or identity/mount anomaly. Do not delete, run the
+   setup probe, acquire an image, raise limits, or launch qualification.
+
+This design preserves the current caps and avoids the unsafe inference that a
+single capped global map is complete. It has not been implemented, published,
+or run. A fresh bounded approval is required before creating a remote workflow
+or executing it. Existing attempt 1 remains consumed; prior evidence and all
+source bindings remain unchanged.
+
+`production_eligible=false` and Gate 5 incomplete remain unchanged.

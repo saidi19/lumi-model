@@ -1,0 +1,76 @@
+"""Offline checks for the fresh attempt-020 successor preflight."""
+
+import ast
+import socket
+import sys
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import preflight_sft_vm_attempt020_v2 as m
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        m.bind()
+        self.client = Mock()
+        self.budget = {"calls": 0, "start": time.monotonic()}
+        self.wrapper = m.ReadOnlyClient(self.client, self.budget)
+
+    def test_pinned_successor_graph_and_unique_output(self):
+        m.runtime()
+        outer, manifest, pins = m.local()
+        self.assertEqual(manifest["attempt"], m.ATTEMPT)
+        self.assertEqual(manifest["nested_setup_members_verified"], 19)
+        self.assertEqual(len(pins), 2)
+        self.assertNotEqual(m.OUTPUT, m.CONSUMED_OUTPUT)
+        self.assertTrue(m.CONSUMED_OUTPUT.is_dir())
+        self.assertTrue(callable(m.admission(outer)))
+
+    def test_mutations_and_objects_are_rejected(self):
+        for name in ("run_instances", "delete_subnet", "get_object", "list_objects_v2"):
+            with self.assertRaises(ValueError):
+                getattr(self.wrapper, name)()
+        self.assertFalse(self.client.mock_calls)
+
+    def test_read_budget_is_bounded(self):
+        self.wrapper.describe_instances(InstanceIds=["synthetic"])
+        self.assertEqual(self.budget["calls"], 1)
+        self.budget["calls"] = 79
+        with self.assertRaises(ValueError):
+            self.wrapper.describe_instances()
+
+    def test_no_execution_path(self):
+        function = m.admission(None)
+        self.assertNotIn("run", function.__globals__)
+        tree = ast.parse(Path(m.__file__).read_bytes())
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Attribute) and node.attr == "_run_network_host_once"
+                for node in ast.walk(tree)
+            )
+        )
+
+    def test_runtime_or_binding_drift_rejected(self):
+        for key in (
+            "QUALIFIED_SHA",
+            "BINDINGS_SHA",
+            "CORRECTION_SHA",
+            "FAILURE_SHA",
+            "BOTOCORE_INIT_SHA",
+        ):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.runtime()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

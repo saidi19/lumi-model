@@ -1,0 +1,283 @@
+"""Real tiny checksum/filesystem work; native unit/host admission doubled."""
+import ast
+import hashlib
+import importlib
+import importlib.util
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PKG = "_vm_fullsize_completion_tests"
+package = types.ModuleType(PKG)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PKG] = package
+m = importlib.import_module(PKG + ".posttraining_vm_fullsize_completion_v1")
+spec = importlib.util.spec_from_file_location("fullsize_package_check",
+    ROOT / "scripts/verify_sft_vm_fullsize_package_v1.py")
+worker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(worker)
+ATTEMPT = "1" * 32
+PINS = {key: "b" * 64 for key in m.handoff.PINS}
+SUCCESS = {"Result": "success", "ActiveState": "active", "SubState": "exited",
+           "ExecMainCode": "1", "ExecMainStatus": "0"}
+
+
+def frozen_consumer():
+    # Identical existing runtime functions, not a new checksum implementation.
+    path = ROOT / "src/lumi/posttraining_sft_runtime_v4.py"
+    names = {"_sha256_file", "_require_private_regular", "_verify_checksum_manifest"}
+    nodes = [node for node in ast.parse(path.read_bytes()).body
+             if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert len(nodes) == 3
+    namespace = {"Path": Path, "hashlib": hashlib, "os": os, "stat": stat,
+                 "_PRIVATE_DIRECTORY_MODE": 0o700, "_PRIVATE_FILE_MODE": 0o600}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_verify_checksum_manifest"]
+
+
+def write(path, raw):
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        write(self.root / "config.json", b"{}")
+        write(self.root / "model.safetensors", b"synthetic opaque bytes")
+        self.manifest()
+        self.consumer = frozen_consumer()
+
+    def manifest(self):
+        self.raw = b"".join(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {p.name}\n".encode()
+                           for p in sorted(self.root.iterdir()) if p.name != "manifest.sha256")
+        write(self.root / "manifest.sha256", self.raw)
+        self.pin = hashlib.sha256(self.raw).hexdigest()
+
+    def test_existing_consumer_accepts_exact_package_and_counts_extra_manifest_reads(self):
+        result = worker.verify_package(self.root, self.pin, self.consumer)
+        total = sum(p.stat().st_size for p in self.root.iterdir())
+        self.assertEqual(result["files"], 3)
+        self.assertEqual(result["package_bytes"], total)
+        self.assertEqual(result["maximum_content_read_bytes"], total + 2*len(self.raw))
+        self.assertTrue(result["independent_checksum_consumer"])
+        self.assertFalse(result["offhost_retention_verified"])
+
+    def test_corrupted_tensor_rejected_by_unchanged_consumer(self):
+        write(self.root / "model.safetensors", b"changed")
+        with self.assertRaises(ValueError):
+            worker.verify_package(self.root, self.pin, self.consumer)
+
+    def test_duplicate_manifest_lines_rejected_before_consumer_repeated_reads(self):
+        raw = self.raw + self.raw.splitlines(keepends=True)[0]
+        write(self.root / "manifest.sha256", raw)
+        check = Mock()
+        with self.assertRaises(ValueError):
+            worker.verify_package(self.root, worker.sha(raw), check)
+        check.assert_not_called()
+
+    def test_wrong_manifest_pin_and_extra_file_rejected_before_consumer(self):
+        check = Mock()
+        with self.assertRaises(ValueError):
+            worker.verify_package(self.root, "0"*64, check)
+        write(self.root / "extra", b"extra")
+        with self.assertRaises(ValueError):
+            worker.verify_package(self.root, self.pin, check)
+        check.assert_not_called()
+
+    def test_symlink_never_followed(self):
+        (self.root / "link").symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            worker.private_tree(self.root, self.pin)
+
+    def test_hardlink_rejected(self):
+        os.link(self.root / "config.json", self.root / "alias")
+        with self.assertRaises(ValueError):
+            worker.private_tree(self.root, self.pin)
+
+    def test_bad_private_mode_rejected(self):
+        (self.root / "config.json").chmod(0o644)
+        with self.assertRaises(ValueError):
+            worker.private_tree(self.root, self.pin)
+
+    def test_content_capacity_rejected_before_consumer(self):
+        with patch.object(worker, "MAX_PACKAGE_BYTES", 1):
+            with self.assertRaises(ValueError):
+                worker.verify_package(self.root, self.pin, Mock())
+
+    def test_actual_consumer_reads_bounded_content_total(self):
+        # Frozen consumer content reads are independently counted here.
+        total = 0
+        original = Path.open
+        class Counted:
+            def __init__(self, handle): self.handle = handle
+            def __enter__(self): return self
+            def __exit__(self, *args): return self.handle.__exit__(*args)
+            def read(self, *args):
+                nonlocal total
+                raw = self.handle.read(*args)
+                total += len(raw.encode() if isinstance(raw, str) else raw)
+                return raw
+            def __getattr__(self, key): return getattr(self.handle, key)
+        with patch.object(Path, "open", lambda path, *a, **kw: Counted(original(path, *a, **kw))):
+            result = worker.verify_package(self.root, self.pin, self.consumer)
+        # Preflight uses an fd rather than Path.open, so add its single manifest read.
+        self.assertEqual(total + len(self.raw), result["maximum_content_read_bytes"])
+
+    def test_native_worker_boundary_rejects_local_invocation(self):
+        with self.assertRaises(ValueError):
+            worker.boundary(ATTEMPT)
+
+
+class CompletionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.destination = self.root / ATTEMPT
+        self.destination.mkdir(mode=0o700)
+        (self.destination / "stage").mkdir(mode=0o700)
+        output = self.destination / "stage/outputs"
+        output.mkdir(mode=0o700)
+        write(output / "original-evidence", b"preserve verbatim")
+        self.enterContext(patch.object(m.handoff, "ROOT", self.root))
+        self.dispatch = self.enterContext(patch.object(m.handoff, "_dispatch_admitted_once"))
+        self.run = self.enterContext(patch.object(m, "_run_verifier"))
+        self.enterContext(patch.object(m.os, "chown"))
+        self.empty = self.enterContext(patch.object(m.frozen, "cgroup_empty", return_value=True))
+        self.summary = {"schema": "lumi.vm-fullsize-worker-result.v0.1",
+            "independent_checksum_consumer": False, "real_4b_import": False,
+            "gate_5_complete": False, "package_manifest_sha256": "a" * 64,
+            "entry": {"status": "coordinator_returned_parent_verification_required", **PINS,
+                      "checkpoint_full_audits": 2, "tokenizer_full_audits": 2}}
+        self.verification = {"schema": "lumi.vm-fullsize-package-verification.v0.1",
+            "status": "passed", "package_manifest_sha256": "a" * 64,
+            "independent_checksum_consumer": True, "offhost_retention_verified": False,
+            "real_4b_import": False, "gate_5_complete": False, "training_authorized": False,
+            "files": 3, "package_bytes": 500, "maximum_content_read_bytes": 800}
+        self.enterContext(patch.object(m, "_read_worker_report", side_effect=self.report))
+
+    def report(self, path, cap):
+        value = self.summary if path.name == "summary.json" else self.verification
+        return json.dumps(value).encode(), value
+
+    def execute(self):
+        return m._complete_admitted_once(ATTEMPT, PINS, machine_id="f" * 32,
+                                         deadline=time.monotonic()+4800)
+
+    def test_import_verify_reap_and_atomic_local_preservation(self):
+        result = self.execute()
+        self.dispatch.assert_called_once()
+        self.run.assert_called_once()
+        self.assertEqual(self.empty.call_count, 3)
+        self.assertEqual((self.destination / "retained/outputs/original-evidence").read_bytes(),
+                         b"preserve verbatim")
+        self.assertTrue(result["local_output_tree_preserved"])
+        self.assertFalse(result["instance_termination_allowed"])
+        self.assertFalse(result["offhost_retention_verified"])
+        self.assertTrue((self.destination / "completion.json").is_file())
+
+    def test_joined_tiny_package_consumed_and_preserved_verbatim(self):
+        root = self.destination / "stage/outputs/import/attempt-001/checkpoint"
+        root.mkdir(mode=0o700, parents=True)
+        # Intermediate mkdir modes are explicit, as they are in the real coordinator.
+        root.parent.chmod(0o700)
+        root.parent.parent.chmod(0o700)
+        write(root / "config.json", b"{}")
+        write(root / "model.safetensors", b"opaque generated package, not 4B weights")
+        raw = b"".join(f"{worker.sha(p.read_bytes())}  {p.name}\n".encode()
+                       for p in sorted(root.iterdir()))
+        write(root / "manifest.sha256", raw)
+        self.summary["package_manifest_sha256"] = worker.sha(raw)
+        def check(_attempt, pin, _source_pin, _deadline):
+            self.verification = worker.verify_package(root, pin, frozen_consumer())
+        self.run.side_effect = check
+        result = self.execute()
+        retained = self.destination / "retained/outputs/import/attempt-001/checkpoint"
+        self.assertEqual((retained / "manifest.sha256").read_bytes(), raw)
+        self.assertEqual(frozen_consumer()(retained, expected_manifest_sha256=worker.sha(raw),
+            require_exact_inventory=True, require_private=True), result["package_manifest_sha256"])
+
+    def test_failed_fsync_retains_original_without_success(self):
+        with patch.object(m, "_fsync_directory", side_effect=OSError("private error")):
+            with self.assertRaisesRegex(ValueError, "completion_failed_retain"):
+                self.execute()
+        self.assertTrue((self.destination / "stage/outputs/original-evidence").is_file())
+        self.assertFalse((self.destination / "completion.json").exists())
+
+    def test_import_failure_prevents_verifier_and_retention(self):
+        self.dispatch.side_effect = ValueError("import")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.run.assert_not_called()
+        self.assertFalse((self.destination / "retained").exists())
+
+    def test_verify_failure_preserves_original_and_records_stage(self):
+        self.run.side_effect = ValueError("private raw error")
+        with self.assertRaisesRegex(ValueError, "completion_failed_verify_unit"):
+            self.execute()
+        self.assertTrue((self.destination / "stage/outputs/original-evidence").is_file())
+        report = json.loads((self.destination / "completion-failed.json").read_bytes())
+        self.assertEqual(report["stage"], "verify_unit")
+        self.assertNotIn("private", json.dumps(report))
+
+    def test_wrong_control_binding_prevents_verification(self):
+        self.summary["entry"]["control_sha256"] = "c" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.run.assert_not_called()
+
+    def test_false_or_mismatched_verification_cannot_retain(self):
+        self.verification["package_manifest_sha256"] = "d" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertFalse((self.destination / "retained").exists())
+
+    def test_live_child_blocks_retention(self):
+        self.empty.return_value = False
+        with self.assertRaisesRegex(ValueError, "completion_failed_retain"):
+            self.execute()
+        self.assertFalse((self.destination / "retained").exists())
+
+    def test_existing_retention_is_not_overwritten(self):
+        (self.destination / "retained").mkdir(mode=0o700)
+        write(self.destination / "retained/old", b"old")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual((self.destination / "retained/old").read_bytes(), b"old")
+        self.assertTrue((self.destination / "stage/outputs/original-evidence").exists())
+
+    def test_verify_unit_has_no_writable_package_or_network(self):
+        args = m.verify_command(ATTEMPT, "a"*64, "b"*64)
+        self.assertIn("--property=PrivateNetwork=yes", args)
+        self.assertIn("--property=MemoryMax=2147483648", args)
+        binds = [arg for arg in args if arg.startswith("--property=BindPaths=")]
+        self.assertEqual(len(binds), 1)
+        self.assertTrue(binds[0].endswith("/stage/verification:/results"))
+        self.assertTrue(any("checkpoint:/package" in arg for arg in args))
+
+    def test_verifier_stopped_on_ambiguous_dispatch(self):
+        commands = Mock(side_effect=[types.SimpleNamespace(returncode=0, stdout=b"not-found"),
+                                    TimeoutError("private details")])
+        with patch.object(m.frozen, "run_command", commands), \
+             patch.object(m.handoff, "_stop_and_reap") as stop:
+            with self.assertRaises(TimeoutError):
+                # Saved native supervision function, with only subprocesses doubled.
+                RUN_VERIFIER(ATTEMPT, "a"*64, "b"*64, time.monotonic()+30)
+            stop.assert_called_once_with(m.verify_unit(ATTEMPT))
+
+    def test_public_route_remains_closed(self):
+        with self.assertRaisesRegex(m.handoff.HandoffError, "host_guard_not_bound"):
+            m.complete_import(approved=True)
+
+
+RUN_VERIFIER = m._run_verifier
+
+if __name__ == "__main__":
+    unittest.main()

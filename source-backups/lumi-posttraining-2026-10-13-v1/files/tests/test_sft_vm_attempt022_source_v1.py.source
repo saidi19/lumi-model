@@ -1,0 +1,224 @@
+"""Actual fresh source graph and fixed watchdog transport, entirely offline."""
+
+import ast
+import importlib
+import json
+import re
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from botocore.exceptions import ClientError, ReadTimeoutError
+
+from scripts import prepare_sft_vm_attempt022_v1 as build
+
+
+class Client:
+    def __init__(self, service, error=None):
+        self.error, self.calls = error, []
+        self.meta = types.SimpleNamespace(
+            endpoint_url="https://iam.amazonaws.com"
+            if service == "iam"
+            else f"https://{service}.us-east-1.amazonaws.com",
+            region_name="us-east-1",
+            config=types.SimpleNamespace(
+                retries={"total_max_attempts": 1}, connect_timeout=3, read_timeout=5, proxies={}
+            ),
+        )
+
+    def __getattr__(self, name):
+        def call(**fields):
+            self.calls.append(name)
+            if self.error is not None:
+                raise self.error
+            return {}
+
+        return call
+
+
+def normalize(raw):
+    raw = raw.replace(build.NEW.encode(), build.OLD.encode())
+    for before, after in (
+        ("attempt-022", "attempt-021"),
+        ("Attempt-022", "Attempt-021"),
+        ("attempt022", "attempt021"),
+        (build.NEW_CIDR, build.OLD_CIDR),
+    ):
+        raw = raw.replace(before.encode(), after.encode())
+    raw = raw.replace(Tests.release["watchdog_code_sha256_base64"].encode(), b"CODE")
+    raw = raw.replace(Tests.base_release["watchdog_code_sha256_base64"].encode(), b"CODE")
+    return re.sub(rb"\b[0-9a-f]{64}\b", b"BOUND_HASH", raw)
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.release = build.build()
+        cls.base_release = json.loads(build.read(build.BASE / "release.json", build.BASE_SHA))
+        cls.base = {
+            name: build.read(build.BASE / name, pin["sha256"], pin["bytes"])
+            for name, pin in cls.base_release["outputs"].items()
+        }
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name).resolve()
+        for name, body in cls.files.items():
+            path = cls.root / name
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path.write_bytes(body)
+        cls.names = {Path(name).stem for name in cls.files if name.startswith("scripts/")}
+        cls.previous = {name: sys.modules.pop(name) for name in cls.names if name in sys.modules}
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        cls.outer.authenticate()
+        cls.outer.loading.fresh_identity()
+        cls.loader = cls.outer.loading
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(str(cls.root / "scripts"))
+        for name in cls.names:
+            sys.modules.pop(name, None)
+        sys.modules.update(cls.previous)
+        cls.temp.cleanup()
+
+    def cloud(self, error):
+        clients = {service: Client(service) for service in self.loader.original_guard.OPS}
+        clients["scheduler"].error = error
+        return self.loader.WatchdogCloud(clients), clients
+
+    def test_complete_graph_authenticates_fresh_identity(self):
+        self.assertEqual(len(self.files), 156)
+        self.assertEqual(self.outer.network.selection.ATTEMPT, build.NEW)
+        self.assertNotEqual(build.NEW, build.OLD)
+        self.assertEqual(self.release["qualified_loader_implementation_sha256"], build.FIX_SHA)
+        self.assertTrue(self.release["internal_loader_import_filename_preserved"])
+
+    def test_bound_loader_is_exact_qualified_fix_with_identity_and_hash_changes_only(self):
+        qualified = build.read(build.ROOT / build.fix.OUTPUT, build.FIX_SHA)
+        self.assertEqual(ast.dump(ast.parse(normalize(self.files[build.LOADER]))),
+                         ast.dump(ast.parse(normalize(qualified))))
+
+    def test_all_other_python_semantics_unchanged_except_identity_and_bindings(self):
+        count = 0
+        for name, body in self.files.items():
+            if name.endswith(".py") and name != build.LOADER:
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        ast.dump(ast.parse(normalize(body))),
+                        ast.dump(ast.parse(normalize(self.base[name]))),
+                    )
+                    count += 1
+        self.assertGreater(count, 100)
+
+    def test_json_resource_caps_and_source_objects_unchanged(self):
+        def clean(value):
+            if type(value) is dict:
+                result = {key: clean(child) for key, child in value.items()}
+                if type(value.get("bytes")) is int and value.get("sha256") == "BOUND_HASH":
+                    result["bytes"] = "BOUND_BYTE_COUNT"
+                return result
+            if type(value) is list:
+                return [clean(child) for child in value]
+            return value
+
+        for name, body in self.files.items():
+            if name.startswith("configs/") and name.endswith(".json"):
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        clean(json.loads(normalize(body))),
+                        clean(json.loads(normalize(self.base[name]))),
+                    )
+
+    def test_new_network_selection_not_claimed_live(self):
+        self.assertFalse(self.release["selected_cidr_live_absence_verified"])
+        self.assertFalse(self.release["current_readback_proves_fresh_identity"])
+        self.assertTrue(self.release["fresh_controls_required"])
+        self.assertTrue(self.release["fresh_live_admission_required"])
+        plan = json.loads(self.files["configs/lumi-vm-private-network-plan-v0.1.json"])
+        self.assertEqual(plan["targets"]["new_private_subnet_cidr"], build.NEW_CIDR)
+
+    def test_installed_fix_keeps_finite_aws_code_and_one_dispatch(self):
+        error = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "PRIVATE_RAW_TEXT"}},
+            "GetScheduleGroup",
+        )
+        cloud, clients = self.cloud(error)
+        with self.assertRaises(self.loader.WatchdogCloudFailure) as caught:
+            cloud.cli("scheduler", "get-schedule-group", Name="synthetic")
+        self.assertEqual(
+            caught.exception.diagnostic, dict(kind="aws_service", code="AccessDeniedException")
+        )
+        self.assertEqual(len(clients["scheduler"].calls), 1)
+        self.assertNotIn("PRIVATE_RAW_TEXT", json.dumps(caught.exception.diagnostic))
+
+    def test_expected_absence_remains_required_lookup(self):
+        error = ClientError(
+            {"Error": {"Code": "ResourceNotFoundException", "Message": "PRIVATE_RAW_TEXT"}},
+            "GetScheduleGroup",
+        )
+        cloud, clients = self.cloud(error)
+        with self.assertRaises(LookupError):
+            cloud.cli("scheduler", "get-schedule-group", Name="synthetic")
+        self.assertEqual(cloud.failure_record, {})
+        self.assertEqual(len(clients["scheduler"].calls), 1)
+
+    def test_transport_timeout_metadata_is_preserved_without_endpoint(self):
+        cloud, _ = self.cloud(ReadTimeoutError(endpoint_url="https://PRIVATE_RAW_TEXT"))
+        with self.assertRaises(self.loader.WatchdogCloudFailure) as caught:
+            cloud.cli("scheduler", "get-schedule-group", Name="synthetic")
+        self.assertEqual(caught.exception.diagnostic, dict(kind="read_timeout", code="none"))
+
+    def test_setup_and_root_archives_remain_fully_bound(self):
+        receipt = build.previous.repair.check(
+            self.files[build.previous.SETUP_SEND],
+            self.files[build.previous.SETUP_STAGE],
+            self.files[build.SETUP_TAR],
+            self.root / build.previous.SETUP_STAGE,
+        )
+        self.assertEqual(receipt["files"], 19)
+        self.assertFalse(receipt["host_admitted"])
+        members = build.previous.source.source.previous.previous.tar_members(self.files[build.TAR])
+        manifest = json.loads(members["release-manifest.json"])
+        self.assertTrue(all(build.sha(members[n]) == sha for n, sha in manifest.items()))
+        self.assertEqual(members["controls/input-selection.json"], self.files[build.SELECTION])
+
+    def test_frozen_archive_and_evidence_bytes_preserved(self):
+        for name, raw in self.base.items():
+            if name not in (build.TAR, build.SETUP_TAR) and (
+                "/" not in name
+                or name.startswith("evidence/")
+                or name.endswith((".tar", ".gz", ".pem"))
+            ):
+                self.assertEqual(self.files[name], raw)
+
+    def test_old_identity_and_authority_rejected(self):
+        self.assertFalse(self.release["execution_permitted"])
+        self.assertFalse(self.release["old_authorization_reused"])
+        self.assertFalse(self.release["old_timer_reused"])
+        self.assertFalse(self.release["historical_failure_cause_proven"])
+        with self.assertRaises(ValueError):
+            self.outer.run(approved=True)
+        with self.assertRaises(ValueError):
+            build.run(approved=True)
+        for name, raw in self.files.items():
+            if name.startswith("scripts/"):
+                self.assertNotIn(build.OLD.encode(), raw)
+
+    def test_evidence_drift_is_rejected_before_output(self):
+        with patch.object(build, "read", side_effect=ValueError), self.assertRaises(ValueError):
+            build.build()
+
+    def test_mutation_or_foreign_update_still_rejected_without_dispatch(self):
+        cloud, clients = self.cloud(None)
+        with self.assertRaises(self.loader.WatchdogCloudFailure):
+            cloud.cli("scheduler", "create-schedule-group", Name="synthetic")
+        with self.assertRaises(self.loader.WatchdogCloudFailure):
+            cloud.cli("lambda", "update-function-code", FunctionName="foreign")
+        self.assertTrue(all(not client.calls for client in clients.values()))
+
+
+if __name__ == "__main__":
+    unittest.main()

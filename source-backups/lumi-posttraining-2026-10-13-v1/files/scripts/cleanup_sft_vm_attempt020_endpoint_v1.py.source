@@ -1,0 +1,171 @@
+"""Exact attempt-020 endpoint cleanup binding; qualified mechanics unchanged."""
+
+import json
+import types
+from pathlib import Path
+
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+
+ROOT = Path(__file__).resolve().parents[1]
+QUALIFIED = ROOT / "scripts/cleanup_sft_vm_attempt019_endpoint_v1.py"
+QUALIFIED_SHA = "a04db2d39ad19ccdf55b7ba1be6755e4854dd0dc24047172524964c424ca5fbe"
+APPROVAL = "configs/lumi-vm-attempt-020-endpoint-cleanup-approval-v0.1.json"
+APPROVAL_SHA = "43e0b21b9150d0d8c5a3a63ae9f53ff99e1e0a5c2cfd753c78ec5bff630f64c3"
+AUDIT = "evidence/lumi-vm-attempt-020-v025-execution-verification-v0.1.json"
+AUDIT_SHA = "f18eae3048a52d319e6cf8c4d57e151be798f43a9505ce15af9ff3b4f92c42e1"
+BLOCKER = "evidence/lumi-vm-attempt-021-control-target-absence-v0.1.json"
+BLOCKER_SHA = "fec629a24fd057924d1ae03e45eb36bd07235c12238891f3c09e9fe59bee2770"
+RUN = "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020"
+SOURCE_BINDINGS = {
+    (RUN + "/network/0001-started.json"): (
+        "c2c94880edfdce63872ddd104c1b64bfb892b0605982a20208e452bf971cb737"
+    ),
+    (RUN + "/network/0003-created-subnet.json"): (
+        "bd18020d4c2edf8367354153b7a01793638023de7275ebc543e29b0e5d4f03bd"
+    ),
+    (RUN + "/network/0005-created-table.json"): (
+        "03e9e043b30c215052124776b3d85d7ce2fad87ce2eb6d84958cdcec74e6b921"
+    ),
+    (RUN + "/host/execution/host/binding.json"): (
+        "643d962d424b073536d2f871a835aeaf5e6a4ca2477598949c769b0a23302663"
+    ),
+    (RUN + "/host/execution/host/launch.json"): (
+        "93ac867b166beac7cafb53ab949e3feb7344063657f0449316ae8ca1efe6249e"
+    ),
+}
+ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+NONCE = "8e287bbbbf7a4b3aa5c68db96efb7073"
+VPC, SUBNET, CIDR = "vpc-0905fbf9490a2dead", "subnet-0d25c06f30f8f812a", "172.31.97.32/27"
+TABLE, VM = "rtb-0022f8a855e85e2e7", "i-015114693b56c75e3"
+ENDPOINT = "eice-039630ac19d9a7694"
+ENDPOINT_GROUP, VM_GROUP = "sg-09db4b81b405b3ccb", "sg-039e86738f495e678"
+VOLUMES = {"vol-0e654866571fa99fd", "vol-0e6c46311964511ac"}
+KEY = "lumi-fullsize-" + ATTEMPT
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-020-endpoint-cleanup-v0.1"
+
+
+def local():
+    m = qualified
+    approval = json.loads(m.read(APPROVAL, APPROVAL_SHA))
+    audit = json.loads(m.read(AUDIT, AUDIT_SHA))
+    blocker = json.loads(m.read(BLOCKER, BLOCKER_SHA))
+    m.need(approval["attempt"] == ATTEMPT and approval["authorized_endpoint"] == ENDPOINT)
+    m.need(approval["authorized_delete_dispatches"] == 1)
+    m.need(approval["maximum_reads"] == 30 and approval["maximum_seconds"] == 600)
+    m.need(type(approval["human_message"]) is str and bool(approval["human_message"].strip()))
+    m.need(
+        all(
+            approval[k] is False
+            for k in (
+                "retry_authorized",
+                "cpu_launch_authorized",
+                "gpu_authorized",
+                "training_authorized",
+                "s3_object_access_authorized",
+                "other_resource_mutation_authorized",
+            )
+        )
+    )
+    m.need(approval["preserve_stopped_instance"] == VM)
+    m.need(set(approval["preserve_encrypted_volumes"]) == VOLUMES)
+    m.need(approval["blocker_sha256"] == BLOCKER_SHA)
+    m.need(
+        audit["attempt"] == ATTEMPT and audit["live_verification"]["instance_state"] == "stopped"
+    )
+    m.need(set(audit["live_verification"]["encrypted_retained_volumes"]) == VOLUMES)
+    m.need(audit["cleanup"]["private_subnet_route_table_endpoint_groups_key_retained"] is True)
+    m.need(blocker["frozen_vpc_endpoint_gate_passed"] is False)
+    m.need(blocker["endpoint_deletion_authorized"] is False and blocker["cloud_mutations"] == 0)
+    m.need(
+        blocker["blocking_vpc_endpoints"]
+        == [dict(endpoint=ENDPOINT, state="create-complete", subnet=SUBNET, owner=m.ACCOUNT)]
+    )
+    values = [json.loads(m.read(name, digest)) for name, digest in SOURCE_BINDINGS.items()]
+    m.need(values[0] == dict(attempt=ATTEMPT, nonce=NONCE, stage="started"))
+    m.need(values[1]["identifier"] == SUBNET and values[2]["identifier"] == TABLE)
+    binding, launch = values[3:]
+    m.need(
+        binding
+        == dict(
+            attempt=ATTEMPT,
+            endpoint=ENDPOINT,
+            endpoint_group=ENDPOINT_GROUP,
+            instance=VM,
+            key_name=KEY,
+            root_volume="vol-0e654866571fa99fd",
+            vm_group=VM_GROUP,
+            work_volume="vol-0e6c46311964511ac",
+        )
+    )
+    m.need(launch["attempt"] == ATTEMPT and launch["instance"] == VM)
+    m.need(launch["request"]["ClientToken"] == ATTEMPT)
+    m.need(launch["request"]["NetworkInterfaces"][0]["SubnetId"] == SUBNET)
+
+
+def bind():
+    raw = files.read(QUALIFIED)
+    files.need(files.sha(raw) == QUALIFIED_SHA)
+    module = types.ModuleType("_qualified_attempt020_endpoint_cleanup")
+    module.__file__ = str(QUALIFIED)
+    exec(compile(raw, str(QUALIFIED), "exec"), module.__dict__)
+    updates = dict(
+        ROOT=ROOT,
+        OUTPUT=OUTPUT,
+        APPROVAL=APPROVAL,
+        APPROVAL_SHA=APPROVAL_SHA,
+        AUDIT=AUDIT,
+        AUDIT_SHA=AUDIT_SHA,
+        BLOCKER=BLOCKER,
+        BLOCKER_SHA=BLOCKER_SHA,
+        SOURCE_BINDINGS=SOURCE_BINDINGS,
+        ATTEMPT=ATTEMPT,
+        NONCE=NONCE,
+        VPC=VPC,
+        SUBNET=SUBNET,
+        CIDR=CIDR,
+        TABLE=TABLE,
+        VM=VM,
+        ENDPOINT=ENDPOINT,
+        ENDPOINT_GROUP=ENDPOINT_GROUP,
+        VM_GROUP=VM_GROUP,
+        KEY=KEY,
+        VOLUMES=VOLUMES,
+    )
+    # Only fixed target fields change. Qualified Cloud and Cleanup code is
+    # executed verbatim, including exact-request allowlist and no-retry guards.
+    module.__dict__.update(updates)
+    module.REQUESTS = {
+        "get-caller-identity": {},
+        "describe-instances": {"InstanceIds": [VM]},
+        "describe-volumes": {"VolumeIds": sorted(VOLUMES)},
+        "describe-subnets": {"SubnetIds": [SUBNET]},
+        "describe-route-tables": {"RouteTableIds": [TABLE]},
+        "describe-security-groups": {"GroupIds": [ENDPOINT_GROUP, VM_GROUP]},
+        "describe-key-pairs": {"KeyNames": [KEY]},
+        "describe-instance-connect-endpoints": {
+            "Filters": [dict(Name="vpc-id", Values=[VPC])],
+            "MaxResults": 20,
+        },
+        "describe-network-interfaces": {
+            "Filters": [dict(Name="subnet-id", Values=[SUBNET])],
+            "MaxResults": 100,
+        },
+        "delete-instance-connect-endpoint": {"InstanceConnectEndpointId": ENDPOINT},
+    }
+    module.__file__ = str(Path(__file__).resolve())
+    module.local = local
+    return module
+
+
+qualified = bind()
+Cloud, Cleanup = qualified.Cloud, qualified.Cleanup
+
+
+def main():
+    # These flags retain all partial evidence; main has one exclusive output
+    # marker and exactly one possible endpoint delete dispatch.
+    qualified.main()
+
+
+if __name__ == "__main__":
+    main()

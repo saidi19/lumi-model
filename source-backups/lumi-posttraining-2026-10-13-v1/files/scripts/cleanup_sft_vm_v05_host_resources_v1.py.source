@@ -1,0 +1,283 @@
+"""One exact approved cleanup; no launch, private-key access or mutation retry."""
+
+import hashlib
+import json
+import os
+import re
+import signal
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PLAN = "configs/lumi-vm-v05-host-resource-cleanup-plan-v0.1.json"
+PLAN_SHA = "87b4616a1d285d97cea8fe9a38be24f8ca87a19e0fce6c6f14875b3ab31bb449"
+APPROVAL = "configs/lumi-vm-v05-host-resource-cleanup-approval-v0.1.json"
+OUTPUT = "artifacts/lumi-vm-v05-host-resource-cleanup-v0.1"
+ACCOUNT = "573978149073"
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+VPC = "vpc-0905fbf9490a2dead"
+VM, EP = "sg-0f44659cfec8fa6b7", "sg-0befee7e888d24436"
+KEY_NAME = "lumi-fullsize-" + ATTEMPT
+READS = {"get_caller_identity", "describe_security_groups", "describe_key_pairs",
+         "describe_instances", "describe_network_interfaces",
+         "describe_security_group_references", "describe_security_group_vpc_associations"}
+WRITES = {"revoke_security_group_ingress", "revoke_security_group_egress",
+          "delete_security_group", "delete_key_pair"}
+
+
+def need(value):
+    if not value:
+        raise ValueError("cleanup_validation_failed")
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def ssh(group):
+    return dict(IpProtocol="tcp", FromPort=22, ToPort=22,
+                UserIdGroupPairs=[dict(GroupId=group, UserId=ACCOUNT)])
+
+
+HTTPS = dict(IpProtocol="tcp", FromPort=443, ToPort=443, IpRanges=[dict(CidrIp="0.0.0.0/0")])
+
+
+class Journal:
+    def __init__(self, path):
+        path.mkdir(mode=0o700, parents=False, exist_ok=False)
+        self.path, self.written = path, 0
+
+    def save(self, name, value):
+        raw = canonical(value)
+        need(self.written + len(raw) <= 262144)
+        self.written += len(raw)
+        fd = os.open(self.path / (name + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+class Cleanup:
+    def __init__(self, clients, save, material, normalize, *, clock=time.monotonic):
+        self.clients, self.save, self.material, self.normalize = clients, save, material, normalize
+        self.clock, self.start = clock, clock()
+        self.calls, self.response_bytes, self.writes = 0, 0, 0
+        self.stage, self.key_id = "identity", None
+        self.failure_code = "validation_failed"
+        self.rules = {VM: ([ssh(EP)], [HTTPS]), EP: ([], [ssh(VM)])}
+        self.absent = []
+        self.admitted = False
+
+    def call(self, operation, **fields):
+        need(operation in READS | WRITES and self.calls < 64)
+        need(0 <= self.clock() - self.start < 570)
+        self.calls += 1
+        client = self.clients["sts" if operation == "get_caller_identity" else "ec2"]
+        try:
+            value = getattr(client, operation)(**fields)
+        except Exception as error:
+            response = getattr(error, "response", {})
+            self.account_response(response)
+            code = response.get("Error", {}).get("Code")
+            if operation == "describe_security_groups" and code == "InvalidGroup.NotFound":
+                return {"SecurityGroups": []}
+            if operation == "describe_key_pairs" and code == "InvalidKeyPair.NotFound":
+                return {"KeyPairs": []}
+            self.failure_code = code if code in {
+                "ExpiredToken", "ExpiredTokenException", "AccessDenied", "UnauthorizedOperation",
+                "DependencyViolation", "InvalidParameterValue", "RequestLimitExceeded",
+            } else "cloud_call_failed"
+            raise ValueError("cleanup_cloud_call_failed") from None
+        self.account_response(value)
+        need(not any(value.get(k) for k in ("NextToken", "nextToken", "IsTruncated")))
+        return value
+
+    def account_response(self, value):
+        size = len(canonical(value))
+        self.response_bytes += size
+        need(size <= 262144 and self.response_bytes <= 2097152)
+
+    def owned(self, row):
+        need([t.get("Value") for t in row.get("Tags", [])
+              if t.get("Key") == "LumiAttempt"] == [ATTEMPT])
+
+    def group(self, row):
+        group = row["GroupId"]
+        need(group in self.rules and row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC)
+        need(row["GroupName"] == KEY_NAME + ("-vm" if group == VM else "-endpoint"))
+        self.owned(row)
+        for field, expected in zip(("IpPermissions", "IpPermissionsEgress"),
+                                   self.rules[group], strict=True):
+            actual = [{k: v for k, v in rule.items() if v != []} for rule in row[field]]
+            need(canonical(actual) == canonical(expected))
+
+    def groups(self):
+        if self.rules:
+            response = self.call("describe_security_groups", GroupIds=list(self.rules))
+            rows = response["SecurityGroups"]
+            need(len(rows) == len(self.rules) and {r["GroupId"] for r in rows} == set(self.rules))
+            for row in rows:
+                self.group(row)
+        for group in self.absent:
+            need(self.call("describe_security_groups", GroupIds=[group])["SecurityGroups"] == [])
+
+    def key(self):
+        fields = dict(KeyPairIds=[self.key_id]) if self.key_id else dict(KeyNames=[KEY_NAME])
+        rows = self.call("describe_key_pairs", IncludePublicKey=True, **fields)["KeyPairs"]
+        need(len(rows) == 1)
+        row = rows[0]
+        self.owned(row)
+        need(row["KeyName"] == KEY_NAME and row["KeyType"] == "ed25519")
+        need(re.fullmatch(r"key-[0-9a-f]{17}", row["KeyPairId"]))
+        need(self.key_id is None or row["KeyPairId"] == self.key_id)
+        need(self.normalize(row["PublicKey"].encode()) == self.material)
+        if self.key_id is None:
+            self.key_id = row["KeyPairId"]
+            self.save("resolved-key", {"key_pair_id": self.key_id, "material_matches": True})
+
+    def dependencies(self):
+        for name, value in (("tag:LumiAttempt", ATTEMPT), ("key-name", KEY_NAME)):
+            rows = self.call("describe_instances", Filters=[dict(Name=name, Values=[value])],
+                             MaxResults=100)["Reservations"]
+            for row in rows:
+                need(all(i["State"]["Name"] == "terminated" for i in row["Instances"]))
+        ids = list(self.rules)
+        if not ids:
+            return
+        filters = [dict(Name="group-id", Values=ids)]
+        need(self.call("describe_network_interfaces", Filters=filters,
+                       MaxResults=100)["NetworkInterfaces"] == [])
+        for name in ("ip-permission.group-id", "egress.ip-permission.group-id"):
+            rows = self.call("describe_security_groups", Filters=[
+                dict(Name="vpc-id", Values=[VPC]), dict(Name=name, Values=ids)],
+                MaxResults=100)["SecurityGroups"]
+            for row in rows:
+                self.group(row)
+        response = self.call("describe_security_group_references", GroupId=ids)
+        need(response["SecurityGroupReferenceSet"] == [])
+        need(self.call("describe_security_group_vpc_associations", Filters=filters,
+                       MaxResults=100)["SecurityGroupVpcAssociations"] == [])
+
+    def admission(self):
+        self.groups()
+        self.key()
+        self.dependencies()
+
+    def mutate(self, operation, fields, verify):
+        need(self.writes < 5)
+        self.writes += 1
+        self.save(f"mutation-{self.writes:02d}", dict(operation=operation, parameters=fields,
+                                                     started=True, retry_allowed=False))
+        try:
+            response = self.call(operation, **fields)
+            need(response.get("Return") is True)
+        except Exception:
+            verified = False
+            try:
+                verify()
+                verified = True
+            except Exception:
+                pass
+            self.save("uncertain-mutation", dict(index=self.writes, readback_matched=verified))
+            raise ValueError("cleanup_mutation_uncertain") from None
+        verify()
+
+    def run(self):
+        need(self.call("get_caller_identity")["Account"] == ACCOUNT)
+        for index in range(5):
+            self.stage = f"admission_{index + 1}"
+            self.admission()
+            self.admitted = True
+            self.stage = f"mutation_{index + 1}"
+            if index == 0:
+                self.rules[VM] = ([], [HTTPS])
+                self.mutate("revoke_security_group_ingress",
+                            dict(GroupId=VM, IpPermissions=[ssh(EP)]), self.groups)
+            elif index == 1:
+                self.rules[EP] = ([], [])
+                self.mutate("revoke_security_group_egress",
+                            dict(GroupId=EP, IpPermissions=[ssh(VM)]), self.groups)
+            elif index in (2, 3):
+                group = EP if index == 2 else VM
+                del self.rules[group]
+                self.absent.append(group)
+                self.mutate("delete_security_group", dict(GroupId=group), self.groups)
+            else:
+                def gone():
+                    response = self.call("describe_key_pairs", KeyPairIds=[self.key_id])
+                    need(response["KeyPairs"] == [])
+                self.mutate("delete_key_pair", dict(KeyPairId=self.key_id), gone)
+        self.stage = "cleanup_verified"
+
+
+def main():
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    need(digest(ROOT / PLAN) == PLAN_SHA)
+    plan = json.loads((ROOT / PLAN).read_text())
+    approval = json.loads((ROOT / APPROVAL).read_text())
+    need(approval["plan_sha256"] == PLAN_SHA and approval["execution_permitted"] is True)
+    need(approval["human_approval"] == "ok shuru kor")
+    for name, expected in (plan["bindings"] | approval["bindings"]).items():
+        need(not name.endswith("/connection-key"))
+        need(digest(ROOT / name) == expected)
+    journal = Journal(ROOT / OUTPUT)
+    journal.save("started", dict(plan_sha256=PLAN_SHA, approval_sha256=digest(ROOT / APPROVAL),
+                                 attempt=ATTEMPT, retry_allowed=False))
+    started, clients, worker = time.monotonic(), [], None
+    result = dict(status="stopped", stage="credentials", calls=0, mutations=0,
+                  cleanup_verified=False, private_key_read=False, instance_actions=0,
+                  real_4b_import=False, gate_5_complete=False, gpu_used=False)
+    def expired(*_):
+        raise TimeoutError("cleanup_deadline")
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 600)
+    try:
+        import provision_sft_vm_host_v3 as parser
+        import sft_vm_controller_credentials_v2 as credentials
+        from botocore.config import Config
+        result["credential_provider_invocations"] = 1
+        value = json.loads(credentials.export_credentials())
+        need(value["Version"] == 1)
+        expiry = datetime.fromisoformat(value["Expiration"].replace("Z", "+00:00"))
+        need((expiry - datetime.now(UTC)).total_seconds() > 660)
+        secret = dict(aws_access_key_id=value["AccessKeyId"],
+                      aws_secret_access_key=value["SecretAccessKey"],
+                      aws_session_token=value["SessionToken"])
+        session = credentials.session()
+        for service in ("sts", "ec2"):
+            clients.append(session.create_client(service, region_name="us-east-1",
+                endpoint_url=credentials.endpoint(service), verify=credentials.ca_path(),
+                config=Config(proxies={}, connect_timeout=3, read_timeout=5,
+                              retries={"total_max_attempts": 1},
+                              ignore_configured_endpoint_urls=True), **secret))
+        secret.clear()
+        value.clear()
+        public = next(name for name in plan["bindings"] if name.endswith("connection-key.pub"))
+        material = parser.public_key((ROOT / public).read_bytes())
+        worker = Cleanup(dict(zip(("sts", "ec2"), clients, strict=True)), journal.save,
+                         material, parser.readback_public_key)
+        worker.run()
+        result.update(status="completed", cleanup_verified=True)
+    except Exception:
+        # Never retain exception/credential/key text.
+        result["failure_code"] = (
+            worker.failure_code if worker else "credential_or_local_setup_failed"
+        )
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        if worker is not None:
+            result.update(stage=worker.stage, calls=worker.calls, mutations=worker.writes,
+                          response_bytes=worker.response_bytes, key_pair_id=worker.key_id)
+        result["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        journal.save("result", result)
+        for client in clients:
+            client.close()
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["cleanup_verified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

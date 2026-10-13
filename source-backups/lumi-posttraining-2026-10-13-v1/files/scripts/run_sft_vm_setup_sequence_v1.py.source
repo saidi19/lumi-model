@@ -1,0 +1,344 @@
+"""One-shot CPU -> SDK -> worker-source -> root-source setup sequence.
+
+Private API for the future admitted bootstrap, not a host-admission shortcut.
+Inputs must already be authenticated/staged. No downloader, live binding,
+credentials, model access or import. Each child is independently time-bounded.
+"""
+
+from __future__ import annotations
+
+import configparser
+import hashlib
+import json
+import os
+import shlex
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+INPUT = Path("/opt/lumi-bootstrap-input")
+OUTPUT = Path("/var/lib/lumi-vm-setup") / ATTEMPT
+WORK = Path("/var/lib/lumi-vm-fullsize")
+CPU = Path("/opt/lumi-sft-rehearsal")
+SDK = Path("/opt/lumi-sft-acquisition")
+SDK_SHA = "fa53d59f93d234d29fcb602ba12a82dcd4d7572660c59bb58456c31902efd2ed"
+WORKER_SHA = "4317d6c87b51bf8caeea5b94cc97db305811035201ede29d38a4a9221e4100a6"
+ROOT_SHA = "74d84d4b2b8bb14ecb0481c843ae9c28410b9311e07d294f00de9528613b069d"
+LOCK_SHA = "26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965"
+PINS = {
+    "posttraining_import_vm_rehearsal_v3.py": (
+        "ac97b64072ccd1f3db702bbf32bf0ff3de410e566ae1dc708533cb147ea15d4c"
+    ),
+    "cpu.service": "10cae88406d0fbf6ad04992f78ea4bd56a310f61c05ff437fa60363669fbcb19",
+    "sdk.service": "3fccaea0689e6e81f51cdb62064e8227fda227d66277642d9432d274c8bce89c",
+    "stage_sft_vm_fullsize_release_v1.py": (
+        "625c53b3c50762d36d7fdafb08158ed413933437eac388df7bfc3f15e9755b07"
+    ),
+    "stage_sft_vm_root_controller_v1.py": (
+        "bf04b2a5350b609a56c06be1b25c70ec27101027a2a077c2cca73bad85fd61cd"
+    ),
+}
+EXTERNAL = {
+    "/opt/lumi-cpu-input/install_sft_vm_cpu_runtime_v1.py": (
+        "4697253d149bb10fbf2c51128f49dc525bd51841d9eb1bee21cb325c841a89a9",
+        131072,
+    ),
+    "/opt/lumi-cpu-input/install_sft_vm_acquisition_sdk_v1.py": (
+        "0326195c9ca27b98471699d85571d1f85ef2f7f8fc1282e58004ac01738aa38c",
+        131072,
+    ),
+    "/opt/lumi-cpu-input/runtime-lock.json": (LOCK_SHA, 131072),
+    "/opt/lumi-sdk-input/install_sft_vm_acquisition_sdk_v1.py": (
+        "0326195c9ca27b98471699d85571d1f85ef2f7f8fc1282e58004ac01738aa38c",
+        131072,
+    ),
+    "/opt/lumi-sdk-input/sdk-release.tar": (SDK_SHA, 20 * 1024**2),
+}
+UNITS = {
+    "cpu": "lumi-cpu-install-v1.service",
+    "sdk": "lumi-sdk-install-v1.service",
+    "worker_source": "lumi-worker-source-install-v1.service",
+    "root_source": "lumi-root-source-install-v1.service",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_sequence_rejected") from None
+
+
+def owned_directory(path):
+    for p in (path, *path.parents):
+        info = p.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+
+
+def read(path, cap=131072):
+    owned_directory(path.parent)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_uid == before.st_gid == 0)
+        need(before.st_nlink == 1 and stat.S_IMODE(before.st_mode) in {0o400, 0o600})
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        need(
+            len(raw) == before.st_size
+            and all(getattr(before, k) == getattr(after, k) for k in fields)
+        )
+    return raw
+
+
+def bound(path, digest, cap=131072):
+    raw = read(path, cap)
+    need(hashlib.sha256(raw).hexdigest() == digest)
+    return raw
+
+
+def preflight(machine_id):
+    need(sys.platform == "linux" and os.geteuid() == os.getegid() == 0)
+    need(sys.version_info[:2] == (3, 12) and sys.flags.isolated and sys.dont_write_bytecode)
+    bodies = {name: bound(INPUT / name, pin) for name, pin in PINS.items()}
+    helper = types.ModuleType("_setup_systemd_helpers")
+    helper.__file__ = str(INPUT / "posttraining_import_vm_rehearsal_v3.py")
+    exec(
+        compile(bodies["posttraining_import_vm_rehearsal_v3.py"], helper.__file__, "exec"),
+        helper.__dict__,
+    )
+    helper.host_check(machine_id)
+    for path, (pin, cap) in EXTERNAL.items():
+        bound(Path(path), pin, cap)
+    lock = json.loads(bound(Path("/opt/lumi-cpu-input/runtime-lock.json"), LOCK_SHA))
+    bound(INPUT / "source-controls.tar", WORKER_SHA, 4 * 1024**2)
+    bound(INPUT / "root-controller.tar", ROOT_SHA, 2 * 1024**2)
+    for path in (OUTPUT, CPU, SDK, WORK / ATTEMPT):
+        need(not path.exists() and not path.is_symlink())
+    owned_directory(OUTPUT.parent)
+    owned_directory(WORK)
+    need(stat.S_IMODE(WORK.stat().st_mode) == 0o700)
+    for name in UNITS.values():
+        result = helper.run_command(
+            ["/usr/bin/systemctl", "show", name, "--property=LoadState", "--value"], 5, capture=True
+        )
+        need(result.returncode in {0, 1, 4} and result.stdout.strip() == b"not-found")
+        need(helper.cgroup_empty(name))
+    return helper, bodies, sum(r["bytes"] for r in lock["requirements"])
+
+
+def command(phase, bodies, machine_id):
+    if phase in {"cpu", "sdk"}:
+        raw = bodies[phase + ".service"].decode().replace("ARCHIVE_SHA256", SDK_SHA)
+        config = configparser.ConfigParser(interpolation=None)
+        config.optionxform = str
+        config.read_string(raw)
+        props = dict(config["Service"])
+        executable = shlex.split(props.pop("ExecStart"))
+        need(props.pop("Type") == "oneshot")
+        # RemainAfterExit retains a terminal state to inspect, then we explicitly
+        # stop/reap. RuntimeMaxSec bounds the process independently of this parent.
+        props.update(RuntimeMaxSec="600", RemainAfterExit="yes", LimitCORE="0")
+    else:
+        need(phase in {"worker_source", "root_source"})
+        props = {
+            "User": "root",
+            "Group": "root",
+            "UMask": "0077",
+            "Restart": "no",
+            "RuntimeMaxSec": "120",
+            "TimeoutStopSec": "10",
+            "RemainAfterExit": "yes",
+            "KillMode": "control-group",
+            "SendSIGKILL": "yes",
+            "LimitCORE": "0",
+            "MemoryMax": "1G",
+            "MemorySwapMax": "0",
+            "TasksMax": "64",
+            "PrivateNetwork": "yes",
+            "RestrictAddressFamilies": "AF_UNIX",
+            "IPAddressDeny": "any",
+            "PrivateDevices": "yes",
+            "ProtectHome": "yes",
+            "ProtectSystem": "strict",
+            "ReadWritePaths": str(WORK),
+            "ReadOnlyPaths": str(INPUT),
+            "NoNewPrivileges": "yes",
+            "StandardInput": "null",
+            "StandardOutput": "null",
+            "StandardError": "null",
+        }
+        if phase == "worker_source":
+            args = [
+                "stage_sft_vm_fullsize_release_v1.py",
+                "--archive",
+                str(INPUT / "source-controls.tar"),
+                "--archive-sha256",
+                WORKER_SHA,
+                "--attempt",
+                ATTEMPT,
+                "--machine-id",
+                machine_id,
+            ]
+        else:
+            args = [
+                "stage_sft_vm_root_controller_v1.py",
+                "--install",
+                str(INPUT / "root-controller.tar"),
+                "--sha256",
+                ROOT_SHA,
+                "--machine-id",
+                machine_id,
+            ]
+        executable = ["/usr/bin/python3", "-I", "-B", str(INPUT / args[0]), *args[1:]]
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + UNITS[phase],
+        ]
+        + [f"--property={k}={v}" for k, v in props.items()]
+        + ["--", *executable]
+    )
+
+
+def receipt(phase, wheel_bytes):
+    paths = {
+        "cpu": CPU / "result.json",
+        "sdk": SDK / "result.json",
+        "worker_source": WORK / ATTEMPT / "source-staging.json",
+        "root_source": WORK / ATTEMPT / "controller-staged.json",
+    }
+    value = json.loads(read(paths[phase], 8192))
+    need(value.get("host_admitted") is False and value.get("gate_5_complete") is False)
+    if phase == "cpu":
+        need(
+            value.get("schema") == "lumi.vm-cpu-offline-install.v0.1"
+            and value.get("status") == "passed"
+        )
+        need(value.get("software_lock_sha256") == LOCK_SHA and value.get("wheel_count") == 34)
+        need(
+            value.get("wheel_bytes") == wheel_bytes
+            and value.get("all_locked_versions_match") is True
+        )
+    elif phase == "sdk":
+        need(
+            value.get("schema") == "lumi.vm-sdk-offline-install.v0.1"
+            and value.get("status") == "passed"
+        )
+        need(
+            value.get("archive_sha256") == SDK_SHA
+            and value.get("sdk_native_wire_qualified") is True
+        )
+    else:
+        need(
+            value.get("schema")
+            == (
+                "lumi.vm-fullsize-source-staging.v0.1"
+                if phase == "worker_source"
+                else "lumi.vm-root-controller-stage.v0.1"
+            )
+        )
+        need(value.get("attempt") == ATTEMPT and value.get("execution_permitted") is False)
+        need(value.get("archive_sha256") == (WORKER_SHA if phase == "worker_source" else ROOT_SHA))
+        need(value.get("staged_file_hashes_verified") is True)
+        if phase == "root_source":
+            need(value.get("binding_created") is False)
+
+
+def child(helper, phase, argv, deadline):
+    unit = UNITS[phase]
+    try:
+        need(
+            helper.run_command(argv, min(15, max(0.001, deadline - time.monotonic()))).returncode
+            == 0
+        )
+        while time.monotonic() < deadline:
+            value = helper.observe(unit)
+            if value["SubState"] in {"exited", "dead", "failed"}:
+                helper.validate_terminal("chain", value)
+                return
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+        raise ValueError("setup_deadline")
+    finally:
+        stopped = helper.run_command(["/usr/bin/systemctl", "stop", unit], 10)
+        need(stopped.returncode == 0 and helper.cgroup_empty(unit))
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def sync(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def save(helper, name, value):
+    helper.write_new(OUTPUT / name, value)
+    sync(OUTPUT)
+
+
+def _run_admitted_once(machine_id, deadline):
+    """Deadline inherits the original setup window; never starts a new 30 minutes."""
+    need(type(deadline) in {int, float} and 60 < deadline - time.monotonic() <= 1800)
+    helper, bodies, wheel_bytes = preflight(machine_id)
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    sync(OUTPUT.parent)
+    save(helper, "started.json", {"retry_allowed": False})
+    completed, phase = [], "preflight"
+    try:
+        for phase in UNITS:
+            # Do not begin a full new child unless its cap and teardown fit.
+            cap = 600 if phase in {"cpu", "sdk"} else 120
+            need(deadline - time.monotonic() >= cap + 30)
+            save(helper, phase + ".started.json", {"retry_allowed": False})
+            child(
+                helper,
+                phase,
+                command(phase, bodies, machine_id),
+                min(deadline - 15, time.monotonic() + cap + 15),
+            )
+            receipt(phase, wheel_bytes)  # Only AFTER stopped/empty child.
+            completed.append(phase)
+        result = {
+            "setup_components_completed": completed,
+            "host_admitted": False,
+            "binding_created": False,
+            "gate_5_complete": False,
+            "retry_allowed": False,
+        }
+        save(helper, "result.json", result)
+        return result
+    except BaseException:
+        save(
+            helper,
+            "failed.json",
+            {
+                "failed_phase": phase,
+                "completed": completed,
+                "retry_allowed": False,
+                "host_admitted": False,
+                "partial_evidence_preserved": True,
+            },
+        )
+        raise ValueError("setup_sequence_failed") from None

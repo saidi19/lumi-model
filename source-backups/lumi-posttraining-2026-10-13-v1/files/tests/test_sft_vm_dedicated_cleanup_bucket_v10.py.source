@@ -1,0 +1,98 @@
+"""Synthetic checks for attempt-019 dedicated cleanup bucket deployment."""
+import copy
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import sft_vm_dedicated_cleanup_bucket_v10 as m
+
+
+class Fake:
+    def __init__(self):
+        self.calls = []
+        self.mutations = []
+        self.collision = False
+
+    def call(self, service, operation, **fields):
+        self.calls.append((service, operation, copy.deepcopy(fields)))
+        if operation.startswith(("create-", "put-")):
+            self.mutations.append(operation)
+        if operation == "get-caller-identity":
+            return {"Account": m.ACCOUNT}
+        if operation == "head-bucket":
+            if self.collision:
+                return {}
+            raise LookupError("absent")
+        if operation == "get-bucket-lifecycle-configuration":
+            raise LookupError("absent")
+        values = {
+            "get-bucket-location": {"LocationConstraint": None},
+            "get-public-access-block": {"PublicAccessBlockConfiguration": m.BLOCK},
+            "get-bucket-ownership-controls": {
+                "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+            },
+            "get-bucket-encryption": {"ServerSideEncryptionConfiguration": m.ENCRYPTION},
+            "get-bucket-versioning": {"Status": "Enabled"},
+            "get-bucket-tagging": {"TagSet": list(reversed(m.TAGS))},
+            "get-bucket-policy": {"Policy": m.encode(m.policy()).decode()},
+            "get-bucket-policy-status": {"PolicyStatus": {"IsPublic": False}},
+        }
+        return copy.deepcopy(values.get(operation, {}))
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "OUTPUT", self.root / "output"))
+        self.enterContext(patch.object(m, "PROPOSAL", self.root / "proposal.json"))
+        self.enterContext(patch.object(m, "APPROVAL", self.root / "approval.json"))
+        m.PROPOSAL.write_bytes(m.encode(m.expected_proposal()))
+        m.APPROVAL.write_bytes(m.encode(m.expected_approval("SYNTHETIC ONLY")))
+        self.cloud = Fake()
+
+    def test_success_exact_scope(self):
+        result = m.run(cloud=self.cloud)
+        self.assertEqual(result["status"], "created_private_cleanup_store_verified")
+        self.assertEqual(result["calls"], 17)
+        self.assertEqual(result["mutation_dispatches"], 6)
+        self.assertFalse(result["cpu_entry_bound"])
+        self.assertFalse(result["gate_5_complete"])
+        self.assertEqual(
+            self.cloud.mutations,
+            [
+                "create-bucket",
+                "put-public-access-block",
+                "put-bucket-encryption",
+                "put-bucket-versioning",
+                "put-bucket-tagging",
+                "put-bucket-policy",
+            ],
+        )
+
+    def test_collision_never_mutates(self):
+        self.cloud.collision = True
+        result = m.run(cloud=self.cloud)
+        self.assertEqual(result["failed_stage"], "fresh_name_absence")
+        self.assertEqual(self.cloud.mutations, [])
+
+    def test_bad_approval_rejected_before_cloud(self):
+        value = m.expected_approval("SYNTHETIC ONLY")
+        for change in ({"shared_bucket_mutation": True}, {"maximum_calls": 21}):
+            m.APPROVAL.write_bytes(m.encode(dict(value, **change)))
+            with self.assertRaises(ValueError):
+                m.run(cloud=self.cloud)
+            self.assertFalse(m.OUTPUT.exists())
+            self.assertFalse(self.cloud.calls)
+
+    def test_source_or_identity_drift_rejected(self):
+        for key in ("QUALIFIED_SHA", "HELPER_SHA", "PLAN_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.sources()
+        with patch.object(m, "ATTEMPT", "wrong"), self.assertRaises(ValueError):
+            m.sources()
+
+
+if __name__ == "__main__":
+    unittest.main()

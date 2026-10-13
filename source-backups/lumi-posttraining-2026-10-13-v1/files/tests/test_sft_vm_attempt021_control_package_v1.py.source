@@ -1,0 +1,87 @@
+"""Offline semantic boundaries for the prepared fresh control package."""
+
+import json
+import sys
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import execute_sft_vm_inert_watchdog_v14 as watch
+from scripts import prepare_sft_vm_attempt021_control_package_v1 as package
+from scripts import sft_vm_dedicated_cleanup_bucket_v12 as bucket
+
+
+class Tests(unittest.TestCase):
+    def test_previous_evidence_and_deployment_sources_unchanged(self):
+        for name, digest in package.PINS.items():
+            package.read(name, digest)
+        expected = package.build_plan()
+        self.assertEqual(expected, json.loads(package.read(package.PLAN_DIR + "/plan.json")))
+
+    def test_new_requests_cannot_address_previous_controls(self):
+        _, deployer = watch.sources()
+        for values in watch.qualified.allowed_requests(deployer).values():
+            for raw in values:
+                self.assertNotIn(package.previous.OLD.encode(), raw)
+        for fields in bucket.requests().values():
+            raw = bucket.encode(fields)
+            self.assertNotIn(package.previous.OLD.encode(), raw)
+            self.assertNotIn(b"lumi-corpus-prod-", raw)
+
+    def test_production_approval_absent_blocks_both_controls(self):
+        self.assertFalse(watch.APPROVAL.exists())
+        self.assertFalse(bucket.APPROVAL.exists())
+        self.assertFalse(watch.OUTPUT.exists())
+        self.assertFalse(bucket.OUTPUT.exists())
+        fake = Mock()
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            watch.run(transport=fake)
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            bucket.run(cloud=fake)
+        self.assertFalse(fake.mock_calls)
+
+    def test_source_and_evidence_hash_drift_rejected(self):
+        helper = package.load_module("_fresh_helper_test", package.HELPER)
+        for name in ("RELEASE_SHA", "SOURCE_PROOF_SHA", "ABSENCE_SHA", "PLAN_RELEASE_SHA"):
+            with self.subTest(name=name), patch.object(helper, name, "0" * 64):
+                with self.assertRaises(ValueError):
+                    helper.verify()
+
+    def test_no_fake_cpu_authority_can_be_inserted_into_plan(self):
+        helper = package.load_module("_fresh_helper_plan_test", package.HELPER)
+        base_read = helper.read
+        plan = json.loads(base_read(helper.PLAN))
+        for key, value in (
+            ("execution_permitted", True),
+            ("approval_record", "invented"),
+            ("successful_readonly_preflight", {}),
+        ):
+            changed = dict(plan, **{key: value})
+
+            def read(name, *args, changed=changed):
+                return helper.encode(changed) if name == helper.PLAN else base_read(name, *args)
+
+            with self.subTest(key=key), patch.object(helper, "read", side_effect=read):
+                with self.assertRaises(ValueError):
+                    helper.build()
+
+    def test_control_limits_and_non_execution_flags_remain_frozen(self):
+        watchdog = watch.expected_proposal()
+        cleanup = bucket.expected_proposal()
+        self.assertEqual(
+            (watchdog["maximum_seconds"], watchdog["maximum_control_calls"]), (600, 45)
+        )
+        self.assertEqual((cleanup["maximum_seconds"], cleanup["maximum_calls"]), (300, 20))
+        self.assertFalse(watchdog["invocation"] or watchdog["schedule_creation"])
+        self.assertFalse(cleanup["object_access"] or cleanup["shared_bucket_mutation"])
+        self.assertFalse(watchdog["execution_permitted"] or cleanup["execution_permitted"])
+        self.assertFalse(watchdog["retry"] or cleanup["retry"])
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

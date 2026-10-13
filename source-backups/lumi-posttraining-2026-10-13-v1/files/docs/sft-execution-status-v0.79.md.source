@@ -1,0 +1,71 @@
+# SFT execution status v0.79
+
+2026-09-13. The approved exact publication completed, but the one fresh workflow
+failed its source/contract preflight. Software acquisition and native Linux CPU
+qualification were skipped. No retry, corrective push, GPU, AWS, real model/data
+access or training was performed. Gate 5 remains incomplete.
+
+## Exact publication and observed result
+
+Plan: `configs/lumi-4b-sft-import-qualification-execution-plan-v0.1.json`
+
+Plan SHA-256:
+`98d40bdda8073d9dda88f3cf6728d989e8f20d1c81a005434416da62b5810673`
+
+The user's reply, `ok shuru kor`, approved the immediately preceding request for
+this exact plan. Eight bounded read-only metadata GETs verified the private repo,
+unchanged parent, no open PR and no active branch CI. Independent local review
+also verified the 70 required files: 32 additions and 38 unchanged parent files.
+
+One non-force push published exactly 32 additions plus the plan, 33 files and
+497,405 content bytes. No unrelated local evidence or private artifact was pushed.
+
+- Commit: `9a4a191fa96753f7d8ae78cedbee54f16d536a04`
+- Sole parent: `ecc545fc423650bf1089311915290523c10b3172`
+- Qualification run: `34736973517`, attempt 1
+- Job: `103670024935`, `private-tiny-importer-v1`
+- Failed step: `Bound sources and pure contracts before any software acquisition`
+- Acquisition, native qualification, input retirement and receipt verification:
+  skipped
+- Aggregate artifact count: zero
+
+The upload step's success is not evidence of an artifact: its warning-only empty
+input behavior ran, and the subsequent inventory explicitly returned zero.
+No raw job log or exception text was accessed. SHA checks, source verification
+and unittest share the failed step, so the exact failing subcommand is not yet
+proved by this metadata.
+
+## Concrete local source finding
+
+`tests/test_sft_import_qualification_acquisition_v1.py:147` hardcodes
+`dir="/private/tmp"` in `AcquisitionTests.setUp`. Seven tests share that setup.
+That macOS-specific parent is not created by the Ubuntu workflow. If absent,
+those fixtures fail with FileNotFoundError before test execution.
+
+This is a demonstrated portability defect, not confirmation of the remote
+exception: the runner's directory existence and raw error were not observed.
+The earlier local pass results did not prove this Ubuntu path assumption. No
+published file was changed to conceal or repair this failed attempt.
+
+## Existing CI snapshot and next boundary
+
+Spark run `34736973484` completed successfully. At 04:08:32 UTC, Source run
+`34736973487` had three successful jobs (frozen lint, isolated SFT controls,
+source-only validators), while its main test job remained in progress. This is
+a timestamped snapshot, not an all-CI-success claim. No active CI was cancelled.
+
+Post-run metadata used eight of the sixteen allowed GETs. Eight remain for a
+later bounded status/evidence read; they do not authorize raw logs or a retry.
+No software ZIP or aggregate ZIP was downloaded. Provider actions, Git transport
+and existing CI dependency traffic are distinct from these metadata body caps.
+
+Current records:
+
+- `evidence/lumi-4b-sft-import-qualification-prepublication-v0.1.json`
+- `evidence/lumi-4b-sft-import-qualification-execution-v0.1.json`
+- `evidence/lumi-4b-sft-import-qualification-execution-verification-v0.1.json`
+
+Fresh direction is required before a portable-fixture correction, changed
+versioned bindings, another push/run, or a raw-log diagnostic. A narrow local
+synthetic-fixture fix does not need GPU or real inputs. The original run and all
+prior evidence remain preserved; execution and production eligibility stay false.

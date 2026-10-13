@@ -1,0 +1,60 @@
+"""Attach shared mutation claims to the frozen network transaction.
+
+Not an expiry armer: deployment, timer/configuration readback, scoped IAM/S3
+admission and authenticated callers are still required. No credentials are
+created and no public execution entry is opened by this module.
+"""
+
+import math
+import time
+
+import provision_sft_vm_host_v2 as host
+import sft_vm_network_cleanup_v1 as worker
+
+
+class ClaimedCloud:
+    def __init__(self, cloud, s3, *, clock=time.monotonic):
+        self.cloud, self.s3, self.claims = cloud, s3, None
+        self.clock, self.deadline = clock, None
+
+    def bind(self, token, deadline):
+        worker.need(self.claims is None)
+        worker.need(type(deadline) in {int, float} and math.isfinite(deadline))
+        worker.need(32 < deadline - self.clock() <= 18000)
+        self.deadline = deadline
+        self.claims = worker.Claims(self.s3, token)
+
+    def cli(self, service, operation, **fields):
+        if operation in worker.OPERATIONS:
+            worker.need(service == "ec2" and self.claims is not None)
+            field = worker.OPERATIONS[operation][0]
+            worker.need(set(fields) == {field})
+            worker.need(self.clock() < self.deadline - 32)
+            # Separate from the frozen cloud's 20-second alarm; never nest or
+            # replace it. Reserve time again before dispatch after the claim.
+            with host.timeout(10):
+                worker.need(self.claims.take(operation, fields[field]))
+            worker.need(self.clock() < self.deadline - 21)
+        return self.cloud.cli(service, operation, **fields)
+
+
+class ExpiryBridge:
+    """Same nonce is shared before any paid allocation; no fake verification."""
+
+    def __init__(self, cloud, expiry):
+        worker.need(type(cloud) is ClaimedCloud)
+        self.cloud, self.expiry, self.bound = cloud, expiry, None
+
+    def arm(self, *, attempt, nonce, deadline):
+        worker.need(self.bound is None and attempt == worker.ATTEMPT)
+        self.cloud.bind(nonce, deadline)
+        self.bound = dict(attempt=attempt, nonce=nonce, deadline=deadline)
+        self.expiry.arm(**self.bound)
+
+    def verify(self, **bound):
+        worker.need(self.bound is not None and bound == self.bound)
+        self.expiry.verify(**bound)
+
+
+def run(**_arguments):
+    raise ValueError("network_cleanup_live_admission_required") from None

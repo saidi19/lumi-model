@@ -1,0 +1,517 @@
+"""Synthetic root-prepare to dropped-worker-seal tests; no native calls."""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import importlib
+import sys
+import threading
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_listener_v2"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_listener_v2")
+IMPORTED = set(sys.modules) - before_import
+REAL_DROPPED_RUNTIME = m._dropped_runtime
+
+PRIVATE = "SYNTHETIC-PRIVATE-SEAL-DATA"
+PID = 2345
+THREAD = 6789
+
+
+class RuntimeTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def valid_runtime(self):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(m.frozen, "sys_platform", return_value="linux"))
+            stack.enter_context(patch.object(m.platform, "machine", return_value="x86_64"))
+            stack.enter_context(patch.object(
+                m.platform, "python_implementation", return_value="CPython",
+            ))
+            stack.enter_context(patch.object(
+                m.frozen, "python_version", return_value=(3, 12),
+            ))
+            stack.enter_context(patch.object(m.frozen, "no_site", return_value=True))
+            stack.enter_context(patch.object(
+                m.frozen, "dont_write_bytecode", return_value=True,
+            ))
+            stack.enter_context(patch.object(
+                m.threading, "current_thread", return_value=threading.main_thread(),
+            ))
+            stack.enter_context(patch.object(m.threading, "active_count", return_value=1))
+            stack.enter_context(patch.object(
+                m.frozen, "loaded_modules", return_value={"sys": object()},
+            ))
+            stack.enter_context(patch.object(
+                m.os, "getresuid", return_value=(m.WORKER_UID,) * 3, create=True,
+            ))
+            stack.enter_context(patch.object(
+                m.os, "getresgid", return_value=(m.WORKER_GID,) * 3, create=True,
+            ))
+            stack.enter_context(patch.object(m.os, "getgroups", return_value=[]))
+            yield
+
+    def test_exact_dropped_runtime_is_accepted(self):
+        with self.valid_runtime():
+            self.assertIsNone(m._dropped_runtime())
+
+    def test_root_and_partial_or_wrong_identity_are_rejected(self):
+        variants = {
+            "root_uid": (m.os, "getresuid", (0, 0, 0)),
+            "mixed_uid": (m.os, "getresuid", (m.WORKER_UID, m.WORKER_UID, 0)),
+            "root_gid": (m.os, "getresgid", (0, 0, 0)),
+            "mixed_gid": (m.os, "getresgid", (m.WORKER_GID, 0, m.WORKER_GID)),
+            "groups": (m.os, "getgroups", [44]),
+        }
+        for label, (owner, name, value) in variants.items():
+            with self.subTest(label=label), self.valid_runtime(), \
+                    patch.object(owner, name, return_value=value), \
+                    self.assertRaises(m.ListenerV2Error) as caught:
+                m._dropped_runtime()
+            self.assertEqual(caught.exception.code, "runtime_rejected")
+
+    def test_each_common_runtime_mismatch_is_rejected(self):
+        variants = {
+            "platform": (m.frozen, "sys_platform", "darwin"),
+            "machine": (m.platform, "machine", "aarch64"),
+            "implementation": (m.platform, "python_implementation", "PyPy"),
+            "version": (m.frozen, "python_version", (3, 13)),
+            "site": (m.frozen, "no_site", False),
+            "bytecode": (m.frozen, "dont_write_bytecode", False),
+            "thread_count": (m.threading, "active_count", 2),
+            "ml_import": (m.frozen, "loaded_modules", {"torch.nn": object()}),
+        }
+        for label, (owner, name, value) in variants.items():
+            with self.subTest(label=label), self.valid_runtime(), \
+                    patch.object(owner, name, return_value=value), \
+                    self.assertRaises(m.ListenerV2Error) as caught:
+                m._dropped_runtime()
+            self.assertEqual(caught.exception.code, "runtime_rejected")
+
+    def test_equal_but_nonexact_identity_shapes_are_rejected(self):
+        class TupleAlias(tuple):
+            pass
+
+        class ListAlias(list):
+            pass
+
+        class IntAlias(int):
+            pass
+
+        for name in ("getresuid", "getresgid"):
+            for value in ((10001.0,) * 3, TupleAlias((10001,) * 3),
+                          (IntAlias(10001),) * 3, [10001] * 3, (10001,) * 2):
+                with self.subTest(name=name, kind=type(value).__name__), \
+                        self.valid_runtime(), patch.object(m.os, name, return_value=value), \
+                        self.assertRaises(m.ListenerV2Error) as caught:
+                    m._dropped_runtime()
+                self.assertEqual(caught.exception.code, "runtime_rejected")
+        with self.valid_runtime(), patch.object(m.os, "getgroups", return_value=ListAlias()), \
+                self.assertRaises(m.ListenerV2Error) as caught:
+            m._dropped_runtime()
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+
+    def test_non_main_thread_is_rejected(self):
+        with self.valid_runtime(), \
+                patch.object(m.threading, "current_thread", return_value=object()), \
+                self.assertRaises(m.ListenerV2Error) as caught:
+            m._dropped_runtime()
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+
+    def test_probe_exception_text_is_not_exposed(self):
+        with patch.object(m.frozen, "sys_platform", side_effect=OSError(PRIVATE)), \
+                self.assertRaises(m.ListenerV2Error) as caught:
+            m._dropped_runtime()
+        self.assertEqual(str(caught.exception), "runtime_rejected")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_import_is_definition_only_without_ml_or_primary_lumi(self):
+        self.assertFalse(any(name == "lumi" or name.startswith("lumi.")
+                             or name.split(".", 1)[0] in m.frozen.ML_ROOTS
+                             for name in IMPORTED))
+
+    def test_public_entry_is_unconditionally_closed(self):
+        for options in ({}, {"approved": True}, {"uid": 10001}, {"native": True}):
+            with self.subTest(options=tuple(options)), \
+                    self.assertRaises(m.ListenerV2Error) as caught:
+                m.install_write_listener(**options)
+            self.assertEqual(caught.exception.code, "host_guard_not_bound")
+
+
+class DelegationTests(unittest.TestCase):
+    def test_root_prepare_delegates_exactly_and_versions_aggregate_report(self):
+        transfer = Mock()
+        base = {
+            "schema": m.frozen.SCHEMA,
+            "status": "transfer_callback_acknowledged_not_native_adoption_or_seal",
+            "listener_filter_sha256": m.frozen.policy.LISTENER_FILTER_SHA256,
+            "listener_flags": m.frozen.LISTENER_FLAGS,
+            "transfer_acknowledged": True,
+            "local_listener_closed": True,
+            "final_seal_installed": False,
+            **dict.fromkeys(m.frozen.FALSE_FLAGS, False),
+        }
+        with patch.object(m.frozen, "_prepare_listener_admitted_once", return_value=base) as call:
+            report = m._prepare_listener_admitted_once(transfer=transfer)
+        call.assert_called_once_with(transfer=transfer)
+        self.assertEqual(report["schema"], m.SCHEMA)
+        self.assertTrue(report["root_prepare_completed"])
+        self.assertFalse(report["dropped_final_seal_installed"])
+        self.assertTrue(all(report[name] is False for name in m.FALSE_FLAGS))
+
+    def test_prepare_translates_frozen_and_opaque_errors(self):
+        for error, code in ((m.frozen.ListenerError("transfer_rejected"),
+                             "transfer_rejected"), (OSError(PRIVATE), "installation_failed")):
+            with self.subTest(code=code), patch.object(
+                    m.frozen, "_prepare_listener_admitted_once", side_effect=error,
+            ), self.assertRaises(m.ListenerV2Error) as caught:
+                m._prepare_listener_admitted_once(transfer=Mock())
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_broker_adoption_delegates_without_wrapping_listener(self):
+        adopted = object()
+        with patch.object(m.frozen, "_adopt_listener_admitted_once",
+                          return_value=adopted) as call:
+            self.assertIs(m._adopt_listener_admitted_once(17), adopted)
+        call.assert_called_once_with(17)
+
+    def test_adoption_translates_frozen_and_opaque_errors(self):
+        for error, code in ((m.frozen.ListenerError("close_failed"), "close_failed"),
+                            (OSError(PRIVATE), "listener_rejected")):
+            with self.subTest(code=code), patch.object(
+                    m.frozen, "_adopt_listener_admitted_once", side_effect=error,
+            ), self.assertRaises(m.ListenerV2Error) as caught:
+                m._adopt_listener_admitted_once(17)
+            self.assertEqual(caught.exception.code, code)
+            self.assertNotIn(PRIVATE, str(caught.exception))
+
+
+class SealTests(unittest.TestCase):
+    def setUp(self):
+        m._SEAL_COMPLETED = False
+        m.frozen._PREPARE_OWNER = (PID, THREAD)
+        m.frozen._PREPARE_FAILED = False
+        m.frozen._TRANSFER_COMPLETED = True
+        m.frozen._LOCAL_LISTENER_CLOSED = True
+        m.frozen._SEAL_ATTEMPTED = False
+        self.events = []
+        self.runtime = self.enterContext(patch.object(
+            m, "_dropped_runtime", side_effect=lambda: self.events.append("dropped_runtime"),
+        ))
+        self.pid = self.enterContext(patch.object(m.os, "getpid", return_value=PID))
+        self.thread = self.enterContext(patch.object(
+            m.threading, "get_ident", return_value=THREAD,
+        ))
+        self.abi = self.enterContext(patch.object(
+            m.frozen, "_abi", side_effect=lambda: self.events.append("abi"),
+        ))
+        self.readback = self.enterContext(patch.object(
+            m.frozen, "_kernel_readback", side_effect=lambda: self.events.append("readback"),
+        ))
+        self.prctl = self.enterContext(patch.object(
+            m.frozen, "_prctl", side_effect=self.prctl_call,
+        ))
+        self.seccomp = self.enterContext(patch.object(
+            m.frozen, "_seccomp", side_effect=self.seccomp_call,
+        ))
+
+    def prctl_call(self, option, value=0):
+        self.events.append(("prctl", option, value))
+        return {m.frozen.PR_GET_NO_NEW_PRIVS: 1,
+                m.frozen.PR_GET_SECCOMP: m.frozen.SECCOMP_MODE_FILTER}[option]
+
+    def seccomp_call(self, operation, flags, pointer):
+        self.events.append(("seccomp", operation, flags))
+        self.assertEqual((operation, flags), (m.frozen.SECCOMP_SET_MODE_FILTER, 0))
+        program = ctypes.cast(pointer, ctypes.POINTER(m.frozen.SockFprog)).contents
+        observed = tuple((program.filter[index].code, program.filter[index].jt,
+                          program.filter[index].jf, program.filter[index].k)
+                         for index in range(program.length))
+        self.assertEqual(observed, m.frozen.policy.FILTER)
+        return 0
+
+    def test_success_uses_exact_dropped_order_and_frozen_filter(self):
+        report = m._seal_admitted_once()
+        self.assertEqual(self.events, [
+            "dropped_runtime", "abi", "readback",
+            ("prctl", m.frozen.PR_GET_NO_NEW_PRIVS, 0),
+            ("prctl", m.frozen.PR_GET_SECCOMP, 0),
+            ("seccomp", m.frozen.SECCOMP_SET_MODE_FILTER, 0),
+            ("prctl", m.frozen.PR_GET_NO_NEW_PRIVS, 0),
+            ("prctl", m.frozen.PR_GET_SECCOMP, 0),
+        ])
+        self.assertTrue(m.frozen._SEAL_ATTEMPTED)
+        self.assertEqual(report["schema"], m.SCHEMA)
+        self.assertEqual(report["worker_uid"], 10001)
+        self.assertEqual(report["worker_gid"], 10001)
+        self.assertTrue(report["same_prepare_process_and_thread"])
+        self.assertTrue(report["no_new_privileges_readback"])
+        self.assertTrue(report["final_seal_installed"])
+        self.assertTrue(all(report[name] is False for name in m.FALSE_FLAGS))
+        self.assertTrue(m._SEAL_COMPLETED)
+        self.assertIsNone(m._require_sealed_owner())
+
+    def test_runtime_rejection_does_not_consume_seal_attempt(self):
+        self.runtime.side_effect = m.ListenerV2Error("runtime_rejected")
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+        self.assertFalse(m.frozen._SEAL_ATTEMPTED)
+        self.abi.assert_not_called()
+
+    def test_every_incomplete_or_wrong_prepare_state_rejects_before_consumption(self):
+        variants = {
+            "owner": ("_PREPARE_OWNER", (PID + 1, THREAD)),
+            "failed": ("_PREPARE_FAILED", True),
+            "not_transferred": ("_TRANSFER_COMPLETED", False),
+            "not_closed": ("_LOCAL_LISTENER_CLOSED", False),
+        }
+        for label, (name, value) in variants.items():
+            with self.subTest(label=label):
+                original = getattr(m.frozen, name)
+                setattr(m.frozen, name, value)
+                try:
+                    with self.assertRaises(m.ListenerV2Error) as caught:
+                        m._seal_admitted_once()
+                    self.assertEqual(caught.exception.code, "seal_rejected")
+                    self.assertFalse(m.frozen._SEAL_ATTEMPTED)
+                    self.abi.assert_not_called()
+                finally:
+                    setattr(m.frozen, name, original)
+
+    def test_started_native_failure_is_terminal_and_not_retried(self):
+        self.readback.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "installation_failed")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertTrue(m.frozen._SEAL_ATTEMPTED)
+        self.assertFalse(m._SEAL_COMPLETED)
+        self.runtime.reset_mock()
+        self.readback.reset_mock()
+        self.readback.side_effect = None
+        with self.assertRaises(m.ListenerV2Error) as retry:
+            m._seal_admitted_once()
+        self.assertEqual(retry.exception.code, "already_attempted")
+        self.readback.assert_not_called()
+
+    def test_failed_preinstall_readback_is_terminal(self):
+        self.prctl.side_effect = lambda option, value=0: (
+            0 if option == m.frozen.PR_GET_NO_NEW_PRIVS
+            else m.frozen.SECCOMP_MODE_FILTER
+        )
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "readback_failed")
+        self.assertTrue(m.frozen._SEAL_ATTEMPTED)
+        self.seccomp.assert_not_called()
+
+    def test_failed_install_is_terminal(self):
+        self.seccomp.side_effect = lambda *_args: -1
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "installation_failed")
+        self.assertTrue(m.frozen._SEAL_ATTEMPTED)
+        self.assertFalse(m._SEAL_COMPLETED)
+        self.seccomp.assert_called_once()
+
+    def test_failed_postinstall_readback_is_terminal(self):
+        values = [1, m.frozen.SECCOMP_MODE_FILTER, 1, 0]
+        self.prctl.side_effect = lambda *_args: values.pop(0)
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "readback_failed")
+        self.assertTrue(m.frozen._SEAL_ATTEMPTED)
+        self.assertFalse(m._SEAL_COMPLETED)
+        self.seccomp.assert_called_once()
+
+    def test_existing_shared_seal_attempt_is_never_reused(self):
+        m.frozen._SEAL_ATTEMPTED = True
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.abi.assert_not_called()
+
+    def test_frozen_error_code_is_preserved_without_private_text(self):
+        self.abi.side_effect = m.frozen.ListenerError("abi_rejected")
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "abi_rejected")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_alias_state_and_owner_values_cannot_admit_a_seal(self):
+        variants = (("_PREPARE_OWNER", (float(PID), THREAD)),
+                    ("_PREPARE_OWNER", [PID, THREAD]),
+                    ("_PREPARE_OWNER", (PID, THREAD + 1)),
+                    ("_PREPARE_FAILED", 0), ("_TRANSFER_COMPLETED", 1),
+                    ("_LOCAL_LISTENER_CLOSED", 1))
+        for name, value in variants:
+            with self.subTest(name=name), patch.object(m.frozen, name, value), \
+                    self.assertRaises(m.ListenerV2Error) as caught:
+                m._seal_admitted_once()
+            self.assertEqual(caught.exception.code, "seal_rejected")
+            self.assertFalse(m.frozen._SEAL_ATTEMPTED)
+        for value in (0, None):
+            with patch.object(m.frozen, "_SEAL_ATTEMPTED", value), \
+                    self.assertRaises(m.ListenerV2Error) as caught:
+                m._seal_admitted_once()
+            self.assertEqual(caught.exception.code, "already_attempted")
+        self.seccomp.assert_not_called()
+
+    def test_owner_probe_errors_are_fixed_codes_and_release_lock(self):
+        self.pid.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(str(caught.exception), "installation_failed")
+        self.assertFalse(m.frozen._SEAL_ATTEMPTED)
+        self.assertFalse(m.frozen._PREPARE_LOCK.locked())
+
+    def test_kernel_return_aliases_fail_closed(self):
+        for value in (True, 1.0):
+            m.frozen._SEAL_ATTEMPTED = False
+            self.prctl.side_effect = lambda *_args: value
+            with self.subTest(value=value), self.assertRaises(m.ListenerV2Error) as caught:
+                m._seal_admitted_once()
+            self.assertEqual(caught.exception.code, "readback_failed")
+            self.assertFalse(m._SEAL_COMPLETED)
+        self.prctl.side_effect = self.prctl_call
+        for value in (False, 0.0):
+            m.frozen._SEAL_ATTEMPTED = False
+            self.seccomp.side_effect = lambda *_args: value
+            with self.subTest(value=value), self.assertRaises(m.ListenerV2Error) as caught:
+                m._seal_admitted_once()
+            self.assertEqual(caught.exception.code, "installation_failed")
+            self.assertFalse(m._SEAL_COMPLETED)
+
+    def test_swallowed_reentry_before_install_poisoned_outer_operation(self):
+        def nested():
+            with self.assertRaises(m.ListenerV2Error) as caught:
+                m._seal_admitted_once()
+            self.assertEqual(caught.exception.code, "reentry")
+
+        self.readback.side_effect = nested
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "seal_rejected")
+        self.assertTrue(m.frozen._PREPARE_FAILED)
+        self.assertFalse(m._SEAL_COMPLETED)
+        self.seccomp.assert_not_called()
+        self.assertFalse(m.frozen._PREPARE_LOCK.locked())
+
+    def test_swallowed_reentry_during_install_prevents_completion(self):
+        def install(*_args):
+            self.assertFalse(m._SEAL_COMPLETED)
+            with self.assertRaises(m.ListenerV2Error) as caught:
+                m._require_sealed_owner()
+            self.assertEqual(caught.exception.code, "reentry")
+            return 0
+
+        self.seccomp.side_effect = install
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "seal_rejected")
+        self.assertFalse(m._SEAL_COMPLETED)
+
+    def test_require_before_completion_revokes_preparation(self):
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._require_sealed_owner()
+        self.assertEqual(caught.exception.code, "seal_rejected")
+        self.assertTrue(m.frozen._PREPARE_FAILED)
+        self.assertFalse(m._SEAL_COMPLETED)
+        self.seccomp.assert_not_called()
+
+    def test_require_after_seal_uses_no_credential_or_native_probe(self):
+        m._seal_admitted_once()
+        self.abi.reset_mock()
+        self.readback.reset_mock()
+        self.prctl.reset_mock()
+        self.seccomp.reset_mock()
+        with patch.object(m, "_dropped_runtime", side_effect=AssertionError(PRIVATE)), \
+                patch.object(m.os, "getresuid", side_effect=AssertionError(PRIVATE), create=True), \
+                patch.object(m.os, "getresgid", side_effect=AssertionError(PRIVATE), create=True), \
+                patch.object(m.os, "getgroups", side_effect=AssertionError(PRIVATE)):
+            m._require_sealed_owner()
+        for call in (self.abi, self.readback, self.prctl, self.seccomp):
+            call.assert_not_called()
+
+    def test_require_changed_process_or_thread_revokes_completion(self):
+        m._seal_admitted_once()
+        self.thread.return_value = THREAD + 1
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._require_sealed_owner()
+        self.assertEqual(caught.exception.code, "seal_rejected")
+        self.thread.return_value = THREAD
+        with self.assertRaises(m.ListenerV2Error):
+            m._require_sealed_owner()
+        self.assertFalse(m._SEAL_COMPLETED)
+
+    def test_retry_after_success_revokes_completion(self):
+        m._seal_admitted_once()
+        with self.assertRaises(m.ListenerV2Error) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertFalse(m._SEAL_COMPLETED)
+        self.seccomp.assert_called_once()
+
+    def test_actual_prepare_then_simulated_drop_then_actual_seal(self):
+        # Only boundary return values simulate root -> 10001. No actual drop,
+        # filter, descriptor, process or transport is exercised by this test.
+        m.frozen._PREPARE_OWNER = None
+        m.frozen._TRANSFER_COMPLETED = False
+        m.frozen._LOCAL_LISTENER_CLOSED = False
+        self.runtime.side_effect = REAL_DROPPED_RUNTIME
+        identity = (11, 22, 0, 0, 0)
+        programs = []
+
+        def install(operation, flags, pointer):
+            self.assertEqual(operation, m.frozen.SECCOMP_SET_MODE_FILTER)
+            program = ctypes.cast(pointer, ctypes.POINTER(m.frozen.SockFprog)).contents
+            rows = tuple((program.filter[index].code, program.filter[index].jt,
+                          program.filter[index].jf, program.filter[index].k)
+                         for index in range(program.length))
+            programs.append((flags, rows))
+            return 17 if flags == m.frozen.LISTENER_FLAGS else 0
+
+        self.seccomp.side_effect = install
+        self.prctl.side_effect = lambda option, value=0: {
+            m.frozen.PR_SET_NO_NEW_PRIVS: 0,
+            m.frozen.PR_GET_NO_NEW_PRIVS: 1,
+            m.frozen.PR_GET_SECCOMP: m.frozen.SECCOMP_MODE_FILTER,
+        }[option]
+        transfer = Mock(return_value=m.frozen.ADOPTED)
+        with RuntimeTests.valid_runtime(self), \
+                patch.object(m.os, "getresuid", return_value=(0, 0, 0)) as uids, \
+                patch.object(m.os, "getresgid", return_value=(0, 0, 0)) as gids, \
+                patch.object(m.frozen, "_descriptor", return_value=identity), \
+                patch.object(m.frozen.os, "close") as close:
+            prepared = m._prepare_listener_admitted_once(transfer=transfer)
+            self.assertTrue(prepared["root_prepare_completed"])
+            transfer.assert_called_once_with(17, identity, m.frozen.policy.LISTENER_FILTER_SHA256)
+            close.assert_called_once_with(17)
+            self.assertFalse(m._SEAL_COMPLETED)
+            with self.assertRaises(m.ListenerV2Error) as still_root:
+                m._seal_admitted_once()
+            self.assertEqual(still_root.exception.code, "runtime_rejected")
+            self.assertFalse(m.frozen._SEAL_ATTEMPTED)
+            uids.return_value = gids.return_value = (10001,) * 3
+            result = m._seal_admitted_once()
+            self.assertTrue(result["final_seal_installed"])
+            m._require_sealed_owner()
+        self.assertEqual(programs, [
+            (m.frozen.LISTENER_FLAGS, m.frozen.policy.LISTENER_FILTER),
+            (0, m.frozen.policy.FILTER),
+        ])
+
+
+if __name__ == "__main__":
+    unittest.main()

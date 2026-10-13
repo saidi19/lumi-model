@@ -1,0 +1,254 @@
+"""Private full-size layout adapter; never acquisition, admission or payload I/O.
+
+An independently admitted Linux/root parent supplies an exact unfrozen owned
+rootfs, authenticated source/control bytes and separately acquired inputs. Only
+metadata is inspected in the existing checkpoint/tokenizer trees. No existing
+input is copied, hashed, chmod'd or chown'd. Four empty rootfs mount targets and
+two fresh sibling directories are created before the source add-on freezes the
+root. The add-on's content reservation excludes filesystem metadata/OS overhead.
+
+Public installation remains closed. Local tests replace native operations.
+Started failure taints the root; newly created nodes remain, without cleanup or
+retry. Paths and identity maps in the private result must not be logged. Only
+the aggregate receipt is retention-safe. Metadata equality/read-only mounts do
+not authenticate content, exclude external writers or prove immutable backing.
+"""
+
+from __future__ import annotations
+
+import os
+
+from . import posttraining_checkpoint_fullsize_sources_v1 as addon
+from . import posttraining_checkpoint_import_rootfs_v2 as import_rootfs
+from . import posttraining_checkpoint_input_mount_v2 as input_mount
+from . import posttraining_checkpoint_prepared_layout_v2 as prepared
+from . import posttraining_sft_oci_rootfs_v1 as rootfs
+
+SCHEMA = "lumi.checkpoint-fullsize-layout.v0.1"
+INPUT_ROLES = ("checkpoint", "tokenizer")
+SIBLINGS = (*INPUT_ROLES, "output", "mountpoint")
+TARGET_MODES = dict(prepared.TARGET_MODES)
+FALSE_FLAGS = (
+    "base_origin_verified", "input_content_authenticated", "filesystem_immutable",
+    "external_writer_exclusion_verified", "host_admission_verified", "mounts_verified",
+    "native_guardian_verified", "native_cumulative_write_enforcement_verified",
+    "arbitrary_native_writes_metered", "real_import_authorized", "execution_permitted",
+    "real_4b_import", "gate_5_complete", "training_authorized", "production_eligible",
+    "external_sibling_cleanup_provided", "retry_allowed",
+)
+ERROR_CODES = frozenset({"arguments_rejected", "binding_rejected", "layout_rejected",
+    "runtime_rejected", "installation_failed", "close_failed", "host_guard_not_bound"})
+
+
+class FullsizeLayoutError(ValueError):
+    def __init__(self, code="installation_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "installation_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code="layout_rejected"):
+    if not value:
+        raise FullsizeLayoutError(code) from None
+
+
+def validate_layout(*, inventories, addon_arguments):
+    """Validate supplied controls and exact plan inventory sizes without any I/O."""
+    try:
+        _need(type(addon_arguments) is dict and type(inventories) is dict
+              and set(inventories) == set(INPUT_ROLES), "arguments_rejected")
+        arguments = dict(addon_arguments)
+        _need(type(arguments.get("files")) is dict
+              and type(arguments.get("control_bodies")) is dict, "arguments_rejected")
+        arguments["files"] = dict(arguments["files"])
+        arguments["control_bodies"] = dict(arguments["control_bodies"])
+        summary = addon.validate_bundle(**arguments)
+        verified = addon.worker.prepare_entry(arguments["control_raw"], arguments["control_bodies"],
+            expected_control_sha256=arguments["expected_control_sha256"],
+            expected_entry_sha256=arguments["expected_entry_sha256"],
+            expected_source_manifest_sha256=arguments["expected_manifest_sha256"],
+            expected_attempt_nonce_sha256=arguments["expected_attempt_nonce_sha256"],
+            runtime_sources={name: arguments["files"]["lumi/" + name]
+                             for name in addon.worker.RUNTIME_NAMES})
+        manifests = {role: input_mount._manifest(inventories[role]) for role in INPUT_ROLES}
+        copied = {role: manifest[0] for role, manifest in manifests.items()}
+        _need(copied == verified["inventories"], "binding_rejected")
+        _need(sum(map(len, copied.values())) <= input_mount.MAXIMUM_FILES
+              and sum(sum(rows.values()) for rows in copied.values()) <= input_mount.MAXIMUM_BYTES,
+              "arguments_rejected")
+        additions = {addon.ENTRY_PATH: arguments["entry"], addon.HELPER_PATH: arguments["helper"],
+            addon.MANIFEST_PATH: arguments["manifest"],
+            addon.CONTROL_PREFIX + "control.json": arguments["control_raw"],
+            **{addon.CONTROL_PREFIX + name: raw
+               for name, raw in arguments["control_bodies"].items()},
+            **{addon.SOURCE_PREFIX + name: raw for name, raw in arguments["files"].items()}}
+        return {"inventories": copied, "manifests": manifests, "addon_arguments": arguments,
+                "summary": summary, "additions": additions}
+    except FullsizeLayoutError:
+        raise
+    except BaseException:
+        raise FullsizeLayoutError("binding_rejected") from None
+
+
+def _close(descriptors, fd):
+    descriptors.remove(fd)  # Consume ownership before ambiguous close, never retry it.
+    try:
+        os.close(fd)
+    except BaseException:
+        raise FullsizeLayoutError("close_failed") from None
+
+
+def _preflight_owned(owned, bundle, checkpoint_path, tokenizer_path, expected):
+    _need(type(owned) is rootfs.OwnedRootfs)
+    owned._guard()
+    _need(not owned._frozen and owned._installed_files == owned._installed_bytes == 0)
+    owned._verify_tree()
+    prepared._directory(owned._parent_fd, 0, 0o700)
+    prepared._directory(owned._root_fd, 0, 0o700)
+    import_rootfs.mount_root._path(str(owned._path))
+    _need(owned._root_name not in SIBLINGS)
+    paths = {"checkpoint": checkpoint_path, "tokenizer": tokenizer_path}
+    for role, path in paths.items():
+        _need(type(path) is str and path == str(owned._parent) + "/" + role)
+        import_rootfs.mount_root._path(path)
+    _need(type(expected) is dict and set(expected) == set(INPUT_ROLES), "arguments_rejected")
+    for identity in expected.values():
+        _need(type(identity) is tuple and len(identity) == 9
+              and all(type(value) is int and value >= 0 for value in identity)
+              and identity[1] > 0, "arguments_rejected")
+    _need(expected["checkpoint"][:2] != expected["tokenizer"][:2])
+    for name in ("output", "mountpoint"):
+        prepared._absent(owned._parent_fd, name)
+    forbidden = (("inputs",), ("outputs",), ("opt", "lumi-release", "importer"),
+                 ("opt", "lumi-release", "fullsize-control"))
+    _need(not any(parts[:len(prefix)] == prefix for prefix in forbidden
+                  for parts in set(owned._nodes) | owned._seen))
+    planned, total = set(owned._nodes), owned._content_bytes
+    for name, body in bundle["additions"].items():
+        parts = tuple(name.split("/"))
+        _need(parts not in owned._nodes and parts not in owned._seen)
+        for depth in range(1, len(parts)):
+            parent = parts[:depth]
+            _need(parent not in owned._nodes or owned._nodes[parent][1] == "directory")
+            planned.add(parent)
+        planned.add(parts)
+        total += len(body)
+        _need(len(body) <= owned._limits["file"])
+    planned.update(TARGET_MODES)
+    _need(len(planned) <= owned._limits["entries"] and total <= owned._limits["total"]
+          and len(bundle["additions"]) == bundle["summary"]["addon_files"]
+          and total - owned._content_bytes == bundle["summary"]["addon_bytes"])
+    return paths, dict(expected)
+
+
+def _pin_inputs(paths, expected, descriptors):
+    result = {}
+    for role in INPUT_ROLES:
+        fd = rootfs._open_absolute(paths[role], directory=True)
+        descriptors.append(fd)
+        prepared._directory(fd, input_mount.UID, 0o700)
+        _need(input_mount._identity(fd) == expected[role])
+        result[role] = fd
+    return result
+
+
+def _trees(owned, pins, bundle, descriptors, excluded):
+    seen, result = set(excluded), {}
+    for role in INPUT_ROLES:
+        owned._guard()
+        result[role] = input_mount._tree(pins[role], bundle["manifests"][role], descriptors,
+                                        readonly=False, seen=seen)
+    return result
+
+
+def _final_controls(owned, bundle, expected, fresh, descriptors, parent_before):
+    owned._guard()
+    owned._verify_tree()
+    _need(owned._frozen is True)
+    for fd in fresh.values():
+        _need(input_mount._listing(fd, descriptors) == [])
+    mount = prepared._mount_arguments(owned, bundle["inventories"], descriptors)
+    identities = mount["expected_identities"]
+    for role in INPUT_ROLES:
+        _need(identities[role] == expected[role])
+    _need(identities["parent"][:2] == parent_before[:2]
+          and identities["parent"] == input_mount._identity(owned._parent_fd)
+          and identities["root"] == input_mount._identity(owned._root_fd)
+          and identities["output"] == input_mount._identity(fresh["output"])
+          and mount["expected_mountpoint_identity"] == input_mount._identity(fresh["mountpoint"]))
+    for role, parts in (("root", ()), ("inputs", ("inputs",)),
+                        ("target_checkpoint", ("inputs", "checkpoint")),
+                        ("target_tokenizer", ("inputs", "tokenizer")),
+                        ("target_output", ("outputs",))):
+        fd = owned._directory(parts)
+        descriptors.append(fd)
+        _need(identities[role] == input_mount._identity(fd))
+        _close(descriptors, fd)
+    return mount
+
+
+def prepare_layout(**_arguments):
+    """Matching controls or an approval flag cannot open native installation."""
+    raise FullsizeLayoutError("host_guard_not_bound") from None
+
+
+def _prepare_admitted_once(owned, *, checkpoint_path, tokenizer_path, expected_input_identities,
+                           inventories, addon_arguments):
+    """Private one-shot adapter; caller independently establishes host/writer premises."""
+    try:
+        addon._runtime()  # Before supplied object access or any native operation.
+    except BaseException:
+        raise FullsizeLayoutError("runtime_rejected") from None
+    descriptors, started, failure = [], False, None
+    try:
+        bundle = validate_layout(inventories=inventories, addon_arguments=addon_arguments)
+        paths, expected = _preflight_owned(owned, bundle, checkpoint_path, tokenizer_path,
+                                          expected_input_identities)
+        parent_before = input_mount._identity(owned._parent_fd)
+        excluded = {parent_before[:2], input_mount._identity(owned._root_fd)[:2]}
+        pins = _pin_inputs(paths, expected, descriptors)
+        before = _trees(owned, pins, bundle, descriptors, excluded)
+        started = True  # Any ambiguous mutation consumes this exact owned attempt.
+        for parts, mode in TARGET_MODES.items():
+            owned._guard()
+            owned._parents(parts)
+            identity, kind, _old_mode = owned._nodes[parts]
+            owned._nodes[parts] = identity, kind, mode
+            owned._seen.add(parts)
+        fresh = {}
+        for role in ("output", "mountpoint"):
+            owned._guard()
+            fresh[role] = prepared._new_directory(owned._parent_fd, role,
+                input_mount.UID if role == "output" else 0, descriptors)
+        installed = addon._install_admitted_once(owned, **bundle["addon_arguments"])
+        _need(installed["installation_frozen"] is True
+              and installed["addon_bytes"] == bundle["summary"]["addon_bytes"]
+              and installed["addon_files"] == bundle["summary"]["addon_files"])
+        excluded.update(input_mount._identity(fd)[:2] for fd in fresh.values())
+        _need(_trees(owned, pins, bundle, descriptors, excluded) == before)
+        mount = _final_controls(owned, bundle, expected, fresh, descriptors, parent_before)
+    except BaseException as error:
+        failure = error.code if type(error) is FullsizeLayoutError else "installation_failed"
+    finally:
+        while descriptors:
+            try:
+                _close(descriptors, descriptors[-1])
+            except BaseException:
+                failure = "close_failed"
+    if failure is not None:
+        if started:
+            owned._tainted = True
+        raise FullsizeLayoutError(failure) from None
+    receipt = {"schema": SCHEMA, "status": "prepared_private_layout_not_execution_authority",
+        "source_manifest_sha256": bundle["summary"]["source_manifest_sha256"],
+        "control_sha256": bundle["summary"]["control_sha256"],
+        "addon_files": installed["addon_files"],
+        "addon_content_write_bytes": installed["addon_bytes"],
+        "input_files": sum(map(len, bundle["inventories"].values())),
+        "input_inventory_bytes": sum(sum(rows.values())
+                                     for rows in bundle["inventories"].values()),
+        "metadata_tree_passes": 2, "input_payload_read_bytes": 0, "input_payload_write_bytes": 0,
+        "existing_input_permission_changes": 0, "new_rootfs_mount_targets": len(TARGET_MODES),
+        "new_external_directories": 2, "installation_frozen": True,
+        "input_layout_prepared": True, **dict.fromkeys(FALSE_FLAGS, False)}
+    return {"mount_arguments": mount, "environment": dict(bundle["summary"]["environment"]),
+            "receipt": receipt}

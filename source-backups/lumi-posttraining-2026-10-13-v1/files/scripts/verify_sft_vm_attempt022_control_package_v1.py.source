@@ -1,0 +1,159 @@
+"""Independent offline control-package verification; never deployment authority."""
+
+import io
+import json
+import sys
+import unittest
+from pathlib import Path
+
+from scripts import execute_sft_vm_inert_watchdog_v15 as watchdog
+from scripts import prepare_sft_vm_attempt022_control_package_v1 as package
+from scripts import sft_vm_dedicated_cleanup_bucket_v13 as cleanup
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE_SHA = "5f49c3e6ed00b4ddfb14346c4c79d11ac09deeb8411de6f6948ef25a56aead9e"
+BUILDER_SHA = "040d644dfba50cc1fb2cc77395cfec36e19d0b957de6af8197824d021fe4de65"
+EXTRA_TEST = "tests/test_sft_vm_attempt022_control_package_v1.py"
+EXTRA_TEST_SHA = "29157b09b01964064b089eab6c42c6a32b36459cd35a51ddb3dcd878096e5e31"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-control-package-verification-v0.1.json"
+need, sha, read = package.need, package.sha, package.read
+
+
+def verify():
+    read(str(Path(package.__file__).relative_to(ROOT)), BUILDER_SHA)
+    read(EXTRA_TEST, EXTRA_TEST_SHA)
+    record = json.loads(read(package.OUTPUT, PACKAGE_SHA))
+    outputs = record["outputs"]
+    for name, pin in outputs.items():
+        raw = read(name, pin["sha256"])
+        need(len(raw) == pin["bytes"])
+    plan_raw = read(package.PLAN_DIR + "/plan.json")
+    release_raw = read(package.PLAN_DIR + "/release.json")
+    helper_raw = read(package.HELPER)
+    need(package.encode(package.build_plan()) == plan_raw)
+    need(package.helper_source(sha(plan_raw), sha(release_raw)) == helper_raw)
+    need(
+        package.control_source(
+            "scripts/execute_sft_vm_inert_watchdog_v14.py", sha(helper_raw), sha(plan_raw)
+        )
+        == read(package.WATCH)
+    )
+    need(
+        package.control_source(
+            "scripts/sft_vm_dedicated_cleanup_bucket_v12.py", sha(helper_raw), sha(plan_raw)
+        )
+        == read(package.BUCKET)
+    )
+    watch_raw, clean_raw = read(package.WATCH_PROPOSAL), read(package.BUCKET_PROPOSAL)
+    watch_value, clean_value = watchdog.decode(watch_raw), cleanup.decode(clean_raw)
+    need(watchdog.encode(watch_value) == watchdog.encode(watchdog.expected_proposal()))
+    need(cleanup.encode(clean_value) == cleanup.encode(cleanup.expected_proposal()))
+    need(watch_value["plan_sha256"] == clean_value["plan_sha256"] == record["plan_sha256"])
+    need(watch_value["helper_sha256"] == clean_value["helper_sha256"] == record["helper_sha256"])
+    need(not watchdog.APPROVAL.exists() and not cleanup.APPROVAL.exists())
+    need(not watchdog.OUTPUT.exists() and not cleanup.OUTPUT.exists())
+    watchdog.sources()
+    cleanup.sources()
+
+    # Only synthetic transports may run. Prevent accidental SDK/network/process
+    # execution during the joined replay, including all negative-boundary cases.
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    suite = unittest.defaultTestLoader.loadTestsFromNames(
+        [
+            "tests.test_sft_vm_inert_watchdog_v14",
+            "tests.test_sft_vm_dedicated_cleanup_bucket_v13",
+            "tests.test_sft_vm_attempt022_control_package_v1",
+        ]
+    )
+    result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+    need(result.wasSuccessful() and result.testsRun == 16)
+    bindings = {name: pin["sha256"] for name, pin in outputs.items()}
+    bindings.update(
+        {
+            package.OUTPUT: PACKAGE_SHA,
+            str(Path(package.__file__).relative_to(ROOT)): BUILDER_SHA,
+            EXTRA_TEST: EXTRA_TEST_SHA,
+            str(Path(__file__).relative_to(ROOT)): sha(read(str(Path(__file__).relative_to(ROOT)))),
+            package.ABSENCE: package.ABSENCE_SHA,
+            package.ABSENCE_PROOF: package.ABSENCE_PROOF_SHA,
+            package.SOURCE_PROOF: package.SOURCE_PROOF_SHA,
+        }
+    )
+    return {
+        "schema": "lumi.vm-attempt022-control-package-verification.v0.1",
+        "attempt": package.ATTEMPT,
+        "status": "control_package_prepared_not_authorized",
+        "source_bindings": bindings,
+        "plan_sha256": record["plan_sha256"],
+        "helper_sha256": record["helper_sha256"],
+        "watchdog": {
+            "proposal_sha256": sha(watch_raw),
+            "entry_sha256": watch_value["entry_sha256"],
+            "maximum_seconds": 600,
+            "maximum_control_calls": 45,
+            "maximum_new_roles": 2,
+            "maximum_new_functions": 1,
+            "maximum_new_log_groups": 1,
+            "invocation": False,
+            "schedule_creation": False,
+            "instance_action": False,
+        },
+        "cleanup_bucket": {
+            "proposal_sha256": sha(clean_raw),
+            "entry_sha256": clean_value["entry_sha256"],
+            "maximum_seconds": 300,
+            "maximum_calls": 20,
+            "fixed_mutations": 6,
+            "shared_bucket_mutation": False,
+            "object_access": False,
+            "iam_mutation": False,
+            "instance_action": False,
+        },
+        "qualification": {
+            "synthetic_tests_passed": result.testsRun,
+            "socket_and_process_creation_blocked": True,
+            "qualified_deployment_programs_reproduced_byte_for_byte_except_bindings": True,
+            "old_consumed_evidence_preserved": True,
+            "fresh_vpc_endpoint_slot_snapshot_bound": True,
+            "full_cpu_or_network_admission_passed": False,
+            "fresh_control_evidence_not_yet_available": True,
+            "control_name_collision_recheck_required_at_deployment": True,
+            "ruff": "passed",
+        },
+        "deployment_sequence": ["unarmed_watchdog", "dedicated_private_cleanup_bucket"],
+        "stop_on_either_failure": True,
+        "maximum_combined_control_calls": 65,
+        "maximum_combined_runtime_seconds": 900,
+        "approval_files_present": False,
+        "deployment_outputs_present": False,
+        "aws_calls": 0,
+        "cloud_mutations": 0,
+        "checkpoint_access": False,
+        "prior_evidence_preserved": True,
+        "cpu_launch_authorized": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--write-once"] and not OUTPUT.exists())
+    result = verify()
+    package.write_new(str(OUTPUT.relative_to(ROOT)), package.encode(result))
+    print(
+        json.dumps(
+            {
+                "status": result["status"],
+                "tests_passed": 16,
+                "plan_sha256": result["plan_sha256"],
+                "aws_calls": 0,
+            },
+            sort_keys=True,
+        )
+    )

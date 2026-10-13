@@ -1,0 +1,320 @@
+"""Private final native binding under the approved trusted-admin/root/OS premise.
+
+NOT a launcher or a public approval switch. A future authenticated controller
+must separately establish cloud/retention admission and real execution authority
+before calling this primitive on the dedicated host. No such delivery is wired
+here. Lost acknowledgement or any partial write consumes the attempt: STOP,
+never retry. The binding hash is committed last; failure after that point may
+leave an executable binding, which the outer controller must treat as consumed.
+
+The UID/GID census observes absence, not exclusion of a malicious root writer.
+Trusted root must keep launch exclusivity throughout admission and execution.
+No new clock, worker, network call, credential or model-data access is introduced.
+"""
+
+import hashlib
+import json
+import os
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ROOT = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+QUAL_ROOT = Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "runtime-qualification"
+PROC = Path("/proc")
+TRUST = "dedicated-vm-trusted-admin-root-os-v1"
+PINS = {
+    "receiver.py": "e2b2f544afac042e64c19914dcb89994d99394101521c2422fc9770e904e2bff",
+    "readiness.py": "c6d65a5e1dc90c46855f76be9ccf241193cf2ac0fedb20c6b8ad1d95bbefdfda",
+    "qualification.py": "1922beb8a6c49f7d8bf4d89e22a73259b3d37f38b4e910f0680499d49e4a064b",
+}
+QUAL_TRUE = (
+    "native_ml_runtime_qualified",
+    "same_boot_readiness_rechecked",
+    "both_cgroups_empty",
+    "generated_tmpfs_unmounted",
+    "independent_checksum_consumer",
+)
+QUAL_FALSE = (
+    "runtime_reinstalled",
+    "binding_created",
+    "host_admitted",
+    "real_4b_import",
+    "gate_5_complete",
+    "training_authorized",
+    "production_eligible",
+    "retry_allowed",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("native_binding_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def unique(rows):
+        value = {}
+        for key, item in rows:
+            need(key not in value)
+            value[key] = item
+        return value
+
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def boundary():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(os.uname().machine == "x86_64" and os.cpu_count() == 16)
+
+
+def private_directory(path):
+    for parent in (path, *path.parents):
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(not info.st_mode & 0o022)
+    need(stat.S_IMODE(path.lstat().st_mode) == 0o700)
+
+
+def root_read(path, cap=32768):
+    # Bootstrap trust without importing a potentially unauthenticated helper.
+    private_directory(path.parent)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(before.st_uid == before.st_gid == 0 and stat.S_IMODE(before.st_mode) == 0o400)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, k) == getattr(after, k)
+            for k in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        )
+    )
+    return raw
+
+
+def helpers():
+    bodies = {name: root_read(QUAL_ROOT / name) for name in PINS}
+    need(all(sha(bodies[name]) == pin for name, pin in PINS.items()))
+    loaded = []
+    for name in ("receiver.py", "readiness.py"):
+        module = types.ModuleType("_native_binding_" + name[:-3])
+        module.__file__ = str(QUAL_ROOT / name)
+        exec(compile(bodies[name], module.__file__, "exec"), module.__dict__)
+        loaded.append(module)
+    return loaded
+
+
+def qualification_report(value, qualification):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "schema",
+            "attempt",
+            "qualification_attempt",
+            "status",
+            "source_files_verified",
+            "generated_files_unchanged",
+            "full_input_audits",
+            *QUAL_TRUE,
+            *QUAL_FALSE,
+        }
+    )
+    need(value["schema"] == "lumi.vm-existing-runtime-qualification.v0.1")
+    need(value["attempt"] == ATTEMPT and value["qualification_attempt"] == qualification)
+    need(value["status"] == "passed_generated_only")
+    need(all(value[k] is True for k in QUAL_TRUE) and all(value[k] is False for k in QUAL_FALSE))
+    for key, expected in (("source_files_verified", 49), ("full_input_audits", 2)):
+        need(type(value[key]) is int and value[key] == expected)
+    need(type(value["generated_files_unchanged"]) is int)
+    need(50 <= value["generated_files_unchanged"] <= 256)
+
+
+def completed(detached, bootstrap, helper, request):
+    need(decode(root_read(QUAL_ROOT / "request.json")) == request)
+    need(root_read(QUAL_ROOT / "finish.started") == b"consumed\n")
+    need(decode(root_read(QUAL_ROOT / "reaped.json")) == detached.result("completed"))
+    need(decode(root_read(QUAL_ROOT / "dispatch.json")) == detached.result("dispatch_requested"))
+    need(decode(root_read(QUAL_ROOT / "started.json")) == detached.result("running"))
+    for name in ("failed.json", "cancel.started"):
+        need(not os.path.lexists(QUAL_ROOT / name))
+    qualification_report(decode(root_read(QUAL_ROOT / "result.json")), detached.QUALIFICATION)
+    for unit in detached.units():
+        need(helper.cgroup_empty(unit))
+        need(bootstrap.show(unit, "ActiveState") == b"inactive")
+
+
+def clean_identity(raw):
+    """Parse identities only; never retain names, command lines or raw status."""
+    rows = {}
+    for line in raw.splitlines():
+        key, separator, value = line.partition(b":")
+        if key not in (b"Uid", b"Gid", b"Groups"):
+            continue
+        need(separator and key not in rows)
+        fields = value.split()
+        need(all(token.isdigit() and len(token) <= 10 for token in fields))
+        need(len(fields) == 4 if key != b"Groups" else len(fields) <= 4096)
+        rows[key] = tuple(int(token) for token in fields)
+    need(set(rows) == {b"Uid", b"Gid", b"Groups"})
+    need(all(10001 not in values for values in rows.values()))
+
+
+def census(budget):
+    """Two sweeps share <=16 MiB and <=40s; each <=4096 PIDs/8192 TIDs.
+
+    All threads are inspected, including saved/fs IDs and supplementary groups.
+    Exiting threads are counted; missing whole-process permission is not ignored.
+    Only aggregate counters escape. These are observations under trusted OS/root.
+    """
+    start = time.monotonic()
+    counts = dict(processes=0, threads=0, vanished=0, bytes_read=0)
+    try:
+        with os.scandir(PROC) as processes:
+            for process in processes:
+                need(budget["seconds"] + time.monotonic() - start <= 40)
+                if not process.name.isascii() or not process.name.isdigit():
+                    continue
+                counts["processes"] += 1
+                need(counts["processes"] <= 4096)
+                try:
+                    with os.scandir(Path(process.path) / "task") as threads:
+                        for thread in threads:
+                            need(thread.name.isascii() and thread.name.isdigit())
+                            counts["threads"] += 1
+                            need(counts["threads"] <= 8192)
+                            need(budget["seconds"] + time.monotonic() - start <= 40)
+                            need(budget["bytes"] + 16385 <= 16 * 1024**2)
+                            try:
+                                fd = os.open(
+                                    Path(thread.path) / "status", os.O_RDONLY | os.O_NOFOLLOW
+                                )
+                                with os.fdopen(fd, "rb") as stream:
+                                    raw = stream.read(16385)
+                            except FileNotFoundError:
+                                counts["vanished"] += 1
+                                continue
+                            budget["bytes"] += len(raw)
+                            counts["bytes_read"] += len(raw)
+                            need(len(raw) <= 16384)
+                            clean_identity(raw)
+                except FileNotFoundError:
+                    counts["vanished"] += 1
+        need(counts["processes"] > 0 and counts["threads"] > counts["vanished"])
+        need(budget["seconds"] + time.monotonic() - start <= 40)
+        return counts
+    finally:
+        budget["seconds"] += time.monotonic() - start
+
+
+def _bind_same_host(expected):
+    boundary()  # Reject Mac/public use before any host path is read.
+    detached, readiness = helpers()
+    bootstrap, helper, request = detached.context(expected)
+    private_directory(ROOT)
+    private_directory(ROOT / "stage")
+    private_directory(ROOT / "controller")
+    need(
+        {p.name for p in ROOT.iterdir()}
+        == {
+            "stage",
+            "credentials",
+            "source-staging.json",
+            "controller",
+            "controller-staged.json",
+        }
+    )
+    admission = ROOT / "native-admission"
+    admission.mkdir(mode=0o700, exist_ok=False)  # Consume before observations; no retries.
+    bootstrap.sync(ROOT)
+    bootstrap.write(
+        admission / "started.json",
+        bootstrap.encode(
+            dict(
+                schema="lumi.vm-native-binding-start.v0.1",
+                attempt=ATTEMPT,
+                trust_scope=TRUST,
+                retry_allowed=False,
+            )
+        ),
+    )
+    completed(detached, bootstrap, helper, request)
+    budget = dict(bytes=0, seconds=0.0)
+    before = census(budget)
+    readiness._inspect_same_host(request)  # Actual checks, not supplied approval flags.
+    after = census(budget)
+    completed(detached, bootstrap, helper, request)
+    # Pinned parent's exact existing schema/deadline checks; no new permission fields.
+    entry = readiness.modules()["parent.py"]
+    binding = dict(
+        schema="lumi.vm-root-host-binding.v0.1",
+        attempt=ATTEMPT,
+        machine_id=request["machine_id"],
+        boot_id=request["boot_id"],
+        host_started_boottime=0,
+        host_deadline_boottime=request["host_deadline_boottime"],
+        prepared_sha256=readiness.DESCRIPTOR_SHA,
+    )
+    now = bootstrap.boot_time()
+    need(0 <= now < request["host_deadline_boottime"] - 11315)
+    entry.validate_binding(
+        binding, ATTEMPT, "dispatch", request["machine_id"], request["boot_id"], now
+    )
+    controller = ROOT / "controller"
+    private_directory(controller)
+    raw = bootstrap.encode(binding)
+    bootstrap.write(controller / "binding.json", raw)
+    need(root_read(controller / "binding.json") == raw)
+    digest = (sha(raw) + "\n").encode()
+    bootstrap.write(controller / "binding.sha256", digest)  # Commit point; never overwrite.
+    need(root_read(controller / "binding.sha256") == digest)
+    report = dict(
+        schema="lumi.vm-native-binding.v0.1",
+        attempt=ATTEMPT,
+        trust_scope=TRUST,
+        binding_sha256=sha(raw),
+        binding_created=True,
+        native_ml_runtime_qualified=True,
+        original_host_deadline_preserved=True,
+        census_before=before,
+        census_after=after,
+        host_admitted=False,
+        cloud_admission_established=False,
+        retention_admission_established=False,
+        adversarial_privileged_writer_exclusion_claimed=False,
+        cumulative_native_write_limit_claimed=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        training_authorized=False,
+        production_eligible=False,
+        retry_allowed=False,
+    )
+    bootstrap.write(admission / "result.json", bootstrap.encode(report))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_native_binding_controller_required") from None

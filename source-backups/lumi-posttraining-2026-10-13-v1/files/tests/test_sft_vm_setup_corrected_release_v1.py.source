@@ -1,0 +1,136 @@
+"""Versioned deployment regression; no old source/evidence is rewritten."""
+
+import ast
+import hashlib
+import importlib
+import importlib.util
+import json
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+
+
+def load(name, relative):
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+native = importlib.import_module("run_sft_vm_setup_detached_v2")
+network = importlib.import_module("run_sft_vm_network_bootstrap_v3")
+driver = importlib.import_module("run_sft_vm_setup_delivery_v2")
+inputs = importlib.import_module("stage_sft_vm_setup_inputs_v4")
+sender = driver.seed.sender
+old_inputs = importlib.import_module("stage_sft_vm_setup_inputs_v3")
+
+native_fixture = load("_corrected_native_fixture", "tests/test_sft_vm_setup_detached_v1.py")
+native_fixture.m, native_fixture.b = native, network
+delivery_fixture = load("_corrected_sender_fixture", "tests/test_sft_vm_setup_delivery_v3.py")
+delivery_fixture.m = sender
+joined_fixture = load("_corrected_join_fixture", "tests/test_sft_vm_setup_delivery_join_v1.py")
+joined_fixture.m, joined_fixture.native, joined_fixture.prior = driver, native, delivery_fixture
+input_fixture = load("_corrected_input_fixture", "tests/test_sft_vm_setup_inputs_v3.py")
+input_fixture.m = inputs
+
+
+class NativeRegressionTests(native_fixture.NativeSetupTests):
+    pass
+
+
+class JoinedDeliveryTests(joined_fixture.SetupDeliveryJoinTests):
+    def setUp(self):
+        super().setUp()
+        self.receiver = ROOT / "scripts/stage_sft_vm_setup_inputs_v4.py"
+        self.archive = ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.4/setup-inputs.tar"
+
+
+class ReleaseTests(input_fixture.SetupInputsTests):
+    def test_only_policy_and_bootstrap_members_replaced(self):
+        self.assertEqual(
+            set(old_inputs.FILES) - set(inputs.FILES),
+            {"lumi-bootstrap-input/run_sft_vm_network_bootstrap_v2.py"},
+        )
+        self.assertEqual(
+            set(inputs.FILES) - set(old_inputs.FILES),
+            {"lumi-bootstrap-input/run_sft_vm_network_bootstrap_v3.py"},
+        )
+        common = set(old_inputs.FILES) & set(inputs.FILES)
+        self.assertEqual(len(common), 17)
+        for name in common:
+            self.assertEqual(old_inputs.FILES[name], inputs.FILES[name])
+        for name, pin in network.PINS.items():
+            self.assertEqual(inputs.FILES["lumi-bootstrap-input/" + name][1], pin)
+
+    def test_actual_built_release_exactly_matches_manifest(self):
+        root = ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.4"
+        raw = inputs.read(root / "setup-inputs.tar", inputs.CAP)
+        self.assertEqual(inputs.sha(raw), sender.ARCHIVE_SHA)
+        self.assertEqual(raw, inputs.assemble())
+        self.assertEqual(
+            json.loads(inputs.read(root / "build.json", 4096)),
+            inputs.receipt(raw) | {"native_staged": False, "uploaded": False},
+        )
+
+    def test_stage_parser_and_boundary_algorithms_unchanged(self):
+        def functions(path):
+            return {
+                node.name: ast.dump(node)
+                for node in ast.parse(path.read_text()).body
+                if isinstance(node, ast.FunctionDef) and node.name != "receipt"
+            }
+
+        self.assertEqual(
+            functions(ROOT / "scripts/stage_sft_vm_setup_inputs_v3.py"),
+            functions(ROOT / "scripts/stage_sft_vm_setup_inputs_v4.py"),
+        )
+
+    def test_frozen_archive_17_common_members_remain_byte_identical(self):
+        old_raw = old_inputs.read(
+            ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.3/setup-inputs.tar", inputs.CAP
+        )
+        new_raw = inputs.read(
+            ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.4/setup-inputs.tar", inputs.CAP
+        )
+        old = old_inputs.unpack(old_raw, old_inputs.sha(old_raw))
+        new = inputs.unpack(new_raw, sender.ARCHIVE_SHA)
+        for name in old.keys() & new.keys():
+            self.assertEqual(old[name], new[name])
+        self.assertEqual(len(new), 18)
+
+    def test_all_versioned_source_bindings_are_connected(self):
+        self.assertEqual(len(driver.source_bytes()), driver.SOURCE_BYTES)
+        self.assertEqual(
+            driver.SOURCE_SHA,
+            hashlib.sha256(
+                (ROOT / "scripts/run_sft_vm_setup_detached_v2.py").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(driver.BOOTSTRAP_SHA, native.BOOTSTRAP_SHA)
+        self.assertEqual(
+            native.BOOTSTRAP_SHA,
+            hashlib.sha256(
+                (ROOT / "scripts/run_sft_vm_network_bootstrap_v3.py").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            driver.seed.SENDER_SHA,
+            hashlib.sha256(
+                (ROOT / "scripts/send_sft_vm_setup_inputs_v4.py").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            sender.RECEIVER_SHA,
+            hashlib.sha256(
+                (ROOT / "scripts/stage_sft_vm_setup_inputs_v4.py").read_bytes()
+            ).hexdigest(),
+        )
+        self.assertIn("run_sft_vm_network_bootstrap_v3.py", driver.launcher("status", {}))
+        self.assertEqual(sender.inputs, inputs)
+
+
+if __name__ == "__main__":
+    unittest.main()

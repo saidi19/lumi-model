@@ -1,0 +1,320 @@
+"""Genuine tiny CPU coordinator/package integration, never the actual 4B input."""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import unittest
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_runner_v2 as runner
+from lumi import posttraining_checkpoint_import_torch_v5 as kernel
+from lumi.posttraining_final_base_metadata_v1 import canonical, sha
+from tests import test_sft_checkpoint_import_torch_v3 as fixtures
+from tests.test_sft_checkpoint_import_runner_v2 import (
+    fixture_kernel_contract,
+    fixture_limits,
+    seal_fixture,
+)
+
+
+class TinyRunnerIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.CheckpointImportTorchTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.CheckpointImportTorchTests.tearDownClass()
+
+    def setUp(self):
+        self.fixture = fixtures.CheckpointImportTorchTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        f = self.fixture
+        config = f.config_class(**f.payload)
+        f.payload = {key: getattr(config, key) for key in kernel.MODEL_FIELDS}
+        f.payload["model_type"] = "lumi"
+        self.config_raw = canonical(f.payload)
+        f.config_path.write_bytes(self.config_raw)
+        f._checkpoint()
+        f.checkpoint_path.chmod(0o700)
+        self.tokens = f.root / "token-input"
+        self.tokens.mkdir(mode=0o700)
+        self.metadata = seal_fixture(f.checkpoint_path, self.tokens, config_raw=self.config_raw)
+        self.attempt = f.root / "coordinator-attempt"
+        self.io_contract = fixture_kernel_contract(self.metadata)
+        self.limits = fixture_limits()
+
+    def execute(self):
+        with patch.object(self.fixture.model_class, "forward",
+                          side_effect=AssertionError("forward")):
+            return runner.run_synthetic_import(
+                metadata=self.metadata, expected_base_sha256=sha(self.metadata[0]),
+                checkpoint_root=self.fixture.checkpoint_path, tokenizer_root=self.tokens,
+                attempt=self.attempt, dtype="bfloat16", limits=self.limits,
+                kernel_io_contract=self.io_contract,
+                expected_kernel_io_contract_sha256=self.io_contract["contract_sha256"],
+            )
+
+    def test_complete_actual_cpu_package_chain_with_frozen_consumer(self):
+        result = self.execute()
+        self.assertEqual(result["status"], "PASS_synthetic_coordinator_not_real_import")
+        self.assertEqual(result["full_input_audits_completed"], 2)
+        self.assertTrue(result["observed_input_identities_unchanged"])
+        for flag in ("real_4b_import", "training_authorized", "production_eligible",
+                     "hard_timeout_enforced_here", "native_backend_read_bytes_metered",
+                     "os_memory_write_limits_enforced", "atomic_input_immutability_verified"):
+            self.assertIs(result[flag], False)
+        self.assertTrue((self.attempt / runner.STARTED).is_file())
+        self.assertTrue((self.attempt / runner.COMPLETE).is_file())
+        self.assertFalse((self.attempt / runner.FAILED).exists())
+        saved = json.loads((self.attempt / runner.COMPLETE).read_bytes())
+        self.assertEqual(saved, result)
+        package = self.attempt / "checkpoint"
+        for entry in json.loads(self.metadata[0])["tokenizer"]["files"]:
+            raw = (package / entry["relative_path"]).read_bytes()
+            self.assertEqual(len(raw), entry["bytes"])
+            self.assertEqual(sha(raw), entry["sha256"])
+        from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+        manifest = package / "manifest.sha256"
+        # Independent direct consumer, not the bounded adapter under test. This
+        # extra verification is test-only on a tiny output under the parent timeout.
+        observed = _verify_checksum_manifest(
+            package, expected_manifest_sha256=sha(manifest.read_bytes()), require_private=True
+        )
+        self.assertEqual(observed, sha(manifest.read_bytes()))
+
+    def test_completed_attempt_cannot_start_second_kernel(self):
+        self.execute()
+        with patch.object(kernel, "convert_and_verify") as convert:
+            with self.assertRaisesRegex(runner.ImportRunnerError, "attempt_exists_no_retry"):
+                self.execute()
+            convert.assert_not_called()
+
+    def test_source_mutation_during_conversion_cannot_complete(self):
+        original = kernel.convert_and_verify
+
+        def mutate(*args, **kwargs):
+            result = original(*args, **kwargs)
+            path = self.fixture.checkpoint_path / "trainer-rank-00000.pt"
+            path.write_bytes(b"different synthetic trainer")
+            return result
+
+        with patch.object(kernel, "convert_and_verify", side_effect=mutate):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "input_audit_failed"):
+                self.execute()
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+        self.assertTrue((self.attempt / runner.FAILED).exists())
+        self.assertFalse((self.attempt / "checkpoint/manifest.sha256").exists())
+
+    def test_late_failure_keeps_completion_explicitly_non_authoritative(self):
+        original = runner._write_new
+
+        def fail(root, name, raw, ledger, **kwargs):
+            if name == runner.FAILED:
+                raise OSError("cannot record synthetic failure")
+            original(root, name, raw, ledger, **kwargs)
+            if name == runner.COMPLETE:
+                raise OSError("synthetic late close failure")
+
+        with patch.object(runner, "_write_new", side_effect=fail):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "runner_failed"):
+                self.execute()
+        saved = json.loads((self.attempt / runner.COMPLETE).read_bytes())
+        self.assertIs(saved["durable_completion_is_execution_authority"], False)
+        self.assertIs(saved["success_requires_returned_outcome_and_parent_supervisor"], True)
+        self.assertFalse((self.attempt / runner.FAILED).exists())
+        with self.assertRaisesRegex(runner.ImportRunnerError, "attempt_exists_no_retry"):
+            self.execute()
+
+
+    def test_exactly_two_source_audits_with_three_zero_content_snapshots(self):
+        from lumi.posttraining_checkpoint_dcp_reader_v1 import CheckpointReadSession
+        verify = CheckpointReadSession.verify
+        seen = []
+
+        def first(session):
+            seen.append(True)
+            return verify(session)
+
+        with (patch.object(CheckpointReadSession, "verify", autospec=True, side_effect=first),
+              patch.object(runner, "_audit", wraps=runner._audit) as audit,
+              patch.object(runner, "snapshot_inventory",
+                           wraps=runner.snapshot_inventory) as snapshots):
+            result = self.execute()
+        self.assertEqual(seen, [True])
+        self.assertEqual([call.args[0] for call in audit.call_args_list],
+                         [self.tokens, self.fixture.checkpoint_path, self.tokens])
+        self.assertEqual(snapshots.call_count, 3)
+        counts = result["content_accounting"]
+        self.assertEqual(counts["checkpoint_full_audits"], 2)
+        self.assertEqual(counts["coordinator_checkpoint_full_audits"], 1)
+        self.assertEqual(counts["tokenizer_full_audits"], 2)
+        self.assertEqual(counts["source_snapshot_payload_reads"], 0)
+        self.assertTrue(result["explicit_checkpoint_and_HF_content_metered"])
+
+    def test_all_content_requests_match_aggregate_and_nonrefundable_envelope(self):
+        files = [path for root in (self.fixture.checkpoint_path, self.tokens)
+                 for path in root.rglob("*") if path.is_file()]
+        from pathlib import Path
+        files += [Path(kernel.__file__).with_name(name)
+                  for name in ("configuration_lumi.py", "modeling_lumi.py")]
+        owned = {(path.stat().st_dev, path.stat().st_ino) for path in files}
+        read_calls, write_calls = [], []
+        original_read, original_pread = os.read, os.pread
+        original_write, original_pwrite = os.write, os.pwrite
+
+        def read(fd, size):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) in owned:
+                read_calls.append(size)
+            return original_read(fd, size)
+
+        def pread(fd, size, offset):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) in owned:
+                read_calls.append(size)
+            return original_pread(fd, size, offset)
+
+        def note_write(fd, raw):
+            info = os.fstat(fd)
+            self.assertTrue(stat.S_ISREG(info.st_mode))
+            owned.add((info.st_dev, info.st_ino))
+            write_calls.append(len(raw))
+
+        def write(fd, raw):
+            note_write(fd, raw)
+            return original_write(fd, raw)
+
+        def pwrite(fd, raw, offset):
+            note_write(fd, raw)
+            return original_pwrite(fd, raw, offset)
+
+        with (patch.object(os, "read", side_effect=read),
+              patch.object(os, "pread", side_effect=pread),
+              patch.object(os, "write", side_effect=write),
+              patch.object(os, "pwrite", side_effect=pwrite)):
+            result = self.execute()
+        counts = result["content_accounting"]
+        self.assertEqual(sum(read_calls), counts["successful_content_read_bytes_requested"])
+        self.assertEqual(sum(read_calls) + counts["unspent_read_envelope_bytes_not_refunded"],
+                         result["coordinator_read_bytes_reserved"])
+        self.assertLessEqual(sum(write_calls), result["private_write_bytes_reserved"])
+        self.assertLessEqual(result["coordinator_read_bytes_reserved"],
+                             self.limits["maximum_coordinator_read_bytes"])
+        self.assertLessEqual(result["private_write_bytes_reserved"],
+                             self.limits["maximum_private_write_bytes"])
+        self.assertTrue(all(0 < amount <= 1048576 for amount in read_calls + write_calls))
+
+    def test_forged_first_audit_summary_does_not_reach_packager(self):
+        from lumi import posttraining_checkpoint_package_v2 as package
+        original = kernel.convert_and_verify
+
+        def corrupt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result["dcp_read_verification"]["dcp_input_audit_bytes"] -= 1
+            return result
+
+        with (patch.object(kernel, "convert_and_verify", side_effect=corrupt),
+              patch.object(package, "finalize_package") as finalize):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "kernel_failed"):
+                self.execute()
+            finalize.assert_not_called()
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+
+    def test_tampered_HF_count_is_rejected_without_package_receipt(self):
+        original = kernel.convert_and_verify
+
+        def corrupt(*args, **kwargs):
+            result = original(*args, **kwargs)
+            result["hf_content_verification"]["hf_content_write_bytes_reserved"] += 1
+            return result
+
+        with patch.object(kernel, "convert_and_verify", side_effect=corrupt):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "package_failed"):
+                self.execute()
+        self.assertFalse((self.attempt / "checkpoint/import-receipt.json").exists())
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+
+    def test_DCP_cap_failure_after_audit_consumes_attempt_without_retry(self):
+        plan = runner.build_import_plan(*self.metadata, expected_base_sha256=sha(self.metadata[0]),
+                                        dtype="bfloat16")
+        self.io_contract["checkpoint_read_contract"]["maximum_read_bytes"] = (
+            plan["resource_bounds"]["checkpoint_inventory_bytes"])
+        self.io_contract["contract_sha256"] = sha(canonical({
+            key: value for key, value in self.io_contract.items() if key != "contract_sha256"}))
+        with self.assertRaisesRegex(runner.ImportRunnerError, "kernel_failed"):
+            self.execute()
+        self.assertTrue((self.attempt / runner.STARTED).exists())
+        self.assertTrue((self.attempt / runner.FAILED).exists())
+        with patch.object(kernel, "convert_and_verify") as convert:
+            with self.assertRaisesRegex(runner.ImportRunnerError, "attempt_exists_no_retry"):
+                self.execute()
+            convert.assert_not_called()
+
+    def test_post_package_source_mutation_cannot_complete(self):
+        from lumi import posttraining_checkpoint_package_v2 as package
+        original = package.finalize_package
+
+        def mutate(**kwargs):
+            result = original(**kwargs)
+            (self.fixture.checkpoint_path / "trainer-rank-00000.pt").write_bytes(b"changed")
+            return result
+
+        with patch.object(package, "finalize_package", side_effect=mutate):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "input_audit_failed"):
+                self.execute()
+        self.assertTrue((self.attempt / "checkpoint/manifest.sha256").exists())
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+
+    def test_exact_aggregate_read_cap_accepts_no_third_checkpoint_audit(self):
+        plan = runner.build_import_plan(*self.metadata, expected_base_sha256=sha(self.metadata[0]),
+                                        dtype="bfloat16")
+        bounds = plan["resource_bounds"]
+        expected = (self.io_contract["checkpoint_read_contract"]["maximum_read_bytes"]
+                    + self.io_contract["hf_io_contract"]["maximum_read_bytes"]
+                    + bounds["checkpoint_inventory_bytes"] + bounds["tokenizer_audit_read_bytes"]
+                    + self.limits["maximum_package_read_bytes"])
+        self.limits["maximum_coordinator_read_bytes"] = expected
+        result = self.execute()
+        self.assertEqual(result["coordinator_read_bytes_reserved"], expected)
+
+    def test_package_receipt_binds_contract_and_unchanged_plan_cap(self):
+        result = self.execute()
+        receipt = json.loads((self.attempt / "checkpoint/import-receipt.json").read_bytes())
+        self.assertEqual(receipt["kernel_io_contract"], self.io_contract)
+        self.assertEqual(result["kernel_io_contract_sha256"], self.io_contract["contract_sha256"])
+        plan = runner.build_import_plan(*self.metadata, expected_base_sha256=sha(self.metadata[0]),
+                                        dtype="bfloat16")
+        self.assertEqual(receipt["plan_sha256"], plan["plan_sha256"])
+        self.assertLessEqual(receipt["model_evidence"]["projected_live_tensor_bytes"],
+                             plan["resource_bounds"]["maximum_projected_live_tensor_bytes"])
+
+    def test_final_checkpoint_short_read_is_terminal_without_remainder_request(self):
+        original_audit, original_read = runner._audit, os.read
+        final_source = [False]
+        short_requests = []
+
+        def read(fd, amount):
+            if final_source[0]:
+                short_requests.append(amount)
+                return original_read(fd, 1)
+            return original_read(fd, amount)
+
+        def audit(root, inventory, ledger):
+            final_source[0] = root == self.fixture.checkpoint_path
+            return original_audit(root, inventory, ledger)
+
+        with (patch.object(runner, "_audit", side_effect=audit),
+              patch.object(os, "read", side_effect=read)):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "input_audit_failed"):
+                self.execute()
+        self.assertEqual(len(short_requests), 1)
+        self.assertTrue((self.attempt / "checkpoint/manifest.sha256").exists())
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

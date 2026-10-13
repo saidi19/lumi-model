@@ -1,0 +1,244 @@
+"""Exercise actual bootstrap -> wheel -> storage -> offline setup return flow."""
+
+import copy
+import importlib.util
+import json
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests.test_sft_vm_watchdog_report_channel_v1 import module
+
+ROOT = Path(__file__).resolve().parents[1]
+m = module("run_sft_vm_network_bootstrap_v3")
+old = module("run_sft_vm_network_bootstrap_v2")
+wheel = module("run_sft_vm_cpu_wheel_unit_v1")
+storage = module("check_sft_vm_storage_v1")
+sequence = module("run_sft_vm_setup_sequence_v1")
+spec = importlib.util.spec_from_file_location(
+    "_return_contract_network_fixtures", ROOT / "tests/test_sft_vm_network_bootstrap_v2.py"
+)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+fixture.m = m
+
+
+def snapshot():
+    return dict(
+        root_volume_matches=True,
+        work_volume_matches=True,
+        private_work_mount_matches=True,
+        no_alias_or_submount_in_current_namespace=True,
+        work_available_bytes=100 * 1024**3,
+        root_available_bytes=4 * 1024**3,
+        other_namespace_writer_exclusion_proven=False,
+        cloud_encryption_or_preservation_rechecked=False,
+        host_admitted=False,
+    )
+
+
+def wrapped():
+    return dict(
+        storage_snapshot=snapshot(),
+        setup=copy.deepcopy(m.EXPECTED_SETUP),
+        host_admitted=False,
+        binding_created=False,
+        gate_5_complete=False,
+    )
+
+
+class ContractTests(unittest.TestCase):
+    def test_old_consumer_rejects_real_storage_shape(self):
+        # Execute the actual frozen storage wrapper, not a guessed fixture shape.
+        setup = types.SimpleNamespace(_run_admitted_once=lambda *a: copy.deepcopy(m.EXPECTED_SETUP))
+        with (
+            patch.object(storage, "inspect", return_value=snapshot()),
+            patch.object(storage, "load_setup", return_value=setup),
+        ):
+            result = storage._run_storage_checked_setup({}, "a" * 32, 1200)
+        self.assertNotEqual(old.encode(result), old.encode(old.EXPECTED_SETUP))
+        with self.assertRaises(ValueError):
+            old.need(old.encode(result) == old.encode(old.EXPECTED_SETUP))
+        self.assertEqual(m.setup_receipt(result), m.EXPECTED_SETUP)
+
+    def test_bad_or_partial_wrapper_cannot_claim_setup_success(self):
+        cases = [
+            m.EXPECTED_SETUP,
+            wrapped() | {"host_admitted": True},
+            wrapped() | {"binding_created": 0},
+            wrapped() | {"extra": "private"},
+        ]
+        for field in (
+            "root_volume_matches",
+            "work_volume_matches",
+            "private_work_mount_matches",
+            "no_alias_or_submount_in_current_namespace",
+        ):
+            for value in (False, 1):
+                bad = wrapped()
+                bad["storage_snapshot"][field] = value
+                cases.append(bad)
+        for field, value in (
+            ("work_available_bytes", 100 * 1024**3 - 1),
+            ("root_available_bytes", 4 * 1024**3 - 1),
+            ("host_admitted", True),
+            ("other_namespace_writer_exclusion_proven", True),
+        ):
+            bad = wrapped()
+            bad["storage_snapshot"][field] = value
+            cases.append(bad)
+        bad = wrapped()
+        bad["setup"]["setup_components_completed"] = ["cpu"]
+        cases.append(bad)
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m.setup_receipt(value)
+
+
+class BootstrapRegressionTests(fixture.NetworkBootstrapTests):
+    def setup(self, machine, volumes, deadline):
+        value = super().setup(machine, volumes, deadline)
+        return wrapped() | {"setup": value}
+
+
+class ReturnChainFixture:
+    def joined_setup(self):
+        self.units_seen = []
+        self.offline = self.root / "offline"
+        self.enterContext(patch.object(m, "SETUP_RESULT", self.offline / "result.json"))
+        self.enterContext(patch.object(sequence, "OUTPUT", self.offline))
+        self.enterContext(patch.object(sequence, "CPU", self.root / "cpu"))
+        self.enterContext(patch.object(sequence, "SDK", self.root / "sdk"))
+        self.enterContext(patch.object(sequence, "WORK", self.root / "work-root"))
+        self.enterContext(patch.object(wheel, "OUTPUT", self.root / "wheel-unit"))
+        self.enterContext(patch.object(wheel, "RECEIPTS", self.root / "wheel-receipts"))
+        wheel.RECEIPTS.mkdir()
+        self.enterContext(patch.object(storage, "inspect", return_value=snapshot()))
+        self.enterContext(patch.object(storage, "load_setup", return_value=sequence))
+        self.enterContext(
+            patch.object(sequence, "read", side_effect=lambda path, cap=131072: path.read_bytes())
+        )
+        from tests.test_sft_vm_setup_sequence_v1 import frozen
+
+        bodies = {
+            phase + ".service": (ROOT / f"configs/lumi-vm-{label}-v0.1.service").read_bytes()
+            for phase, label in (("cpu", "cpu-runtime-install"), ("sdk", "acquisition-sdk-install"))
+        }
+        self.helper = types.SimpleNamespace(
+            write_new=frozen.write_new,
+            observe=Mock(
+                return_value={
+                    "ActiveState": "active",
+                    "SubState": "exited",
+                    "Result": "success",
+                    "ExecMainCode": "1",
+                    "ExecMainStatus": "0",
+                }
+            ),
+            validate_terminal=frozen.validate_terminal,
+            cgroup_empty=Mock(return_value=True),
+            run_command=self.child_command,
+        )
+        self.enterContext(
+            patch.object(sequence, "preflight", return_value=(self.helper, bodies, 102))
+        )
+        self.enterContext(
+            patch.object(wheel, "preflight", return_value=(storage, sequence, self.helper, 102))
+        )
+        self.wheel._run_network_admitted_once = wheel._run_network_admitted_once
+
+    def child_command(self, argv, timeout, **kwargs):
+        if argv[0] == "/usr/bin/systemd-run":
+            name = next(v.split("=", 1)[1] for v in argv if v.startswith("--unit="))
+            self.units_seen.append(name)
+            if name == wheel.UNIT:
+                from tests.test_sft_vm_cpu_wheel_unit_v1 import receipt
+
+                path, value = wheel.RECEIPTS / "cpu-wheels-result.json", receipt()
+            else:
+                phase = next(k for k, v in sequence.UNITS.items() if v == name)
+                if phase == "cpu":
+                    path = sequence.CPU / "result.json"
+                    value = dict(
+                        schema="lumi.vm-cpu-offline-install.v0.1",
+                        status="passed",
+                        software_lock_sha256=sequence.LOCK_SHA,
+                        wheel_count=34,
+                        wheel_bytes=102,
+                        all_locked_versions_match=True,
+                    )
+                elif phase == "sdk":
+                    path = sequence.SDK / "result.json"
+                    value = dict(
+                        schema="lumi.vm-sdk-offline-install.v0.1",
+                        status="passed",
+                        archive_sha256=sequence.SDK_SHA,
+                        sdk_native_wire_qualified=True,
+                    )
+                else:
+                    path = (
+                        sequence.WORK
+                        / sequence.ATTEMPT
+                        / (
+                            "source-staging.json"
+                            if phase == "worker_source"
+                            else "controller-staged.json"
+                        )
+                    )
+                    value = dict(
+                        schema="lumi.vm-fullsize-source-staging.v0.1"
+                        if phase == "worker_source"
+                        else "lumi.vm-root-controller-stage.v0.1",
+                        attempt=sequence.ATTEMPT,
+                        execution_permitted=False,
+                        archive_sha256=sequence.WORKER_SHA
+                        if phase == "worker_source"
+                        else sequence.ROOT_SHA,
+                        staged_file_hashes_verified=True,
+                        binding_created=False,
+                    )
+                value.update(host_admitted=False, gate_5_complete=False)
+                if getattr(self, "reject_sdk", False) and phase == "sdk":
+                    value["sdk_native_wire_qualified"] = False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.helper.write_new(path, value)
+        else:
+            self.assertEqual(argv[:2], ["/usr/bin/systemctl", "stop"])
+        return types.SimpleNamespace(returncode=0)
+
+
+class JoinedTests(unittest.TestCase):
+    setUp = fixture.NetworkBootstrapTests.setUp
+    show = fixture.NetworkBootstrapTests.show
+    command = fixture.NetworkBootstrapTests.command
+    setup = fixture.NetworkBootstrapTests.setup
+    call = fixture.NetworkBootstrapTests.call
+    joined_setup = ReturnChainFixture.joined_setup
+    child_command = ReturnChainFixture.child_command
+
+    def test_real_coordinators_and_receipt_parsers_reach_transition(self):
+        self.joined_setup()
+        value = self.call()
+        self.assertTrue(value["wheel_and_offline_setup_verified"])
+        self.assertEqual(self.units_seen, [wheel.UNIT, *sequence.UNITS.values()])
+        self.assertIn("transition", self.events)
+        saved = json.loads((wheel.OUTPUT / "result.json").read_text())
+        self.assertEqual(saved["setup"], wrapped())
+        self.assertEqual(json.loads((self.offline / "result.json").read_text()), m.EXPECTED_SETUP)
+        self.assertFalse(value["host_admitted"])
+
+    def test_failed_actual_sdk_receipt_blocks_source_staging_and_transition(self):
+        self.joined_setup()
+        self.reject_sdk = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(
+            self.units_seen, [wheel.UNIT, sequence.UNITS["cpu"], sequence.UNITS["sdk"]]
+        )
+        self.assertNotIn("transition", self.events)
+        self.shutdown.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

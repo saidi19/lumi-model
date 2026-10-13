@@ -1,0 +1,226 @@
+"""Join an admitted wheel acquisition unit to the frozen offline setup sequence.
+
+No public dispatch entry. Independent global network/expiry admission is a
+prerequisite of the private API, not established by a flag or these local tests.
+Deployment of this source and the wheel source remains an outer-bootstrap task.
+No new source selection, wheel lock, mount layer or installer implementation.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+INPUT = Path("/opt/lumi-bootstrap-input")
+RECEIPTS = Path("/var/lib/lumi-vm-input-deployment/606d788073f1f0b66a39eabeb4b32c2c")
+OUTPUT = RECEIPTS / "wheel-unit"
+UNIT = "lumi-cpu-wheels-v1.service"
+SOURCE = INPUT / "acquire_sft_vm_cpu_wheels_v1.py"
+SOURCE_SHA = "8e8c3e0d55ea494463eff120a677d910ecf3e2224d62527a0145d64e9c7f090b"
+STORAGE_SHA = "ed6aa6456b31d5d9f32f7ebdf51c46ff60f56bdac212b0459ecb6fb9c05dc9c8"
+
+
+def need(value):
+    if not value:
+        raise ValueError("wheel_unit_rejected") from None
+
+
+def load_storage():
+    path = INPUT / "check_sft_vm_storage_v1.py"
+    for parent in path.parents:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(stat.S_IMODE(info.st_mode) == 0o400 and info.st_nlink == 1)
+        raw = stream.read(131073)
+    need(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == STORAGE_SHA)
+    module = types.ModuleType("_wheel_unit_storage")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def command(deadline):
+    need(type(deadline) in {int, float} and math.isfinite(deadline) and deadline > 0)
+    # The exact preflight-verified source is read again through a readonly mount
+    # and authenticated before execution. No source bytes are interpolated here.
+    code = f"""import hashlib,os,signal,stat,time,types
+signal.alarm(300)
+fd=os.open({str(SOURCE)!r},os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+with os.fdopen(fd,"rb") as f:
+ s=os.fstat(f.fileno())
+ assert stat.S_ISREG(s.st_mode) and s.st_uid==s.st_gid==0 and s.st_nlink==1
+ assert stat.S_IMODE(s.st_mode)==0o400
+ raw=f.read(131073)
+assert len(raw)<=131072 and hashlib.sha256(raw).hexdigest()=={SOURCE_SHA!r}
+module=types.ModuleType("_verified_wheel_acquisition")
+module.__file__={str(SOURCE)!r}
+exec(compile(raw,module.__file__,"exec"),module.__dict__)
+end=min({deadline!r},time.monotonic()+300)
+assert time.monotonic()<end
+signal.alarm(0)
+module._acquire_admitted_once(deadline=end)
+"""
+    props = {
+        "User": "root",
+        "Group": "root",
+        "UMask": "0077",
+        "Restart": "no",
+        "RuntimeMaxSec": "300",
+        "TimeoutStopSec": "10",
+        "KillMode": "control-group",
+        "SendSIGKILL": "yes",
+        "RemainAfterExit": "yes",
+        "LimitCORE": "0",
+        "MemoryMax": "1G",
+        "MemorySwapMax": "0",
+        "TasksMax": "64",
+        "LimitFSIZE": "512M",
+        "ProtectSystem": "strict",
+        "ProtectHome": "yes",
+        "PrivateTmp": "yes",
+        "PrivateDevices": "yes",
+        "NoNewPrivileges": "yes",
+        "CapabilityBoundingSet": "",
+        "RestrictAddressFamilies": "AF_INET AF_UNIX",
+        "IPAddressDeny": "169.254.169.254/32",
+        "ReadWritePaths": "/opt/lumi-cpu-input " + str(RECEIPTS),
+        "ReadOnlyPaths": str(INPUT) + " /opt/lumi-cpu-input/runtime-lock.json"
+        " /opt/lumi-cpu-input/install_sft_vm_cpu_runtime_v1.py"
+        " /opt/lumi-cpu-input/install_sft_vm_acquisition_sdk_v1.py",
+        "StandardInput": "null",
+        "StandardOutput": "null",
+        "StandardError": "null",
+    }
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + UNIT,
+        ]
+        + [f"--property={k}={v}" for k, v in props.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", "-c", code]
+    )
+
+
+def preflight(machine_id, volumes):
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(sys.flags.isolated and sys.dont_write_bytecode)
+    storage = load_storage()
+    storage.inspect(volumes)
+    setup = storage.load_setup()
+    helper, _, wheel_bytes = setup.preflight(machine_id)
+    setup.bound(SOURCE, SOURCE_SHA)
+    setup.owned_directory(RECEIPTS)
+    need(not os.path.lexists(OUTPUT))
+    need(not os.path.lexists(Path("/opt/lumi-cpu-input/wheels")))
+    for name in ("started", "failed", "result"):
+        need(not os.path.lexists(RECEIPTS / f"cpu-wheels-{name}.json"))
+    loaded = helper.run_command(
+        ["/usr/bin/systemctl", "show", UNIT, "--property=LoadState", "--value"], 5, capture=True
+    )
+    need(loaded.returncode in {0, 1, 4} and loaded.stdout.strip() == b"not-found")
+    need(helper.cgroup_empty(UNIT))
+    return storage, setup, helper, wheel_bytes
+
+
+def child(helper, argv, deadline):
+    try:
+        need(helper.run_command(argv, 15).returncode == 0)
+        while time.monotonic() < deadline:
+            value = helper.observe(UNIT)
+            if value["SubState"] in {"exited", "dead", "failed"}:
+                helper.validate_terminal("chain", value)
+                return
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+        raise ValueError("wheel_unit_deadline")
+    finally:
+        stopped = helper.run_command(["/usr/bin/systemctl", "stop", UNIT], 10)
+        need(stopped.returncode == 0 and helper.cgroup_empty(UNIT))
+
+
+def check_receipt(setup, expected_bytes):
+    import json
+
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            need(key not in result)
+            result[key] = value
+        return result
+
+    value = json.loads(
+        setup.read(RECEIPTS / "cpu-wheels-result.json", 4096), object_pairs_hook=unique
+    )
+    expected = {
+        "requests_started": 34,
+        "wheels_verified": 34,
+        "verified_content_bytes": expected_bytes,
+        "all_wheel_readback_matches": True,
+        "retry_allowed": False,
+        "host_admitted": False,
+        "gate_5_complete": False,
+        "runtime_installed": False,
+        "global_network_cap_proven": False,
+    }
+    need(json.dumps(value, sort_keys=True) == json.dumps(expected, sort_keys=True))
+
+
+def run(**_arguments):
+    raise ValueError("network_and_expiry_admission_not_bound") from None
+
+
+def _run_network_admitted_once(machine_id, volumes, deadline):
+    """Only for a separately admitted native controller; no boolean override."""
+    need(type(deadline) in {int, float} and 330 <= deadline - time.monotonic() <= 1800)
+    storage, setup, helper, wheel_bytes = preflight(machine_id, volumes)
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    setup.sync(OUTPUT.parent)
+
+    def save(name, value):
+        helper.write_new(OUTPUT / name, value)
+        setup.sync(OUTPUT)
+
+    save("started.json", {"retry_allowed": False, "host_admitted": False})
+    phase = "wheel_unit"
+    try:
+        need(deadline - time.monotonic() >= 330)
+        child(helper, command(deadline - 15), min(deadline - 15, time.monotonic() + 315))
+        phase = "wheel_receipt"
+        check_receipt(setup, wheel_bytes)
+        phase = "offline_setup"
+        result = storage._run_storage_checked_setup(volumes, machine_id, deadline)
+        save(
+            "result.json",
+            {
+                "wheel_unit_reaped_and_verified": True,
+                "setup": result,
+                "host_admitted": False,
+                "gate_5_complete": False,
+                "retry_allowed": False,
+            },
+        )
+        return result
+    except BaseException:
+        save(
+            "failed.json",
+            {
+                "failed_phase": phase,
+                "retry_allowed": False,
+                "host_admitted": False,
+                "partial_evidence_preserved": True,
+            },
+        )
+        raise ValueError("wheel_setup_sequence_failed") from None

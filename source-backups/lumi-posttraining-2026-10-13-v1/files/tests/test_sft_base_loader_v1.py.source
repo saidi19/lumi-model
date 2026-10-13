@@ -1,0 +1,335 @@
+"""Real bounded file reads over tiny synthetic blobs; native tensor work doubled."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import os
+import struct
+import sys
+import tempfile
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+PACKAGE = "_synthetic_base_loader_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(Path(__file__).resolve().parents[1] / "src/lumi")]
+sys.modules[PACKAGE] = package
+loader = importlib.import_module(PACKAGE + ".posttraining_sft_base_loader_v1")
+
+
+def blob(shape=None, *, dtype="F32", offsets=None):
+    header = {"__metadata__": {"format": "pt"}, "weight": {
+        "dtype": dtype, "shape": shape or [2, 2], "data_offsets": offsets or [0, 16]}}
+    raw = json.dumps(header, separators=(",", ":")).encode()
+    raw += b" " * (-len(raw) % 8)
+    return len(raw).to_bytes(8, "little") + raw + struct.pack("<4f", 1, 2, 3, 4)
+
+
+class LoaderTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="lumi-base-loader-synthetic-")
+        self.root = Path(self.temp.name)
+        self.root.chmod(0o700)
+        self.charges, self.events, self.fds = [], [], []
+        self.payloads = {"config.json": b"{}", "model.safetensors": blob()}
+        self.install()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def install(self):
+        for name, raw in self.payloads.items():
+            path = self.root / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+        self.rows = [{"path": name, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+                     for name, raw in sorted(self.payloads.items())]
+
+    def open_root(self):
+        self.events.append("open")
+        fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        self.fds.append(fd)
+        return fd
+
+    def make(self, **changes):
+        options = dict(inventory=self.rows,
+                       expected_inventory_sha256=hashlib.sha256(
+                           loader._canonical(self.rows)).hexdigest(),
+                       rank=0, admit=lambda: self.events.append("admit"), open_root=self.open_root,
+                       reserve=lambda rank, **values: self.charges.append((rank, values)),
+                       check_budget=lambda: None, maximum_read_bytes=4096,
+                       maximum_file_bytes=4096, maximum_control_bytes=1024,
+                       maximum_live_bytes=65536)
+        return loader.BoundedBaseLoader(**{**options, **changes})
+
+    def doubles(self):
+        stack = ExitStack()
+        self.runtime = stack.enter_context(patch.object(loader, "_runtime", return_value=object()))
+        self.plan = stack.enter_context(patch.object(
+            loader, "_model_plan", return_value=("synthetic_config", {"weight": [2, 2]})))
+        self.decode = stack.enter_context(patch.object(
+            loader, "_decode", return_value={"weight": object()}))
+        self.build = stack.enter_context(patch.object(loader, "_build", return_value=object()))
+        return stack
+
+    def error(self, code, operation, *args, **kwargs):
+        with self.assertRaises(loader.BaseLoadError) as caught:
+            operation(*args, **kwargs)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_inert_constructor_and_inventory_pin(self):
+        self.make()
+        self.assertEqual(self.events, [])
+        self.error("inventory_rejected", self.make, expected_inventory_sha256="0" * 64)
+
+    def test_invalid_inventory_names_hashes_and_duplicates_precede_io(self):
+        for value in ("../model.safetensors", "/config.json", "pytorch_model.bin"):
+            rows = [dict(row) for row in self.rows]
+            rows[0]["path"] = value
+            self.error("inventory_rejected", self.make, inventory=rows)
+        self.error("inventory_rejected", self.make, inventory=self.rows + [self.rows[0]])
+        self.assertEqual(self.events, [])
+
+    def test_caps_rejected_before_admission(self):
+        for changes in ({"maximum_read_bytes": 1}, {"maximum_live_bytes": 1}):
+            self.error("budget_rejected", self.make, **changes)
+        self.error("invalid_arguments", self.make, maximum_control_bytes=True)
+        self.assertEqual(self.events, [])
+
+    def test_denial_precedes_runtime_and_root_open(self):
+        reader = self.make(admit=lambda: False)
+        with self.doubles():
+            self.error("admission_rejected", reader)
+            self.error("admission_rejected", reader)
+            self.runtime.assert_not_called()
+        self.assertEqual(self.fds, [])
+        self.assertEqual(self.charges, [])
+
+    def test_missing_runtime_never_opens_files(self):
+        reader = self.make()
+        with patch.object(loader.sys, "platform", "darwin"):
+            self.error("runtime_rejected", reader)
+        self.assertEqual(self.fds, [])
+
+    def test_success_reads_exact_bound_bytes_once_and_closes_root(self):
+        reader = self.make()
+        with self.doubles():
+            result = reader()
+            self.assertIs(result, self.build.return_value)
+            self.build.assert_called_once()
+            self.assertEqual(self.build.call_args.args[0], "synthetic_config")
+            self.assertEqual(set(self.build.call_args.args[1]), {"weight"})
+        self.assertEqual(sum(row["checkpoint_read_bytes"] for _, row in self.charges),
+                         sum(map(len, self.payloads.values())))
+        self.assertEqual(reader.summary()["files_verified"], 2)
+        with self.assertRaises(OSError):
+            os.fstat(self.fds[0])
+        self.error("already_consumed", reader)
+        self.assertFalse(reader.summary()["real_execution_authorized"])
+
+    def test_payload_hash_mismatch_precedes_native_deserialization(self):
+        raw = bytearray(self.payloads["model.safetensors"])
+        raw[-1] ^= 1
+        (self.root / "model.safetensors").write_bytes(raw)
+        reader = self.make()
+        with self.doubles():
+            self.error("checksum_mismatch", reader)
+            self.decode.assert_not_called()
+            self.build.assert_not_called()
+
+    def test_size_mismatch_never_reads_payload(self):
+        (self.root / "model.safetensors").write_bytes(b"x")
+        reader = self.make()
+        with self.doubles():
+            self.error("read_failed", reader)
+            self.decode.assert_not_called()
+        self.assertEqual(sum(row["checkpoint_read_bytes"] for _, row in self.charges), 2)
+
+    def test_reservation_failure_precedes_pread(self):
+        reader = self.make(reserve=lambda *_args, **_kwargs: False)
+        with self.doubles(), patch.object(loader.os, "pread") as pread:
+            self.error("read_failed", reader)
+            pread.assert_not_called()
+        self.assertEqual(reader.summary()["checkpoint_read_bytes_reserved"], 2)
+
+    def test_symlink_and_permissive_file_modes_rejected(self):
+        path = self.root / "model.safetensors"
+        path.chmod(0o644)
+        with self.doubles():
+            self.error("read_failed", self.make())
+        path.chmod(0o600)
+        path.rename(self.root / "kept")
+        path.symlink_to(self.root / "kept")
+        with self.doubles():
+            self.error("read_failed", self.make())
+
+    def test_header_and_shape_mismatch_precede_native_decode(self):
+        for raw in (blob(offsets=[1, 17]), blob(dtype="I64"),
+                    blob(shape=[True, 4]), blob(shape=[1, 4])):
+            self.payloads["model.safetensors"] = raw
+            self.install()
+            with self.doubles():
+                code = "model_rejected" if raw == blob(shape=[1, 4]) else "header_rejected"
+                self.error(code, self.make())
+                self.decode.assert_not_called()
+
+    def test_sharded_index_mapping_is_checked(self):
+        self.payloads = {
+            "config.json": b"{}",
+            "model-00001-of-00001.safetensors": blob(),
+            "model.safetensors.index.json": loader._canonical({
+                "metadata": {"total_size": 16},
+                "weight_map": {"wrong": "model-00001-of-00001.safetensors"}})}
+        self.install()
+        with self.doubles():
+            self.error("model_rejected", self.make())
+            self.decode.assert_not_called()
+
+    def test_valid_sharded_index_and_weights_read_once(self):
+        weight = "model-00001-of-00001.safetensors"
+        self.payloads = {"config.json": b"{}", weight: blob(),
+                         "model.safetensors.index.json": loader._canonical({
+                             "metadata": {"total_size": 16}, "weight_map": {"weight": weight}})}
+        self.install()
+        reader = self.make()
+        with self.doubles():
+            reader()
+        self.assertEqual(reader.summary()["files_verified"], 3)
+        self.assertEqual(reader.summary()["checkpoint_read_bytes_reserved"],
+                         sum(map(len, self.payloads.values())))
+
+    def test_config_budget_rejected_before_weight_read(self):
+        reader = self.make()
+        with self.doubles():
+            self.plan.side_effect = loader.BaseLoadError("budget_rejected")
+            self.error("budget_rejected", reader)
+            self.decode.assert_not_called()
+        self.assertEqual(reader.summary()["checkpoint_read_bytes_reserved"], 2)
+
+    def test_missing_model_keys_block_model_build(self):
+        with self.doubles():
+            self.plan.return_value = ("config", {"weight": [2, 2], "other": [2]})
+            self.error("model_rejected", self.make())
+            self.build.assert_not_called()
+
+    def test_close_failure_rejects_success_without_retry(self):
+        reader = self.make()
+        original_close = os.close
+
+        def close(fd):
+            original_close(fd)
+            if fd == self.fds[0]:
+                raise OSError("PRIVATE")
+
+        with self.doubles(), patch.object(loader.os, "close", close):
+            self.error("close_failed", reader)
+        self.assertTrue(reader.summary()["root_close_failed"])
+
+    def test_swallowed_reentry_during_admission_is_terminal(self):
+        reader = self.make()
+
+        def admit():
+            self.error("already_consumed", reader)
+
+        reader._admit = admit
+        with self.doubles():
+            self.error("already_consumed", reader)
+            self.runtime.assert_not_called()
+
+    def test_owner_and_reinitialization_guards(self):
+        reader = self.make()
+        with patch.object(loader.os, "getpid", return_value=-1):
+            self.error("owner_mismatch", reader)
+        self.error("already_consumed", reader.__init__, inventory=[], rank=0, admit=lambda: None,
+                   open_root=lambda: None, reserve=lambda *_: None, check_budget=lambda: None,
+                   maximum_read_bytes=1, maximum_file_bytes=1, maximum_control_bytes=1,
+                   maximum_live_bytes=1, expected_inventory_sha256="a" * 64)
+
+    def test_unknown_config_loading_switch_rejected_before_native_config(self):
+        config_module = types.SimpleNamespace(LumiConfig=Mock())
+        self.error("model_rejected", loader._model_plan, {"quantization_config": {}},
+                   (None, None, config_module, None, None, None), 1000, 10)
+        config_module.LumiConfig.assert_not_called()
+
+    def test_native_architecture_budget_checked_before_meta_model(self):
+        configuration = types.SimpleNamespace(LumiConfig=Mock(return_value=types.SimpleNamespace()))
+        modeling = types.SimpleNamespace(LumiForCausalLM=Mock())
+        counter = types.SimpleNamespace(parameter_breakdown=lambda _: types.SimpleNamespace(
+            total=1000))
+        self.error("budget_rejected", loader._model_plan, {},
+                   (None, None, configuration, modeling, None, counter), 100, 10)
+        modeling.LumiForCausalLM.assert_not_called()
+
+    def test_bad_root_callback_does_not_close_standard_descriptor(self):
+        reader = self.make(open_root=lambda: False)
+        with self.doubles(), patch.object(loader.os, "close") as close:
+            self.error("read_failed", reader)
+            close.assert_not_called()
+
+    def test_source_mode_read_only_fd_rejects_hardlinked_payload(self):
+        os.link(self.root / "model.safetensors", self.root / "linked")
+        with self.doubles():
+            self.error("read_failed", self.make())
+            self.decode.assert_not_called()
+
+    def test_bounded_loader_composes_with_model_preparation(self):
+        from .test_sft_model_prepare_v1 import PreparationTests
+
+        native = PreparationTests()
+        native.setUp()
+        preparation_module = importlib.import_module(
+            PACKAGE + ".posttraining_sft_model_prepare_v1")
+        read = self.make()
+        preparation = preparation_module.ModelPreparation(**native.options(load_model=read))
+        with self.doubles(), native.native_double(preparation):
+            self.build.return_value = native.model
+            prepared = preparation()
+        self.assertEqual(read.summary()["state"], "complete")
+        self.assertEqual(preparation.summary()["state"], "complete")
+        matrix = native.model.items[0]
+        self.assertEqual(matrix.shape, (0,))
+        self.assertEqual(prepared.optimizer.param_groups[0]["params"], [matrix])
+        prepared.close()
+        self.assertEqual(native.events.count("release"), 1)
+
+    def test_native_builder_never_receives_checkpoint_path(self):
+        calls = []
+
+        class Model:
+            @classmethod
+            def from_pretrained(cls, path, **kwargs):
+                calls.append((path, kwargs))
+                return cls(), {"missing_keys": [], "unexpected_keys": [], "error_msgs": []}
+
+            def parameters(self):
+                return [types.SimpleNamespace(device=types.SimpleNamespace(type="cpu"),
+                                              dtype="float32")]
+
+        class CPU:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        torch = types.SimpleNamespace(float32="float32", device=lambda kind: CPU())
+        transformers = types.SimpleNamespace(GenerationConfig=types.SimpleNamespace(
+            from_model_config=lambda config: "generation"))
+        model = loader._build("config", {"weight": object()},
+                              (torch, None, None, types.SimpleNamespace(LumiForCausalLM=Model),
+                               transformers, None))
+        self.assertIs(type(model), Model)
+        self.assertIsNone(calls[0][0])
+        self.assertIs(calls[0][1]["local_files_only"], True)
+        self.assertIs(calls[0][1]["trust_remote_code"], False)
+        self.assertEqual(calls[0][1]["dtype"], "float32")
+
+
+if __name__ == "__main__":
+    unittest.main()

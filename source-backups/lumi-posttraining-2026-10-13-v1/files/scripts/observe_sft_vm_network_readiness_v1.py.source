@@ -1,0 +1,303 @@
+"""Bounded read-only readiness snapshot, never allocation or host admission.
+
+Existing frozen selectors and store checks are reused without modification.
+No objects, credentials, raw policies, or raw cloud errors are persisted.
+"""
+
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import subprocess
+import time
+from decimal import Decimal
+from pathlib import Path
+
+import check_sft_vm_cleanup_store_v1 as store
+import prepare_sft_vm_private_network_v1 as selection
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-network-readiness-v0.1/attempt-001"
+PINS = {
+    "scripts/check_sft_vm_cleanup_store_v1.py": (
+        "5c1eb9bea3f315014322e92c84ec342f6af41db7faf97a0191a8d5d07343c6ba"
+    ),
+    "scripts/prepare_sft_vm_private_network_v1.py": (
+        "d16c638f596b2479baf83b710b46b25ba8082180193b04f72d4cf86065e96599"
+    ),
+    "configs/lumi-vm-private-network-plan-v0.1.json": (
+        "50d6a1207dd89a8d018c21a67d3220b4b689931b872397bb4190578ced74174a"
+    ),
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json": store.bucket.PROPOSAL_SHA,
+}
+QUOTAS = {
+    "nat": ("vpc", "L-F678F1CE", "NAT gateways per Availability Zone"),
+    "eip": ("ec2", "L-0263D0A3", "EC2-VPC Elastic IPs"),
+    "subnet": ("vpc", "L-407747CB", "Subnets per VPC"),
+    "route_table": ("vpc", "L-589F43AA", "Route tables per VPC"),
+}
+OPS = {
+    **store.ReadCloud.OPS,
+    "ec2": {
+        "describe-vpcs",
+        "describe-subnets",
+        "describe-route-tables",
+        "describe-internet-gateways",
+        "describe-nat-gateways",
+        "describe-addresses",
+    },
+    "service-quotas": {"get-service-quota"},
+    "pricing": {"get-products"},
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("readiness_rejected") from None
+
+
+class Cloud:
+    def __init__(self):
+        self.calls, self.bytes = 0, 0
+        self.start = time.monotonic()
+        self.stage = "source_bindings"
+
+    def cli(self, service, operation, **fields):
+        need(operation in OPS.get(service, set()))
+        need(self.calls < 24 and time.monotonic() - self.start < 280)
+        if service == "s3api":
+            need(fields == dict(Bucket=store.worker.BUCKET, ExpectedBucketOwner=selection.ACCOUNT))
+        if service == "sts":
+            need(fields == {})
+        self.calls += 1
+        self.stage = operation
+        answer = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                service,
+                operation,
+                "--cli-input-json",
+                json.dumps(fields),
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "5",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=20,
+            env=dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER=""),
+        )
+        size = len(answer.stdout) + len(answer.stderr)
+        self.bytes += size
+        need(size <= 524288 and self.bytes <= 2097152)
+        need(answer.returncode == 0 and time.monotonic() - self.start < 300)
+        value = json.loads(answer.stdout, object_pairs_hook=store.worker.unique)
+        need(type(value) is dict)
+        need(
+            not value.get("NextToken")
+            and not value.get("nextToken")
+            and not value.get("IsTruncated")
+        )
+        return value
+
+
+def one(rows):
+    need(type(rows) is list and len(rows) == 1)
+    return rows[0]
+
+
+def public_route(tables):
+    explicit = [
+        t
+        for t in tables
+        if any(a.get("SubnetId") == selection.PUBLIC_SUBNET for a in t["Associations"])
+    ]
+    selected = one(
+        explicit or [t for t in tables if any(a.get("Main") is True for a in t["Associations"])]
+    )
+    route = one([r for r in selected["Routes"] if r.get("DestinationCidrBlock") == "0.0.0.0/0"])
+    need(route["State"] == "active" and route.get("GatewayId", "").startswith("igw-"))
+    return selected["RouteTableId"], route["GatewayId"]
+
+
+def price_rows(cloud, service_code, usage):
+    value = cloud.cli(
+        "pricing",
+        "get-products",
+        ServiceCode=service_code,
+        MaxResults=20,
+        Filters=[
+            dict(Type="TERM_MATCH", Field="regionCode", Value="us-east-1"),
+            dict(Type="TERM_MATCH", Field="usagetype", Value=usage),
+        ],
+    )
+    product = json.loads(one(value["PriceList"]), object_pairs_hook=store.worker.unique)
+    need(product["product"]["attributes"]["usagetype"] == usage)
+    term = one(list(product["terms"]["OnDemand"].values()))
+    dimension = one(list(term["priceDimensions"].values()))
+    need(dimension["beginRange"] == "0" and dimension["endRange"] == "Inf")
+    return dict(
+        usage_type=usage,
+        unit=dimension["unit"],
+        usd=dimension["pricePerUnit"]["USD"],
+        effective_date=term["effectiveDate"],
+    )
+
+
+def headroom(quota, service, code, name, used):
+    need(quota["ServiceCode"] == service and quota["QuotaCode"] == code)
+    need(quota["QuotaName"] == name and quota.get("GlobalQuota") is False)
+    value = quota["Value"]
+    need(type(value) in {int, float} and math.isfinite(value) and value >= used + 1)
+    return dict(quota=value, conservatively_counted_usage=used, required_additional=1)
+
+
+def observe(cloud, report):
+    for path, digest in PINS.items():
+        need(hashlib.sha256((ROOT / path).read_bytes()).hexdigest() == digest)
+    raw = (ROOT / "configs/lumi-vm-fullsize-host-proposal-v0.1.json").read_bytes()
+    now = int(time.time())
+    # Deliberately diagnostic, not a nonce allocated to a real cleanup execution.
+    bound = dict(
+        armed=True,
+        attempt=selection.ATTEMPT,
+        nonce="0" * 32,
+        not_before=now + 17100,
+        expires_at=now + 18000,
+    )
+    admission = store.Admission(cloud, raw)
+    admission(bound)
+    report["store"] = admission.report
+    report["store_snapshot_passed"] = True
+    vf = [dict(Name="vpc-id", Values=[selection.VPC])]
+    vpc = one(cloud.cli("ec2", "describe-vpcs", VpcIds=[selection.VPC])["Vpcs"])
+    subnets = cloud.cli("ec2", "describe-subnets", Filters=vf, MaxResults=100)["Subnets"]
+    tables = cloud.cli("ec2", "describe-route-tables", Filters=vf, MaxResults=100)["RouteTables"]
+    need(all(t["VpcId"] == selection.VPC and t["OwnerId"] == selection.ACCOUNT for t in tables))
+    table, gateway = public_route(tables)
+    igw = one(
+        cloud.cli("ec2", "describe-internet-gateways", InternetGatewayIds=[gateway])[
+            "InternetGateways"
+        ]
+    )
+    need(igw["OwnerId"] == selection.ACCOUNT)
+    need(igw["Attachments"] == [dict(State="available", VpcId=selection.VPC)])
+    nats = cloud.cli("ec2", "describe-nat-gateways", MaxResults=100)["NatGateways"]
+    addresses = cloud.cli("ec2", "describe-addresses")["Addresses"]
+    # Region-wide nondeleted NAT count is conservative for the target AZ quota.
+    need(all(n["State"] in {"pending", "available", "deleting", "failed", "deleted"} for n in nats))
+    usage = dict(
+        nat=sum(n["State"] != "deleted" for n in nats),
+        eip=len(addresses),
+        subnet=len(subnets),
+        route_table=len(tables),
+    )
+    report["quota_headroom"] = {}
+    for key, (service, code, name) in QUOTAS.items():
+        q = cloud.cli("service-quotas", "get-service-quota", ServiceCode=service, QuotaCode=code)[
+            "Quota"
+        ]
+        report["quota_headroom"][key] = headroom(q, service, code, name, usage[key])
+    rates = [
+        price_rows(cloud, "AmazonEC2", usage) for usage in ("NatGateway-Hours", "NatGateway-Bytes")
+    ]
+    ipv4 = price_rows(cloud, "AmazonVPC", "USE1-PublicIPv4:InUseAddress")
+    need(ipv4["unit"] == "Hrs" and Decimal(ipv4["usd"]).is_finite())
+    need(0 < Decimal(ipv4["usd"]) <= Decimal("0.005"))
+    observation = dict(
+        complete_pages=True,
+        vpc=dict(
+            id=vpc["VpcId"],
+            owner=vpc["OwnerId"],
+            state=vpc["State"],
+            ipv4_cidrs=[
+                a["CidrBlock"]
+                for a in vpc["CidrBlockAssociationSet"]
+                if a["CidrBlockState"]["State"] != "disassociated"
+            ],
+        ),
+        subnets=[
+            dict(
+                id=s["SubnetId"],
+                owner=s["OwnerId"],
+                vpc=s["VpcId"],
+                cidr=s["CidrBlock"],
+                az=s["AvailabilityZone"],
+                state=s["State"],
+                ipv6_on_creation=s["AssignIpv6AddressOnCreation"],
+                available_ipv4=s["AvailableIpAddressCount"],
+            )
+            for s in subnets
+        ],
+        public_subnet_id=selection.PUBLIC_SUBNET,
+        public_route_table=table,
+        public_default_gateway=gateway,
+        nat_pricing=rates,
+    )
+    selected = selection.plan(observation)
+    frozen = json.loads((ROOT / "configs/lumi-vm-private-network-plan-v0.1.json").read_bytes())
+    need(selected["targets"] == frozen["targets"])
+    report.update(
+        network_snapshot_passed=True,
+        selected_cidr=selected["targets"]["new_private_subnet_cidr"],
+        prices=rates + [ipv4],
+        network_cost_estimate_usd=selected["limits"]["network_cost_estimate_usd"],
+        status="read_only_prerequisites_verified",
+    )
+
+
+def run():
+    OUTPUT.mkdir(parents=True, mode=0o700, exist_ok=False)
+    report = dict(
+        schema="lumi.vm-network-readiness-observation.v0.1",
+        status="started",
+        observed_at=dt.datetime.now(dt.UTC).isoformat(),
+        store_snapshot_passed=False,
+        network_snapshot_passed=False,
+        execution_admitted=False,
+        gate_5_complete=False,
+        real_4b_import=False,
+        gpu_used=False,
+        cloud_mutations=0,
+        object_access=0,
+        diagnostic_nonce_only=True,
+        source_bindings=PINS,
+    )
+
+    def save(name, value):
+        raw = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+        need(len(raw) <= 32768)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    save("started.json", report)
+    cloud = Cloud()
+    try:
+        observe(cloud, report)
+    except BaseException:
+        report.update(status="stopped_no_mutation", failed_stage=cloud.stage)
+    report.update(
+        cli_invocations=cloud.calls,
+        response_content_bytes=cloud.bytes,
+        elapsed_seconds=round(time.monotonic() - cloud.start, 3),
+        no_retry=True,
+        snapshot_not_future_execution_authority=True,
+    )
+    save("result.json", report)
+    print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    run()

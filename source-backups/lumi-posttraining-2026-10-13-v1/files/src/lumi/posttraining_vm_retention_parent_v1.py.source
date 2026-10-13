@@ -1,0 +1,285 @@
+"""Detached retention-only parent and one-shot credential FIFO; no admission.
+
+The authenticated entry supplies a separate retention binding and fixed
+boottime deadline. No acquisition/import launch, secret argv/env or retries.
+ExecStopPost only reaps the exact retention worker, never deletes evidence.
+"""
+
+from __future__ import annotations
+
+import errno
+import math
+import os
+import select
+import time
+from pathlib import Path
+
+from . import posttraining_vm_retention_continuation_v2 as continuation
+
+old = continuation.original
+worker = continuation.worker
+ATTEMPT = continuation.ATTEMPT
+ROOT = continuation.ROOT
+ENTRY_REL = "retention-release/scripts/run_sft_vm_retention_parent_v1.py"
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_parent_rejected") from None
+
+
+def remaining(end):
+    need(type(end) in {int, float} and math.isfinite(end))
+    value = end - time.clock_gettime(time.CLOCK_BOOTTIME)
+    need(0 < value <= 1800)
+    return value
+
+
+def unit():
+    return f"lumi-vm-fullsize-v1-{ATTEMPT}-retention-parent.service"
+
+
+def paths():
+    root = ROOT / ATTEMPT
+    old.setup.workflow._directory(root)
+    state = root / "retention-parent"
+    return root, state, state / "credential.fifo"
+
+
+def mark(state, name, body):
+    old.marker(state, name, body)
+
+
+def validate_state(state, binding_pin, end):
+    value = worker.retention.decode(
+        worker.retention.small(state / "dispatch.json", "root", 0o600, 4096)
+    )
+    expected = dict(binding_sha256=binding_pin, deadline_boottime=end, retry_allowed=False)
+    need(worker.retention.canonical(value) == worker.retention.canonical(expected))
+
+
+def command(end):
+    seconds = int(remaining(end))
+    need(seconds > 60)
+    root = ROOT / ATTEMPT
+    entry = root / ENTRY_REL
+    props = dict(
+        User="root",
+        Group="root",
+        Restart="no",
+        RuntimeMaxSec=str(seconds),
+        TimeoutStartSec="15",
+        TimeoutStopSec="30",
+        KillMode="control-group",
+        SendSIGKILL="yes",
+        OOMPolicy="kill",
+        LimitCORE="0",
+        UMask="0077",
+        MemoryMax=str(1024**3),
+        MemorySwapMax="0",
+        TasksMax="64",
+        PrivateMounts="no",
+        PrivateNetwork="no",
+        RestrictAddressFamilies="AF_UNIX",
+        WorkingDirectory=str(root),
+        StandardInput="null",
+        StandardOutput="null",
+        StandardError="null",
+        RemainAfterExit="no",
+        ExecStopPost=f"/usr/bin/python3 -I -B {entry} stop",
+    )
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + unit(),
+        ]
+        + [f"--property={k}={v}" for k, v in props.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", str(entry), "serve"]
+    )
+
+
+def _dispatch_admitted_once(binding_pin, end):
+    need(worker.retention.pin(binding_pin))
+    root, state, fifo = paths()
+    launch = command(end)
+    result = old.handoff.frozen.run_command(
+        ["/usr/bin/systemctl", "show", unit(), "--property=LoadState", "--value"], 5, capture=True
+    )
+    need(result.returncode in {0, 1, 4} and result.stdout.strip() == b"not-found")
+    need(old.handoff.frozen.cgroup_empty(unit()))
+    state.mkdir(mode=0o700, exist_ok=False)
+    old.setup.completion._fsync_directory(root)
+    mark(
+        state,
+        "dispatch.json",
+        dict(binding_sha256=binding_pin, deadline_boottime=end, retry_allowed=False),
+    )
+    os.mkfifo(fifo, 0o600)
+    old.fifo_info(fifo)
+    old.setup.completion._fsync_directory(state)
+    # A lost acknowledgement consumes the dispatch; never launch again.
+    need(old.handoff.frozen.run_command(launch, min(15, remaining(end))).returncode == 0)
+    return dict(dispatch_requested=True, workflow_completed=False, gate_5_complete=False)
+
+
+def _submit_admitted_once(raw, binding_pin, end):
+    _root, state, fifo = paths()
+    validate_state(state, binding_pin, end)
+    continuation.normalize_retention_credentials(raw, time.time(), remaining(end))
+    identity = old.fifo_info(fifo)
+    mark(state, "delivery.started.json", dict(retry_allowed=False))
+    deadline = time.monotonic() + min(10, remaining(end))
+    fd = None
+    try:
+        while fd is None and time.monotonic() < deadline:
+            need(old.fifo_info(fifo) == identity)
+            try:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                time.sleep(0.02)
+        need(fd is not None)
+        row = os.fstat(fd)
+        need((row.st_dev, row.st_ino) == identity)
+        offset = 0
+        while offset < len(raw):
+            left = min(deadline - time.monotonic(), remaining(end))
+            need(left > 0 and select.select([], [fd], [], left)[1] == [fd])
+            try:
+                n = os.write(fd, raw[offset:])
+            except BlockingIOError:
+                continue
+            need(n > 0)
+            offset += n
+    except BaseException:
+        raise ValueError("retention_delivery_failed") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    mark(state, "delivery.sent.json", dict(bytes_sent=len(raw), receiver_acceptance_proven=False))
+    return dict(delivery_sent=True, workflow_completed=False, gate_5_complete=False)
+
+
+def _serve_admitted_once(binding_pin, end, machine_id, prior_binding_pin):
+    need(remaining(end) > 60)
+    need(
+        old.handoff.frozen.small(Path("/proc/self/cgroup")).strip()
+        == f"0::/system.slice/{unit()}".encode()
+    )
+    _root, state, fifo = paths()
+    validate_state(state, binding_pin, end)
+    mark(state, "started.json", dict(retry_allowed=False))
+    fd = None
+    phase = "receive"
+    try:
+        identity = old.fifo_info(fifo)
+        fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        row = os.fstat(fd)
+        need((row.st_dev, row.st_ino) == identity)
+        need(select.select([fd], [], [], min(30, remaining(end)))[0] == [fd])
+        need(old.fifo_info(fifo) == identity)
+        fifo.unlink()  # Only this exact FIFO name, not credential or artifact data.
+        old.setup.completion._fsync_directory(state)
+        phase = "retention"
+        start = time.monotonic()
+        seconds = remaining(end)
+        need(seconds > 60)
+        result = continuation._continue_admitted_once(
+            ATTEMPT,
+            machine_id=machine_id,
+            expected_binding_sha256=prior_binding_pin,
+            credential_fd=fd,
+            deadline=start + seconds,
+        )
+        need(
+            result.get("offhost_retention_verified") is True
+            and result.get("gate_5_complete") is False
+        )
+        mark(
+            state,
+            "result.json",
+            dict(
+                offhost_retention_verified=True,
+                gate_5_complete=False,
+                commit_sha256=result["commit_sha256"],
+                instance_termination_allowed=False,
+            ),
+        )
+    except BaseException:
+        try:
+            mark(
+                state,
+                "failed.json",
+                dict(stage=phase, retry_allowed=False, output_deletion_allowed=False),
+            )
+        except BaseException:
+            pass
+        raise ValueError("retention_parent_failed") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _stop_admitted(binding_pin, end):
+    # Expiry must never prevent cleanup. No credential read, unlink or unmount.
+    _root, state, _fifo = paths()
+    validate_state(state, binding_pin, end)
+    mark(state, "stop.started.json", dict(retry_allowed=False))
+    name = worker.unit_name(ATTEMPT)
+    success = False
+    try:
+        result = old.handoff.frozen.run_command(
+            ["/usr/bin/systemctl", "show", name, "--property=LoadState,ActiveState"],
+            5,
+            capture=True,
+        )
+        need(result.returncode in {0, 1, 4})
+        rows = dict(line.split("=", 1) for line in result.stdout.decode("ascii").splitlines())
+        need(rows.get("LoadState") in {"not-found", "loaded"})
+        if rows["LoadState"] == "loaded" and rows.get("ActiveState") != "inactive":
+            old.handoff._stop_and_reap(name)
+        need(old.handoff.frozen.cgroup_empty(name))
+        success = True
+    finally:
+        mark(
+            state,
+            "stop.result.json",
+            dict(
+                retention_cgroup_reaped=success,
+                credential_source_cleanup_claimed=False,
+                output_deletion_allowed=False,
+            ),
+        )
+
+
+def _status_admitted(binding_pin, end):
+    _root, state, _fifo = paths()
+    validate_state(state, binding_pin, end)
+    code = "dispatch_requested"
+    for name, value in (
+        ("started.json", "running"),
+        ("result.json", "retention_returned"),
+        ("failed.json", "failed"),
+    ):
+        if (state / name).exists():
+            worker.retention.decode(worker.retention.small(state / name, "root", 0o600, 4096))
+            code = value
+    empty = old.handoff.frozen.cgroup_empty(unit())
+    if empty and code == "running":
+        code = "interrupted"
+    return dict(
+        state=code,
+        parent_cgroup_empty=empty,
+        gate_5_complete=False,
+        instance_termination_allowed=False,
+        retry_allowed=False,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None

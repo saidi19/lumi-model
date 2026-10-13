@@ -1,0 +1,172 @@
+"""One authorized STS, exact instance and console read; sanitized results only."""
+
+import hashlib
+import json
+import re
+import signal
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTCOME = "evidence/lumi-vm-private-outer-execution-outcome-v0.7.json"
+OUTCOME_SHA = "4481e3daff3ddd9032db426223bed4126f9bde5511951102a74d2548403b81c7"
+CLEANUP_SHA = "f7a4bb9ea544352fcc9ee4abedf0b7b27fd277aec4b72d96f5a86043a3b6df08"
+OUTPUT = "artifacts/lumi-vm-v07-boot-diagnostic-v0.1"
+ACCOUNT = "573978149073"
+INSTANCE = "i-045114b98ce9b3a48"
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+VPC = "vpc-0905fbf9490a2dead"
+SUBNET = "subnet-09acdd244d70aa502"
+ERRORS = {"ExpiredToken", "ExpiredTokenException", "AccessDenied",
+          "UnauthorizedOperation", "InvalidParameterValue", "RequestLimitExceeded"}
+REASONS = {"Client.InstanceInitiatedShutdown", "Client.UserInitiatedShutdown",
+           "Client.InternalError", "Server.InternalError", "Server.InsufficientInstanceCapacity",
+           "Server.SpotInstanceShutdown", "Client.VolumeLimitExceeded"}
+MARKERS = {
+    "cloud_init": r"cloud-init",
+    "bootcmd": r"bootcmd",
+    "bootcmd_failed": r"Failed to run module bootcmd|Running module bootcmd.*failed",
+    "traceback": r"Traceback \(most recent call last\)",
+    "assertion_error": r"AssertionError",
+    "early_stop_rejected": r"early_stop_rejected",
+    "early_stop_path": r"/opt/lumi-early-stop",
+    "early_setup_timer": r"lumi-fullsize-early-setup-v1",
+    "early_host_timer": r"lumi-fullsize-early-host-v1",
+    "poweroff": r"power.?off|powering off",
+    "shutdown": r"shutting down|shutdown",
+    "kernel_panic": r"kernel panic",
+    "out_of_memory": r"out of memory|oom-kill",
+    "python_missing": r"(python3|/usr/bin/python3).*(not found|No such file)",
+    "permission_denied": r"Permission denied",
+    "failed": r"\bfailed\b",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("diagnostic_rejected")
+
+
+def instance_summary(value):
+    need(type(value) is dict and not value.get("NextToken"))
+    reservations = value["Reservations"]
+    need(type(reservations) is list and len(reservations) == 1)
+    reservation = reservations[0]
+    need(reservation["OwnerId"] == ACCOUNT)
+    rows = reservation["Instances"]
+    need(type(rows) is list and len(rows) == 1)
+    row = rows[0]
+    need(row["InstanceId"] == INSTANCE and row["VpcId"] == VPC and row["SubnetId"] == SUBNET)
+    need(row["InstanceType"] == "r6i.4xlarge")
+    need([t.get("Value") for t in row.get("Tags", [])
+          if t.get("Key") == "LumiAttempt"] == [ATTEMPT])
+    need(row["State"]["Name"] == "stopped")
+    code = row.get("StateReason", {}).get("Code")
+    return dict(identity_matches=True, state="stopped",
+                reason_code=code if code in REASONS else "other_or_absent",
+                reason_message_present=bool(row.get("StateReason", {}).get("Message")),
+                transition_reason_present=bool(row.get("StateTransitionReason")),
+                attached_volume_count=len(row.get("BlockDeviceMappings", [])))
+
+
+def console_summary(value):
+    need(type(value) is dict and value["InstanceId"] == INSTANCE)
+    output = value.get("Output", "")
+    need(type(output) is str and len(output.encode()) <= 196608)
+    # Botocore's after-call handler already decodes GetConsoleOutput base64.
+    # Raw console is treated as untrusted data, never printed or saved.
+    counts = {name: len(re.findall(pattern, output, re.IGNORECASE))
+              for name, pattern in MARKERS.items()}
+    return dict(instance_matches=True, output_present=bool(output),
+                decoded_bytes=len(output.encode()), line_count=len(output.splitlines()),
+                timestamp_present=value.get("Timestamp") is not None, marker_counts=counts)
+
+
+def main():
+    need(hashlib.sha256((ROOT / OUTCOME).read_bytes()).hexdigest() == OUTCOME_SHA)
+    need(hashlib.sha256((ROOT / "scripts/cleanup_sft_vm_v06_leftovers_v1.py").read_bytes())
+         .hexdigest() == CLEANUP_SHA)
+    import cleanup_sft_vm_v06_leftovers_v1 as cleanup
+    outcome = json.loads((ROOT / OUTCOME).read_bytes())
+    for name, pin in outcome["bindings"].items():
+        path = ROOT / name
+        need(path.resolve().is_relative_to(ROOT) and not path.is_symlink())
+        need(not name.endswith("/connection-key"))
+        need(cleanup.digest(path) == pin)
+    need(outcome["execution"]["instance"] == INSTANCE)
+    need(outcome["host"]["stopped_verified"] is True)
+    journal = cleanup.Journal(ROOT / OUTPUT)
+    def save(name, value):
+        need(journal.written + len(cleanup.canonical(value)) <= 16384)
+        journal.save(name, value)
+    save("started", dict(human_approval="ok kor", outcome_sha256=OUTCOME_SHA,
+                         script_sha256=cleanup.digest(Path(__file__)),
+                         calls_cap=3, wall_seconds_cap=60, mutations_allowed=False,
+                         credential_provider_invocations_cap=1, retry_allowed=False))
+    started, clients = time.monotonic(), []
+    report = dict(status="stopped", stage="imports", calls=0, mutations=0,
+                  credential_provider_invocations=0, response_bytes=0,
+                  raw_response_retained=False, private_key_read=False,
+                  model_access=False, gpu_used=False, training_started=False)
+    def expired(*_):
+        raise TimeoutError("diagnostic_deadline")
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 55)
+    def read(client, operation, **fields):
+        need(report["calls"] < 3 and time.monotonic() - started < 45)
+        need(operation in {"get_caller_identity", "describe_instances", "get_console_output"})
+        report["calls"] += 1
+        value = getattr(client, operation)(**fields)
+        size = len(cleanup.canonical(value))
+        report["response_bytes"] += size
+        need(size <= 262144 and report["response_bytes"] <= 524288)
+        return value
+    try:
+        import sft_vm_controller_credentials_v2 as credentials
+        from botocore.config import Config
+        report["stage"] = "credential_export"
+        report["credential_provider_invocations"] = 1
+        value = json.loads(credentials.export_credentials(), object_pairs_hook=cleanup.unique)
+        need(type(value["Version"]) is int and value["Version"] == 1)
+        expiry = datetime.fromisoformat(value["Expiration"].replace("Z", "+00:00"))
+        need((expiry - datetime.now(UTC)).total_seconds() > 90)
+        secret = dict(aws_access_key_id=value["AccessKeyId"],
+                      aws_secret_access_key=value["SecretAccessKey"],
+                      aws_session_token=value["SessionToken"])
+        need(all(type(v) is str and 0 < len(v) <= 16384 for v in secret.values()))
+        session = credentials.session()
+        report["stage"] = "client_setup"
+        for service in ("sts", "ec2"):
+            clients.append(session.create_client(service, region_name="us-east-1",
+                endpoint_url=credentials.endpoint(service), verify=credentials.ca_path(),
+                config=Config(proxies={}, connect_timeout=3, read_timeout=5,
+                              retries={"total_max_attempts": 1},
+                              ignore_configured_endpoint_urls=True), **secret))
+        secret.clear()
+        value.clear()
+        report["stage"] = "identity"
+        need(read(clients[0], "get_caller_identity")["Account"] == ACCOUNT)
+        report["identity_matches"] = True
+        report["stage"] = "instance_readback"
+        response = read(clients[1], "describe_instances", InstanceIds=[INSTANCE])
+        report["instance_observation"] = instance_summary(response)
+        report["stage"] = "console_readback"
+        response = read(clients[1], "get_console_output", InstanceId=INSTANCE, Latest=True)
+        report["console_observation"] = console_summary(response)
+        report.update(status="diagnostic_completed", stage="complete")
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        report["failure_code"] = code if code in ERRORS else "read_or_validation_failed"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for client in clients:
+            client.close()
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        save("result", report)
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["status"] == "diagnostic_completed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

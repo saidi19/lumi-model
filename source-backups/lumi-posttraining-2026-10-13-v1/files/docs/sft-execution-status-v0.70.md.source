@@ -1,0 +1,143 @@
+# SFT execution status v0.70
+
+2026-09-10. **AWS access and exact final-base metadata verification now pass.**
+The user reported refreshing the CLI login and resumed the in-progress work.
+The earlier failed account check and v0.69 evidence remain unchanged. This step
+does not restore the 4B model, start a GPU, or complete Gate 5.
+
+## Fresh read-only AWS result
+
+The default AWS profile matched the expected account. Exactly five AWS application
+commands completed: one account check, two object HEADs and two conditional GETs.
+Automatic retries were disabled; no request was retried. The bounded operation
+took approximately 6.171 seconds under a 60-second application deadline.
+
+Only the two exact inventory-bound checkpoint metadata objects were downloaded:
+
+| Object | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `distributed-training-state.json` | 7,583 | `819046f39176dc9fce677db69623265e83a5c6dbdd38bed78fec8adaff1fb3e6` |
+| `manifest.sha256` | 1,564 | `73c852095441a4246cea7bb97f7831c364137869e00e29c815b7e22a5972f8de` |
+
+The exact bucket/key selection came from the independently hash-bound Segment-3
+backup plan. Each HEAD required the historical size; each GET was conditioned on
+the observed ETag and required the original content SHA-256. Total body bytes:
+**9,147**. ETag was a concurrency condition, not used as a content hash. The
+operation bounds were five commands, 16 KiB response-metadata allowance per
+command, 15 seconds per command, and no weight/trainer/data object access.
+
+This confirms those two objects, not current availability or contents of all
+52 backup objects. Network traffic was not packet-metered. No credentials or raw
+stderr were retained; no remote object, bucket, instance or registry was changed.
+
+Exact downloaded bytes are retained privately in
+`artifacts/lumi-sft-final-base-metadata-v0.1/`, directory 0700, files 0400.
+Saved sizes/hashes were rechecked. Later checks reused these bytes without
+another S3 GET. The checkpoint state may contain historical operational metadata;
+it is not a Git/publication target and is not reproduced in the aggregate report.
+
+## Verified base and configuration
+
+The state matches our original `lumi-4b-base`: step **76,294**, sequence cursor
+19,531,250, exactly **80,000,000,000 pretraining tokens**, and historical world
+size eight. Source commit and run fingerprint match the frozen base binding.
+
+The manifest's 18 declarations match the sealed handoff exactly. Including the
+manifest itself, all 19 checkpoint inventory entries and declared sizes/hashes
+match the historical backup plan. This is a **declaration comparison**, not
+verification or loading of those 19 payload files.
+
+The state binds the model configuration to SHA-256
+`643e8da652577f802d959740d66a7e6bafc5b065aa45010c2d7e0340ed9509be`.
+The existing `configs/lumi-4b-v0.2.json` is exactly those 616 bytes, matching the
+original Git blob at pretraining commit
+`418a113021daddb0ea8e364e2a20c3eabc4ab9bf`. No configuration was guessed or
+modified, and no model was allocated.
+
+## Corrected tokenizer metadata interpretation
+
+The v0.69 statement that an expected tokenizer checksum file was missing was
+incorrect. The preserved field named `tokenizer.manifest_sha256` has a different
+documented meaning: it hashes a normalized JSON inventory, not a line-format
+`manifest.sha256` file.
+
+The original implementation `src/lumi/posttraining_readiness.py:72` normalizes
+the three entries to `bytes`, `relative_path`, and `sha256`, sorts by path, and
+hashes compact sorted-key UTF-8 JSON without a trailing newline. The readiness
+script also matches that inventory against the backup-plan objects. Its exact
+425-byte canonical representation yields
+`282d7caa5a9a952c8af66fb28679ee34fa3c844c28e8922f4b4e297ca0fdaab9`.
+
+The synthetic import-v2 validator instead checks that digest against a supplied
+checksum-line file, then parses checksum lines. That is a genuine real-lineage
+contract mismatch. Existing tiny synthetic tests did not catch it because their
+fixtures used checksum-file semantics. Neither original source nor prior tests
+were changed or falsely relabeled as real-base acceptance.
+
+Added the pure, independently pinned metadata validator
+`src/lumi/posttraining_final_base_metadata_v1.py` and synthetic tests. It accepts
+only four bounded byte strings: base binding, DCP manifest, checkpoint state and
+model configuration. It uses the original tokenizer inventory algorithm, requires
+the caller's independent base-file hash before parsing, preserves or strengthens
+the original DCP/state/config/run/rank checks, and returns only fixed metadata
+fields. It cannot open files, access a network, import ML, restore a checkpoint
+or dispatch a worker. Input limits: base/manifest/config 16 KiB each, state 32 KiB,
+combined 64 KiB, at most 128 manifest entries, report at most 4 KiB.
+
+The four exact real metadata inputs total **12,048 bytes** and pass this new
+validator. An independent evaluation of the original pure readiness definitions
+agrees on the tokenizer inventory hash. All input/source hashes were verified
+before and after. The original immutable importer is not wired to this successor;
+a real-import executor must explicitly integrate it later. No tokenizer checksum
+file was fabricated, and no synthetic size limit was widened.
+
+Tokenizer payload files were not read. Thus inventory lineage is verified while
+`tokenizer_payload_verified=false`, `checkpoint_payload_verified=false`,
+`real_4b_import=false` and all execution flags stay false. The pure validator's
+`remote_availability_verified=false` means it performs no remote observation;
+the separate acquisition receipt records the successful two-object AWS check.
+
+## Tests and source bindings
+
+Forty-two new synthetic/source tests cover the original algorithm, all six input
+inventory permutations, auxiliary-field normalization, checksum-file and newline
+confusion, wrong pins, malformed/duplicate JSON, bounded reads, manifest/path/
+rank/state/config mismatches, strict numeric types and closed non-execution flags.
+Tests preserve 12 core original predicate ASTs and map every prior lineage check.
+No test opens private metadata or model/tokenizer/data payloads.
+
+Together with the existing launch-v2, import-v2 and WorkerRun-v1 regressions,
+**167 tests pass without failures/skips** on Python 3.11.15 (0.193s), 3.13.7
+(0.209s) and 3.14.6 (0.198s). Exact Ruff E,F,I,B,UP, line length 100, target py311
+passes. Independent read-only source review found no concrete blocker. No native
+Linux acceptance, ML test, CI workflow or GPU run was started.
+
+| New artifact | SHA-256 |
+| --- | --- |
+| Metadata validator | `9f70fc5f925c4153c644543c17a415bd41d6b7e75ab03697be947c6f8f16ee69` |
+| Synthetic tests | `04a6974f8de6133f5cfc00e5997eb80f8ff8df89a9e5c6bd810286ec6befb1dd` |
+| Aggregate evidence, 6,830 bytes | `35fc6036d0839bb82d7658f8f2864ed9c7573cccca0f3fb8f0612eba014bdce7` |
+
+Evidence: `evidence/lumi-4b-sft-final-base-metadata-preflight-v0.1.json`.
+New files are local-only and unpublished. HEAD remains
+`ecc545fc423650bf1089311915290523c10b3172`. Historical tracked source, original
+importer, accepted CPU image, previous failures and completed CPU evidence remain
+unchanged.
+
+## Next existing dependency
+
+The AWS-account and exact checkpoint-metadata blockers are resolved for this
+observation. Do not repeat this acquisition or search for a fictitious tokenizer
+checksum file. **The next software task is the resource-bounded real-4B CPU
+restore/import successor**, integrating these verified metadata semantics with
+closed inventory, tensor/dtype/tied-weight/HF-reload checks and an exact private
+output budget. This task still needs real-sized resource planning; copying the
+synthetic importer and raising its caps is not completion.
+
+The full historical checkpoint is about 48.84 GB; the model-only portion is about
+16.82 GB. Those inventory sizes do not authorize a partial restore or a large
+download to the Mac. Dedicated host/geometry, source-compatible GPU worker,
+actual import and data-relocation receipts, CUDA criteria and bounded execution
+approval remain downstream. No GPU is required for this completed metadata task;
+do not start GPU billing yet. Gate 5, real SFT and production eligibility remain
+incomplete/false.

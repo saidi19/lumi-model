@@ -1,0 +1,386 @@
+"""Synthetic exact listener transport tests; no sockets/native calls are made."""
+
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import importlib
+import stat
+import sys
+import threading
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_transport_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_transport_v1")
+IMPORTED = set(sys.modules) - before_import
+PRIVATE = "SYNTHETIC-PRIVATE-TRANSPORT-DATA"
+IDENTITY = (8, 12, 0o600, 0)
+CHANNEL_IDENTITY = (8, 25, 0o140600, 0, 0)
+
+
+def rights(*fds, size=None):
+    body = b"".join(m.FD.pack(fd) for fd in fds)
+    size = 16 + len(body) if size is None else size
+    result = m.CMSG_HEADER.pack(size, m.SOL_SOCKET, m.SCM_RIGHTS) + body
+    return result + b"\0" * ((-len(result)) % 8)
+
+
+def pidfd(fd):
+    result = m.CMSG_HEADER.pack(20, m.SOL_SOCKET, m.SCM_PIDFD) + m.FD.pack(fd)
+    return result + b"\0" * 4
+
+
+class TransportTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def native_doubles(self, received=None):
+        with contextlib.ExitStack() as stack:
+            self.runtime = stack.enter_context(patch.object(m, "_runtime"))
+            self.channel = stack.enter_context(patch.object(
+                m, "_channel", return_value=CHANNEL_IDENTITY))
+            self.clock = stack.enter_context(patch.object(m.time, "monotonic_ns", return_value=1))
+            self.poll = stack.enter_context(patch.object(m, "_poll"))
+            self.send = stack.enter_context(patch.object(
+                m, "_sendmsg", side_effect=lambda fd, data, passed: len(data)))
+            self.recv = stack.enter_context(patch.object(
+                m, "_recvmsg", return_value=received or (m.OFFER, rights(50), 0, True)))
+            self.descriptor = stack.enter_context(patch.object(
+                m.listener, "_descriptor", return_value=IDENTITY))
+            self.close = stack.enter_context(patch.object(m.os, "close"))
+            yield m._Transport(20, deadline_ns=1000000001)
+
+    def assert_code(self, code, action):
+        with self.assertRaises(m.TransportError) as caught:
+            action()
+        self.assertEqual(str(caught.exception), code)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_public_entry_never_opens(self):
+        for options in ({}, {"approved": True}, {"native": True}, {"channel_fd": 20}):
+            with self.subTest(options=options):
+                self.assert_code("host_guard_not_bound", lambda: m.transfer_write_listener(
+                    **options))
+
+    def test_import_is_inert_and_does_not_load_primary_package_or_ml(self):
+        self.assertFalse(any(name == "lumi" or name.startswith("lumi.")
+                             or name.split(".", 1)[0] in m.listener.ML_ROOTS
+                             for name in IMPORTED))
+
+    def test_worker_transfer_uses_exact_frozen_offer_and_ack_and_borrows_listener(self):
+        with self.native_doubles((m.ACK, b"", 0, True)) as transport:
+            result = transport.transfer(40, IDENTITY, m.listener.policy.LISTENER_FILTER_SHA256)
+            self.assertEqual(result, m.listener.ADOPTED)
+            self.send.assert_called_once_with(20, m.OFFER, 40)
+            self.recv.assert_called_once_with(20, len(m.ACK) + 1)
+            self.close.assert_not_called()
+            self.assertTrue(transport.snapshot()["acknowledged"])
+            self.assertEqual(transport._deadline_ns, 1000000001)
+
+    def test_offer_receive_transfers_ownership_only_on_explicit_take(self):
+        with self.native_doubles() as transport:
+            offer = transport.receive_admitted_once()
+            self.assertEqual(offer._fd, 50)
+            self.close.assert_not_called()
+            self.assertEqual(offer.take_admitted_once(), 50)
+            self.assert_code("already_attempted", offer.take_admitted_once)
+            self.close.assert_not_called()
+
+    def test_abandoned_offer_closes_exactly_once(self):
+        with self.native_doubles() as transport:
+            offer = transport.receive_admitted_once()
+            offer.close_admitted_once()
+            self.assert_code("already_attempted", offer.close_admitted_once)
+            self.close.assert_called_once_with(50)
+            self.assertFalse(offer._taken)
+
+    def test_offer_close_failure_consumes_ownership(self):
+        with self.native_doubles() as transport:
+            offer = transport.receive_admitted_once()
+            self.close.side_effect = OSError(PRIVATE)
+            self.assert_code("close_failed", offer.close_admitted_once)
+            self.assert_code("already_attempted", offer.close_admitted_once)
+            self.close.assert_called_once_with(50)
+
+    def test_offer_identity_change_is_consumed_without_closing_replacement(self):
+        with self.native_doubles() as transport:
+            offer = transport.receive_admitted_once()
+            self.descriptor.return_value = (9, 99, 0o600, 0)
+            self.assert_code("listener_rejected", offer.close_admitted_once)
+            self.assert_code("already_attempted", offer.close_admitted_once)
+            self.close.assert_not_called()
+
+    def test_ack_requires_exact_adopted_listener_then_sends_no_rights(self):
+        with self.native_doubles() as transport:
+            offer = transport.receive_admitted_once()
+            adopted = m.listener._Listener(offer.take_admitted_once(), IDENTITY, transport._owner)
+            transport.acknowledge_admitted_once(adopted)
+            self.send.assert_called_once_with(20, m.ACK, None)
+            self.close.assert_not_called()
+            self.assertTrue(transport.snapshot()["acknowledged"])
+
+    def test_ack_rejects_unconsumed_offer_and_made_up_adoption(self):
+        for kind in ("unconsumed", "wrong_type", "wrong_fd", "wrong_identity", "closed",
+                     "failed", "abandoned"):
+            with self.subTest(kind=kind), self.native_doubles() as transport:
+                offer = transport.receive_admitted_once()
+                if kind == "abandoned":
+                    offer.close_admitted_once()
+                elif kind != "unconsumed":
+                    offer.take_admitted_once()
+                adopted = m.listener._Listener(50, IDENTITY, transport._owner)
+                if kind == "wrong_type":
+                    adopted = object()
+                if kind == "wrong_fd":
+                    adopted._fd = 51
+                if kind == "wrong_identity":
+                    adopted._identity = (9, 99, 0o600, 0)
+                if kind == "closed":
+                    adopted._closed = True
+                if kind == "failed":
+                    adopted._failed = True
+                self.assert_code("adoption_rejected", lambda: transport.acknowledge_admitted_once(
+                    adopted))
+                self.send.assert_not_called()
+
+    def test_malformed_offer_retires_all_received_descriptors_without_retry(self):
+        cases = [
+            (b"wrong", rights(50), 0, True, [50]),
+            (m.OFFER, rights(50, 51), 0, True, [50, 51]),
+            (m.OFFER, rights(50) + rights(51), 0, True, [50, 51]),
+            (m.OFFER, rights(50) + rights(50), 0, True, [50]),
+            (m.OFFER, rights(0), 0, True, [0]),
+            (m.OFFER, rights(50), 8, True, [50]),
+            (m.OFFER, rights(50), 32, True, [50]),
+            (m.OFFER, rights(50), 0, False, [50]),
+            (m.OFFER + b"x", rights(50), 0, True, [50]),
+            (m.OFFER, rights(50, size=21), 0, True, [50]),
+            (m.OFFER, b"", 0, True, []),
+        ]
+        for packet, control, flags, bounded, expected in cases:
+            with self.subTest(control=control, flags=flags), self.native_doubles(
+                    (packet, control, flags, bounded)) as transport:
+                self.assert_code("packet_rejected", transport.receive_admitted_once)
+                self.assertEqual([call.args[0] for call in self.close.call_args_list], expected)
+                self.recv.assert_called_once()
+                self.assert_code("already_failed", transport.receive_admitted_once)
+
+    def test_unknown_ancillary_then_rights_is_rejected_and_rights_closed(self):
+        unknown = m.CMSG_HEADER.pack(16, 1, 2)
+        with self.native_doubles((m.OFFER, unknown + rights(50), 0, True)) as transport:
+            self.assert_code("packet_rejected", transport.receive_admitted_once)
+            self.close.assert_called_once_with(50)
+
+    def test_unexpected_scm_pidfd_is_rejected_and_installed_fd_is_closed(self):
+        with self.native_doubles((m.OFFER, pidfd(60), 0, True)) as transport:
+            self.assert_code("packet_rejected", transport.receive_admitted_once)
+            self.close.assert_called_once_with(60)
+
+    def test_wrong_ack_with_rights_closes_rights_but_not_original(self):
+        with self.native_doubles((b"wrong", rights(50), 0, True)) as transport:
+            self.assert_code("packet_rejected", lambda: transport.transfer(
+                40, IDENTITY, m.listener.policy.LISTENER_FILTER_SHA256))
+            self.close.assert_called_once_with(50)
+
+    def test_ack_cannot_carry_even_one_valid_right(self):
+        with self.native_doubles((m.ACK, rights(50), 0, True)) as transport:
+            self.assert_code("packet_rejected", lambda: transport.transfer(
+                40, IDENTITY, m.listener.policy.LISTENER_FILTER_SHA256))
+            self.close.assert_called_once_with(50)
+
+    def test_descriptor_validation_failure_retires_received_right(self):
+        with self.native_doubles() as transport:
+            self.descriptor.side_effect = OSError(PRIVATE)
+            self.assert_code("transport_failed", transport.receive_admitted_once)
+            self.close.assert_called_once_with(50)
+
+    def test_cleanup_attempts_each_right_once_after_close_error(self):
+        with self.native_doubles((m.OFFER, rights(50, 51), 0, True)) as transport:
+            self.close.side_effect = [OSError(PRIVATE), None]
+            self.assert_code("close_failed", transport.receive_admitted_once)
+            self.assertEqual([call.args[0] for call in self.close.call_args_list], [50, 51])
+
+    def test_expired_after_receive_closes_right_before_return(self):
+        with self.native_doubles() as transport:
+            self.recv.side_effect = lambda *args: (
+                setattr(self.clock, "return_value", 1000000001)
+                or (m.OFFER, rights(50), 0, True))
+            self.assert_code("deadline_exhausted", transport.receive_admitted_once)
+            self.close.assert_called_once_with(50)
+
+    def test_short_send_is_terminal_with_no_receive_or_retry(self):
+        with self.native_doubles() as transport:
+            self.send.side_effect = None
+            self.send.return_value = len(m.OFFER) - 1
+            self.assert_code("transport_failed", lambda: transport.transfer(
+                40, IDENTITY, m.listener.policy.LISTENER_FILTER_SHA256))
+            self.send.assert_called_once()
+            self.recv.assert_not_called()
+            self.close.assert_not_called()
+
+    def test_send_eintr_and_poll_failure_never_retry_or_expose_exception(self):
+        for boundary in ("send", "poll", "recv"):
+            with self.subTest(boundary=boundary), self.native_doubles() as transport:
+                getattr(self, boundary).side_effect = InterruptedError(PRIVATE)
+                self.assert_code("transport_failed", lambda: transport.transfer(
+                    40, IDENTITY, m.listener.policy.LISTENER_FILTER_SHA256))
+                self.close.assert_not_called()
+                self.assertEqual(getattr(self, boundary).call_count, 1)
+
+    def test_borrowed_descriptor_replacement_and_digest_mismatch_fail_before_send(self):
+        for identity, digest in (((), m.listener.policy.LISTENER_FILTER_SHA256),
+                                 (IDENTITY, "0" * 64)):
+            with self.native_doubles() as transport:
+                self.assert_code("listener_rejected", lambda: transport.transfer(
+                    40, identity, digest))
+                self.send.assert_not_called()
+                self.close.assert_not_called()
+
+    def test_channel_identity_change_is_terminal(self):
+        with self.native_doubles() as transport:
+            self.channel.return_value = ()
+            self.assert_code("channel_rejected", transport.receive_admitted_once)
+            self.recv.assert_not_called()
+
+    def test_owner_change_rejects_without_receiving(self):
+        with self.native_doubles() as transport:
+            transport._owner = (-1, -1)
+            self.assert_code("owner_mismatch", transport.receive_admitted_once)
+            self.recv.assert_not_called()
+
+    def test_reentry_is_terminal_and_lock_is_not_released_by_nested_call(self):
+        with self.native_doubles() as transport:
+            transport._lock.acquire()
+            self.assert_code("reentry", transport.receive_admitted_once)
+            self.assertTrue(transport._lock.locked())
+            transport._lock.release()
+
+    def test_second_receive_cannot_replace_listener(self):
+        with self.native_doubles() as transport:
+            offer = transport.receive_admitted_once()
+            self.assert_code("already_attempted", transport.receive_admitted_once)
+            offer.close_admitted_once()
+            self.recv.assert_called_once()
+
+    def test_reports_contain_only_aggregate_values_and_false_claims(self):
+        with self.native_doubles() as transport:
+            result = transport.snapshot()
+            self.assertEqual(set(result), {"schema", "offer_attempted", "acknowledged",
+                                           "terminal_failed", *m.FALSE_FLAGS})
+            self.assertTrue(all(result[key] is False for key in m.FALSE_FLAGS))
+
+
+class NativeBoundaryTests(unittest.TestCase):
+    def test_linux_abi_constants_and_layout_are_explicit(self):
+        self.assertEqual((m.SOL_SOCKET, m.SCM_RIGHTS, m.SCM_PIDFD,
+                          m.AF_UNIX, m.SOCK_SEQPACKET), (1, 1, 4, 1, 5))
+        self.assertEqual((m.MSG_DONTWAIT, m.MSG_NOSIGNAL, m.MSG_CMSG_CLOEXEC),
+                         (0x40, 0x4000, 0x40000000))
+        self.assertEqual((ctypes.sizeof(m._IOVec), ctypes.sizeof(m._MsgHdr)), (16, 56))
+        self.assertEqual(m.CONTROL_BYTES, 1032)
+
+    def test_sendmsg_exact_one_right_fixed_flags_and_no_python_socket_retry(self):
+        def send(fd, pointer, flags):
+            message = ctypes.cast(pointer, ctypes.POINTER(m._MsgHdr)).contents
+            self.assertEqual((fd, flags), (20, m.MSG_DONTWAIT | m.MSG_NOSIGNAL))
+            self.assertEqual(ctypes.string_at(message.iov[0].base, message.iov[0].length), m.OFFER)
+            self.assertEqual(ctypes.string_at(message.control, message.controllen), rights(40))
+            return len(m.OFFER)
+        native = Mock(side_effect=send)
+        with patch.object(m, "_function", return_value=native):
+            self.assertEqual(m._sendmsg(20, m.OFFER, 40), len(m.OFFER))
+        native.assert_called_once()
+
+    def test_send_ack_has_no_ancillary(self):
+        def send(_fd, pointer, _flags):
+            message = ctypes.cast(pointer, ctypes.POINTER(m._MsgHdr)).contents
+            self.assertIsNone(message.control)
+            self.assertEqual(message.controllen, 0)
+            return len(m.ACK)
+        with patch.object(m, "_function", return_value=Mock(side_effect=send)):
+            self.assertEqual(m._sendmsg(20, m.ACK, None), len(m.ACK))
+
+    def test_recvmsg_sets_cloexec_atomically_and_keeps_control_on_truncation(self):
+        def receive(fd, pointer, flags):
+            message = ctypes.cast(pointer, ctypes.POINTER(m._MsgHdr)).contents
+            self.assertEqual((fd, flags), (20, m.MSG_DONTWAIT | m.MSG_CMSG_CLOEXEC))
+            self.assertEqual(message.controllen, 1032)
+            ctypes.memmove(message.iov[0].base, m.OFFER, len(m.OFFER))
+            ctypes.memmove(message.control, rights(50), 24)
+            message.controllen, message.flags = 24, 8
+            return len(m.OFFER)
+        native = Mock(side_effect=receive)
+        with patch.object(m, "_function", return_value=native):
+            self.assertEqual(m._recvmsg(20, len(m.OFFER) + 1), (m.OFFER, rights(50), 8, True))
+        native.assert_called_once()
+
+    def test_poll_uses_exact_event_and_one_bounded_wait(self):
+        def poll(pointer, count, timeout):
+            value = ctypes.cast(pointer, ctypes.POINTER(m._PollFD)).contents
+            self.assertEqual((value.fd, value.events, count, timeout), (20, m.POLLIN, 1, 19))
+            value.revents = m.POLLIN
+            return 1
+        native = Mock(side_effect=poll)
+        with patch.object(m, "_function", return_value=native):
+            self.assertIsNone(m._poll(20, m.POLLIN, 19))
+        native.assert_called_once()
+
+    def test_poll_timeout_eintr_and_hup_fail_without_retry(self):
+        for result, events in ((0, 0), (-1, 0), (1, 17), (2, 1)):
+            def poll(pointer, _count, _timeout):
+                ctypes.cast(pointer, ctypes.POINTER(m._PollFD)).contents.revents = events
+                return result
+            with self.subTest(result=result, events=events), \
+                    patch.object(m, "_function", return_value=Mock(side_effect=poll)) as factory, \
+                    self.assertRaises(m.TransportError):
+                m._poll(20, m.POLLIN, 19)
+            factory.return_value.assert_called_once()
+
+    def test_channel_rejects_wrong_domain_type_cloexec_mode_or_owner(self):
+        for mismatch in ("domain", "type", "cloexec", "access", "owner", "group",
+                         "regular"):
+            info = types.SimpleNamespace(st_dev=8, st_ino=25, st_mode=stat.S_IFSOCK | 0o600,
+                                         st_uid=0, st_gid=0)
+            if mismatch == "owner":
+                info.st_uid = 10001
+            if mismatch == "group":
+                info.st_gid = 10001
+            if mismatch == "regular":
+                info.st_mode = stat.S_IFREG | 0o600
+            def flags(_fd, operation):
+                if operation == m.F_GETFD:
+                    return 0 if mismatch == "cloexec" else 1
+                return 0 if mismatch == "access" else 2
+            def option(_fd, operation):
+                if operation == m.SO_DOMAIN:
+                    return 2 if mismatch == "domain" else 1
+                return 1 if mismatch == "type" else 5
+            with self.subTest(mismatch=mismatch), patch.object(m.os, "fstat", return_value=info), \
+                    patch.object(m.fcntl, "fcntl", side_effect=flags), \
+                    patch.object(m, "_socket_option", side_effect=option), \
+                    patch.object(m, "_connected"), self.assertRaises(m.TransportError):
+                m._channel(20)
+
+    def test_connected_socket_validation_is_fixed_unix_and_rejects_unconnected(self):
+        for result, family in ((0, b"\1\0"), (-1, b"\1\0"), (0, b"\2\0")):
+            def peer(_fd, address, size):
+                ctypes.memmove(address, family, 2)
+                ctypes.cast(size, ctypes.POINTER(ctypes.c_uint32)).contents.value = 2
+                return result
+            with self.subTest(result=result, family=family), \
+                    patch.object(m, "_function", return_value=Mock(side_effect=peer)):
+                if result == 0 and family == b"\1\0":
+                    self.assertIsNone(m._connected(20))
+                else:
+                    with self.assertRaises(m.TransportError):
+                        m._connected(20)
+
+
+if __name__ == "__main__":
+    unittest.main()

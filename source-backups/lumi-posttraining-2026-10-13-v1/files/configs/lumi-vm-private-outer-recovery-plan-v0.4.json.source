@@ -1,0 +1,146 @@
+{
+  "schema": "lumi.vm-private-outer-recovery-plan.v0.4",
+  "date": "2026-10-05",
+  "status": "local_preparation_only_watchdog_diagnostic_required",
+  "execution_permitted": false,
+  "approval_record": null,
+  "purpose": "Resume the existing isolated CPU checkpoint-import route, not GPU SFT launcher development or a new converter.",
+  "bindings": {
+    "configs/lumi-vm-private-outer-execution-proposal-v0.3.json": "b280942e7c04d705044836916e213c5ba99f64bcd3eb1faf9bfbe7b43abc2842",
+    "evidence/lumi-vm-private-outer-execution-outcome-v0.3.json": "d17ef78b4a261ca929828fcf5fe70a0cacedbaf1acf9695d1a5cc374ada9356c",
+    "evidence/lumi-vm-v03-network-cleanup-recovery-verification-v0.1.json": "401e92c338e703202536922392380349006c2e970eafa770aa336429a973791b",
+    "scripts/load_sft_vm_private_host_v1.py": "08b2579ee298013496c56f7cc26bc26cbf1f5769f99f949c1070afcc3f5e90ac",
+    "scripts/arm_sft_vm_external_watchdog_v2.py": "39cb6deefa6161eb93bed9e0c9b8accd19c66a3beb101014b42b97b85277e14a",
+    "scripts/run_sft_vm_private_outer_v2.py": "b88a2c4eaececa1fac229920159434897b3bbb97bdb1c7ffb66b4472edf4179a",
+    "tests/test_sft_vm_private_host_loading_v1.py": "e10519814cf8847ceef0b9029564855181e04fb7334106b7cd1a7d0156551e67",
+    "tests/test_sft_vm_private_host_sources_v1.py": "fa08f9b66b5f9e309e7d2977c2ad59ef7378d1752e9f9fec09e72e2713d67173",
+    "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json": "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42",
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json": "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061",
+    "artifacts/lumi-vm-private-outer-execution-v0.3/attempt-003/host-preparation/staged/manifest.json": "b798632213908644254c3c16ccafc173b9c3416177915ea09234182f222c8875"
+  },
+  "findings": {
+    "prior_attempt": "v0.3 consumed; no retry and no old-output overwrite",
+    "last_execution": "Network created; host watchdog code update/readback failed after 17 calls and one code mutation. No instance, checkpoint acquisition or import started.",
+    "cleanup": "2026-10-03 saved recovery verifies old EIP/subnet/route table absent. This is historical evidence, not a fresh cloud observation. Other old IAM/Lambda/scheduler resources were preserved.",
+    "proven_successor_blocker": "The frozen updater's initial inert_checks(original_guard) requires the original public-subnet code hash. An unarmed previously derived watchdog is rejected at read 10 without any write. The saved v0.3 observation reports derived code remained installed.",
+    "predecessor_original_code_sha256_base64": "gbk536fGHj4CPGuXO4BKvaqQ3rujDseS0JBedtqTRBg=",
+    "predecessor_derived_code_sha256_base64": "OZVEcy+HguwyYycwA8N/6PCudW4ISR5rpODIeLHQ6vE=",
+    "historical_exact_failure_known": false,
+    "historical_failure_limit": "Three synthetic cases (wrong revision, wrong code digest, Failed update status after one InProgress poll) reproduce exactly 17 calls and one update; retained aggregate evidence cannot distinguish them.",
+    "local_reproduction": {
+      "command": "artifacts/lumi-vm-acquisition-sdk-test-runtime-v0.1/bin/python -S -B - <<'PY'\nimport json\nfrom tests.test_sft_vm_private_host_loading_v1 import LoadingTests\nf=LoadingTests()\nf.setUp()\ntry:\n    loaded=f.install()\n    f.cloud.code=loaded.joined.lifecycle.guard.CODE\n    f.cloud.revision='previous-derived-revision'\n    try:\n        f.update(loaded)\n    except ValueError:\n        rejected=True\n    else:\n        rejected=False\n    print(json.dumps({'case':'old_updater_with_inert_derived_predecessor','rejected':rejected,'code_update_attempts':f.cloud.updates,'read_calls':len(f.cloud.calls),'concurrency':f.cloud.concurrency,'schedule_absent':f.cloud.schedule is None}))\n    assert rejected and f.cloud.updates==0\nfinally:\n    f.doCleanups()\nfor fault in ('revision','code','status'):\n    f=LoadingTests(); f.setUp()\n    try:\n        loaded=f.install()\n        f.cloud.pending=1\n        original=f.cloud.cli\n        polls=[0]\n        def cli(service,operation,**fields):\n            reply=original(service,operation,**fields)\n            if operation=='get-function-configuration' and f.cloud.updates:\n                polls[0]+=1\n                if polls[0]==2:\n                    if fault=='revision': reply['RevisionId']='different-revision'\n                    if fault=='code': reply['CodeSha256']='different-code'\n                    if fault=='status': reply['LastUpdateStatus']='Failed'\n            return reply\n        f.cloud.cli=cli\n        try:f.update(loaded)\n        except ValueError:pass\n        else:raise AssertionError('unexpected acceptance')\n        result=json.loads((f.f.root/'update/result.json').read_text())\n        assert result['api_calls']==17 and result['code_update_attempts']==1\n        print(json.dumps({'case':'synthetic_'+fault,'api_calls':result['api_calls'],'code_update_attempts':result['code_update_attempts'],'status':result['status']}))\n    finally:f.doCleanups()\nPY",
+      "cases": 4,
+      "unexpected_results": 0,
+      "cloud_calls": 0,
+      "fixture_update_calls_only": true,
+      "old_files_changed": false
+    }
+  },
+  "next_bounded_diagnostic": {
+    "authorization": "Not performed or authorized by this planning file; obtain direct approval for this exact read-only cloud scope.",
+    "account": "573978149073",
+    "region": "us-east-1",
+    "resources": {
+      "function": "lumi-stop-606d788073f1f0b66a39eabeb4b32c2c",
+      "roles": [
+        "lumi-stop-worker-606d788073f1f0b66a39eabeb4b32c2c",
+        "lumi-stop-schedule-606d788073f1f0b66a39eabeb4b32c2c"
+      ],
+      "inline_policy": "OnlyBoundWatchdog",
+      "schedule_group": "lumi-stop-606d788073f1f0b66a39eabeb4b32c2c",
+      "schedule": "stop"
+    },
+    "allowlisted_read_calls": [
+      "sts:GetCallerIdentity once",
+      "iam:GetRole, GetRolePolicy, ListRolePolicies, ListAttachedRolePolicies once for each of the two exact roles",
+      "lambda:GetFunctionConfiguration twice (start/end), GetFunctionConcurrency twice (start/end), GetFunctionEventInvokeConfig once",
+      "scheduler:GetScheduleGroup and GetSchedule once for exact names; expected absence must be distinguished from access failure"
+    ],
+    "limits": {
+      "maximum_resource_api_calls": 16,
+      "maximum_additional_credential_provider_requests": 4,
+      "maximum_runtime_seconds": 600,
+      "maximum_response_bytes": 2097152,
+      "maximum_single_response_bytes": 262144,
+      "maximum_private_report_bytes": 65536,
+      "mutation_calls": 0,
+      "object_body_reads": 0,
+      "log_reads": 0,
+      "instance_actions": 0,
+      "gpu_use": 0,
+      "retry_after_failure": false
+    },
+    "checks": [
+      "Expected account/region and exact resource identities",
+      "Full role trust/inline-policy equality; no extra attached policies or unbounded pagination",
+      "Full frozen runtime/handler/role/environment constraints",
+      "Code equals separately hash-bound predecessor expectation, not a value trusted because AWS returned it",
+      "Concurrency zero and exact UNARMED environment at both ends",
+      "No scheduling group/schedule that could activate this function",
+      "Stable revision/code and Active/Successful current status; distinguish mismatch category using fixed codes, no raw response or exception retention"
+    ],
+    "output_policy": "Retain only allowlisted check codes, comparison booleans, counts and content digests; never retain environment values, credentials, raw IAM documents or exception text.",
+    "failure": "Stop before cloud writes and before any paid allocation. No cleanup or mutation authority implied. A current observation cannot reconstruct missing historical exception evidence."
+  },
+  "conditional_correction": {
+    "only_after_diagnostic": "Select a versioned updater that accepts only the explicitly bound observed predecessor code while retaining all inert/ownership/schedule checks; never accept arbitrary current code.",
+    "no_speculative_poll_relaxation": "Do not weaken revision/code/state checks based solely on the lost historical failure. Any asynchronous transition change needs supported semantics and targeted regression coverage.",
+    "required_diagnostics": "Fixed stage/failure code plus per-check booleans and counts in successor result; no raw response/exception text.",
+    "fresh_bindings": "Fresh execution output, network nonce, specialized-source filenames and unused claim namespace. Resolve prepared-host attempt and preserved issuer/STOP/retention claims before allocating; never silently reuse or delete consumed claims.",
+    "integration": "Bind corrected updater and its hashes into versioned outer/entry. Run focused synthetic preflight/update/failure-cleanup tests; no unrelated GPU bootstrap work.",
+    "allocation_order": "All available static and read-only preconditions, current inert watchdog, source hashes, readiness and expiry/cleanup admission must pass before NAT/EIP/host allocations. Created-subnet-specific code derivation remains inside a separately approved new network transaction.",
+    "approval": "After corrected implementation and read-only results, freeze an exact fresh execution proposal and obtain a new explicit human approval. This preparation file cannot be used as that approval."
+  },
+  "proposed_cpu_scope_unchanged": {
+    "execution_count": 1,
+    "instance_type": "r6i.4xlarge",
+    "maximum_instance_seconds": 14400,
+    "maximum_shared_network_controller_seconds": 18000,
+    "cleanup_reserve_seconds": 1800,
+    "encrypted_root_gib": 32,
+    "encrypted_work_gib": 128,
+    "public_host_ip": false,
+    "source_objects": 22,
+    "maximum_source_body_bytes": 48843765443,
+    "maximum_source_eof_probe_bytes": 22,
+    "import": "Existing frozen CPU conversion and independent verification; no new dataset selection or converter.",
+    "retention": {
+      "maximum_package_bytes": 8415205181,
+      "maximum_metadata_bytes": 4194304,
+      "maximum_nonoverwriting_puts": 528,
+      "maximum_independent_gets": 528,
+      "no_list": true,
+      "no_multipart": true,
+      "no_retry": true
+    },
+    "lifecycle": "STOP and verify instance stopped; preserve EBS/S3. Delete only fresh owned NAT/EIP; remove new empty subnet/table only after ownership/ENI/claim checks.",
+    "temporary_support": "Exact scoped IAM/credentials, connection resources and independent expiry/watchdog remain required under the frozen route. Final names, permissions and mutation bounds must be disclosed by the execution proposal.",
+    "planning_ceilings_usd": {
+      "host": 10,
+      "network": 5,
+      "combined_not_ten": true,
+      "hard_billing_cap": false,
+      "retained_storage_and_other_services_additional": true
+    },
+    "prices_currently_verified": false,
+    "refresh_prices_quota_ami_capacity_before_execution": true,
+    "credits_not_assumed": true
+  },
+  "excluded": [
+    "No AWS action during this local preparation",
+    "No replay of v0.3",
+    "No GPU, inference or SFT training",
+    "No source/dataset/test-object reads in the diagnostic",
+    "No arbitrary resource cleanup",
+    "No production promotion, registry mutation or seal",
+    "No unrelated new abstraction or repeated full GPU synthetic suite"
+  ],
+  "nonclaims": {
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "gpu_used": false,
+    "new_cloud_attempt_started": false
+  }
+}

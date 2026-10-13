@@ -1,0 +1,88 @@
+{
+  "schema": "lumi.vm-private-network-plan.v0.1",
+  "attempt": "606d788073f1f0b66a39eabeb4b32c2c",
+  "account": "573978149073",
+  "region": "us-east-1",
+  "status": "selected_not_allocated_controller_cleanup_not_yet_bound",
+  "execution_permitted": false,
+  "network_scope_approval_record_required": true,
+  "targets": {
+    "vpc": "vpc-0905fbf9490a2dead",
+    "availability_zone": "us-east-1a",
+    "existing_public_subnet_for_nat": "subnet-0dc6039a6453f7c95",
+    "new_private_subnet_cidr": "172.31.96.0/27",
+    "private_subnet_id": null,
+    "private_route_table_id": null,
+    "nat_gateway_id": null,
+    "elastic_ip_allocation_id": null,
+    "nat_type": "zonal_public",
+    "nat_and_host_same_az": true
+  },
+  "maximum_new_resources": {
+    "private_subnets": 1,
+    "route_tables": 1,
+    "nat_gateways": 1,
+    "elastic_ips": 1
+  },
+  "existing_resource_changes_allowed": false,
+  "host_public_ip_allowed": false,
+  "limits": {
+    "network_seconds_from_first_allocation": 18000,
+    "network_setup_seconds": 1800,
+    "host_seconds_unchanged": 14400,
+    "cleanup_reserved_seconds": 1800,
+    "planned_nat_processed_bytes": 79456894976,
+    "nat_usd_per_hour": "0.0450000000",
+    "nat_usd_per_gb": "0.0450000000",
+    "ipv4_usd_per_hour": "0.005",
+    "network_cost_estimate_usd": "3.82556",
+    "network_planning_ceiling_usd": "5.00",
+    "aws_enforced_billing_cap": false,
+    "deadline_enforcement_implemented": false,
+    "traffic_limit_enforcement_claimed_by_this_plan": false,
+    "credits_assumed": false,
+    "excludes": [
+      "EC2",
+      "EBS",
+      "S3 requests",
+      "taxes",
+      "nonstandard data transfer"
+    ]
+  },
+  "required_before_first_paid_allocation": [
+    "Freeze and test create/rollback/expiry cleanup with an exact created-ID ownership ledger; network scope approval is not fullsize execution approval.",
+    "Bind a live bounded controller and interruption/expiry cleanup route. A TTL tag or EC2 STOP watchdog alone does not delete NAT or release its Elastic IP.",
+    "Recheck identity, region, current subnet CIDR absence, NAT/EIP/subnet quotas, public route and current prices. Allocation ambiguity consumes the operation; do not blindly retry it.",
+    "Have the host/import/retention invocation ready before allocating NAT. Start one absolute network clock at first paid allocation; never restart it at host launch.",
+    "Bind the exact created private subnet/route/NAT/EIP IDs into the successor proposal and every directly consequent source pin before host launch."
+  ],
+  "cleanup": {
+    "cost_bearing_resources": "Delete only the newly created NAT, observe deleted state, then release only its newly allocated EIP; do not wait for eventual instance termination to stop NAT/EIP charges.",
+    "private_default_route": "Remove only the exact attempt-created NAT route from the exact new private route table; never touch existing public or main routes.",
+    "stopped_host_case": "Preserve the new private subnet and isolated route table if the stopped host or endpoint still owns an ENI. Do not terminate a host, delete volumes, detach its ENI or replace a shared association to force network cleanup.",
+    "empty_subnet_case": "Disassociate/delete only exact new resources after confirming no dependent ENIs and ownership/creation receipts; retain uncertainty for explicit recovery.",
+    "ambiguous_write": "Record a fixed stage code, observe the exact created ID when known, and never repeat an ambiguous create/delete/release request automatically.",
+    "cleanup_implemented": false
+  },
+  "instance_launch_authorized": false,
+  "real_4b_import": false,
+  "gate_5_complete": false,
+  "gpu_used": false,
+  "training_authorized": false,
+  "production_eligible": false,
+  "bindings": {
+    "evidence/lumi-vm-private-network-observation-v0.1.json": "80ebe71320e048a6252570675e1f6da721ddf33f2a799ffe3c3630f6dbbd5291",
+    "scripts/prepare_sft_vm_private_network_v1.py": "d16c638f596b2479baf83b710b46b25ba8082180193b04f72d4cf86065e96599",
+    "evidence/lumi-vm-execution-entry-preflight-v0.2.json": "bb596e17e662a25902aa85337ed0851de78b14d1357a2c388677c3644748a2bc"
+  },
+  "user_scope_approval": {
+    "date": "2026-10-02",
+    "request": "ok shuru kor",
+    "context": "Direct reply approving temporary private subnet and NAT after disclosure of additional AWS charges. Implementation/lifecycle checks remain required before allocation; not fullsize import or training authority."
+  },
+  "pricing_sources": [
+    "AWS Pricing GetProducts in us-east-1 observed 2026-10-02",
+    "https://aws.amazon.com/vpc/pricing/",
+    "https://docs.aws.amazon.com/vpc/latest/userguide/nat-gateway-pricing.html"
+  ]
+}

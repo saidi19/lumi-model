@@ -1,0 +1,639 @@
+import base64
+import copy
+import datetime as dt
+import gzip
+import hashlib
+import importlib
+import json
+import shlex
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_fresh_host_v1 as fresh
+from tests.test_sft_vm_setup_detached_v1 import BOOT, MACHINE, seed_receipt
+
+m = importlib.import_module("provision_sft_vm_host_v1")
+initial = m.initial
+native = importlib.import_module("run_sft_vm_early_stop_v1")
+setup = m.setup
+P, B = fresh.prior.P, fresh.prior.B
+IDS = dict(machine_id=MACHINE, boot_id=BOOT)
+
+
+def proof(**changes):
+    return (
+        dict(
+            attempt=m.ATTEMPT,
+            source_sha256=initial.EARLY_SHA,
+            **IDS,
+            **initial.BASE,
+            early_timers_armed=True,
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14400,
+            observed_boottime=50.0,
+        )
+        | changes
+    )
+
+
+class InitialTests(unittest.TestCase):
+    def test_native_install_and_proof_use_exclusive_paths_and_reboot_requests_stop(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source = root / "source.py"
+            source.write_bytes(initial.source_bytes())
+            source.chmod(0o400)
+            systemd = root / "systemd"
+            systemd.mkdir()
+            output = root / "receipts" / m.ATTEMPT
+            commands = []
+
+            def read(path, cap=32768, *, mode=0o400):
+                self.assertEqual(path.stat().st_mode & 0o777, mode)
+                raw = path.read_bytes()
+                self.assertLessEqual(len(raw), cap)
+                return raw
+
+            def show(unit, prop):
+                path = systemd / unit
+                if prop == "LoadState":
+                    return b"loaded" if path.exists() else b"not-found"
+                return {
+                    "FragmentPath": str(path).encode(),
+                    "DropInPaths": b"",
+                    "ActiveState": b"active" if unit.endswith(".timer") else b"inactive",
+                    "SubState": b"waiting",
+                    "FailureAction": b"poweroff",
+                }[prop]
+
+            with (
+                patch.object(native, "SOURCE", source),
+                patch.object(native, "OUTPUT", output),
+                patch.object(native, "SYSTEMD", systemd),
+                patch.object(native, "owned"),
+                patch.object(native, "identity", return_value=IDS),
+                patch.object(native, "boot_time", return_value=100),
+                patch.object(native, "read", side_effect=read),
+                patch.object(native, "show", side_effect=show),
+                patch.object(native, "command", side_effect=lambda args: commands.append(args)),
+            ):
+                value = native._install_once()
+                self.assertTrue(value["early_timers_armed"])
+                starts = [args for args in commands if "start" in args]
+                self.assertEqual(
+                    [args[-1] for args in starts], [native.HOST + ".timer", native.SETUP + ".timer"]
+                )
+                before = {p: p.read_bytes() for p in systemd.iterdir()}
+                self.assertEqual(native._main(["install"]), 2)
+                self.assertEqual(commands[-1], ["/usr/bin/systemctl", "--no-block", "poweroff"])
+                self.assertEqual(before, {p: p.read_bytes() for p in systemd.iterdir()})
+                with (
+                    patch.object(
+                        native,
+                        "show",
+                        side_effect=lambda unit, prop: (
+                            b"bad" if prop == "DropInPaths" else show(unit, prop)
+                        ),
+                    ),
+                    self.assertRaises(ValueError),
+                ):
+                    native._proof()
+
+    def test_bound_small_deterministic_userdata_installs_before_ssh_without_secrets(self):
+        raw = initial.user_data()
+        self.assertLessEqual(len(raw), 16384)
+        self.assertEqual(raw, initial.user_data())
+        config = json.loads(gzip.decompress(raw).removeprefix(b"#cloud-config\n"))
+        self.assertEqual(set(config), {"bootcmd"})
+        shell = config["bootcmd"][0]
+        self.assertEqual(shell[:2], ["/bin/sh", "-c"])
+        self.assertIn("/usr/bin/timeout --signal=KILL 120s", shell[-1])
+        self.assertIn("|| /usr/bin/systemctl --no-block poweroff", shell[-1])
+        # Locate Python -c exactly rather than executing the generated command.
+        words = shlex.split(shell[-1])
+        code = words[words.index("-c") + 1]
+        compile(code, "<synthetic-user-data>", "exec")
+        compile(initial.proof_launcher(), "<synthetic-ssh-proof>", "exec")
+        self.assertIn(initial.EARLY_SHA, code)
+        self.assertNotIn("lumi-vm-bootstrap", code)  # Does not precreate frozen seed paths.
+        self.assertNotIn("AWS_SECRET", code)
+        self.assertNotIn("mkfs", code)
+
+    def test_proof_rejects_boolean_deadline_injected_admission_bad_boot_and_nonfinite_time(self):
+        self.assertTrue(initial.validate_proof(native.canonical(proof()))["early_timers_armed"])
+        for changed in (
+            {"host_admitted": True},
+            {"setup_deadline_boottime": True},
+            {"observed_boottime": 1350},
+            {"source_sha256": "0" * 64},
+            {"boot_id": "invalid"},
+            {"extra": True},
+        ):
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                initial.validate_proof(native.canonical(proof(**changed)))
+        with self.assertRaises(ValueError):
+            initial.validate_proof(json.dumps(proof(observed_boottime=float("nan"))).encode())
+
+    def test_unit_deadlines_are_boot_relative_and_no_restart_or_disk_mutation(self):
+        units = native.units()
+        self.assertEqual(len(units), 4)
+        self.assertIn(b"OnBootSec=1800s", units[native.SETUP + ".timer"])
+        self.assertIn(b"OnBootSec=14400s", units[native.HOST + ".timer"])
+        for name, raw in units.items():
+            self.assertNotIn(b"OnActiveSec", raw)
+            self.assertNotIn(b"mkfs", raw)
+            if name.endswith(".service"):
+                self.assertIn(b"Restart=no", raw)
+                self.assertIn(b"FailureAction=poweroff", raw)
+
+    def test_native_setup_expiry_requires_all_exact_receipts_and_same_boot(self):
+        context = dict(attempt=m.ATTEMPT, **IDS, source_sha256=initial.EARLY_SHA)
+
+        def read(path, cap=32768, *, mode=0o400):
+            if path == native.SOURCE:
+                return initial.source_bytes()
+            if path == native.OUTPUT / "context.json":
+                return native.canonical(context)
+            if "reaped.json" in str(path):
+                return native.canonical(
+                    dict(state="completed", setup_unit_reaped=True, **native.BASE)
+                )
+            if "network-guard" in str(path):
+                return native.canonical(
+                    dict(
+                        wheel_and_offline_setup_verified=True,
+                        setup_gate_removed=True,
+                        watchdog_left_running=True,
+                        expiry_left_armed=True,
+                        host_admitted=False,
+                        gate_5_complete=False,
+                        retry_allowed=False,
+                    )
+                )
+            self.assertEqual(mode, 0o600)
+            return native.canonical(
+                dict(
+                    setup_components_completed=["cpu", "sdk", "worker_source", "root_source"],
+                    **native.BASE,
+                )
+            )
+
+        with (
+            patch.object(native, "identity", return_value=IDS),
+            patch.object(native, "boot_time", return_value=1800),
+            patch.object(native, "read", side_effect=read),
+        ):
+            self.assertTrue(native._setup_complete())
+            context["boot_id"] = "changed"
+            with self.assertRaises(ValueError):
+                native._setup_complete()
+
+    def test_native_failure_calls_stop_without_emitting_exception(self):
+        for action in ("install", "setup-check", "wrong"):
+            with (
+                patch.object(native, "_install_once", side_effect=ValueError("PRIVATE")),
+                patch.object(native, "_setup_complete", side_effect=ValueError("PRIVATE")),
+                patch.object(native, "stop") as stop,
+            ):
+                self.assertEqual(native._main([action]), 2)
+                stop.assert_called_once()
+
+    def test_public_entries_never_grant_launch_or_setup(self):
+        for module in (m, initial, native, setup):
+            with self.assertRaises(ValueError):
+                module.run(approved=True, execute=True)
+
+
+class Cloud(fresh.Cloud):
+    def __init__(self):
+        data, _, _ = fresh.fixture()
+        super().__init__(data)
+        self.groups = {}
+        self.started = False
+        self.fail_launch = False
+        self.fail_stop = False
+        self.stop_effective = True
+        self.stopped = False
+        self.launch_count = self.stop_count = 0
+        self.create_count = 0
+        self.user_data = None
+        self.key_name = "lumi-fullsize-" + m.ATTEMPT
+        data["image"]["Images"][0]["RootDeviceType"] = "ebs"
+        data["endpoint"]["InstanceConnectEndpoints"][0]["PreserveClientIp"] = False
+        data["instances"]["Reservations"][0]["Instances"][0]["KeyName"] = self.key_name
+
+    def cli(self, service, operation, **fields):
+        self.calls.append((service, operation, copy.deepcopy(fields)))
+        h = P["host"]
+        tags = [dict(Key="LumiAttempt", Value=m.ATTEMPT)]
+        if operation == "describe-subnets":
+            return {
+                "Subnets": [
+                    dict(
+                        SubnetId=h["subnet"],
+                        VpcId=h["vpc"],
+                        OwnerId=h["account"],
+                        AvailabilityZone=h["availability_zone"],
+                        State="available",
+                        AssignIpv6AddressOnCreation=False,
+                    )
+                ]
+            }
+        if operation == "create-security-group":
+            self.create_count += 1
+            group = B["vm_group"] if self.create_count == 1 else B["endpoint_group"]
+            self.groups[group] = dict(
+                GroupId=group,
+                GroupName=fields["GroupName"],
+                VpcId=h["vpc"],
+                OwnerId=h["account"],
+                Tags=tags,
+                IpPermissions=[],
+                IpPermissionsEgress=[dict(IpProtocol="-1", IpRanges=[dict(CidrIp="0.0.0.0/0")])],
+            )
+            return {"GroupId": group}
+        if operation == "describe-security-groups":
+            return {"SecurityGroups": copy.deepcopy([self.groups[k] for k in fields["GroupIds"]])}
+        if operation == "revoke-security-group-egress":
+            self.groups[fields["GroupId"]]["IpPermissionsEgress"] = []
+            return {"Return": True}
+        if operation.startswith("authorize-security-group-"):
+            key = "IpPermissions" if operation.endswith("ingress") else "IpPermissionsEgress"
+            self.groups[fields["GroupId"]][key] = copy.deepcopy(fields["IpPermissions"])
+            return {"Return": True}
+        if operation == "import-key-pair":
+            self.public = fields["PublicKeyMaterial"]
+            return dict(KeyPairId="key-" + "a" * 17, KeyName=self.key_name)
+        if operation == "describe-key-pairs":
+            return {
+                "KeyPairs": [
+                    dict(
+                        KeyName=self.key_name,
+                        KeyPairId="key-" + "a" * 17,
+                        KeyType="ed25519",
+                        PublicKey=self.public.decode(),
+                        Tags=tags,
+                    )
+                ]
+            }
+        if operation == "create-instance-connect-endpoint":
+            return {"InstanceConnectEndpoint": dict(InstanceConnectEndpointId=B["endpoint"])}
+        if operation == "run-instances":
+            self.launch_count += 1
+            self.started = True
+            self.advance(60)
+            self.user_data = fields["UserData"]
+            now = dt.datetime.now(dt.UTC)
+            self.data["instances"]["Reservations"][0]["Instances"][0]["LaunchTime"] = now
+            for volume in self.data["volumes"]["Volumes"]:
+                volume["CreateTime"] = now
+            if self.fail_launch:
+                raise TimeoutError("PRIVATE cloud exception")
+            return {"Instances": [{"InstanceId": B["instance"]}]}
+        if operation == "stop-instances":
+            self.stop_count += 1
+            if self.stop_effective:
+                self.stopped = True
+            if self.fail_stop:
+                raise TimeoutError("PRIVATE stop exception")
+            return {}
+        if operation == "describe-instances":
+            value = copy.deepcopy(self.data["instances"])
+            if self.stopped:
+                value["Reservations"][0]["Instances"][0]["State"]["Name"] = "stopped"
+            return value
+        # Parent supplies real validators' remaining public metadata fixtures.
+        self.calls.pop()
+        return super().cli(service, operation, **fields)
+
+
+class ProvisionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.output = self.root / "attempt"
+        self.cloud = Cloud()
+        self.now = 100.0
+        self.cloud.advance = self.sleep
+        self.operations = []
+        self.proof_changes = {}
+        self.seed_changes = {}
+        self.responses = ["dispatch_requested", "running", "setup_returned", "completed"]
+        self.keygen = self.enterContext(patch.object(m, "fresh_key", side_effect=self.key))
+        self.ssh = self.enterContext(
+            patch.object(
+                setup.delivery.seed.sender.delivery, "pipe_exchange", side_effect=self.exchange
+            )
+        )
+        self.upload = self.enterContext(
+            patch.object(
+                setup.delivery.seed.sender,
+                "pipe_exchange",
+                return_value=setup.delivery.seed.INPUTS.canonical(
+                    setup.delivery.seed.sender.expected_receipt()
+                ),
+            )
+        )
+
+    def key(self, path):
+        path.write_bytes(b"SYNTHETIC-NOT-A-PRIVATE-KEY")
+        path.chmod(0o600)
+        return b"ssh-ed25519 " + base64.b64encode(b"\0\0\0\x0bssh-ed25519\0\0\0\x20" + b"s" * 32)
+
+    def exchange(self, argv, body, seconds):
+        code = shlex.split(argv[-1])[-1]
+        if "m._proof()" in code:
+            self.operations.append("early_proof")
+            return native.canonical(proof(**self.proof_changes))
+        if "names = (" in code:
+            self.operations.append("seed")
+            return native.canonical(seed_receipt() | self.seed_changes)
+        op = next(
+            op
+            for op, entry in (
+                ("dispatch", "_deploy_and_dispatch_once"),
+                ("status", "_status"),
+                ("finish", "_finish_once"),
+                ("abort", "_abort_once"),
+            )
+            if entry in code
+        )
+        self.operations.append(op)
+        state = "shutdown_requested" if op == "abort" else self.responses.pop(0)
+        return native.canonical(
+            dict(state=state, setup_unit_reaped=state == "completed", **setup.delivery.BASE)
+        )
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def call(self):
+        return m._provision_and_setup_admitted_once(
+            self.output, cloud=self.cloud, clock=lambda: self.now, sleep=self.sleep
+        )
+
+    def report(self):
+        return json.loads((self.output / "result.json").read_bytes())
+
+    def test_actual_local_join_creates_once_proves_early_guard_then_existing_setup(self):
+        value = self.call()
+        self.assertTrue(value["report"]["setup_completed"])
+        self.assertFalse(value["report"]["host_admitted"] or value["report"]["real_4b_import"])
+        self.assertEqual(self.cloud.launch_count, 1)
+        self.assertEqual(self.cloud.stop_count, 0)
+        self.assertEqual(self.cloud.user_data, initial.user_data())
+        self.assertEqual(
+            self.operations, ["early_proof", "seed", "dispatch", "status", "status", "finish"]
+        )
+        self.keygen.assert_called_once()
+        self.upload.assert_called_once()
+        # Validate every request against the installed SDK's offline models.
+        import botocore.handlers
+        import botocore.session
+        import botocore.validate
+
+        session = botocore.session.get_session()
+        for service, operation, fields in self.cloud.calls:
+            fields = copy.deepcopy(fields)
+            if operation == "run-instances":
+                botocore.handlers.base64_encode_user_data(fields)
+            model = session.get_service_model(service).operation_model(
+                "".join(word.capitalize() for word in operation.split("-"))
+            )
+            botocore.validate.validate_parameters(fields, model.input_shape)
+        launch = next(fields for _, op, fields in self.cloud.calls if op == "run-instances")
+        self.assertEqual(launch["MinCount"], launch["MaxCount"])
+        self.assertFalse(launch["NetworkInterfaces"][0]["AssociatePublicIpAddress"])
+        self.assertTrue(
+            all(v["Ebs"]["DeleteOnTermination"] is False for v in launch["BlockDeviceMappings"])
+        )
+        count = len(self.cloud.calls)
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(len(self.cloud.calls), count)
+        for path in self.output.rglob("*.json"):
+            self.assertNotIn(b"PRIVATE", path.read_bytes())
+            self.assertNotIn(b"private-console-must-not-be-retained", path.read_bytes())
+
+    def test_route_failure_creates_nothing(self):
+        self.cloud.network["describe-route-tables"]["RouteTables"][0]["Routes"][0]["State"] = (
+            "blackhole"
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.create_count, 0)
+        self.assertEqual(self.cloud.launch_count, 0)
+        self.keygen.assert_not_called()
+        self.ssh.assert_not_called()
+
+    def test_unacknowledged_resource_creation_is_not_retried_or_followed_by_launch(self):
+        original = self.cloud.cli
+
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if operation == "create-security-group":
+                raise TimeoutError("PRIVATE resource ambiguity")
+            return value
+
+        self.cloud.cli = cli
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.create_count, 1)
+        self.assertEqual(self.cloud.launch_count, 0)
+        self.assertFalse(any("delete" in op for _, op, _ in self.cloud.calls))
+
+    def test_wrong_owned_group_is_not_mutated(self):
+        original = self.cloud.cli
+
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if operation == "describe-security-groups":
+                value["SecurityGroups"][0]["OwnerId"] = "000000000000"
+            return value
+
+        self.cloud.cli = cli
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(
+            any(op.startswith(("revoke-", "authorize-")) for _, op, _ in self.cloud.calls)
+        )
+        self.assertEqual(self.cloud.launch_count, 0)
+
+    def test_ineffective_firewall_mutation_blocks_launch_on_readback(self):
+        original = self.cloud.cli
+
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if operation == "authorize-security-group-ingress":
+                self.cloud.groups[fields["GroupId"]]["IpPermissions"] = []
+            return value
+
+        self.cloud.cli = cli
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.launch_count, 0)
+        self.keygen.assert_not_called()
+
+    def test_never_ready_endpoint_has_bounded_observations_and_no_launch_retry(self):
+        self.cloud.data["endpoint"]["InstanceConnectEndpoints"][0]["State"] = "create-in-progress"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(
+            sum(op == "describe-instance-connect-endpoints" for _, op, _ in self.cloud.calls), 40
+        )
+        self.assertEqual(self.cloud.launch_count, 0)
+
+    def test_consumed_original_deadline_stops_without_entering_ssh(self):
+        original = self.cloud.cli
+
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if self.cloud.started and operation != "run-instances":
+                self.now += 200
+            return value
+
+        self.cloud.cli = cli
+        with self.assertRaises(ValueError):
+            self.call()
+        self.ssh.assert_not_called()
+        self.assertEqual(self.cloud.launch_count, 1)
+
+    def test_setup_dispatch_failure_is_not_retried_and_outer_stop_runs(self):
+        self.responses = ["failed"]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.operations.count("dispatch"), 1)
+        self.assertTrue(self.report()["stopped_verified"])
+
+    def test_success_receipt_write_failure_still_stops_without_retry(self):
+        original = m.Transaction.save
+
+        def save(transaction, name, value):
+            if name == "result.json":
+                raise OSError("PRIVATE disk failure")
+            return original(transaction, name, value)
+
+        with (
+            patch.object(m.Transaction, "save", save),
+            self.assertRaisesRegex(ValueError, "^fresh_provisioning_failed$"),
+        ):
+            self.call()
+        self.assertEqual((self.cloud.launch_count, self.cloud.stop_count), (1, 1))
+        self.assertTrue(self.cloud.stopped)
+
+    def test_ambiguous_launch_is_reconciled_stopped_and_never_launched_twice(self):
+        self.cloud.fail_launch = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual((self.cloud.launch_count, self.cloud.stop_count), (1, 1))
+        self.assertTrue(self.report()["stopped_verified"])
+        self.assertFalse(self.report()["stop_verification_unresolved"])
+        self.ssh.assert_not_called()
+
+    def test_bad_initial_proof_prevents_seed_and_requests_stop(self):
+        self.proof_changes["early_timers_armed"] = False
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.operations, ["early_proof"])
+        self.upload.assert_not_called()
+        self.assertEqual((self.cloud.launch_count, self.cloud.stop_count), (1, 1))
+
+    def test_native_clock_cannot_precede_launch(self):
+        self.proof_changes["observed_boottime"] = 1000
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.operations, ["early_proof"])
+        self.assertTrue(self.report()["stopped_verified"])
+
+    def test_native_clock_cannot_move_backwards_at_seed(self):
+        self.seed_changes["observed_boottime"] = 40.0
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.operations, ["early_proof", "seed"])
+        self.assertTrue(self.report()["stopped_verified"])
+
+    def test_reboot_between_proof_and_seed_prevents_setup_dispatch(self):
+        self.seed_changes["boot_id"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.operations, ["early_proof", "seed"])
+        self.assertTrue(self.report()["stopped_verified"])
+
+    def test_ambiguous_stop_observed_without_retry(self):
+        self.cloud.fail_launch = self.cloud.fail_stop = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.stop_count, 1)
+        self.assertTrue(self.report()["stopped_verified"])
+
+    def test_unconfirmed_stop_is_not_success_and_no_delete_or_retry(self):
+        self.cloud.fail_launch = self.cloud.fail_stop = True
+        self.cloud.stop_effective = False
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertTrue(self.report()["stop_verification_unresolved"])
+        self.assertFalse(self.report()["stopped_verified"])
+        self.assertEqual((self.cloud.launch_count, self.cloud.stop_count), (1, 1))
+        self.assertFalse(any("delete" in op or "terminate" in op for _, op, _ in self.cloud.calls))
+
+    def test_mismatched_reconciliation_target_is_never_stopped(self):
+        self.cloud.fail_launch = True
+        self.cloud.data["instances"]["Reservations"][0]["Instances"][0]["ClientToken"] = "0" * 32
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.cloud.stop_count, 0)
+        self.assertTrue(self.report()["stop_verification_unresolved"])
+
+
+class WireTests(unittest.TestCase):
+    def test_sdk_adapter_rejects_retries_custom_endpoint_and_unrelated_mutation(self):
+        def clients():
+            return {
+                name: types.SimpleNamespace(
+                    meta=types.SimpleNamespace(
+                        region_name="us-east-1",
+                        endpoint_url=f"https://{name}.us-east-1.amazonaws.com",
+                        config=types.SimpleNamespace(
+                            retries={"total_max_attempts": 1},
+                            connect_timeout=3,
+                            read_timeout=5,
+                            proxies={},
+                        ),
+                    )
+                )
+                for name in ("ec2", "sts")
+            }
+
+        c = clients()
+        cloud = m.SDKCloud(c)
+        with self.assertRaises(ValueError):
+            cloud.cli("ec2", "terminate-instances", InstanceIds=[B["instance"]])
+        c["ec2"].meta.config.retries["total_max_attempts"] = 2
+        with self.assertRaises(ValueError):
+            m.SDKCloud(c)
+        c = clients()
+        c["ec2"].meta.endpoint_url = "https://example.com"
+        with self.assertRaises(ValueError):
+            m.SDKCloud(c)
+
+    def test_sdk_keeps_binary_userdata_not_double_base64(self):
+        # Offline botocore serializer only: no client, credentials or network.
+        import botocore.serialize
+        import botocore.session
+
+        model = botocore.session.get_session().get_service_model("ec2")
+        serializer = botocore.serialize.create_serializer(model.metadata["protocol"])
+        request = m.connection.launch_request(B)
+        raw = initial.user_data()
+        # Boto's RunInstances event handler performs base64 before serialization.
+        import botocore.handlers
+
+        fields = dict(request, UserData=raw)
+        botocore.handlers.base64_encode_user_data(fields)
+        wire = serializer.serialize_to_request(fields, model.operation_model("RunInstances"))
+        self.assertEqual(base64.b64decode(wire["body"]["UserData"]), raw)
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(), hashlib.sha256(initial.user_data()).hexdigest()
+        )

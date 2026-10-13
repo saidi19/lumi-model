@@ -1,0 +1,370 @@
+"""Private post-admission join of the existing issuers, deliveries and STOP.
+
+No bootstrap, admission creation, SDK creation or public executable path.
+The private joined entry uses the frozen guarded provisioner, then requires
+actual native admission BEFORE credentials. Channels/callbacks are trusted
+controller dependencies, not proof that
+admission occurred. The retention callback must perform separate authenticated
+completion, writer-exclusion, bucket and retention admission after import.
+"""
+
+import copy
+import datetime as dt
+import hashlib
+import math
+import time
+from pathlib import Path
+
+import arm_sft_vm_external_watchdog_v1 as guard
+import issue_sft_vm_acquisition_credentials_v1 as acquisition
+import issue_sft_vm_retention_credentials_v1 as retention
+import run_sft_vm_detached_delivery_v1 as workflow
+import run_sft_vm_retention_delivery_v1 as backup
+
+ATTEMPT = retention.ATTEMPT
+PINS = {
+    "arm_sft_vm_external_watchdog_v1.py": (
+        "d3adcd98472eb937d6f10d426f268d94ebf9668f29d3ea463be79b1f8d99f9ea"
+    ),
+    "issue_sft_vm_acquisition_credentials_v1.py": (
+        "6ce2065b97564637fe85b0c827c9584c50774c0f7e5ffb5bae943d3a85c92e5a"
+    ),
+    "issue_sft_vm_retention_credentials_v1.py": (
+        "0643bcb42ec5d2aeefff56b7a6ee7bccf8c65f9c884aa7a5f7a0da9ec5113440"
+    ),
+    "run_sft_vm_detached_delivery_v1.py": (
+        "e9dff26db2a86bfca4c75e5ddfcf74a3a696f7c709a143d253ab39c472be2a99"
+    ),
+    "run_sft_vm_retention_delivery_v1.py": (
+        "7a77addc180683fccf990c0b00f9048d1415d0d964b2610613432567f8a91237"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("admitted_lifecycle_rejected") from None
+
+
+def number(value):
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def inputs(selection_raw, proposal_raw):
+    for name, pin in PINS.items():
+        need(hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() == pin)
+    need(type(selection_raw) is bytes and len(selection_raw) <= 131072)
+    need(hashlib.sha256(selection_raw).hexdigest() == acquisition.permissions.SELECTION_SHA)
+    need(type(proposal_raw) is bytes and len(proposal_raw) <= 32768)
+    need(hashlib.sha256(proposal_raw).hexdigest() == retention.PROPOSAL_SHA)
+
+
+class StopLedger:
+    """One STOP across inner retention cleanup and outer failure cleanup.
+
+    Ambiguous acknowledgement consumes the write; later calls may observe the
+    exact instance but cannot repeat STOP. IAM/session cleanup remains separate.
+    The supplied cloud transport must have its existing <=20-second timeout.
+    """
+
+    def __init__(self, cloud, binding, deadline, clock):
+        self.cloud, self.instance = cloud, binding["instance"]
+        self.deadline, self.clock = deadline, clock
+        self.stop_attempted, self.reads = False, 0
+
+    def cli(self, service, operation, **fields):
+        need(service == "ec2" and self.deadline - self.clock() > 20)
+        if operation == "describe-instances":
+            need(fields == {"InstanceIds": [self.instance]} and self.reads < 64)
+            self.reads += 1
+        else:
+            need(operation == "stop-instances" and not self.stop_attempted)
+            need(fields == dict(InstanceIds=[self.instance], Force=False, Hibernate=False))
+            self.stop_attempted = True
+        return self.cloud.cli(service, operation, **fields)
+
+
+def issuer_succeeded(value, *, retained=False):
+    need(type(value) is dict)
+    for name in (
+        "session_issued",
+        "delivery_returned",
+        "long_term_key_removed_before_delivery",
+        "cleanup_verified",
+    ):
+        need(value.get(name) is True)
+    need(value.get("cleanup_errors") == [])
+    for name in ("gate_5_complete", "production_eligible", "credential_contents_retained"):
+        need(value.get(name) is False)
+    if retained:
+        need(value.get("retention_completion_reported") is True)
+
+
+def _run_after_native_admission(
+    output,
+    binding,
+    *,
+    selection_raw,
+    proposal_raw,
+    prior_binding_sha,
+    workflow_exchange,
+    admit_retention,
+    acquisition_cloud,
+    retention_cloud,
+    host_cloud,
+    launch_monotonic,
+    host_deadline,
+    workflow_deadline,
+    clock=time.monotonic,
+    wait=time.sleep,
+    now=lambda: dt.datetime.now(dt.UTC),
+    _stop_ledger=None,
+):
+    """Caller retains host supervision until the exclusive started marker exists.
+
+    Exact original host deadline is passed through, never renewed. No issuer
+    ambient-cloud default is used. A returned report is not Gate 5 approval.
+    The callback takes binding, prior binding pin and the original host deadline;
+    it returns an authenticated retention exchange and its already bound deadline.
+    This hook deliberately does NOT implement native admission with a boolean.
+    """
+    inputs(selection_raw, proposal_raw)
+    binding = dict(binding)
+    workflow.connection.targets(binding, {"prepared_attempt": ATTEMPT})
+    need(binding["attempt"] == ATTEMPT)
+    need(
+        type(prior_binding_sha) is str and workflow.re.fullmatch(r"[0-9a-f]{64}", prior_binding_sha)
+    )
+    need(callable(workflow_exchange) and callable(admit_retention))
+    need(all(c is not None for c in (acquisition_cloud, retention_cloud, host_cloud)))
+    need(all(number(t) for t in (launch_monotonic, host_deadline, workflow_deadline, clock())))
+    need(0 <= clock() - launch_monotonic and host_deadline == launch_monotonic + 14400)
+    need(8615 < workflow_deadline - clock() <= 9000)
+    # Finish backup by launch+13700, before the external timer's earliest
+    # launch-relative 13940. Do not spend its safety reserve on useful work.
+    need(workflow_deadline <= host_deadline - 2700)
+    ledger = _stop_ledger or StopLedger(host_cloud, binding, host_deadline, clock)
+    need(type(ledger) is StopLedger and ledger.cloud is host_cloud)
+    need(ledger.instance == binding["instance"] and ledger.deadline == host_deadline)
+    need(ledger.clock is clock)
+    workflow.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = acquisition.base.save
+    save(output / "started.json", dict(attempt=ATTEMPT, retry_allowed=False))
+    report = dict(
+        workflow_completed_and_reaped=False,
+        acquisition_iam_cleanup_verified=False,
+        retention_admission_returned=False,
+        offhost_retention_verified=False,
+        retention_iam_cleanup_verified=False,
+        stopped_verified=False,
+        lifecycle_completed=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        training_authorized=False,
+        production_eligible=False,
+        retry_allowed=False,
+    )
+    phase = "acquisition_and_import"
+    submitted = False
+    try:
+
+        def deliver_source(raw):
+            nonlocal submitted
+            need(not submitted and workflow_deadline - clock() >= 8615)
+            submitted = True
+            value = workflow._deliver_admitted_once(
+                raw,
+                ATTEMPT,
+                output / "workflow-delivery",
+                workflow_exchange,
+                deadline=workflow_deadline,
+                clock=clock,
+                wait=wait,
+            )
+            need(value["workflow_returned"] is True and value["stop_verified"] is True)
+            report["workflow_completed_and_reaped"] = True
+            return value
+
+        issued = acquisition._run_for_admitted_delivery(
+            selection_raw,
+            ATTEMPT,
+            output / "acquisition-issuer",
+            deliver_source,
+            cloud=acquisition_cloud,
+            now=now,
+            wait=wait,
+        )
+        issuer_succeeded(issued)
+        need(submitted and report["workflow_completed_and_reaped"])
+        report["acquisition_iam_cleanup_verified"] = True
+        phase = "retention_admission"
+        need(host_deadline - clock() >= 2560)
+        # Trusted native adapter owns completion.json, current writer exclusion,
+        # same-boot identity, bucket/release checks and new scoped binding.
+        channel, end = admit_retention(dict(binding), prior_binding_sha, host_deadline)
+        need(callable(channel) and number(end))
+        need(180 < end - clock() <= 1800 and end <= host_deadline - 700)
+        report["retention_admission_returned"] = True
+        phase = "retention"
+        retained = False
+
+        def deliver_retention(raw):
+            nonlocal retained
+            need(not retained and end - clock() > 120)
+            retained = True
+            value = backup._deliver_admitted_once(
+                raw,
+                binding,
+                output / "retention-delivery",
+                channel,
+                prior_binding_sha=prior_binding_sha,
+                cloud=ledger,
+                deadline=end,
+                host_deadline=host_deadline,
+                clock=clock,
+                wait=wait,
+            )
+            # Existing delivery validates receipt, guest reaping and EC2 STOP.
+            report["offhost_retention_verified"] = True
+            report["commit_sha256"] = value["commit_sha256"]
+            return value
+
+        issued = retention._run_for_admitted_delivery(
+            proposal_raw,
+            ATTEMPT,
+            output / "retention-issuer",
+            deliver_retention,
+            cloud=retention_cloud,
+            now=now,
+            wait=wait,
+        )
+        issuer_succeeded(issued, retained=True)
+        need(retained and report["offhost_retention_verified"])
+        report["retention_iam_cleanup_verified"] = True
+    except BaseException:
+        report["failed_phase"] = phase
+    finally:
+        # Also covers issuer failures before delivery, admission rejection and
+        # failed IAM cleanup AFTER a successful delivery. Never repeat STOP.
+        try:
+            stopped = backup._stop_exact_host(
+                binding, ledger, host_deadline, clock=clock, wait=wait
+            )
+            report["stopped_verified"] = stopped["stopped_verified"]
+        except BaseException:
+            report["stopped_verified"] = False
+        report["stop_attempted"] = ledger.stop_attempted
+        report["stop_observation_reads"] = ledger.reads
+        report["lifecycle_completed"] = "failed_phase" not in report and report["stopped_verified"]
+        report["status"] = (
+            "completed_private_lifecycle"
+            if report["lifecycle_completed"]
+            else "failed_preserve_evidence_no_retry"
+        )
+        save(output / "result.json", report)
+    return report
+
+
+def _provision_then_run_once(
+    output,
+    *,
+    admit_native,
+    selection_raw,
+    proposal_raw,
+    host_cloud,
+    watchdog_cloud,
+    acquisition_cloud,
+    retention_cloud,
+    wall=time.time,
+    clock=time.monotonic,
+    wait=time.sleep,
+    now=lambda: dt.datetime.now(dt.UTC),
+):
+    """Trusted future controller only; not authority to launch via callback flags.
+
+    admit_native must authenticate/install the existing source/runtime/disk,
+    network and parent closure on this exact same host/boot, then return the
+    pinned channel and ORIGINAL deadlines. A concrete native adapter is still
+    required; this module intentionally cannot synthesize that admission.
+    """
+    inputs(selection_raw, proposal_raw)
+    need(callable(admit_native))
+    need(
+        all(c is not None for c in (host_cloud, watchdog_cloud, acquisition_cloud, retention_cloud))
+    )
+    workflow.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = acquisition.base.save
+    save(output / "started.json", dict(attempt=ATTEMPT, retry_allowed=False))
+    phase, provisioned, ledger = "guarded_provision", None, None
+    report = dict(
+        lifecycle_completed=False,
+        gate_5_complete=False,
+        real_4b_import=False,
+        training_authorized=False,
+        production_eligible=False,
+        retry_allowed=False,
+    )
+    try:
+        provisioned = guard._provision_guarded_once(
+            output / "host",
+            host_cloud=host_cloud,
+            watchdog_cloud=watchdog_cloud,
+            wall=wall,
+            clock=clock,
+            wait=wait,
+        )
+        binding = dict(provisioned["binding"])
+        deadline = provisioned["host_deadline_monotonic"]
+        launch = provisioned["launch_monotonic"]
+        ledger = StopLedger(host_cloud, binding, deadline, clock)
+        need(provisioned["report"]["setup_completed"] is True)
+        phase = "native_admission"
+        admitted = admit_native(copy.deepcopy(provisioned), output / "host")
+        need(
+            type(admitted) is dict
+            and set(admitted)
+            == {"workflow_exchange", "workflow_deadline", "prior_binding_sha", "admit_retention"}
+        )
+        phase = "admitted_lifecycle"
+        report["lifecycle"] = _run_after_native_admission(
+            output / "lifecycle",
+            dict(binding),
+            selection_raw=selection_raw,
+            proposal_raw=proposal_raw,
+            host_cloud=host_cloud,
+            acquisition_cloud=acquisition_cloud,
+            retention_cloud=retention_cloud,
+            launch_monotonic=launch,
+            host_deadline=deadline,
+            clock=clock,
+            wait=wait,
+            now=now,
+            _stop_ledger=ledger,
+            **admitted,
+        )
+        report["lifecycle_completed"] = report["lifecycle"]["lifecycle_completed"]
+    except BaseException:
+        report["failed_phase"] = phase
+    finally:
+        if ledger is not None:
+            try:
+                observed = backup._stop_exact_host(
+                    binding, ledger, deadline, clock=clock, wait=wait
+                )
+                report["stopped_verified"] = observed["stopped_verified"]
+            except BaseException:
+                report["stopped_verified"] = False
+            report["stop_attempted"] = ledger.stop_attempted
+            report["lifecycle_completed"] &= report["stopped_verified"]
+        else:
+            # Frozen provisioner owns launch ambiguity and partial-resource
+            # cleanup; never guess an instance identity from incomplete return.
+            report["provisioner_failure_evidence_authoritative"] = True
+        save(output / "result.json", report)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("native_admission_and_execution_authority_not_bound") from None

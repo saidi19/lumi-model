@@ -1,0 +1,258 @@
+"""Local production-bootstrap/SSH parity probe preparation; no cloud authority."""
+
+import ast
+import hashlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "scripts/qualify_sft_vm_setup_transfer_v1.py"
+BASE_SHA = "defcf6d6ca9e1c3aa6f503d4c8a3e05d7f07422b81bb05caa1d8194f47cbb77a"
+ENTRY = ROOT / "scripts/qualify_sft_vm_setup_production_v1.py"
+BOOT = ROOT / "artifacts/lumi-setup-production-probe-v0.1/user-data.gz"
+BOOT_SHA = "83b20d4bd5f1a7b1bfdc28c7407e3377dd7f56efcf1f8c8be7806674d6bda363"
+TOKEN = "lumi-setup-production-20261013-6c81e926"
+
+AUTHENTICATE = """def authenticate():
+    from importlib import util
+
+    from scripts import preflight_sft_vm_attempt022_v2 as preflight
+    from scripts import prepare_sft_vm_setup_exchange_diagnostic_v1 as diagnostic
+    need(sha(read(ROOT / PROOF)) == PROOF_SHA)
+    need(sha(read(RELEASE / "release.json")) == RELEASE_SHA)
+    need(sha(read(Path(preflight.__file__))) ==
+         "659f4ab23e021206ac4ff1232c2c8ce66d37a759410c45aa05671f65c00f0f00")
+    need(sha(read(diagnostic.OUTPUT)) ==
+         "877ed7f14d1b9e1fa888f7da96230e4225b79861dafb4ed81e5af11227c33569")
+    need(read(diagnostic.OUTPUT) == diagnostic.build())
+    preflight.local()
+    seed = importlib.import_module("start_sft_vm_setup_bootstrap_v5")
+    initial = importlib.import_module("build_sft_vm_initial_boot_v1")
+    connection = importlib.import_module("prepare_sft_vm_host_connection_v3")
+    spec = util.spec_from_file_location("_production_sender_v6", diagnostic.OUTPUT)
+    sender = util.module_from_spec(spec)
+    spec.loader.exec_module(sender)
+    seed.sender = sender
+    seed.initial, seed.production_connection = initial, connection
+    receiver = read(RELEASE / "scripts/stage_sft_vm_setup_inputs_v5.py")
+    archive = read(RELEASE / "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar")
+    need(sha(receiver) == sender.RECEIVER_SHA and len(receiver) == sender.RECEIVER_BYTES)
+    need(sha(archive) == sender.ARCHIVE_SHA and len(archive) == sender.ARCHIVE_BYTES)
+    sender.validate_receipt_contract(archive)
+    need(initial.user_data() == read(BOOT))
+    need(sha(read(BOOT)) == BOOT_SHA)
+    return seed, receiver, archive
+"""
+
+USER_DATA = """def user_data():
+    raw = read(BOOT, 16384)
+    need(sha(raw) == BOOT_SHA)
+    return raw
+"""
+
+SSH_ARGV = """def ssh_argv(instance, private_ip, hosts, vm, seed):
+    import ipaddress
+    need(re.fullmatch(r"i-[0-9a-f]{17}", instance))
+    need(ipaddress.ip_address(private_ip) in ipaddress.ip_network("172.31.97.64/27"))
+    devices = {d["DeviceName"]: d["Ebs"]["VolumeId"] for d in vm["BlockDeviceMappings"]}
+    need(set(devices) == {"/dev/sda1", "/dev/sdf"})
+    binding = dict(attempt=OWNER_ATTEMPT, instance=instance, endpoint=ENDPOINT,
+                   root_volume=devices["/dev/sda1"], work_volume=devices["/dev/sdf"],
+                   vm_group=GROUP, endpoint_group=ENDPOINT_GROUP, key_name=KEY_NAME)
+    config = hosts.parent / "ssh_config"
+    text = seed.production_connection.ssh_config(binding, KEY, hosts)
+    fd = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(text)
+    return ["/usr/bin/ssh", "-F", str(config), "-T", "-o", "LogLevel=QUIET",
+            "lumi-fullsize-" + OWNER_ATTEMPT]
+"""
+
+TRANSFER = """def transfer(seed, receiver, archive, argv, report):
+    sender = seed.sender
+    report["failure_stage"] = "production_early_proof"
+    report["production_proof_dispatch_attempted"] = True
+    raw = sender.delivery.pipe_exchange(
+        argv + ["sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(seed.initial.proof_launcher())],
+        b"", 25,
+    )
+    proof = seed.initial.validate_proof(raw)
+    report["production_early_timers_verified"] = True
+    report["failure_stage"] = "seed"
+    report["seed_dispatch_attempted"] = True
+    reply = sender.delivery.pipe_exchange(
+        argv + ["sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(seed.SEED)], b"", 25
+    )
+    identity = seed.validate_seed(reply)
+    need(identity["machine_id"] == proof["machine_id"] and identity["boot_id"] == proof["boot_id"])
+    need(identity["observed_boottime"] < 440)
+    report["seed_confirmed"] = True
+    launcher = sender.native_launcher(identity["machine_id"], identity["boot_id"], 1800)
+    report["failure_stage"] = "exchange"
+    report["transfer_dispatch_attempted"] = True
+    report["attempted_payload_bytes"] = len(receiver) + len(archive)
+    reply = sender.pipe_exchange(
+        argv + ["sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(launcher)],
+        receiver + archive, sender.LOCAL_SECONDS,
+    )
+    report["failure_stage"] = "receipt_decode"
+    observed = sender.delivery.decode(reply)
+    report["failure_stage"] = "receipt_contract"
+    need(sender.inputs.canonical(observed) == sender.inputs.canonical(sender.expected_receipt()))
+    report.update(full_receipt_matches=True, native_19_files_readback_verified=True)
+    report.pop("failure_stage", None)
+"""
+
+
+def source():
+    raw = BASE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("production_probe_base_rejected") from None
+    text = raw.decode()
+    replacements = {
+        "authenticate": AUTHENTICATE,
+        "user_data": USER_DATA,
+        "ssh_argv": SSH_ARGV,
+        "transfer": TRANSFER,
+    }
+    for name, body in replacements.items():
+        node = next(n for n in ast.parse(text).body if getattr(n, "name", None) == name)
+        lines = text.splitlines(keepends=True)
+        lines[node.lineno - 1 : node.end_lineno] = [body]
+        text = "".join(lines)
+    text = text.replace(
+        "from scripts.diagnose_sft_vm_transport_live_v1 import console_key",
+        "connection = seed.production_connection",
+    )
+    text = text.replace("key = console_key(raw)", "key, _ = connection.host_key(console, instance)")
+    text = text.replace(
+        'stream.write(f"{instance} ssh-ed25519 {key}\\n")',
+        'stream.write(f"lumi-fullsize-{OWNER_ATTEMPT} ssh-ed25519 {key}\\n")',
+    )
+    text = text.replace(
+        'ssh_argv(instance, vm["PrivateIpAddress"], hosts)',
+        'ssh_argv(instance, vm["PrivateIpAddress"], hosts, vm, seed)',
+    )
+    text = text.replace(
+        '                report["instance"] = instance',
+        '                report["instance"] = instance\n'
+        "                if terminal:\n"
+        "                    for _ in range(6):\n"
+        '                        volumes = cloud.call("describe_volumes", cleanup=True,\n'
+        '                            Filters=[dict(Name="tag:LumiDiagnostic", '
+        'Values=[TOKEN])])["Volumes"]\n'
+        "                        need(type(volumes) is list)\n"
+        "                        if not volumes:\n"
+        '                            report["disposable_volumes_absent_verified"] = True\n'
+        "                            break\n"
+        "                        sleep(3)\n"
+        '                    if not report.get("disposable_volumes_absent_verified"):\n'
+        '                        report["cleanup_unresolved"] = True',
+    )
+    text = text.replace(
+        '    except BaseException:\n        report["status"] = "failed_no_retry"',
+        "    except BaseException as error:\n"
+        "        if type(error) is seed.sender.SetupExchangeFailure:\n"
+        '            report["exchange_diagnostic"] = error.diagnostic\n'
+        '        report["status"] = "failed_no_retry"',
+    )
+    text = text.replace(
+        "read(KEY, 16384)  # Stable root-private key read; never retain or print its contents.",
+        "# Key material is never read by preflight; SSH opens the existing key.",
+    )
+    text = text.replace(
+        'len(approval["human_authorization"]) > 100',
+        '0 < len(approval["human_authorization"].strip()) <= 4096',
+    )
+    text = text.replace(
+        'for device, size in (("/dev/sda1", 8),)',
+        'for device, size in (("/dev/sda1", 8), ("/dev/sdf", 1))',
+    )
+    old = """        BlockDeviceMappings=[
+            dict(
+                DeviceName="/dev/sda1",
+                Ebs=dict(VolumeSize=8, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True),
+            ),
+        ],"""
+    new = """        BlockDeviceMappings=[
+            dict(DeviceName=device, Ebs=dict(VolumeSize=size, VolumeType="gp3", Encrypted=True,
+                                            DeleteOnTermination=True))
+            for device, size in (("/dev/sda1", 8), ("/dev/sdf", 1))
+        ],"""
+    launch_node = next(
+        n for n in ast.parse(text).body if getattr(n, "name", None) == "launch_fields"
+    )
+    request = next(n.value for n in launch_node.body if isinstance(n, ast.Return))
+    disk_node = next(k.value for k in request.keywords if k.arg == "BlockDeviceMappings")
+    old = ast.get_source_segment(text, disk_node)
+    new = (
+        "[dict(DeviceName=device, Ebs=dict(VolumeSize=size, VolumeType='gp3',\n"
+        "                Encrypted=True, DeleteOnTermination=True))\n"
+        "         for device, size in (('/dev/sda1', 8), ('/dev/sdf', 1))]"
+    )
+    text = text.replace(old, new, 1)
+    values = dict(
+        RELEASE="artifacts/lumi-vm-attempt-022-source-v0.2",
+        RELEASE_SHA="90596ec5852b0853b0240b0e2fa3fae8a779cb31ad0b5b8fb40612631cbaa2d9",
+        PROOF="evidence/lumi-vm-attempt-022-v027-execution-verification-v0.1.json",
+        PROOF_SHA="4487cd77edc0dfa69d0b2a3b9f355183a6414ba3e880af1b0e6b9ddd7423b4b0",
+        PLAN="configs/lumi-setup-production-qualification-v0.1.json",
+        APPROVAL="configs/lumi-setup-production-qualification-approval-v0.1.json",
+        OUT="artifacts/lumi-setup-production-qualification-v0.1",
+        READ_OUT="evidence/lumi-setup-production-readiness-v0.1.json",
+        KEY="artifacts/lumi-vm-private-outer-execution-v0.27/attempt-022/host/execution/host/connection-key",
+        TOKEN=TOKEN,
+        SUBNET="subnet-01a8d7450c55dd887",
+        TABLE="rtb-0bacc7e6aeca79611",
+        ENDPOINT="eice-071066d816f667350",
+        GROUP="sg-0dbc0abf7c47f4a96",
+        ENDPOINT_GROUP="sg-08b21c77567d56625",
+        KEY_NAME="lumi-fullsize-afae7b4618174ce084fd3b6a902d74e1",
+        RETAINED="i-015ad6b19c5af228d",
+        OWNER_ATTEMPT="afae7b4618174ce084fd3b6a902d74e1",
+        VOLUMES={"vol-09cbed02ec986965f", "vol-0cfb6cfadd0cda34a"},
+    )
+    paths = {"RELEASE", "PROOF", "PLAN", "APPROVAL", "OUT", "READ_OUT", "KEY"}
+    for name, value in values.items():
+        node = next(
+            n
+            for n in ast.parse(text).body
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == name
+        )
+        if name in paths - {"PROOF"}:
+            body = (
+                f"{name} = (ROOT\n"
+                + "".join(f"    / {part!r}\n" for part in Path(value).parts)
+                + ")\n"
+            )
+        elif type(value) is set:
+            body = name + " = {" + ", ".join(repr(v) for v in sorted(value)) + "}\n"
+        else:
+            body = f"{name} = {value!r}\n"
+        lines = text.splitlines(keepends=True)
+        lines[node.lineno - 1 : node.end_lineno] = [body]
+        text = "".join(lines)
+    text += f"\nBOOT = ROOT / {str(BOOT.relative_to(ROOT))!r}\nBOOT_SHA = {BOOT_SHA!r}\n"
+    # Constants must exist before main is dispatched.
+    text = text.replace('if __name__ == "__main__":\n    main()', "")
+    text += '\nif __name__ == "__main__":\n    main()\n'
+    compile(text, str(ENTRY), "exec")
+    return text.encode()
+
+
+def prepare_boot():
+    import importlib
+    import os
+
+    from scripts import preflight_sft_vm_attempt022_v2 as preflight
+
+    preflight.local()
+    raw = importlib.import_module("build_sft_vm_initial_boot_v1").user_data()
+    if hashlib.sha256(raw).hexdigest() != BOOT_SHA or BOOT.exists():
+        raise ValueError("production_boot_preparation_rejected") from None
+    BOOT.parent.mkdir(mode=0o700, exist_ok=False)
+    fd = os.open(BOOT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        if stream.write(raw) != len(raw):
+            raise ValueError("production_boot_short_write") from None

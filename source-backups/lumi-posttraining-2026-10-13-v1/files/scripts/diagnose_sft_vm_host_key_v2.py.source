@@ -1,0 +1,225 @@
+"""One corrected-parser stopped-host verification; no restart, keys or raw text."""
+
+import ast
+import base64
+import binascii
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROOF = ROOT / "evidence/lumi-vm-attempt-012-cpu-execution-verification-v0.1.json"
+PROOF_SHA = "5a15231b36d022c2f47a9c8fdbd7f296ddb5650da16c6de5861dba651db3aaf8"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-012-host-key-diagnostic-v0.2"
+SOURCE = "artifacts/lumi-vm-attempt-012-source-v0.1/scripts/prepare_sft_vm_host_connection_v3.py"
+MAX_CONSOLE = 262144
+START = b"-----BEGIN SSH HOST KEY KEYS-----"
+END = b"-----END SSH HOST KEY KEYS-----"
+
+
+def need(value):
+    if not value:
+        raise ValueError("host_key_diagnostic_rejected") from None
+
+
+def one(values):
+    need(len(values) == 1)
+    return values[0]
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+
+
+def frozen_parser(source):
+    nodes = [
+        n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef) and n.name == "host_key"
+    ]
+    need(len(nodes) == 1)
+    namespace = dict(base64=base64, hashlib=hashlib, need=need, one=one, MAX_CONSOLE=MAX_CONSOLE)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-host-key>", "exec"), namespace)
+    return namespace["host_key"]
+
+
+def analyze(reply, instance, parser):
+    result = dict(repaired_parser_passes=False, rejection="not_checked")
+    if reply.get("InstanceId") != instance:
+        return dict(result, rejection="instance_mismatch")
+    value = reply.get("Output")
+    result["output_is_string"] = type(value) is str
+    if type(value) is not str:
+        return dict(result, rejection="output_type")
+    result["output_characters"] = len(value)
+    if len(value) > MAX_CONSOLE:
+        return dict(result, rejection="encoded_size")
+    try:
+        raw = value.encode("utf-8")
+    except UnicodeEncodeError:
+        return dict(result, rejection="invalid_unicode")
+    if len(raw) > MAX_CONSOLE:
+        return dict(result, rejection="encoded_size")
+    result["transport_is_base64"] = START not in raw
+    if START not in raw:
+        try:
+            raw = base64.b64decode(raw, validate=True)
+        except binascii.Error:
+            return dict(result, rejection="outer_base64")
+    result["decoded_bytes"] = len(raw)
+    if len(raw) > MAX_CONSOLE:
+        return dict(result, rejection="decoded_size")
+    result.update(begin_markers=raw.count(START), end_markers=raw.count(END))
+    result["markers_in_order"] = raw.count(START) == raw.count(END) == 1 and raw.index(
+        START
+    ) < raw.index(END)
+    result["fixed_boot_marker_counts"] = {
+        "wrapper_entry": raw.count(b"LUMI_BOOT_V2:wrapper_entry"),
+        "wrapper_rejected": raw.count(b"LUMI_BOOT_V2:wrapper_rejected"),
+    }
+    result["ed25519_lines"] = sum(
+        line.strip().startswith(b"ssh-ed25519 ") for line in raw.splitlines()
+    )
+    result["ed25519_valid_blobs"] = 0
+    for line in raw.splitlines():
+        fields = line.strip().split()
+        if fields and fields[0] == b"ssh-ed25519" and len(fields) in {2, 3}:
+            try:
+                blob = base64.b64decode(fields[1], validate=True)
+                result["ed25519_valid_blobs"] += int(
+                    len(blob) == 51 and blob[:19] == b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20"
+                )
+            except binascii.Error:
+                pass
+    try:
+        parser(reply, instance)  # Returned public key and fingerprint are discarded.
+        result.update(repaired_parser_passes=True, rejection="none")
+    except (ValueError, KeyError, UnicodeError, binascii.Error):
+        result["rejection"] = (
+            "marker_cardinality" if raw.count(START) != 1 or raw.count(END) != 1 else "key_contract"
+        )
+    return result
+
+
+def run():
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    raw = PROOF.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == PROOF_SHA)
+    proof = json.loads(raw)
+    need(proof["failure"]["deepest_saved_stage"] == "host_key")
+    for name, pin in proof["source_bindings"].items():
+        relative = Path(name)
+        need(not relative.is_absolute() and ".." not in relative.parts)
+        path = ROOT / relative
+        need(not any(p.is_symlink() for p in (path, *path.parents)))
+        body = path.read_bytes()
+        need(len(body) == pin["bytes"] and hashlib.sha256(body).hexdigest() == pin["sha256"])
+    builder_path = ROOT / "scripts/prepare_sft_vm_host_key_unicode_v2.py"
+    need(not any(p.is_symlink() for p in (builder_path, *builder_path.parents)))
+    need(
+        hashlib.sha256(builder_path.read_bytes()).hexdigest()
+        == "4697665f078a8de3828d6ea5d6ac13b5ba62a5062add05c64057c9a53feb6b91"
+    )
+    from scripts import prepare_sft_vm_host_key_unicode_v2 as repair
+
+    repaired_source = repair.build()
+    parser = frozen_parser(repaired_source)
+    from scripts import execute_sft_vm_private_outer_v13 as entry
+
+    entry.local_preconditions()
+    credentials = entry.outer.credentials
+    instance, attempt = proof["outcome"]["instance"], proof["attempt"]
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+
+    def save(name, value):
+        body = encode(value)
+        need(len(body) <= 8192)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    save(
+        "started.json",
+        dict(
+            human_authorization="tahole ekhon ki korbi. jeda dorkar kor tui permisssion dichi",
+            repaired_source_sha256=hashlib.sha256(repaired_source).hexdigest(),
+            repair_builder_sha256=hashlib.sha256(builder_path.read_bytes()).hexdigest(),
+            proof_sha256=PROOF_SHA,
+            script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            maximum_seconds=180,
+            maximum_service_calls=3,
+            maximum_console_reads=1,
+            retry=False,
+            mutations=0,
+        ),
+    )
+    start = time.monotonic()
+    reader = credentials.Reader(start + 180)
+    client = None
+    report = dict(
+        status="stopped_no_retry",
+        stage="credentials_identity",
+        console_reads=0,
+        ec2_calls=0,
+        mutations=0,
+        raw_console_retained=False,
+        key_values_retained=False,
+        instance_restarted=False,
+        gpu=False,
+        training=False,
+        retry=False,
+    )
+    try:
+        metadata = reader()  # One credential generation and one STS identity call.
+        client = credentials.session().create_client(
+            "ec2",
+            region_name="us-east-1",
+            endpoint_url=credentials.endpoint("ec2"),
+            config=credentials.legacy.config("ec2"),
+            verify=credentials.ca_path(),
+            aws_access_key_id=metadata["access_key"],
+            aws_secret_access_key=metadata["secret_key"],
+            aws_session_token=metadata["token"],
+        )
+        report["stage"] = "stopped_host_ownership"
+        reader.active()
+        report["ec2_calls"] += 1
+        with entry.outer.network.host.timeout(20):
+            response = client.describe_instances(InstanceIds=[instance])
+        need(not response.get("NextToken"))
+        row = one(one(response["Reservations"])["Instances"])
+        need(row["InstanceId"] == instance and row["State"]["Name"] == "stopped")
+        need(row["InstanceType"] == "r6i.4xlarge")
+        need({t["Key"]: t["Value"] for t in row["Tags"]}.get("LumiAttempt") == attempt)
+        need(
+            {v["Ebs"]["VolumeId"] for v in row["BlockDeviceMappings"]}
+            == set(proof["outcome"]["two_retained_ebs_ids"])
+        )
+        report["stopped_host_ownership_verified"] = True
+        report["stage"] = "one_console_read"
+        reader.active()
+        report["ec2_calls"] += 1
+        report["console_reads"] += 1
+        with entry.outer.network.host.timeout(20):
+            reply = client.get_console_output(InstanceId=instance, Latest=True)
+        report["stage"] = "aggregate_analysis"
+        report["aggregate"] = analyze(reply, instance, parser)
+        reader.active()
+        report["status"] = "completed_current_console_aggregate_only"
+    except Exception:
+        report["failure_code"] = "bounded_stage_failed"
+    finally:
+        if client is not None:
+            client.close()
+        reader.closed = True
+        report["credential_generations"] = reader.calls
+        report["elapsed_seconds"] = round(time.monotonic() - start, 3)
+        report["historical_console_reconstructed"] = False
+        save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    print(encode(run()).decode(), end="")

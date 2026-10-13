@@ -1,0 +1,67 @@
+# SFT execution status v0.128: native failure localized to coordinator call
+
+2026-09-28 Asia/Dhaka (2026-09-27 UTC). The approved v2 diagnostic successor
+ran exactly once. It failed with **stage_coordinate_import**, child/worker
+exit status **47**. This is useful localization, not a successful import or
+an established internal root cause. Gate 5 remains incomplete. No real S3
+model/checkpoint/dataset, GPU, inference, training or production approval.
+
+## Execution and observed boundaries
+
+The same fresh t3.large created before the user interruption was resumed;
+no replacement instance or repeated native attempt was launched. The VM was
+created at 18:28:42 UTC and confirmed terminated before 18:47:14 UTC, within
+the 60-minute lifetime. An initial local CLI count-option rejection occurred
+before the launch API request; correcting it did not start a second instance.
+
+All ten prepared artifact bindings matched. Boot health, pinned SSH host key,
+expiry timer, cgroup controllers, worker identity, no IAM profile, mandatory
+IMDS token and encrypted 20-GiB delete-on-termination storage were verified.
+Staging installed the 34 hash-pinned CPU wheels (248,715,637 bytes) under the
+non-resetting HTTPS quota. Quota accounting ended at 290,518,141 bytes, below
+1 GiB, with no quota drops. Actual billed cost was not queried or asserted.
+
+Preparation completed: the supervisor advanced to import, and the independent
+bounded system journal showed successful deactivation. The independent polling
+observer missed its transient terminal snapshot; its terminal field is null,
+not fabricated as an observed exit zero. It sampled 255 preparation cgroup
+observations with a maximum of 284,475,392 bytes. These are sampled values,
+not exhaustive memory peaks.
+
+For import, the independent observer captured status 47 / exit-code / failed
+and six cgroup observations, sampled maximum 21,176,320 bytes. The root
+failure record retained `stage_coordinate_import`, retry_allowed=false.
+Bound-source inspection maps 47 to the coordinator call after the entry's
+cold loader, initial runtime gate, read-only inputs, writable output and
+control-read/contract checks. It does not prove the coordinator's repeated
+runtime gate, source preflight, path checks or conversion succeeded.
+
+Both exact cgroups were absent after failure; the stage directory was empty
+and unmounted, no cleanup-failure record existed, and all 49 original staged
+source hashes still matched. No failed attempt was retried or modified.
+
+## Resource closure
+
+Confirmed instance `i-0375eca1575f6ed6a` terminated and volume
+`vol-01c93abe0ba20d27b` absent. Endpoint `eice-09a2e66dbef915f7c` reached
+delete-complete. Temporary groups `sg-0eb8a0d48f1b9defd` and
+`sg-0fa714c966e3b0db9`, and key registration `key-088457b2b3025d11b`, were
+successfully deleted. Only this attempt's resources were changed. Ephemeral
+generated VM data is not recoverable; local aggregate evidence is preserved.
+
+Evidence: `artifacts/lumi-vm-coordinator-native-attempt-v0.2/` authorization,
+resource IDs, result and cleanup records. Prior evidence/source bundles remain
+unchanged. No commit or push occurred.
+
+## Next useful work
+
+Do not spend another native run merely to rediscover exit 47. First inspect
+the existing coordinator's fixed rejection-code handling and reproduce its
+source/path/resource preconditions locally with generated fixtures. Preserve
+raw-text restrictions and all security gates. If finer native evidence is
+still needed, transport only an allowlisted coordinator rejection code, with
+synthetic coverage, before seeking separate approval for any new attempt.
+The current approval is consumed. Internal root cause and fix remain unproven.
+
+Real-input host admission and verified 4B CPU import still precede Gate 6
+GPU smoke/save/resume/SFT. Gates 7 evaluation and 8 serving remain later.

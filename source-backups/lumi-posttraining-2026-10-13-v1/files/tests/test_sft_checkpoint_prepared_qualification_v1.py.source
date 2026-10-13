@@ -1,0 +1,413 @@
+"""Synthetic orchestration only; no Docker, forks, ML, archive or real-data reads."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import importlib.util
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("_prepared_native_harness_tests_v1",
+    ROOT / "scripts/run_checkpoint_prepared_qualification_v1.py")
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+PACKAGE = "_prepared_native_harness_pipeline_contract_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+pipeline = importlib.import_module(PACKAGE + ".posttraining_checkpoint_prepared_pipeline_v1")
+workspace_contract = importlib.import_module(
+    PACKAGE + ".posttraining_checkpoint_fixture_workspace_v1")
+
+
+def pipeline_receipt(nonce="a" * 64):
+    return {"schema": pipeline.SCHEMA,
+        "status": "two_guardian_passes_completed_cleanup_pending", "synthetic_only": True,
+        "generation_guard_launches": 1, "import_guard_launches": 1,
+        "owned_cgroups_empty_and_removed": 2, "cleanup_required_on_success_and_failure": True,
+        "generation_nonce_sha256": nonce, "generator_receipt_sha256": "b" * 64,
+        "import_receipt_sha256": "c" * 64, "control_sha256": "d" * 64,
+        "generated_input_files": 9, "generated_input_bytes": 2000,
+        **dict.fromkeys(pipeline.NONCLAIMS, False)}
+
+
+class FakeRoot:
+    def __init__(self, parent, role, events):
+        self.path = parent / "owned-root"
+        self.path.mkdir(mode=0o700)
+        self.role, self.events = role, events
+        self.close = Mock(side_effect=self._close)
+
+    def _close(self):
+        self.events.append("close_" + self.role)
+        self.path.rmdir()
+
+    def summary(self):
+        return {"schema": "lumi.sft-oci-rootfs.v0.1",
+            "archive_bytes": len(b"generated export surrogate"), "archive_entries": 1,
+            "owned_entries": 2, "archive_headers": 1, "metadata_bytes": 0,
+            "content_bytes": 100, "hardlinks": 0, "symlinks": 0, "installed_files": 1,
+            "installed_bytes": 1, "installation_frozen": True, "cleanup_attempted": False,
+            "cleanup_completed": False, "operation_tainted": False, "metadata_normalized": True,
+            "filesystem_immutable": False, "production_eligible": False,
+            "real_sft_execution_permitted": False}
+
+
+class FakeWorkspace:
+    def __init__(self, parent, role, events):
+        self.path = parent / ("workspace-" + role)
+        self.path.mkdir(mode=0o700)
+        self.role, self.events = role, events
+        self.cleanup = Mock(side_effect=self._cleanup)
+
+    def _cleanup(self, *, descendants_reaped, native_mounts_released, deadline_ns):
+        if descendants_reaped is not True or native_mounts_released is not True:
+            raise AssertionError("cleanup_before_quiescence")
+        self.events.append("workspace_cleanup_" + self.role)
+        files, directories, size = 0, 1, 0
+        # Only known generated test nodes; the production census is tested separately.
+        for top in self.path.iterdir():
+            if top.name not in {"mountpoint", "checkpoint", "tokenizer", "output"}:
+                raise AssertionError("unexpected_test_node")
+            for child in top.iterdir():
+                files += 1
+                size += child.stat().st_size
+                child.unlink()
+            directories += 1
+            top.rmdir()
+        self.path.rmdir()
+        nodes = files + directories
+        return {"schema": workspace_contract.SCHEMA, "status": "removed", "role": self.role,
+            "workspace_removed": True, "census_nodes": nodes, "removed_files": files,
+            "removed_directories": directories, "declared_file_bytes": size,
+            "kernel_metadata_read_calls": 6 * nodes + 2, "kernel_metadata_bytes_read": nodes * 100,
+            "directory_entries_observed": 2 * (nodes - 1), "source_payload_bytes_read": 0,
+            "identity_checked_removal": True, "mount_boundary_checks_passed": True,
+            "descendants_reaped_premise": True, "native_mounts_released_premise": True,
+            "descendant_reaping_verified_by_adapter": False,
+            "native_mount_release_verified_by_adapter": False, "adopted_existing_directory": False,
+            "external_mutation_excluded": False, "retry_authorized": False,
+            "production_eligible": False}
+
+
+class HarnessTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="lumi-generated-harness-tests-")
+        self.addCleanup(self.temp.cleanup)
+        self.base_path = Path(self.temp.name).resolve()
+        self.parent = self.base_path / "harness"
+        self.events, self.roots, self.workspaces = [], {}, {}
+        self.loaded, self.container_name = False, None
+        self.pipeline_fail = self.extract_fail = self.retire_fail = False
+        self.base = types.SimpleNamespace(subreaper=Mock(),
+            wait_statuses=Mock(side_effect=self.wait_statuses))
+        self.binding = types.SimpleNamespace(image_id=(
+            "sha256:321d50ae5207dee05cd58ec5436d97978becde2ee8a767f2e8768229e6a9ad43"),
+            source_identity_sha256=lambda: "f" * 64)
+        self.admission = types.SimpleNamespace(IMAGE_ID=self.binding.image_id,
+            verify_created_oci=Mock(return_value=self.binding))
+        self.helper = types.SimpleNamespace(load_base=Mock(return_value=self.base),
+            load_admission=Mock(return_value=self.admission))
+        rootfs = types.SimpleNamespace(extract_rootfs=Mock(side_effect=self.extract))
+        self.pipeline = types.SimpleNamespace(SCHEMA=pipeline.SCHEMA, NONCLAIMS=pipeline.NONCLAIMS,
+            addon=types.SimpleNamespace(rootfs=rootfs),
+            run_prepared_pipeline=Mock(side_effect=self.run_pipeline))
+        self.workspace_module = types.SimpleNamespace(
+            create_workspace=Mock(side_effect=self.workspace),
+            validate_cleanup_receipt=Mock(side_effect=lambda value, **kwargs:
+                workspace_contract.validate_cleanup_receipt(value, **kwargs)))
+        self.bundles = {"generator": {"fixed": "generator"}, "importer": {"fixed": "importer"}}
+        self.enterContext(patch.object(m, "_ATTEMPTED", False))
+        self.enterContext(patch.object(m, "DESCENDANTS_REAPED", True))
+        self.enterContext(patch.object(m, "STAGE", "preflight"))
+        self.runtime = self.enterContext(patch.object(m, "runtime"))
+        self.loader = self.enterContext(patch.object(m, "load_sources", return_value=(
+            self.helper, self.pipeline, self.workspace_module, self.bundles, 70)))
+        self.enterContext(patch.dict(os.environ, {}, clear=True))
+        self.enterContext(patch.object(m.os, "umask"))
+        self.enterContext(patch.object(m.os, "statvfs", return_value=types.SimpleNamespace(
+            f_bavail=32 * 1024**3, f_frsize=1)))
+        self.enterContext(patch.object(m.os, "urandom", side_effect=lambda size: b"n" * size))
+        self.enterContext(patch.object(m.tempfile, "mkdtemp", side_effect=self.parent_directory))
+        self.enterContext(patch.object(m, "copy_image", side_effect=self.copy_image))
+        self.command = self.enterContext(patch.object(m, "command", side_effect=self.docker))
+        self.enterContext(patch.object(m, "image_inventory", side_effect=lambda *_args:
+            [self.admission.IMAGE_ID] if self.loaded else []))
+        self.enterContext(patch.object(m, "container_inventory", side_effect=lambda *_args:
+            [self.container_name] if self.container_name else []))
+        self.enterContext(patch.object(m, "create_options", side_effect=self.create_options))
+
+    def parent_directory(self, **_kwargs):
+        self.parent.mkdir(mode=0o700)
+        return str(self.parent)
+
+    def copy_image(self, _source, target, _deadline, file_ids):
+        target.write_bytes(b"generated archive surrogate")
+        file_ids[target] = m.identity(target.stat())
+
+    def create_options(self, image_id, name):
+        return ["create", image_id, name]
+
+    def docker(self, _config, arguments, **options):
+        self.events.append("docker_" + arguments[0])
+        if arguments == ["image", "load"]:
+            self.loaded = True
+        elif arguments[0] == "create":
+            self.container_name = arguments[-1]
+            return ("a" * 64).encode(), 64, "a" * 64, 0
+        elif arguments[0] == "export":
+            raw = b"generated export surrogate"
+            options["output_file"].write(raw)
+            return b"", len(raw), hashlib.sha256(raw).hexdigest(), 0
+        elif arguments[0] == "rm":
+            if self.retire_fail:
+                raise OSError("private daemon detail")
+            self.container_name = None
+        elif arguments[:2] == ["image", "rm"]:
+            self.loaded = False
+        else:
+            raise AssertionError("unexpected_Docker_operation")
+        return b"", 0, "a" * 64, 0
+
+    def workspace(self, parent, *, role, deadline_ns):
+        self.workspaces[role] = FakeWorkspace(parent, role, self.events)
+        return self.workspaces[role]
+
+    def extract(self, _exported, parent, **arguments):
+        role = next(role for role, workspace in self.workspaces.items() if workspace.path == parent)
+        self.events.append("extract_" + role)
+        if role == "importer" and self.extract_fail:
+            raise RuntimeError("synthetic extraction failure")
+        self.roots[role] = FakeRoot(parent, role, self.events)
+        return self.roots[role]
+
+    def run_pipeline(self, **arguments):
+        self.events.append("pipeline")
+        self.assertIs(arguments["generator_root"], self.roots["generator"])
+        self.assertIs(arguments["importer_root"], self.roots["importer"])
+        self.assertIs(arguments["generator_bundle"], self.bundles["generator"])
+        target = self.workspaces["importer"].path / "output"
+        target.mkdir(mode=0o700)
+        (target / "generated.txt").write_bytes(b"generated test output")
+        if self.pipeline_fail:
+            raise RuntimeError("private generated path")
+        return pipeline_receipt(arguments["generation_nonce_sha256"])
+
+    def wait_statuses(self, _deadline):
+        self.events.append("reap")
+        return {}
+
+    def invoke(self):
+        return m.run(Path("/never-read/model-or-archive"))
+
+    def test_success_single_pipeline_two_roots_all_cleanup_and_no_private_text(self):
+        result = self.invoke()
+        self.assertEqual(result["status"], "passed")
+        self.pipeline.run_prepared_pipeline.assert_called_once()
+        self.assertEqual(self.events.count("pipeline"), 1)
+        self.assertEqual(result["software_roots_extracted"], 2)
+        self.assertTrue(result["private_owned_cleanup_verified"])
+        self.assertTrue(result["descendants_reaped"])
+        self.assertTrue(all(result["cleanup_inventory"].values()))
+        self.assertEqual(set(result["workspace_cleanup"]), {"generator", "importer"})
+        self.assertFalse(self.parent.exists())
+        raw = m.canonical(result)
+        self.assertNotIn(str(self.base_path).encode(), raw)
+        self.assertNotIn(b"generated test output", raw)
+        self.assertLess(len(raw), m.MAXIMUM_REPORT_BYTES)
+        for key in m.NONCLAIMS:
+            self.assertIs(result[key], False)
+
+    def test_reaping_precedes_root_close_then_each_workspace_cleanup(self):
+        self.invoke()
+        for role in ("generator", "importer"):
+            self.assertLess(self.events.index("reap"), self.events.index("close_" + role))
+            self.assertLess(self.events.index("close_" + role),
+                            self.events.index("workspace_cleanup_" + role))
+        self.assertGreaterEqual(self.base.subreaper.call_count, 1)
+
+    def test_extraction_deadline_covers_both_roots_and_pipeline(self):
+        with patch.object(m.time, "monotonic", return_value=100), \
+                patch.object(m.time, "monotonic_ns", return_value=100_000_000_000):
+            self.invoke()
+        calls = self.pipeline.addon.rootfs.extract_rootfs.call_args_list
+        self.assertEqual([call.kwargs["deadline"] for call in calls], [1180, 1180])
+        self.assertEqual(self.pipeline.run_prepared_pipeline.call_args.kwargs["deadline_ns"],
+                         340_000_000_000)
+
+    def test_no_Docker_start_build_pull_push_or_remote_commands(self):
+        self.invoke()
+        allowed = {"image", "create", "export", "rm"}
+        self.assertTrue(all(call.args[1][0] in allowed for call in self.command.call_args_list))
+        self.assertEqual([call.args[1] for call in self.command.call_args_list
+                          if call.args[1][0] == "image"],
+                         [["image", "load"],
+                          ["image", "rm", "--no-prune", self.admission.IMAGE_ID]])
+
+    def test_pipeline_failure_cleans_partial_external_output_without_retry(self):
+        self.pipeline_fail = True
+        with self.assertRaises(RuntimeError):
+            self.invoke()
+        self.pipeline.run_prepared_pipeline.assert_called_once()
+        self.assertFalse(self.parent.exists())
+        with self.assertRaisesRegex(m.FixtureError, "^runtime_rejected$"):
+            self.invoke()
+
+    def test_second_extraction_failure_cleans_first_root_and_both_workspaces(self):
+        self.extract_fail = True
+        with self.assertRaises(RuntimeError):
+            self.invoke()
+        self.pipeline.run_prepared_pipeline.assert_not_called()
+        self.roots["generator"].close.assert_called_once()
+        self.assertFalse(self.parent.exists())
+
+    def test_unreaped_descendant_blocks_root_and_workspace_cleanup(self):
+        self.base.wait_statuses.side_effect = RuntimeError("still running")
+        with self.assertRaisesRegex(m.FixtureError, "^cleanup_unconfirmed$"):
+            self.invoke()
+        for root in self.roots.values():
+            root.close.assert_not_called()
+        for workspace in self.workspaces.values():
+            workspace.cleanup.assert_not_called()
+        self.assertFalse(m.DESCENDANTS_REAPED)
+
+    def test_unexpected_reaped_child_prevents_success_but_allows_safe_cleanup(self):
+        self.base.wait_statuses.side_effect = lambda _deadline: {123: 0}
+        with self.assertRaisesRegex(m.FixtureError, "^cleanup_unconfirmed$"):
+            self.invoke()
+        self.assertTrue(m.DESCENDANTS_REAPED)
+        for workspace in self.workspaces.values():
+            workspace.cleanup.assert_called_once()
+
+    def test_root_cleanup_failure_preserves_its_workspace_no_retry(self):
+        original = self.pipeline.run_prepared_pipeline.side_effect
+
+        def fail_cleanup(**arguments):
+            result = original(**arguments)
+            self.roots["importer"].close.side_effect = RuntimeError("private cleanup")
+            return result
+
+        self.pipeline.run_prepared_pipeline.side_effect = fail_cleanup
+        with self.assertRaisesRegex(m.FixtureError, "^cleanup_unconfirmed$"):
+            self.invoke()
+        self.roots["importer"].close.assert_called_once()
+        self.workspaces["importer"].cleanup.assert_not_called()
+
+    def test_ambiguous_container_retirement_is_not_retried(self):
+        self.retire_fail = True
+        with self.assertRaisesRegex(m.FixtureError, "^cleanup_unconfirmed$"):
+            self.invoke()
+        self.assertEqual(sum(call.args[1][0] == "rm" for call in self.command.call_args_list), 1)
+        self.workspace_module.create_workspace.assert_not_called()
+
+    def test_insufficient_pipeline_budget_before_any_launch(self):
+        m.BASE, m.PIPELINE = self.base, self.pipeline
+        with patch.object(m.time, "monotonic", return_value=100), \
+                patch.object(m.time, "monotonic_ns", return_value=100_000_000_000):
+            with self.assertRaisesRegex(m.FixtureError, "^deadline_exhausted$"):
+                m.run_pipeline({}, {}, {}, 220)
+        self.pipeline.run_prepared_pipeline.assert_not_called()
+
+    def test_runtime_rejection_precedes_source_and_archive_access(self):
+        self.runtime.side_effect = m.FixtureError("runtime_rejected")
+        with self.assertRaisesRegex(m.FixtureError, "^runtime_rejected$"):
+            self.invoke()
+        self.loader.assert_not_called()
+        self.command.assert_not_called()
+
+    def test_full_pipeline_receipt_required_no_authority_escalation(self):
+        m.PIPELINE = self.pipeline
+        value = pipeline_receipt()
+        self.assertEqual(m.validate_pipeline(value), value)
+        for key in value:
+            selected = dict(value)
+            del selected[key]
+            with self.assertRaisesRegex(m.FixtureError, "^pipeline_rejected$"):
+                m.validate_pipeline(selected)
+        for key, part in (("execution_permitted", True), ("owned_cgroups_empty_and_removed", True),
+                           ("generated_input_files", 33), ("private_data", b"never public")):
+            with self.assertRaisesRegex(m.FixtureError, "^pipeline_rejected$"):
+                m.validate_pipeline(dict(value, **{key: part}))
+
+    def test_wrong_nonce_from_pipeline_rejected_and_cleaned(self):
+        self.pipeline.run_prepared_pipeline.side_effect = (
+            lambda **_kwargs: pipeline_receipt("e" * 64))
+        with self.assertRaisesRegex(m.FixtureError, "^pipeline_rejected$"):
+            self.invoke()
+        self.assertFalse(self.parent.exists())
+
+    def test_main_sanitizes_private_error_and_writes_only_allowlisted_frame(self):
+        with patch.object(m, "run", side_effect=OSError("private payload path")), \
+                patch.object(m.sys, "argv", ["entry", "--synthetic-only", "/never-read"]), \
+                patch.object(m.os, "write", side_effect=lambda _fd, raw: len(raw)) as write:
+            self.assertEqual(m.main(), 2)
+        raw = write.call_args.args[1]
+        self.assertNotIn(b"private payload", raw)
+        self.assertNotIn(b"/never-read", raw)
+        self.assertIn(b'"status":"failed"', raw)
+
+    def test_actual_cleanup_and_supervisor_validators_accept_whole_harness_report(self):
+        selected = importlib.util.spec_from_file_location("_prepared_supervisor_harness_interop_v1",
+            ROOT / "scripts/supervise_checkpoint_prepared_qualification_v1.py")
+        supervisor = importlib.util.module_from_spec(selected)
+        selected.loader.exec_module(supervisor)
+        result = self.invoke()
+        self.assertEqual(supervisor.parse_report(m.canonical(result), 0), result)
+
+    def test_invalid_cleanup_receipt_prevents_harness_success(self):
+        self.workspace_module.validate_cleanup_receipt.side_effect = ValueError("private invalid")
+        with self.assertRaisesRegex(m.FixtureError, "^cleanup_unconfirmed$"):
+            self.invoke()
+        self.assertEqual(self.workspace_module.validate_cleanup_receipt.call_count, 2)
+
+
+class SourceContractTests(unittest.TestCase):
+    def test_admission_rejects_duplicate_paths_noncanonical_and_missing_fixed_modules(self):
+        row = {"path": m.ENTRY, "bytes": 1, "sha256": "a" * 64}
+        for value in ({"schema": m.SOURCE_SCHEMA, "files": [row]},
+                      {"schema": m.SOURCE_SCHEMA, "files": [row, row]},
+                      {"schema": "wrong", "files": []}):
+            with self.assertRaisesRegex(m.FixtureError, "^source_rejected$"):
+                m.parse_admission(m.canonical(value))
+
+    def test_verified_loader_covers_both_dynamic_packages_and_rejects_missing_module(self):
+        finder = m.VerifiedHostSources("private", {"src/lumi/allowed.py": b"VALUE = 1\n"})
+        for parent in ("private", "_lumi_generated_cgroup_fixture_v1",
+                       "_lumi_checkpoint_guard_base_" + "a" * 32 + "_components"):
+            spec = finder.find_spec(parent + ".allowed")
+            self.assertIs(spec.loader, finder)
+            with self.assertRaisesRegex(m.FixtureError, "^source_rejected$"):
+                finder.find_spec(parent + ".unbound")
+        self.assertIsNone(finder.find_spec("unrelated.allowed"))
+
+    def test_verified_loader_compiles_bound_bytes_without_pyc_or_unbound_import(self):
+        finder = m.VerifiedHostSources("private", {"src/lumi/allowed.py": b"VALUE = 17\n"})
+        module = types.ModuleType("private.allowed")
+        finder.exec_module(module)
+        self.assertEqual(module.VALUE, 17)
+        self.assertIsNone(module.__cached__)
+
+    def test_actual_manifest_and_full_source_closure_load_without_ML(self):
+        before_modules, before_finders = set(sys.modules), list(sys.meta_path)
+        try:
+            helper, selected, workspace, bundles, count = m.load_sources()
+            self.assertGreater(count, 20)
+            self.assertLessEqual(count, 128)
+            self.assertEqual(set(bundles), {"generator", "importer"})
+            self.assertIs(selected.addon.rootfs, selected.layout.rootfs)
+            self.assertEqual(workspace.__package__, selected.__package__)
+            self.assertTrue(callable(helper.load_base))
+            self.assertFalse({"torch", "numpy", "transformers", "safetensors", "lumi"}
+                             & {name.split(".")[0] for name in set(sys.modules) - before_modules})
+        finally:
+            sys.meta_path[:] = before_finders
+            for name in set(sys.modules) - before_modules:
+                if name.startswith("_lumi_prepared_qualification_"):
+                    sys.modules.pop(name, None)

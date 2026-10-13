@@ -1,0 +1,503 @@
+"""Private-entry lifecycle: tiny local base blobs and metadata-only native doubles."""
+
+import importlib
+import json
+import os
+import socket
+import threading
+import time
+import types
+import unittest
+from contextlib import ExitStack
+from unittest.mock import Mock, patch
+
+from . import test_sft_base_loader_v2 as base_fixture
+from . import test_sft_model_prepare_v1 as prep_fixture
+from . import test_sft_smoke_bridge_v1 as bridge_fixture
+from . import test_sft_socket_transport_v1 as transport_fixture
+
+entry = importlib.import_module(bridge_fixture.PACKAGE + ".posttraining_sft_worker_entry_v1")
+base = importlib.import_module(bridge_fixture.PACKAGE + ".posttraining_sft_base_loader_v2")
+prep = importlib.import_module(bridge_fixture.PACKAGE + ".posttraining_sft_model_prepare_v1")
+
+
+class WorkerEntryTests(unittest.TestCase):
+    def setUp(self):
+        self.f = bridge_fixture.RankBridgeTests()
+        self.f.setUp()
+        self.b = base_fixture.LoaderTests()
+        self.b.setUp()
+        self.p = prep_fixture.PreparationTests()
+        self.p.setUp()
+        self.pairs = [socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(2)]
+        self.deadline = time.monotonic_ns()+8_000_000_000
+        self.ledger = entry.WorkerLedgerClient(
+            self.pairs[0][0], epoch="a"*64, rank=0, token="b"*64,
+            interrupt=lambda: None, maximum_wire_bytes=2**20,
+            deadline_ns=self.deadline, maximum_exchange_ns=1_000_000_000)
+        self.control = entry.WorkerControlClient(
+            self.pairs[1][0], invocation_index=0, interrupt=lambda: None,
+            maximum_wire_bytes=2**20, maximum_reads=1000,
+            deadline_ns=self.deadline, maximum_exchange_ns=1_000_000_000)
+        self.events = []
+        self.pre = Mock(side_effect=lambda: self.events.append("pre"))
+        self.health = Mock(side_effect=lambda: self.events.append("health"))
+        self.interrupt = Mock(return_value=None)
+        self.release = Mock(side_effect=lambda: self.events.append("roots_closed"))
+        self.open = Mock(side_effect=lambda: self.resources())
+        self.instance = None
+
+    def tearDown(self):
+        if self.instance is not None:
+            try:
+                self.instance.close()
+            except entry.WorkerEntryError:
+                pass
+        self.ledger.close()
+        self.control.close()
+        for pair in self.pairs:
+            for sock in pair:
+                sock.close()
+        self.b.tearDown()
+        self.f.tearDown()
+
+    def resources(self, **changes):
+        return entry.RankResources(**{
+            "encoded_root": object(), "output_parent_fd": 99, "close": self.release, **changes})
+
+    def options(self, **changes):
+        loader = self.b.make()
+        return {
+            "ledger": self.ledger, "control": self.control, "invocation_index": 0,
+            "runtime_metadata": {"source_root": "/work/release/src/lumi",
+                "dependency_root": "/work/runtime/site-packages", "port": 23456,
+                "deadline_ns": self.deadline, "maximum_operation_ns": 1_000_000_000},
+            "base_metadata": {"inventory": self.b.rows,
+                "expected_inventory_sha256": base_fixture.hashlib.sha256(
+                    base_fixture.loader._canonical(self.b.rows)).hexdigest(),
+                "maximum_read_bytes": loader._read_cap, "maximum_file_bytes": 4096,
+                "maximum_control_bytes": loader._control_cap,
+                "maximum_live_bytes": loader._live_cap},
+            "worker_metadata": {key: self.f.options[key] for key in entry.WORKER_KEYS},
+            "pre_ml": self.pre, "runtime_health": self.health,
+            "open_base_root": self.b.open_root, "open_resources": self.open,
+            "interrupt": self.interrupt, **changes}
+
+    def make(self, **changes):
+        self.instance = entry.WorkerEntry(**self.options(**changes))
+        return self.instance
+
+    def error(self, code, fn):
+        with self.assertRaises(entry.WorkerEntryError) as caught:
+            fn()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def worker(self, model, optimizer, **kwargs):
+        self.events.append("worker")
+        self.assertIs(type(optimizer), self.p.torch.optim.AdamW)
+        run = self.instance._rank._worker
+        run._state = run._stage = "complete"
+        run._steps = run._checkpoints = run._stop - run._from
+        run._restores = int(run._from == 1)
+        # Explicit metadata double, not a real ledger transaction/native step.
+        self.ledger._requests = 1
+        return {"private_fixture": "not-for-public-summary"}
+
+    def report(self, summary, requests):
+        self.events.append("report")
+        self.assertEqual(summary, self.control._expected)
+        self.assertEqual(requests, 1)
+        self.assertIn("roots_closed", self.events)
+        self.assertNotIn("runtime_closed", self.events)
+        self.control._state = "released"
+
+    def doubles(self, instance):
+        stack = ExitStack()
+        def start():
+            self.events.append("runtime_start")
+            if instance._runtime._pre() is not None:
+                raise ValueError("PRIVATE")
+            instance._runtime._state = "ready"
+            return self.p.context
+        stack.enter_context(patch.object(instance._runtime, "start", side_effect=start))
+        stack.enter_context(patch.object(instance._runtime, "_native_check", return_value=None))
+        stack.enter_context(patch.object(instance._runtime, "close",
+                                        side_effect=lambda: self.events.append("runtime_closed")))
+        stack.enter_context(patch.object(entry, "_directory_info", return_value=None))
+        stack.enter_context(patch.object(base, "_runtime", return_value=object()))
+        stack.enter_context(patch.object(base, "_model_plan",
+                                        return_value=(None, {"weight": [2, 2]})))
+        stack.enter_context(patch.object(base, "_decode", return_value={"weight": object()}))
+        stack.enter_context(patch.object(base, "_build", return_value=self.p.model))
+        stack.enter_context(patch.object(prep.ModelPreparation, "_runtime", return_value=(
+            self.p.torch, self.p.distributed,
+            types.SimpleNamespace(LumiForCausalLM=prep_fixture.Model),
+            self.p.fsdp)))
+        # Charge real tiny fixture reads, but do not use a live parent in unit tests.
+        stack.enter_context(patch.object(instance._loader, "_reserve",
+            side_effect=lambda rank, **amounts: self.b.charges.append((rank, amounts))))
+        stack.enter_context(patch.object(instance._rank._worker, "run", side_effect=self.worker))
+        stack.enter_context(patch.object(instance._control, "report_and_wait",
+                                        side_effect=self.report))
+        return stack
+
+    def test_constructor_is_inert_and_binds_frozen_successors(self):
+        instance = self.make()
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.b.fds, [])
+        self.pre.assert_not_called()
+        self.assertIs(type(instance._loader), entry.BoundedBaseLoader)
+        self.assertEqual(instance._runtime._epoch, self.ledger._epoch)
+        self.assertIs(instance._rank._worker._client, self.ledger)
+        self.assertNotIn("/work", repr(instance))
+
+    def test_metadata_is_copied_and_callback_injection_rejected(self):
+        options = self.options()
+        instance = entry.WorkerEntry(**options)
+        self.instance = instance
+        options["worker_metadata"]["profile"]["learning_rate"] = 9.0
+        self.assertEqual(instance._rank._worker._profile["learning_rate"], 1e-5)
+        for metadata in (None, {"admit": lambda: None}, {"x": object()}, {"x": float("nan")}):
+            self.error("invalid_arguments", lambda metadata=metadata: entry.WorkerEntry(
+                **self.options(worker_metadata=metadata)))
+
+    def test_wrong_epoch_geometry_deadline_and_same_checks_rejected(self):
+        for changes in ({"invocation_index": True}, {"invocation_index": 2},
+                        {"runtime_health": self.pre}, {"ledger": object()}):
+            self.error("invalid_arguments", lambda changes=changes: entry.WorkerEntry(
+                **self.options(**changes)))
+        options = self.options()
+        options["runtime_metadata"]["deadline_ns"] += 1
+        self.error("invalid_arguments", lambda: entry.WorkerEntry(**options))
+
+    def test_used_client_rejected_without_stealing_ownership(self):
+        self.ledger._requests = 1
+        self.error("invalid_arguments", lambda: entry.WorkerEntry(**self.options()))
+        self.assertFalse(self.ledger.closed)
+        self.assertIsNotNone(self.control._sock)
+
+    def test_channels_cannot_alias_the_same_socket_identity(self):
+        identity = self.control._identity
+        try:
+            self.control._identity = self.ledger._identity
+            self.error("invalid_arguments", lambda: entry.WorkerEntry(**self.options()))
+        finally:
+            self.control._identity = identity
+        self.assertFalse(self.ledger.closed)
+
+    def test_missing_resume_receipt_stops_third_invocation_before_runtime(self):
+        self.control.close()
+        self.pairs[1][1].close()
+        self.pairs[1] = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.control = entry.WorkerControlClient(
+            self.pairs[1][0], invocation_index=2, interrupt=lambda: None,
+            maximum_wire_bytes=2**20, maximum_reads=1000,
+            deadline_ns=self.deadline, maximum_exchange_ns=1_000_000_000)
+        instance = self.make(invocation_index=2)
+        with self.doubles(instance), patch.object(instance._runtime, "start") as start:
+            self.error("invalid_arguments", instance.run)
+            start.assert_not_called()
+        self.open.assert_not_called()
+
+    def test_success_real_tiny_base_loader_and_model_preparation(self):
+        instance = self.make()
+        with self.doubles(instance):
+            result = instance.run()
+        self.assertEqual(result, {"private_fixture": "not-for-public-summary"})
+        self.assertEqual(instance.summary()["state"], "complete")
+        self.assertEqual(instance._loader.summary()["files_verified"], 2)
+        self.assertEqual(instance._preparation.summary()["state"], "complete")
+        self.assertEqual(self.events.count("roots_closed"), 1)
+        self.assertLess(self.events.index("roots_closed"), self.events.index("report"))
+        self.assertLess(self.events.index("report"), self.events.index("runtime_closed"))
+        self.assertTrue(self.ledger.closed)
+        self.assertEqual(self.control.summary()["state"], "closed")
+        self.assertNotIn("not-for-public-summary", json.dumps(instance.summary()))
+        self.error("already_consumed", instance.run)
+        self.interrupt.assert_not_called()
+
+    def test_invalid_resume_precedes_runtime_and_opens(self):
+        instance = self.make()
+        with self.doubles(instance), patch.object(instance._runtime, "start") as start:
+            self.error("invalid_arguments", lambda: instance.run(resume_manifest_sha256="e"*64))
+            start.assert_not_called()
+        self.open.assert_not_called()
+        self.assertTrue(self.ledger.closed)
+
+    def test_real_mac_runtime_denial_never_opens_resources_or_base(self):
+        instance = self.make()
+        cold = importlib.import_module(bridge_fixture.PACKAGE + ".posttraining_sft_cold_runtime_v1")
+        with patch.object(cold, "_ATTEMPTED", False), patch.object(cold.sys, "platform", "darwin"):
+            self.error("runtime_failed", instance.run)
+        self.open.assert_not_called()
+        self.pre.assert_not_called()
+        self.assertEqual(self.b.fds, [])
+        self.assertTrue(self.ledger.closed)
+
+    def test_denied_pre_admission_and_swallowed_reentry_stop_startup(self):
+        instance = self.make()
+        self.pre.side_effect = lambda: self.error("reentry", instance.run)
+        with self.doubles(instance):
+            self.error("reentry", instance.run)
+        self.open.assert_not_called()
+        self.assertEqual(self.b.fds, [])
+        self.interrupt.assert_called_once()
+
+    def test_false_pre_admission_never_opens_roots(self):
+        instance = self.make()
+        self.pre.side_effect = None
+        self.pre.return_value = False
+        with self.doubles(instance):
+            self.error("runtime_failed", instance.run)
+        self.open.assert_not_called()
+        self.assertEqual(self.b.fds, [])
+
+    def test_post_import_health_reentry_stops_before_resources(self):
+        instance = self.make()
+        self.health.side_effect = lambda: self.error("reentry", instance.close)
+        with self.doubles(instance):
+            self.error("reentry", instance.run)
+        self.open.assert_not_called()
+
+    def test_base_fd_is_adopted_before_swallowed_reentry_is_rejected(self):
+        instance = self.make()
+        def opening():
+            fd = self.b.open_root()
+            self.error("reentry", instance.run)
+            return fd
+        instance._open_base = opening
+        with self.doubles(instance):
+            self.error("reentry", instance.run)
+        self.assertEqual(instance._loader.summary()["files_verified"], 0)
+        self.assertEqual(len(self.b.fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(self.b.fds[0])
+        self.release.assert_called_once()
+
+    def test_open_resources_failure_still_retires_runtime_and_channels(self):
+        instance = self.make()
+        self.open.side_effect = ValueError("PRIVATE")
+        with self.doubles(instance):
+            self.error("resources_failed", instance.run)
+        self.assertIn("runtime_closed", self.events)
+        self.assertTrue(self.ledger.closed)
+        self.assertIsNone(self.control._sock)
+        self.release.assert_not_called()
+
+    def test_invalid_owned_resource_result_is_still_closed(self):
+        instance = self.make()
+        self.open.side_effect = lambda: self.resources(output_parent_fd=True)
+        with self.doubles(instance):
+            self.error("resources_failed", instance.run)
+        self.release.assert_called_once()
+
+    def test_invalid_output_directory_stops_before_model_reads(self):
+        instance = self.make()
+        with self.doubles(instance), patch.object(entry, "_directory_info",
+                                                 side_effect=ValueError("PRIVATE")):
+            self.error("resources_failed", instance.run)
+        self.assertEqual(self.b.fds, [])
+        self.release.assert_called_once()
+
+    def test_resource_return_adopted_even_if_callback_swallows_reentry(self):
+        instance = self.make()
+        def opening():
+            self.error("reentry", instance.run)
+            return self.resources()
+        self.open.side_effect = opening
+        with self.doubles(instance):
+            self.error("reentry", instance.run)
+        self.release.assert_called_once()
+        self.assertEqual(self.b.fds, [])
+
+    def test_loader_failure_closes_roots_and_never_reports(self):
+        instance = self.make()
+        with self.doubles(instance), \
+                patch.object(base, "_decode", side_effect=ValueError("PRIVATE")):
+            self.error("worker_failed", instance.run)
+        self.release.assert_called_once()
+        self.assertNotIn("report", self.events)
+        self.assertTrue(self.ledger.closed)
+
+    def test_worker_failure_cleanup_preserves_first_code(self):
+        instance = self.make()
+        self.release.side_effect = ValueError("PRIVATE-CLOSE")
+        with self.doubles(instance), patch.object(instance._rank._worker, "run",
+                side_effect=ValueError("PRIVATE-WORKER")):
+            self.error("worker_failed", instance.run)
+        self.assertTrue(instance.summary()["cleanup_failed"])
+        self.release.assert_called_once()
+        self.assertNotIn("report", self.events)
+        self.assertIn("runtime_closed", self.events)
+
+    def test_resource_cleanup_failure_cannot_report_success(self):
+        instance = self.make()
+        self.release.side_effect = ValueError("PRIVATE")
+        with self.doubles(instance):
+            self.error("worker_failed", instance.run)
+        self.release.assert_called_once()
+        self.assertNotIn("report", self.events)
+
+    def test_parent_report_rejection_closes_every_owned_resource(self):
+        instance = self.make()
+        with self.doubles(instance), patch.object(self.control, "report_and_wait",
+                                                 side_effect=ValueError("PRIVATE")):
+            self.error("report_failed", instance.run)
+        self.assertTrue(self.ledger.closed)
+        self.assertIsNone(self.control._sock)
+        self.release.assert_called_once()
+
+    def test_runtime_cleanup_failure_does_not_skip_socket_cleanup_or_retry(self):
+        instance = self.make()
+        with self.doubles(instance), patch.object(instance._runtime, "close",
+                side_effect=ValueError("PRIVATE")) as close:
+            self.error("retirement_failed", instance.run)
+            self.error("retirement_failed", instance.close)
+            close.assert_called_once()
+        self.assertTrue(self.ledger.closed)
+        self.assertIsNone(self.control._sock)
+        self.assertTrue(instance.summary()["cleanup_failed"])
+
+    def test_unstarted_close_is_inert_except_owned_client_retirement(self):
+        instance = self.make()
+        instance.close()
+        instance.close()
+        self.pre.assert_not_called()
+        self.open.assert_not_called()
+        self.assertEqual(instance.summary()["state"], "closed")
+        self.error("already_consumed", instance.run)
+        self.interrupt.assert_not_called()
+
+    def test_owner_mismatch_never_starts_runtime(self):
+        instance = self.make()
+        owner = instance._owner
+        instance._owner = (-1, -1)
+        self.error("owner_mismatch", instance.run)
+        instance._owner = owner
+        self.open.assert_not_called()
+
+
+class WorkerEntryCompositionTests(unittest.TestCase):
+    def test_real_entry_eight_ranks_three_epochs_with_native_doubles(self):
+        harness = transport_fixture.SocketTransportTests()
+        harness.setUp()
+        configuration = WorkerEntryTests()
+        configuration.setUp()
+        transport = importlib.import_module(
+            bridge_fixture.PACKAGE + ".posttraining_sft_socket_transport_v2")
+        locals_ = threading.local()
+        entries, model_loads, steps, closes, results, gpu_syncs = [], [], [], [], [], []
+        metadata = configuration.options()
+
+        def runtime_start(runtime):
+            if runtime._pre() is not None:
+                raise ValueError("SYNTHETIC_ADMISSION")
+            runtime._state = "ready"
+            return locals_.preparation.context
+
+        def model_runtime(preparation):
+            p = locals_.preparation
+            self.assertIs(preparation._context, p.context)
+            return (p.torch, p.distributed,
+                    types.SimpleNamespace(LumiForCausalLM=prep_fixture.Model), p.fsdp)
+
+        def load_model(loader):
+            model_loads.append((harness.index, loader._rank))
+            return locals_.preparation.model
+
+        def worker_run(run, model, optimizer, **kwargs):
+            p = locals_.preparation
+            self.assertIs(type(optimizer), p.torch.optim.AdamW)
+            self.assertIsInstance(model, prep_fixture.Wrapped)
+            self.assertEqual(kwargs["resume_manifest_sha256"], "e"*64 if run._from else None)
+            # Real helper/phase/StepGate code, but no input/model tensor/checkpoint work.
+            run._state = "running"
+            run._helpers()
+            run._sync("inputs", run._from)
+            run._sync("restored", run._from)
+            for step in range(run._from+1, run._stop+1):
+                with run._gate.step(step):
+                    steps.append((harness.index, run._rank, step))
+                run._sync("checkpoint", step)
+            run._state = run._stage = "complete"
+            run._steps = run._checkpoints = run._stop-run._from
+            run._restores = int(run._from == 1)
+            return {"synthetic_checkpoint": True}
+
+        def worker(rank):
+            ledger = control = instance = None
+            try:
+                deadline = time.monotonic_ns()+4_000_000_000
+                ledger = entry.WorkerLedgerClient(
+                    harness.peers[rank][0], epoch=harness.f.epoch, rank=rank,
+                    token=harness.f.tokens[rank], interrupt=lambda: None,
+                    maximum_wire_bytes=2**20, deadline_ns=deadline,
+                    maximum_exchange_ns=2_000_000_000)
+                control = entry.WorkerControlClient(
+                    harness.peers[rank][1], invocation_index=harness.index,
+                    deadline_ns=deadline, maximum_exchange_ns=2_000_000_000,
+                    maximum_wire_bytes=2**20, maximum_reads=1000, interrupt=lambda: None)
+                p = prep_fixture.PreparationTests()
+                p.setUp()
+                p.context = types.SimpleNamespace(device=object())
+                p.torch.cuda.synchronize = lambda device: gpu_syncs.append(rank)
+                locals_.preparation = p
+                instance = entry.WorkerEntry(
+                    ledger=ledger, control=control, invocation_index=harness.index,
+                    runtime_metadata={**metadata["runtime_metadata"], "deadline_ns": deadline},
+                    base_metadata=metadata["base_metadata"],
+                    worker_metadata=metadata["worker_metadata"], pre_ml=lambda: None,
+                    runtime_health=lambda: None, open_base_root=lambda: self.fail("base open"),
+                    open_resources=lambda: entry.RankResources(object(), 99,
+                        lambda: closes.append((harness.index, rank))), interrupt=lambda: None)
+                entries.append(instance)
+                resume = dict(resume_checkpoint_name="checkpoint-00000001",
+                              resume_manifest_sha256="e"*64) if harness.index == 2 else {}
+                results.append(instance.run(**resume))
+            except BaseException:
+                harness.errors.append(rank)
+            finally:
+                if instance is not None:
+                    instance.close()
+                else:
+                    if ledger is not None:
+                        ledger.close()
+                    if control is not None:
+                        control.close()
+
+        harness.worker = worker
+        try:
+            with patch.object(entry.ColdRuntime, "start", runtime_start), \
+                    patch.object(entry, "_directory_info", return_value=None), \
+                    patch.object(entry.ColdRuntime, "_native_check", return_value=None), \
+                    patch.object(entry.ColdRuntime, "close", return_value=None), \
+                    patch.object(entry.ModelPreparation, "_runtime", model_runtime), \
+                    patch.object(entry.BoundedBaseLoader, "__call__", load_model), \
+                    patch.object(entry.RankPhases, "_runtime",
+                                 lambda self: locals_.preparation.torch), \
+                    patch.object(bridge_fixture.worker.WorkerRun, "run", worker_run):
+                for index in range(3):
+                    if index:
+                        harness.f.new(index)
+                        harness.parents, harness.peers, harness.threads = [], [], []
+                    harness.index = index
+                    parent = transport.SocketTransport(**harness.options())
+                    result = parent.run()
+                    self.assertEqual(result["state"], "complete")
+                    self.assertEqual(result["eof_channels"], 16)
+                    self.assertEqual(harness.errors, [])
+            self.assertEqual(len(entries), 24)
+            self.assertEqual(len(model_loads), 24)
+            self.assertEqual(len(closes), 24)
+            self.assertEqual(len(set(closes)), 24)
+            self.assertEqual(len(steps), 32)
+            self.assertEqual(len(gpu_syncs), 176)
+            self.assertEqual(results, [{"synthetic_checkpoint": True}]*24)
+            self.assertTrue(all(item.summary()["state"] == "complete" for item in entries))
+            self.assertTrue(all(not item.summary()["cleanup_failed"] for item in entries))
+            self.assertEqual(harness.f.ledger.summary()["invocations_completed"], 3)
+            self.assertEqual(harness.f.ledger.summary()["global_optimizer_steps_completed"], 4)
+        finally:
+            harness.tearDown()
+            configuration.tearDown()

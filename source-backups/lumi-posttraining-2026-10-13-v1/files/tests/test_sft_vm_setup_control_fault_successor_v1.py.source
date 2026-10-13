@@ -1,0 +1,136 @@
+"""No live cloud: predicate identity, fault matrix, empty visibility and budget replay."""
+
+import ast
+import copy
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_setup_control_fault_successor_v1 as builder
+from scripts import qualify_sft_vm_setup_production_v3 as m
+from tests import test_sft_vm_setup_visibility_successor_v1 as base
+
+
+class Tests(base.Tests):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed, cls.receiver, cls.archive = m.authenticate()
+
+    def setUp(self):
+        self.enterContext(patch.object(base, "m", m))
+        super().setUp()
+        self.control_fault = None
+
+    def cloud(self, **options):
+        cloud, now, calls = super().cloud(**options)
+        original, reads = cloud.call, [0]
+
+        def call(operation, **fields):
+            response = original(operation, **fields)
+            if operation == "describe_instances" and cloud.launch_sent:
+                if fields.get("InstanceIds") != [m.RETAINED]:
+                    reads[0] += 1
+                    mode = self.control_fault
+                    if (
+                        mode == "empty_forever"
+                        or (mode == "empty_boot" and reads[0] <= 2)
+                        or (mode == "empty_cleanup" and reads[0] == 2)
+                    ):
+                        response = dict(Reservations=[])
+                    elif mode == "mismatch":
+                        response["Reservations"][0]["Instances"][0]["SecurityGroups"] = [
+                            dict(GroupId="PRIVATE_SENTINEL")
+                        ]
+            return response
+
+        cloud.call = call
+        return cloud, now, calls
+
+    def test_reproducible_entry(self):
+        self.assertEqual(m.read(builder.OUTPUT), builder.build())
+
+    def test_all_ownership_guard_expressions_identical(self):
+        def predicates(raw):
+            function = next(n for n in ast.parse(raw).body if getattr(n, "name", None) == "owned")
+            calls = sorted(
+                (
+                    n
+                    for n in ast.walk(function)
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id in {"need", "one", "tag"}
+                ),
+                key=lambda n: (n.lineno, n.col_offset),
+            )
+            return [ast.dump(n, include_attributes=False) for n in calls]
+
+        self.assertEqual(predicates(m.read(builder.BASE)), predicates(m.read(builder.OUTPUT)))
+
+    def test_ownership_fault_matrix_is_finite_and_fail_closed(self):
+        cloud, _, _ = self.cloud()
+        cloud.call("run_instances", **m.launch_fields())
+        instance = "i-00000000000000001"
+        response = cloud.call("describe_instances", InstanceIds=[instance])
+        cases = (
+            ("account", "owner", "PRIVATE_SENTINEL", "account"),
+            ("vm", "ClientToken", "PRIVATE_SENTINEL", "identity_token"),
+            ("vm", "InstanceId", "i-00000000000000002", "identity_token"),
+            ("vm", "ImageId", "PRIVATE_SENTINEL", "image_type"),
+            ("vm", "InstanceType", "PRIVATE_SENTINEL", "image_type"),
+            ("vm", "Tags", [], "diagnostic_tag"),
+            ("vm", "VpcId", "PRIVATE_SENTINEL", "network_key"),
+            ("vm", "SecurityGroups", [], "security_groups"),
+            ("vm", "PublicIpAddress", "1.2.3.4", "public_ip_profile"),
+            ("vm", "IamInstanceProfile", {"Arn": "PRIVATE_SENTINEL"}, "public_ip_profile"),
+            ("vm", "MetadataOptions", {}, "imds_tokens"),
+            ("vm", "MetadataOptions", {"HttpTokens": "optional"}, "imds_tokens"),
+            ("vm", "NetworkInterfaces", [{"Ipv6Addresses": ["PRIVATE_SENTINEL"]}], "ipv6"),
+        )
+        for scope, key, value, expected in cases:
+            with self.subTest(code=expected, key=key):
+                altered = copy.deepcopy(response)
+                reservation = altered["Reservations"][0]
+                if scope == "account":
+                    reservation["OwnerId"] = value
+                else:
+                    reservation["Instances"][0][key] = value
+                with self.assertRaises(m.OwnershipFailure) as caught:
+                    m.owned(altered, instance)
+                self.assertEqual(caught.exception.code, expected)
+                self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+
+    def test_empty_initial_visibility_uses_existing_poll_budget(self):
+        self.control_fault = "empty_boot"
+        result, calls, _, transfer, _ = self.replay()
+        self.assertEqual(result["status"], "source_only_native_transfer_passed")
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(transfer.call_count, 1)
+        self.assertEqual(sum(op == "run_instances" for op, _ in calls), 1)
+        self.assertLessEqual(len(calls), 100)
+
+    def test_empty_cleanup_visibility_requires_positive_ownership(self):
+        self.control_fault = "empty_cleanup"
+        result, calls, _, _, _ = self.replay()
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_ownership_mismatch_prevents_ssh_and_termination(self):
+        self.control_fault = "mismatch"
+        result, calls, control, transfer, files = self.replay()
+        self.assertEqual(result["ownership_failure_code"], "security_groups")
+        self.assertEqual(result["cleanup_ownership_failure_code"], "security_groups")
+        self.assertTrue(result["cleanup_unresolved"])
+        self.assertFalse(any(op == "terminate_instances" for op, _ in calls))
+        self.assertNotIn(b"PRIVATE_SENTINEL", b"".join(files.values()))
+        control.assert_not_called()
+        transfer.assert_not_called()
+
+    def test_persistent_empty_visibility_is_bounded_and_never_assumed_deleted(self):
+        self.control_fault = "empty_forever"
+        result, calls, control, transfer, _ = self.replay()
+        self.assertEqual(result["status"], "failed_no_retry")
+        self.assertTrue(result["cleanup_unresolved"])
+        self.assertFalse(result["terminated_verified"])
+        self.assertLessEqual(len(calls), 100)
+        self.assertLess(result["elapsed_seconds"], 850)
+        self.assertFalse(any(op == "terminate_instances" for op, _ in calls))
+        control.assert_not_called()
+        transfer.assert_not_called()

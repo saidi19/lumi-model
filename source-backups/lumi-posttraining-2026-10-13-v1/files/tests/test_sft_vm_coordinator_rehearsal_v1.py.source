@@ -1,0 +1,216 @@
+"""Portable two-unit supervisor tests: every systemd/mount/uid action doubled."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('generated_coordinator_supervisor',
+    ROOT / 'src/lumi/posttraining_vm_coordinator_rehearsal_v1.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+ATTEMPT, PIN = 'a' * 32, 'b' * 64
+
+
+def summary():
+    return {'schema':'lumi.vm-coordinator-generated-result.v0.1', 'status':'passed',
+        'control_sha256':PIN, 'full_input_audits':2, 'independent_checksum_consumer':True,
+        'coordinator_read_bytes_reserved':1000, 'private_write_bytes_reserved':1000,
+        'package_manifest_sha256':'c' * 64, 'real_4b_import':False, 'training_authorized':False,
+        'production_eligible':False, 'fullsize_resource_admission':False}
+
+
+class CommandTests(unittest.TestCase):
+    def test_fixed_two_unit_sequence_and_readonly_import_binds(self):
+        self.assertEqual(m.MODES, ('prepare', 'import'))
+        prep = m.properties(ATTEMPT, 'prepare')
+        worker = m.properties(ATTEMPT, 'import')
+        self.assertNotIn('TemporaryFileSystem', prep)
+        self.assertTrue(prep['BindPaths'].endswith('/stage:/work'))
+        self.assertIn('/stage/fixture:/inputs', worker['BindReadOnlyPaths'])
+        self.assertIn('/stage/release:/work/release', worker['BindReadOnlyPaths'])
+        self.assertTrue(worker['BindPaths'].endswith('/stage/results:/results'))
+        self.assertNotIn('/inputs', worker['InaccessiblePaths'])
+        self.assertNotIn('BindPaths', m.frozen.properties('chain'))
+        for mode in m.MODES:
+            p = m.properties(ATTEMPT, mode)
+            for key, value in {'PrivateNetwork':'yes', 'PrivateDevices':'yes', 'Restart':'no',
+                'MemoryMax':str(2 * 1024**3), 'MemorySwapMax':'0', 'TasksMax':'64',
+                'RuntimeMaxSec':'90', 'KillMode':'control-group', 'StandardOutput':'null',
+                'StandardError':'null', 'NoNewPrivileges':'yes'}.items():
+                self.assertEqual(p[key], value)
+            command = m.launch_command(ATTEMPT, mode, PIN)
+            self.assertEqual(command[-8:], [str(m.PYTHON), '-I', '-B', str(m.SCRIPT),
+                                            'worker', ATTEMPT, mode, PIN])
+            self.assertNotIn('/bin/sh', command)
+
+    def test_unbound_arguments_reject(self):
+        for attempt, mode, pin in ((True, 'prepare', PIN), ('../escape', 'import', PIN),
+                                  (ATTEMPT, 'real', PIN), (ATTEMPT, 'import', 'bad')):
+            with self.subTest(mode=mode), self.assertRaises(m.Error):
+                m.launch_command(attempt, mode, pin)
+
+    def test_mac_rejects_before_mount_or_source_reads(self):
+        with patch.object(m.sys, 'platform', 'darwin'), \
+                patch.object(m, 'verify_release') as source, patch.object(m, 'run_command') as run:
+            with self.assertRaisesRegex(m.Error, 'host'):
+                m.launch(machine_id=ATTEMPT, attempt=ATTEMPT, release_sha256=PIN)
+            source.assert_not_called()
+            run.assert_not_called()
+
+    def test_mac_worker_rejects_before_preparation_or_child(self):
+        with patch.object(m.sys, 'platform', 'darwin'), \
+                patch.object(m, 'copy_sources') as copy, patch.object(m.subprocess, 'run') as run:
+            with self.assertRaisesRegex(m.Error, 'worker_boundary'):
+                m.worker(ATTEMPT, 'prepare', PIN)
+            copy.assert_not_called()
+            run.assert_not_called()
+
+    def test_import_dispatch_uses_fixed_cold_entry_not_test_runner(self):
+        with patch.object(m, 'worker_check'), \
+                patch.object(m.os, 'statvfs', return_value=SimpleNamespace(f_flag=os.ST_RDONLY)), \
+                patch.object(m.subprocess, 'run',
+                             return_value=SimpleNamespace(returncode=0)) as run:
+            m.worker(ATTEMPT, 'import', PIN)
+        args = run.call_args.args[0]
+        self.assertIn('/work/release/scripts/run_sft_vm_coordinator_entry_v1.py', args)
+        self.assertFalse(any('unittest' in part or 'patch' in part for part in args))
+
+
+class PhaseTests(unittest.TestCase):
+    def setUp(self):
+        self.run = self.enterContext(patch.object(m, 'run_command',
+            return_value=SimpleNamespace(returncode=0, stdout=b'not-found\n')))
+        self.empty = self.enterContext(patch.object(m, 'cgroup_empty', return_value=True))
+        self.observe = self.enterContext(patch.object(m.frozen, 'observe', return_value={
+            'ActiveState':'active', 'SubState':'exited', 'Result':'success',
+            'ExecMainCode':'1', 'ExecMainStatus':'0'}))
+
+    def stops(self):
+        return [call for call in self.run.call_args_list
+                if call.args[0][:2] == ['/usr/bin/systemctl', 'stop']]
+
+    def test_success_stops_exact_unit_once(self):
+        m.run_phase(ATTEMPT, 'import', PIN, float('inf'))
+        self.assertEqual(len(self.stops()), 1)
+        self.assertEqual(self.stops()[0].args[0][-1], m.unit_name(ATTEMPT, 'import'))
+
+    def test_existing_unit_is_not_touched(self):
+        self.run.return_value.stdout = b'loaded\n'
+        with self.assertRaisesRegex(m.Error, 'attempt_used'):
+            m.run_phase(ATTEMPT, 'prepare', PIN, float('inf'))
+        self.assertEqual(self.run.call_count, 1)
+
+    def test_ambiguous_dispatch_stops_once_without_retry(self):
+        self.run.side_effect = [SimpleNamespace(returncode=0, stdout=b'not-found\n'),
+            subprocess.TimeoutExpired('fixed', 15), SimpleNamespace(returncode=0)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            m.run_phase(ATTEMPT, 'import', PIN, float('inf'))
+        self.assertEqual(self.run.call_count, 3)
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_failed_exit_or_nonempty_cgroup_cannot_pass(self):
+        self.observe.return_value['ExecMainStatus'] = '1'
+        with self.assertRaisesRegex(m.Error, 'case_failed'):
+            m.run_phase(ATTEMPT, 'import', PIN, float('inf'))
+        self.observe.return_value['ExecMainStatus'] = '0'
+        self.empty.return_value = False
+        with self.assertRaisesRegex(m.Error, 'cleanup'):
+            m.run_phase(ATTEMPT, 'import', PIN, float('inf'))
+
+    def test_deadline_precedes_dispatch_but_still_stops_once(self):
+        with self.assertRaisesRegex(m.Error, 'deadline'):
+            m.run_phase(ATTEMPT, 'import', PIN, 0)
+        self.assertEqual(len(self.stops()), 1)
+        self.assertFalse(any(call.args[0][0] == '/usr/bin/systemd-run'
+                             for call in self.run.call_args_list))
+
+
+class LifecycleTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix='lumi-generated-vm-lifecycle-')
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.enterContext(patch.object(m, 'ATTEMPTS', self.root))
+        self.enterContext(patch.object(m, 'root_owned'))
+        self.enterContext(patch.object(m.frozen, 'host_check'))
+        self.enterContext(patch.object(m, 'verify_release', return_value={'src/lumi/tiny.py':PIN}))
+        self.enterContext(patch.object(m.os, 'chown'))
+        self.empty = self.enterContext(patch.object(m, 'cgroup_empty', return_value=True))
+        self.mounted = False
+        def command(argv, *_args, **_kwargs):
+            if argv[0] == '/usr/bin/mount':
+                self.mounted = True
+            if argv[0] == '/usr/bin/umount':
+                self.mounted = False
+            return SimpleNamespace(returncode=0)
+        self.run = self.enterContext(patch.object(m, 'run_command', side_effect=command))
+        self.enterContext(patch.object(m.os.path, 'ismount', side_effect=lambda _p:self.mounted))
+        self.phases = []
+        def phase(attempt, mode, pin, deadline):
+            self.assertTrue((self.root / attempt / 'started.json').exists())
+            self.assertEqual(pin, PIN)
+            self.phases.append(mode)
+        self.phase = self.enterContext(patch.object(m, 'run_phase', side_effect=phase))
+        before = {'release/src/lumi/tiny.py':PIN, 'fixture/controls.json':PIN}
+        self.enterContext(patch.object(m, 'inventory', side_effect=[
+            before, before | {'results/summary.json':'c' * 64}]))
+        self.enterContext(patch.object(m, 'small', return_value=json.dumps(summary()).encode()))
+
+    def launch(self):
+        return m.launch(machine_id=ATTEMPT, attempt=ATTEMPT, release_sha256=PIN)
+
+    def test_one_preparation_then_one_import_and_cleanup_before_success(self):
+        report = self.launch()
+        self.assertEqual(self.phases, ['prepare', 'import'])
+        self.assertFalse(self.mounted)
+        self.assertTrue(report['generated_tmpfs_unmounted'])
+        self.assertTrue((self.root / ATTEMPT / 'result.json').exists())
+        self.assertFalse((self.root / ATTEMPT / 'failure.json').exists())
+
+    def test_failed_preparation_never_dispatches_import(self):
+        self.phase.side_effect = m.Error('fixture_failed')
+        with self.assertRaises(m.Error):
+            self.launch()
+        self.assertEqual(self.phase.call_count, 1)
+        self.assertFalse(self.mounted)
+        self.assertTrue((self.root / ATTEMPT / 'failure.json').exists())
+        self.assertFalse((self.root / ATTEMPT / 'result.json').exists())
+
+    def test_prior_attempt_is_preserved_without_mount_or_phase(self):
+        path = self.root / ATTEMPT
+        path.mkdir(mode=0o700)
+        (path / 'sentinel').write_bytes(b'preserve')
+        with self.assertRaisesRegex(m.Error, 'attempt_used'):
+            self.launch()
+        self.run.assert_not_called()
+        self.phase.assert_not_called()
+        self.assertEqual((path / 'sentinel').read_bytes(), b'preserve')
+
+    def test_cleanup_failure_prevents_pass_retains_mount_and_marker(self):
+        self.empty.return_value = False
+        with self.assertRaisesRegex(m.Error, 'cleanup'):
+            self.launch()
+        self.assertTrue(self.mounted)
+        self.assertTrue((self.root / ATTEMPT / 'cleanup-failure.json').exists())
+        self.assertFalse((self.root / ATTEMPT / 'result.json').exists())
+        self.assertFalse(any(call.args[0][0] == '/usr/bin/umount'
+                             for call in self.run.call_args_list))
+
+    def test_forged_or_excessive_aggregate_cannot_pass(self):
+        for key, value in (('real_4b_import', True), ('full_input_audits', True),
+                           ('private_write_bytes_reserved', 5 * 1024**2), ('extra', 'private')):
+            with self.subTest(key=key), self.assertRaises(m.Error):
+                m.validate_summary(json.dumps(summary() | {key:value}).encode(), PIN)
+
+
+if __name__ == '__main__':
+    unittest.main()

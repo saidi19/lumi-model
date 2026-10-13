@@ -1,0 +1,45 @@
+{
+  "schema": "lumi.vm-boot-smoke-proposal.v0.5",
+  "date": "2026-10-08",
+  "approved": false,
+  "execution_permitted": false,
+  "token": "lumi-boot-v2-smoke-20261008-05",
+  "instance_type": "t3.small",
+  "instance_count": 1,
+  "max_seconds": 720,
+  "scope": "Proposal only: one fresh boot-only CPU smoke, no retry, model data, S3, GPU, training, SSH, public IP, NAT, EIP, new IAM or retained-resource changes.",
+  "cleanup": "Terminate only the fresh owned instance, auto-delete only its encrypted 16 GiB root, delete only its new security group.",
+  "caps": {
+    "resource_api_calls": 128,
+    "credential_identity_calls": 4,
+    "api_response_bytes": 16777216,
+    "private_journal_bytes": 1048576
+  },
+  "bindings": {
+    "scripts/execute_sft_vm_boot_smoke_v5.py": "9020c56e957422621d89f2ea26296a4a2ab615cd6fdb008cd43273e44cdb8916",
+    "tests/test_sft_vm_boot_smoke_v5.py": "73c2c5181ab0d8b52e10789b49521d3e9c986eb3f1a94e5b7eb25a0cde53d59b",
+    "scripts/sft_vm_controller_credentials_v2.py": "8de7a85755d79aebd2f27b98482a51cf0b65af4356cd8bd3e583e00e8211aadb",
+    "scripts/run_sft_vm_early_stop_v2.py": "c5df93301f80b1f91a9bb8bb3cc2c833134e7a487d88332604dc657c41fce71d",
+    "scripts/build_sft_vm_initial_boot_v2.py": "b54e195627d91e54e409459b08a544596538496a764de49c675418dba7b7b3a2",
+    "evidence/lumi-vm-boot-smoke-outcome-v0.4.json": "22ba8fec23685ac1994f7b944fe06380c60fbde86b26ed5d4f176a1dbe268f08"
+  },
+  "changes": [
+    "Terminal-state validation permits missing detached network fields only on the already-bound terminated identity; all ownership pins remain mandatory.",
+    "Explicit serial marker routing; at most six cached-console fallback reads within existing 24-poll/360-second observation bound; never merge snapshots or mask nonempty rejection markers.",
+    "Retain cleanup failure stage and operation without exception text."
+  ],
+  "validation": {
+    "tests_run": 83,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 0,
+    "guard_violations": [],
+    "elapsed_seconds": 0.792,
+    "ruff": "pass",
+    "shell_syntax": "pass",
+    "native_boot_passed": false,
+    "live_readonly_preflight_performed": false
+  },
+  "billing": "720-second execution limit is not a hard billing cap; unresolved cleanup must be reported.",
+  "requires": "Fresh explicit approval of this version before creating an approval file or making any cloud call. Current user authorization covers local repair only."
+}

@@ -1,0 +1,268 @@
+"""One authorized endpoint deletion; retain the stopped VM and every other resource."""
+
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+AUDIT = "evidence/lumi-vm-attempt-010-retained-network-observation-v0.1.json"
+AUDIT_SHA = "144bc4dc8500da0042591ddcf1719ebe444c76896558f265a02f94cac485ca40"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-010-endpoint-cleanup-v0.1"
+ACCOUNT, REGION = "573978149073", "us-east-1"
+ATTEMPT = "9b87f7f591a240ef8b10f46b8d008fa0"
+NONCE = "f0e1b394ef5d4586b08a526177b5fe01"
+VPC, SUBNET = "vpc-0905fbf9490a2dead", "subnet-07386c9d440cb3df8"
+TABLE, VM = "rtb-0a737e12d5b748f61", "i-04afbb5dbed16b970"
+ENDPOINT, ENI = "eice-0610246d79f65e4e5", "eni-07a799f9bc52c8511"
+VM_ENI = "eni-0be242b5e8d3de0ca"
+VOLUMES = {"vol-0d4073e16f8374d1e", "vol-0b621ec4cadc3452c"}
+REQUESTS = {
+    "get-caller-identity": {},
+    "describe-instances": {"InstanceIds": [VM]},
+    "describe-volumes": {"VolumeIds": sorted(VOLUMES)},
+    "describe-subnets": {"SubnetIds": [SUBNET]},
+    "describe-route-tables": {"RouteTableIds": [TABLE]},
+    "describe-instance-connect-endpoints": {
+        "Filters": [{"Name": "vpc-id", "Values": [VPC]}],
+        "MaxResults": 20,
+    },
+    "describe-network-interfaces": {
+        "Filters": [{"Name": "subnet-id", "Values": [SUBNET]}],
+        "MaxResults": 100,
+    },
+    "delete-instance-connect-endpoint": {"InstanceConnectEndpointId": ENDPOINT},
+}
+DELETE = "delete-instance-connect-endpoint"
+
+
+def need(value):
+    if not value:
+        raise ValueError("endpoint_cleanup_rejected")
+
+
+def owned(row, nonce=False):
+    for key, value in [("LumiAttempt", ATTEMPT)] + ([("LumiNetworkNonce", NONCE)] if nonce else []):
+        need([t.get("Value") for t in row.get("Tags", []) if t.get("Key") == key] == [value])
+
+
+class Cloud:
+    def __init__(self, save, *, clock=time.monotonic):
+        self.save, self.clock, self.start = save, clock, clock()
+        self.reads = self.writes = self.bytes = 0
+        self.stage = "initial"
+
+    def call(self, operation):
+        need(operation in REQUESTS and self.clock() - self.start < 565)
+        self.stage = operation
+        if operation == DELETE:
+            need(self.writes == 0)
+            self.writes = 1
+            self.save("delete-dispatch", dict(endpoint=ENDPOINT, retry=False))
+        else:
+            need(self.reads < 30)
+            self.reads += 1
+        service = "sts" if operation == "get-caller-identity" else "ec2"
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("AWS_")
+            and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                REGION,
+                "--endpoint-url",
+                f"https://{service}.{REGION}.amazonaws.com",
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+                "--no-cli-pager",
+                service,
+                operation,
+                "--cli-input-json",
+                json.dumps(REQUESTS[operation]),
+                "--output",
+                "json",
+                "--no-paginate",
+            ],
+            capture_output=True,
+            timeout=30,
+            env=env,
+        )
+        need(len(result.stdout) <= 262144 and len(result.stderr) <= 8192)
+        self.bytes += len(result.stdout) + len(result.stderr)
+        need(self.bytes <= 4194304)
+        self.save(
+            f"call-{self.reads + self.writes:02d}",
+            dict(operation=operation, acknowledged=result.returncode == 0),
+        )
+        need(result.returncode == 0)
+        value = json.loads(result.stdout or b"{}")
+        need(not any(value.get(k) for k in ("NextToken", "nextToken", "IsTruncated")))
+        return value
+
+
+class Cleanup:
+    def __init__(self, cloud, *, wait=time.sleep):
+        self.c, self.wait = cloud, wait
+
+    def preserved(self):
+        reservations = self.c.call("describe-instances")["Reservations"]
+        need(len(reservations) == 1 and reservations[0]["OwnerId"] == ACCOUNT)
+        rows = reservations[0]["Instances"]
+        need(len(rows) == 1)
+        row = rows[0]
+        need(row["InstanceId"] == VM and row["State"]["Name"] == "stopped")
+        need(row["VpcId"] == VPC and row["SubnetId"] == SUBNET and row["ClientToken"] == ATTEMPT)
+        need(row["InstanceType"] == "r6i.4xlarge")
+        disks = row["BlockDeviceMappings"]
+        need({d["Ebs"]["VolumeId"] for d in disks} == VOLUMES)
+        need(all(d["Ebs"]["DeleteOnTermination"] is False for d in disks))
+        volumes = self.c.call("describe-volumes")["Volumes"]
+        need(len(volumes) == 2 and {v["VolumeId"] for v in volumes} == VOLUMES)
+        for volume in volumes:
+            need(volume["State"] == "in-use" and len(volume["Attachments"]) == 1)
+            need(volume["Attachments"][0]["InstanceId"] == VM)
+        subnets = self.c.call("describe-subnets")["Subnets"]
+        need(len(subnets) == 1)
+        subnet = subnets[0]
+        need(subnet["SubnetId"] == SUBNET and subnet["VpcId"] == VPC)
+        need(subnet["OwnerId"] == ACCOUNT and subnet["CidrBlock"] == "172.31.96.32/27")
+        owned(subnet, True)
+        tables = self.c.call("describe-route-tables")["RouteTables"]
+        need(len(tables) == 1)
+        table = tables[0]
+        need(
+            table["RouteTableId"] == TABLE and table["VpcId"] == VPC and table["OwnerId"] == ACCOUNT
+        )
+        owned(table, True)
+        need(len(table["Associations"]) == 1)
+        need(table["Associations"][0]["SubnetId"] == SUBNET)
+        need(table["Associations"][0]["Main"] is False)
+        need(not any(r.get("DestinationCidrBlock") == "0.0.0.0/0" for r in table["Routes"]))
+
+    def endpoint(self):
+        rows = self.c.call("describe-instance-connect-endpoints")["InstanceConnectEndpoints"]
+        need(type(rows) is list and len(rows) <= 20)
+        active = [r for r in rows if r["State"] != "delete-complete"]
+        need(all(r["InstanceConnectEndpointId"] == ENDPOINT for r in active))
+        selected = [r for r in rows if r["InstanceConnectEndpointId"] == ENDPOINT]
+        need(len(selected) <= 1)
+        if not selected:
+            return None
+        row = selected[0]
+        need(row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC and row["SubnetId"] == SUBNET)
+        owned(row)
+        if row["State"] == "create-complete":
+            need(row["NetworkInterfaceIds"] == [ENI])
+        return row["State"]
+
+    def interfaces(self, deleted):
+        rows = self.c.call("describe-network-interfaces")["NetworkInterfaces"]
+        need({r["NetworkInterfaceId"] for r in rows} == ({VM_ENI} if deleted else {VM_ENI, ENI}))
+        for row in rows:
+            need(row["OwnerId"] == ACCOUNT and row["SubnetId"] == SUBNET and row["VpcId"] == VPC)
+            if row["NetworkInterfaceId"] == VM_ENI:
+                need(row["Attachment"]["InstanceId"] == VM)
+            else:
+                need(row["InterfaceType"] == "ec2_instance_connect_endpoint")
+                need(not row.get("Attachment", {}).get("InstanceId"))
+
+    def run(self):
+        need(self.c.call("get-caller-identity")["Account"] == ACCOUNT)
+        self.preserved()
+        state = self.endpoint()
+        if state in (None, "delete-complete"):
+            self.interfaces(True)
+            return dict(status="already_absent_no_mutation", cleanup_verified=True)
+        need(state == "create-complete")
+        self.interfaces(False)
+        self.c.save("preflight", dict(ownership_verified=True, preserved_resources_verified=True))
+        self.c.call(DELETE)
+        for _ in range(16):
+            if self.endpoint() in (None, "delete-complete"):
+                break
+            need(self.c.clock() - self.c.start < 580)
+            self.wait(10)
+        else:
+            raise ValueError("endpoint_deletion_not_observed_no_retry")
+        self.interfaces(True)
+        self.preserved()
+        return dict(status="endpoint_removed_preserved_resources_verified", cleanup_verified=True)
+
+
+def main():
+    raw = (ROOT / AUDIT).read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == AUDIT_SHA)
+    for name, digest in json.loads(raw)["source_bindings"].items():
+        need(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest)
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = (json.dumps(value, sort_keys=True) + "\n").encode()
+        need(written + len(raw) <= 1048576)
+        fd = os.open(
+            OUTPUT / (name + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    save(
+        "started",
+        dict(
+            human_authorization="ok kor",
+            endpoint=ENDPOINT,
+            audit_sha256=AUDIT_SHA,
+            source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            maximum_reads=30,
+            maximum_delete_dispatches=1,
+            maximum_seconds=600,
+            retry=False,
+            gpu=False,
+            training=False,
+        ),
+    )
+    cloud = Cloud(save)
+    report = dict(
+        status="stopped_no_retry",
+        cleanup_verified=False,
+        endpoint=ENDPOINT,
+        instance_actions=0,
+        s3_actions=0,
+        gpu=False,
+        training=False,
+        gate_5_complete=False,
+    )
+    try:
+        report.update(Cleanup(cloud).run())
+    except BaseException:
+        report["failed_stage"] = cloud.stage
+    finally:
+        report.update(
+            reads=cloud.reads,
+            delete_dispatches=cloud.writes,
+            response_bytes=cloud.bytes,
+            elapsed_seconds=round(cloud.clock() - cloud.start, 3),
+        )
+        save("result", report)
+        print(json.dumps(report, sort_keys=True))
+    return report
+
+
+if __name__ == "__main__":
+    main()

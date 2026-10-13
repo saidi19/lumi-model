@@ -1,0 +1,327 @@
+"""Synthetic fixed-frame and stream tests; no native listener/process operations."""
+
+import json
+import os
+import threading
+import unittest
+from unittest.mock import Mock, patch
+
+from lumi import posttraining_checkpoint_write_broker_v1 as core
+from lumi import posttraining_checkpoint_write_ledger_v1 as ledger
+from lumi import posttraining_checkpoint_write_listener_v1 as listener
+
+
+class LedgerTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 100
+        self.clock = patch.object(ledger.time, "monotonic_ns", side_effect=lambda: self.now)
+        self.clock.start()
+        self.addCleanup(self.clock.stop)
+        self.budget = core.make_budget(
+            maximum_bytes=50, maximum_notifications=3, maximum_call_bytes=20,
+            precharged_bytes=5,
+        )
+        self.parent = ledger._ParentLedger(self.budget, deadline_ns=1000)
+        self.bound = listener._Listener(-1, (), (os.getpid(), threading.get_ident()))
+        self.bound.receive_admitted_once = Mock(return_value=self.notification(1, 10))
+        self.bound.id_valid = Mock(return_value=True)
+        self.bound.send_response = Mock(return_value=None)
+        self.session = ledger._BrokerSession(self.bound, self.budget, deadline_ns=1000)
+
+    @staticmethod
+    def notification(identifier, count):
+        return core.NOTIFICATION.pack(
+            identifier, 20, 0, 1, core.AUDIT_ARCH_X86_64, 0, 11, 999, count, 0, 0, 0,
+        )
+
+    def exchange(self, raw):
+        frames = []
+        self.parent._accept_admitted_once(raw, send_ack=frames.append)
+        self.assertEqual(len(frames), 1)
+        return frames[0]
+
+    def accept(self, ordinal=1, count=10, total=15, send_ack=lambda _raw: None):
+        self.parent._accept_admitted_once(
+            ledger.encode_offer(ordinal, count, total), send_ack=send_ack,
+        )
+
+    def test_fixed_frame_sizes_and_roundtrip(self):
+        self.assertEqual(len(ledger.encode_offer(1, 0, 5)), 24)
+        self.assertEqual(ledger.decode_offer(ledger.encode_offer(1, 0, 5)), (1, 0, 5))
+        self.assertEqual(len(ledger.encode_ack(1)), 8)
+
+    def test_codec_rejects_noninteger_and_range(self):
+        for values in ((True, 0, 5), (0, 0, 5), (-1, 0, 5), (1, -1, 5),
+                       (1, 0, 2**64), (1.0, 0, 5)):
+            with self.subTest(values=values), self.assertRaises(ledger.LedgerError):
+                ledger.encode_offer(*values)
+        for value in (True, 0, -1, 2**64):
+            with self.subTest(value=value), self.assertRaises(ledger.LedgerError):
+                ledger.encode_ack(value)
+
+    def test_decode_rejects_wrong_type_shape_and_zero_ordinal(self):
+        for raw in (b"", bytes(23), bytes(25), bytearray(24), bytes(24), "x" * 24):
+            with self.subTest(kind=type(raw)), self.assertRaises(ledger.LedgerError):
+                ledger.decode_offer(raw)
+
+    def test_public_always_closed(self):
+        with self.assertRaisesRegex(ledger.LedgerError, "host_guard_not_bound"):
+            ledger.run_write_ledger(approved=True)
+
+    def test_exact_listener_required(self):
+        with self.assertRaisesRegex(ledger.LedgerError, "listener_rejected"):
+            ledger._BrokerSession(Mock(), self.budget, deadline_ns=1000)
+
+    def test_deadline_contract(self):
+        for deadline in (True, 100, 99, 2**63, 3_600_000_000_101):
+            with self.subTest(deadline=deadline), self.assertRaises(ledger.LedgerError):
+                ledger._ParentLedger(self.budget, deadline_ns=deadline)
+
+    def test_budget_copied_and_malformed_rejected(self):
+        self.budget["maximum_bytes"] = 1000
+        self.assertEqual(self.parent._budget["maximum_bytes"], 50)
+        self.assertEqual(self.session._budget["maximum_bytes"], 50)
+        with self.assertRaisesRegex(ledger.LedgerError, "budget_rejected"):
+            ledger._ParentLedger({"approval": True}, deadline_ns=1000)
+
+    def test_parent_stores_before_ack(self):
+        def ack(raw):
+            self.assertEqual(raw, ledger.encode_ack(1))
+            self.assertEqual(self.parent._reserved, 15)
+            self.assertEqual(self.parent._accepted, 1)
+        self.accept(send_ack=ack)
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+
+    def test_parent_ack_failure_never_refunds(self):
+        with self.assertRaises(ledger.LedgerError):
+            self.accept(send_ack=Mock(side_effect=RuntimeError("private sentinel")))
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+        self.assertTrue(self.parent.snapshot()["terminal_failed"])
+        with self.assertRaisesRegex(ledger.LedgerError, "already_failed"):
+            self.accept(2, 5, 20)
+
+    def test_parent_ambiguous_ack_return_rejected(self):
+        with self.assertRaisesRegex(ledger.LedgerError, "ack_rejected"):
+            self.accept(send_ack=lambda _raw: True)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 1)
+
+    def test_parent_replay_and_gap_terminal(self):
+        for ordinal in (1, 3):
+            self.parent = ledger._ParentLedger(self.budget, deadline_ns=1000)
+            self.accept()
+            with self.subTest(ordinal=ordinal), self.assertRaisesRegex(
+                    ledger.LedgerError, "sequence_rejected"):
+                self.accept(ordinal, 0, 15)
+
+    def test_parent_total_must_be_exact(self):
+        for total in (0, 5, 14, 16):
+            self.parent = ledger._ParentLedger(self.budget, deadline_ns=1000)
+            with self.subTest(total=total), self.assertRaises(ledger.LedgerError):
+                self.accept(total=total)
+            self.assertEqual(self.parent.snapshot()["reserved_bytes"], 5)
+
+    def test_parent_call_and_total_caps(self):
+        with self.assertRaisesRegex(ledger.LedgerError, "budget_exhausted"):
+            self.accept(count=21, total=26)
+        self.parent = ledger._ParentLedger(self.budget, deadline_ns=1000)
+        self.accept(count=20, total=25)
+        self.accept(2, 20, 45)
+        with self.assertRaisesRegex(ledger.LedgerError, "budget_exhausted"):
+            self.accept(3, 6, 51)
+
+    def test_zero_requests_consume_notification_cap(self):
+        for ordinal in range(1, 4):
+            self.accept(ordinal, 0, 5)
+        with self.assertRaisesRegex(ledger.LedgerError, "budget_exhausted"):
+            self.accept(4, 0, 5)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 3)
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 5)
+
+    def test_parent_deadline_before_ack_prevents_offer(self):
+        self.now = 1000
+        send = Mock()
+        with self.assertRaisesRegex(ledger.LedgerError, "deadline_exhausted"):
+            self.accept(send_ack=send)
+        send.assert_not_called()
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 5)
+
+    def test_parent_deadline_after_ack_terminal_and_reserved(self):
+        def ack(_raw):
+            self.now = 1000
+        with self.assertRaisesRegex(ledger.LedgerError, "deadline_exhausted"):
+            self.accept(send_ack=ack)
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+
+    def test_parent_swallowed_reentry_still_fails(self):
+        def ack(_raw):
+            with self.assertRaisesRegex(ledger.LedgerError, "reentry"):
+                self.parent.snapshot()
+        with self.assertRaisesRegex(ledger.LedgerError, "already_failed"):
+            self.accept(send_ack=ack)
+
+    def test_parent_wrong_owner_terminal(self):
+        with patch.object(ledger.os, "getpid", return_value=os.getpid() + 1):
+            with self.assertRaisesRegex(ledger.LedgerError, "owner_mismatch"):
+                self.accept()
+        self.assertTrue(self.parent.snapshot()["terminal_failed"])
+
+    def test_ack_before_any_id_validation_or_response(self):
+        events = []
+        def exchange(raw):
+            events.append("offer")
+            acknowledgment = self.exchange(raw)
+            events.append("ack")
+            return acknowledgment
+        def valid(_identifier):
+            events.append("validate")
+            self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+            return True
+        def respond(_raw):
+            events.append("response")
+        self.bound.id_valid.side_effect = valid
+        self.bound.send_response.side_effect = respond
+        self.session._service_admitted_once(exchange_offer=exchange)
+        self.assertEqual(events, ["offer", "ack", "validate", "response"])
+        self.assertEqual(self.session.snapshot()["parent_acknowledged_bytes"], 15)
+
+    def test_three_distinct_requests_match_parent_and_core(self):
+        self.bound.receive_admitted_once.side_effect = [self.notification(10, 10),
+            self.notification(11, 0), self.notification(12, 20)]
+        for _ in range(3):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 35)
+        self.assertEqual(self.session.snapshot()["parent_acknowledged_bytes"], 35)
+        self.assertEqual(self.session._core.snapshot()["reserved_bytes"], 35)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 3)
+
+    def test_duplicate_private_id_stops_before_second_offer(self):
+        exchange = Mock(side_effect=self.exchange)
+        self.session._service_admitted_once(exchange_offer=exchange)
+        with self.assertRaisesRegex(ledger.LedgerError, "duplicate_notification"):
+            self.session._service_admitted_once(exchange_offer=exchange)
+        self.assertEqual(exchange.call_count, 1)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 1)
+
+    def test_stale_kernel_id_reserved_without_response(self):
+        self.bound.id_valid.return_value = False
+        with self.assertRaisesRegex(ledger.LedgerError, "broker_failed"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.bound.send_response.assert_not_called()
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+
+    def test_receive_failure_before_offer(self):
+        self.bound.receive_admitted_once.side_effect = OSError("private sentinel")
+        exchange = Mock()
+        with self.assertRaisesRegex(ledger.LedgerError, "listener_failed"):
+            self.session._service_admitted_once(exchange_offer=exchange)
+        exchange.assert_not_called()
+        self.assertEqual(self.session.snapshot()["offers_attempted"], 0)
+
+    def test_malformed_notification_never_offered(self):
+        self.bound.receive_admitted_once.return_value = b"private sentinel"
+        with self.assertRaisesRegex(ledger.LedgerError, "listener_failed"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 0)
+
+    def test_session_cap_before_parent_offer(self):
+        self.bound.receive_admitted_once.return_value = self.notification(1, 21)
+        with self.assertRaisesRegex(ledger.LedgerError, "budget_exhausted"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 0)
+
+    def test_missing_ack_consumes_attempt_without_continuation(self):
+        with self.assertRaisesRegex(ledger.LedgerError, "ack_rejected"):
+            self.session._service_admitted_once(exchange_offer=lambda _raw: b"")
+        self.assertEqual(self.session.snapshot()["reserved_bytes"], 15)
+        self.assertEqual(self.session.snapshot()["parent_acknowledged_bytes"], 5)
+        self.bound.id_valid.assert_not_called()
+
+    def test_replayed_or_wrong_type_ack_rejected(self):
+        for raw in (ledger.encode_ack(2), bytearray(ledger.encode_ack(1)), b"A"):
+            session = ledger._BrokerSession(self.bound, self.budget, deadline_ns=1000)
+            with self.subTest(kind=type(raw)), self.assertRaisesRegex(
+                    ledger.LedgerError, "ack_rejected"):
+                session._service_admitted_once(exchange_offer=lambda _offer: raw)
+        self.bound.id_valid.assert_not_called()
+
+    def test_lost_ack_keeps_parent_upper_bound(self):
+        def exchange(raw):
+            self.exchange(raw)
+            raise OSError("private sentinel")
+        with self.assertRaises(ledger.LedgerError):
+            self.session._service_admitted_once(exchange_offer=exchange)
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+        self.assertEqual(self.session.snapshot()["parent_acknowledged_bytes"], 5)
+        self.bound.send_response.assert_not_called()
+
+    def test_failure_after_ack_keeps_parent_upper_bound(self):
+        self.bound.send_response.side_effect = OSError("private sentinel")
+        with self.assertRaisesRegex(ledger.LedgerError, "broker_failed"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+        self.assertEqual(self.session.snapshot()["parent_acknowledged_bytes"], 15)
+        with self.assertRaisesRegex(ledger.LedgerError, "already_failed"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+
+    def test_session_deadline_after_receive_prevents_offer(self):
+        def receive():
+            self.now = 1000
+            return self.notification(1, 10)
+        self.bound.receive_admitted_once.side_effect = receive
+        with self.assertRaisesRegex(ledger.LedgerError, "deadline_exhausted"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.assertEqual(self.parent.snapshot()["offers_accepted"], 0)
+
+    def test_session_deadline_after_ack_prevents_continuation(self):
+        def exchange(raw):
+            acknowledgment = self.exchange(raw)
+            self.now = 1000
+            return acknowledgment
+        with self.assertRaisesRegex(ledger.LedgerError, "deadline_exhausted"):
+            self.session._service_admitted_once(exchange_offer=exchange)
+        self.bound.id_valid.assert_not_called()
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+
+    def test_session_deadline_after_send_terminal(self):
+        def send(_raw):
+            self.now = 1000
+        self.bound.send_response.side_effect = send
+        with self.assertRaisesRegex(ledger.LedgerError, "broker_failed"):
+            self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.assertTrue(self.session.snapshot()["terminal_failed"])
+        self.assertEqual(self.parent.snapshot()["reserved_bytes"], 15)
+
+    def test_session_swallowed_callback_reentry_still_fails(self):
+        def exchange(raw):
+            with self.assertRaisesRegex(ledger.LedgerError, "reentry"):
+                self.session.snapshot()
+            return self.exchange(raw)
+        with self.assertRaisesRegex(ledger.LedgerError, "already_failed"):
+            self.session._service_admitted_once(exchange_offer=exchange)
+        self.bound.id_valid.assert_not_called()
+
+    def test_session_owner_mismatch_before_receive(self):
+        with patch.object(ledger.threading, "get_ident", return_value=-1):
+            with self.assertRaisesRegex(ledger.LedgerError, "owner_mismatch"):
+                self.session._service_admitted_once(exchange_offer=self.exchange)
+        self.bound.receive_admitted_once.assert_not_called()
+
+    def test_snapshots_are_detached_aggregate_and_raw_text_free(self):
+        self.session._service_admitted_once(exchange_offer=self.exchange)
+        for stream in (self.parent, self.session):
+            snapshot = stream.snapshot()
+            self.assertTrue(all(type(value) in (str, bool, int) for value in snapshot.values()))
+            self.assertFalse(any(key in snapshot for key in ("id", "raw", "response", "error")))
+            self.assertTrue(all(snapshot[flag] is False for flag in ledger.FALSE_FLAGS))
+            snapshot["reserved_bytes"] = 0
+            self.assertEqual(stream.snapshot()["reserved_bytes"], 15)
+            self.assertNotIn("private sentinel", json.dumps(snapshot))
+
+    def test_control_transport_overhead_bounded_by_notification_cap(self):
+        snapshot = self.parent.snapshot()
+        self.assertEqual(snapshot["maximum_offer_bytes"], 72)
+        self.assertEqual(snapshot["maximum_ack_bytes"], 24)
+
+
+if __name__ == "__main__":
+    unittest.main()

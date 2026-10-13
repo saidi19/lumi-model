@@ -1,0 +1,74 @@
+"""Fresh-process authentication of saved entries, metadata bounds and templates."""
+
+import importlib
+import json
+import socket
+import sys
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+cpu = importlib.import_module("scripts.execute_sft_vm_private_outer_v16")
+watch = importlib.import_module("scripts.execute_sft_vm_inert_watchdog_v8")
+bucket = importlib.import_module("scripts.sft_vm_dedicated_cleanup_bucket_v6")
+bindings = importlib.import_module("scripts.prepare_sft_vm_deployment_bindings_v8")
+
+
+class Tests(unittest.TestCase):
+    def test_actual_saved_source_and_predecessor_graph(self):
+        cpu.local_preconditions()
+        self.assertEqual(len(cpu.outer.loading.sources.inputs()), 34)
+        watch.sources()
+        bucket.sources()
+
+    def test_only_pinned_release_has_larger_read_bound(self):
+        path = cpu.RELEASE / "release.json"
+        self.assertGreater(path.stat().st_size, 131072)
+        with self.assertRaises(ValueError):
+            cpu.bounded(path)
+        self.assertEqual(cpu.sha(cpu.bounded(path, 262144)), cpu.RELEASE_SHA)
+
+    def test_pending_templates_match_actual_files_but_grant_no_authority(self):
+        for module, template in (
+            (cpu, "configs/lumi-vm-private-outer-execution-approval-template-v0.16.json"),
+            (watch, "configs/lumi-vm-attempt-015-watchdog-execution-approval-template-v0.1.json"),
+        ):
+            value = json.loads((ROOT / template).read_bytes())
+            raw = module.PROPOSAL.read_bytes()
+            self.assertEqual(value["proposal_sha256"], module.sha(raw))
+            self.assertEqual(value["entry_sha256"], module.sha(Path(module.__file__).read_bytes()))
+            self.assertEqual(module.decode(raw), module.expected_proposal())
+            self.assertEqual(value["approved_execution_count"], 0)
+            self.assertIsNone(value["human_message"])
+            self.assertFalse(module.APPROVAL.exists())
+            self.assertFalse(module.OUTPUT.exists())
+        self.assertFalse(cpu.AUDIT.exists())
+        value = json.loads(
+            (
+                ROOT / "configs/lumi-vm-attempt-015-cleanup-bucket-approval-template-v0.1.json"
+            ).read_bytes()
+        )
+        expected = bucket.expected_approval("pending")
+        expected.update(
+            human_message=None, approved_execution_count=0, status="pending_explicit_human_approval"
+        )
+        self.assertEqual(value, expected)
+        self.assertFalse(bucket.APPROVAL.exists() or bucket.OUTPUT.exists())
+
+    def test_new_controls_missing_fail_closed(self):
+        self.assertFalse((ROOT / bindings.WATCH).exists())
+        self.assertFalse((ROOT / bindings.STORE).exists())
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            bindings.controls()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("external_execution_forbidden")
+
+    sys.addaudithook(guard)
+    unittest.main()

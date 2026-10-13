@@ -1,0 +1,419 @@
+"""Metadata doubles only: no native ML import, CUDA, network or model access."""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import stat
+import sys
+import types
+import unittest
+from contextlib import ExitStack
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+SPEC = importlib.util.spec_from_file_location(
+    "_synthetic_sft_cold_runtime_v1",
+    Path(__file__).resolve().parents[1] / "src/lumi/posttraining_sft_cold_runtime_v1.py")
+runtime = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(runtime)
+
+
+class ColdRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.old_attempted = runtime._ATTEMPTED
+        runtime._ATTEMPTED = False
+        self.addCleanup(setattr, runtime, "_ATTEMPTED", self.old_attempted)
+        self.events = []
+        self.now = 1_000_000
+        self.pre = Mock(side_effect=lambda: self.events.append("pre"))
+        self.health = Mock(side_effect=lambda: self.events.append("health"))
+        self.interrupt = Mock(return_value=None)
+        self.current = None
+        self.world = types.SimpleNamespace(WORLD=None)
+        self.group = object()
+        self.destroyed = []
+        self.cuda = types.SimpleNamespace(
+            is_initialized=lambda: self.current is not None,
+            is_available=lambda: True, device_count=lambda: 8,
+            set_device=self.set_device, current_device=lambda: self.current,
+            is_bf16_supported=lambda **kw: kw == {"including_emulation": False})
+        self.dist = types.SimpleNamespace(
+            is_available=lambda: True, is_nccl_available=lambda: True,
+            is_initialized=lambda: self.world.WORLD is not None, group=self.world,
+            TCPStore=self.store, PrefixStore=lambda prefix, store: (prefix, store),
+            init_process_group=self.init_group, destroy_process_group=self.destroy,
+            get_world_size=lambda group: 8, get_rank=lambda group: self.rank,
+            get_backend=lambda group: "nccl")
+        self.torch = types.ModuleType("torch")
+        self.torch.__version__ = "2.10.0"
+        self.torch.cuda, self.torch.distributed = self.cuda, self.dist
+        self.torch.device = lambda kind, rank: types.SimpleNamespace(type=kind, index=rank)
+        self.modules = {name: types.ModuleType(name) for name in runtime.MODULES}
+        self.modules["torch"] = self.torch
+        self.modules["lumi.distributed_training"].DistributedContext = types.SimpleNamespace
+        self.rank = 0
+
+    def set_device(self, index):
+        self.events.append("cuda")
+        self.current = index
+
+    def store(self, *args, **kwargs):
+        self.events.append("store")
+        self.store_args = args, kwargs
+        return object()
+
+    def init_group(self, **kwargs):
+        self.events.append("group")
+        self.group_kwargs = kwargs
+        self.world.WORLD = self.group
+
+    def destroy(self, group):
+        self.events.append("destroy")
+        self.destroyed.append(group)
+        self.world.WORLD = None
+
+    def make(self, **changes):
+        return runtime.ColdRuntime(**{
+            "source_root": "/work/release/src/lumi",
+            "dependency_root": "/work/runtime/site-packages", "rank": self.rank,
+            "port": 23456, "epoch_sha256": "a" * 64,
+            "deadline_ns": 10_000_000_000, "maximum_operation_ns": 2_000_000_000,
+            "pre_ml": self.pre, "check_health": self.health, "interrupt": self.interrupt,
+            "clock_ns": lambda: self.now, **changes})
+
+    def start(self, client):
+        with patch.object(runtime, "_cold"), \
+                patch.object(client, "_load", return_value=self.modules):
+            return client.start()
+
+    def error(self, code, fn):
+        with self.assertRaises(runtime.ColdRuntimeError) as caught:
+            fn()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn("PRIVATE", repr(caught.exception))
+
+    def test_constructor_inert_and_invalid_metadata(self):
+        self.make()
+        self.assertEqual(self.events, [])
+        self.assertFalse(runtime._ATTEMPTED)
+        for kw in ({"rank": True}, {"rank": 8}, {"port": 0}, {"port": True},
+                   {"epoch_sha256": "PRIVATE"}, {"deadline_ns": True},
+                   {"maximum_operation_ns": 999}, {"source_root": "/tmp/../x"},
+                   {"dependency_root": "/x/"}, {"source_root": "//x"},
+                   {"check_health": self.pre}):
+            self.error("invalid_arguments", lambda kw=kw: self.make(**kw))
+
+    def test_real_mac_cold_check_stops_before_callback_or_import(self):
+        client = self.make()
+        with patch.object(runtime.sys, "platform", "darwin"), patch.object(client, "_load") as load:
+            self.error("cold_runtime_required", client.start)
+            load.assert_not_called()
+        self.pre.assert_not_called()
+        self.assertTrue(runtime._ATTEMPTED)
+
+    def test_denied_pre_admission_never_imports(self):
+        self.pre.side_effect = None
+        self.pre.return_value = False
+        client = self.make()
+        with patch.object(runtime, "_cold"), patch.object(client, "_load") as load:
+            self.error("admission_rejected", client.start)
+            load.assert_not_called()
+        self.assertEqual(self.events, [])
+        self.interrupt.assert_called_once()
+
+    def test_admission_rechecked_for_warm_modules(self):
+        client = self.make()
+        with patch.object(runtime, "_cold", side_effect=[None,
+                runtime.ColdRuntimeError("cold_runtime_required")]), \
+                patch.object(client, "_load") as load:
+            self.error("cold_runtime_required", client.start)
+            load.assert_not_called()
+
+    def test_exact_start_order_explicit_rank_store_and_context(self):
+        self.rank = 3
+        client = self.make()
+        context = self.start(client)
+        self.assertEqual(self.events,
+                         ["pre", "health", "cuda", "health", "store", "group", "health"])
+        self.assertEqual(vars(context), {"rank": 3, "local_rank": 3, "world_size": 8,
+                                        "backend": "nccl", "device": context.device})
+        self.assertEqual(vars(context.device), {"type": "cuda", "index": 3})
+        args, kw = self.store_args
+        self.assertEqual(args, ("127.0.0.1", 23456))
+        self.assertEqual(kw, {"world_size": 8, "is_master": False, "timeout": timedelta(seconds=2),
+                              "wait_for_workers": True, "multi_tenant": False})
+        self.assertEqual(set(self.group_kwargs), {"backend", "store", "rank", "world_size",
+                                                 "timeout", "device_id"})
+        self.assertEqual(self.group_kwargs["store"][0], "a" * 64)
+        client.check_health()
+        self.pre.assert_called_once()
+        self.assertEqual(self.health.call_count, 4)
+        client.close()
+        client.close()
+        self.assertEqual(self.destroyed, [self.group])
+        self.assertEqual(client.summary()["state"], "closed")
+        self.assertFalse(client.summary()["execution_authorized"])
+
+    def test_rank_zero_owns_rendezvous(self):
+        self.start(self.make())
+        self.assertIs(self.store_args[1]["is_master"], True)
+
+    def test_global_attempt_prevents_fresh_object_retry(self):
+        self.start(self.make())
+        other = self.make()
+        self.error("already_consumed", lambda: self.start(other))
+        self.pre.assert_called_once()
+
+    def test_import_exception_is_fixed_and_terminal(self):
+        client = self.make()
+        with patch.object(runtime, "_cold"), \
+                patch.object(client, "_load", side_effect=ValueError("PRIVATE")):
+            self.error("import_failed", client.start)
+        self.error("import_failed", client.start)
+        self.interrupt.assert_called_once()
+        self.assertNotIn("PRIVATE", json.dumps(client.summary()))
+
+    def test_wrong_torch_or_unavailable_nccl_no_cuda(self):
+        for change in ("version", "nccl"):
+            runtime._ATTEMPTED = False
+            self.torch.__version__ = "2.9.0" if change == "version" else "2.10.0"
+            self.dist.is_nccl_available = lambda: False
+            self.error("runtime_rejected", lambda: self.start(self.make()))
+        self.assertNotIn("cuda", self.events)
+
+    def test_preexisting_group_never_destroyed(self):
+        self.world.WORLD = object()
+        client = self.make()
+        self.error("runtime_rejected", lambda: self.start(client))
+        client.close()
+        self.assertEqual(self.destroyed, [])
+
+    def test_warm_cuda_no_device_setup(self):
+        self.current = 0
+        self.error("runtime_rejected", lambda: self.start(self.make()))
+        self.assertNotIn("cuda", self.events)
+
+    def test_health_denial_after_import_precedes_cuda(self):
+        self.health.side_effect = ValueError("PRIVATE")
+        self.error("health_rejected", lambda: self.start(self.make()))
+        self.assertNotIn("cuda", self.events)
+
+    def test_health_cannot_initialize_group_or_cuda(self):
+        self.health.side_effect = lambda: setattr(self.world, "WORLD", object())
+        client = self.make()
+        self.error("runtime_rejected", lambda: self.start(client))
+        client.close()
+        self.assertEqual(self.destroyed, [])
+
+    def test_missing_eight_devices_stops_before_store(self):
+        self.cuda.device_count = lambda: 1
+        self.error("cuda_failed", lambda: self.start(self.make()))
+        self.assertNotIn("store", self.events)
+
+    def test_native_bf16_required(self):
+        self.cuda.is_bf16_supported = lambda **kw: False
+        self.error("cuda_failed", lambda: self.start(self.make()))
+        self.assertNotIn("store", self.events)
+
+    def test_health_denial_after_cuda_stops_before_store(self):
+        self.health.side_effect = [None, False]
+        self.error("health_rejected", lambda: self.start(self.make()))
+        self.assertNotIn("store", self.events)
+
+    def test_second_health_cannot_inject_unowned_group(self):
+        def health():
+            if self.current is not None:
+                self.world.WORLD = object()
+        self.health.side_effect = health
+        client = self.make()
+        self.error("runtime_rejected", lambda: self.start(client))
+        client.close()
+        self.assertNotIn("store", self.events)
+        self.assertEqual(self.destroyed, [])
+
+    def test_model_preparation_uses_post_import_health_and_existing_context(self):
+        from . import test_sft_model_prepare_v1 as fixture
+
+        client = self.make()
+        context = self.start(client)
+        preparation_fixture = fixture.PreparationTests()
+        preparation_fixture.setUp()
+        preparation_fixture.context = context
+        preparation = fixture.prep.ModelPreparation(**preparation_fixture.options(
+            context=context, admit=client.check_health))
+        with preparation_fixture.native_double(preparation):
+            prepared = preparation()
+        self.assertEqual(preparation.summary()["state"], "complete")
+        self.pre.assert_called_once()
+        self.assertEqual(self.health.call_count, 4)
+        prepared.close()
+        # Rank resources retire before the separately owned distributed runtime.
+        self.assertEqual(preparation_fixture.events[-1], "release")
+        client.close()
+        self.assertEqual(self.destroyed, [self.group])
+
+    def test_group_failure_no_cleanup_of_unowned_partial_group(self):
+        def partial(**kw):
+            self.world.WORLD = object()
+            raise ValueError("PRIVATE")
+        self.dist.init_process_group = partial
+        client = self.make()
+        self.error("group_failed", lambda: self.start(client))
+        client.close()
+        self.assertEqual(self.destroyed, [])
+        self.interrupt.assert_called_once()
+
+    def test_final_health_failure_can_close_owned_group_once(self):
+        self.health.side_effect = [None, None, False]
+        client = self.make()
+        self.error("health_rejected", lambda: self.start(client))
+        client.close()
+        client.close()
+        self.assertEqual(self.destroyed, [self.group])
+
+    def test_group_replacement_never_destroyed(self):
+        client = self.make()
+        self.start(client)
+        self.world.WORLD = object()
+        self.error("runtime_rejected", client.check_health)
+        self.error("runtime_rejected", client.close)
+        self.assertTrue(client.summary()["cleanup_failed"])
+        self.error("cleanup_failed", client.close)
+        self.assertEqual(self.destroyed, [])
+
+    def test_native_destroy_failure_not_retried(self):
+        client = self.make()
+        self.start(client)
+        self.dist.destroy_process_group = Mock(side_effect=ValueError("PRIVATE"))
+        self.error("cleanup_failed", client.close)
+        self.error("cleanup_failed", client.close)
+        self.dist.destroy_process_group.assert_called_once_with(self.group)
+
+    def test_deadline_before_admission(self):
+        client = self.make(deadline_ns=self.now)
+        self.error("deadline_exhausted", lambda: self.start(client))
+        self.pre.assert_not_called()
+
+    def test_remaining_timeout_shrinks_after_store(self):
+        def delayed(*args, **kwargs):
+            self.now = 9_000_000_000
+            return self.store(*args, **kwargs)
+        self.dist.TCPStore = delayed
+        self.start(self.make())
+        self.assertEqual(self.group_kwargs["timeout"], timedelta(seconds=1))
+
+    def test_store_consuming_deadline_prevents_group_start(self):
+        def delayed(*args, **kwargs):
+            self.now = 10_000_000_000
+            return object()
+        self.dist.TCPStore = delayed
+        self.error("deadline_exhausted", lambda: self.start(self.make()))
+        self.assertNotIn("group", self.events)
+
+    def test_regressed_clock_and_swallowed_reentry_are_terminal(self):
+        client = self.make()
+        self.pre.side_effect = lambda: setattr(self, "now", self.now - 1)
+        self.error("deadline_exhausted", lambda: self.start(client))
+        runtime._ATTEMPTED = False
+        other = self.make()
+        def reenter():
+            self.error("reentry", other.start)
+        self.pre.side_effect = reenter
+        self.error("reentry", lambda: self.start(other))
+        self.assertNotIn("cuda", self.events)
+
+    def test_owner_mismatch_stops_before_work(self):
+        client = self.make()
+        client._owner = (-1, -1)
+        self.error("owner_mismatch", client.start)
+        self.pre.assert_not_called()
+
+    def test_closed_object_never_interrupts_next_attempt(self):
+        client = self.make()
+        client.close()
+        self.error("already_consumed", client.start)
+        self.interrupt.assert_not_called()
+
+    def test_loader_uses_fixed_imports_without_init_or_pth(self):
+        client = self.make()
+        calls = []
+        def load(name):
+            calls.append(name)
+            self.assertIn("lumi", sys.modules)
+            self.assertEqual(sys.modules["lumi"].__path__, [client._source])
+            return self.modules[name]
+        with patch.object(runtime, "_protected_directory") as directory, \
+                patch.object(runtime, "_cold"), \
+                patch.object(runtime.importlib, "import_module", side_effect=load), \
+                patch.object(sys, "path", list(sys.path)), patch.dict(sys.modules), \
+                patch.dict(os.environ):
+            result = client._load()
+            self.assertEqual(sys.path[-1], client._dependencies)
+            self.assertEqual(os.environ["HF_HUB_OFFLINE"], "1")
+            self.assertEqual(os.environ["TRANSFORMERS_OFFLINE"], "1")
+            self.assertEqual(sys.modules["lumi"].__spec__.loader, None)
+        self.assertEqual(calls, list(runtime.MODULES))
+        self.assertEqual(set(result), set(runtime.MODULES))
+        self.assertEqual(directory.call_count, 2)
+
+    def test_loader_source_rejection_before_path_or_module_changes(self):
+        client = self.make()
+        before = list(sys.path)
+        with patch.object(runtime, "_protected_directory", side_effect=ValueError("PRIVATE")), \
+                patch.object(runtime.importlib, "import_module") as load:
+            with self.assertRaises(ValueError):
+                client._load()
+            load.assert_not_called()
+        self.assertEqual(sys.path, before)
+
+    def test_directory_checks_reject_symlink_writable_or_nonroot_parent(self):
+        for info in (types.SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_uid=0),
+                     types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o775, st_uid=0),
+                     types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=1)):
+            with patch.object(Path, "lstat", return_value=info):
+                self.error("source_rejected", lambda: runtime._protected_directory("/work/source"))
+        good = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        with patch.object(Path, "lstat", return_value=good) as read:
+            runtime._protected_directory("/work/source")
+            self.assertEqual(read.call_count, 3)
+
+    def cold_host(self):
+        stack = ExitStack()
+        stack.enter_context(patch.object(runtime.sys, "platform", "linux"))
+        stack.enter_context(patch.object(runtime.sys, "version_info", (3, 13, 0)))
+        stack.enter_context(patch.object(runtime.sys, "flags",
+                                        types.SimpleNamespace(isolated=1, no_site=1)))
+        for method in ("getuid", "geteuid", "getgid", "getegid"):
+            stack.enter_context(patch.object(runtime.os, method, return_value=10001))
+        stack.enter_context(patch.object(runtime.threading, "active_count", return_value=1))
+        return stack
+
+    def test_cold_interpreter_flags_required(self):
+        with self.cold_host():
+            runtime._cold()
+            runtime.sys.flags.isolated = 0
+            self.error("cold_runtime_required", runtime._cold)
+            runtime.sys.flags.isolated = 1
+            runtime.sys.flags.no_site = 0
+            self.error("cold_runtime_required", runtime._cold)
+
+    def test_preloaded_ml_or_lumi_rejected(self):
+        with self.cold_host():
+            for name in ("torch", "transformers", "lumi", "numpy.core"):
+                with patch.dict(sys.modules, {name: types.ModuleType(name)}):
+                    self.error("cold_runtime_required", runtime._cold)
+
+    def test_root_identity_and_extra_thread_rejected(self):
+        with self.cold_host():
+            with patch.object(runtime.os, "geteuid", return_value=0):
+                self.error("cold_runtime_required", runtime._cold)
+            with patch.object(runtime.threading, "active_count", return_value=2):
+                self.error("cold_runtime_required", runtime._cold)
+
+
+if __name__ == "__main__":
+    unittest.main()

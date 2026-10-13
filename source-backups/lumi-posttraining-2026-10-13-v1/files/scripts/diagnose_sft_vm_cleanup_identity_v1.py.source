@@ -1,0 +1,171 @@
+"""One read-only STS diagnostic; retain fixed categories, never raw CLI output."""
+
+import datetime as dt
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-cleanup-identity-diagnostic-v0.1"
+PRIOR = ROOT / "evidence/lumi-vm-dedicated-cleanup-bucket-verification-v0.1.json"
+PRIOR_SHA = "b4981632e472dab21fd21ba6df6aca68c32bfc9e28cd42c0f0fc0643cc7bd53d"
+
+
+def classify(stderr):
+    """Classification is an observation, not proof of the previous failure."""
+    raw = stderr.lower()
+    groups = (
+        ("cli_validation", (b"parameter validation failed", b"unknown options", b"invalid json")),
+        ("tls_verification", (b"ssl validation failed", b"certificate verify failed")),
+        ("connect_timeout", (b"connect timeout", b"connection timeout")),
+        ("read_timeout", (b"read timeout", b"read timed out")),
+        ("credentials_expired", (b"expiredtoken", b"token has expired", b"session has expired")),
+        (
+            "login_refresh_required",
+            (
+                b"please run 'aws login'",
+                b"please run aws login",
+                b"please reauthenticate",
+                b"error loading sso token",
+            ),
+        ),
+        ("credentials_missing", (b"unable to locate credentials",)),
+        ("credentials_rejected", (b"invalidclienttokenid", b"signaturedoesnotmatch")),
+        ("access_denied", (b"accessdenied", b"access denied")),
+        (
+            "endpoint_connection",
+            (
+                b"could not connect to the endpoint",
+                b"connection was closed",
+                b"name or service not known",
+                b"nodename nor servname",
+            ),
+        ),
+        ("service_throttling", (b"throttling", b"requestlimitexceeded")),
+    )
+    matches = [kind for kind, markers in groups if any(marker in raw for marker in markers)]
+    return matches[0] if len(matches) == 1 else "unclassified_or_multiple_categories"
+
+
+def selftest():
+    for message, expected in (
+        (b'Read timeout on endpoint URL: "PRIVATE"', "read_timeout"),
+        (b"Connect timeout on endpoint URL PRIVATE", "connect_timeout"),
+        (b"SSL validation failed PRIVATE", "tls_verification"),
+        (b"(ExpiredToken) PRIVATE", "credentials_expired"),
+        (b"Please run 'aws login' PRIVATE", "login_refresh_required"),
+        (b"Parameter validation failed PRIVATE", "cli_validation"),
+        (b"Could not connect to the endpoint PRIVATE", "endpoint_connection"),
+        (b"PRIVATE_UNEXPECTED", "unclassified_or_multiple_categories"),
+        (b"Read timeout AccessDenied PRIVATE", "unclassified_or_multiple_categories"),
+    ):
+        assert classify(message) == expected
+
+
+def save(name, value):
+    raw = (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+    assert len(raw) <= 8192
+    fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        assert stream.write(raw) == len(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def run():
+    selftest()
+    raw = PRIOR.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == PRIOR_SHA
+    for name, pin in json.loads(raw)["source_bindings"].items():
+        path = ROOT / name
+        assert not path.is_symlink()
+        data = path.read_bytes()
+        assert len(data) == pin["bytes"] and hashlib.sha256(data).hexdigest() == pin["sha256"]
+    assert not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents))
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    report = dict(
+        schema="lumi.cleanup-identity-diagnostic.v0.1",
+        authorization="ok shuru kor",
+        prior_report_sha256=PRIOR_SHA,
+        script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        maximum_calls=1,
+        subprocess_timeout_seconds=20,
+        connect_timeout_seconds=5,
+        read_timeout_seconds=10,
+        operation="sts.get-caller-identity",
+        profile="default",
+        region="us-east-1",
+        deployment_retried=False,
+        mutations=0,
+        resource_setup_started=False,
+        raw_output_retained=False,
+        credential_values_retained=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    save("started.json", report)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith("AWS_") and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+    }
+    env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+    start = time.monotonic()
+    report["control_calls"] = 1
+    try:
+        response = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                "sts",
+                "get-caller-identity",
+                "--cli-input-json",
+                "{}\n",
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "10",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=20,
+            env=env,
+        )
+        report["exit_code"] = response.returncode
+        if len(response.stdout) > 32768 or len(response.stderr) > 8192:
+            report["status"] = "response_size_rejected"
+        elif response.returncode:
+            report["status"] = classify(response.stderr)
+        else:
+            try:
+                value = json.loads(response.stdout)
+                report["status"] = (
+                    "identity_verified"
+                    if value.get("Account") == "573978149073"
+                    else "wrong_account"
+                )
+            except (ValueError, AttributeError):
+                report["status"] = "invalid_identity_response"
+    except subprocess.TimeoutExpired:
+        report["status"] = "subprocess_deadline"
+    except OSError:
+        report["status"] = "local_process_error"
+    report["elapsed_seconds"] = round(time.monotonic() - start, 3)
+    report["observed_at_utc"] = dt.datetime.now(dt.UTC).isoformat()
+    report["previous_failure_cause_proven"] = False
+    save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    print(json.dumps(run(), sort_keys=True))

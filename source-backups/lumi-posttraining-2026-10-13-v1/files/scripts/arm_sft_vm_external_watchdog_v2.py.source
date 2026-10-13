@@ -1,0 +1,324 @@
+"""Private launch interlock; no CLI, credentials, approval or live execution.
+
+The existing provisioner receives GuardedCloud, not its bare EC2 transport.
+Only its first exact RunInstances request can arm the existing watchdog. All
+arming writes are single-shot; errors preserve the fresh receipt directory.
+AWS timers are best-effort protection, not an exactly-once or billing guarantee.
+"""
+
+import datetime as dt
+import hashlib
+import math
+import os
+import time
+from pathlib import Path
+
+import prepare_sft_vm_external_watchdog_v1 as inert
+import provision_sft_vm_host_v2 as provision
+import sft_vm_external_watchdog_v1 as worker
+
+FUNCTION_ARN = f"arn:aws:lambda:{worker.REGION}:{worker.ACCOUNT}:function:{worker.FUNCTION}"
+GROUP_ARN = f"arn:aws:scheduler:{worker.REGION}:{worker.ACCOUNT}:schedule-group/{inert.GROUP}"
+SCHEDULE_ARN = f"arn:aws:scheduler:{worker.REGION}:{worker.ACCOUNT}:schedule/{inert.GROUP}/stop"
+CODE = "gbk536fGHj4CPGuXO4BKvaqQ3rujDseS0JBedtqTRBg="
+# Frozen provisioner requires launch acknowledgement within 120 seconds.
+# Reserve 20 seconds per transport call and 20 seconds for its surrounding IO.
+ARM_SECONDS = 80
+PINS = {
+    "sft_vm_external_watchdog_v1.py": (
+        "e1ff9874a5db20d9c56925991ae862740452bac86492757b1001c7349557923f"
+    ),
+    "prepare_sft_vm_external_watchdog_v1.py": (
+        "4ff03fafb127029371f726dbea32ad940373606041ef362a3438e4f9ec1c290b"
+    ),
+    "provision_sft_vm_host_v2.py": (
+        "9102cb01fc177a09d15e064817c9a6a438c126b4799f15c992621a59079826d5"
+    ),
+}
+OPS = {
+    "sts": {"get-caller-identity"},
+    "iam": {"get-role", "get-role-policy", "list-role-policies", "list-attached-role-policies"},
+    "lambda": {
+        "get-function-configuration",
+        "get-function-concurrency",
+        "get-function-event-invoke-config",
+        "update-function-configuration",
+        "put-function-concurrency",
+    },
+    "scheduler": {"get-schedule-group", "create-schedule-group", "get-schedule", "create-schedule"},
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("watchdog_launch_interlock_rejected")
+
+
+class SDKCloud:
+    """Caller supplies authenticated fixed-endpoint, no-retry management clients."""
+
+    def __init__(self, clients):
+        need(set(clients) == set(OPS))
+        for service, client in clients.items():
+            meta = client.meta
+            endpoint = (
+                "https://iam.amazonaws.com"
+                if service == "iam"
+                else f"https://{service}.{worker.REGION}.amazonaws.com"
+            )
+            need(meta.endpoint_url == endpoint)
+            need(service == "iam" or meta.region_name == worker.REGION)
+            need(meta.config.retries.get("total_max_attempts") == 1)
+            need(0 < meta.config.connect_timeout <= 3 and 0 < meta.config.read_timeout <= 5)
+            need(meta.config.proxies == {})
+        self.clients = clients
+
+    def cli(self, service, operation, **fields):
+        need(operation in OPS.get(service, set()))
+        try:
+            with provision.timeout(20):
+                return getattr(self.clients[service], operation.replace("-", "_"))(**fields)
+        except Exception as error:
+            code = getattr(error, "response", {}).get("Error", {}).get("Code")
+            if code == "ResourceNotFoundException":
+                raise LookupError("absent") from None
+            raise RuntimeError("watchdog_cloud_call_failed") from None
+
+
+def configuration(value, environment):
+    expected = dict(
+        FunctionArn=FUNCTION_ARN,
+        CodeSha256=CODE,
+        Role=inert.BASE + inert.WORKER_ROLE,
+        Runtime="python3.13",
+        Handler="watchdog.handler",
+        Timeout=180,
+        MemorySize=128,
+        Architectures=["arm64"],
+        EphemeralStorage={"Size": 512},
+        State="Active",
+        LastUpdateStatus="Successful",
+        Environment=environment,
+    )
+    need(all(value.get(k) == v for k, v in expected.items()))
+    need(not value.get("Layers") and not value.get("VpcConfig", {}).get("VpcId"))
+    need(not value.get("DeadLetterConfig") and not value.get("FileSystemConfigs"))
+    need(type(value.get("RevisionId")) is str and bool(value["RevisionId"]))
+
+
+def schedule(bound):
+    stamp = dt.datetime.fromtimestamp(bound["stop_at"], dt.UTC).strftime("%Y-%m-%dT%H:%M:%S")
+    return dict(
+        Name="stop",
+        GroupName=inert.GROUP,
+        State="ENABLED",
+        ScheduleExpression=f"at({stamp})",
+        ScheduleExpressionTimezone="UTC",
+        FlexibleTimeWindow={"Mode": "OFF"},
+        ActionAfterCompletion="NONE",
+        Target=dict(
+            Arn=FUNCTION_ARN,
+            RoleArn=inert.BASE + inert.SCHEDULER_ROLE,
+            Input=inert.compact(dict(attempt=worker.ATTEMPT, stop_at=bound["stop_at"])),
+            RetryPolicy=dict(MaximumRetryAttempts=0, MaximumEventAgeInSeconds=60),
+        ),
+    )
+
+
+class GuardedCloud:
+    def __init__(
+        self,
+        host_cloud,
+        watchdog_cloud,
+        output,
+        *,
+        wall=time.time,
+        clock=time.monotonic,
+        wait=time.sleep,
+    ):
+        self.host, self.watchdog, self.output = host_cloud, watchdog_cloud, Path(output)
+        self.wall, self.clock, self.wait = wall, clock, wait
+        self.used, self.calls = False, 0
+        self.started = None
+
+    def call(self, service, operation, **fields):
+        need(operation in OPS.get(service, set()) and self.calls < 80)
+        need(0 <= self.clock() - self.started < ARM_SECONDS - 20)
+        self.calls += 1
+        return self.watchdog.cli(service, operation, **fields)
+
+    def save(self, name, value):
+        raw = (inert.compact(value) + "\n").encode()
+        need(len(raw) <= 8192)
+        fd = os.open(self.output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+
+    def verify(self, bound):
+        environment = {"Variables": {"LUMI_WATCHDOG_BINDING": inert.compact(bound)}}
+        configuration(
+            self.call("lambda", "get-function-configuration", FunctionName=worker.FUNCTION),
+            environment,
+        )
+        need(
+            self.call("lambda", "get-function-concurrency", FunctionName=worker.FUNCTION).get(
+                "ReservedConcurrentExecutions"
+            )
+            == 1
+        )
+        event = self.call(
+            "lambda", "get-function-event-invoke-config", FunctionName=worker.FUNCTION
+        )
+        need(event["MaximumRetryAttempts"] == 0 and event["MaximumEventAgeInSeconds"] == 60)
+        need(not any(event.get("DestinationConfig", {}).values()))
+        actual = self.call("scheduler", "get-schedule", Name="stop", GroupName=inert.GROUP)
+        need(actual.get("Arn") == SCHEDULE_ARN)
+        need(all(actual.get(k) == v for k, v in schedule(bound).items()))
+
+    def arm(self):
+        need(self.call("sts", "get-caller-identity")["Account"] == worker.ACCOUNT)
+        for name, trust, policy in inert.policies():
+            role = self.call("iam", "get-role", RoleName=name)["Role"]
+            need(role["Arn"] == inert.BASE + name and role["AssumeRolePolicyDocument"] == trust)
+            need(
+                self.call("iam", "get-role-policy", RoleName=name, PolicyName=inert.POLICY)[
+                    "PolicyDocument"
+                ]
+                == policy
+            )
+            inline = self.call("iam", "list-role-policies", RoleName=name)
+            attached = self.call("iam", "list-attached-role-policies", RoleName=name)
+            need(inline["PolicyNames"] == [inert.POLICY] and not inline.get("IsTruncated"))
+            need(attached["AttachedPolicies"] == [] and not attached.get("IsTruncated"))
+        current = self.call("lambda", "get-function-configuration", FunctionName=worker.FUNCTION)
+        configuration(current, inert.UNARMED)
+        need(
+            self.call("lambda", "get-function-concurrency", FunctionName=worker.FUNCTION).get(
+                "ReservedConcurrentExecutions"
+            )
+            == 0
+        )
+        for operation, fields in (
+            ("get-schedule-group", dict(Name=inert.GROUP)),
+            ("get-schedule", dict(Name="stop", GroupName=inert.GROUP)),
+        ):
+            try:
+                self.call("scheduler", operation, **fields)
+            except LookupError:
+                continue
+            need(False)
+        start = math.floor(self.wall())
+        stop = ((start + 14000) // 60) * 60
+        bound = dict(
+            armed=True,
+            attempt=worker.ATTEMPT,
+            launch_not_before=start,
+            launch_not_after=start + 300,
+            stop_at=stop,
+            expires_at=stop + 300,
+        )
+        worker.binding(inert.compact(bound))
+        self.save("binding.json", bound)
+        environment = {"Variables": {"LUMI_WATCHDOG_BINDING": inert.compact(bound)}}
+        self.call(
+            "lambda",
+            "update-function-configuration",
+            FunctionName=worker.FUNCTION,
+            RevisionId=current["RevisionId"],
+            Environment=environment,
+        )
+        for _ in range(20):
+            updated = self.call(
+                "lambda", "get-function-configuration", FunctionName=worker.FUNCTION
+            )
+            need(updated["LastUpdateStatus"] in {"InProgress", "Successful"})
+            if updated["LastUpdateStatus"] == "Successful":
+                configuration(updated, environment)
+                break
+            self.wait(2)
+        else:
+            need(False)
+        self.call(
+            "scheduler", "create-schedule-group", Name=inert.GROUP, ClientToken=worker.ATTEMPT
+        )
+        group = self.call("scheduler", "get-schedule-group", Name=inert.GROUP)
+        need(group["Arn"] == GROUP_ARN and group["State"] == "ACTIVE")
+        self.call(
+            "lambda",
+            "put-function-concurrency",
+            FunctionName=worker.FUNCTION,
+            ReservedConcurrentExecutions=1,
+        )
+        self.call("scheduler", "create-schedule", ClientToken=worker.ATTEMPT, **schedule(bound))
+        self.verify(bound)
+        return bound
+
+    def cli(self, service, operation, **fields):
+        if (service, operation) != ("ec2", "run-instances"):
+            return self.host.cli(service, operation, **fields)
+        need(not self.used)
+        self.used = True  # Consumed even on validation failure; never retry a launch.
+        self.started, initial_wall = self.clock(), self.wall()
+        for name, digest in PINS.items():
+            need(hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest() == digest)
+        # Only vm_group is projected into launch_request. Endpoint values below
+        # are syntax placeholders, not endpoint admission or ownership evidence;
+        # the frozen provisioner still performs those checks before this call.
+        group = fields["NetworkInterfaces"][0]["Groups"][0]
+        reference = dict(
+            attempt=worker.ATTEMPT,
+            key_name="lumi-fullsize-" + worker.ATTEMPT,
+            vm_group=group,
+            endpoint="eice-" + "0" * 17,
+            endpoint_group="sg-" + ("1" if group != "sg-" + "1" * 17 else "2") * 17,
+        )
+        expected = provision.connection.launch_request(reference)
+        expected["UserData"] = provision.initial.user_data()
+        need(fields == expected)
+        provision.connection.safe_path(self.output)
+        self.output.mkdir(mode=0o700)  # Fresh exclusive attempt evidence.
+        self.save("started.json", dict(attempt=worker.ATTEMPT, retry_allowed=False))
+        try:
+            bound = self.arm()
+            self.save("armed.json", dict(binding=bound, api_calls=self.calls, verified=True))
+            elapsed = self.clock() - self.started
+            now = self.wall()
+            need(0 <= elapsed < ARM_SECONDS and abs(now - initial_wall - elapsed) <= 2)
+            need(bound["launch_not_before"] <= now <= bound["launch_not_after"] - 30)
+            return self.host.cli(service, operation, **fields)
+        except BaseException:
+            self.save(
+                "failed.json",
+                dict(
+                    stage="arming_or_launch_failed",
+                    retry_allowed=False,
+                    api_calls=self.calls,
+                    preserve_partial=True,
+                ),
+            )
+            raise RuntimeError("watchdog_arming_or_launch_failed") from None
+
+
+def _provision_guarded_once(
+    output, *, host_cloud, watchdog_cloud, wall=time.time, clock=time.monotonic, wait=time.sleep
+):
+    """Private integration only; caller must separately establish run authority."""
+    guarded = GuardedCloud(
+        host_cloud,
+        watchdog_cloud,
+        Path(output).with_name(Path(output).name + "-watchdog"),
+        wall=wall,
+        clock=clock,
+        wait=wait,
+    )
+    return provision._provision_and_setup_admitted_once(
+        output,
+        cloud=guarded,
+        clock=clock,
+        sleep=wait,
+        utcnow=lambda: dt.datetime.fromtimestamp(wall(), dt.UTC),
+    )
+
+
+def run(**_arguments):
+    raise RuntimeError("fullsize_execution_not_authorized")

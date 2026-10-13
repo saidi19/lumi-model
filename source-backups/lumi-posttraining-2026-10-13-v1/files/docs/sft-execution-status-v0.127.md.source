@@ -1,0 +1,72 @@
+# SFT execution status v0.127: raw-text-free failure-stage transport prepared
+
+2026-09-27. The diagnostic blind spot is repaired in a versioned successor.
+**264 local tests passed, with zero failures, errors or skips; Ruff passed.**
+This is local preparation, not a native import pass or a root-cause fix for
+the v0.126 failure. Gate 5 remains incomplete. No AWS command, new instance,
+GPU, real model data, inference or training was used in this step.
+
+## Narrow change
+
+The frozen v1 worker discarded child stderr and collapsed all failures to a
+generic result. New v2 entry/worker/launcher/supervisor files transport a
+fixed allowlisted stage through process exit status and systemd observation.
+Child stdout/stderr remain DEVNULL; no exception string, traceback, source,
+candidate text or dynamic file path is collected. No additional log files
+are produced by the worker. These codes locate the failing boundary; they
+do not necessarily identify its internal cause.
+
+Entry codes 40–50 distinguish single-use check, cold loader, runtime gate,
+read-only inputs, writable output, control read, control contract, coordinator
+import, result contract, independent checksum consumer and summary write.
+Worker codes 60–66 distinguish worker boundary, worker arguments, preparation
+source copy, import read-only binds, child dispatch, unknown child failure
+and worker control load. Unknown child statuses are not trusted as stages.
+
+The parent accepts a diagnostic code only with the corresponding failed,
+normal-exit systemd state. Signals, OOM and timeout results cannot be interpreted
+as a successful stage diagnosis. All failures still fail closed and stop the
+exact unit. The existing exclusive attempt marker and empty-cgroup cleanup
+rules remain. The new unit prefix and /opt release root use v2.
+
+No parser, vocabulary, rights, checksum, resource, runtime-admission or
+production gate was relaxed. Existing CPU/memory/tasks/time/tmpfs constraints,
+private networking, private devices and source/input read-only bind properties
+are unchanged. Old v1 files, bundle v0.2 and failed native evidence are preserved.
+
+## Verification
+
+- 32 diagnostic/successor tests plus 232 existing regression/bootstrap tests
+  passed in 5.486 seconds using the existing local CPython 3.13.7 environment.
+- Successor tests include actual tiny generated conversion/package/checksum
+  flow, with Linux host observations substituted locally; no full-size model.
+  Native systemd/mount/UID operations are doubled. Local success cannot prove
+  Linux namespace behavior, actual 3.12 admission or future native success.
+- Fixed-code transport, exception-string non-disclosure, child output discard,
+  all diagnostic terminal statuses, cleanup and consumed-attempt rejection
+  have synthetic coverage. OS properties match the predecessor exactly.
+- The final parent audit hook recorded zero network and blocked-real-artifact
+  attempts. This is not OS sandbox proof and does not automatically propagate
+  to fresh test interpreters. Source-only archive verification is separate.
+- Initial development invocations exposed a missing PYTHONPATH in the test
+  command and an overbroad guard matching synthetic temporary /work subpaths;
+  corrected test invocation/prefix matching before the final passing suite.
+  No failed native attempt was rerun. Formatting findings were also corrected.
+- All 49 files in the new archive match both its manifest and workspace
+  sources; 51 members and the unchanged runtime-lock hash were verified.
+  The staging successor's archive/manifest pins match. Staging was not run.
+
+## Prepared successor, not execution authority
+
+Source archive: `artifacts/lumi-vm-coordinator-source-v0.3/source-release.tar.gz`
+SHA-256 `d24873f19cbae18aa5f0ef7a6cc7ccb982aa54ecbb3dc16192c41dfe8689bb81`.
+Manifest SHA-256
+`c65e43efd3041805615335dca8afc6003875043f5365cea5c03812a9e2a1722b`.
+49 source files / 816,121 source bytes; 51 members / 181,754 compressed bytes.
+Use only `scripts/stage_sft_vm_coordinator_v2.py` for this archive.
+
+Next: separately authorize one fresh bounded generated-only native CPU check
+under `docs/lumi-vm-coordinator-native-run-proposal-v0.2.md`. Do not reuse the
+consumed approval, attempt ID or failed evidence. This preparation does not
+authorize deployment, S3 acquisition, real 4B import, Gate 6 GPU SFT or later
+evaluation/serving. No commit or push occurred.

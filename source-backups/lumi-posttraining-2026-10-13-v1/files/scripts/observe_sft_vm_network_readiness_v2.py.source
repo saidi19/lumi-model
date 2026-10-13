@@ -1,0 +1,41 @@
+"""Read-only successor: correct NAT quota ID from authoritative AWS discovery.
+
+Preserves the first observation and frozen v1 source. Does not resume mutations
+or repeat any source/model pass. All v1 read limits and validations remain.
+"""
+
+import hashlib
+import json
+from pathlib import Path
+
+import observe_sft_vm_network_readiness_v1 as base
+
+BASE_SHA = "a24aeb32513684999e97b4cc8bec04f2463c98da4c3b4a5dd3da7d2527247075"
+FAILED_SHA = "d32b933fa1109f660708f321cf053c632ebaf8ab367d0644008dcec981b15177"
+NAT_QUOTA = ("vpc", "L-FE5A380F", "NAT gateways per Availability Zone")
+OUTPUT = base.ROOT / "artifacts/lumi-vm-network-readiness-v0.1/attempt-002"
+
+
+def run():
+    base.need(hashlib.sha256(Path(base.__file__).read_bytes()).hexdigest() == BASE_SHA)
+    previous = base.ROOT / "artifacts/lumi-vm-network-readiness-v0.1/attempt-001/result.json"
+    raw = previous.read_bytes()
+    base.need(hashlib.sha256(raw).hexdigest() == FAILED_SHA)
+    result = json.loads(raw)
+    base.need(result["failed_stage"] == "get-service-quota" and result["cloud_mutations"] == 0)
+    old_quotas, old_output, old_pins = base.QUOTAS, base.OUTPUT, base.PINS
+    try:
+        base.QUOTAS = dict(old_quotas, nat=NAT_QUOTA)
+        base.OUTPUT = OUTPUT
+        base.PINS = dict(old_pins)
+        base.PINS["scripts/observe_sft_vm_network_readiness_v1.py"] = BASE_SHA
+        base.PINS["scripts/observe_sft_vm_network_readiness_v2.py"] = hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest()
+        return base.run()
+    finally:
+        base.QUOTAS, base.OUTPUT, base.PINS = old_quotas, old_output, old_pins
+
+
+if __name__ == "__main__":
+    run()

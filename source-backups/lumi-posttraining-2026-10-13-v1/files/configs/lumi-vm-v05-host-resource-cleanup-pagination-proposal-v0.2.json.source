@@ -1,0 +1,48 @@
+{
+  "schema": "lumi.vm-v05-host-resource-cleanup-pagination-proposal.v0.2",
+  "date": "2026-10-07",
+  "status": "requires_explicit_authorization",
+  "execution_permitted": false,
+  "scope": "One fresh versioned cleanup successor for the same two security groups and same imported EC2 key registration; not a retry of either consumed execution.",
+  "parent_plan": {
+    "path": "configs/lumi-vm-v05-host-resource-cleanup-plan-v0.1.json",
+    "sha256": "87b4616a1d285d97cea8fe9a38be24f8ca87a19e0fce6c6f14875b3ab31bb449"
+  },
+  "diagnostic_result": {
+    "path": "artifacts/lumi-vm-v05-association-diagnostic-v0.1/result.json",
+    "sha256": "55c2ff22bea0a29c8ffdd95bd4ad1537dd934779a732aac5455d1b9a615e0203"
+  },
+  "resolved_key_receipt": {
+    "path": "artifacts/lumi-vm-v05-host-resource-cleanup-v0.1/resolved-key.json",
+    "sha256": "81475803848dc76f1a4c76803c3f3fe995c2cded3aa8d2337e4e2ac6256f876d"
+  },
+  "targets": {
+    "vm_group": "sg-0f44659cfec8fa6b7",
+    "endpoint_group": "sg-0befee7e888d24436",
+    "key_pair": "key-001ddc510adbf2902"
+  },
+  "only_policy_changes": [
+    "Permit up to eight pages per DescribeSecurityGroupVpcAssociations query, carrying forward the exact same group-id filter and MaxResults=100; no other query gains pagination.",
+    "Require a valid list and zero association rows on every page. Require terminal absent/null/empty NextToken; a continuation token never means success. Reject malformed/repeated tokens and cap exhaustion. Keep opaque tokens in memory only.",
+    "Increase aggregate resource API call cap from 64 to 96 solely to cover bounded association pagination and readback; retain other original execution caps.",
+    "Pin deletion to the already resolved exact KeyPairId as well as fresh name/type/ownership/material checks.",
+    "Record allowlisted check-stage codes and pagination counts, without response, token, key or exception text."
+  ],
+  "caps": {
+    "credential_provider_invocations": 1,
+    "resource_api_calls": 96,
+    "mutation_api_calls": 5,
+    "association_pages_per_query": 8,
+    "wall_seconds": 600,
+    "single_response_bytes": 262144,
+    "aggregate_response_bytes": 2097152,
+    "private_write_bytes": 262144,
+    "aws_sdk_total_max_attempts": 1,
+    "mutating_retries": 0
+  },
+  "unchanged": "All original ownership/rule/dependency checks, exact ordered five mutations, pre-mutation rechecks, protected exclusive journaling, uncertain-mutation stop, deletion readback and preservation requirements remain in force. Any association row still blocks cleanup; no association is disassociated.",
+  "required_before_live": "Implement fresh versioned executor with synthetic pagination, foreign association, token-cycle, truncation, call-budget and no-retry tests, then bind exact implementation/test hashes in the new approval record.",
+  "forbidden": "No new instance/network/key, checkpoint/data access, training/GPU, private-key access/deletion, EBS/S3/IAM/watchdog/registry/remote-claim mutation or unrelated cleanup. Preserve all prior failed and diagnostic evidence.",
+  "paid_execution_authorized": false,
+  "training_authorized": false
+}

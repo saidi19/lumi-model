@@ -1,0 +1,262 @@
+"""Synthetic streams and doubled OS/SDK boundaries; no AWS or native dispatch."""
+import hashlib
+import importlib
+import importlib.util
+import io
+import json
+import os
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+from urllib.parse import quote
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_vm_fullsize_transition_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+t = importlib.import_module(PACKAGE + ".posttraining_vm_fullsize_transport_v1")
+h = importlib.import_module(PACKAGE + ".posttraining_vm_fullsize_handoff_v1")
+CREDS = {"access_key": "synthetic", "secret_key": "synthetic", "session_token": "synthetic"}
+PINS = {key: "a" * 64 for key in h.PINS}
+ID = "1" * 32
+SUCCESS = {"Result": "success", "ActiveState": "active", "SubState": "exited",
+           "ExecMainCode": "1", "ExecMainStatus": "0"}
+
+
+class TransportTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(self.temp).resolve()
+        self.fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
+        self.data = {"bound/model/a": b"opaque", "bound/tokenizer/a": b"{}"}
+        self.rows = [{"key": key, "role": role, "target_relative_path": name,
+                      "bytes": len(self.data[key]),
+                      "sha256": hashlib.sha256(self.data[key]).hexdigest()}
+                     for key, role, name in [("bound/model/a", "checkpoint", "model/a"),
+                                             ("bound/tokenizer/a", "tokenizer", "tokenizer/a")]]
+        self.selected = {"objects": self.rows, "object_count": 2, "object_bytes": 8,
+                         "bucket": t.BUCKET, "account": t.ACCOUNT, "region": t.REGION}
+        self.raw = json.dumps(self.selected).encode()
+        self.enterContext(patch.object(t.staging, "SELECTION_SHA256",
+                                       hashlib.sha256(self.raw).hexdigest()))
+        self.enterContext(patch.object(t.staging, "_runtime"))
+        self.client, self.session = Mock(), Mock()
+        self.http = self.client._endpoint.http_session
+        self.session.create_client.return_value = self.client
+        self.client.get_object.side_effect = self.respond
+        self.config = Mock(side_effect=lambda **kwargs: kwargs)
+        self.bodies = []
+
+    def before(self, request):
+        guard = self.client.meta.events.register_first.call_args.args[1]
+        return guard(request=request)
+
+    def respond(self, **kwargs):
+        self.assertEqual(set(kwargs), {"Bucket", "Key", "ExpectedBucketOwner"})
+        self.assertEqual(kwargs["ExpectedBucketOwner"], t.ACCOUNT)
+        self.before(types.SimpleNamespace(method="GET", url=t.OBJECT_ENDPOINT +
+                                          quote(kwargs["Key"], safe="/")))
+        body = io.BytesIO(self.data[kwargs["Key"]])
+        self.bodies.append(body)
+        return {"ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 0},
+                "ContentLength": len(self.data[kwargs["Key"]]), "Body": body}
+
+    def execute(self):
+        return t._acquire_admitted_once(self.fd, self.raw, session=self.session,
+            config_type=self.config, credentials=CREDS, deadline=time.monotonic()+30)
+
+    def test_transport_to_real_staging_tiny_bytes(self):
+        result = self.execute()
+        self.assertEqual(result["http_sends"], 2)
+        self.assertTrue(all(body.closed for body in self.bodies))
+        self.http.close.assert_called_once()
+        self.assertEqual((self.root / "inputs/checkpoint/model/a").read_bytes(), b"opaque")
+        self.assertEqual((self.root / "inputs/tokenizer/tokenizer/a").read_bytes(), b"{}")
+        self.assertFalse(result["credentials_erased"])
+        self.assertFalse(result["acquisition_cgroup_reaped"])
+
+    def test_explicit_tls_endpoint_no_proxy_or_ambient_credential_option(self):
+        self.execute()
+        options = self.session.create_client.call_args.kwargs
+        self.assertEqual(options["endpoint_url"], t.ENDPOINT)
+        self.assertIs(options["verify"], True)
+        self.assertEqual(options["aws_session_token"], "synthetic")
+        self.assertEqual(options["config"]["proxies"], {})
+        self.assertEqual(options["config"]["retries"], {"max_attempts": 1, "mode": "standard"})
+        self.assertEqual(options["config"]["read_timeout"], 30)
+
+    def test_sdk_second_send_blocked_before_response(self):
+        def retry(**kwargs):
+            request = types.SimpleNamespace(method="GET", url=t.OBJECT_ENDPOINT + kwargs["Key"])
+            self.before(request)
+            self.before(request)
+        self.client.get_object.side_effect = retry
+        with self.assertRaisesRegex(t.staging.StagingError, "^staging_failed$"):
+            self.execute()
+        self.assertEqual(self.client.get_object.call_count, 1)
+        self.http.close.assert_called_once()
+
+    def test_head_redirect_post_and_query_never_send(self):
+        transport = t._ExactResponses(self.client, self.selected, time.monotonic()+30)
+        transport.active = self.rows[0]["key"]
+        for method, url in [("HEAD", t.OBJECT_ENDPOINT+self.rows[0]["key"]),
+                            ("POST", t.OBJECT_ENDPOINT+self.rows[0]["key"]),
+                            ("GET", "https://other.example/key"),
+                            ("GET", t.OBJECT_ENDPOINT+self.rows[0]["key"]+"?partNumber=1")]:
+            with self.subTest(method=method, url=url), self.assertRaises(t.TransportError):
+                transport.before_send(types.SimpleNamespace(method=method, url=url))
+        self.assertEqual(transport.http_sends, 0)
+
+    def test_unselected_key_and_repeat_rejected(self):
+        transport = t._ExactResponses(self.client, self.selected, time.monotonic()+30)
+        with self.assertRaises(t.TransportError):
+            transport.open(t.BUCKET, "unselected")
+        _, body = transport.open(t.BUCKET, self.rows[0]["key"])
+        body.close()
+        with self.assertRaises(t.TransportError):
+            transport.open(t.BUCKET, self.rows[0]["key"])
+
+    def test_bad_response_closed_without_payload_read(self):
+        for extra in [{"ContentLength": 900}, {"ContentEncoding": "gzip"},
+                      {"ContentRange": "bytes 0-4/6"},
+                      {"ResponseMetadata": {"HTTPStatusCode": 206, "RetryAttempts": 0}},
+                      {"ResponseMetadata": {"HTTPStatusCode": 200, "RetryAttempts": 1}}]:
+            transport = t._ExactResponses(self.client, self.selected, time.monotonic()+30)
+            body = Mock()
+            def response(body=body, extra=extra, **kwargs):
+                value = self.respond(**kwargs)
+                value["Body"].close()
+                return value | {"Body": body} | extra
+            self.client.get_object.side_effect = response
+            with self.subTest(fields=set(extra)), self.assertRaises(t.TransportError):
+                transport.open(t.BUCKET, self.rows[0]["key"])
+            body.close.assert_called_once()
+            body.read.assert_not_called()
+
+    def test_close_failure_cannot_return_success(self):
+        self.http.close.side_effect = OSError("private token must not escape")
+        with self.assertRaisesRegex(t.TransportError, "^transport_close_failed$"):
+            self.execute()
+        self.assertTrue((self.root / "acquisition.started").exists())
+
+    def test_bad_credentials_do_not_create_client(self):
+        for credentials in ({}, CREDS | {"profile": "default"}, CREDS | {"session_token": ""}):
+            with self.assertRaises(t.TransportError):
+                t.client_options(credentials, self.config)
+        self.session.create_client.assert_not_called()
+
+    def test_runtime_before_client_or_control(self):
+        with patch.object(t.staging, "_runtime", side_effect=ValueError("runtime")):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.session.create_client.assert_not_called()
+
+    def test_public_acquire_closed(self):
+        with self.assertRaisesRegex(t.TransportError, "host_guard_not_bound"):
+            t.acquire_inputs(approved=True)
+
+
+class HandoffTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        (self.root / ID).mkdir(mode=0o700)
+        self.enterContext(patch.object(h, "ROOT", self.root))
+        self.enterContext(patch.object(h.sys, "platform", "linux"))
+        self.enterContext(patch.object(h.os, "geteuid", return_value=0))
+        self.enterContext(patch.object(h.frozen, "host_check"))
+        self.enterContext(patch.object(h.frozen, "root_owned"))
+        self.events = []
+        self.run = self.enterContext(patch.object(h.frozen, "run_command",
+                                                 side_effect=self.command))
+        self.observe = self.enterContext(patch.object(h.frozen, "observe", return_value=SUCCESS))
+        self.empty = self.enterContext(patch.object(h.frozen, "cgroup_empty", return_value=True))
+
+    def command(self, command, *_args, **_kwargs):
+        self.events.append(command)
+        return types.SimpleNamespace(returncode=0, stdout=b"not-found\n")
+
+    def execute(self):
+        return h._dispatch_admitted_once(ID, PINS, machine_id="b"*32,
+                                         deadline=time.monotonic()+3605)
+
+    def test_acquisition_stop_precedes_import_and_both_reaped(self):
+        result = self.execute()
+        self.assertEqual(self.events[0], ["/usr/bin/systemctl", "stop", h.unit_name(ID,"acquire")])
+        self.assertEqual(self.events[2][0], "/usr/bin/systemd-run")
+        self.assertEqual(self.events[-1], ["/usr/bin/systemctl", "stop", h.unit_name(ID,"import")])
+        self.assertEqual(self.empty.call_count, 2)
+        self.assertTrue(result["both_cgroups_empty"])
+        self.assertFalse(result["real_4b_import"])
+
+    def test_live_acquisition_child_blocks_import(self):
+        self.empty.return_value = False
+        with self.assertRaisesRegex(h.HandoffError, "cleanup"):
+            self.execute()
+        self.assertEqual(len(self.events), 1)
+
+    def test_failed_acquisition_stopped_without_import(self):
+        self.observe.return_value = SUCCESS | {"Result": "exit-code", "ExecMainStatus": "1"}
+        with self.assertRaisesRegex(h.HandoffError, "acquisition_failed"):
+            self.execute()
+        self.assertEqual(len(self.events), 1)
+
+    def test_ambiguous_dispatch_stopped_no_retry(self):
+        def commands(command, *args, **kwargs):
+            result = self.command(command, *args, **kwargs)
+            if command[0] == "/usr/bin/systemd-run":
+                raise TimeoutError("private details")
+            return result
+        self.run.side_effect = commands
+        with self.assertRaisesRegex(h.HandoffError, "dispatch"):
+            self.execute()
+        self.assertEqual(self.events[-1][1], "stop")
+        with self.assertRaisesRegex(h.HandoffError, "attempt_used"):
+            self.execute()
+        self.assertEqual(sum(c[0]=="/usr/bin/systemd-run" for c in self.events), 1)
+
+    def test_existing_import_unit_is_not_overwritten_or_stopped(self):
+        def commands(command, *args, **kwargs):
+            result = self.command(command, *args, **kwargs)
+            if "show" in command:
+                result.stdout = b"loaded\n"
+            return result
+        self.run.side_effect = commands
+        with self.assertRaisesRegex(h.HandoffError, "attempt_used"):
+            self.execute()
+        self.assertEqual(len(self.events), 2)
+
+    def test_import_failure_or_cleanup_failure_cannot_pass(self):
+        self.observe.side_effect = [SUCCESS, SUCCESS | {"Result": "oom-kill"}]
+        with self.assertRaisesRegex(h.HandoffError, "import_failed"):
+            self.execute()
+        self.assertEqual(self.events[-1][-1], h.unit_name(ID, "import"))
+
+    def test_command_contains_no_acquisition_credential_mount_or_shell(self):
+        command = h.import_command(ID, PINS)
+        self.assertIn("--property=PrivateNetwork=yes", command)
+        self.assertIn("--property=MemoryMax=68719476736", command)
+        self.assertIn(h.SCRIPT, command)
+        self.assertFalse(any("LoadCredential" in s or "AWS_ACCESS_KEY" in s for s in command))
+        self.assertNotIn("sh", command)
+
+    def test_public_dispatch_closed(self):
+        with self.assertRaisesRegex(h.HandoffError, "host_guard_not_bound"):
+            h.dispatch_import(approved=True)
+
+    def test_known_stage_retained_without_logs_or_signal_misclassification(self):
+        observed = SUCCESS | {"Result": "exit-code", "ActiveState": "failed",
+                              "SubState": "failed", "ExecMainStatus": "45"}
+        self.assertEqual(h._import_failure(observed).worker_stage, "contract")
+        for change in ({"ExecMainCode": "2"}, {"Result": "oom-kill"},
+                       {"ExecMainStatus": "045"}, {"ExecMainStatus": "private text"}):
+            self.assertIsNone(h._import_failure(observed | change).worker_stage)
+
+
+if __name__ == "__main__":
+    unittest.main()

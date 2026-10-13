@@ -1,0 +1,381 @@
+import copy
+import datetime as dt
+import hashlib
+import importlib
+import json
+import shlex
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_host_connection_v1 as prior
+from tests.test_sft_vm_setup_detached_v1 import seed_receipt
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+m = importlib.import_module("prepare_sft_vm_host_connection_v2")
+join = importlib.import_module("run_sft_vm_host_setup_v1")
+
+
+def fixture():
+    data = prior.fixture()
+    now = dt.datetime.now(dt.UTC)
+    start = now - dt.timedelta(seconds=60)
+    vm = data["instances"]["Reservations"][0]["Instances"][0]
+    vm.update(ClientToken=prior.B["attempt"], LaunchTime=start + dt.timedelta(seconds=2))
+    snapshot = "snap-" + "a" * 17
+    data["image"]["Images"][0].update(
+        RootDeviceName="/dev/sda1",
+        BlockDeviceMappings=[dict(DeviceName="/dev/sda1", Ebs={"SnapshotId": snapshot})],
+    )
+    for index, volume in enumerate(data["volumes"]["Volumes"]):
+        volume.update(
+            CreateTime=start + dt.timedelta(seconds=3),
+            SnapshotId=snapshot if index == 0 else "",
+            MultiAttachEnabled=False,
+        )
+    data["group"]["SecurityGroups"][0]["IpPermissionsEgress"] = [
+        dict(IpProtocol="tcp", FromPort=443, ToPort=443, IpRanges=[{"CidrIp": "0.0.0.0/0"}])
+    ]
+    request = m.launch_request(prior.B)
+    launch = dict(
+        attempt=prior.B["attempt"],
+        instance=prior.B["instance"],
+        client_token=prior.B["attempt"],
+        started_at=start.isoformat(),
+        acknowledged_at=(start + dt.timedelta(seconds=5)).isoformat(),
+        request=request,
+        request_sha256=hashlib.sha256(m.canonical(request)).hexdigest(),
+    )
+    return data, launch, now
+
+
+def routes():
+    vpc, subnet = prior.P["host"]["vpc"], prior.P["host"]["subnet"]
+    public, nat_id, internet = "subnet-" + "7" * 17, "nat-" + "8" * 17, "igw-" + "9" * 17
+    tables = []
+    for selected, target in ((subnet, {"NatGatewayId": nat_id}), (public, {"GatewayId": internet})):
+        tables.append(
+            dict(
+                VpcId=vpc,
+                Associations=[
+                    dict(SubnetId=selected, Main=False, AssociationState={"State": "associated"})
+                ],
+                Routes=[dict(DestinationCidrBlock="0.0.0.0/0", State="active", **target)],
+            )
+        )
+    return {
+        "describe-route-tables": {"RouteTables": tables},
+        "describe-nat-gateways": {
+            "NatGateways": [
+                dict(
+                    NatGatewayId=nat_id,
+                    VpcId=vpc,
+                    SubnetId=public,
+                    State="available",
+                    ConnectivityType="public",
+                    NatGatewayAddresses=[
+                        dict(PublicIp="8.8.8.8", AllocationId="eipalloc-" + "c" * 17)
+                    ],
+                )
+            ]
+        },
+        "describe-internet-gateways": {
+            "InternetGateways": [
+                dict(
+                    InternetGatewayId=internet,
+                    OwnerId=prior.P["host"]["account"],
+                    Attachments=[dict(VpcId=vpc, State="available")],
+                )
+            ]
+        },
+    }
+
+
+class Cloud:
+    def __init__(self, data, network=None):
+        self.data, self.calls = data, []
+        self.network = routes() if network is None else network
+
+    def cli(self, service, operation, **kwargs):
+        self.calls.append((service, operation, kwargs))
+        if operation in self.network:
+            return copy.deepcopy(self.network[operation])
+        if operation == "get-console-output":
+            return dict(
+                InstanceId=prior.B["instance"],
+                Output="private-console-must-not-be-retained\n" + prior.CONSOLE,
+            )
+        key = {
+            "get-caller-identity": "identity",
+            "describe-instances": "instances",
+            "describe-instance-status": "health",
+            "describe-instance-attribute": "shutdown",
+            "describe-images": "image",
+            "describe-instance-connect-endpoints": "endpoint",
+            "describe-security-groups": "group",
+            "describe-volumes": "volumes",
+        }[operation]
+        return copy.deepcopy(self.data[key])
+
+
+class FreshHostTests(unittest.TestCase):
+    def test_launch_public_fields_can_be_built_before_ids_exist_and_preserve_disks(self):
+        resources = {
+            k: v for k, v in prior.B.items() if k not in {"instance", "root_volume", "work_volume"}
+        }
+        value = m.launch_request(resources)
+        self.assertEqual(value, m.launch_request(prior.B))
+        self.assertNotIn("UserData", value)  # Not a runnable/approved full launch.
+        self.assertFalse(value["NetworkInterfaces"][0]["AssociatePublicIpAddress"])
+        self.assertEqual(value["InstanceType"], "r6i.4xlarge")
+        self.assertEqual(value["MinCount"], value["MaxCount"])
+        for device in value["BlockDeviceMappings"]:
+            self.assertFalse(device["Ebs"]["DeleteOnTermination"])
+            self.assertTrue(device["Ebs"]["Encrypted"])
+            self.assertNotIn("SnapshotId", device["Ebs"])
+
+    def test_original_checker_does_not_prove_freshness_but_successor_does(self):
+        data, launch, now = fixture()
+        data["volumes"]["Volumes"][1]["SnapshotId"] = "snap-" + "b" * 17
+        self.assertTrue(prior.m.inspect(data, prior.B, prior.P)["control_plane_matches"])
+        with self.assertRaises(ValueError):
+            m.inspect(data, prior.B, prior.P, launch, observed_at=now)
+        data["volumes"]["Volumes"][1]["SnapshotId"] = ""
+        value = m.inspect(data, prior.B, prior.P, launch, observed_at=now)
+        self.assertTrue(value["fresh_launch_and_work_volume_match"])
+        self.assertFalse(value["native_host_admitted"])
+
+    def test_old_future_multiattach_or_wrong_root_snapshot_rejected(self):
+        for change in (
+            {"CreateTime": dt.datetime(2020, 1, 1, tzinfo=dt.UTC)},
+            {"CreateTime": dt.datetime(2100, 1, 1, tzinfo=dt.UTC)},
+            {"MultiAttachEnabled": True},
+            {"SnapshotId": "snap-" + "c" * 17},
+        ):
+            data, launch, now = fixture()
+            data["volumes"]["Volumes"][1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                m.inspect(data, prior.B, prior.P, launch, observed_at=now)
+        data, launch, now = fixture()
+        data["volumes"]["Volumes"][0]["SnapshotId"] = ""
+        with self.assertRaises(ValueError):
+            m.inspect(data, prior.B, prior.P, launch, observed_at=now)
+
+    def test_launch_window_token_request_injection_or_stale_record_rejected(self):
+        data, launch, now = fixture()
+        for changed in (
+            launch | {"approved": True},
+            launch | {"client_token": "0" * 32},
+            launch | {"request_sha256": "0" * 64},
+            launch | {"acknowledged_at": (now + dt.timedelta(hours=1)).isoformat()},
+        ):
+            with self.assertRaises(ValueError):
+                m.inspect(data, prior.B, prior.P, changed, observed_at=now)
+        altered = copy.deepcopy(launch)
+        altered["request"]["BlockDeviceMappings"][1]["Ebs"]["SnapshotId"] = "snap-existing"
+        altered["request_sha256"] = hashlib.sha256(m.canonical(altered["request"])).hexdigest()
+        with self.assertRaises(ValueError):
+            m.inspect(data, prior.B, prior.P, altered, observed_at=now)
+        altered = copy.deepcopy(launch)
+        altered["request"]["MinCount"] = True
+        altered["request_sha256"] = hashlib.sha256(m.canonical(altered["request"])).hexdigest()
+        with self.assertRaises(ValueError):
+            m.inspect(data, prior.B, prior.P, altered, observed_at=now)
+        with self.assertRaises(ValueError):
+            m.inspect(data, prior.B, prior.P, launch, observed_at=now + dt.timedelta(hours=1))
+        data["instances"]["Reservations"][0]["Instances"][0]["ClientToken"] = "0" * 32
+        with self.assertRaises(ValueError):
+            m.inspect(data, prior.B, prior.P, launch, observed_at=now)
+
+    def test_private_existing_nat_route_without_connectivity_claim_or_mutation(self):
+        data, _, _ = fixture()
+        cloud = Cloud(data)
+        report = m.read_route(cloud, prior.P)
+        self.assertTrue(report["private_egress_route_configured"])
+        self.assertFalse(report["egress_reachability_proven"])
+        self.assertFalse(report["new_network_resources_created"])
+        self.assertEqual(len(cloud.calls), 3)
+        self.assertTrue(all(op.startswith("describe-") for _, op, _ in cloud.calls))
+
+    def test_direct_igw_blackhole_unavailable_private_nat_or_wrong_gateway_rejected(self):
+        data, _, _ = fixture()
+        for fault in (
+            "igw",
+            "blackhole",
+            "nat-state",
+            "nat-private",
+            "gateway-owner",
+            "pagination",
+            "same-subnet",
+        ):
+            net = routes()
+            default = net["describe-route-tables"]["RouteTables"][0]["Routes"][0]
+            nat = net["describe-nat-gateways"]["NatGateways"][0]
+            if fault == "igw":
+                default["GatewayId"] = default.pop("NatGatewayId")
+            elif fault == "blackhole":
+                default["State"] = "blackhole"
+            elif fault == "nat-state":
+                nat["State"] = "pending"
+            elif fault == "nat-private":
+                nat["ConnectivityType"] = "private"
+            elif fault == "gateway-owner":
+                net["describe-internet-gateways"]["InternetGateways"][0]["OwnerId"] = "wrong"
+            elif fault == "pagination":
+                net["describe-route-tables"]["NextToken"] = "more"
+            else:
+                nat["SubnetId"] = prior.P["host"]["subnet"]
+            with self.subTest(fault=fault), self.assertRaises(ValueError):
+                m.read_route(Cloud(data, net), prior.P)
+
+    def test_main_route_fallback_ambiguity_and_timezone_rules(self):
+        tables = routes()["describe-route-tables"]["RouteTables"]
+        table = tables[0]
+        table["Associations"] = [dict(Main=True, AssociationState={"State": "associated"})]
+        self.assertIs(
+            m.route_table(tables, prior.P["host"]["subnet"], prior.P["host"]["vpc"]), table
+        )
+        with self.assertRaises(ValueError):
+            m.route_table(tables + [table], prior.P["host"]["subnet"], prior.P["host"]["vpc"])
+        with self.assertRaises(ValueError):
+            m.utc("2026-01-01T00:00:00")
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+class JoinTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.key = self.root / "synthetic_key"
+        self.key.write_text("not a real private key")
+        self.key.chmod(0o600)
+        self.output = self.root / "joined"
+        self.data, self.launch, _ = fixture()
+        self.cloud = Cloud(self.data)
+        self.now, self.deadline = 100.0, 1600.0
+        self.operations = []
+        self.responses = ["dispatch_requested", "running", "setup_returned", "completed"]
+        self.ssh = self.enterContext(
+            patch.object(
+                join.delivery.seed.sender.delivery, "pipe_exchange", side_effect=self.exchange
+            )
+        )
+        self.upload = self.enterContext(
+            patch.object(
+                join.delivery.seed.sender,
+                "pipe_exchange",
+                return_value=join.delivery.seed.INPUTS.canonical(
+                    join.delivery.seed.sender.expected_receipt()
+                ),
+            )
+        )
+
+    def exchange(self, argv, body, seconds):
+        code = shlex.split(argv[-1])[-1]
+        if "names = (" in code:
+            self.operations.append("seed")
+            return join.delivery.seed.INPUTS.canonical(seed_receipt())
+        op = next(
+            op
+            for op, entry in (
+                ("dispatch", "_deploy_and_dispatch_once"),
+                ("status", "_status"),
+                ("finish", "_finish_once"),
+                ("abort", "_abort_once"),
+            )
+            if entry in code
+        )
+        self.operations.append(op)
+        if op == "dispatch":
+            self.assertIn("'host_deadline_boottime': 14000", code)
+        state = "shutdown_requested" if op == "abort" else self.responses.pop(0)
+        return join.delivery.seed.INPUTS.canonical(
+            dict(state=state, setup_unit_reaped=state == "completed", **join.delivery.BASE)
+        )
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def call(self):
+        return join._prepare_and_setup_admitted_once(
+            prior.B,
+            self.key,
+            self.output,
+            self.launch,
+            cloud=self.cloud,
+            deadline=self.deadline,
+            original_host_deadline_boottime=14000,
+            remaining_control_bytes=32 * 1024**2,
+            clock=lambda: self.now,
+            sleep=self.sleep,
+        )
+
+    def test_actual_cloud_validators_connection_seed_sender_and_setup_join(self):
+        value = self.call()
+        self.assertTrue(value["fresh_host_control_plane_verified"] and value["setup_completed"])
+        self.assertFalse(value["host_admitted"] or value["binding_created"])
+        self.assertEqual(value["cloud_observation_calls"], 12)
+        self.assertEqual(self.operations, ["seed", "dispatch", "status", "status", "finish"])
+        self.upload.assert_called_once()
+        for path in self.output.rglob("*.json"):
+            self.assertNotIn(b"private-console-must-not-be-retained", path.read_bytes())
+        before = len(self.cloud.calls)
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(len(self.cloud.calls), before)
+
+    def test_invalid_snapshot_or_missing_private_egress_blocks_all_ssh(self):
+        self.data["volumes"]["Volumes"][1]["SnapshotId"] = "snap-existing"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.ssh.assert_not_called()
+        self.upload.assert_not_called()
+        result = json.loads((self.output / "result.json").read_text())
+        self.assertEqual(result["failed_stage"], "cloud_admission")
+        self.assertTrue(result["outer_lifecycle_stop_required_on_failure"])
+
+    def test_bad_route_blocks_console_and_ssh(self):
+        self.cloud.network["describe-route-tables"]["RouteTables"][0]["Routes"][0] = dict(
+            DestinationCidrBlock="0.0.0.0/0", GatewayId="igw-" + "9" * 17, State="active"
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        self.ssh.assert_not_called()
+        self.assertFalse(any(op == "get-console-output" for _, op, _ in self.cloud.calls))
+
+    def test_deadline_consumption_is_not_restarted_or_skipped(self):
+        original = self.cloud.cli
+
+        def cli(*args, **kwargs):
+            self.now += 200
+            return original(*args, **kwargs)
+
+        self.cloud.cli = cli
+        with self.assertRaises(ValueError):
+            self.call()
+        self.ssh.assert_not_called()
+        self.assertLess(len(self.cloud.calls), 12)
+
+    def test_ambiguous_setup_never_dispatches_twice(self):
+        self.ssh.side_effect = TimeoutError("secret transport text")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.ssh.call_count, 1)
+        report = (self.output / "result.json").read_bytes()
+        self.assertNotIn(b"secret transport", report)
+        self.assertEqual(json.loads(report)["failed_stage"], "guarded_setup")
+
+    def test_source_pins_and_public_entry_closed(self):
+        for name, pin in join.PINS.items():
+            self.assertEqual(
+                hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest(), pin
+            )
+        with self.assertRaises(ValueError):
+            join.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

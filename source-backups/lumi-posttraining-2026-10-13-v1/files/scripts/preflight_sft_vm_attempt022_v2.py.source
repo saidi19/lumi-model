@@ -1,0 +1,173 @@
+"""Fresh inclusive read-only admission. No CPU runner/approval/marker reachable."""
+
+import ast
+import hashlib
+import importlib
+import importlib.util
+import json
+import math
+import sys
+import time
+import uuid
+from decimal import Decimal
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_deployment_bindings_v3 as bindings
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+from scripts import sft_vm_admission_budget_v1 as budget
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / bindings.RELEASE
+ATTEMPT = bindings.ATTEMPT
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-022-readonly-preflight-v0.2"
+SOURCE = ROOT / "scripts/execute_sft_vm_private_outer_v19.py"
+SOURCE_SHA = "3a028e25c23a02a4cdc850e878a86a4700fd06887ccc9c6587dc62f6b4d6da14"
+BINDINGS_SHA = "6691511eae2b36f5a2ac0e832b38f6742c5aacb03b10ae2f0a5c94d4f8e33002"
+BUDGET_SHA = "93b389a15ea8911ca9afb4d8124542b09470311065ccccd552806162ad7f781f"
+SDK = ROOT / "artifacts/lumi-vm-acquisition-sdk-test-runtime-v0.1/lib/python3.13/site-packages"
+BOTOCORE_INIT_SHA = "a67becb8e1a2afa3579e33dd5f79073779aee3809bca0488d0bc7cb2fd9015d5"
+MAX_CALLS, MAX_SECONDS = 79, 1500
+need, sha, encode = bindings.need, bindings.sha, bindings.encode
+
+
+def runtime():
+    need(sha(files.read(Path(bindings.__file__))) == BINDINGS_SHA)
+    need(sha(files.read(Path(budget.__file__))) == BUDGET_SHA)
+    need(sha(files.read(SOURCE)) == SOURCE_SHA)
+    spec = importlib.util.find_spec("botocore")
+    need(spec is not None and spec.origin is not None)
+    origin = Path(spec.origin).resolve()
+    need(origin == (SDK / "botocore/__init__.py").resolve())
+    need(hashlib.sha256(origin.read_bytes()).hexdigest() == BOTOCORE_INIT_SHA)
+    need(sys.dont_write_bytecode)
+
+
+def local():
+    runtime()
+    manifest = bindings.verify()
+    pins = bindings.controls()
+    directory = str(RELEASE / "scripts")
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    existing = sys.modules.get("run_sft_vm_private_outer_v7")
+    expected = RELEASE / "scripts/run_sft_vm_private_outer_v7.py"
+    need(existing is None or Path(existing.__file__).resolve() == expected)
+    outer = importlib.import_module("run_sft_vm_private_outer_v7")
+    need(Path(outer.__file__).resolve() == expected)
+    outer.authenticate()
+    outer.loading.fresh_identity()
+    return outer, manifest, pins
+
+
+def admission(outer):
+    raw = files.read(SOURCE)
+    need(sha(raw) == SOURCE_SHA)
+    names = {"Preflight", "AdmissionFailure", "inspect_before_marker"}
+    nodes = [node for node in ast.parse(raw).body if getattr(node, "name", None) in names]
+    need(len(nodes) == 3)
+    namespace = dict(
+        outer=outer,
+        local_preconditions=lambda: None,
+        RELEASE=RELEASE,
+        ATTEMPT=ATTEMPT,
+        need=need,
+        json=json,
+        time=time,
+        uuid=uuid,
+        Decimal=Decimal,
+        sha=sha,
+    )
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), "<pinned-readonly-admission>", "exec"),
+        namespace,
+    )
+    need("run" not in namespace and "authorized" not in namespace)
+    return namespace["inspect_before_marker"]
+
+
+def run():
+    outer, _, pins = local()
+    inspect = admission(outer)
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    files.save(
+        OUTPUT / "started.json",
+        dict(
+            entry_sha256=sha(files.read(Path(__file__))),
+            control_evidence=pins,
+            max_calls=MAX_CALLS,
+            max_seconds=MAX_SECONDS,
+            credential_identity_calls_included=True,
+            execution_authorized=False,
+        ),
+    )
+    report = dict(
+        status="started",
+        cloud_mutations=0,
+        object_access=0,
+        execution_marker_created=False,
+        outer_invoked=False,
+        cpu_launch_authorized=False,
+        gpu=False,
+        training=False,
+        gate_5_complete=False,
+        retry_performed=False,
+    )
+    started = time.monotonic()
+    bundle = None
+    with budget.AdmissionBudget(outer.credentials) as meter:
+        try:
+            start = float(math.floor(time.monotonic()))
+            first = True
+
+            def clock():
+                nonlocal first
+                if first:
+                    first = False
+                    return start
+                return time.monotonic()
+
+            reader = outer.credentials.Reader(start + 18000, clock=clock)
+            bundle = meter.clients(reader)
+            result = meter.inspect(inspect, bundle)
+            files.save(OUTPUT / "admission.json", result)
+            report.update(status="readonly_preflight_passed", admission=result)
+        except BaseException as error:
+            stage = getattr(error, "stage", "admission")
+            report.update(
+                status="stopped_no_retry",
+                failed_stage=stage
+                if stage in {"cpu", "watchdog", "network", "cleanup_store"}
+                else "admission",
+            )
+        finally:
+            if bundle is not None:
+                bundle.close()
+            report.update(
+                admission_call_budget=meter.report(),
+                elapsed_seconds=round(time.monotonic() - started, 3),
+            )
+            files.save(OUTPUT / "result.json", report)
+    print(
+        json.dumps(
+            {
+                key: report[key]
+                for key in (
+                    "status",
+                    "admission_call_budget",
+                    "elapsed_seconds",
+                    "cloud_mutations",
+                    "object_access",
+                    "execution_marker_created",
+                    "outer_invoked",
+                )
+            },
+            sort_keys=True,
+        )
+    )
+    return report
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--inspect-once"])
+    run()

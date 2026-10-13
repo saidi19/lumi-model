@@ -1,0 +1,142 @@
+# SFT execution status v0.50
+
+Local-only result receipt, 2026-09-09. Do not publish this result-only document
+to trigger another CI run. Preserve the failed commit and evidence; no native
+retry or acceptance-check relaxation is authorized by this receipt.
+
+## Exact published successor
+
+`edaa86e238223cf3a1ecfb6292640d8bc43e72de`, parent
+`3fcb22e01228052bd3abf3d69862ee8dc1f1b525`, adds exactly the eleven files listed
+in v0.49. No previous accepted source, fixture, workflow, test or evidence was
+modified. Publication used the exact local tree/commit objects, a verified
+private repository, a checked parent ref and a non-force update. Local HEAD,
+origin tracking ref and live GitHub branch were verified equal after publication.
+
+Local checks: **278 passed in 0.281 seconds** (120 new pure/AST tests plus 158
+accepted pure/AST regressions), exact-file Ruff clean. No native script, Linux
+fixture or Linux wrapper was imported or executed on the Mac, including skips.
+
+## Real image build passed; CPU acceptance stopped
+
+[CPU release candidate run 34321790686](https://github.com/saidi19/lumi-model/actions/runs/34321790686),
+job `102369854047`, failed once at **cpu_acceptance**, after **55 seconds** of
+builder runtime. The scoped report requires that these earlier stages returned
+success before reaching this stage:
+
+- Same-commit tracked-source snapshot: **465 files / 11,567,702 bytes**.
+- Pinned base inspection and inventory: **2375 files / 82,518,542 bytes**;
+  base distribution metadata contains only pip **25.0.1**.
+- All **34 exact wheels / 248,715,637 bytes** passed size and SHA-256 checks.
+- Offline, binary-only, hash-locked image build and `pip check` completed.
+- Final image-ID container creation and nonroot/read-only/network-none,
+  no-host-software-bind/device inspection passed.
+
+These are program-order claims supported by the reached stage and retained
+control files, not an invented per-stage success transcript. The v1 failed
+report does not retain the built image ID; do not invent one. The immutable
+image was built, but it is **not an accepted release**, and no image archive was
+uploaded. The workflow skipped its accepted-image upload step. There was no
+second container acceptance start, CI rerun, promotion or registry push.
+
+The exact retained probe failure is:
+
+```
+probe_stage = worker_run
+fixture_stage = ledger
+child_stage = run
+code = probe_failed
+```
+
+`child_stage=run` spans the entire `WorkerRun.run()` call. It does not establish
+which component failed, whether the input-origin witness was reached, or how
+many optimizer steps occurred. It is not evidence of corrupt data, an invalid
+model, a GPU issue, or a proven OverlayFS bug. Existing rejection checks remain
+unchanged. `real_sft_execution_permitted=false` and `production_eligible=false`.
+
+The failed image's generated temporary files were not added to the immutable
+image. The exact owned worker container was retired: no cleanup-failed flag was
+reported, and the final cleanup path completed. Do not infer successful fixture
+cleanup counters from a failed probe.
+
+## Byte-preserved evidence
+
+Private GitHub artifact **10092161066**,
+`sft-cpu-release-evidence-edaa86e238223cf3a1ecfb6292640d8bc43e72de`, is 144,515 bytes;
+downloaded ZIP SHA-256:
+`2c3ab4fd844208efbdc6b6e39b05a323d8cb1bb1e2258bf0c92de406450d4aa4`.
+It was read in memory only. No software image or package binary was downloaded
+onto the Mac. The two tiny reports below were copied locally and their raw-byte
+hashes rechecked:
+
+- `artifacts/lumi-sft-oci-release-candidate-v0.1-failed-34321790686/release-report.json`:
+  565 bytes, `a0fce383c04853fcb7173b5d560b22f2818a650e88df7cab8c5f43174bddbc21`.
+- `artifacts/lumi-sft-oci-release-candidate-v0.1-failed-34321790686/software-command-0480-failure.log`:
+  501 bytes, `aa1e334d868214c612b6fa31f4d7cea745613c50c0642b9e9407dac8746ef7f0`.
+- Retained base inventory: 367,787 bytes,
+  `e30ec2e16ab8360be394b890e9f06e8819ae9f12c2414b975148beb76d93f8e8`.
+- Retained source inventory: 70,189 bytes,
+  `417a3af0b7e6972082bd394192ae663e67d1e0ce3733c949ca32d2c8bf4f7bc6`.
+- Retained software lock: 12,187 bytes,
+  `26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965`.
+
+Remote evidence retention is 30 days, not permanent archival. Prior failures,
+v0.48 local handoff and unrelated untracked workspace files remain untouched.
+
+## Unaffected regressions
+
+[Spark run 34321790682](https://github.com/saidi19/lumi-model/actions/runs/34321790682),
+job `102369854063`, passed **3 tests, zero skips, in 111.62 seconds**, at the exact
+same commit. Its completed log was read in memory (51,695 bytes).
+
+[Source run 34321790698](https://github.com/saidi19/lumi-model/actions/runs/34321790698)
+completed successfully on the same SHA. Its source-only-validators
+`102369854310`, isolated-sft-controls `102369854450`, frozen-lint-integrity
+`102369854573`, and test `102369854499` jobs all passed. The completed test log
+(61,540 bytes, read in memory) reports **4916 passed, 58 skipped, 329 deselected,
+36 warnings, 9746 subtests passed in 445.29 seconds**. The final partition is
+`SOURCE_SCOPE_ACCOUNTED`: **4974 source-selected**, **327 private NOT_EXECUTED**,
+and **2 history tests separately routed**. `private_integration_passed=false`
+and `full_ci_passed=false` remain unchanged.
+
+Final local HEAD, origin tracking ref and live GitHub branch are all the exact
+`edaa86e238223cf3a1ecfb6292640d8bc43e72de` commit; the tracked tree and index are
+clean. Only this local receipt and the two tiny evidence copies were added after
+publication; unrelated untracked work was preserved.
+
+## Next justified work: visibility, not a guessed gate bypass
+
+Read-only review found a concrete reporting omission: v1 `failure_stages()`
+exports the probe/fixture/child stages but omits the frozen fixture's already
+collected `WORKER_STAGE`, `WORKER_CODE` and `COMPONENT_DIAGNOSTICS`. It also lacks
+a way to carry an observer witness rejection from the rank process to the
+parent. Consequently the retained report cannot identify the exact failing
+check. This reporting gap is proven; the underlying rejection cause is not.
+
+A fresh diagnostic successor should retain only fixed allowlisted component and
+observer codes/stages plus aggregate counts; no module names, paths, PIDs,
+source/candidate/model text or exception messages. Preserve every existing
+rejection and frozen fixture byte. A metadata-only `record_failure` composition
+hook is necessary to capture validated failed-outcome extras: merely adding
+extras to a child result is insufficient because the frozen parent discards
+unknown fields and failed `run_invocation()` does not return those reports.
+Also retain the actual built image ID and completed acquisition counts before
+acceptance, so failure cannot erase successful software-build bindings.
+
+Do not add broad temporary-path or pseudo-file exceptions, weaken inode/device
+matching, or change training/runtime policy based on this incomplete report.
+Kernel OverlayFS behavior is version-dependent; the
+[kernel documentation](https://kernel.org/doc/html/latest/filesystems/overlayfs.html)
+does not identify this particular failure, and
+[newer proc-map code](https://github.com/torvalds/linux/blob/v6.17/fs/proc/task_mmu.c)
+uses a user-inode indirection. Likewise, reviewed setuptools aliases already
+fit the dependency root; Torch class-level pseudo-file attributes do not prove
+what this observer saw in module dictionaries. These are rejected hypotheses,
+not implemented fixes.
+
+No fresh native diagnostic or successor acceptance was started in this turn.
+Gate 5 remains partial: real software packaging is now exercised, but same-image
+CPU acceptance is blocked, then integrated guardian/worker admission remains.
+Dedicated real-host binding, original pretrained S3 checkpoint restoration,
+exact data relocation, explicitly approved H100/CUDA checks, real SFT,
+evaluation and later rights/quality/release gates are still downstream.

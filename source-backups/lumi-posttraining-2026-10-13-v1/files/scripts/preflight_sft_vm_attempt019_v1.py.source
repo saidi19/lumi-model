@@ -1,0 +1,102 @@
+"""Fresh read-only CPU/control admission for attempt-019."""
+import hashlib
+import importlib
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+from scripts import preflight_sft_vm_attempt017_v1 as qualified
+from scripts import prepare_sft_vm_deployment_bindings_v19 as bindings
+
+ROOT = Path(__file__).resolve().parents[1]
+QUALIFIED_SHA = "939363befa790b34537feffd7c9c0e1f992de643678402e4baa6b0faf6633745"
+BINDINGS_SHA = "0aff5899fcf0fcc72e9c3fef8cf50c4be7b65f68ca9d06259312fafcc7439d06"
+CORRECTION = ROOT / "evidence/lumi-vm-attempt-019-source-v0.1-verification-v0.1.json"
+CORRECTION_SHA = "fc55f988dc5ddc7b833a361209e74fbde44e0bc35494ed95b21e083bbaf6fac9"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-018-v022-execution-cleanup-verification-v0.1.json"
+FAILURE_SHA = "3b5c425666588bb7ef24c24599ad523bd411f68db1ee57526a0fdb4ea4c9c36f"
+SDK = ROOT / "artifacts/lumi-vm-acquisition-sdk-test-runtime-v0.1/lib/python3.13/site-packages"
+BOTOCORE_INIT_SHA = "a67becb8e1a2afa3579e33dd5f79073779aee3809bca0488d0bc7cb2fd9015d5"
+ATTEMPT = bindings.ATTEMPT
+RELEASE = ROOT / bindings.RELEASE
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-019-readonly-preflight-v0.1"
+SOURCE = ROOT / "scripts/execute_sft_vm_private_outer_v19.py"
+SOURCE_SHA = "3a028e25c23a02a4cdc850e878a86a4700fd06887ccc9c6587dc62f6b4d6da14"
+MAX_CALLS, MAX_SECONDS = 79, 1500
+ReadOnlyClient = qualified.ReadOnlyClient
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_readonly_preflight_v1_rejected") from None
+
+
+def runtime():
+    need(hashlib.sha256(Path(qualified.__file__).read_bytes()).hexdigest() == QUALIFIED_SHA)
+    need(hashlib.sha256(Path(bindings.__file__).read_bytes()).hexdigest() == BINDINGS_SHA)
+    need(hashlib.sha256(CORRECTION.read_bytes()).hexdigest() == CORRECTION_SHA)
+    need(hashlib.sha256(FAILURE.read_bytes()).hexdigest() == FAILURE_SHA)
+    need(not SDK.is_symlink() and SDK.is_dir())
+    spec = importlib.util.find_spec("botocore")
+    need(spec is not None and spec.origin is not None)
+    origin = Path(spec.origin).resolve()
+    need(origin == (SDK / "botocore/__init__.py").resolve())
+    need(hashlib.sha256(origin.read_bytes()).hexdigest() == BOTOCORE_INIT_SHA)
+
+
+def bind():
+    runtime()
+    values = {
+        "bindings": bindings,
+        "ROOT": ROOT,
+        "RELEASE": RELEASE,
+        "ATTEMPT": ATTEMPT,
+        "OUTPUT": OUTPUT,
+        "SOURCE": SOURCE,
+        "SOURCE_SHA": SOURCE_SHA,
+        "MAX_CALLS": MAX_CALLS,
+        "MAX_SECONDS": MAX_SECONDS,
+        "local": local,
+    }
+    for key, value in values.items():
+        setattr(qualified, key, value)
+    return qualified
+
+
+def local():
+    bind()
+    manifest = bindings.verify()
+    pins = bindings.controls()
+    proof_path = ROOT / "evidence/lumi-vm-attempt-016-endpoint-cleanup-verification-v0.1.json"
+    proof = json.loads(
+        bindings.read(
+            str(proof_path.relative_to(ROOT)),
+            "503443d85c9d2e5cb99fd06255e9defe058a53f6ee7aeb91756d31e2e5990837",
+        )
+    )
+    need(proof["result"]["cleanup_verified"] and proof["endpoint_interface_absent"])
+    for name, pin in proof["source_bindings"].items():
+        bindings.read(name, pin["sha256"], pin["bytes"])
+    need(sys.dont_write_bytecode)
+    sys.path.insert(0, str(RELEASE / "scripts"))
+    existing = sys.modules.get("run_sft_vm_private_outer_v7")
+    expected_outer = RELEASE / "scripts/run_sft_vm_private_outer_v7.py"
+    need(existing is None or Path(existing.__file__).resolve() == expected_outer)
+    outer = importlib.import_module("run_sft_vm_private_outer_v7")
+    need(Path(outer.__file__).resolve() == expected_outer)
+    outer.authenticate()
+    outer.loading.fresh_identity()
+    return outer, manifest, pins
+
+
+def admission(outer):
+    return bind().admission(outer)
+
+
+def run():
+    return bind().run()
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,133 @@
+"""Synthetic local pipe fixtures only; never SSH, cloud, receiver staging or model data."""
+
+import ast
+import json
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_setup_exchange_diagnostic_v1 as builder
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.ns = builder.test_namespace()
+        for name in ("socket", "create_connection"):
+            guard = patch.object(socket, name, side_effect=AssertionError("no_network"))
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def fixture(self, code, timeout=2):
+        return self.ns["pipe_exchange"](
+            [sys.executable, "-I", "-B", "-c", code], b"x" * 4096, timeout
+        )
+
+    def failure(self, code, timeout=2):
+        with self.assertRaises(self.ns["SetupExchangeFailure"]) as caught:
+            self.fixture(code, timeout)
+        return caught.exception.diagnostic
+
+    def test_saved_candidate_is_reproducible(self):
+        self.assertEqual(builder.build(), builder.OUTPUT.read_bytes())
+
+    def test_policy_caps_and_success_receipt_are_unchanged(self):
+        old, new = ast.parse(builder.BASE.read_bytes()), ast.parse(builder.build())
+        for name in (
+            "MAX_REPLY",
+            "LOCAL_SECONDS",
+            "REMOTE_SECONDS",
+            "SETUP_SECONDS",
+            "ARCHIVE_SHA",
+            "ARCHIVE_BYTES",
+            "RECEIVER_SHA",
+            "RECEIVER_BYTES",
+        ):
+
+            def constant(tree, name=name):
+                return next(
+                    ast.literal_eval(n.value)
+                    for n in tree.body
+                    if isinstance(n, ast.Assign)
+                    and isinstance(n.targets[0], ast.Name)
+                    and n.targets[0].id == name
+                )
+
+            self.assertEqual(constant(old), constant(new))
+        for name in ("expected_receipt", "validate_receipt_contract", "command", "run"):
+            nodes = [
+                next(n for n in tree.body if getattr(n, "name", None) == name)
+                for tree in (old, new)
+            ]
+            self.assertEqual(ast.dump(nodes[0]), ast.dump(nodes[1]))
+
+    def test_remote_launcher_assertions_are_identical(self):
+        old = ast.parse(builder.BASE.read_bytes())
+        node = next(n for n in old.body if getattr(n, "name", None) == "native_launcher")
+        values = dict(self.ns)
+        exec(
+            compile(ast.Module(body=[node], type_ignores=[]), "<original-launcher>", "exec"), values
+        )
+        args = (
+            "a" * 32,
+            "b" * 8 + "-" + "b" * 4 + "-" + "b" * 4 + "-" + "b" * 4 + "-" + "b" * 12,
+            1800,
+        )
+        before, after = (
+            ast.parse(values["native_launcher"](*args)),
+            ast.parse(self.ns["native_launcher"](*args)),
+        )
+
+        def assertions(tree):
+            return [ast.dump(n) for n in ast.walk(tree) if isinstance(n, ast.Assert)]
+
+        self.assertEqual(assertions(before), assertions(after))
+
+    def test_success_reply_is_not_modified(self):
+        raw = self.fixture('import sys;sys.stdin.buffer.read();print("synthetic_receipt")')
+        self.assertEqual(raw, b"synthetic_receipt\n")
+
+    def test_native_failure_code_is_finite(self):
+        payload = json.dumps(
+            dict(status="setup_delivery_failed", execution_permitted=False, failure_code="receiver")
+        )
+        result = self.failure(f"import sys;sys.stdin.buffer.read();print({payload!r});sys.exit(2)")
+        self.assertEqual(result["remote_failure_code"], "receiver")
+        self.assertEqual(result["exit_code"], 2)
+        self.assertEqual(result["stdin_bytes_written"], 4096)
+
+    def test_nonzero_stderr_does_not_leak(self):
+        result = self.failure(
+            'import sys;sys.stdin.buffer.read();sys.stderr.write("PRIVATE_SENTINEL");sys.exit(9)'
+        )
+        self.assertEqual(result["exit_code"], 9)
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_overlong_reply_is_rejected(self):
+        result = self.failure('import sys;sys.stdin.buffer.read();sys.stdout.write("x"*4097)')
+        self.assertLessEqual(result["stdout_bytes_seen"], 4097)
+        self.assertEqual(result["phase"], "read")
+
+    def test_arbitrary_native_failure_text_is_not_retained(self):
+        payload = json.dumps(
+            dict(
+                status="setup_delivery_failed",
+                execution_permitted=False,
+                failure_code="PRIVATE_SENTINEL",
+            )
+        )
+        result = self.failure(f"import sys;sys.stdin.buffer.read();print({payload!r});sys.exit(2)")
+        self.assertIsNone(result["remote_failure_code"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_unknown_exception_text_is_not_retained(self):
+        fake = type("Process", (), {"poll": lambda self: None})()
+        result = self.ns["exchange_diagnostic"](
+            Exception("PRIVATE_SENTINEL"), "write", 3, b"", fake
+        )
+        self.assertEqual(result["kind"], "other")
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+
+if __name__ == "__main__":
+    unittest.main()

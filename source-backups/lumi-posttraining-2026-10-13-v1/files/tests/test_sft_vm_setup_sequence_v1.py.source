@@ -1,0 +1,201 @@
+import hashlib
+import importlib.util
+import json
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_detached_parent_v1 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "setup_sequence_test", ROOT / "scripts/run_sft_vm_setup_sequence_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+frozen = previous.m.handoff.frozen
+
+
+class SequenceTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.output = self.root / "setup"
+        self.enterContext(patch.object(m, "OUTPUT", self.output))
+        self.bodies = {
+            name + ".service": (ROOT / path).read_bytes()
+            for name, path in (
+                ("cpu", "configs/lumi-vm-cpu-runtime-install-v0.1.service"),
+                ("sdk", "configs/lumi-vm-acquisition-sdk-install-v0.1.service"),
+            )
+        }
+        self.events = []
+        self.bad_dispatch = None
+        self.bad_receipt = None
+        self.bad_stop = False
+        self.helper = types.SimpleNamespace(
+            write_new=frozen.write_new,
+            observe=Mock(return_value=previous.prior.fixture.SUCCESS),
+            validate_terminal=frozen.validate_terminal,
+            cgroup_empty=Mock(return_value=True),
+        )
+
+        def commands(argv, timeout, **kw):
+            if argv[0] == "/usr/bin/systemd-run":
+                unit = next(a.split("=", 1)[1] for a in argv if a.startswith("--unit="))
+                phase = next(p for p, name in m.UNITS.items() if name == unit)
+                self.events.append(("dispatch", phase))
+                if phase == self.bad_dispatch:
+                    raise TimeoutError("private exception")
+            elif argv[:2] == ["/usr/bin/systemctl", "stop"]:
+                self.events.append(("stop", argv[2]))
+                if self.bad_stop:
+                    return types.SimpleNamespace(returncode=1)
+            else:
+                self.fail("unexpected command")
+            return types.SimpleNamespace(returncode=0)
+
+        self.helper.run_command = Mock(side_effect=commands)
+        self.enterContext(
+            patch.object(m, "preflight", return_value=(self.helper, self.bodies, 102))
+        )
+
+        def receipt(phase, count):
+            self.assertEqual(self.events[-1], ("stop", m.UNITS[phase]))
+            self.assertEqual(count, 102)
+            self.events.append(("receipt", phase))
+            if phase == self.bad_receipt:
+                raise ValueError("private exception")
+
+        self.enterContext(patch.object(m, "receipt", side_effect=receipt))
+
+    def run_case(self, seconds=1700):
+        return m._run_admitted_once("b" * 32, time.monotonic() + seconds)
+
+    def test_all_four_steps_sequential_reaped_before_receipts_no_binding(self):
+        result = self.run_case()
+        self.assertEqual(result["setup_components_completed"], list(m.UNITS))
+        self.assertFalse(result["host_admitted"])
+        self.assertFalse(result["binding_created"])
+        self.assertEqual(
+            [x for x in self.events if x[0] == "dispatch"],
+            [("dispatch", phase) for phase in m.UNITS],
+        )
+        self.assertEqual(len(self.events), 12)
+        with self.assertRaises(FileExistsError):
+            self.run_case()
+        self.assertEqual(len(self.events), 12)
+
+    def test_ambiguous_cpu_dispatch_stops_and_never_starts_sdk(self):
+        self.bad_dispatch = "cpu"
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events, [("dispatch", "cpu"), ("stop", m.UNITS["cpu"])])
+        failure = (self.output / "failed.json").read_bytes()
+        self.assertNotIn(b"private exception", failure)
+        self.assertEqual(json.loads(failure)["completed"], [])
+        with self.assertRaises(FileExistsError):
+            self.run_case()
+
+    def test_failed_sdk_receipt_blocks_both_source_stages(self):
+        self.bad_receipt = "sdk"
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual([p for action, p in self.events if action == "dispatch"], ["cpu", "sdk"])
+        self.assertEqual(
+            json.loads((self.output / "failed.json").read_bytes())["completed"], ["cpu"]
+        )
+
+    def test_cleanup_or_live_cgroup_prevents_receipt_and_next_step(self):
+        self.bad_stop = True
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertFalse(any(action == "receipt" for action, _ in self.events))
+
+    def test_insufficient_remaining_setup_window_never_starts_child(self):
+        with self.assertRaises(ValueError):
+            self.run_case(250)
+        self.assertFalse(self.events)
+        self.assertTrue((self.output / "started.json").exists())
+
+    def test_failed_terminal_is_not_a_successful_install(self):
+        self.helper.observe.return_value = previous.prior.fixture.SUCCESS | {
+            "Result": "exit-code",
+            "ExecMainStatus": "1",
+        }
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events[-1], ("stop", m.UNITS["cpu"]))
+        self.assertEqual(len(self.events), 2)
+
+
+class WiringTests(unittest.TestCase):
+    def test_native_boundary_rejects_mac_and_public_entry_closed(self):
+        with patch.object(m.sys, "platform", "darwin"), self.assertRaises(ValueError):
+            m.preflight("b" * 32)
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)
+
+    def test_commands_reuse_templates_and_exact_entry_paths(self):
+        bodies = {
+            phase + ".service": (ROOT / name).read_bytes()
+            for phase, name in (
+                ("cpu", "configs/lumi-vm-cpu-runtime-install-v0.1.service"),
+                ("sdk", "configs/lumi-vm-acquisition-sdk-install-v0.1.service"),
+            )
+        }
+        for phase in m.UNITS:
+            argv = m.command(phase, bodies, "b" * 32)
+            self.assertIn("--no-block", argv)
+            self.assertIn("--property=PrivateNetwork=yes", argv)
+            self.assertIn("--property=Restart=no", argv)
+            self.assertIn("--property=RemainAfterExit=yes", argv)
+            self.assertIn(
+                "--property=RuntimeMaxSec=" + ("600" if phase in {"cpu", "sdk"} else "120"), argv
+            )
+            self.assertNotIn("ARCHIVE_SHA256", " ".join(argv))
+        self.assertIn(m.SDK_SHA, m.command("sdk", bodies, "b" * 32))
+
+    def test_all_source_and_template_pins_match_checkout(self):
+        mapping = {
+            "cpu.service": "configs/lumi-vm-cpu-runtime-install-v0.1.service",
+            "sdk.service": "configs/lumi-vm-acquisition-sdk-install-v0.1.service",
+            "posttraining_import_vm_rehearsal_v3.py": (
+                "src/lumi/posttraining_import_vm_rehearsal_v3.py"
+            ),
+        }
+        for name, digest in m.PINS.items():
+            path = ROOT / mapping.get(name, "scripts/" + name)
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+        for name, (digest, _) in m.EXTERNAL.items():
+            basename = Path(name).name
+            if basename.endswith(".tar"):
+                continue
+            path = ROOT / (
+                "configs/lumi-sft-linux-cpu-release-v0.1.lock.json"
+                if basename == "runtime-lock.json"
+                else "scripts/" + basename
+            )
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), digest)
+
+    def test_wrong_receipt_rejected_without_claiming_admission(self):
+        value = dict(
+            schema="lumi.vm-cpu-offline-install.v0.1",
+            status="passed",
+            host_admitted=False,
+            gate_5_complete=False,
+            software_lock_sha256=m.LOCK_SHA,
+            wheel_count=34,
+            wheel_bytes=102,
+            all_locked_versions_match=True,
+        )
+        with patch.object(m, "read", return_value=json.dumps(value).encode()):
+            m.receipt("cpu", 102)
+        for change in ({"host_admitted": True}, {"wheel_bytes": 103}, {"schema": "wrong"}):
+            with (
+                patch.object(m, "read", return_value=json.dumps(value | change).encode()),
+                self.assertRaises(ValueError),
+            ):
+                m.receipt("cpu", 102)

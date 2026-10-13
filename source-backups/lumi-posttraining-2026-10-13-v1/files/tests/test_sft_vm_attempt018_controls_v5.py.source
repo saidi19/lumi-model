@@ -1,0 +1,26 @@
+"""Offline tests for final v0.22 CPU-scope correction."""
+import unittest
+
+from scripts import prepare_sft_vm_attempt018_controls_v5 as m
+
+
+class Tests(unittest.TestCase):
+    def test_scope_closes_v021_objections(self):
+        plan = m.build()
+        scope = plan["cpu_scope_reference"]
+        self.assertTrue(scope["source"]["source_versions_bound"])
+        self.assertTrue(scope["source"]["hard_ip_packet_quotas_implemented"])
+        self.assertFalse(scope["source"]["wire_or_billing_byte_cap_claimed"])
+        self.assertIn("implemented_requires", scope["retention"]["status"])
+        self.assertTrue(scope["watchdog_launch_interlock_bound"])
+        self.assertEqual(scope["status"], "guarded_execution_prepared_not_authorized")
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_public_execution_entry_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

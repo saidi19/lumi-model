@@ -1,0 +1,210 @@
+"""One approved read-only watchdog inspection; fixed targets, no mutation API."""
+
+import configparser
+import datetime as dt
+import hashlib
+import importlib
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PLAN = ROOT / "configs/lumi-vm-private-outer-recovery-plan-v0.4.json"
+PLAN_SHA = "eadd6a2f78944383bdf6605f9a396db1f7ddfec56d0960d1b955bab50fafe7d9"
+OUT = ROOT / "artifacts/lumi-vm-watchdog-readonly-recovery-v0.1"
+ACCOUNT, REGION = "573978149073", "us-east-1"
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+FUNCTION = "lumi-stop-" + ATTEMPT
+CODE = "OZVEcy+HguwyYycwA8N/6PCudW4ISR5rpODIeLHQ6vE="
+
+
+class Stop(Exception):
+    pass
+
+
+def need(value, code):
+    if not value:
+        raise Stop(code) from None
+
+
+def cached_credentials():
+    # Match installed AWS CLI generate_login_cache_key; no refresh or provider HTTP.
+    config = configparser.RawConfigParser()
+    config.read("/Users/afnan/.aws/config")
+    session = config.get("default", "login_session")
+    path = Path("/Users/afnan/.aws/login/cache") / (
+        hashlib.sha256(session.encode()).hexdigest() + ".json")
+    need(path.stat().st_size <= 32768, "credential_cache_rejected")
+    value = json.loads(path.read_bytes())["accessToken"]
+    expiry = dt.datetime.fromisoformat(value["expiresAt"].replace("Z", "+00:00"))
+    need(expiry.timestamp()-time.time() > 660, "login_required")
+    need(value["accountId"] == ACCOUNT, "credential_account_rejected")
+    return dict(aws_access_key_id=value["accessKeyId"],
+                aws_secret_access_key=value["secretAccessKey"],
+                aws_session_token=value["sessionToken"])
+
+
+def encoded(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def save(name, value):
+    raw = encoded(value) + b"\n"
+    need(len(raw) < 16384, "report_cap")
+    fd = os.open(OUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(raw)
+
+
+def requests(inert):
+    ops = [("sts", "get_caller_identity", {})]
+    for role, _, _ in inert.policies():
+        ops.extend(("iam", op, dict(RoleName=role, **extra)) for op, extra in (
+            ("get_role", {}), ("get_role_policy", {"PolicyName": inert.POLICY}),
+            ("list_role_policies", {}), ("list_attached_role_policies", {})))
+    ops.extend(("lambda", op, {"FunctionName": FUNCTION}) for op in (
+        "get_function_configuration", "get_function_concurrency",
+        "get_function_event_invoke_config"))
+    ops.extend((("scheduler", "get_schedule_group", {"Name": FUNCTION}),
+                ("scheduler", "get_schedule", {"Name": "stop", "GroupName": FUNCTION})))
+    ops.extend(("lambda", op, {"FunctionName": FUNCTION}) for op in (
+        "get_function_configuration", "get_function_concurrency"))
+    return ops
+
+
+def inspect(clients, inert, report):
+    start = time.monotonic()
+    first = None
+    policies = {name: (trust, policy) for name, trust, policy in inert.policies()}
+    for service, operation, fields in requests(inert):
+        stage = f"{service}.{operation}"
+        report["stage"] = stage
+        need(time.monotonic()-start < 580, "deadline")
+        need(report["resource_api_calls"] < 16, "api_cap")
+        report["resource_api_calls"] += 1
+        try:
+            value = getattr(clients[service], operation)(**fields)
+        except Exception as error:
+            response = getattr(error, "response", {})
+            value = response
+            code = response.get("Error", {}).get("Code")
+            if service == "scheduler" and code == "ResourceNotFoundException":
+                value = None
+            else:
+                raise Stop("api_read_failed") from None
+        size = len(encoded(response if value is None else value))
+        report["response_bytes"] += size
+        need(size <= 262144 and report["response_bytes"] <= 2097152, "response_cap")
+        need(value is None or not any(value.get(k) for k in (
+            "NextToken", "Marker", "IsTruncated")), "pagination_rejected")
+        checks = {}
+        if service == "sts":
+            checks["account"] = value.get("Account") == ACCOUNT
+        elif service == "iam":
+            role = fields["RoleName"]
+            trust, policy = policies[role]
+            if operation == "get_role":
+                checks["role_arn"] = value["Role"].get("Arn") == inert.BASE + role
+                checks["role_trust"] = value["Role"].get("AssumeRolePolicyDocument") == trust
+            elif operation == "get_role_policy":
+                checks["inline_policy"] = value.get("PolicyDocument") == policy
+            elif operation == "list_role_policies":
+                checks["only_expected_inline_policy"] = value.get("PolicyNames") == [inert.POLICY]
+            else:
+                checks["no_attached_policies"] = value.get("AttachedPolicies") == []
+        elif service == "scheduler":
+            checks["absent"] = value is None
+        elif operation == "get_function_configuration":
+            expected = dict(FunctionArn=f"arn:aws:lambda:{REGION}:{ACCOUNT}:function:{FUNCTION}",
+                CodeSha256=CODE, Role=inert.BASE+inert.WORKER_ROLE, Runtime="python3.13",
+                Handler="watchdog.handler", Timeout=180, MemorySize=128, Architectures=["arm64"],
+                EphemeralStorage={"Size": 512}, State="Active", LastUpdateStatus="Successful",
+                Environment=inert.UNARMED)
+            checks.update({"configuration_"+key: value.get(key) == item
+                           for key, item in expected.items()})
+            checks["no_extra_bindings"] = not (value.get("Layers") or
+                value.get("VpcConfig", {}).get("VpcId") or value.get("DeadLetterConfig")
+                or value.get("FileSystemConfigs"))
+            revision = value.get("RevisionId")
+            checks["revision_present"] = type(revision) is str and bool(revision)
+            if first is None:
+                first = revision
+            else:
+                checks["revision_stable"] = revision == first
+        elif operation == "get_function_concurrency":
+            checks["concurrency_zero"] = value.get("ReservedConcurrentExecutions") == 0
+        else:
+            checks["retry_disabled"] = value.get("MaximumRetryAttempts") == 0
+            checks["event_age"] = value.get("MaximumEventAgeInSeconds") == 60
+            checks["no_destinations"] = not any(value.get("DestinationConfig", {}).values())
+        report["checks"].append(dict(stage=stage, checks=checks))
+        need(all(checks.values()), "metadata_mismatch")
+    report["status"] = "passed_readonly_current_inert_predecessor"
+
+
+def main():
+    need(sys.flags.no_site and sys.dont_write_bytecode, "stdlib_entry_required")
+    raw = PLAN.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == PLAN_SHA, "plan_binding")
+    for path, pin in json.loads(raw)["bindings"].items():
+        need(hashlib.sha256((ROOT/path).read_bytes()).hexdigest() == pin, "source_binding")
+    # Authenticate the policy source and its sole local import before loading.
+    for name, pin in (
+        ("prepare_sft_vm_external_watchdog_v1.py",
+         "4ff03fafb127029371f726dbea32ad940373606041ef362a3438e4f9ec1c290b"),
+        ("sft_vm_external_watchdog_v1.py",
+         "e1ff9874a5db20d9c56925991ae862740452bac86492757b1001c7349557923f")):
+        need(hashlib.sha256((ROOT/"scripts"/name).read_bytes()).hexdigest() == pin,
+             "policy_binding")
+    secret = cached_credentials()
+    OUT.mkdir(mode=0o700, exist_ok=False)
+    report = dict(schema="lumi.watchdog-readonly-recovery.v0.1", status="stopped",
+        stage="client_setup", plan_sha256=PLAN_SHA, resource_api_calls=0,
+        credential_provider_requests=0, response_bytes=0, checks=[], mutation_calls=0,
+        instance_actions=0, model_reads=0, gpu_used=False, gate_5_complete=False)
+    save("started.json", dict(plan_sha256=PLAN_SHA, retry_allowed=False,
+                              scope="approved_16_readonly_metadata_calls"))
+    clients = {}
+    started = time.monotonic()
+    def expire(*_):
+        raise Stop("deadline")
+    signal.signal(signal.SIGALRM, expire)
+    signal.setitimer(signal.ITIMER_REAL, 600)
+    try:
+        sys.path.insert(0, str(ROOT/"artifacts/lumi-vm-acquisition-sdk-test-runtime-v0.1"
+                               /"lib/python3.13/site-packages"))
+        import botocore.session
+        from botocore.config import Config
+        inert = importlib.import_module("prepare_sft_vm_external_watchdog_v1")
+        session = botocore.session.Session()
+        session.set_config_variable("config_file", "/dev/null")
+        session.set_config_variable("credentials_file", "/dev/null")
+        for service in ("sts", "iam", "lambda", "scheduler"):
+            endpoint = "https://iam.amazonaws.com" if service == "iam" else (
+                f"https://{service}.{REGION}.amazonaws.com")
+            clients[service] = session.create_client(service, region_name=REGION,
+                endpoint_url=endpoint, config=Config(proxies={}, connect_timeout=3,
+                    read_timeout=5, retries={"total_max_attempts": 1},
+                    ignore_configured_endpoint_urls=True), **secret)
+        secret = None
+        inspect(clients, inert, report)
+    except BaseException as error:
+        report["failure_code"] = error.args[0] if type(error) is Stop else "inspection_failed"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for client in clients.values():
+            client.close()
+        report["elapsed_seconds"] = round(time.monotonic()-started, 3)
+        save("result.json", report)
+    print(json.dumps(report))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BaseException as error:
+        print(json.dumps({"status": "not_started",
+            "failure_code": error.args[0] if type(error) is Stop else "preflight_failed"}))

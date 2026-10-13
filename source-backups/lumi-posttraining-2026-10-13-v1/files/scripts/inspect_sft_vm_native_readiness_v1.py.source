@@ -1,0 +1,265 @@
+"""Read-only same-boot readiness inspection BEFORE native admission.
+
+Private authenticated SSH integration only. Never install a binding, dispatch a
+worker, use credentials, read model data or interpret preparation as admission.
+All helpers are authenticated before execution. Run only on the dedicated Linux
+host; local tests replace native boundaries. An actual inspection pass still
+does not qualify the ML runtime or exclude arbitrary privileged writers.
+"""
+
+import hashlib
+import json
+import math
+import os
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+INPUT = Path("/opt/lumi-bootstrap-input")
+ROOT = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+CONTROLLER = ROOT / "controller"
+PINS = {
+    "run_sft_vm_network_bootstrap_v4.py": (
+        "804c5121c7aaab818c9d6f3e70fe7463b8963619617e1117cab5387997fb37b8"
+    ),
+    "run_sft_vm_setup_detached_v3.py": (
+        "923a8f8d93ecfcf003662416a6239ef4cacd334478f9d07a883feb9eddb337ad"
+    ),
+    "check_sft_vm_storage_v1.py": (
+        "ed6aa6456b31d5d9f32f7ebdf51c46ff60f56bdac212b0459ecb6fb9c05dc9c8"
+    ),
+    "run_sft_vm_setup_sequence_v1.py": (
+        "47d3b59e116b83cc479104e9d26eac55545470d304cd73114980ab42d4d43688"
+    ),
+    "stage_sft_vm_fullsize_release_v1.py": (
+        "625c53b3c50762d36d7fdafb08158ed413933437eac388df7bfc3f15e9755b07"
+    ),
+    "parent.py": "4ec3f33ba9236f34f3ceb1b0c83f2c8abc46c9ec969b8f5c964bf5dd6f390197",
+}
+DESCRIPTOR_SHA = "f6aab162e22e2c5a6b871f270766d7687080a5ec3350d328af5cd549cc8719fd"
+SDK_LOCK_SHA = "8d4b775307c3d70d8b99d17a1bf901ce1ea1a5e8294481a89b2a87f83b2ace4c"
+
+
+def need(value):
+    if not value:
+        raise ValueError("native_readiness_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def unique(rows):
+        result = {}
+        for k, v in rows:
+            need(k not in result)
+            result[k] = v
+        return result
+
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def read(path, cap=131072, *, uid=0):
+    """Stable no-follow regular files only; no /proc, devices or runtime data."""
+    need(path.is_absolute() and uid in {0, 10001})
+    for parent in path.parents:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid in {0, uid})
+        need(not info.st_mode & 0o022)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(before.st_uid == before.st_gid == uid and 0 < before.st_size <= cap)
+        need(stat.S_IMODE(before.st_mode) in ({0o400} if uid else {0o400, 0o600}))
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, k) == getattr(after, k)
+            for k in (
+                "st_dev",
+                "st_ino",
+                "st_nlink",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        )
+    )
+    return raw
+
+
+def modules():
+    bodies = {}
+    for name, pin in PINS.items():
+        path = CONTROLLER / name if name == "parent.py" else INPUT / name
+        body = read(path)
+        need(sha(body) == pin)
+        bodies[name] = path, body
+    # Authenticate entire top-level closure before executing any helper.
+    loaded = {}
+    for name, (path, body) in bodies.items():
+        module = types.ModuleType("_readiness_" + name[:-3])
+        module.__file__ = str(path)
+        exec(compile(body, str(path), "exec"), module.__dict__)
+        loaded[name] = module
+    return loaded
+
+
+def boundary():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(os.uname().machine == "x86_64" and os.cpu_count() == 16)
+
+
+def guards(bootstrap, policy, request):
+    bootstrap.native_identity(request["machine_id"], request["boot_id"])
+    context = decode(bootstrap.read(bootstrap.OUTPUT / "context.json", 4096))
+    need(
+        context
+        == dict(
+            machine_id=request["machine_id"],
+            boot_id=request["boot_id"],
+            original_deadline_boot_seconds=request["host_deadline_boottime"],
+            host_net_inode=bootstrap.host_network_inode(),
+        )
+    )
+    observed = bootstrap.boot_time()
+    need(math.isfinite(observed) and 0 <= observed < request["host_deadline_boottime"] - 11315)
+    need(bootstrap.setup_finished(policy))
+    quotas = policy.inspect(bootstrap.snapshot(policy), setup=False)
+    bootstrap.active(policy)
+    units = policy.expiry_units(
+        original_deadline_boot_seconds=request["host_deadline_boottime"],
+        observed_boot_seconds=math.floor(observed),
+    )
+    units[bootstrap.WATCH] = bootstrap.watch_unit(PINS["run_sft_vm_network_bootstrap_v4.py"])
+    for name, body in units.items():
+        path = bootstrap.SYSTEMD / name
+        need(bootstrap.read(path, 32768) == body.encode())
+        need(bootstrap.show(name, "FragmentPath") == str(path).encode())
+        need(bootstrap.show(name, "DropInPaths") == b"")
+    for action in ("FailureAction", "SuccessAction"):
+        need(bootstrap.show(bootstrap.WATCH, action) == b"poweroff")
+    return quotas
+
+
+def idle(helper, bootstrap, sequence):
+    for unit in sequence.UNITS.values():
+        need(helper.cgroup_empty(unit))
+        need(bootstrap.show(unit, "ActiveState") == b"inactive")
+    for phase in ("parent", "acquire", "import", "verify", "retain", "retention-parent"):
+        unit = f"lumi-vm-fullsize-v1-{ATTEMPT}-{phase}.service"
+        need(bootstrap.show(unit, "LoadState") == b"not-found" and helper.cgroup_empty(unit))
+    for name in ("binding.json", "binding.sha256"):
+        need(not os.path.lexists(CONTROLLER / name))
+
+
+def sources(entry, stage, sequence):
+    expected = {"parent.py", "prepared-attempt.json", "src"}
+    need({p.name for p in CONTROLLER.iterdir()} == expected)
+    need({p.name for p in (CONTROLLER / "src/lumi").iterdir()} == set(entry.SOURCE_PINS))
+    for name, pin in entry.SOURCE_PINS.items():
+        need(sha(entry.root_file(CONTROLLER / "src/lumi" / name)) == pin)
+    descriptor = entry.root_file(CONTROLLER / "prepared-attempt.json")
+    need(sha(descriptor) == DESCRIPTOR_SHA)
+    entry.descriptor(descriptor, {"prepared_sha256": DESCRIPTOR_SHA}, ATTEMPT)
+    archive = read(INPUT / "source-controls.tar", 4 * 1024**2)
+    members, _ = stage.validate(archive, sequence.WORKER_SHA, ATTEMPT)
+    need(members["prepared-attempt.json"] == descriptor)
+    for name, body in members.items():
+        need(read(ROOT / "stage/release" / name, 1024**2, uid=10001) == body)
+    for name in ("acquisition", "outputs"):
+        path = ROOT / "stage" / name
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 10001)
+        need(stat.S_IMODE(info.st_mode) == 0o700 and not list(path.iterdir()))
+    path = ROOT / "credentials"
+    info = path.lstat()
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0)
+    need(stat.S_IMODE(info.st_mode) == 0o700 and not list(path.iterdir()))
+    return len(members), len(entry.SOURCE_PINS)
+
+
+def versions(bootstrap, root, lock):
+    # Metadata query only. Do not import torch, instantiate a model or contact
+    # package indexes. Existing command reader bounds stdout and suppresses stderr.
+    expected = {r["name"]: r["version"] for r in lock["requirements"]}
+    need(len(expected) == len(lock["requirements"]) and 0 < len(expected) <= 64)
+    code = (
+        "import importlib.metadata as m,json;print(json.dumps({n:m.version(n) for n in "
+        + repr(sorted(expected))
+        + "},sort_keys=True))"
+    )
+    raw = bootstrap.command([str(root / "venv/bin/python"), "-I", "-B", "-c", code], seconds=10)
+    need(decode(raw) == expected)
+    return len(expected)
+
+
+def _inspect_same_host(request):
+    boundary()  # Never touch proc/installed artifacts on the user's Mac.
+    start = time.monotonic()
+    loaded = modules()
+    bootstrap = loaded["run_sft_vm_network_bootstrap_v4.py"]
+    detached = loaded["run_sft_vm_setup_detached_v3.py"]
+    sequence = loaded["run_sft_vm_setup_sequence_v1.py"]
+    storage = loaded["check_sft_vm_storage_v1.py"]
+    detached.validate_request(request, bootstrap, starting=False)
+    need(detached._status(request) == detached.result("completed", reaped=True))
+    helper = detached.helpers(bootstrap)
+    helper.host_check(request["machine_id"])
+    policy = bootstrap.load("build_sft_vm_network_expiry_v3.py")
+    prior = guards(bootstrap, policy, request)
+    storage.inspect(request["volumes"])
+    idle(helper, bootstrap, sequence)
+    cpu_lock_raw = read(Path("/opt/lumi-cpu-input/runtime-lock.json"))
+    need(sha(cpu_lock_raw) == sequence.LOCK_SHA)
+    cpu_lock = decode(cpu_lock_raw)
+    for phase in sequence.UNITS:
+        sequence.receipt(phase, sum(r["bytes"] for r in cpu_lock["requirements"]))
+    count, closure = sources(
+        loaded["parent.py"], loaded["stage_sft_vm_fullsize_release_v1.py"], sequence
+    )
+    sdk_raw = read(sequence.SDK / "qualification/configs/lumi-vm-acquisition-sdk-v0.1.lock.json")
+    need(sha(sdk_raw) == SDK_LOCK_SHA)
+    cpu_count = versions(bootstrap, sequence.CPU, cpu_lock)
+    sdk_count = versions(bootstrap, sequence.SDK, decode(sdk_raw))
+    # Recheck original guard/counters and idle workers after the metadata probes.
+    policy.inspect(bootstrap.snapshot(policy), setup=False, previous=prior)
+    guards(bootstrap, policy, request)
+    storage.inspect(request["volumes"])
+    idle(helper, bootstrap, sequence)
+    need(0 <= time.monotonic() - start <= 120)
+    return dict(
+        schema="lumi.vm-native-readiness.v0.1",
+        attempt=ATTEMPT,
+        same_boot_setup_and_guards_observed=True,
+        storage_snapshot_matches=True,
+        staged_source_files_verified=count,
+        parent_source_files_verified=closure,
+        cpu_package_versions_matched=cpu_count,
+        sdk_package_versions_matched=sdk_count,
+        expected_worker_units_absent=True,
+        binding_created=False,
+        host_admitted=False,
+        native_ml_runtime_qualified=False,
+        privileged_writer_exclusion_proven=False,
+        cloud_volume_encryption_proven=False,
+        execution_permitted=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("native_readiness_requires_authenticated_host_entry") from None

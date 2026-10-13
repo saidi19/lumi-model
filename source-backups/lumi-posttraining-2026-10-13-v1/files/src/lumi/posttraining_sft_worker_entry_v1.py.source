@@ -1,0 +1,326 @@
+"""Private worker composition, not a public launcher or authorization issuer.
+
+Load under an authenticated PRIVATE stdlib package namespace before ML, not
+through lumi.__init__. The admitted caller supplies already authenticated fresh
+ledger/control channels, private metadata and resource-opening capabilities.
+pre_ml must authenticate target/source/data/attempt authority and installed host
+controls. runtime_health must remain valid AFTER ML import. Paths, hashes and
+callback returns alone are not proofs of those external premises.
+
+This entry composes the existing ColdRuntime, v2 BoundedBaseLoader,
+ModelPreparation, AdmittedRank/WorkerRun and RankPhases. It never changes the
+frozen profile or approval/launch contract. There is no CLI, argument/env receipt
+reader, cloud action or retry path. Independent guardian deadlines and cleanup
+remain required for native hangs and partially failing resource acquisition.
+
+Successful construction transfers ownership of both clients. run() returns a
+PRIVATE worker result only after parent release and local retirement. Only
+summary() and fixed error codes may be logged. The outer child must then exit;
+returning here is not OS process retirement or proof of native training success.
+"""
+
+import math
+import os
+import threading
+from dataclasses import dataclass
+
+from .posttraining_sft_base_loader_v2 import BoundedBaseLoader
+from .posttraining_sft_checkpoint_worker_v1 import _directory_info
+from .posttraining_sft_cold_runtime_v1 import ColdRuntime
+from .posttraining_sft_model_prepare_v1 import ModelPreparation
+from .posttraining_sft_phase_bridge_v1 import phases
+from .posttraining_sft_rank_phases_v1 import RankPhases
+from .posttraining_sft_smoke_bridge_v1 import AdmittedRank
+from .posttraining_sft_supervisor_v2 import SEQUENCE
+from .posttraining_sft_worker_client_v2 import WorkerLedgerClient
+from .posttraining_sft_worker_control_v2 import WorkerControlClient
+
+ERRORS = frozenset({"invalid_arguments", "owner_mismatch", "already_consumed", "reentry",
+                    "runtime_failed", "resources_failed", "preparation_failed", "worker_failed",
+                    "report_failed", "retirement_failed", "cleanup_failed"})
+RUNTIME_KEYS = {"source_root", "dependency_root", "port", "deadline_ns", "maximum_operation_ns"}
+BASE_KEYS = {"inventory", "expected_inventory_sha256", "maximum_read_bytes", "maximum_file_bytes",
+             "maximum_control_bytes", "maximum_live_bytes"}
+WORKER_KEYS = {"profile", "loader_bindings", "source_identity_sha256", "checkpoint_limits"}
+
+
+class WorkerEntryError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "worker_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code="invalid_arguments"):
+    if not condition:
+        raise WorkerEntryError(code) from None
+
+
+def _metadata(value):
+    """Bounded plain-data snapshot: no custom objects, deepcopy hooks or callables."""
+    count = 0
+    def copy(item, depth):
+        nonlocal count
+        count += 1
+        _need(count <= 8192 and depth <= 8)
+        if type(item) is dict:
+            _need(len(item) <= 256 and all(type(k) is str and len(k) <= 128 for k in item))
+            return {k: copy(v, depth+1) for k, v in item.items()}
+        if type(item) is list:
+            _need(len(item) <= 256)
+            return [copy(v, depth+1) for v in item]
+        _need(item is None or type(item) is bool
+              or type(item) is str and len(item) <= 4096
+              or type(item) is int and abs(item) < 2**63
+              or type(item) is float and math.isfinite(item))
+        return item
+    return copy(value, 0)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class RankResources:
+    """Owned rank-local roots; close must release only these resources, once.
+
+    open_resources must clean its own partial acquisition on failure. The
+    encoded root and output descriptor refer only to externally authenticated
+    inputs/private outputs. This type does not establish their provenance.
+    """
+
+    encoded_root: object
+    output_parent_fd: int
+    close: object
+
+
+class WorkerEntry:
+    def __init__(self, *, ledger, control, invocation_index, runtime_metadata,
+                 base_metadata, worker_metadata, pre_ml, runtime_health,
+                 open_base_root, open_resources, interrupt):
+        _need(not hasattr(self, "_owner"), "already_consumed")
+        _need(type(ledger) is WorkerLedgerClient and type(control) is WorkerControlClient
+              and type(invocation_index) is int and 0 <= invocation_index < 3
+              and pre_ml is not runtime_health
+              and all(callable(fn) for fn in (pre_ml, runtime_health, open_base_root,
+                                              open_resources, interrupt)))
+        owner = os.getpid(), threading.get_ident()
+        _need(ledger._owner == control._owner == owner
+              and ledger._identity[1:3] != control._identity[1:3]
+              and 0 <= ledger._rank < 8 and not ledger.closed and ledger._failure is None
+              and ledger._requests == ledger._fences == 0 and ledger._pending_step is None
+              and not ledger._busy and not control._busy and control._failure is None
+              and control._state == "ready" and control._index == 0
+              and control._phases == phases(invocation_index))
+        runtime, base, worker = map(_metadata, (runtime_metadata, base_metadata, worker_metadata))
+        _need(type(runtime) is type(base) is type(worker) is dict
+              and set(runtime) == RUNTIME_KEYS and set(base) == BASE_KEYS
+              and set(worker) == WORKER_KEYS
+              and runtime["deadline_ns"] == ledger._deadline == control._deadline)
+        self._owner, self._index = owner, invocation_index
+        self._ledger, self._control, self._open = ledger, control, open_resources
+        self._pre_ml, self._runtime_health, self._open_base = pre_ml, runtime_health, open_base_root
+        self._interrupt = interrupt
+        self._state, self._stage, self._failure = "idle", "idle", None
+        self._busy = self._interrupted = self._cleanup_failed = False
+        self._resources_closed = self._runtime_closed = self._ledger_closed = False
+        self._control_closed = False
+        self._resources = self._context = self._phases = None
+        self._preparation = None
+        self._pad = (worker["profile"].get("pad_token_id")
+                     if type(worker["profile"]) is dict else None)
+        try:
+            self._runtime = ColdRuntime(
+                **runtime, rank=ledger._rank, epoch_sha256=ledger._epoch,
+                pre_ml=lambda: self._invoke(self._pre_ml),
+                check_health=lambda: self._invoke(self._runtime_health),
+                interrupt=self._interrupt_once)
+            self._loader = BoundedBaseLoader(
+                **base, rank=ledger._rank, admit=self._runtime.check_health,
+                open_root=self._base_root, reserve=ledger.reserve,
+                check_budget=self._runtime.check_health)
+            _, start, stop, _ = SEQUENCE[invocation_index]
+            self._rank = AdmittedRank(worker_options={
+                **worker, "client": ledger, "rank": ledger._rank, "world_size": 8,
+                "from_step": start, "stop_step": stop, "record_limit": 8,
+                "device_type": "cuda", "admit": self._runtime.check_health,
+                "synchronize": self._synchronize, "interrupt": self._interrupt_once,
+            }, prepare=self._prepare)
+        except BaseException:
+            # No callbacks, socket traffic or resource ownership transferred on
+            # constructor failure; the caller still owns both supplied clients.
+            raise WorkerEntryError("invalid_arguments") from None
+
+    def __repr__(self):
+        return "<WorkerEntry: private admitted inputs>"
+
+    def _interrupt_once(self):
+        if self._state in {"complete", "closed"}:
+            return
+        if not self._interrupted:
+            self._interrupted = True
+            try:
+                self._interrupt()
+            except BaseException:
+                pass
+
+    def _fail(self, code):
+        if self._state in {"complete", "closed"}:
+            raise WorkerEntryError("already_consumed") from None
+        if self._failure is None:
+            self._failure, self._state = code, "failed"
+        self._interrupt_once()
+        raise WorkerEntryError(self._failure) from None
+
+    def _live(self):
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._failure is not None:
+            self._fail(self._failure)
+        _need(self._state == "running", "already_consumed")
+
+    def _invoke(self, fn, *args, **kwargs):
+        self._live()
+        result = fn(*args, **kwargs)
+        self._live()  # A callback cannot swallow a reentry failure.
+        return result
+
+    def _synchronize(self, phase, step):
+        self._live()
+        _need(self._phases is not None, "worker_failed")
+        return self._invoke(self._phases, phase, step)
+
+    def _base_root(self):
+        self._live()
+        # Transfer the FD to BoundedBaseLoader before its next guarded budget
+        # check, so even swallowed reentry cannot strand an already opened FD.
+        return self._open_base()
+
+    def _prepare(self):
+        self._live()
+        _need(self._preparation is None, "preparation_failed")
+        self._preparation = ModelPreparation(
+            context=self._context, rank=self._ledger._rank, pad_token_id=self._pad,
+            encoded_root=self._resources.encoded_root,
+            output_parent_fd=self._resources.output_parent_fd,
+            admit=self._runtime.check_health, load_model=self._loader,
+            release=self._close_resources)
+        return self._invoke(self._preparation)
+
+    def _cleanup_call(self, flag, callback):
+        if getattr(self, flag):
+            return
+        setattr(self, flag, True)  # Never retry an ambiguous close.
+        before = self._failure
+        try:
+            _need(callback() is None and self._failure == before, "cleanup_failed")
+        except BaseException:
+            self._cleanup_failed = True
+            raise WorkerEntryError("cleanup_failed") from None
+
+    def _close_resources(self):
+        if type(self._resources) is RankResources and callable(self._resources.close):
+            self._cleanup_call("_resources_closed", self._resources.close)
+
+    def _retire(self):
+        self._close_resources()
+        self._cleanup_call("_runtime_closed", self._runtime.close)
+        self._cleanup_call("_ledger_closed", self._ledger.close)
+
+    def _cleanup(self):
+        # Try every owned cleanup independently without erasing the first error.
+        for cleanup in (self._close_resources,
+                        lambda: self._cleanup_call("_runtime_closed", self._runtime.close),
+                        lambda: self._cleanup_call("_ledger_closed", self._ledger.close),
+                        lambda: self._cleanup_call("_control_closed", self._control.close)):
+            try:
+                cleanup()
+            except BaseException:
+                self._cleanup_failed = True
+
+    def run(self, *, resume_checkpoint_name=None, resume_manifest_sha256=None):
+        if self._state in {"complete", "closed"}:
+            raise WorkerEntryError("already_consumed") from None
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._busy:
+            self._fail("reentry")
+        if self._state != "idle":
+            self._fail(self._failure or "already_consumed")
+        self._state, self._stage, self._busy = "running", "validation", True
+        result = None
+        try:
+            resumed = SEQUENCE[self._index][3]
+            _need((not resumed and resume_checkpoint_name is None
+                   and resume_manifest_sha256 is None)
+                  or (resumed and type(resume_checkpoint_name) is str
+                      and resume_checkpoint_name == "checkpoint-00000001"
+                      and type(resume_manifest_sha256) is str and len(resume_manifest_sha256) == 64
+                      and all(c in "0123456789abcdef" for c in resume_manifest_sha256)))
+            self._stage = "runtime"
+            self._context = self._invoke(self._runtime.start)
+            self._stage = "resources"
+            _need(self._invoke(self._runtime.check_health) is None, "resources_failed")
+            self._live()
+            # Adopt returned ownership before the post-callback check.
+            self._resources = self._open()
+            self._live()
+            _need(type(self._resources) is RankResources and callable(self._resources.close)
+                  and type(self._resources.output_parent_fd) is int
+                  and 3 <= self._resources.output_parent_fd < 2**31, "resources_failed")
+            # Reject a bad output capability before allocating/loading the model.
+            self._invoke(_directory_info, self._resources.output_parent_fd)
+            self._phases = RankPhases(
+                control=self._control, ledger=self._ledger, context=self._context,
+                invocation_index=self._index, check_health=self._runtime.check_health,
+                interrupt=self._interrupt_once)
+            self._stage = "worker"
+            result = self._invoke(self._rank.run, resume_checkpoint_name=resume_checkpoint_name,
+                                  resume_manifest_sha256=resume_manifest_sha256)
+            self._stage = "report"
+            _need(self._resources_closed and not self._cleanup_failed, "cleanup_failed")
+            _need(self._invoke(self._control.report_and_wait,
+                              self._rank._worker.summary(),
+                              self._ledger.summary()["requests_sent"]) is None, "report_failed")
+            self._stage = "retirement"
+            _need(self._invoke(self._control.retire, self._retire) is None, "retirement_failed")
+            self._control_closed = True
+            self._state, self._stage = "complete", "complete"
+            return result  # Private checkpoint/state receipt; never print.
+        except BaseException as error:
+            code = error.code if type(error) is WorkerEntryError else {
+                "validation": "invalid_arguments", "runtime": "runtime_failed",
+                "resources": "resources_failed", "worker": "worker_failed",
+                "report": "report_failed", "retirement": "retirement_failed",
+            }.get(self._stage, "worker_failed")
+            try:
+                self._fail(code)
+            finally:
+                result = None
+                self._cleanup()
+        finally:
+            self._busy = False
+
+    def close(self):
+        """Abandon an unstarted entry or clean a failed one; never resume it."""
+        if self._state in {"complete", "closed"}:
+            return
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._busy:
+            self._fail("reentry")
+        self._busy = True
+        try:
+            self._cleanup()
+            if self._cleanup_failed:
+                self._fail("cleanup_failed")
+            if self._failure is None:
+                self._state = "closed"
+        finally:
+            self._busy = False
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-worker-entry-summary.v0.1",
+                "state": self._state, "stage": self._stage, "failure_code": self._failure,
+                "cleanup_failed": self._cleanup_failed,
+                "resources_close_attempted": self._resources_closed,
+                "runtime_close_attempted": self._runtime_closed,
+                "ledger_close_attempted": self._ledger_closed,
+                "control_close_attempted": self._control_closed,
+                "execution_authorized": False, "production_eligible": False}

@@ -1,0 +1,252 @@
+import base64
+import contextlib
+import importlib.util
+import io
+import json
+import subprocess
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "native_probe_v4_test", ROOT / "scripts/probe_sft_vm_network_native_v4.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class ProbeDiagnosticsTests(unittest.TestCase):
+    def command_failure(self, stderr, code=1, stdout=b""):
+        # Synthetic commands only; never starts a subprocess.
+        with patch.object(
+            m.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=code, stdout=stdout, stderr=stderr),
+        ) as call:
+            with self.assertRaises(m.CommandFailure) as failure:
+                m.run(["synthetic"], timeout=3)
+        self.assertEqual(call.call_count, 1)
+        return m.failure_summary(failure.exception)
+
+    def test_known_errors_only_emit_allowlisted_codes(self):
+        for pattern, code in m.ERROR_PATTERNS:
+            with self.subTest(code=code):
+                result = self.command_failure(b"PRIVATE_SENTINEL " + pattern + b" other text")
+                self.assertEqual(result, {"error_code": code, "returncode": 1})
+                self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_unknown_error_does_not_emit_text(self):
+        self.assertEqual(
+            self.command_failure(b"PRIVATE_SENTINEL"),
+            {"error_code": "command_failed", "returncode": 1},
+        )
+
+    def test_diagnostic_and_stdout_bounds(self):
+        for stderr, stdout in ((b"x" * 4097, b""), (b"", b"x" * 65537)):
+            self.assertEqual(
+                self.command_failure(stderr, 0, stdout)["error_code"], "command_output_limit"
+            )
+
+    def test_timeout_and_os_error_do_not_emit_details_or_retry(self):
+        for error, code in (
+            (subprocess.TimeoutExpired("PRIVATE_SENTINEL", 3, stderr=b"secret"), "command_timeout"),
+            (OSError("PRIVATE_SENTINEL"), "command_unavailable"),
+        ):
+            with patch.object(m.subprocess, "run", side_effect=error) as call:
+                with self.assertRaises(m.CommandFailure) as caught:
+                    m.run(["synthetic"])
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(
+                m.failure_summary(caught.exception), {"error_code": code, "returncode": None}
+            )
+
+    def test_unexpected_exceptions_never_emit_messages(self):
+        for error, code in (
+            (AssertionError("PRIVATE_SENTINEL"), "assertion_failed"),
+            (ValueError("PRIVATE_SENTINEL"), "value_rejected"),
+            (RuntimeError("PRIVATE_SENTINEL"), "unexpected_failure"),
+        ):
+            self.assertEqual(m.failure_summary(error), {"error_code": code})
+
+    def test_success_preserves_stdout(self):
+        with patch.object(
+            m.subprocess,
+            "run",
+            return_value=SimpleNamespace(returncode=0, stdout=b"synthetic", stderr=b""),
+        ):
+            self.assertEqual(m.run(["synthetic"]), b"synthetic")
+
+    def test_child_records_stage_and_code_without_retry_or_payload(self):
+        output = io.StringIO()
+        with (
+            patch.object(m.signal, "alarm"),
+            patch.object(m, "udp_observation", return_value="received"),
+            patch.object(m, "policy", return_value=SimpleNamespace(install_policy=lambda: {})),
+            patch.object(
+                m, "run", side_effect=[b"", m.CommandFailure("syntax_rejected", 1)]
+            ) as call,
+            contextlib.redirect_stdout(output),
+        ):
+            m.child()
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(
+            json.loads(output.getvalue()),
+            {
+                "isolated_network_namespace": True,
+                "udp_positive_control": True,
+                "failed_phase": "exact_policy_syntax",
+                "error_code": "syntax_rejected",
+                "returncode": 1,
+            },
+        )
+
+
+CSPEC = importlib.util.spec_from_file_location(
+    "native_controller_v5_codec_test", ROOT / "scripts/execute_sft_vm_network_native_v5.py"
+)
+c = importlib.util.module_from_spec(CSPEC)
+CSPEC.loader.exec_module(c)
+
+
+class ConsoleFramesTests(unittest.TestCase):
+    def report(self):
+        return {
+            "schema": "lumi.network-native-probe.v0.3",
+            "status": "awaiting_independent_stopped_observation",
+            "real_4b_import": False,
+            "gate_5_complete": False,
+            "gpu": False,
+            "retry_allowed": False,
+            "synthetic": "x" * 10000,
+        }
+
+    def test_roundtrip_large_report_and_small_lines(self):
+        report = self.report()
+        frames = m.report_frames(report)
+        self.assertGreater(len(frames), 10)
+        self.assertLess(max(map(len, frames)), 640)
+        self.assertEqual(c.decode_native_console("\n".join(frames)), report)
+
+    def test_aws_encoded_and_log_interleaving(self):
+        frames = m.report_frames(self.report())
+        console = "\r\n".join(["synthetic log", *frames, "other synthetic log"])
+        self.assertEqual(
+            c.decode_native_console(base64.b64encode(console.encode()).decode()), self.report()
+        )
+
+    def test_incomplete_snapshots_wait_without_exception(self):
+        frames = m.report_frames(self.report())
+        for count in range(len(frames)):
+            self.assertIsNone(c.decode_native_console("\n".join(frames[:count])))
+        self.assertEqual(c.decode_native_console("\n".join(frames)), self.report())
+
+    def test_truncation_corruption_and_conflicts_are_not_reports(self):
+        frames = m.report_frames(self.report())
+        damaged = frames[-1][:-3] + "AAA"
+        for rows in (frames[:-1] + [damaged], frames + [damaged], [frames[0][:-1]], frames[1:]):
+            self.assertIsNone(c.decode_native_console("\n".join(rows)))
+
+    def test_exact_duplicates_and_reordering_are_safe(self):
+        frames = m.report_frames(self.report())
+        self.assertEqual(
+            c.decode_native_console("\n".join(list(reversed(frames)) + frames)), self.report()
+        )
+
+    def test_mixed_report_digests_rejected(self):
+        other = dict(self.report(), synthetic="y")
+        self.assertIsNone(
+            c.decode_native_console(
+                "\n".join(m.report_frames(self.report()) + m.report_frames(other))
+            )
+        )
+
+    def test_invalid_shapes_and_higher_authority_flags_rejected(self):
+        for key, value in (
+            ("schema", "wrong"),
+            ("status", {}),
+            ("status", None),
+            ("gpu", True),
+            ("retry_allowed", True),
+            ("real_4b_import", True),
+        ):
+            with self.subTest(key=key):
+                self.assertIsNone(
+                    c.decode_native_console(
+                        "\n".join(m.report_frames(dict(self.report(), **{key: value})))
+                    )
+                )
+
+    def test_limits_and_noise(self):
+        for value in (None, 1, "", "%%%", "x" * 262145, "LUMI_NETWORK_PROBE_V2=abc"):
+            self.assertIsNone(c.decode_native_console(value))
+        with self.assertRaises(AssertionError):
+            m.report_frames(dict(self.report(), synthetic="x" * 32768))
+
+    def test_no_network_or_process_needed_for_report_transport(self):
+        with patch.object(m.subprocess, "run") as run:
+            self.assertEqual(
+                c.decode_native_console("\n".join(m.report_frames(self.report()))), self.report()
+            )
+        run.assert_not_called()
+
+
+class UdpObservationTests(unittest.TestCase):
+    def sockets(self):
+        receiver, sender = MagicMock(), MagicMock()
+        receiver.__enter__.return_value = receiver
+        sender.__enter__.return_value = sender
+        sender.sendto.return_value = 1
+        receiver.recv.return_value = b"x"
+        return receiver, sender
+
+    def test_positive_control_receives_exact_generated_byte(self):
+        receiver, sender = self.sockets()
+        with patch.object(m.socket, "socket", side_effect=[receiver, sender]):
+            self.assertEqual(m.udp_observation(), "received")
+        sender.sendto.assert_called_once_with(b"x", ("127.0.0.1", 443))
+
+    def test_expected_drop_paths_distinguished(self):
+        for mode in ("send_eperm", "receive_timeout"):
+            receiver, sender = self.sockets()
+            if mode == "send_eperm":
+                sender.sendto.side_effect = OSError(m.errno.EPERM, "synthetic")
+            else:
+                receiver.recv.side_effect = TimeoutError()
+            with patch.object(m.socket, "socket", side_effect=[receiver, sender]):
+                self.assertEqual(m.udp_observation(), mode)
+
+    def test_bind_and_other_send_errors_are_not_success(self):
+        for mode in ("bind", "send_other", "receive_other"):
+            receiver, sender = self.sockets()
+            if mode == "bind":
+                receiver.bind.side_effect = OSError(m.errno.EPERM, "synthetic")
+            elif mode == "send_other":
+                sender.sendto.side_effect = OSError(m.errno.EACCES, "synthetic")
+            else:
+                receiver.recv.side_effect = OSError(m.errno.EIO, "synthetic")
+            with patch.object(m.socket, "socket", side_effect=[receiver, sender]):
+                with self.assertRaises(OSError):
+                    m.udp_observation()
+
+    def test_positive_control_failure_prevents_policy_installation(self):
+        output = io.StringIO()
+        with (
+            patch.object(m.signal, "alarm"),
+            patch.object(m, "policy", return_value=SimpleNamespace()),
+            patch.object(m, "run", return_value=b"") as run,
+            patch.object(m, "udp_observation", return_value="send_eperm"),
+            contextlib.redirect_stdout(output),
+        ):
+            m.child()
+        self.assertEqual(run.call_count, 1)  # loopback setup only
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["failed_phase"], "udp_positive_control")
+        self.assertNotIn("quic_blocked", report)
+
+    def test_os_error_retains_errno_not_text(self):
+        self.assertEqual(
+            m.failure_summary(OSError(m.errno.EPERM, "PRIVATE_SENTINEL")),
+            {"error_code": "socket_or_os_error", "errno": m.errno.EPERM},
+        )

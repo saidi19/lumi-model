@@ -1,0 +1,39 @@
+"""Fresh plan uses unchanged bounds and explicitly unapproved templates."""
+
+import json
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v3 as m
+from tests import test_sft_vm_deployment_bindings_v2 as prior
+
+
+class Tests(prior.Tests):
+    def setUp(self):
+        self.enterContext(patch.object(prior, "m", m))
+
+    def test_new_scope_and_prior_limits(self):
+        plan, _ = m.build()
+        self.assertEqual(plan["attempt"], m.ATTEMPT)
+        self.assertNotIn(m.PREVIOUS, json.dumps(plan))
+        scope = plan["cpu_scope_reference"]
+        self.assertEqual(scope["instance_count"], 1)
+        self.assertEqual(scope["instance_type"], "r6i.4xlarge")
+        self.assertEqual(scope["maximum_instance_seconds"], 14400)
+        self.assertEqual(scope["shared_controller_seconds"], 18000)
+        self.assertEqual(scope["cleanup_reserve_seconds"], 1800)
+        self.assertIn(m.ATTEMPT, scope["retention"]["prefix"])
+        self.assertTrue(scope["output"].endswith("v0.11/attempt-011"))
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_all_nonidentity_cpu_limits_match_previous_plan(self):
+        plan, _ = m.build()
+        old = json.loads(
+            (m.ROOT / "configs/lumi-vm-attempt-010-deployment-plan-v0.1.json").read_bytes()
+        )
+        normalized = json.loads(
+            json.dumps(old["cpu_scope_reference"])
+            .replace(m.PREVIOUS, m.ATTEMPT)
+            .replace("v0.10/attempt-010", "v0.11/attempt-011")
+        )
+        self.assertEqual(plan["cpu_scope_reference"], normalized)
+        self.assertEqual(plan["cost_disclosure"], old["cost_disclosure"])

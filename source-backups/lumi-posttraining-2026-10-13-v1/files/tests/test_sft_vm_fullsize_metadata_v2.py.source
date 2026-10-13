@@ -1,0 +1,92 @@
+"""Synthetic VersionId binding tests; no network or payload access."""
+import copy
+import importlib.util
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "metadata_selection_v2", ROOT / "scripts/prepare_sft_vm_fullsize_metadata_v2.py"
+)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class VersionBindingTests(unittest.TestCase):
+    def setUp(self):
+        self.selected = {
+            "schema": "old",
+            "account": "123",
+            "region": "us-east-1",
+            "bucket": "bucket",
+            "source_bindings": {
+                "backup.json": ("backup", "f" * 64),
+                "manifest.sha256": ("manifest", "e" * 64),
+            },
+            "objects": [
+                {"role": "checkpoint", "target_relative_path": "a", "key": "p/a",
+                 "bytes": 3, "sha256": "a" * 64},
+                {"role": "tokenizer", "target_relative_path": "b", "key": "p/b",
+                 "bytes": 4, "sha256": "b" * 64},
+            ],
+            "object_count": 2,
+            "object_versions_bound": False,
+            "remote_availability_verified": False,
+        }
+        self.receipt = {
+            "schema_version": 1,
+            "status": "pass",
+            "source_checkpoint_unchanged": True,
+            "storage": {"account": "123", "region": "us-east-1", "bucket": "bucket",
+                        "archive_prefix": "p/",
+                        "versioning": "Enabled", "server_side_encryption": "AES256"},
+            "bindings": {"plan_sha256": "f" * 64,
+                         "checkpoint_manifest_sha256": "e" * 64},
+            "total_objects": 52,
+            "objects": [
+                {"key": "p/a", "bytes": 3, "sha256": "a" * 64, "version_id": "v.1_a"},
+                {"key": "p/b", "bytes": 4, "sha256": "b" * 64, "version_id": "v.2_b"},
+            ] + [
+                {"key": f"other/{i}", "bytes": 1, "sha256": "c" * 64,
+                 "version_id": f"other_{i}"} for i in range(50)
+            ],
+        }
+
+    def test_binds_exact_versions_without_claiming_remote_availability(self):
+        result = m.bind(self.selected, self.receipt)
+        self.assertTrue(result["object_versions_bound"])
+        self.assertEqual([r["version_id"] for r in result["objects"]], ["v.1_a", "v.2_b"])
+        self.assertFalse(result["remote_availability_verified"])
+        self.assertFalse(result["execution_permitted"])
+
+    def test_missing_bad_or_duplicate_version_rejected(self):
+        for field, value in (("version_id", ""), ("version_id", "bad/value"),
+                             ("bytes", 9),
+                             ("sha256", "d" * 64), ("key", "different")):
+            receipt = copy.deepcopy(self.receipt)
+            receipt["objects"][0][field] = value
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                m.bind(self.selected, receipt)
+
+    def test_wrong_storage_or_unversioned_receipt_rejected(self):
+        for field, value in (("account", "other"), ("region", "elsewhere"),
+                             ("bucket", "other"), ("versioning", "Suspended"),
+                             ("server_side_encryption", "aws:kms")):
+            receipt = copy.deepcopy(self.receipt)
+            receipt["storage"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                m.bind(self.selected, receipt)
+
+    def test_duplicate_receipt_key_and_prebound_input_rejected(self):
+        receipt = copy.deepcopy(self.receipt)
+        receipt["objects"][-1]["key"] = "p/a"
+        with self.assertRaises(ValueError):
+            m.bind(self.selected, receipt)
+        selected = copy.deepcopy(self.selected)
+        selected["object_versions_bound"] = True
+        with self.assertRaises(ValueError):
+            m.bind(selected, self.receipt)
+
+
+if __name__ == "__main__":
+    unittest.main()

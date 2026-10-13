@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Prepare/install the root controller source overlay, never admit a host.
+
+Preserves the frozen worker archive. Creates no binding.json/binding.sha256,
+credentials, runtime, systemd unit, mount or network operation. Thus staging
+alone cannot open the root entry. Native admission must precede binding creation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import stat
+import sys
+import tarfile
+import types
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+ROOT = Path("/var/lib/lumi-vm-fullsize")
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ENTRY = "scripts/run_sft_vm_parent_entry_v2.py"
+ENTRY_SHA = "4ec3f33ba9236f34f3ceb1b0c83f2c8abc46c9ec969b8f5c964bf5dd6f390197"
+RELEASE = "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar"
+RELEASE_SHA = "4317d6c87b51bf8caeea5b94cc97db305811035201ede29d38a4a9221e4100a6"
+DESCRIPTOR_SHA = "f6aab162e22e2c5a6b871f270766d7687080a5ec3350d328af5cd549cc8719fd"
+CAP = 2 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("root_controller_stage_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def read(path, maximum):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(0 < before.st_size <= maximum)
+        raw = stream.read(maximum + 1)
+        after = os.fstat(stream.fileno())
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        need(
+            len(raw) == before.st_size
+            and all(getattr(before, k) == getattr(after, k) for k in fields)
+        )
+    return raw
+
+
+def validate(members):
+    need(sha(members["parent.py"]) == ENTRY_SHA)
+    entry = types.ModuleType("_root_stage_pinned_entry")
+    exec(compile(members["parent.py"], ENTRY, "exec"), entry.__dict__)
+    expected = {"parent.py", "prepared-attempt.json"} | {"src/lumi/" + n for n in entry.SOURCE_PINS}
+    need(set(members) == expected and len(members) == 11)
+    need(all(0 < len(raw) <= 131072 for raw in members.values()))
+    for name, pin in entry.SOURCE_PINS.items():
+        need(sha(members["src/lumi/" + name]) == pin)
+    raw = members["prepared-attempt.json"]
+    need(sha(raw) == DESCRIPTOR_SHA)
+    entry.descriptor(raw, {"prepared_sha256": DESCRIPTOR_SHA}, ATTEMPT)
+    return entry
+
+
+def unpack(raw, expected):
+    need(len(raw) <= CAP and len(expected) == 64 and sha(raw) == expected)
+    members = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for item in archive:
+            need(len(members) < 11 and item.name not in members)
+            need(item.type == tarfile.REGTYPE and not item.linkname and not item.pax_headers)
+            need(0 < item.size <= 131072)
+            with archive.extractfile(item) as stream:
+                body = stream.read(item.size + 1)
+            need(len(body) == item.size)
+            members[item.name] = body
+    validate(members)  # Exact paths/hash set before writing anything.
+    return members
+
+
+def assemble(repo=REPO):
+    entry_raw = read(repo / ENTRY, 131072)
+    need(sha(entry_raw) == ENTRY_SHA)
+    entry = types.ModuleType("_root_stage_entry_metadata")
+    exec(compile(entry_raw, ENTRY, "exec"), entry.__dict__)
+    worker_release = read(repo / RELEASE, CAP)
+    need(sha(worker_release) == RELEASE_SHA)
+    with tarfile.open(fileobj=io.BytesIO(worker_release), mode="r:") as archive:
+        with archive.extractfile("prepared-attempt.json") as stream:
+            descriptor = stream.read(131073)
+    members = {"parent.py": entry_raw, "prepared-attempt.json": descriptor}
+    for name in entry.SOURCE_PINS:
+        members["src/lumi/" + name] = read(repo / "src/lumi" / name, 131072)
+    validate(members)
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in sorted(members.items()):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(body), 0o400
+            archive.addfile(info, io.BytesIO(body))
+    raw = output.getvalue()
+    need(unpack(raw, sha(raw)) == members)
+    return raw
+
+
+def sync(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write(path, raw):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def prepare(destination):
+    raw = assemble()
+    need(not any(p.is_symlink() for p in (destination, *destination.parents)))
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    write(destination / "root-controller.tar", raw)
+    result = {
+        "schema": "lumi.vm-root-controller-release.v0.1",
+        "attempt": ATTEMPT,
+        "archive_sha256": sha(raw),
+        "archive_bytes": len(raw),
+        "members": 11,
+        "parent_entry_sha256": ENTRY_SHA,
+        "native_installed": False,
+        "host_admitted": False,
+        "execution_permitted": False,
+    }
+    write(destination / "build.json", canonical(result))
+    sync(destination)
+    return result
+
+
+def boundary(machine_id):
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(type(machine_id) is str and len(machine_id) == 32)
+    with open("/etc/machine-id", "rb") as stream:
+        need(stream.read(65).strip() == machine_id.encode("ascii"))
+    attempt = ROOT / ATTEMPT
+    for path in (attempt, *attempt.parents):
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    need(stat.S_IMODE(attempt.stat().st_mode) == 0o700)
+    # The frozen worker stage must already exist; never synthesize a fresh
+    # attempt here or replace its source archive/outputs.
+    info = (attempt / "stage").lstat()
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and stat.S_IMODE(info.st_mode) == 0o700)
+
+
+def install(archive, expected, machine_id):
+    boundary(machine_id)
+    members = unpack(read(archive, CAP), expected)
+    attempt = ROOT / ATTEMPT
+    # Confirm we are joining the exact previously staged worker descriptor.
+    need(
+        read(attempt / "stage/release/prepared-attempt.json", 131072)
+        == members["prepared-attempt.json"]
+    )
+    controller = attempt / "controller"
+    controller.mkdir(mode=0o700, exist_ok=False)  # Consumed on any partial failure.
+    sync(attempt)
+    try:
+        directories = {controller}
+        for name, body in sorted(members.items()):
+            path = controller / name
+            for relative in reversed(path.relative_to(controller).parents):
+                parent = controller / relative
+                if parent not in directories:
+                    parent.mkdir(mode=0o700)
+                    directories.add(parent)
+            write(path, body)
+        entry = validate(members)
+        for name, body in members.items():
+            need(entry.root_file(controller / name) == body)
+        for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+            sync(path)
+        result = {
+            "schema": "lumi.vm-root-controller-stage.v0.1",
+            "attempt": ATTEMPT,
+            "archive_sha256": expected,
+            "parent_entry_sha256": ENTRY_SHA,
+            "staged_file_hashes_verified": True,
+            "binding_created": False,
+            "host_admitted": False,
+            "execution_permitted": False,
+            "gate_5_complete": False,
+            "retry_allowed": False,
+        }
+        write(attempt / "controller-staged.json", canonical(result))
+        sync(attempt)
+        return result
+    except BaseException:
+        write(
+            attempt / "controller-stage-failed.json",
+            canonical(
+                {
+                    "retry_allowed": False,
+                    "execution_permitted": False,
+                    "partial_files_preserved": True,
+                }
+            ),
+        )
+        sync(attempt)
+        raise ValueError("root_controller_stage_failed") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument("--prepare", type=Path)
+    action.add_argument("--install", type=Path)
+    parser.add_argument("--sha256")
+    parser.add_argument("--machine-id")
+    args = parser.parse_args()
+    try:
+        if args.prepare:
+            need(args.sha256 is None and args.machine_id is None)
+            result = prepare(args.prepare)
+        else:
+            need(args.sha256 is not None and args.machine_id is not None)
+            result = install(args.install, args.sha256, args.machine_id)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except BaseException:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

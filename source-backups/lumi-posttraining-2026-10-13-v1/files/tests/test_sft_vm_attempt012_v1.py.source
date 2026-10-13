@@ -1,0 +1,156 @@
+"""Offline authentication and isolation of the fresh composed CPU source."""
+
+import hashlib
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_attempt012_v1 as b
+
+
+class SourceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temporary = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temporary.cleanup)
+        cls.root = Path(temporary.name).resolve() / "candidate"
+        with patch.object(b, "OUTPUT", cls.root):
+            cls.report = b.prepare()
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.addClassCleanup(sys.path.remove, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        cls.store, cls.credentials = cls.outer.store, cls.outer.credentials
+
+    def test_actual_outer_and_guest_loader_authentication(self):
+        self.outer.authenticate()
+        self.outer.loading.fresh_identity()
+        self.assertEqual(self.store.worker.ATTEMPT, b.NEW)
+        self.assertNotEqual(self.store.worker.ATTEMPT, b.OLD)
+        self.assertFalse(self.report["execution_permitted"])
+
+    def test_all_saved_hashes_and_fresh_names(self):
+        for name, pin in self.report["outputs"].items():
+            raw = (self.root / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), pin["sha256"])
+        self.assertEqual(self.store.worker.BUCKET, b.BUCKET)
+        self.assertIn(b.NEW, self.store.worker.PREFIX)
+        host = json.loads(
+            (self.root / "configs/lumi-vm-fullsize-host-proposal-v0.1.json").read_bytes()
+        )
+        self.assertEqual(host["prepared_attempt"], b.NEW)
+        self.assertIn(b.NEW, host["retention_proposal"]["prefix"])
+        self.assertEqual(
+            host["retention_proposal"]["bucket"], "lumi-corpus-prod-27777c02b29b76efcac3"
+        )
+
+    def test_checkpoint_selection_byte_identical_to_prior(self):
+        name = "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"
+        self.assertEqual((b.BASE / name).read_bytes(), (self.root / name).read_bytes())
+
+    def test_only_expiry_clients_receive_longer_timeout_same_provider(self):
+        import botocore.credentials
+
+        reader = self.credentials.Reader(18100, clock=lambda: 100, wall=lambda: 2000000000)
+        sdk, provider = Mock(), Mock()
+        created = []
+
+        def create(name, **fields):
+            client = Mock()
+            created.append((name, fields, client))
+            return client
+
+        sdk.create_client.side_effect = create
+        with (
+            patch.object(self.credentials.Reader, "__call__", return_value={}),
+            patch.object(
+                botocore.credentials.RefreshableCredentials,
+                "create_from_metadata",
+                return_value=provider,
+            ),
+            patch.object(self.credentials, "session", return_value=sdk),
+        ):
+            bundle = self.credentials.Clients(reader)
+        self.assertIs(sdk._credentials, provider)
+        self.assertEqual(len(created), 11)
+        self.assertEqual([x[0] for x in created[8:]], ["iam", "lambda", "scheduler"])
+        for index, (_, fields, _) in enumerate(created):
+            self.assertEqual(fields["config"].read_timeout, 5 if index < 8 else 15)
+            self.assertEqual(fields["config"].retries["total_max_attempts"], 1)
+            self.assertEqual(fields["config"].connect_timeout, 3)
+        self.assertIs(bundle.expiry_clients["sts"], bundle.clients["sts"])
+        bundle.close()
+        self.assertTrue(reader.closed)
+        for _, _, client in created:
+            client.close.assert_called_once()
+
+    def test_expiry_client_construction_failure_closes_existing_clients(self):
+        import botocore.credentials
+
+        reader = self.credentials.Reader(18100, clock=lambda: 100, wall=lambda: 2000000000)
+        clients = [Mock() for _ in range(9)]
+        sdk = Mock()
+        sdk.create_client.side_effect = [*clients, TimeoutError("PRIVATE_SENTINEL")]
+        with (
+            patch.object(self.credentials.Reader, "__call__", return_value={}),
+            patch.object(
+                botocore.credentials.RefreshableCredentials,
+                "create_from_metadata",
+                return_value=Mock(),
+            ),
+            patch.object(self.credentials, "session", return_value=sdk),
+        ):
+            with self.assertRaises(self.outer.failure.Failure) as caught:
+                self.credentials.Clients(reader)
+        self.assertEqual(self.outer.failure.describe(caught.exception)["kind"], "timeout")
+        for client in clients:
+            client.close.assert_called_once()
+        self.assertTrue(reader.closed)
+
+    def test_real_store_composition_routes_only_expiry_to_new_clients(self):
+        ordinary = {k: Mock() for k in self.credentials.SERVICES}
+        expiry = {k: Mock() for k in self.store.armer.OPS}
+        with (
+            patch.object(self.store, "ReadCloud"),
+            patch.object(self.store.network, "SDKCloud"),
+            patch.object(self.store.armer, "SDKCloud") as construct,
+        ):
+            self.store._components(Path("unused"), ordinary, b"{}", expiry_clients=expiry)
+        self.assertEqual(construct.call_args.args[0], expiry)
+
+    def test_nested_failure_diagnostic_preserved(self):
+        value = dict(stage="expiry_control", kind="read_timeout", check="list-role-policies")
+        error = self.outer.failure.Failure("redacted", value)
+        self.assertEqual(self.outer.failure.describe(error), value)
+
+    def test_expiry_adapter_accepts_15_rejects_over_limit(self):
+        clients = {}
+        for name in self.store.armer.OPS:
+            clients[name] = types.SimpleNamespace(
+                meta=types.SimpleNamespace(
+                    endpoint_url=self.credentials.endpoint(name),
+                    region_name="us-east-1",
+                    config=types.SimpleNamespace(
+                        proxies={},
+                        retries={"total_max_attempts": 1},
+                        connect_timeout=3,
+                        read_timeout=15,
+                    ),
+                )
+            )
+        self.store.armer.SDKCloud(clients)
+        clients["iam"].meta.config.read_timeout = 16
+        with self.assertRaises(ValueError):
+            self.store.armer.SDKCloud(clients)
+
+    def test_closed_public_entry_and_no_overwrite(self):
+        with self.assertRaises(ValueError):
+            b.run(approved=True)
+        with patch.object(b, "OUTPUT", self.root), patch.object(b, "build", return_value=({}, {})):
+            with self.assertRaises(ValueError):
+                b.prepare()

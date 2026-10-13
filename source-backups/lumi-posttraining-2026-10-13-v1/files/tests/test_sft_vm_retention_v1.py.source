@@ -1,0 +1,510 @@
+"""Tiny actual package/files and SDK signing/parsing; HTTP/native boundary doubled."""
+
+import base64
+import hashlib
+import importlib
+import io
+import json
+import os
+import shutil
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_vm_retention_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+m = importlib.import_module(PACKAGE + ".posttraining_vm_fullsize_retention_v1")
+t = importlib.import_module(PACKAGE + ".posttraining_vm_retention_transport_v1")
+NATIVE_RUNTIME = m._runtime
+CREDS = dict(
+    access_key="ASIASYNTHETICEXAMPLE",
+    secret_key="not-a-real-secret",
+    session_token="synthetic-token",
+)
+
+
+def write(path, raw):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+
+class Body(io.BytesIO):
+    def __init__(self, raw):
+        super().__init__(raw)
+        self.read_calls = 0
+
+    def read(self, *args):
+        self.read_calls += 1
+        return super().read(*args)
+
+    def stream(self, amt=16384, decode_content=False):
+        while True:
+            data = self.read(amt)
+            if not data:
+                return
+            yield data
+
+
+class Store:
+    def __init__(self, aws_response):
+        self.response = aws_response
+        self.objects, self.calls, self.bodies, self.reads = {}, [], [], []
+        self.status = None
+        self.corrupt_key = None
+        self.bad_length = False
+        self.collision = False
+        self.drop_ack = False
+
+    def send(self, request):
+        key = request.url.removeprefix(t.OBJECT_ENDPOINT)
+        self.calls.append((request.method, key))
+        h = t.headers_of(request.headers)
+        assert h["authorization"].startswith("AWS4-HMAC-SHA256 Credential=ASIASYNTHETICEXAMPLE/")
+        assert h["x-amz-security-token"] == "synthetic-token"
+        if request.method == "PUT":
+            chunks = []
+            while True:
+                raw = request.body.read(16384)
+                self.reads.append(len(raw))
+                if not raw:
+                    break
+                chunks.append(raw)
+            body = b"".join(chunks)
+            assert len(body) == int(h["content-length"])
+            assert (
+                base64.b64encode(hashlib.sha256(body).digest()).decode()
+                == h["x-amz-checksum-sha256"]
+            )
+            assert h["if-none-match"] == "*"
+            if key in self.objects or self.collision:
+                return self.reply(request.url, 412, b"private-error-body")
+            self.objects[key] = body
+            if self.drop_ack:
+                raise OSError("SECRET wire acknowledgement missing")
+            return self.reply(request.url, self.status or 200, b"")
+        body = self.objects[key]
+        if key == self.corrupt_key:
+            body = b"x" * len(body)
+        return self.reply(request.url, self.status or 200, body)
+
+    def reply(self, url, status, raw):
+        body = Body(raw)
+        self.bodies.append(body)
+        size = len(raw) + int(self.bad_length)
+        return self.response(
+            url,
+            status,
+            {
+                "content-length": str(size),
+                "x-amz-server-side-encryption": "AES256",
+                "etag": '"ignored"',
+            },
+            body,
+        )
+
+
+class RetentionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.destination = self.root / m.ATTEMPT
+        self.package = self.destination / m.PACKAGE_REL
+        write(self.package / "config.json", b"{}")
+        write(self.package / "model.safetensors", b"opaque synthetic package; never tensors")
+        manifest = b"".join(
+            f"{m.sha(p.read_bytes())}  {p.name}\n".encode() for p in sorted(self.package.iterdir())
+        )
+        write(self.package / "manifest.sha256", manifest)
+        self.package_bytes = sum(p.stat().st_size for p in self.package.iterdir())
+        self.verification = dict(
+            schema="lumi.vm-fullsize-package-verification.v0.1",
+            status="passed",
+            package_manifest_sha256=m.sha(manifest),
+            independent_checksum_consumer=True,
+            offhost_retention_verified=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            training_authorized=False,
+            files=3,
+            package_bytes=self.package_bytes,
+            maximum_content_read_bytes=self.package_bytes + 2 * len(manifest),
+        )
+        self.metadata = {
+            "verification.json": m.canonical(self.verification),
+            "summary.json": b'{"synthetic":true}',
+            "source-config.json": b"{}",
+            "import-started-v0.6.json": b'{"synthetic_started":true}',
+            "import-complete-v0.6.json": b'{"synthetic_completed":true}',
+        }
+        self.completed = dict(
+            schema="lumi.vm-fullsize-completion.v0.1",
+            status="verified_package_preserved_locally_offhost_retention_pending",
+            source_manifest_sha256="b" * 64,
+            import_summary_sha256=m.sha(self.metadata["summary.json"]),
+            verification_sha256=m.sha(self.metadata["verification.json"]),
+            package_manifest_sha256=m.sha(manifest),
+            independent_checksum_consumer=True,
+            all_three_cgroups_empty=True,
+            local_output_tree_preserved=True,
+            offhost_retention_verified=False,
+            instance_termination_allowed=False,
+            gpu=False,
+            training_authorized=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            production_eligible=False,
+        )
+        self.metadata["completion.json"] = m.canonical(self.completed)
+        for name, raw in self.metadata.items():
+            write(self.destination / m.METADATA[name][0], raw)
+        for path in self.root.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o700)
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        for name, value in (
+            ("ROOT_UID", os.geteuid()),
+            ("ROOT_GID", os.getegid()),
+            ("WORKER_UID", os.geteuid()),
+            ("WORKER_GID", os.getegid()),
+        ):
+            self.enterContext(patch.object(m, name, value))
+        self.enterContext(patch.object(m, "_runtime"))
+
+        # Same directory safety checks within registered synthetic root; do not
+        # treat macOS's world-writable temp ancestor as a native admitted path.
+        def parents(path):
+            for item in (path, *path.parents):
+                if item == self.root.parent:
+                    break
+                st = item.lstat()
+                m.need(m.stat.S_ISDIR(st.st_mode) and not st.st_mode & 0o022)
+                m.need(st.st_uid == os.geteuid())
+
+        self.enterContext(patch.object(m, "parents", side_effect=parents))
+        import botocore.awsrequest
+        from botocore.config import Config
+        from botocore.session import Session
+
+        self.session = Session()
+        self.session.set_config_variable("config_file", "/dev/null")
+        self.session.set_config_variable("credentials_file", "/dev/null")
+        self.session.set_config_variable("profile", None)
+        self.store = Store(botocore.awsrequest.AWSResponse)
+        self.clients = [
+            self.session.create_client("s3", **t.client_options(CREDS, Config)) for _ in range(2)
+        ]
+        for client in self.clients:
+            self.addCleanup(client.close)
+            self.enterContext(
+                patch.object(client._endpoint.http_session, "send", side_effect=self.store.send)
+            )
+        self.deadline = time.monotonic() + 60
+        self.writer, self.reader = (
+            t.Writer(self.clients[0], self.deadline),
+            t.Reader(self.clients[1], self.deadline),
+        )
+
+    def call(self):
+        return m._retain_completed_admitted_once(
+            m.ATTEMPT,
+            self.completed,
+            writer=self.writer,
+            reader=self.reader,
+            deadline=self.deadline,
+        )
+
+    def test_real_sdk_and_local_files_complete_conditional_put_get_commit_last(self):
+        original = {p: p.read_bytes() for p in self.destination.rglob("*") if p.is_file()}
+        value = self.call()
+        self.assertTrue(value["offhost_retention_verified"] and value["commit_readback_verified"])
+        self.assertFalse(value["real_4b_import"] or value["instance_termination_allowed"])
+        self.assertEqual((value["puts_attempted"], value["gets_attempted"]), (10, 10))
+        self.assertEqual((self.writer.http_sends, self.reader.http_sends), (10, 10))
+        key = m.PREFIX + "metadata/retention-commit.json"
+        self.assertEqual(self.store.calls[-2:], [("PUT", key), ("GET", key)])
+        commit = json.loads(self.store.objects[key])
+        self.assertEqual(len(commit["objects"]), 9)
+        self.assertEqual(value["commit_sha256"], m.sha(self.store.objects[key]))
+        self.assertEqual(sum(self.store.reads), value["uploaded_content_bytes"])
+        self.assertEqual(value["uploaded_content_bytes"], value["readback_content_bytes"])
+        self.assertTrue(all(self.store.bodies[i].closed for i in range(1, 20, 2)))
+        self.assertTrue(all(p.read_bytes() == raw for p, raw in original.items()))
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(len(self.store.calls), 20)
+
+    def test_existing_completion_checksum_consumer_and_rename_joined_to_retention(self):
+        from tests import test_sft_vm_fullsize_completion_v1 as prior
+
+        root = self.root / "joined"
+        destination = root / m.ATTEMPT
+        stage = destination / "stage"
+        stage.mkdir(mode=0o700, parents=True)
+        root.chmod(0o700)
+        destination.chmod(0o700)
+        shutil.copytree(self.destination / "retained/outputs", stage / "outputs")
+        pins = {key: "b" * 64 for key in m.completion.handoff.PINS}
+        summary = dict(
+            schema="lumi.vm-fullsize-worker-result.v0.1",
+            independent_checksum_consumer=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            package_manifest_sha256=self.completed["package_manifest_sha256"],
+            entry=dict(
+                status="coordinator_returned_parent_verification_required",
+                **pins,
+                checkpoint_full_audits=2,
+                tokenizer_full_audits=2,
+            ),
+        )
+        write(stage / "outputs/summary.json", m.canonical(summary))
+
+        def verify(attempt, package_pin, source_pin, deadline):
+            result = prior.worker.verify_package(
+                stage / "outputs/import/attempt-001/checkpoint",
+                package_pin,
+                prior.frozen_consumer(),
+            )
+            write(stage / "verification/verification.json", m.canonical(result))
+
+        def read_report(path, cap):
+            raw = path.read_bytes()
+            self.assertLessEqual(len(raw), cap)
+            return raw, json.loads(raw)
+
+        with (
+            patch.object(m, "ROOT", root),
+            patch.object(m.completion.handoff, "ROOT", root),
+            patch.object(m.completion.handoff, "_dispatch_admitted_once") as dispatch,
+            patch.object(m.completion, "_run_verifier", side_effect=verify),
+            patch.object(m.completion, "_read_worker_report", side_effect=read_report),
+            patch.object(m.completion.os, "chown"),
+            patch.object(m.completion.frozen, "cgroup_empty", return_value=True),
+        ):
+            completed = m.completion._complete_admitted_once(
+                m.ATTEMPT, pins, machine_id="f" * 32, deadline=time.monotonic() + 4800
+            )
+            result = m._retain_completed_admitted_once(
+                m.ATTEMPT, completed, writer=self.writer, reader=self.reader, deadline=self.deadline
+            )
+            dispatch.assert_called_once()
+        self.assertTrue(result["offhost_retention_verified"])
+        self.assertFalse(result["real_4b_import"])
+        self.assertFalse((stage / "outputs").exists())
+        self.assertTrue((destination / m.PACKAGE_REL / "model.safetensors").is_file())
+
+    def test_failed_commit_get_never_claims_finished_backup_or_disk_deletion(self):
+        self.store.corrupt_key = m.PREFIX + "metadata/retention-commit.json"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.store.calls), 20)
+        failed = json.loads((self.destination / "retention/failed.json").read_bytes())
+        self.assertFalse(
+            failed["offhost_retention_verified"] or failed["instance_termination_allowed"]
+        )
+        self.assertTrue((self.package / "model.safetensors").exists())
+
+    def test_get_redirect_is_closed_before_error_body_or_followup_request(self):
+        original = self.store.send
+
+        def send(request):
+            if request.method == "GET":
+                self.store.status = 301
+            return original(request)
+
+        for client in self.clients:
+            client._endpoint.http_session.underlying.send.side_effect = send
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.store.calls), 2)
+        self.assertEqual(self.store.bodies[-1].read_calls, 0)
+        self.assertTrue(self.store.bodies[-1].closed)
+
+    def test_mutation_during_upload_is_rejected_even_if_remote_bytes_hash_match(self):
+        original = self.writer.put
+
+        def put(row, body):
+            original(row, body)
+            if row["key"].endswith("package/config.json"):
+                row["path"].chmod(0o400)
+
+        with patch.object(self.writer, "put", side_effect=put), self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.store.calls), 1)
+
+    def test_same_client_role_or_changed_proposal_does_not_start_io(self):
+        with self.assertRaises(ValueError):
+            m._retain_completed_admitted_once(
+                m.ATTEMPT,
+                self.completed,
+                writer=self.writer,
+                reader=self.writer,
+                deadline=self.deadline,
+            )
+        with patch.object(m, "PROPOSAL_SHA", "0" * 64), self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+        self.assertFalse((self.destination / "retention").exists())
+
+    def test_unrelated_list_or_head_and_second_physical_send_are_rejected(self):
+        for method, args in (
+            ("list_objects_v2", {"Bucket": m.BUCKET}),
+            ("head_bucket", {"Bucket": m.BUCKET}),
+        ):
+            with self.assertRaises(ValueError):
+                getattr(self.clients[0], method)(**args)
+        self.assertEqual(self.store.calls, [])
+
+    def test_client_retry_policy_cannot_be_relaxed(self):
+        self.clients[0].meta.config.retries["total_max_attempts"] = 2
+        with self.assertRaises(ValueError):
+            t.Writer(self.clients[0], self.deadline)
+        self.assertEqual(self.store.calls, [])
+
+    def test_private_permission_mismatch_prevents_upload(self):
+        (self.package / "config.json").chmod(0o644)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_corrupt_get_fails_without_commit_or_retry_and_preserves_source(self):
+        self.store.corrupt_key = m.PREFIX + "package/config.json"
+        with self.assertRaisesRegex(ValueError, "^retention_failed$"):
+            self.call()
+        self.assertEqual(len(self.store.calls), 2)
+        self.assertTrue(self.store.bodies[-1].closed)
+        self.assertFalse(any(k.endswith("retention-commit.json") for k in self.store.objects))
+        self.assertTrue((self.package / "model.safetensors").exists())
+        result = json.loads((self.destination / "retention/failed.json").read_bytes())
+        self.assertFalse(result["offhost_retention_verified"])
+
+    def test_collision_error_body_is_not_read_or_retried(self):
+        self.store.collision = True
+        reads = []
+        original = Body.read
+        with patch.object(Body, "read", lambda body, *a: (reads.append(a), original(body, *a))[1]):
+            with self.assertRaises(ValueError):
+                self.call()
+        self.assertEqual(reads, [])
+        self.assertEqual(len(self.store.calls), 1)
+        self.assertTrue(self.store.bodies[0].closed)
+
+    def test_ambiguous_put_acknowledgement_consumes_attempt(self):
+        self.store.drop_ack = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.store.calls), 1)
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(len(self.store.calls), 1)
+        self.assertNotIn(b"SECRET", (self.destination / "retention/failed.json").read_bytes())
+
+    def test_bad_raw_size_rejected_before_sdk_reads_body(self):
+        self.store.bad_length = True
+        reads = []
+        original = Body.read
+        with patch.object(Body, "read", lambda body, *a: (reads.append(a), original(body, *a))[1]):
+            with self.assertRaises(ValueError):
+                self.call()
+        self.assertEqual(reads, [])
+        self.assertEqual(len(self.store.calls), 1)
+
+    def test_changed_manifest_rejected_before_any_http_send(self):
+        write(self.package / "manifest.sha256", b"invalid")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_duplicate_line_rejected_even_with_matching_report_hash(self):
+        path = self.package / "manifest.sha256"
+        raw = path.read_bytes()
+        write(path, raw + raw.splitlines(keepends=True)[0])
+        self.completed["package_manifest_sha256"] = m.sha(path.read_bytes())
+        self.verification["package_manifest_sha256"] = self.completed["package_manifest_sha256"]
+        verification = m.canonical(self.verification)
+        self.completed["verification_sha256"] = m.sha(verification)
+        write(self.destination / m.METADATA["verification.json"][0], verification)
+        write(self.destination / "completion.json", m.canonical(self.completed))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_extra_package_file_rejected_without_reading_its_contents(self):
+        write(self.package / "unexpected", b"must-not-upload")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_unsafe_symlink_rejected_without_following_it(self):
+        (self.package / "bad").symlink_to(self.root)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_unsafe_hardlink_and_permissions_rejected(self):
+        path = self.package / "config.json"
+        os.link(path, self.root / "alias")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_package_capacity_rejected_before_upload(self):
+        with patch.object(m, "PACKAGE_CAP", 1), patch.object(m, "policy"):
+            with self.assertRaises(ValueError):
+                self.call()
+        self.assertEqual(self.store.calls, [])
+
+    def test_deadline_is_not_renewed_and_expired_call_does_not_create_marker(self):
+        self.deadline = time.monotonic() - 1
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.destination / "retention").exists())
+        self.assertEqual(self.store.calls, [])
+
+    def test_public_entry_and_wrong_prefix_are_closed(self):
+        for module in (m, t):
+            with self.assertRaises(ValueError):
+                module.retain_package(approved=True)
+        with self.assertRaises(ValueError):
+            self.writer.put(dict(key="other/project", bytes=1, sha256="0" * 64), io.BytesIO(b"x"))
+        self.assertEqual(self.store.calls, [])
+
+    def test_native_runtime_not_admitted_on_mac(self):
+        with patch.object(m.sys, "platform", "darwin"):
+            with self.assertRaises(ValueError):
+                NATIVE_RUNTIME(m.ATTEMPT)
+
+
+class BodyTests(unittest.TestCase):
+    def test_forward_only_stream_cannot_overread_rewind_or_accept_corruption(self):
+        raw = b"sixsix"
+        row = dict(bytes=len(raw), sha256=m.sha(raw))
+        body = m.CheckedBody(io.BytesIO(raw), row, time.monotonic() + 60, time.monotonic)
+        self.assertFalse(hasattr(body, "seek"))
+        self.assertEqual(body.read(3), b"six")
+        self.assertEqual(body.read(10), b"six")
+        self.assertEqual(body.read(1), b"")
+        body.finish()
+        with self.assertRaises(ValueError):
+            body.read(m.CHUNK + 1)
+        wrong = m.CheckedBody(io.BytesIO(b"badbad"), row, time.monotonic() + 60, time.monotonic)
+        wrong.read(6)
+        with self.assertRaises(ValueError):
+            wrong.finish()
+
+    def test_readback_rejects_truncated_extra_or_bad_bytes_and_closes(self):
+        row = dict(bytes=3, sha256=m.sha(b"abc"))
+        for raw in (b"ab", b"abcd", b"xyz"):
+            body = io.BytesIO(raw)
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                m.readback(
+                    Mock(open=Mock(return_value=body)), row, time.monotonic() + 60, time.monotonic
+                )
+            self.assertTrue(body.closed)

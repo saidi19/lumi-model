@@ -1,0 +1,195 @@
+"""One-shot pinned CPU-wheel acquisition feeding the frozen offline installer.
+
+Private admitted-unit API only. No install, model access, credentials, mounts or
+host admission. Global setup HTTPS/expiry enforcement must precede dispatch.
+Preserves the lock, installer, service ReadOnlyPaths and old rehearsal sources.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import signal
+import ssl
+import stat
+import sys
+import time
+import types
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+INPUT = Path("/opt/lumi-cpu-input")
+RECEIPTS = Path("/var/lib/lumi-vm-input-deployment/606d788073f1f0b66a39eabeb4b32c2c")
+INSTALLER_SHA = "4697253d149bb10fbf2c51128f49dc525bd51841d9eb1bee21cb325c841a89a9"
+UNIT = "lumi-cpu-wheels-v1.service"
+CAP = 512 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("cpu_wheel_acquisition_rejected") from None
+
+
+def installer():
+    path = INPUT / "install_sft_vm_cpu_runtime_v1.py"
+    for parent in path.parents:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(stat.S_IMODE(info.st_mode) == 0o400 and info.st_nlink == 1)
+        raw = stream.read(131073)
+    need(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == INSTALLER_SHA)
+    module = types.ModuleType("_wheel_bound_installer")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def boundary(cpu):
+    need(sys.platform == "linux" and os.geteuid() == os.getegid() == 0)
+    need(sys.version_info[:2] == (3, 12) and sys.flags.isolated and sys.dont_write_bytecode)
+    with open("/proc/self/cgroup", "rb") as stream:
+        need(stream.read(4097).strip() == f"0::/system.slice/{UNIT}".encode())
+    group = Path("/sys/fs/cgroup/system.slice") / UNIT
+    for name, value in (("memory.max", 1024**3), ("memory.swap.max", 0), ("pids.max", 64)):
+        with (group / name).open("rb") as stream:
+            need(stream.read(65).strip() == str(value).encode())
+    cpu.owned(INPUT, directory=True)
+    cpu.owned(RECEIPTS, directory=True)
+    space = os.statvfs(INPUT)
+    need(space.f_bavail * space.f_frsize >= CAP + 16 * 1024**2)
+
+
+def urls(rows):
+    need(len(rows) == 34 and sum(row["bytes"] for row in rows) <= CAP)
+    for row in rows:
+        value = row["url"]
+        need(type(value) is str and value == value.strip())
+        url = urllib.parse.urlsplit(value)
+        need(
+            url.scheme == "https"
+            and url.hostname in {"files.pythonhosted.org", "download.pytorch.org"}
+        )
+        need(url.port in {None, 443} and url.username is None and url.password is None)
+        need(not url.query and not url.fragment)
+        need(urllib.parse.unquote(url.path.rsplit("/", 1)[-1]) == row["filename"])
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("cpu_wheel_redirect_rejected") from None
+
+
+def opener():
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirect(),
+        urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+    )
+
+
+def sync(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write(path, value):
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    need(len(raw) <= 4096)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync(path.parent)
+
+
+def fetch(row, destination, transport, deadline, clock):
+    remaining = deadline - clock()
+    need(remaining > 0)
+    request = urllib.request.Request(
+        row["url"], headers={"Accept-Encoding": "identity"}, method="GET"
+    )
+    # No retry, authentication, environment proxy, redirect, HEAD or listing.
+    with transport.open(request, timeout=min(30, remaining)) as response:
+        need(response.status == 200 and response.geturl() == row["url"])
+        lengths = response.headers.get_all("Content-Length", [])
+        need(len(lengths) == 1 and lengths[0] == str(row["bytes"]))
+        need(response.headers.get("Content-Encoding", "identity").lower() == "identity")
+        need(response.headers.get("Transfer-Encoding") is None)
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as output:
+            count, digest = 0, hashlib.sha256()
+            while True:
+                need(clock() < deadline)
+                block = response.read(min(1024**2, row["bytes"] - count + 1))
+                if not block:
+                    break
+                count += len(block)
+                need(count <= row["bytes"])
+                digest.update(block)
+                need(output.write(block) == len(block))
+            need(count == row["bytes"] and digest.hexdigest() == row["sha256"])
+            output.flush()
+            os.fsync(output.fileno())
+    return count
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _acquire_admitted_once(*, deadline, clock=time.monotonic):
+    need(type(deadline) in {int, float} and 0 < deadline - clock() <= 300)
+    cpu = installer()
+    boundary(cpu)
+    rows = cpu.lock(cpu.helpers())  # Existing pinned schema/filename/hash checks.
+    urls(rows)  # All origins checked before any request or attempt write.
+    remaining = deadline - clock()
+    need(0 < remaining <= 300)
+    need(signal.getitimer(signal.ITIMER_REAL) == (0, 0))
+    need(signal.getsignal(signal.SIGALRM) == signal.SIG_DFL)
+    signal.setitimer(signal.ITIMER_REAL, remaining)
+    wheels = INPUT / "wheels"
+    try:
+        wheels.mkdir(mode=0o700, exist_ok=False)  # Partial directory consumes this attempt.
+        sync(INPUT)
+        report = {
+            "requests_started": 0,
+            "wheels_verified": 0,
+            "verified_content_bytes": 0,
+            "all_wheel_readback_matches": False,
+            "retry_allowed": False,
+            "host_admitted": False,
+            "gate_5_complete": False,
+            "runtime_installed": False,
+            "global_network_cap_proven": False,
+        }
+        write(RECEIPTS / "cpu-wheels-started.json", report)
+        try:
+            transport = opener()
+            for row in rows:
+                report["requests_started"] += 1
+                count = fetch(row, wheels / row["filename"], transport, deadline, clock)
+                report["wheels_verified"] += 1
+                report["verified_content_bytes"] += count
+            sync(wheels)
+            need(clock() < deadline)
+            need(cpu.audit_wheels(rows) == report["verified_content_bytes"])
+            need(clock() < deadline)
+            report["all_wheel_readback_matches"] = True
+            write(RECEIPTS / "cpu-wheels-result.json", report)
+            return report
+        except BaseException:
+            write(RECEIPTS / "cpu-wheels-failed.json", report)
+            raise ValueError("cpu_wheel_acquisition_failed") from None
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)

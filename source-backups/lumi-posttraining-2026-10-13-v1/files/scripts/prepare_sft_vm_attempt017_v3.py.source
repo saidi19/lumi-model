@@ -1,0 +1,78 @@
+"""Offline correction of the private-host watchdog baseline binding."""
+
+import ast
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-017-source-v0.2"
+BASE_SHA = "185dd2494665d5c4ba36ef34199fc658d0d6db87dacc9323451890f4edaa62f7"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-017-source-v0.3"
+TARGET = "scripts/prepare_sft_vm_private_host_sources_v4.py"
+OLD = "xZsPwZ2CQbUvlEEf81/rXZVpZK8jZSKlwRrWVaT1aI8="
+NEW = "r1qUvs60xU03/SA6sEeux5AUwnjSNjxsLSyv0vz+jyw="
+FAILURE = ROOT / "artifacts/lumi-vm-private-outer-execution-v0.20/entry-result.json"
+
+
+def build():
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt012_v1.py",
+                 "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc")
+    failure = json.loads(Failure_raw := FAILURE.read_bytes())
+    closure.need(closure.sha(Failure_raw)
+                 == "9821cbd2ec445bd174f6d6b4b52034626d1904bca4ce12a112323ac50f256955")
+    closure.need(failure["execution_marker_created"] is True)
+    closure.need(failure["host_lifecycle_completed"] is False)
+    closure.need(failure["network_cleanup_verified"] is True)
+    manifest = json.loads(closure.read(BASE / "release.json", BASE_SHA))
+    original = {n: closure.read(BASE / n, p["sha256"], p["bytes"])
+                for n, p in manifest["outputs"].items()}
+    target = original[TARGET]
+    closure.need(target.count(OLD.encode()) == 1 and NEW.encode() not in target)
+    seeds = original | {TARGET: target.replace(OLD.encode(), NEW.encode())}
+    preserved = {n for n in original if "/" not in n or n.startswith("evidence/")
+                 or n.endswith((".gz", ".tar", ".pem"))}
+    final = closure.closure(original, seeds, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            closure.need(raw == original[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        closure.need(len(raw) == pin["bytes"] and closure.sha(raw) == pin["sha256"])
+    report = dict(
+        manifest,
+        schema="lumi.vm-attempt017-source.v0.3",
+        corrected_base_release_sha256=BASE_SHA,
+        consumed_attempt_retained=True,
+        execution_permitted=False,
+        fresh_identity_required=True,
+        private_host_watchdog_baseline_corrected=True,
+        previous_watchdog_code_sha256_base64=OLD,
+        watchdog_code_sha256_base64=NEW,
+        semantic_source_changes=[TARGET],
+        outputs={n: dict(bytes=len(b), sha256=closure.sha(b))
+                 for n, b in sorted(final.items())},
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_kwargs):
+    raise ValueError("consumed_attempt_repair_is_not_execution_authority")

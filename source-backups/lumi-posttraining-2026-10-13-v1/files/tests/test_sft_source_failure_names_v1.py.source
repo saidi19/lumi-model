@@ -1,0 +1,201 @@
+"""Synthetic-only exact-scope failure-name extraction and privacy contracts."""
+
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/parse_sft_source_failure_names_v1.py"
+SPEC = importlib.util.spec_from_file_location("failure_names_v1", PATH)
+PARSER = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PARSER)
+
+SOURCE_GROUP = (
+    "##[group]Run python -B -m pytest -p scripts.ci_source_partition_v1 "
+    "--lumi-source-suite tests"
+)
+SUMMARY = "=== short test summary info ==="
+EXIT = "##[error]Process completed with exit code 1."
+NODE = "tests/test_demo.py::DemoTests::test_a"
+OTHER = "tests/test_other.py::test_b"
+COLLECTION = "tests/test_other.py"
+VALID_ROW = "FAILED " + NODE + " - AssertionError: PRIVATE_MESSAGE"
+
+
+class FailureNameTests(unittest.TestCase):
+    nodes = {NODE, OTHER, COLLECTION}
+
+    def fixture(self, rows=VALID_ROW, prefix="", suffix=""):
+        return (
+            prefix + SOURCE_GROUP + "\n##[endgroup]\n" + SUMMARY + "\n" + rows + "\n" + EXIT
+            + "\n" + suffix
+        ).encode("utf-8")
+
+    def parse(self, rows=VALID_ROW, **kwargs):
+        return PARSER.parse_names(self.fixture(rows, **kwargs), self.nodes, SOURCE_GROUP)
+
+    def rejected(self, value):
+        with self.assertRaises(PARSER.Rejected) as caught:
+            PARSER.parse_names(value, self.nodes, SOURCE_GROUP)
+        self.assertRegex(str(caught.exception), r"^[a-z][a-z0-9_]{0,99}$")
+        self.assertNotIn("PRIVATE", str(caught.exception))
+
+    def test_no_footer_required(self):
+        self.assertEqual(self.parse(), [{"test": NODE, "error_type": "AssertionError"}])
+
+    def test_unfamiliar_footer_does_not_discard_observed_names(self):
+        self.assertEqual(self.parse(VALID_ROW + "\n=== unfamiliar footer ==="), self.parse())
+
+    def test_footer_counts_do_not_assert_completeness(self):
+        self.assertEqual(self.parse(VALID_ROW + "\n99 failed in 1.00s"), self.parse())
+
+    def test_timestamp_and_ansi(self):
+        raw = self.fixture("\x1b[31m" + VALID_ROW + "\x1b[0m")
+        stamped = b"\n".join(b"2026-09-15T01:02:03.1234567Z " + row for row in raw.splitlines())
+        self.assertEqual(PARSER.parse_names(stamped, self.nodes, SOURCE_GROUP), self.parse())
+
+    def test_parameter_values_are_removed(self):
+        value = self.parse("FAILED " + NODE + "[PRIVATE_PARAMETER] - TypeError: PRIVATE_MESSAGE")
+        self.assertEqual(value, [{"test": NODE, "error_type": None}])
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
+    def test_parameter_cannot_inject_exception_type(self):
+        value = self.parse(
+            "FAILED " + NODE + "[PRIVATE] - ValueError: FAKE] - TypeError: PRIVATE_MESSAGE"
+        )
+        self.assertEqual(value, [{"test": NODE, "error_type": None}])
+
+    def test_parameter_with_double_colon_never_changes_node(self):
+        value = self.parse("FAILED " + NODE + "[PRIVATE::Other::test_secret] - ValueError: PRIVATE")
+        self.assertEqual(value, [{"test": NODE, "error_type": None}])
+
+    def test_truncated_parameter_row_ignored(self):
+        self.assertEqual(
+            self.parse("FAILED " + OTHER + "[PRIVATE_TRUNCATED\n" + VALID_ROW), self.parse()
+        )
+
+    def test_only_truncated_parameter_rejected(self):
+        self.rejected(self.fixture("FAILED " + NODE + "[PRIVATE_TRUNCATED"))
+
+    def test_custom_exception_type_not_retained(self):
+        self.assertEqual(
+            self.parse("FAILED " + NODE + " - PrivateCustomerError: PRIVATE"),
+            [{"test": NODE, "error_type": None}],
+        )
+
+    def test_assertion_expression_does_not_supply_type(self):
+        self.assertIsNone(self.parse("FAILED " + NODE + " - assert ValueError == PRIVATE")[0]["error_type"])
+
+    def test_exception_name_must_have_exact_delimiter(self):
+        self.assertIsNone(self.parse("FAILED " + NODE + " - ValueError PRIVATE")[0]["error_type"])
+
+    def test_builtin_type_without_message(self):
+        self.assertEqual(self.parse("FAILED " + NODE + " - ValueError")[0]["error_type"], "ValueError")
+
+    def test_pytest_failed_type(self):
+        self.assertEqual(self.parse("FAILED " + NODE + " - Failed: PRIVATE")[0]["error_type"], "Failed")
+
+    def test_collection_error_node(self):
+        self.assertEqual(
+            self.parse("ERROR " + COLLECTION + " - ImportError: PRIVATE"),
+            [{"test": COLLECTION, "error_type": "ImportError"}],
+        )
+
+    def test_unknown_full_node_in_known_file_ignored(self):
+        unknown = "FAILED tests/test_demo.py::DemoTests::private_identifier - ValueError: PRIVATE"
+        self.assertEqual(self.parse(unknown + "\n" + VALID_ROW), self.parse())
+
+    def test_unknown_path_ignored(self):
+        unknown = "FAILED tests/test_private.py::test_secret - ValueError: PRIVATE"
+        self.assertEqual(self.parse(unknown + "\n" + VALID_ROW), self.parse())
+
+    def test_malformed_failure_row_ignored(self):
+        self.assertEqual(self.parse("FAILED PRIVATE_NOT_A_NODE\n" + VALID_ROW), self.parse())
+
+    def test_only_unknown_or_malformed_rows_rejected(self):
+        for rows in (
+            "FAILED tests/test_demo.py::DemoTests::private_identifier - ValueError: PRIVATE",
+            "ERROR PRIVATE_NOT_A_NODE",
+            "1 passed in 0.01s",
+        ):
+            with self.subTest(rows=rows):
+                self.rejected(self.fixture(rows))
+
+    def test_same_node_same_type_deduplicated(self):
+        self.assertEqual(self.parse(VALID_ROW + "\n" + VALID_ROW), self.parse())
+
+    def test_same_node_conflicting_types_become_null(self):
+        value = self.parse(VALID_ROW + "\nERROR " + NODE + " - TypeError: PRIVATE")
+        self.assertEqual(value, [{"test": NODE, "error_type": None}])
+
+    def test_parameterized_and_plain_type_become_null(self):
+        value = self.parse(VALID_ROW + "\nFAILED " + NODE + "[PRIVATE] - AssertionError: PRIVATE")
+        self.assertEqual(value, [{"test": NODE, "error_type": None}])
+
+    def test_observed_nodes_sorted_and_only_allowlisted_fields(self):
+        value = self.parse("FAILED " + OTHER + " - KeyError: PRIVATE\n" + VALID_ROW)
+        self.assertEqual([row["test"] for row in value], sorted([NODE, OTHER]))
+        self.assertTrue(all(set(row) == {"test", "error_type"} for row in value))
+        self.assertNotIn("PRIVATE", json.dumps(value))
+
+    def test_unrelated_group_failures_are_ignored(self):
+        unrelated = (
+            "##[group]Run unrelated\n##[endgroup]\n" + SUMMARY + "\nFAILED " + OTHER
+            + " - KeyError: PRIVATE\n" + EXIT + "\n"
+        )
+        self.assertEqual(self.parse(prefix=unrelated, suffix=unrelated), self.parse())
+
+    def test_failure_before_summary_is_not_exported(self):
+        raw = self.fixture().replace(SUMMARY.encode(), ("FAILED " + OTHER + " - KeyError: PRIVATE\n" + SUMMARY).encode())
+        self.assertEqual(PARSER.parse_names(raw, self.nodes, SOURCE_GROUP), self.parse())
+
+    def test_failure_after_source_exit_is_not_exported(self):
+        self.assertEqual(self.parse(suffix="FAILED " + OTHER + " - KeyError: PRIVATE\n"), self.parse())
+
+    def test_failure_row_must_be_anchored(self):
+        self.assertEqual(self.parse("PRIVATE prefix FAILED " + OTHER + " - KeyError: PRIVATE\n" + VALID_ROW), self.parse())
+
+    def test_missing_exact_source_group_rejected(self):
+        self.rejected(self.fixture().replace(SOURCE_GROUP.encode(), b"##[group]Run unrelated"))
+
+    def test_multiple_exact_source_groups_rejected(self):
+        self.rejected(self.fixture() + self.fixture())
+
+    def test_missing_summary_rejected(self):
+        self.rejected(self.fixture().replace(SUMMARY.encode(), b"PRIVATE no header"))
+
+    def test_multiple_summary_headers_rejected(self):
+        self.rejected(self.fixture(VALID_ROW + "\n" + SUMMARY + "\n" + VALID_ROW))
+
+    def test_missing_exit_rejected(self):
+        self.rejected(self.fixture().replace(EXIT.encode(), b""))
+
+    def test_multiple_exits_rejected(self):
+        self.rejected(self.fixture(VALID_ROW + "\n" + EXIT))
+
+    def test_zero_exit_rejected(self):
+        self.rejected(self.fixture().replace(b"exit code 1.", b"exit code 0."))
+
+    def test_summary_failure_line_cap_counts_duplicates(self):
+        self.assertEqual(self.parse("\n".join([VALID_ROW] * 512)), self.parse())
+        self.rejected(self.fixture("\n".join([VALID_ROW] * 513)))
+
+    def test_summary_failure_line_cap_counts_unbound_rows(self):
+        rows = ["FAILED tests/test_private.py::test_secret - ValueError: PRIVATE"] * 512
+        self.rejected(self.fixture("\n".join(rows + [VALID_ROW])))
+
+    def test_invalid_utf8_rejected_without_text(self):
+        self.rejected(self.fixture() + b"\xffPRIVATE_RAW")
+
+    def test_oversized_input_rejected(self):
+        self.rejected(b"X" * (PARSER.MAX_LOG + 1))
+
+    def test_empty_input_rejected(self):
+        self.rejected(b"")
+
+    def test_nonbytes_input_rejected(self):
+        self.rejected(bytearray(self.fixture()))
+
+
+if __name__ == "__main__":
+    unittest.main()

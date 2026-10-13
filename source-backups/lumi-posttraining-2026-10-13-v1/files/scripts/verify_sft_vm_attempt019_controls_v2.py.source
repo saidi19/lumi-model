@@ -1,0 +1,82 @@
+"""Correct exact S3 lifecycle absence handling in the control verifier."""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+from scripts import verify_sft_vm_attempt019_controls_v1 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "e936d055caefc830e27adf5f1d7acb09291958e0ef025a601b485a2aff9029cf"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-019-control-verification-failure-v0.1.json"
+FAILURE_SHA = "29c6641187abf985165d3518a235bac788de25f05af7bb38b14895b63aebe1dc"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_verification_v2_rejected") from None
+
+
+class Reads(previous.Reads):
+    def absent(self, service, operation, **fields):
+        try:
+            self.call(service, operation, **fields)
+        except Exception as error:
+            code = previous.transport.error_code(error)
+            expected = set(previous.transport.ABSENCE_CODES.get(service, set()))
+            if service == "s3" and operation == "get_bucket_lifecycle_configuration":
+                expected.add("NoSuchLifecycleConfiguration")
+            if code in expected:
+                return True
+            raise
+        return False
+
+
+def runtime():
+    need(hashlib.sha256(Path(previous.__file__).read_bytes()).hexdigest() == PREVIOUS_SHA)
+    need(FAILURE_SHA is not None)
+    need(hashlib.sha256(FAILURE.read_bytes()).hexdigest() == FAILURE_SHA)
+    need(not previous.WATCH_OUTPUT.exists() and not previous.STORE_OUTPUT.exists())
+
+
+def verify_live(cloud):
+    runtime()
+    original = previous.Reads
+    previous.Reads = Reads
+    try:
+        return previous.verify_live(cloud)
+    finally:
+        previous.Reads = original
+
+
+def run():
+    runtime()
+    cloud = previous.transport.clients()
+    try:
+        watch, store = verify_live(cloud)
+    finally:
+        for client in cloud.values():
+            client.close()
+    for path, value in ((previous.WATCH_OUTPUT, watch), (previous.STORE_OUTPUT, store)):
+        raw = previous.encode(value)
+        fd = previous.os.open(
+            path,
+            previous.os.O_WRONLY
+            | previous.os.O_CREAT
+            | previous.os.O_EXCL
+            | previous.os.O_NOFOLLOW,
+            0o400,
+        )
+        with previous.os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    print(
+        previous.json.dumps(
+            {"watchdog": watch["status"], "cleanup_store": store["status"]},
+            sort_keys=True,
+        )
+    )
+    return watch, store
+
+
+if __name__ == "__main__":
+    run()

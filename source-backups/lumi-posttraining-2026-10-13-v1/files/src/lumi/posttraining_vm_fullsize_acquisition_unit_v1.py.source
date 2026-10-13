@@ -1,0 +1,229 @@
+"""Acquisition-to-completion wiring; does not provision or authorize a host.
+
+Root supplies an authenticated SDK at the fixed path, release and private disk.
+Only stage/acquisition is writable, never stage itself: otherwise a writable
+release alias would bypass the read-only source mount. After a successful empty
+acquisition cgroup, root must move acquisition/inputs to stage/inputs before
+the frozen handoff stops the acquisition unit and starts the import unit.
+No source mutation, worker retries, or off-host retention is implemented here.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+import time
+
+from . import posttraining_vm_fullsize_completion_v1 as completion
+from . import posttraining_vm_fullsize_handoff_v1 as handoff
+from . import posttraining_vm_fullsize_staging_v1 as staging
+
+PYTHON = "/opt/lumi-sft-acquisition/venv/bin/python"
+SCRIPT = "/work/release/scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+
+
+def properties(attempt):
+    handoff.unit_name(attempt, "acquire")
+    root = handoff.ROOT / attempt
+    result = handoff.controls._base()
+    result.update(
+        {
+            "MemoryMax": str(1024**3),
+            "RuntimeMaxSec": "3600",
+            "PrivateNetwork": "no",
+            "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6",
+            "BindReadOnlyPaths": f"{root}/stage/release:/work/release",
+            "BindPaths": f"{root}/stage/acquisition:/acquisition",
+            "LoadCredential": f"aws-session.json:{root}/credentials/aws-session.json",
+            "ReadOnlyPaths": "/opt/lumi-sft-acquisition/venv",
+        }
+    )
+    return result
+
+
+def command(attempt, *, entry_sha256, source_manifest_sha256):
+    unit = handoff.unit_name(attempt, "acquire")
+    handoff.need(
+        all(handoff.frozen.hex_id(v, 64) for v in (entry_sha256, source_manifest_sha256)),
+        "arguments",
+    )
+    result = [
+        "/usr/bin/systemd-run",
+        "--quiet",
+        "--no-ask-password",
+        "--service-type=exec",
+        "--unit=" + unit,
+    ]
+    result += [f"--property={k}={v}" for k, v in properties(attempt).items()]
+    result += [f"--setenv={k}={v}" for k, v in handoff.frozen.ENV.items()]
+    return result + [
+        "--",
+        PYTHON,
+        "-I",
+        "-B",
+        SCRIPT,
+        "--attempt",
+        attempt,
+        "--entry-sha256",
+        entry_sha256,
+        "--source-manifest-sha256",
+        source_manifest_sha256,
+    ]
+
+
+def _validate_receipt(report):
+    nested = {
+        "schema": "lumi.vm-fullsize-staging.v0.1",
+        "status": "copied_hash_verified",
+        "selection_sha256": staging.SELECTION_SHA256,
+        "objects": 22,
+        "content_bytes_written": staging.MAX_INPUT_BYTES,
+        "maximum_body_bytes_returned": staging.MAX_INPUT_BYTES + 22,
+        "readonly_mount_verified": False,
+        "acquisition_cgroup_reaped": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+    }
+    expected = {
+        "schema": "lumi.vm-fullsize-acquisition.v0.1",
+        "staging": nested,
+        "http_sends": 22,
+        "sdk_http_session_closed_on_return": True,
+        "credentials_erased": False,
+        "acquisition_cgroup_reaped": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+    }
+    # Canonical serialization distinguishes booleans from integer lookalikes.
+    handoff.need(
+        json.dumps(report, sort_keys=True) == json.dumps(expected, sort_keys=True),
+        "acquisition_failed",
+    )
+
+
+def _worker_directory(path):
+    info = path.lstat()
+    handoff.need(
+        stat.S_ISDIR(info.st_mode)
+        and info.st_uid == info.st_gid == 10001
+        and stat.S_IMODE(info.st_mode) == 0o700,
+        "host",
+    )
+    return info
+
+
+def _run_acquisition_admitted_once(attempt, pins, *, machine_id, deadline):
+    """Fresh root-parent dispatch, joined to existing handoff's terminal contract.
+
+    Caller has already authenticated source, SDK and host storage/egress. Return
+    retains the successful exited unit so frozen handoff can observe and stop it.
+    Empty-cgroup readback is mandatory BEFORE root moves the input directory.
+    On failure, stop/reap and preserve everything; never retry the acquisition.
+    """
+    launch = command(attempt, **pins)
+    handoff.need(
+        type(deadline) in {int, float} and 0 < deadline - time.monotonic() <= 3615, "deadline"
+    )
+    handoff.frozen.host_check(machine_id)
+    destination = handoff.ROOT / attempt
+    stage = destination / "stage"
+    for path in (destination, stage):
+        handoff.frozen.root_owned(path)
+        handoff.need(
+            stat.S_ISDIR(path.lstat().st_mode) and stat.S_IMODE(path.lstat().st_mode) == 0o700,
+            "host",
+        )
+    acquisition = stage / "acquisition"
+    _worker_directory(acquisition)
+    handoff.need(list(acquisition.iterdir()) == [], "host")
+    handoff.need(
+        not (stage / "inputs").exists() and not (stage / "inputs").is_symlink(), "attempt_used"
+    )
+    fd = os.open(
+        destination / "acquisition-dispatch.started",
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o400,
+    )
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    completion._fsync_directory(destination)
+    unit = handoff.unit_name(attempt, "acquire")
+    old = handoff.frozen.run_command(
+        ["/usr/bin/systemctl", "show", unit, "--property=LoadState", "--value"], 5, capture=True
+    )
+    handoff.need(old.returncode in {0, 1, 4} and old.stdout.strip() == b"not-found", "attempt_used")
+    phase = "dispatch"
+    try:
+        handoff.need(time.monotonic() < deadline, "deadline")
+        handoff.need(handoff.frozen.run_command(launch, 15).returncode == 0, "dispatch")
+        phase = "terminal"
+        while time.monotonic() < deadline:
+            observed = handoff.frozen.observe(unit)
+            if observed["SubState"] in {"exited", "failed", "dead"}:
+                handoff.frozen.validate_terminal("chain", observed)
+                break
+            time.sleep(0.2)
+        else:
+            raise handoff.HandoffError("deadline")
+        handoff.need(handoff.frozen.cgroup_empty(unit), "cleanup")
+        phase = "receipt"
+        _, report = completion._read_worker_report(acquisition / "acquisition.json", 8192)
+        _validate_receipt(report)
+        phase = "handoff"
+        info = _worker_directory(acquisition / "inputs")
+        handoff.need(info.st_dev == stage.stat().st_dev, "host")
+        os.rename(acquisition / "inputs", stage / "inputs")
+        completion._fsync_directory(acquisition)
+        completion._fsync_directory(stage)
+        return report
+    except BaseException:
+        try:
+            handoff.frozen.write_new(
+                destination / "acquisition-failed.json",
+                {"stage": phase, "retry_allowed": False, "output_deletion_allowed": False},
+            )
+        except BaseException:
+            pass
+        finally:
+            handoff._stop_and_reap(unit)
+        raise handoff.HandoffError("acquisition_failed") from None
+
+
+def run_workflow(**_arguments):
+    raise handoff.HandoffError("host_guard_not_bound") from None
+
+
+def _run_workflow_admitted_once(attempt, acquisition_pins, import_pins, *, machine_id, deadline):
+    """One acquisition -> import -> independent check -> local-preservation path.
+
+    Not host provisioning/admission, not durable off-host backup. Root credential
+    source stays private for the admitting parent's teardown; never claim erased.
+    """
+    handoff.import_command(attempt, import_pins)  # Validate before any dispatch.
+    command(attempt, **acquisition_pins)
+    handoff.need(
+        acquisition_pins["source_manifest_sha256"] == import_pins["source_manifest_sha256"],
+        "arguments",
+    )
+    handoff.need(
+        type(deadline) in {int, float} and 0 < deadline - time.monotonic() <= 8435, "deadline"
+    )
+    _run_acquisition_admitted_once(
+        attempt,
+        acquisition_pins,
+        machine_id=machine_id,
+        deadline=min(deadline, time.monotonic() + 3615),
+    )
+    try:
+        return completion._complete_admitted_once(
+            attempt,
+            import_pins,
+            machine_id=machine_id,
+            deadline=min(deadline, time.monotonic() + 4820),
+        )
+    finally:
+        # Also if completion fails before entering its own handoff/cleanup.
+        handoff._stop_and_reap(handoff.unit_name(attempt, "acquire"))

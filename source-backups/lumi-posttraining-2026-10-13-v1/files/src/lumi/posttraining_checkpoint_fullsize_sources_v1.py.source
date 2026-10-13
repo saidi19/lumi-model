@@ -1,0 +1,193 @@
+"""Bound full-size source/control add-on only; no data layout or public install.
+
+Pure validation checks supplied bytes, not origin, authorization or complete
+dependency closure. A future independently admitted parent must authenticate the
+entire runtime/source closure before the private root-only installer can be used.
+It writes only absent source/control destinations in an exact owned rootfs and
+freezes that adapter. It never creates checkpoint/tokenizer/output roots, mount
+targets or sibling directories, and never acquires or reads payloads.
+
+The bounded add-on content reservation is separate from coordinator content
+budgets; it is not arbitrary native-write or OS-overhead accounting. Frozen
+OwnedRootfs writes retain their existing bounded short-write continuation.
+Started failures taint the owned tree, including a failed freeze; no retry,
+cleanup, source replacement or admission is provided here. Tests use doubles.
+"""
+
+from __future__ import annotations
+
+from io import BytesIO
+
+from . import posttraining_checkpoint_fullsize_bootstrap_v1 as bootstrap
+from . import posttraining_checkpoint_fullsize_entry_v1 as worker
+from . import posttraining_checkpoint_guard_sources_v1 as sources
+from . import posttraining_sft_oci_rootfs_v1 as rootfs
+
+SCHEMA = "lumi.checkpoint-fullsize-source-control-addon.v0.1"
+ENTRY_PATH = "opt/lumi-release/guardian/fullsize_entry.py"
+HELPER_PATH = "opt/lumi-release/guardian/guarded_import_helpers.py"
+CONTROL_PREFIX = "opt/lumi-release/fullsize-control/"
+MANIFEST_PATH = sources.MANIFEST_PATH
+SOURCE_PREFIX = sources.SOURCE_PREFIX
+HELPER_BYTES = 14356
+HELPER_SHA256 = "687a2989ccefdf2466dc77cda62d99d5c6428bc60c74e0e32e15991cec120690"
+MAXIMUM_ADDON_BYTES = (sources.MAXIMUM_SOURCE_BYTES + sources.MAXIMUM_MANIFEST_BYTES
+    + sources.MAXIMUM_FILE_BYTES + HELPER_BYTES + worker.MAXIMUM_CONTROL_BYTES
+    + worker.MAXIMUM_BUNDLE_BYTES)
+MAXIMUM_ADDON_FILES = sources.MAXIMUM_FILES + 4 + len(worker.CONTROL_NAMES)
+REQUIRED_SOURCES = frozenset({
+    "lumi/__init__.py", "lumi/posttraining_checkpoint_guard_fixture_v1.py",
+    "lumi/posttraining_checkpoint_fullsize_entry_v1.py",
+    "lumi/posttraining_checkpoint_import_runner_v3.py",
+    "lumi/posttraining_checkpoint_import_runner_v2.py",
+    "lumi/posttraining_checkpoint_resource_envelope_v1.py",
+    "lumi/posttraining_checkpoint_host_contract_v1.py",
+    "lumi/posttraining_checkpoint_import_plan_v1.py",
+    "lumi/posttraining_final_base_metadata_v1.py",
+    "lumi/posttraining_checkpoint_io_contract_v1.py",
+    "lumi/posttraining_checkpoint_import_torch_v5.py",
+    "lumi/posttraining_checkpoint_package_v2.py",
+    "lumi/configuration_lumi.py", "lumi/modeling_lumi.py",
+})
+FALSE_FLAGS = (
+    "base_origin_verified", "dependency_closure_verified", "source_immutability_verified",
+    "filesystem_immutable", "host_admission_verified", "native_guardian_verified",
+    "input_layout_ready", "mounts_verified", "native_cumulative_write_enforcement_verified",
+    "arbitrary_native_writes_metered", "coordinator_budget_covers_addon_writes",
+    "execution_permitted", "real_import_authorized", "real_4b_import",
+    "gate_5_complete", "training_authorized", "production_eligible", "retry_allowed",
+)
+ERROR_CODES = frozenset({"binding_rejected", "runtime_rejected", "installation_rejected",
+                         "host_guard_not_bound"})
+
+
+class FullsizeSourceError(ValueError):
+    def __init__(self, code="installation_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "installation_rejected"
+        super().__init__(self.code)
+
+
+def _need(value, code="installation_rejected"):
+    if not value:
+        raise FullsizeSourceError(code) from None
+
+
+def validate_bundle(files, manifest, entry, helper, control_raw, control_bodies, *,
+                    expected_manifest_sha256, expected_entry_sha256, expected_control_sha256,
+                    expected_attempt_nonce_sha256):
+    """Authenticate exact bounded bytes without importing supplied code or I/O."""
+    try:
+        summary = sources.validate_bundle(files, manifest, entry,
+            expected_manifest_sha256=expected_manifest_sha256,
+            expected_entry_sha256=expected_entry_sha256)
+        _need(REQUIRED_SOURCES <= set(files) and type(helper) is bytes
+              and len(helper) == HELPER_BYTES and sources._digest(helper) == HELPER_SHA256,
+              "binding_rejected")
+        prepared = worker.prepare_entry(control_raw, control_bodies,
+            expected_control_sha256=expected_control_sha256,
+            expected_entry_sha256=expected_entry_sha256,
+            expected_source_manifest_sha256=expected_manifest_sha256,
+            expected_attempt_nonce_sha256=expected_attempt_nonce_sha256,
+            runtime_sources={name: files["lumi/" + name] for name in worker.RUNTIME_NAMES})
+        environment = bootstrap.validate_environment(dict(bootstrap.FIXED_ENV) | {
+            "LUMI_IMPORT_SOURCE_MANIFEST_SHA256": expected_manifest_sha256,
+            "LUMI_FULLSIZE_ENTRY_SHA256": expected_entry_sha256,
+            "LUMI_FULLSIZE_CONTROL_SHA256": expected_control_sha256,
+            "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256": expected_attempt_nonce_sha256,
+        })
+        control_bytes = len(control_raw) + sum(map(len, control_bodies.values()))
+        addon_bytes = summary["addon_bytes"] + HELPER_BYTES + control_bytes
+        addon_files = summary["addon_files"] + 2 + len(worker.CONTROL_NAMES)
+        _need(addon_bytes <= MAXIMUM_ADDON_BYTES and addon_files <= MAXIMUM_ADDON_FILES,
+              "binding_rejected")
+        bindings = dict(prepared["bindings"]) | {"helper_sha256": HELPER_SHA256}
+        return {"schema": SCHEMA, "status": "PASS_bound_addon_not_installation_or_admission",
+            "source_manifest_sha256": expected_manifest_sha256,
+            "entry_sha256": expected_entry_sha256, "helper_sha256": HELPER_SHA256,
+            "control_sha256": expected_control_sha256,
+            "source_files": summary["source_files"], "source_bytes": summary["source_bytes"],
+            "control_files": len(worker.CONTROL_NAMES) + 1, "control_bytes": control_bytes,
+            "addon_files": addon_files, "addon_bytes": addon_bytes,
+            "addon_content_write_bytes_reserved": addon_bytes,
+            "addon_bindings_sha256": worker.sha(worker.canonical(bindings)),
+            "bindings": bindings, "environment": environment,
+            "installation_frozen": False, **dict.fromkeys(FALSE_FLAGS, False)}
+    except FullsizeSourceError:
+        raise
+    except BaseException:
+        raise FullsizeSourceError("binding_rejected") from None
+
+
+def _runtime():
+    try:
+        sources._runtime()
+    except BaseException:
+        raise FullsizeSourceError("runtime_rejected") from None
+
+
+def install_fullsize_addon(**_arguments):
+    """Public installation stays closed even for a matching supplied bundle."""
+    raise FullsizeSourceError("host_guard_not_bound") from None
+
+
+def _install_admitted_once(owned, *, files, manifest, entry, helper, control_raw, control_bodies,
+                           expected_manifest_sha256, expected_entry_sha256,
+                           expected_control_sha256, expected_attempt_nonce_sha256):
+    """Install only fixed absent source/control files in an already admitted tree."""
+    _runtime()  # Before supplied object access, controls, filesystem checks or writes.
+    _need(type(files) is dict and type(control_bodies) is dict, "binding_rejected")
+    files, control_bodies = dict(files), dict(control_bodies)
+    summary = validate_bundle(files, manifest, entry, helper, control_raw, control_bodies,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_entry_sha256=expected_entry_sha256,
+        expected_control_sha256=expected_control_sha256,
+        expected_attempt_nonce_sha256=expected_attempt_nonce_sha256)
+    _need(type(owned) is rootfs.OwnedRootfs)
+    started = False
+    try:
+        owned._guard()
+        _need(not owned._frozen and owned._installed_files == owned._installed_bytes == 0)
+        owned._verify_tree()
+        additions = {ENTRY_PATH: entry, HELPER_PATH: helper, MANIFEST_PATH: manifest,
+            CONTROL_PREFIX + "control.json": control_raw,
+            **{SOURCE_PREFIX + name: body for name, body in files.items()},
+            **{CONTROL_PREFIX + name: body for name, body in control_bodies.items()}}
+        for prefix in (("opt", "lumi-release", "importer"),
+                       ("opt", "lumi-release", "fullsize-control")):
+            _need(not any(parts[:3] == prefix for parts in set(owned._nodes) | owned._seen))
+        planned, total = set(owned._nodes), owned._content_bytes
+        content_before = total
+        for name, body in additions.items():
+            parts = tuple(name.split("/"))
+            _need(parts not in owned._nodes and parts not in owned._seen)
+            for depth in range(1, len(parts)):
+                parent = parts[:depth]
+                _need(parent not in owned._nodes or owned._nodes[parent][1] == "directory")
+                planned.add(parent)
+            planned.add(parts)
+            total += len(body)
+            _need(len(body) <= owned._limits["file"])
+        # Prepay the entire fixed content reservation before the first write.
+        reserved = summary["addon_content_write_bytes_reserved"]
+        _need(len(planned) <= owned._limits["entries"] and total <= owned._limits["total"]
+              and len(additions) == summary["addon_files"]
+              and total - content_before == reserved <= MAXIMUM_ADDON_BYTES)
+        started = True
+        for name, body in sorted(additions.items()):
+            owned._guard()
+            parts = tuple(name.split("/"))
+            owned._write(parts, BytesIO(body), len(body), 0o444)
+            owned._seen.add(parts)
+            owned._installed_files += 1
+            owned._installed_bytes += len(body)
+        _need(owned._installed_files == summary["addon_files"]
+              and owned._installed_bytes == reserved
+              and owned._content_bytes - content_before == reserved)
+        owned.freeze()
+        _need(owned._frozen is True)
+    except BaseException:
+        if started:
+            owned._tainted = True
+        raise FullsizeSourceError("installation_rejected") from None
+    return {**summary, "status": "installed_source_control_only_not_execution_authority",
+            "installation_frozen": True}

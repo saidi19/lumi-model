@@ -1,0 +1,256 @@
+"""Successor matrix uses service-appropriate ARNs for forbidden actions.
+
+The v1 policy is unchanged; its failed mixed-service/S3-ARN simulation remains.
+Bound exact-object role permissions; optional read-only AWS policy simulation.
+
+No IAM mutation, key issuance or source requests. Future admitted provisioning
+must attach/read back the entire role policy before issuing a fresh session.
+HEAD shares s3:GetObject permission: frozen transport, not IAM, forbids HEAD.
+Simulation does not prove bucket/KMS/SCP permissions or source availability.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+import check_sft_temporary_issuer_v2 as issuer
+
+SELECTION = Path("configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json")
+SELECTION_SHA = "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42"
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+
+
+def need(condition):
+    if not condition:
+        raise ValueError("acquisition_permission_rejected") from None
+
+
+def policy_for_keys(keys, expiry):
+    """Pure constructor used with synthetic keys; production caller binds bytes."""
+    need(type(keys) is list and len(keys) == 22 and len(set(keys)) == 22)
+    need(
+        all(
+            type(k) is str
+            and k
+            and k.isascii()
+            and not any(c in k for c in "*?${}\\")
+            and all(32 < ord(c) < 127 for c in k)
+            for k in keys
+        )
+    )
+    need(expiry.tzinfo is not None and expiry.utcoffset() == dt.timedelta(0))
+    arns = [f"arn:aws:s3:::{BUCKET}/{key}" for key in keys]
+    # Allow is deliberately paired with explicit NotResource and NotAction
+    # denies. Exact long ARNs appear once, fitting the 10,240-character quota.
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Sid": "ReadOnly", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"},
+            {"Sid": "DenyOtherResources", "Effect": "Deny", "Action": "*", "NotResource": arns},
+            {
+                "Sid": "DenyOtherActions",
+                "Effect": "Deny",
+                "NotAction": "s3:GetObject",
+                "Resource": "*",
+            },
+            {
+                "Sid": "DenyInsecure",
+                "Effect": "Deny",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+            },
+            {
+                "Sid": "DenyExpired",
+                "Effect": "Deny",
+                "Action": "*",
+                "Resource": "*",
+                "Condition": {"DateGreaterThanEquals": {"aws:CurrentTime": expiry.isoformat()}},
+            },
+        ],
+    }
+    need(len(issuer.base.compact(policy)) <= 10240)
+    return policy, arns
+
+
+def build(raw, now):
+    need(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == SELECTION_SHA)
+    selected = json.loads(raw)
+    need(
+        selected["account"] == issuer.base.ACCOUNT
+        and selected["region"] == issuer.base.REGION
+        and selected["bucket"] == BUCKET
+        and selected["object_count"] == 22
+        and sum(row["bytes"] for row in selected["objects"]) == 48843765443
+    )
+    expiry = now + dt.timedelta(seconds=7200)
+    policy, arns = policy_for_keys([row["key"] for row in selected["objects"]], expiry)
+    return policy, arns, expiry
+
+
+def check_matrix(cloud, policy, arns, now, expiry):
+    outside = [
+        arns[0] + ".not-selected",
+        "arn:aws:s3:::lumi-not-selected/object",
+        f"arn:aws:s3:::{BUCKET}",
+    ]
+    denied = [
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetObjectVersion",
+    ]
+    extra_allow = {
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}],
+    }
+    cases = [
+        ("exact_objects", [policy], ["s3:GetObject"], arns + outside, now, True),
+        ("forbidden_actions", [policy], denied, [arns[0]], now, True),
+        ("list_bucket", [policy], ["s3:ListBucket"], [f"arn:aws:s3:::{BUCKET}"], now, True),
+        (
+            "iam_write",
+            [policy],
+            ["iam:CreateUser"],
+            [f"arn:aws:iam::{issuer.base.ACCOUNT}:user/lumi/prohibited"],
+            now,
+            True,
+        ),
+        (
+            "kms_decrypt",
+            [policy],
+            ["kms:Decrypt"],
+            [
+                f"arn:aws:kms:{issuer.base.REGION}:{issuer.base.ACCOUNT}:key/00000000-0000-0000-0000-000000000000"
+            ],
+            now,
+            True,
+        ),
+        (
+            "role_assumption",
+            [policy],
+            ["sts:AssumeRole"],
+            [f"arn:aws:iam::{issuer.base.ACCOUNT}:role/lumi/prohibited"],
+            now,
+            True,
+        ),
+        ("insecure_transport", [policy], ["s3:GetObject"], [arns[0]], now, False),
+        ("expired", [policy], ["s3:GetObject"], [arns[0]], expiry, True),
+        (
+            "additional_allow_cannot_override",
+            [policy, extra_allow],
+            ["s3:GetObject", "s3:PutObject"],
+            [arns[0], outside[0]],
+            now,
+            True,
+        ),
+    ]
+    totals = {"allowed": 0, "explicitDeny": 0}
+    checked_cases = []
+    for label, policies, actions, resources, when, secure in cases:
+        result = cloud.cli(
+            "iam",
+            "simulate-custom-policy",
+            PolicyInputList=[issuer.base.compact(p) for p in policies],
+            ActionNames=actions,
+            ResourceArns=resources,
+            MaxItems=100,
+            ContextEntries=[
+                {
+                    "ContextKeyName": "aws:CurrentTime",
+                    "ContextKeyType": "date",
+                    "ContextKeyValues": [when.isoformat()],
+                },
+                {
+                    "ContextKeyName": "aws:SecureTransport",
+                    "ContextKeyType": "boolean",
+                    "ContextKeyValues": [str(secure).lower()],
+                },
+            ],
+        )
+        need(result.get("IsTruncated", False) is False and not result.get("NextToken"))
+        expected = {(action, arn) for action in actions for arn in resources}
+        seen = set()
+        for row in result["EvaluationResults"]:
+            need(not row.get("MissingContextValues"))
+            # Current API aggregates per action. Never interpret that aggregate
+            # as a decision for an individual resource; require exact coverage.
+            resources_result = row.get("ResourceSpecificResults")
+            if resources_result is None:
+                # Older service response: exact top-level ARN, not a template.
+                need(row.get("EvalResourceName") in resources)
+                resources_result = [
+                    {
+                        "EvalResourceName": row["EvalResourceName"],
+                        "EvalResourceDecision": row["EvalDecision"],
+                    }
+                ]
+            for entry in resources_result:
+                pair = (row["EvalActionName"], entry["EvalResourceName"])
+                need(
+                    pair in expected and pair not in seen and not entry.get("MissingContextValues")
+                )
+                seen.add(pair)
+                allow = pair[0] == "s3:GetObject" and pair[1] in arns and secure and when < expiry
+                decision = "allowed" if allow else "explicitDeny"
+                need(entry["EvalResourceDecision"] == decision)
+                totals[decision] += 1
+        need(seen == expected)
+        checked_cases.append(label)
+    return {
+        "calls": len(cases),
+        "decisions": sum(totals.values()),
+        "checked_cases": checked_cases,
+        **totals,
+    }
+
+
+def main():
+    need(len(sys.argv) == 3 and sys.argv[1] in {"--prepare", "--simulate"})
+    output = Path(sys.argv[2])
+    now = dt.datetime.now(dt.UTC).replace(microsecond=0)
+    policy, arns, expiry = build(SELECTION.read_bytes(), now)
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    issuer.base.save(
+        output / "started.json",
+        {
+            "selection_sha256": SELECTION_SHA,
+            "mode": sys.argv[1],
+            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "cli_adapter_sha256": hashlib.sha256(Path(issuer.__file__).read_bytes()).hexdigest(),
+        },
+    )
+    issuer.base.save(output / "role-policy.json", policy)
+    result = {
+        "schema": "lumi-acquisition-permissions-v0.2",
+        "status": "prepared_only",
+        "object_count": 22,
+        "policy_characters": len(issuer.base.compact(policy)),
+        "policy_sha256": hashlib.sha256((output / "role-policy.json").read_bytes()).hexdigest(),
+        "policy_expires_at": expiry.isoformat(),
+        "iam_mutations": 0,
+        "s3_requests": 0,
+        "credentials_issued": 0,
+        "gate_5_complete": False,
+        "live_source_access_verified": False,
+        "host_admitted": False,
+    }
+    if sys.argv[1] == "--simulate":
+        try:
+            cloud = issuer.Cloud()
+            identity = cloud.cli("sts", "get-caller-identity")
+            need(identity.get("Account") == issuer.base.ACCOUNT)
+            result["simulation"] = check_matrix(cloud, policy, arns, now, expiry)
+            result["status"] = "policy_simulation_passed_not_source_access"
+        except Exception:
+            result["status"] = "simulation_failed_no_retry"
+    issuer.base.save(output / "result.json", result)
+    print(issuer.base.compact(result))
+    return int(result["status"] == "simulation_failed_no_retry")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

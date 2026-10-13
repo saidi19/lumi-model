@@ -1,0 +1,91 @@
+"""Offline checks for the attempt-018 control plan."""
+
+import ast
+import base64
+import hashlib
+import json
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt018_controls_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.saved = json.loads((m.OUTPUT / "plan.json").read_bytes())
+        cls.release = json.loads((m.OUTPUT / "release.json").read_bytes())
+        cls.base = json.loads(m.read(m.BASE_PLAN, m.BASE_PLAN_SHA))
+
+    def test_saved_plan_rebuilds_exactly(self):
+        self.assertEqual(self.saved, m.build())
+        raw = (m.OUTPUT / "plan.json").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), self.release["plan_sha256"])
+        self.assertEqual(len(raw), self.release["plan_bytes"])
+
+    def test_all_release_and_control_bindings_verify(self):
+        manifest = m.verified_inputs()
+        self.assertEqual(len(manifest["outputs"]), 156)
+        self.assertEqual(len(self.saved["source_bindings"]), len(m.BINDINGS))
+        for name, pin in self.saved["source_bindings"].items():
+            raw = m.read(name, pin["sha256"], pin["bytes"])
+            if name.endswith(".py"):
+                ast.parse(raw)
+
+    def test_cpu_envelope_is_unchanged(self):
+        new = self.saved["cpu_scope_reference"]
+        old = self.base["cpu_scope_reference"]
+        for key in ("instance_count", "instance_type", "vcpu", "memory_mib",
+                    "maximum_instance_seconds", "shared_controller_seconds",
+                    "cleanup_reserve_seconds", "import_limits", "storage"):
+            self.assertEqual(new[key], old[key])
+        self.assertEqual(self.saved["cost_disclosure"], self.base["cost_disclosure"])
+
+    def test_fresh_identity_absence_and_consumed_predecessor(self):
+        self.assertEqual(self.saved["attempt"], m.ATTEMPT)
+        self.assertEqual(self.saved["network_candidate_cidr"], m.CIDR)
+        self.assertTrue(self.saved["network_candidate_live_availability_verified"])
+        predecessor = self.saved["predecessor_state"]
+        self.assertTrue(predecessor["execution_marker_consumed"])
+        self.assertFalse(predecessor["cpu_instance_launched"])
+        self.assertTrue(predecessor["temporary_network_removed"])
+        self.assertFalse(predecessor["cleanup_unresolved"])
+        operational = dict(self.saved)
+        operational.pop("predecessor_state")
+        self.assertNotIn(m.OLD.encode(), m.encode(operational))
+
+    def test_watchdog_code_is_exact_new_worker_package(self):
+        worker = m.read(m.RELEASE + "/scripts/sft_vm_external_watchdog_v1.py")
+        deploy = ast.parse(m.read(m.RELEASE + "/scripts/prepare_sft_vm_external_watchdog_v1.py"))
+        package = next(node for node in deploy.body if getattr(node, "name", None) == "package")
+        namespace = {"Path": m.Path, "io": __import__("io"), "zipfile": __import__("zipfile"),
+                     "need": m.need, "worker": type("Worker", (), {"__file__": str(
+                         m.ROOT / m.RELEASE / "scripts/sft_vm_external_watchdog_v1.py")})}
+        exec(compile(ast.Module(body=[package], type_ignores=[]), "<package>", "exec"), namespace)
+        expected = base64.b64encode(hashlib.sha256(namespace["package"]()).digest()).decode()
+        self.assertEqual(expected, self.saved["watchdog"]["expected_code_sha256_base64"])
+        self.assertEqual(hashlib.sha256(worker).hexdigest(), self.saved["source_bindings"][
+            m.RELEASE + "/scripts/sft_vm_external_watchdog_v1.py"]["sha256"])
+
+    def test_no_execution_authority_and_no_overwrite(self):
+        self.assertFalse(self.saved["execution_permitted"])
+        self.assertFalse(self.saved["gate_5_complete"])
+        self.assertFalse(self.release["gpu"])
+        self.assertFalse(self.release["training"])
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "OUTPUT", m.OUTPUT), self.assertRaises(ValueError):
+            m.prepare()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

@@ -1,0 +1,119 @@
+"""CIDR-only isolated source successor; frozen selector and controls unchanged."""
+
+import ast
+import json
+import os
+import sys
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt022_v1 as previous
+from scripts import verify_sft_vm_attempt022_source_v1 as qualified
+
+ROOT = previous.ROOT
+BASE = previous.OUTPUT
+BASE_SHA = qualified.RELEASE_SHA
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-022-source-v0.2"
+DIAGNOSTIC = ROOT / "evidence/lumi-vm-attempt-022-network-diagnostic-verification-v0.1.json"
+DIAGNOSTIC_SHA = "37a919a76fa567a8aa8d3ff272415d3729437cdf89c8b52f651a0e01a0f95bcc"
+OLD_CIDR, NEW_CIDR = "172.31.97.96/27", "172.31.97.64/27"
+ATTEMPT = previous.NEW
+need, sha, read, encode = previous.need, previous.sha, previous.read, previous.encode
+
+
+def prerequisites():
+    diagnostic = json.loads(read(DIAGNOSTIC, DIAGNOSTIC_SHA))
+    need(diagnostic["status"] == "fresh_selection_contract_mismatch_verified")
+    need(diagnostic["selection_comparison"] == {
+        "pinned_cidr": OLD_CIDR, "computed_first_free_cidr": NEW_CIDR,
+        "target_field_difference_count": 1, "only_cidr_differs": True, "targets_match": False,
+    })
+    for name, digest in diagnostic["source_bindings"].items():
+        read(ROOT / name, digest)
+    manifest = json.loads(read(BASE / "release.json", BASE_SHA))
+    need(manifest["attempt"] == ATTEMPT and len(manifest["outputs"]) == 156)
+    base = {name: read(BASE / name, pin["sha256"], pin["bytes"])
+            for name, pin in manifest["outputs"].items()}
+    return base, manifest
+
+
+def build():
+    base, manifest = prerequisites()
+    preserved = {name for name in base if name not in (previous.TAR, previous.SETUP_TAR)
+                 and ("/" not in name or name.startswith("evidence/")
+                      or name.endswith((".gz", ".tar", ".pem")))}
+    changed = {name for name, raw in base.items() if name.endswith((".py", ".json"))
+               and name not in preserved and OLD_CIDR.encode() in raw}
+    need(changed == {"scripts/run_sft_vm_private_network_v1.py",
+                     "configs/lumi-vm-private-network-plan-v0.1.json"})
+    seed = {name: raw.replace(OLD_CIDR.encode(), NEW_CIDR.encode()) if name in changed else raw
+            for name, raw in base.items()}
+    final = previous.previous.close(base, seed, preserved)
+    worker = "scripts/sft_vm_external_watchdog_v1.py"
+    selector = "scripts/prepare_sft_vm_private_network_v1.py"
+    need(final[worker] == base[worker] and final[selector] == base[selector])
+    before_code = manifest["watchdog_code_sha256_base64"]
+    for name, raw in final.items():
+        normalized = raw.replace(NEW_CIDR.encode(), OLD_CIDR.encode())
+        if name in preserved:
+            need(raw == base[name])
+        if name.endswith(".py"):
+            need(ast.dump(ast.parse(qualified.normalize(normalized, before_code, before_code)))
+                 == ast.dump(ast.parse(qualified.normalize(base[name], before_code, before_code))))
+        if name.startswith("configs/") and name.endswith(".json"):
+            need(qualified.config_shape(json.loads(qualified.normalize(
+                normalized, before_code, before_code))) == qualified.config_shape(json.loads(
+                    qualified.normalize(base[name], before_code, before_code))))
+    archive = previous.previous.setup_members(final[previous.SETUP_TAR])
+    contract = previous.previous.stage_contract(final[previous.previous.SETUP_STAGE])
+    need(len(archive) == 19 and all(sha(raw) == contract[name][1]
+                                  for name, raw in archive.items()))
+    sender = previous.previous.constants(final[previous.previous.SETUP_SEND])
+    need(sender["ARCHIVE_SHA"] == sha(final[previous.SETUP_TAR]))
+    need(sender["ARCHIVE_BYTES"] == len(final[previous.SETUP_TAR]))
+    receiver = final[previous.previous.SETUP_STAGE]
+    need(sender["RECEIVER_SHA"] == sha(receiver) and sender["RECEIVER_BYTES"] == len(receiver))
+    report = dict(
+        schema="lumi.vm-attempt022-source.v0.2", status="cidr_only_source_bound_not_authorized",
+        attempt=ATTEMPT, base_release_sha256=BASE_SHA, diagnostic_sha256=DIAGNOSTIC_SHA,
+        selected_cidr=NEW_CIDR, prior_selected_cidr=OLD_CIDR,
+        selected_cidr_fresh_full_admission_passed=False,
+        watchdog_code_sha256_base64=before_code, watchdog_code_unchanged=True,
+        selector_byte_identical=True, receipt_file_count=19,
+        sender_receiver_receipts_equal=True, versioned_object_count=22,
+        source_versions_bound=True, prior_evidence_preserved=True,
+        execution_permitted=False, retry=False, aws_calls=0, cloud_mutations=0,
+        checkpoint_access=False, real_4b_import=False, gate_5_complete=False,
+        gpu=False, training=False, production_eligible=False,
+        outputs={name: dict(bytes=len(raw), sha256=sha(raw))
+                 for name, raw in sorted(final.items())},
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (files | {"release.json": encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return dict(status=report["status"], source_files=len(files),
+                release_sha256=sha(encode(report)), aws_calls=0)
+
+
+def verify():
+    files, report = build()
+    need(read(OUTPUT / "release.json", sha(encode(report))) == encode(report))
+    for name, raw in files.items():
+        need(read(OUTPUT / name, sha(raw), len(raw)) == raw)
+    with patch.object(qualified, "RELEASE", OUTPUT):
+        qualified.outer_check()
+    return report
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--prepare-once"])
+    print(json.dumps(prepare(), sort_keys=True))

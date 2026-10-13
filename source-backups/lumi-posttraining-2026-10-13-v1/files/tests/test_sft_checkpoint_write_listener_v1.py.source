@@ -1,0 +1,672 @@
+"""Synthetic seccomp/ioctl doubles only; never invoke a native listener."""
+
+from __future__ import annotations
+
+import ctypes
+import contextlib
+import importlib
+import stat
+import sys
+import threading
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_checkpoint_write_listener_test_namespace"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_listener_v1")
+IMPORTED = set(sys.modules) - before_import
+PRIVATE = "PRIVATE_EXCEPTION_OR_PAYLOAD"
+FD = 17
+PID = 2345
+THREAD = 6789
+IDENTITY = (7, 11, stat.S_IFCHR, 0, 0)
+NOTIFICATION = m.broker.NOTIFICATION.pack(
+    41, 123, 0, 1, m.policy.AUDIT_ARCH_X86_64, 0, 9, 0, 13, 0, 0, 0,
+)
+RESPONSE = m.broker.RESPONSE.pack(41, 0, 0, m.broker.CONTINUE)
+
+
+def info(*, inode=11):
+    return types.SimpleNamespace(
+        st_dev=7, st_ino=inode, st_mode=stat.S_IFCHR | 0o600, st_uid=0, st_gid=0,
+    )
+
+
+class NativeFunction(Mock):
+    """Mock that also accepts the ctypes function metadata assignments."""
+
+
+class LayoutAndRuntimeTests(unittest.TestCase):
+    def test_linux_v68_constants_are_exact_and_not_caller_selected(self):
+        self.assertEqual(m.SYS_SECCOMP, 317)
+        self.assertEqual(m.SECCOMP_SET_MODE_FILTER, 1)
+        self.assertEqual(m.SECCOMP_GET_ACTION_AVAIL, 2)
+        self.assertEqual(m.SECCOMP_GET_NOTIF_SIZES, 3)
+        self.assertEqual(m.SECCOMP_FILTER_FLAG_NEW_LISTENER, 0x8)
+        self.assertEqual(m.SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV, 0x20)
+        self.assertEqual(m.LISTENER_FLAGS, 0x28)
+        self.assertEqual(m.PR_GET_SECCOMP, 21)
+        self.assertEqual(m.PR_SET_NO_NEW_PRIVS, 38)
+        self.assertEqual(m.PR_GET_NO_NEW_PRIVS, 39)
+        self.assertEqual(m.SECCOMP_MODE_FILTER, 2)
+        self.assertEqual(m.SECCOMP_IOCTL_NOTIF_RECV, 0xC0502100)
+        self.assertEqual(m.SECCOMP_IOCTL_NOTIF_SEND, 0xC0182101)
+        self.assertEqual(m.SECCOMP_IOCTL_NOTIF_ID_VALID, 0x40082102)
+
+    def test_ctypes_layouts_match_linux_x86_64_abi(self):
+        self.assertEqual((ctypes.sizeof(m.SockFilter), m.SockFilter.code.offset,
+                          m.SockFilter.jt.offset, m.SockFilter.jf.offset,
+                          m.SockFilter.k.offset), (8, 0, 2, 3, 4))
+        self.assertEqual((ctypes.sizeof(m.SockFprog), m.SockFprog.length.offset,
+                          m.SockFprog.filter.offset), (16, 0, 8))
+        self.assertEqual((ctypes.sizeof(m.SeccompData), m.SeccompData.number.offset,
+                          m.SeccompData.arch.offset, m.SeccompData.instruction_pointer.offset,
+                          m.SeccompData.arguments.offset), (64, 0, 4, 8, 16))
+        self.assertEqual((ctypes.sizeof(m.SeccompNotif), m.SeccompNotif.identifier.offset,
+                          m.SeccompNotif.pid.offset, m.SeccompNotif.flags.offset,
+                          m.SeccompNotif.data.offset), (80, 0, 8, 12, 16))
+        self.assertEqual((ctypes.sizeof(m.SeccompNotifResp),
+                          m.SeccompNotifResp.identifier.offset,
+                          m.SeccompNotifResp.value.offset, m.SeccompNotifResp.error.offset,
+                          m.SeccompNotifResp.flags.offset), (24, 0, 8, 16, 20))
+        self.assertEqual((ctypes.sizeof(m.SeccompNotifSizes),
+                          m.SeccompNotifSizes.notification.offset,
+                          m.SeccompNotifSizes.response.offset,
+                          m.SeccompNotifSizes.data.offset), (6, 0, 2, 4))
+        m._abi()
+
+    def test_low_level_wrappers_use_typed_variadic_syscall_arguments(self):
+        syscall = NativeFunction(return_value=0)
+        library = types.SimpleNamespace(syscall=syscall)
+        marker = ctypes.c_uint32(1)
+        pointer = ctypes.byref(marker)
+        with patch.object(m, "_libc", return_value=library):
+            self.assertEqual(m._prctl(38, 1), 0)
+            self.assertEqual(m._seccomp(2, 0, pointer), 0)
+            self.assertEqual(m._ioctl(17, 0x1234, pointer), 0)
+        self.assertEqual(syscall.call_count, 3)
+        numbers = [arguments.args[0].value for arguments in syscall.call_args_list]
+        self.assertEqual(numbers, [m.SYS_PRCTL, m.SYS_SECCOMP, m.SYS_IOCTL])
+        self.assertEqual([argument.value for argument in syscall.call_args_list[0].args[1:]],
+                         [38, 1, 0, 0, 0])
+        self.assertEqual([argument.value for argument in syscall.call_args_list[1].args[1:3]],
+                         [2, 0])
+        self.assertEqual([argument.value for argument in syscall.call_args_list[2].args[1:3]],
+                         [17, 0x1234])
+        self.assertEqual(syscall.argtypes, [ctypes.c_long])
+        self.assertIs(syscall.restype, ctypes.c_long)
+
+    @contextlib.contextmanager
+    def valid_runtime(self):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(m, "sys_platform", return_value="linux"))
+            stack.enter_context(patch.object(m.platform, "machine", return_value="x86_64"))
+            stack.enter_context(patch.object(m.platform, "python_implementation",
+                                             return_value="CPython"))
+            stack.enter_context(patch.object(m, "python_version", return_value=(3, 12)))
+            stack.enter_context(patch.object(m, "no_site", return_value=True))
+            stack.enter_context(patch.object(m, "dont_write_bytecode", return_value=True))
+            stack.enter_context(patch.object(m.os, "getresuid", return_value=(0, 0, 0),
+                                             create=True))
+            stack.enter_context(patch.object(m.os, "getresgid", return_value=(0, 0, 0),
+                                             create=True))
+            stack.enter_context(patch.object(m.threading, "current_thread",
+                                             return_value=threading.main_thread()))
+            stack.enter_context(patch.object(m.threading, "active_count", return_value=1))
+            stack.enter_context(patch.object(m, "loaded_modules",
+                                             return_value={"sys": object()}))
+            yield
+
+    def test_runtime_accepts_only_fixed_linux_root_single_thread_contract(self):
+        with self.valid_runtime():
+            self.assertIsNone(m._runtime())
+
+    def test_runtime_rejects_each_wrong_host_property(self):
+        variants = {
+            "platform": ("sys_platform", "darwin"),
+            "machine": ("machine", "aarch64"),
+            "implementation": ("python_implementation", "PyPy"),
+            "version": ("python_version", (3, 13)),
+            "site": ("no_site", False),
+            "bytecode": ("dont_write_bytecode", False),
+            "uid": ("getresuid", (0, 0, 1)),
+            "gid": ("getresgid", (0, 1, 0)),
+            "threads": ("active_count", 2),
+            "ml": ("loaded_modules", {"torch.nn": object()}),
+        }
+        for label, (name, bad) in variants.items():
+            owner = (m.platform if name in {"machine", "python_implementation"} else
+                     m.os if name in {"getresuid", "getresgid"} else
+                     m.threading if name == "active_count" else m)
+            with self.subTest(label=label), self.valid_runtime(), \
+                    patch.object(owner, name, return_value=bad), \
+                    self.assertRaises(m.ListenerError) as caught:
+                m._runtime()
+            self.assertEqual(caught.exception.code, "runtime_rejected")
+
+    def test_runtime_rejects_non_main_thread_and_opaque_probe_error(self):
+        with self.valid_runtime(), \
+                patch.object(m.threading, "current_thread", return_value=object()), \
+                self.assertRaises(m.ListenerError):
+            m._runtime()
+        with patch.object(m, "sys_platform", side_effect=OSError(PRIVATE)), \
+                self.assertRaises(m.ListenerError) as caught:
+            m._runtime()
+        self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def test_import_is_definition_only_without_ml_or_primary_lumi(self):
+        self.assertFalse(any(name == "lumi" or name.startswith("lumi.")
+                             or name.split(".", 1)[0] in m.ML_ROOTS for name in IMPORTED))
+
+
+class NativeHarness(unittest.TestCase):
+    def setUp(self):
+        m._PREPARE_OWNER = None
+        m._ADOPT_OWNER = None
+        m._TRANSFER_COMPLETED = False
+        m._LOCAL_LISTENER_CLOSED = False
+        m._SEAL_ATTEMPTED = False
+        m._PREPARE_FAILED = False
+        self.events = []
+        self.closed = []
+        self.runtime = self.enterContext(patch.object(
+            m, "_runtime", side_effect=lambda: self.events.append("runtime"),
+        ))
+        self.pid = self.enterContext(patch.object(m.os, "getpid", return_value=PID))
+        self.thread = self.enterContext(patch.object(m.threading, "get_ident", return_value=THREAD))
+        self.fcntl = self.enterContext(patch.object(
+            m.fcntl, "fcntl",
+            side_effect=lambda fd, operation: self.descriptor_flags(fd, operation),
+        ))
+        self.fstat = self.enterContext(patch.object(m.os, "fstat", side_effect=lambda fd: info()))
+        self.close = self.enterContext(patch.object(m.os, "close", side_effect=self.close_fd))
+        self.seccomp = self.enterContext(patch.object(m, "_seccomp", side_effect=self.seccomp_call))
+        self.prctl = self.enterContext(patch.object(m, "_prctl", side_effect=self.prctl_call))
+
+    def descriptor_flags(self, fd, operation):
+        self.assertEqual((fd, operation), (FD, m.fcntl.F_GETFD))
+        self.events.append(("fcntl", fd))
+        return m.fcntl.FD_CLOEXEC
+
+    def close_fd(self, fd):
+        self.events.append(("close", fd))
+        self.closed.append(fd)
+
+    def prctl_call(self, option, value=0):
+        self.events.append(("prctl", option, value))
+        return {m.PR_SET_NO_NEW_PRIVS: 0, m.PR_GET_NO_NEW_PRIVS: 1,
+                m.PR_GET_SECCOMP: m.SECCOMP_MODE_FILTER}[option]
+
+    def seccomp_call(self, operation, flags, pointer):
+        self.events.append(("seccomp", operation, flags))
+        if operation == m.SECCOMP_GET_ACTION_AVAIL:
+            action = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32)).contents
+            self.assertEqual(action.value, m.policy.USER_NOTIF)
+            return 0
+        if operation == m.SECCOMP_GET_NOTIF_SIZES:
+            sizes = ctypes.cast(pointer, ctypes.POINTER(m.SeccompNotifSizes)).contents
+            sizes.notification, sizes.response, sizes.data = 80, 24, 64
+            return 0
+        self.assertEqual(operation, m.SECCOMP_SET_MODE_FILTER)
+        program = ctypes.cast(pointer, ctypes.POINTER(m.SockFprog)).contents
+        observed = tuple((program.filter[index].code, program.filter[index].jt,
+                          program.filter[index].jf, program.filter[index].k)
+                         for index in range(program.length))
+        if flags == m.LISTENER_FLAGS:
+            self.assertEqual(observed, m.policy.LISTENER_FILTER)
+            return FD
+        self.assertEqual(flags, 0)
+        self.assertEqual(observed, m.policy.FILTER)
+        return 0
+
+    def assert_terminal_prepare(self):
+        transfer = Mock(return_value=m.ADOPTED)
+        with self.assertRaises(m.ListenerError) as caught:
+            m._prepare_listener_admitted_once(transfer=transfer)
+        self.assertEqual(caught.exception.code, "already_attempted")
+        transfer.assert_not_called()
+
+
+class InstallationTests(NativeHarness):
+    def test_public_entry_is_unconditionally_closed(self):
+        for options in ({}, {"approved": True}, {"native_qualified": True},
+                        {"transfer": lambda *_: m.ADOPTED}):
+            with self.subTest(options=tuple(options)), self.assertRaises(m.ListenerError) as caught:
+                m.install_write_listener(**options)
+            self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.runtime.assert_not_called()
+        self.seccomp.assert_not_called()
+
+    def test_prepare_probes_kernel_installs_listener_only_transfers_and_closes(self):
+        observed = []
+
+        def transfer(fd, identity, digest):
+            observed.append((fd, identity, digest))
+            self.events.append("transfer")
+            return m.ADOPTED
+
+        report = m._prepare_listener_admitted_once(transfer=transfer)
+        self.assertEqual(observed, [(FD, IDENTITY, m.policy.LISTENER_FILTER_SHA256)])
+        self.assertEqual(self.events, ["runtime",
+            ("seccomp", m.SECCOMP_GET_ACTION_AVAIL, 0),
+            ("seccomp", m.SECCOMP_GET_NOTIF_SIZES, 0),
+            ("prctl", m.PR_SET_NO_NEW_PRIVS, 1),
+            ("prctl", m.PR_GET_NO_NEW_PRIVS, 0),
+            ("seccomp", m.SECCOMP_SET_MODE_FILTER, m.LISTENER_FLAGS),
+            ("fcntl", FD), ("prctl", m.PR_GET_SECCOMP, 0), "transfer",
+            ("fcntl", FD), ("close", FD)])
+        self.assertEqual(self.closed, [FD])
+        self.assertEqual(report["listener_flags"], 0x28)
+        self.assertTrue(report["transfer_acknowledged"])
+        self.assertTrue(report["local_listener_closed"])
+        self.assertFalse(report["final_seal_installed"])
+        self.assertTrue(all(report[key] is False for key in m.FALSE_FLAGS))
+        self.assert_terminal_prepare()
+
+    def test_prepare_runtime_is_first_and_failed_runtime_has_no_effect(self):
+        self.runtime.side_effect = m.ListenerError("runtime_rejected")
+        transfer = Mock(return_value=m.ADOPTED)
+        with self.assertRaises(m.ListenerError) as caught:
+            m._prepare_listener_admitted_once(transfer=transfer)
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+        transfer.assert_not_called()
+        self.seccomp.assert_not_called()
+        self.prctl.assert_not_called()
+        self.close.assert_not_called()
+
+    def test_kernel_probe_requires_exact_action_and_notification_sizes(self):
+        for stage in ("action_return", "action_value", "sizes_return", "sizes_value"):
+            m._PREPARE_OWNER = None
+
+            def bad(operation, flags, pointer, target=stage):
+                if operation == m.SECCOMP_GET_ACTION_AVAIL:
+                    if target == "action_value":
+                        ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint32)).contents.value = 0
+                    return 1 if target == "action_return" else 0
+                sizes = ctypes.cast(pointer, ctypes.POINTER(m.SeccompNotifSizes)).contents
+                sizes.notification, sizes.response, sizes.data = ((80, 24, 63)
+                    if target == "sizes_value" else (80, 24, 64))
+                return 1 if target == "sizes_return" else 0
+
+            self.seccomp.side_effect = bad
+            with self.subTest(stage=stage), self.assertRaises(m.ListenerError) as caught:
+                m._prepare_listener_admitted_once(transfer=Mock(return_value=m.ADOPTED))
+            self.assertEqual(caught.exception.code, "abi_rejected")
+            self.prctl.assert_not_called()
+            self.close.assert_not_called()
+            self.seccomp.reset_mock()
+
+    def test_missing_cloexec_rejects_and_closes_once_without_transfer(self):
+        self.fcntl.side_effect = lambda _fd, _op: 0
+        transfer = Mock(return_value=m.ADOPTED)
+        with self.assertRaises(m.ListenerError) as caught:
+            m._prepare_listener_admitted_once(transfer=transfer)
+        self.assertEqual(caught.exception.code, "listener_rejected")
+        transfer.assert_not_called()
+        self.assertEqual(self.closed, [FD])
+        self.assert_terminal_prepare()
+
+    def test_transfer_must_return_exact_ack_and_never_retries(self):
+        for result in (None, True, bytearray(m.ADOPTED), m.ADOPTED + b"x"):
+            m._PREPARE_OWNER = None
+            m._TRANSFER_COMPLETED = m._LOCAL_LISTENER_CLOSED = False
+            self.closed.clear()
+            transfer = Mock(return_value=result)
+            with self.subTest(result=type(result)), self.assertRaises(m.ListenerError) as caught:
+                m._prepare_listener_admitted_once(transfer=transfer)
+            self.assertEqual(caught.exception.code, "transfer_rejected")
+            transfer.assert_called_once()
+            self.assertEqual(self.closed, [FD])
+
+    def test_transfer_exception_is_opaque_and_listener_closes_once(self):
+        transfer = Mock(side_effect=OSError(PRIVATE))
+        with self.assertRaises(m.ListenerError) as caught:
+            m._prepare_listener_admitted_once(transfer=transfer)
+        self.assertEqual(caught.exception.code, "transfer_rejected")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertEqual(self.closed, [FD])
+        self.assert_terminal_prepare()
+
+    def test_transfer_mutating_descriptor_never_closes_reused_number(self):
+        changed = False
+
+        def changed_info(_fd):
+            return info(inode=99 if changed else 11)
+
+        self.fstat.side_effect = changed_info
+        for behavior in ("wrong_ack", "exception"):
+            m._PREPARE_OWNER = None
+            m._PREPARE_FAILED = False
+            self.closed.clear()
+            changed = False
+
+            def transfer(*_arguments, selected=behavior):
+                nonlocal changed
+                changed = True
+                if selected == "exception":
+                    raise OSError(PRIVATE)
+                return b"WRONG"
+
+            with self.subTest(behavior=behavior), self.assertRaises(m.ListenerError):
+                m._prepare_listener_admitted_once(transfer=transfer)
+            self.assertEqual(self.closed, [])
+
+    def test_duplicate_prepare_after_success_poison_seal(self):
+        m._prepare_listener_admitted_once(transfer=Mock(return_value=m.ADOPTED))
+        with self.assertRaises(m.ListenerError) as caught:
+            m._prepare_listener_admitted_once(transfer=Mock(return_value=m.ADOPTED))
+        self.assertEqual(caught.exception.code, "already_attempted")
+        with self.assertRaises(m.ListenerError) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "seal_rejected")
+
+    def test_ambiguous_close_after_ack_is_terminal_and_not_retried(self):
+        self.close.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ListenerError) as caught:
+            m._prepare_listener_admitted_once(transfer=Mock(return_value=m.ADOPTED))
+        self.assertEqual(caught.exception.code, "close_failed")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.close.assert_called_once_with(FD)
+        self.assertFalse(m._LOCAL_LISTENER_CLOSED)
+        self.assert_terminal_prepare()
+
+    def test_final_seal_requires_same_owner_completed_transfer_and_local_close(self):
+        for state in ((None, False, False), ((PID, THREAD), False, True),
+                      ((PID, THREAD), True, False), ((PID + 1, THREAD), True, True)):
+            m._PREPARE_OWNER, m._TRANSFER_COMPLETED, m._LOCAL_LISTENER_CLOSED = state
+            with self.subTest(state=state), self.assertRaises(m.ListenerError) as caught:
+                m._seal_admitted_once()
+            self.assertEqual(caught.exception.code, "seal_rejected")
+        self.seccomp.assert_not_called()
+
+    def test_final_seal_uses_flags_zero_and_reads_back_before_and_after(self):
+        m._prepare_listener_admitted_once(transfer=Mock(return_value=m.ADOPTED))
+        self.events.clear()
+        report = m._seal_admitted_once()
+        self.assertEqual(self.events, ["runtime",
+            ("seccomp", m.SECCOMP_GET_ACTION_AVAIL, 0),
+            ("seccomp", m.SECCOMP_GET_NOTIF_SIZES, 0),
+            ("prctl", m.PR_GET_NO_NEW_PRIVS, 0),
+            ("prctl", m.PR_GET_SECCOMP, 0),
+            ("seccomp", m.SECCOMP_SET_MODE_FILTER, 0),
+            ("prctl", m.PR_GET_NO_NEW_PRIVS, 0),
+            ("prctl", m.PR_GET_SECCOMP, 0)])
+        self.assertTrue(report["final_seal_installed"])
+        self.assertEqual(report["filter_sha256"], m.policy.FILTER_SHA256)
+        with self.assertRaises(m.ListenerError) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+
+    def test_failed_started_seal_is_terminal_without_retry(self):
+        m._prepare_listener_admitted_once(transfer=Mock(return_value=m.ADOPTED))
+        original = self.seccomp.side_effect
+
+        def fail_filter(operation, flags, pointer):
+            result = original(operation, flags, pointer)
+            return -1 if operation == m.SECCOMP_SET_MODE_FILTER else result
+
+        self.seccomp.side_effect = fail_filter
+        with self.assertRaises(m.ListenerError) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "installation_failed")
+        with self.assertRaises(m.ListenerError) as caught:
+            m._seal_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+
+
+class AdoptionFailureTests(NativeHarness):
+    def test_failed_adoption_consumes_owner_and_closes_transferred_fd_once(self):
+        with patch.object(m, "_kernel_readback",
+                          side_effect=m.ListenerError("abi_rejected")) as readback:
+            with self.assertRaises(m.ListenerError) as caught:
+                m._adopt_listener_admitted_once(FD)
+        self.assertEqual(caught.exception.code, "abi_rejected")
+        self.assertEqual(m._ADOPT_OWNER, (PID, THREAD))
+        readback.assert_called_once_with()
+        self.close.assert_called_once_with(FD)
+
+        m._ADOPT_OWNER = None
+        self.close.reset_mock()
+        self.close.side_effect = OSError(PRIVATE)
+        with patch.object(m, "_kernel_readback",
+                          side_effect=m.ListenerError("abi_rejected")) as readback:
+            with self.assertRaises(m.ListenerError) as caught:
+                m._adopt_listener_admitted_once(FD)
+        self.assertEqual(caught.exception.code, "close_failed")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        readback.assert_called_once_with()
+        self.close.assert_called_once_with(FD)
+
+
+class ListenerTests(NativeHarness):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(patch.object(m, "_kernel_readback"))
+        self.ioctl_events = []
+        self.ioctl = self.enterContext(patch.object(m, "_ioctl", side_effect=self.ioctl_call))
+        self.listener = m._adopt_listener_admitted_once(FD)
+        self.events.clear()
+
+    def ioctl_call(self, fd, command, pointer):
+        self.assertEqual(fd, FD)
+        if command == m.SECCOMP_IOCTL_NOTIF_RECV:
+            self.assertEqual(ctypes.string_at(pointer, 80), b"\0" * 80)
+            ctypes.memmove(pointer, NOTIFICATION, 80)
+            value = NOTIFICATION
+        elif command == m.SECCOMP_IOCTL_NOTIF_ID_VALID:
+            value = ctypes.cast(pointer, ctypes.POINTER(ctypes.c_uint64)).contents.value
+        elif command == m.SECCOMP_IOCTL_NOTIF_SEND:
+            value = ctypes.string_at(pointer, 24)
+        else:
+            self.fail(f"unexpected ioctl {command}")
+        self.ioctl_events.append((command, value))
+        return 0
+
+    def test_adoption_is_runtime_first_cloexec_and_process_global_one_shot(self):
+        self.assertEqual(self.runtime.call_count, 1)
+        self.assertEqual(m._ADOPT_OWNER, (PID, THREAD))
+        with self.assertRaises(m.ListenerError) as caught:
+            m._adopt_listener_admitted_once(FD)
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertEqual(self.runtime.call_count, 2)
+
+    def test_receive_validate_send_exact_frames_and_aggregate_snapshot(self):
+        self.assertEqual(self.listener.receive_admitted_once(), NOTIFICATION)
+        self.assertIs(self.listener.id_valid(41), True)
+        self.assertIsNone(self.listener.send_response(RESPONSE))
+        self.assertEqual(self.ioctl_events, [
+            (m.SECCOMP_IOCTL_NOTIF_RECV, NOTIFICATION),
+            (m.SECCOMP_IOCTL_NOTIF_ID_VALID, 41),
+            (m.SECCOMP_IOCTL_NOTIF_SEND, RESPONSE),
+        ])
+        report = self.listener.snapshot()
+        self.assertEqual({key: report[key] for key in (
+            "notifications_received", "ids_validated", "responses_continued",
+            "outstanding_notification", "terminal_failed", "listener_closed")},
+            {"notifications_received": 1, "ids_validated": 1, "responses_continued": 1,
+             "outstanding_notification": False, "terminal_failed": False,
+             "listener_closed": False})
+        self.assertTrue(all(report[key] is False for key in m.FALSE_FLAGS))
+        self.assertNotIn("id", report)
+        self.assertNotIn("pid", report)
+
+    def test_receive_rejects_second_outstanding_notification_without_ioctl_retry(self):
+        self.listener.receive_admitted_once()
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.receive_admitted_once()
+        self.assertEqual(caught.exception.code, "notification_rejected")
+        self.assertEqual([event[0] for event in self.ioctl_events],
+                         [m.SECCOMP_IOCTL_NOTIF_RECV])
+        self.assertTrue(self.listener.snapshot()["terminal_failed"])
+
+    def test_id_validation_requires_exact_outstanding_id_once(self):
+        for value in (None, True, -1, 40, 42, 2**64):
+            m._ADOPT_OWNER = None
+            listener = m._adopt_listener_admitted_once(FD)
+            listener.receive_admitted_once()
+            before = len(self.ioctl_events)
+            with self.subTest(value=value), self.assertRaises(m.ListenerError) as caught:
+                listener.id_valid(value)
+            self.assertEqual(caught.exception.code, "notification_invalid")
+            self.assertEqual(len(self.ioctl_events), before)
+
+    def test_id_validation_cannot_be_retried_for_same_notification(self):
+        self.listener.receive_admitted_once()
+        self.listener.id_valid(41)
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.id_valid(41)
+        self.assertEqual(caught.exception.code, "notification_invalid")
+        self.assertEqual([event[0] for event in self.ioctl_events].count(
+            m.SECCOMP_IOCTL_NOTIF_ID_VALID), 1)
+
+    def test_response_requires_prior_successful_id_validation(self):
+        self.listener.receive_admitted_once()
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.send_response(RESPONSE)
+        self.assertEqual(caught.exception.code, "response_rejected")
+        self.assertFalse(any(event[0] == m.SECCOMP_IOCTL_NOTIF_SEND
+                             for event in self.ioctl_events))
+
+    def test_response_requires_exact_immutable_24_byte_continue_frame(self):
+        variants = (None, bytearray(RESPONSE), RESPONSE[:-1], RESPONSE + b"x",
+                    m.broker.RESPONSE.pack(40, 0, 0, 1),
+                    m.broker.RESPONSE.pack(41, 1, 0, 1),
+                    m.broker.RESPONSE.pack(41, 0, -1, 1),
+                    m.broker.RESPONSE.pack(41, 0, 0, 0))
+        for raw in variants:
+            m._ADOPT_OWNER = None
+            listener = m._adopt_listener_admitted_once(FD)
+            listener.receive_admitted_once()
+            listener.id_valid(41)
+            before = len(self.ioctl_events)
+            with self.subTest(raw=type(raw)), self.assertRaises(m.ListenerError) as caught:
+                listener.send_response(raw)
+            self.assertEqual(caught.exception.code, "response_rejected")
+            self.assertEqual(len(self.ioctl_events), before)
+
+    def test_each_ioctl_failure_is_terminal_opaque_and_never_retried(self):
+        for operation in ("receive", "validate", "send"):
+            m._ADOPT_OWNER = None
+            listener = m._adopt_listener_admitted_once(FD)
+            original = self.ioctl.side_effect
+            target = {"receive": m.SECCOMP_IOCTL_NOTIF_RECV,
+                      "validate": m.SECCOMP_IOCTL_NOTIF_ID_VALID,
+                      "send": m.SECCOMP_IOCTL_NOTIF_SEND}[operation]
+
+            def fail(fd, command, pointer, expected=target, delegate=original):
+                if command == expected:
+                    raise OSError(PRIVATE)
+                return delegate(fd, command, pointer)
+
+            self.ioctl.side_effect = fail
+            if operation != "receive":
+                listener.receive_admitted_once()
+            if operation == "send":
+                listener.id_valid(41)
+            action = (listener.receive_admitted_once if operation == "receive" else
+                      (lambda: listener.id_valid(41)) if operation == "validate" else
+                      (lambda: listener.send_response(RESPONSE)))
+            with self.subTest(operation=operation), self.assertRaises(m.ListenerError) as caught:
+                action()
+            self.assertNotIn(PRIVATE, str(caught.exception))
+            calls_before = self.ioctl.call_count
+            with self.assertRaises(m.ListenerError):
+                action()
+            self.assertEqual(self.ioctl.call_count, calls_before)
+            self.ioctl.side_effect = original
+
+    def test_nonzero_ioctl_return_is_terminal(self):
+        original = self.ioctl.side_effect
+        self.ioctl.side_effect = lambda fd, command, pointer: (
+            1 if command == m.SECCOMP_IOCTL_NOTIF_RECV else original(fd, command, pointer))
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.receive_admitted_once()
+        self.assertEqual(caught.exception.code, "notification_rejected")
+        self.assertTrue(self.listener.snapshot()["terminal_failed"])
+
+    def test_descriptor_identity_change_is_terminal_before_ioctl(self):
+        self.fstat.side_effect = lambda _fd: info(inode=99)
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.receive_admitted_once()
+        self.assertEqual(caught.exception.code, "listener_rejected")
+        self.ioctl.assert_not_called()
+        self.assertTrue(self.listener.snapshot()["terminal_failed"])
+
+    def test_pid_and_thread_owner_changes_are_terminal_before_ioctl(self):
+        for target in (self.pid, self.thread):
+            m._ADOPT_OWNER = None
+            target.return_value += 1
+            listener = self.listener
+            with self.subTest(target=target), self.assertRaises(m.ListenerError) as caught:
+                listener.receive_admitted_once()
+            self.assertEqual(caught.exception.code, "owner_mismatch")
+            target.return_value -= 1
+            self.assertTrue(listener.snapshot()["terminal_failed"])
+            self.listener = m._adopt_listener_admitted_once(FD)
+
+    def test_lock_reentry_terminally_taints_without_ioctl(self):
+        self.assertTrue(self.listener._lock.acquire(blocking=False))
+        try:
+            with self.assertRaises(m.ListenerError) as caught:
+                self.listener.receive_admitted_once()
+            self.assertEqual(caught.exception.code, "reentry")
+        finally:
+            self.listener._lock.release()
+        self.ioctl.assert_not_called()
+        self.assertTrue(self.listener.snapshot()["terminal_failed"])
+
+    def test_swallowed_reentry_during_receive_still_fails_outer_operation(self):
+        original = self.ioctl.side_effect
+
+        def recurse(fd, command, pointer):
+            if command == m.SECCOMP_IOCTL_NOTIF_RECV:
+                with self.assertRaises(m.ListenerError):
+                    self.listener.receive_admitted_once()
+            return original(fd, command, pointer)
+
+        self.ioctl.side_effect = recurse
+        with self.assertRaises(m.ListenerError):
+            self.listener.receive_admitted_once()
+        self.assertTrue(self.listener.snapshot()["terminal_failed"])
+
+    def test_close_checks_identity_closes_once_and_returns_closed_snapshot(self):
+        report = self.listener.close_admitted_once()
+        self.assertEqual(self.closed, [FD])
+        self.assertTrue(report["listener_closed"])
+        self.assertFalse(report["terminal_failed"])
+        with self.assertRaises(m.ListenerError):
+            self.listener.close_admitted_once()
+        self.assertEqual(self.closed, [FD])
+
+    def test_close_ambiguity_consumes_ownership_and_is_not_retried(self):
+        self.close.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.close_admitted_once()
+        self.assertEqual(caught.exception.code, "close_failed")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.close.assert_called_once_with(FD)
+        report = self.listener.snapshot()
+        self.assertTrue(report["listener_closed"])
+        self.assertTrue(report["terminal_failed"])
+        with self.assertRaises(m.ListenerError):
+            self.listener.close_admitted_once()
+        self.close.assert_called_once_with(FD)
+
+    def test_close_identity_mismatch_never_closes_recycled_descriptor(self):
+        self.fstat.side_effect = lambda _fd: info(inode=99)
+        with self.assertRaises(m.ListenerError) as caught:
+            self.listener.close_admitted_once()
+        self.assertEqual(caught.exception.code, "listener_rejected")
+        self.close.assert_not_called()
+        self.assertTrue(self.listener.snapshot()["listener_closed"])
+        self.assertTrue(self.listener.snapshot()["terminal_failed"])
+
+
+if __name__ == "__main__":
+    unittest.main()

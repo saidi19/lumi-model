@@ -1,0 +1,129 @@
+"""Rebind attempt-018 controls to the byte-count-closed v0.4 source."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_controls_v3 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "ead69dcac8b7e2bbb79308b074bd72ea282608b74eaa590161d5b083afc5beb2"
+ATTEMPT = previous.ATTEMPT
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.4"
+RELEASE_SHA = "29b71cbaf944c97867bc8466e19aa8ff3e89834ec12641ff0744f651b70d9bfb"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-018-source-v0.4-verification-v0.1.json"
+SOURCE_PROOF_SHA = "51e9601a927d7e183e2c8006c625e8435e592bcf93905f3eb7288945532f8150"
+FAILURE = "evidence/lumi-vm-attempt-018-source-v0.3-authentication-failure-v0.1.json"
+FAILURE_SHA = "8d6de31036d320ca2d4e588981450596f08a361b6a77ee7d321fd7dcfdbf2543"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.4"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_control_plan_v4_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    path = Path(name)
+    need(not path.is_absolute() and ".." not in path.parts)
+    path = ROOT / path
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    plan = previous.build()
+    release = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    source = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    need(
+        release["attempt"] == source["attempt"] == failure["attempt"] == ATTEMPT
+        and release["source_versions_bound"] is True
+        and release["versioned_object_count"] == 22
+        and release["iam_source_action"] == "s3:GetObjectVersion"
+        and release["repair"] == "propagate_sha256_and_byte_count_bindings"
+        and source["status"] == "offline_source_repair_and_authentication_verified"
+        and source["source_release_sha256"] == RELEASE_SHA
+        and source["outer_source_authentication_verified"] is True
+        and failure["cloud_calls"] == failure["cloud_mutations"] == 0
+    )
+    for name, pin in release["outputs"].items():
+        raw = read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    plan["schema"] = "lumi.vm-attempt-018-control-plan.v0.4"
+    plan["status"] = "source_authentication_repaired_preflight_required"
+    plan["release_manifest_sha256"] = RELEASE_SHA
+    plan["source_preparation_evidence"] = {"path": SOURCE_PROOF, "sha256": SOURCE_PROOF_SHA}
+    plan["v03_authentication_failure_evidence"] = {"path": FAILURE, "sha256": FAILURE_SHA}
+    plan["source_bindings"] = {
+        RELEASE + "/" + name: release["outputs"][name] for name in previous.BINDINGS
+    }
+    plan["source_repair"].update(
+        sha256_and_byte_count_closure=True,
+        outer_source_authentication_verified=True,
+        failed_v03_preserved=True,
+    )
+    plan["readiness_review"]["confirmed_defect"] = (
+        "v0.3 propagated content hashes but retained stale byte counts in composed source "
+        "manifests; v0.4 closes both SHA-256 and byte-count bindings and passes the full "
+        "outer source authentication path offline."
+    )
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-018-control-plan-release.v0.4",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": RELEASE_SHA,
+        "source_verification_sha256": SOURCE_PROOF_SHA,
+        "v03_authentication_failure_sha256": FAILURE_SHA,
+        "sha256_and_byte_count_closure": True,
+        "outer_source_authentication_verified": True,
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

@@ -1,0 +1,258 @@
+"""Synthetic checks for the exact attempt-019 endpoint cleanup."""
+
+import copy
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from scripts import cleanup_sft_vm_attempt019_endpoint_v1 as m
+
+ENDPOINT_ENI = "eni-" + "1" * 17
+VM_ENI = "eni-" + "2" * 17
+
+
+def tags(nonce=False):
+    result = [{"Key": "LumiAttempt", "Value": m.ATTEMPT}]
+    if nonce:
+        result.append({"Key": "LumiNetworkNonce", "Value": m.NONCE})
+    return result
+
+
+def fixture():
+    return {
+        "get-caller-identity": {"Account": m.ACCOUNT},
+        "describe-instances": {
+            "Reservations": [
+                {
+                    "OwnerId": m.ACCOUNT,
+                    "Instances": [
+                        {
+                            "InstanceId": m.VM,
+                            "State": {"Name": "stopped"},
+                            "VpcId": m.VPC,
+                            "SubnetId": m.SUBNET,
+                            "ClientToken": m.ATTEMPT,
+                            "InstanceType": "r6i.4xlarge",
+                            "Tags": tags(),
+                            "NetworkInterfaces": [{"NetworkInterfaceId": VM_ENI}],
+                            "SecurityGroups": [{"GroupId": m.VM_GROUP}],
+                            "BlockDeviceMappings": [
+                                {"Ebs": {"VolumeId": volume, "DeleteOnTermination": False}}
+                                for volume in m.VOLUMES
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        "describe-volumes": {
+            "Volumes": [
+                {
+                    "VolumeId": volume,
+                    "State": "in-use",
+                    "Tags": tags(),
+                    "Encrypted": True,
+                    "Attachments": [{"InstanceId": m.VM}],
+                }
+                for volume in m.VOLUMES
+            ]
+        },
+        "describe-subnets": {
+            "Subnets": [
+                {
+                    "SubnetId": m.SUBNET,
+                    "VpcId": m.VPC,
+                    "OwnerId": m.ACCOUNT,
+                    "CidrBlock": m.CIDR,
+                    "Tags": tags(True),
+                }
+            ]
+        },
+        "describe-route-tables": {
+            "RouteTables": [
+                {
+                    "RouteTableId": m.TABLE,
+                    "VpcId": m.VPC,
+                    "OwnerId": m.ACCOUNT,
+                    "Tags": tags(True),
+                    "Associations": [{"SubnetId": m.SUBNET, "Main": False}],
+                    "Routes": [],
+                }
+            ]
+        },
+        "describe-security-groups": {
+            "SecurityGroups": [
+                {
+                    "GroupId": group,
+                    "OwnerId": m.ACCOUNT,
+                    "VpcId": m.VPC,
+                    "Tags": tags(),
+                }
+                for group in (m.ENDPOINT_GROUP, m.VM_GROUP)
+            ]
+        },
+        "describe-key-pairs": {
+            "KeyPairs": [
+                {"KeyName": m.KEY, "KeyPairId": "key-" + "3" * 17, "Tags": tags()}
+            ]
+        },
+        "describe-instance-connect-endpoints": {
+            "InstanceConnectEndpoints": [
+                {
+                    "InstanceConnectEndpointId": m.ENDPOINT,
+                    "State": "create-complete",
+                    "OwnerId": m.ACCOUNT,
+                    "VpcId": m.VPC,
+                    "SubnetId": m.SUBNET,
+                    "Tags": tags(),
+                    "NetworkInterfaceIds": [ENDPOINT_ENI],
+                    "SecurityGroupIds": [m.ENDPOINT_GROUP],
+                    "PreserveClientIp": False,
+                }
+            ]
+        },
+        "describe-network-interfaces": {
+            "NetworkInterfaces": [
+                {
+                    "NetworkInterfaceId": ENDPOINT_ENI,
+                    "OwnerId": m.ACCOUNT,
+                    "SubnetId": m.SUBNET,
+                    "VpcId": m.VPC,
+                    "InterfaceType": "ec2_instance_connect_endpoint",
+                },
+                {
+                    "NetworkInterfaceId": VM_ENI,
+                    "OwnerId": m.ACCOUNT,
+                    "SubnetId": m.SUBNET,
+                    "VpcId": m.VPC,
+                    "Attachment": {"InstanceId": m.VM},
+                },
+            ]
+        },
+    }
+
+
+class Fake:
+    def __init__(self):
+        self.data, self.ops = fixture(), []
+        self.save = lambda *args: None
+
+    def call(self, operation):
+        self.ops.append(operation)
+        if operation == m.DELETE:
+            self.data["describe-instance-connect-endpoints"]["InstanceConnectEndpoints"] = []
+            self.data["describe-network-interfaces"]["NetworkInterfaces"].pop(0)
+            return {}
+        return copy.deepcopy(self.data[operation])
+
+
+class Tests(unittest.TestCase):
+    def test_local_bindings_and_authorization(self):
+        m.local()
+
+    def test_success_one_delete_and_every_preservation_rechecked(self):
+        cloud = Fake()
+        self.assertTrue(m.Cleanup(cloud).run()["cleanup_verified"])
+        self.assertEqual(cloud.ops.count(m.DELETE), 1)
+        for operation in (
+            "describe-instances",
+            "describe-volumes",
+            "describe-subnets",
+            "describe-route-tables",
+            "describe-security-groups",
+            "describe-key-pairs",
+        ):
+            self.assertEqual(cloud.ops.count(operation), 2)
+
+    def test_wrong_identity_state_or_owned_resource_blocks_delete(self):
+        variants = ("identity", "running", "volume", "group", "key", "endpoint")
+        for variant in variants:
+            cloud = Fake()
+            if variant == "identity":
+                cloud.data["get-caller-identity"]["Account"] = "wrong"
+            elif variant == "running":
+                cloud.data["describe-instances"]["Reservations"][0]["Instances"][0]["State"][
+                    "Name"
+                ] = "running"
+            elif variant == "volume":
+                cloud.data["describe-volumes"]["Volumes"][0]["Encrypted"] = False
+            elif variant == "group":
+                cloud.data["describe-security-groups"]["SecurityGroups"][0]["Tags"] = []
+            elif variant == "key":
+                cloud.data["describe-key-pairs"]["KeyPairs"][0]["Tags"] = []
+            else:
+                cloud.data["describe-instance-connect-endpoints"][
+                    "InstanceConnectEndpoints"
+                ][0]["Tags"] = []
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                m.Cleanup(cloud).run()
+            self.assertNotIn(m.DELETE, cloud.ops)
+
+    def test_unknown_interface_or_changed_route_blocks_delete(self):
+        for variant in ("interface", "route"):
+            cloud = Fake()
+            if variant == "interface":
+                cloud.data["describe-network-interfaces"]["NetworkInterfaces"][0][
+                    "NetworkInterfaceId"
+                ] = "eni-" + "4" * 17
+            else:
+                cloud.data["describe-route-tables"]["RouteTables"][0]["Routes"] = [
+                    {"DestinationCidrBlock": "0.0.0.0/0"}
+                ]
+            with self.subTest(variant=variant), self.assertRaises(ValueError):
+                m.Cleanup(cloud).run()
+            self.assertNotIn(m.DELETE, cloud.ops)
+
+    def test_already_absent_does_not_mutate_and_rechecks_preservation(self):
+        cloud = Fake()
+        cloud.call(m.DELETE)
+        cloud.ops.clear()
+        result = m.Cleanup(cloud).run()
+        self.assertEqual(result["status"], "already_absent_no_mutation")
+        self.assertNotIn(m.DELETE, cloud.ops)
+        self.assertEqual(cloud.ops.count("describe-instances"), 2)
+
+    def test_transport_is_single_dispatch_and_only_exact_endpoint(self):
+        cloud = m.Cloud(lambda *args: None, clock=lambda: 0)
+        with patch.object(
+            m.subprocess,
+            "run",
+            return_value=SimpleNamespace(stdout=b"{}", stderr=b"", returncode=0),
+        ) as call:
+            cloud.call(m.DELETE)
+            arguments = call.call_args.args[0]
+            self.assertEqual(
+                json.loads(arguments[arguments.index("--cli-input-json") + 1]),
+                {"InstanceConnectEndpointId": m.ENDPOINT},
+            )
+            self.assertEqual(call.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+            for operation in (m.DELETE, "terminate-instances", "delete-subnet", "get-object"):
+                with self.assertRaises(ValueError):
+                    cloud.call(operation)
+            self.assertEqual(call.call_count, 1)
+
+    def test_timeout_consumes_dispatch_and_prevents_retry(self):
+        cloud = m.Cloud(lambda *args: None, clock=lambda: 0)
+        with patch.object(m.subprocess, "run", side_effect=TimeoutError("SECRET")) as call:
+            with self.assertRaises(TimeoutError):
+                cloud.call(m.DELETE)
+            with self.assertRaises(ValueError):
+                cloud.call(m.DELETE)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(cloud.writes, 1)
+
+    def test_read_and_deadline_budgets_fail_closed(self):
+        now = [0]
+        cloud = m.Cloud(lambda *args: None, clock=lambda: now[0])
+        cloud.reads = m.MAX_READS
+        with self.assertRaises(ValueError):
+            cloud.call("get-caller-identity")
+        now[0] = m.MAX_SECONDS - 35
+        with self.assertRaises(ValueError):
+            cloud.call(m.DELETE)
+        self.assertEqual(cloud.writes, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

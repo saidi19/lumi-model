@@ -1,0 +1,629 @@
+"""Corrected process-role candidate; production and private launch are closed.
+
+Only the worker enters the workload leaf. A blocking broker in that leaf would
+prevent guardian-v2 from observing natural workload completion. Broker resource
+limits must be independently admitted before the launcher can be reopened.
+Child role transitions prune ambient descriptors and verify the resulting set.
+Inherited descriptor-close attempts are consumed before the syscall.
+
+This successor preserves v1 evidence but retracts its implied native safety:
+fork-before-pidfd-binding has no child start gate, and controller-first guardian
+termination is not a proved workload cleanup path. The private compositor now
+rejects before any native operation. Role helpers remain synthetic candidates;
+fixed producers, start gates and cleanup handoff must be integrated together.
+No native process, private payload, remote action or training is authorized.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import re
+import threading
+import time
+
+from . import posttraining_checkpoint_write_authority_v2 as authority
+from . import posttraining_checkpoint_write_child_v1 as child
+from . import posttraining_checkpoint_write_topology_v1 as topology
+from . import posttraining_sft_cgroup_v1 as cgroup
+from . import posttraining_checkpoint_guard_bootstrap_v3 as descriptors
+
+SCHEMA = "lumi.checkpoint-write-process.v0.2"
+MAXIMUM_NS = 3590 * 1_000_000_000
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "already_attempted", "owner_mismatch", "reentry", "already_failed",
+    "fork_failed", "topology_failed", "child_binding_failed",
+    "cgroup_failed", "descriptor_changed", "role_runtime_unbound",
+    "cleanup_unconfirmed",
+})
+FALSE_FLAGS = (
+    "role_runtime_bound", "controller_event_loop_verified",
+    "endpoint_peer_authenticated", "endpoint_exclusivity_verified",
+    "parent_received_ready", "guardian_armed_after_ready",
+    "parent_received_consumed", "ledger_exchanged",
+    "native_write_continuations_verified",
+    "native_cumulative_write_enforcement_verified",
+    "bootstrap_integration_verified", "native_fork_qualified",
+    "execution_permitted", "real_4b_import", "gate_5_complete",
+    "training_authorized", "production_eligible", "retry_allowed",
+)
+_ATTEMPTED = False
+
+
+class ProcessCompositionError(ValueError):
+    def __init__(self, code="fork_failed"):
+        self.code = (
+            code if type(code) is str and code in ERROR_CODES
+            else "fork_failed"
+        )
+        super().__init__(self.code)
+
+
+def _need(condition, code="fork_failed"):
+    if not condition:
+        raise ProcessCompositionError(code) from None
+
+
+def compose_write_processes(**_arguments):
+    """No descriptor, limit, deadline, approval or receipt opens this path."""
+    raise ProcessCompositionError("host_guard_not_bound") from None
+
+
+def _runtime():
+    try:
+        topology._runtime()
+        child._runtime()
+        cgroup._runtime()
+        _need(hasattr(os, "fork") and hasattr(os, "_exit")
+              and hasattr(fcntl, "F_DUPFD_CLOEXEC"), "runtime_rejected")
+    except BaseException:
+        raise ProcessCompositionError("runtime_rejected") from None
+
+
+def _fixed_error(error, fallback):
+    if type(error) is ProcessCompositionError:
+        return error.code
+    return fallback
+
+
+def _owned_pidfd(owner):
+    _need(type(owner) is child._ChildOwner, "child_binding_failed")
+    acquired = False
+    try:
+        acquired = owner._enter(allow_failed=True)
+        _need(not owner._reaped and owner._fd is not None,
+              "child_binding_failed")
+        return owner._fd
+    except BaseException:
+        raise ProcessCompositionError("child_binding_failed") from None
+    finally:
+        if acquired:
+            owner._lock.release()
+
+
+def _duplicate_child_pidfd(owner):
+    """Create one independent CLOEXEC pidfd copy for another fixed component."""
+    original = duplicate = None
+    identity = None
+    acquired = False
+    try:
+        _need(type(owner) is child._ChildOwner, "child_binding_failed")
+        acquired = owner._enter(allow_failed=True)
+        _need(not owner._reaped and owner._fd is not None,
+              "child_binding_failed")
+        original, identity = owner._fd, owner._identity
+        duplicate = fcntl.fcntl(original, fcntl.F_DUPFD_CLOEXEC, 3)
+        _need(type(duplicate) is int and 3 <= duplicate < 2**31
+              and duplicate != original
+              and os.get_inheritable(duplicate) is False
+              and child._identity(duplicate) == identity,
+              "child_binding_failed")
+        result, duplicate = duplicate, None
+        return result
+    except BaseException:
+        if duplicate is not None:
+            closing, duplicate = duplicate, None
+            try:
+                if identity is not None:
+                    _need(child._identity(closing) == identity,
+                          "descriptor_changed")
+                os.close(closing)
+            except BaseException:
+                raise ProcessCompositionError("cleanup_unconfirmed") from None
+        raise ProcessCompositionError("child_binding_failed") from None
+    finally:
+        if acquired:
+            owner._lock.release()
+
+
+def _close_pidfd_duplicate(fd, identity):
+    try:
+        _need(type(fd) is int and child._identity(fd) == identity,
+              "descriptor_changed")
+        os.close(fd)
+    except BaseException:
+        raise ProcessCompositionError("cleanup_unconfirmed") from None
+
+
+def _close_parent_descriptor(fd, identity):
+    try:
+        _need(type(fd) is int and cgroup._directory(fd) == identity,
+              "descriptor_changed")
+        os.close(fd)
+    except BaseException:
+        raise ProcessCompositionError("cleanup_unconfirmed") from None
+
+
+def _close_group_descriptor(fd, identity):
+    try:
+        _need(type(fd) is int and cgroup._directory(fd) == identity,
+              "descriptor_changed")
+        os.close(fd)
+    except BaseException:
+        raise ProcessCompositionError("cleanup_unconfirmed") from None
+
+
+def _retire_child(owner, cleanup_deadline_ns):
+    try:
+        owner.terminate_admitted_once()
+        owner.reap_admitted_once(
+            deadline_ns=cleanup_deadline_ns, require_success=False,
+        )
+        owner.close_admitted_once()
+    except BaseException:
+        raise ProcessCompositionError("cleanup_unconfirmed") from None
+
+
+def _close_inherited_pidfd_copy(owner):
+    """Run only in a later fork child; mutate and close that inherited copy."""
+    try:
+        _need(type(owner) is child._ChildOwner and owner._fd is not None
+              and owner._close_attempted is False, "child_binding_failed")
+        closing, identity = owner._fd, owner._identity
+        owner._fd = None
+        owner._close_attempted = True
+        _need(child._identity(closing) == identity, "descriptor_changed")
+        os.close(closing)
+    except BaseException:
+        raise ProcessCompositionError("cleanup_unconfirmed") from None
+
+
+class _FinalRole:
+    """One final topology copy; endpoint transfer and cleanup stay private."""
+
+    def __init__(self, value, stage):
+        _need(type(value) is topology._Topology and type(stage) is str
+              and stage in authority.FINAL_STAGES
+              and value.snapshot()["stage"] == stage,
+              "topology_failed")
+        self._topology = value
+        self._stage = stage
+        self._owner = os.getpid(), threading.get_ident()
+        self._lock = threading.Lock()
+        self._transfers = 0
+        self._cleanup_attempted = False
+        self._cleaned = False
+        self._failed = False
+
+    def _enter(self, *, cleanup=False):
+        acquired = False
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()),
+                  "owner_mismatch")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            _need(cleanup or not self._failed, "already_failed")
+            return True
+        except BaseException as error:
+            if acquired:
+                self._lock.release()
+            raise ProcessCompositionError(
+                _fixed_error(error, "topology_failed")
+            ) from None
+
+    def take_endpoint_authority_admitted_once(self, name):
+        acquired = False
+        try:
+            acquired = self._enter()
+            _need(not self._cleanup_attempted, "already_attempted")
+            result = authority._detach_admitted_once(self._topology, name)
+            self._transfers += 1
+            return result
+        except BaseException as error:
+            self._failed = True
+            raise ProcessCompositionError(
+                _fixed_error(error, "topology_failed")
+            ) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def cleanup_admitted_once(self):
+        acquired = False
+        try:
+            acquired = self._enter(cleanup=True)
+            _need(not self._cleanup_attempted, "already_attempted")
+            self._cleanup_attempted = True
+            self._topology.close_all_admitted_once()
+            self._cleaned = True
+            return self.snapshot()
+        except BaseException:
+            self._failed = True
+            raise ProcessCompositionError("cleanup_unconfirmed") from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def snapshot(self):
+        return {
+            "schema": SCHEMA,
+            "role": self._stage,
+            "final_topology_bound": True,
+            "endpoint_authorities_transferred": self._transfers,
+            "cleanup_attempted": self._cleanup_attempted,
+            "topology_cleaned": self._cleaned,
+            "terminal_failed": self._failed,
+            **dict.fromkeys(FALSE_FLAGS, False),
+        }
+
+
+class _ControllerComposition(_FinalRole):
+    def __init__(self, value, guardian_owner, cleanup_deadline_ns):
+        super().__init__(value, "controller")
+        _need(type(guardian_owner) is child._ChildOwner
+              and type(cleanup_deadline_ns) is int,
+              "child_binding_failed")
+        self._guardian = guardian_owner
+        self._cleanup_deadline_ns = cleanup_deadline_ns
+
+    def cleanup_admitted_once(self):
+        acquired = False
+        failures = 0
+        try:
+            acquired = self._enter(cleanup=True)
+            _need(not self._cleanup_attempted, "already_attempted")
+            self._cleanup_attempted = True
+            try:
+                _retire_child(self._guardian, self._cleanup_deadline_ns)
+            except BaseException:
+                failures += 1
+            try:
+                self._topology.close_all_admitted_once()
+            except BaseException:
+                failures += 1
+            self._cleaned = failures == 0
+            _need(self._cleaned, "cleanup_unconfirmed")
+            return self.snapshot()
+        except BaseException:
+            self._failed = True
+            raise ProcessCompositionError("cleanup_unconfirmed") from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+
+class _GuardianComposition(_FinalRole):
+    def __init__(self, value, lease, parent_fd, parent_identity,
+                 broker_owner, worker_owner, cleanup_deadline_ns):
+        super().__init__(value, "guardian_watch")
+        _need(type(lease) is cgroup.CgroupLease
+              and all(type(item) is child._ChildOwner
+                      for item in (broker_owner, worker_owner))
+              and type(parent_fd) is int and type(parent_identity) is tuple
+              and type(cleanup_deadline_ns) is int,
+              "arguments_rejected")
+        self._lease = lease
+        self._parent_fd = parent_fd
+        self._parent_identity = parent_identity
+        self._broker = broker_owner
+        self._worker = worker_owner
+        self._cleanup_deadline_ns = cleanup_deadline_ns
+        self._broker_duplicates = 0
+
+    def duplicate_broker_pidfd_admitted_once(self):
+        acquired = False
+        try:
+            acquired = self._enter()
+            _need(not self._cleanup_attempted and self._broker_duplicates == 0,
+                  "already_attempted")
+            result = _duplicate_child_pidfd(self._broker)
+            self._broker_duplicates = 1
+            return result
+        except BaseException as error:
+            self._failed = True
+            raise ProcessCompositionError(
+                _fixed_error(error, "child_binding_failed")
+            ) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def cleanup_admitted_once(self):
+        acquired = False
+        failures = 0
+        try:
+            acquired = self._enter(cleanup=True)
+            _need(not self._cleanup_attempted, "already_attempted")
+            self._cleanup_attempted = True
+            try:
+                self._lease.kill()
+            except BaseException:
+                failures += 1
+            for owner in (self._broker, self._worker):
+                try:
+                    _retire_child(owner, self._cleanup_deadline_ns)
+                except BaseException:
+                    failures += 1
+            try:
+                self._lease.close()
+            except BaseException:
+                failures += 1
+            try:
+                closing, self._parent_fd = self._parent_fd, None
+                _close_parent_descriptor(closing, self._parent_identity)
+            except BaseException:
+                failures += 1
+            try:
+                self._topology.close_all_admitted_once()
+            except BaseException:
+                failures += 1
+            self._cleaned = failures == 0
+            _need(self._cleaned, "cleanup_unconfirmed")
+            return self.snapshot()
+        except BaseException:
+            self._failed = True
+            raise ProcessCompositionError("cleanup_unconfirmed") from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def snapshot(self):
+        result = super().snapshot()
+        result.update({
+            "nested_children_bound": 2,
+            "broker_pidfd_duplicates_created": self._broker_duplicates,
+            "lease_owned": self._parent_fd is not None,
+        })
+        return result
+
+
+def _prune_child_descriptors(kept):
+    """Child-only: close ambient non-stdio FDs once, then read back the set."""
+    _need(type(kept) is tuple
+          and all(type(fd) is int and 3 <= fd < 2**20 for fd in kept)
+          and len(set(kept)) == len(kept),
+          "descriptor_changed")
+    try:
+        descriptors._close_except(set(kept))
+        remaining = descriptors._descriptors()
+        _need(remaining - {0, 1, 2} == set(kept), "descriptor_changed")
+    except BaseException:
+        raise ProcessCompositionError("cleanup_unconfirmed") from None
+
+
+def _role_branch_admitted_once(value, stage, parent_fd, parent_identity,
+                               group_fd, group_identity, inherited_owner=None):
+    parent_open = group_open = True
+    inherited_open = inherited_owner is not None
+    role = None
+    try:
+        value.adopt_fork_child_admitted_once()
+        _need(stage in ("broker", "worker"), "arguments_rejected")
+        if inherited_owner is not None:
+            inherited_open = False
+            _close_inherited_pidfd_copy(inherited_owner)
+        kept = value.transition_admitted_once(
+            stage, extra_keep=(parent_fd, group_fd),
+        )
+        _prune_child_descriptors(kept)
+        closing, parent_open = parent_fd, False
+        _close_parent_descriptor(closing, parent_identity)
+        if stage == "worker":
+            cgroup.enter_current_process(group_fd)
+        closing, group_open = group_fd, False
+        _close_group_descriptor(closing, group_identity)
+        role = _FinalRole(value, stage)
+        return role
+    except BaseException as error:
+        failures = 0
+        if inherited_open:
+            try:
+                _close_inherited_pidfd_copy(inherited_owner)
+            except BaseException:
+                failures += 1
+        if group_open:
+            try:
+                _close_group_descriptor(group_fd, group_identity)
+            except BaseException:
+                failures += 1
+        if parent_open:
+            try:
+                _close_parent_descriptor(parent_fd, parent_identity)
+            except BaseException:
+                failures += 1
+        try:
+            value.close_all_admitted_once()
+        except BaseException:
+            failures += 1
+        if failures:
+            raise ProcessCompositionError("cleanup_unconfirmed") from None
+        raise ProcessCompositionError(
+            _fixed_error(error, "topology_failed")
+        ) from None
+
+
+def _broker_runtime_admitted(_role, _deadline_ns):
+    raise ProcessCompositionError("role_runtime_unbound") from None
+
+
+def _worker_runtime_admitted(_role, _deadline_ns):
+    raise ProcessCompositionError("role_runtime_unbound") from None
+
+
+def _guardian_runtime_admitted(_composition, _deadline_ns):
+    raise ProcessCompositionError("role_runtime_unbound") from None
+
+
+def _role_process_entry(value, stage, parent_fd, parent_identity,
+                        group_fd, group_identity, deadline_ns,
+                        inherited_owner=None):
+    role = None
+    code = 2
+    try:
+        role = _role_branch_admitted_once(
+            value, stage, parent_fd, parent_identity,
+            group_fd, group_identity, inherited_owner,
+        )
+        runtime = (
+            _broker_runtime_admitted if stage == "broker"
+            else _worker_runtime_admitted
+        )
+        result = runtime(role, deadline_ns)
+        _need(type(result) is int and result == 0, "role_runtime_unbound")
+        code = 0
+    except BaseException:
+        code = 2
+    finally:
+        if role is not None:
+            try:
+                role.cleanup_admitted_once()
+            except BaseException:
+                code = 2
+    os._exit(code)
+
+
+def _cleanup_guardian_partial(value, lease, parent_fd, parent_identity,
+                              owners, cleanup_deadline_ns):
+    failures = 0
+    if lease is not None:
+        try:
+            lease.kill()
+        except BaseException:
+            failures += 1
+    for owner in owners:
+        try:
+            _retire_child(owner, cleanup_deadline_ns)
+        except BaseException:
+            failures += 1
+    if lease is not None:
+        try:
+            lease.close()
+        except BaseException:
+            failures += 1
+    if parent_fd is not None:
+        try:
+            _close_parent_descriptor(parent_fd, parent_identity)
+        except BaseException:
+            failures += 1
+    try:
+        value.close_all_admitted_once()
+    except BaseException:
+        failures += 1
+    _need(failures == 0, "cleanup_unconfirmed")
+
+
+def _guardian_branch_admitted_once(value, parent_fd, parent_identity,
+                                   cgroup_name, limits, deadline_ns,
+                                   cleanup_deadline_ns):
+    lease = None
+    broker_owner = worker_owner = None
+    handed_off = False
+    try:
+        value.adopt_fork_child_admitted_once()
+        kept = value.transition_admitted_once(
+            "guardian_prefork", extra_keep=(parent_fd,),
+        )
+        _prune_child_descriptors(kept)
+        _need(cgroup._directory(parent_fd) == parent_identity,
+              "descriptor_changed")
+        lease = cgroup.CgroupLease(
+            parent_fd, name=cgroup_name, limits=dict(limits),
+        )
+        group_fd = lease.fileno()
+        group_identity = cgroup._directory(group_fd)
+        broker_pid = os.fork()
+        _need(type(broker_pid) is int and 0 <= broker_pid < 2**31,
+              "fork_failed")
+        if broker_pid == 0:
+            _role_process_entry(
+                value, "broker", parent_fd, parent_identity,
+                group_fd, group_identity, deadline_ns,
+            )
+            raise ProcessCompositionError("fork_failed") from None
+        _need(broker_pid > 1, "fork_failed")
+        broker_owner = child._bind_admitted_once(
+            broker_pid, "broker", deadline_ns=cleanup_deadline_ns,
+        )
+        worker_pid = os.fork()
+        _need(type(worker_pid) is int and 0 <= worker_pid < 2**31,
+              "fork_failed")
+        if worker_pid == 0:
+            _role_process_entry(
+                value, "worker", parent_fd, parent_identity,
+                group_fd, group_identity, deadline_ns, broker_owner,
+            )
+            raise ProcessCompositionError("fork_failed") from None
+        _need(worker_pid > 1, "fork_failed")
+        worker_owner = child._bind_admitted_once(
+            worker_pid, "worker", deadline_ns=cleanup_deadline_ns,
+        )
+        broker_fd = _owned_pidfd(broker_owner)
+        worker_fd = _owned_pidfd(worker_owner)
+        _need(len({parent_fd, group_fd, broker_fd, worker_fd}) == 4,
+              "descriptor_changed")
+        kept = value.transition_admitted_once(
+            "guardian_watch",
+            extra_keep=(parent_fd, group_fd, broker_fd, worker_fd),
+        )
+        _prune_child_descriptors(kept)
+        result = _GuardianComposition(
+            value, lease, parent_fd, parent_identity,
+            broker_owner, worker_owner, cleanup_deadline_ns,
+        )
+        handed_off = True
+        return result
+    except BaseException as error:
+        if not handed_off:
+            owners = tuple(
+                item for item in (broker_owner, worker_owner)
+                if item is not None
+            )
+            try:
+                _cleanup_guardian_partial(
+                    value, lease, parent_fd, parent_identity,
+                    owners, cleanup_deadline_ns,
+                )
+            except BaseException:
+                raise ProcessCompositionError("cleanup_unconfirmed") from None
+        raise ProcessCompositionError(
+            _fixed_error(error, "fork_failed")
+        ) from None
+
+
+def _guardian_process_entry(value, parent_fd, parent_identity, cgroup_name,
+                            limits, deadline_ns, cleanup_deadline_ns):
+    composition = None
+    code = 2
+    try:
+        composition = _guardian_branch_admitted_once(
+            value, parent_fd, parent_identity, cgroup_name,
+            limits, deadline_ns, cleanup_deadline_ns,
+        )
+        result = _guardian_runtime_admitted(composition, deadline_ns)
+        _need(type(result) is int and result == 0, "role_runtime_unbound")
+        code = 0
+    except BaseException:
+        code = 2
+    finally:
+        if composition is not None:
+            try:
+                composition.cleanup_admitted_once()
+            except BaseException:
+                code = 2
+    os._exit(code)
+
+
+def _compose_admitted_once(**_arguments):
+    """No fork until start-gates, cleanup handoff and fixed roles are bound."""
+    raise ProcessCompositionError("role_runtime_unbound") from None

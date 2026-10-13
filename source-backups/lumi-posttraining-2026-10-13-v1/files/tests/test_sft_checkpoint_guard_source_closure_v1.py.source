@@ -1,0 +1,84 @@
+"""Verify the exact local source closure without importing its ML dependencies."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import unittest
+from pathlib import Path
+
+from tests.test_sft_checkpoint_guard_sources_v1 import entry, subject
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "configs/lumi-4b-sft-import-guard-source-manifest-v0.1.json"
+
+
+def bound_sources():
+    raw = MANIFEST.read_bytes()
+    rows = entry.validate_source_manifest(raw, hashlib.sha256(raw).hexdigest())
+    files = {}
+    for name, row in rows.items():
+        body = (ROOT / "src" / name).read_bytes()
+        if len(body) != row["bytes"] or hashlib.sha256(body).hexdigest() != row["sha256"]:
+            raise AssertionError("source closure changed")
+        files[name] = body
+    return raw, files
+
+
+class SourceClosureTests(unittest.TestCase):
+    def test_exact_canonical_local_sources_match_entry_and_addon_contract(self):
+        raw, files = bound_sources()
+        self.assertEqual(raw, subject.build_manifest(files))
+        self.assertEqual(len(files), 35)
+        self.assertEqual(sum(map(len, files.values())), 610752)
+        self.assertEqual(json.loads(raw)["schema"], entry.SOURCE_SCHEMA)
+
+    def test_static_relative_closure_plus_explicit_dynamic_model_roots(self):
+        _raw, files = bound_sources()
+        pending = ["__init__", "posttraining_checkpoint_guard_fixture_v1",
+                   "configuration_lumi", "modeling_lumi"]
+        seen = set()
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            seen.add(name)
+            source = "lumi/" + name + ".py"
+            self.assertIn(source, files)
+            for node in ast.walk(ast.parse(files[source])):
+                if isinstance(node, ast.ImportFrom):
+                    if node.level:
+                        self.assertEqual(node.level, 1)
+                        pending.extend([node.module.split(".")[0]] if node.module
+                                       else [alias.name for alias in node.names])
+                    elif node.module and node.module.startswith("lumi."):
+                        pending.append(node.module.split(".")[1])
+                elif isinstance(node, ast.Import):
+                    pending.extend(alias.name.split(".")[1] for alias in node.names
+                                   if alias.name.startswith("lumi."))
+        self.assertEqual({"lumi/" + name + ".py" for name in seen}, set(files))
+
+    def test_original_initializer_and_dynamic_control_sources_retained(self):
+        _raw, files = bound_sources()
+        initializer = (ROOT / "src/lumi/__init__.py").read_bytes()
+        self.assertEqual(files["lumi/__init__.py"], initializer)
+        self.assertGreater(len(initializer), 0)
+        self.assertIn(b"register_lumi()", initializer)
+        for name in ("configuration_lumi", "modeling_lumi"):
+            self.assertIn("lumi/" + name + ".py", files)
+
+    def test_fixed_entry_and_bootstrap_environments_equal(self):
+        import importlib
+
+        bootstrap = importlib.import_module(
+            subject.__package__ + ".posttraining_checkpoint_guard_bootstrap_v1")
+        self.assertEqual(entry.FIXED_ENV, bootstrap.FIXED_ENV)
+        self.assertEqual(entry.PIN_KEYS, bootstrap.HASH_ENV)
+        self.assertEqual(str(entry.ENTRY), bootstrap.ENTRY)
+
+    def test_only_python_source_no_dataset_or_test_payloads(self):
+        _raw, files = bound_sources()
+        self.assertTrue(all(entry.SOURCE_NAME.fullmatch(name) for name in files))
+        self.assertFalse(any(name.startswith("lumi/test_") for name in files))
+

@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Cold retention child. Never provision credentials, mount, launch or train.
+
+The parent projects an exact read-only package view and a separate writable
+receipt directory. No acquisition inputs or credential source are visible here.
+Authenticated SDK/runtime and live cloud permissions remain admission duties.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import math
+import os
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ROOT = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+RELEASE = Path("/work/release")
+ENTRY = RELEASE / "scripts/retain_sft_vm_package_v1.py"
+RUNTIME = Path("/opt/lumi-sft-acquisition/venv")
+UNIT = f"lumi-vm-fullsize-v1-{ATTEMPT}-retain.service"
+PACKAGE = "_lumi_retention_cold"
+CONSUMED = False
+STAGE = "boundary"
+HELPER_PIN = "c3fe17fe42b7e5bf7df19e8a5f198568ce7d9efa89dc2af148d3f73e9fd89424"
+PINS = {
+    "posttraining_import_vm_rehearsal_v3": (
+        "ac97b64072ccd1f3db702bbf32bf0ff3de410e566ae1dc708533cb147ea15d4c"
+    ),
+    "posttraining_vm_fullsize_controls_v1": (
+        "937e44cdc598247bddf2fd9e1762b8ad79f79361fb707fcd2dfdaac045267a93"
+    ),
+    "posttraining_vm_fullsize_staging_v1": (
+        "0dd28e571a9b01ef7a2270fc9df81545d5f903acfb1133ba2771ebce1c479c68"
+    ),
+    "posttraining_vm_fullsize_handoff_v1": (
+        "c5cd7106ea4c8b6ba48e5d10fe2f18e42349dc581a0a3cb2a0a26dd6ce9f6fcc"
+    ),
+    "posttraining_vm_fullsize_completion_v1": (
+        "259bc102563dcf48ac55e818505082f5c0703efbfa1698055a03144c60ab98a7"
+    ),
+    "posttraining_vm_fullsize_transport_v1": (
+        "cb6b21e6ab1011dcc2902305f67ecaf24687930ef40628b9b01b9ce40e123c30"
+    ),
+    "posttraining_vm_fullsize_retention_v1": (
+        "1032c6c1e916bc7c1040898240362a0863e67c0869e6c88e6d786a6d3a43c9e2"
+    ),
+    "posttraining_vm_retention_transport_v1": (
+        "e405f819b5837e3174edc692b39907284b5119be93ad2e26e59328a7f946dbbf"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_entry_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, cap=131072, mode=0o400):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(before.st_uid == before.st_gid == 0 and stat.S_IMODE(before.st_mode) == mode)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        need(
+            len(raw) == before.st_size
+            and all(getattr(before, k) == getattr(after, k) for k in fields)
+        )
+    return raw
+
+
+def kernel(path, cap=4096):
+    with open(path, "rb") as stream:
+        raw = stream.read(cap + 1)
+    need(0 < len(raw) <= cap)
+    return raw
+
+
+def decode(raw):
+    def unique(items):
+        result = {}
+        for k, v in items:
+            need(k not in result)
+            result[k] = v
+        return result
+
+    value = json.loads(raw, object_pairs_hook=unique)
+    need(type(value) is dict)
+    return value
+
+
+def mounts(raw, protected):
+    """Reject writable child mount aliases too, not just top-level statvfs."""
+    need(type(raw) is bytes and len(raw) <= 1024**2)
+    seen = set()
+    for line in raw.decode("ascii").splitlines():
+        left, right = line.split(" - ", 1)
+        fields, fs = left.split(), right.split()
+        need(len(fields) >= 6 and len(fs) >= 3)
+        path = fields[4]
+        if any(path == p or path.startswith(p + "/") for p in protected):
+            need("ro" in fields[5].split(","))
+            seen.add(path)
+    need(set(protected) <= seen)
+
+
+def limits():
+    need(kernel("/proc/self/cgroup").strip() == f"0::/system.slice/{UNIT}".encode())
+    group = Path("/sys/fs/cgroup/system.slice") / UNIT
+    for name, limit in (("memory.max", 1024**3), ("memory.swap.max", 0), ("pids.max", 64)):
+        need(kernel(group / name, 64).strip() == str(limit).encode())
+    status = dict(
+        line.split(":", 1) for line in kernel("/proc/self/status", 16384).decode().splitlines()
+    )
+    need(status["NoNewPrivs"].strip() == "1")
+    need(all(int(status[k].strip(), 16) == 4 for k in ("CapEff", "CapPrm", "CapBnd")))
+    need(all(int(status[k].strip(), 16) == 0 for k in ("CapAmb", "CapInh")))
+
+
+def boundary():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(sys.flags.isolated and sys.dont_write_bytecode and Path(__file__) == ENTRY)
+    need(Path(sys.prefix) == RUNTIME and Path(sys.executable) == RUNTIME / "bin/python")
+    need(os.geteuid() == os.getegid() == 0 and os.getgroups() in ([], [0]))
+    limits()
+    credential = Path("/run/credentials") / UNIT / "aws-session.json"
+    protected = [
+        str(ROOT / n)
+        for n in ("retained", "stage/verification", "completion.json", "admission.json")
+    ]
+    protected += [str(RELEASE), str(RUNTIME), str(credential.parent)]
+    mounts(kernel("/proc/self/mountinfo", 1024**2), protected)
+    need(all(os.statvfs(p).f_flag & os.ST_RDONLY for p in protected))
+    need(not os.statvfs(ROOT).f_flag & os.ST_RDONLY)
+    for path in (ROOT, *ROOT.parents):
+        row = path.lstat()
+        need(stat.S_ISDIR(row.st_mode) and row.st_uid == 0 and not row.st_mode & 0o022)
+    need(stat.S_IMODE(ROOT.stat().st_mode) == 0o700)
+    need(
+        {p.name for p in ROOT.iterdir()}
+        == {"retained", "stage", "completion.json", "admission.json"}
+    )
+    need({p.name for p in (ROOT / "stage").iterdir()} == {"verification"})
+    need(
+        not Path("/run/systemd/private").exists()
+        and not Path("/run/dbus/system_bus_socket").exists()
+    )
+    return credential
+
+
+def admission(raw):
+    value = decode(raw)
+    need(
+        set(value)
+        == {
+            "schema",
+            "attempt",
+            "completion_sha256",
+            "readonly_identities",
+            "view_identity",
+            "deadline_boottime",
+        }
+    )
+    need(value["schema"] == "lumi.vm-retention-admission.v0.1" and value["attempt"] == ATTEMPT)
+    need(type(value["completion_sha256"]) is str and len(value["completion_sha256"]) == 64)
+    identities = value["readonly_identities"]
+    need(
+        type(identities) is dict
+        and set(identities) == {"retained", "stage/verification", "completion.json"}
+    )
+    for name, pin in list(identities.items()) + [("", value["view_identity"])]:
+        need(type(pin) is list and len(pin) == 2 and all(type(v) is int and v >= 0 for v in pin))
+        row = (ROOT / name).lstat()
+        need([row.st_dev, row.st_ino] == pin)
+    end = value["deadline_boottime"]
+    now = time.clock_gettime(time.CLOCK_BOOTTIME)
+    need(type(end) in {int, float} and math.isfinite(end) and 0 < end - now <= 1780)
+    return value
+
+
+def load():
+    need(
+        not any(
+            n == PACKAGE
+            or n.startswith(PACKAGE + ".")
+            or n.split(".")[0] in {"lumi", "torch", "transformers", "botocore", "boto3"}
+            for n in sys.modules
+        )
+    )
+    source = RELEASE / "src/lumi"
+    bodies = {n: read(source / (n + ".py")) for n in PINS}
+    helper_path = RELEASE / "scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+    helper_raw = read(helper_path)
+    need(all(sha(bodies[n]) == pin for n, pin in PINS.items()) and sha(helper_raw) == HELPER_PIN)
+    package = types.ModuleType(PACKAGE)
+    package.__path__ = []
+    sys.modules[PACKAGE] = package
+    for name, raw in bodies.items():
+        module = types.ModuleType(PACKAGE + "." + name)
+        module.__file__, module.__package__ = str(source / (name + ".py")), PACKAGE
+        sys.modules[module.__name__] = module
+        setattr(package, name, module)
+        exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    helper = types.ModuleType(PACKAGE + "._credential_reader")
+    helper.__file__ = str(helper_path)
+    exec(compile(helper_raw, helper.__file__, "exec"), helper.__dict__)
+    return module, helper
+
+
+def execute(entry_sha256):
+    global CONSUMED, STAGE
+    need(not CONSUMED)
+    STAGE = "boundary"
+    credential = boundary()
+    CONSUMED = True
+    STAGE = "source"
+    need(type(entry_sha256) is str and sha(read(ENTRY)) == entry_sha256)
+    transport, helper = load()
+    transport.retention.policy()
+    STAGE = "admission"
+    approved = admission(read(ROOT / "admission.json", 4096))
+    raw = read(ROOT / "completion.json", 131072, 0o600)
+    need(sha(raw) == approved["completion_sha256"])
+    completed = decode(raw)
+    STAGE = "credentials"
+    secret = helper.credentials(credential)
+    need(secret["access_key"].startswith("ASIA"))
+    STAGE = "sdk"
+    session, config = helper.sdk()
+    remaining = approved["deadline_boottime"] - time.clock_gettime(time.CLOCK_BOOTTIME)
+    need(0 < remaining <= 1780)
+    STAGE = "retention"
+    return transport._retain_admitted_once(
+        ATTEMPT,
+        completed,
+        session=session,
+        config_type=config,
+        retention_credentials=secret,
+        deadline=time.monotonic() + remaining,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--entry-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        execute(args.entry_sha256)
+    except BaseException:
+        stages = ["boundary", "source", "admission", "credentials", "sdk", "retention"]
+        parser.exit(70 + stages.index(STAGE), "retention_entry_failed\n")
+
+
+if __name__ == "__main__":
+    main()

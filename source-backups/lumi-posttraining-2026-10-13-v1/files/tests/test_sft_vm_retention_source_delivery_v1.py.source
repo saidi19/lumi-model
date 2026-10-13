@@ -1,0 +1,353 @@
+"""Authentic frozen source/install/admission composition; transport/native boundaries doubled."""
+
+import importlib
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("stage_sft_vm_retention_source_v1")
+d = importlib.import_module("send_sft_vm_retention_source_v1")
+fixtures = importlib.import_module("tests.test_sft_vm_runtime_qualification_v1")
+admission = importlib.import_module("tests.test_sft_vm_retention_admission_v1")
+
+
+class SourceTests(unittest.TestCase):
+    def setUp(self):
+        self.parts = d.payload()
+        self.bodies = dict(zip(m.PINS, self.parts[1:4], strict=True))
+
+    def test_actual_pins_exact_archive_and_frozen_installer_members(self):
+        self.assertEqual(m.sha(self.parts[0]), d.SOURCE_SHA)
+        self.assertEqual(len(self.parts[-1]), 235520)
+        loaded = m.sources(self.bodies)
+        members = m.unpack(self.parts[-1], loaded)
+        self.assertEqual(len(members), 22)
+        self.assertEqual(m.sha(members["release-manifest.json"]), m.MANIFEST_SHA)
+        self.assertEqual(members["scripts/run_sft_vm_retention_parent_v1.py"], admission.ENTRY)
+
+    def test_changed_missing_extra_helper_rejected_before_exec(self):
+        for bodies in (
+            dict(self.bodies, unknown=b"x"),
+            {},
+            self.bodies
+            | {"prepare_sft_vm_retention_release_v2.py": b"raise RuntimeError('must-not-exec')"},
+        ):
+            with self.assertRaises(ValueError):
+                m.sources(bodies)
+
+    def test_truncated_trailing_corrupted_archive_rejected(self):
+        loaded = m.sources(self.bodies)
+        for archive in (self.parts[-1][:-1], self.parts[-1] + b"x", bytes(235520)):
+            with self.assertRaises(ValueError):
+                m.unpack(archive, loaded)
+
+    def test_mac_rejects_before_native_paths_and_public_closed(self):
+        with patch.object(sys, "platform", "darwin"):
+            with self.assertRaises(ValueError):
+                m._stage_once({}, "a" * 64, self.bodies, self.parts[-1])
+        for module in (m, d):
+            with self.assertRaises(ValueError):
+                module.run(approved=True)
+
+    def test_remote_launcher_syntax_and_fixed_source_order(self):
+        code = d.launcher({}, "a" * 64, list(map(len, self.parts)))
+        compile(code, "synthetic_retention_source_launcher", "exec")
+        self.assertIn("strict=True", code)
+        self.assertIn("signal.alarm(75)", code)
+        with self.assertRaises(ValueError):
+            d.launcher({}, "a" * 64, [1, 1, 1, 1, 1])
+
+
+class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.f = fixtures.ChannelTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.pin = "c" * 64
+        self.exchange = self.enterContext(
+            patch.object(
+                d.sender, "pipe_exchange", return_value=json.dumps(m.report(self.pin)).encode()
+            )
+        )
+
+    def call(self, **changes):
+        kwargs = dict(
+            deadline=100, host_deadline=14400, remaining_control_bytes=4000000, clock=lambda: 0
+        )
+        return d._deliver_once(
+            self.f.root / "source-transfer",
+            self.f.binding,
+            self.f.key,
+            self.f.root,
+            self.f.config_pin,
+            self.f.hosts_pin,
+            self.f.request,
+            self.pin,
+            **(kwargs | changes),
+        )
+
+    def test_actual_pinned_channel_fits_tunnel_charges_command_and_body(self):
+        report = self.call()
+        self.assertTrue(report["source_delivery_completed"])
+        self.assertFalse(report["binding_created"] or report["host_admitted"])
+        argv, body, timeout = self.exchange.call_args.args
+        self.assertEqual(timeout, 80)
+        self.assertIn("signal.alarm(75)", argv[-1])
+        self.assertIn("--max-tunnel-duration 120", (self.f.root / "ssh_config").read_text())
+        self.assertEqual(body, b"".join(d.payload()))
+        self.assertEqual(
+            report["control_content_bytes_charged"], len(body) + len(argv[-1].encode())
+        )
+        self.exchange.assert_called_once()
+
+    def test_lost_reply_charged_unknown_remote_state_and_no_retry(self):
+        self.exchange.side_effect = TimeoutError("private-secret")
+        with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+            self.call()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.exchange.assert_called_once()
+        raw = (self.f.root / "source-transfer/result.json").read_text()
+        self.assertNotIn("private-secret", raw)
+        report = json.loads(raw)
+        self.assertTrue(report["outer_stop_required_on_failure"])
+        self.assertGreater(report["control_content_bytes_charged"], 235520)
+        self.assertEqual(report["release_state"], "unknown_after_transfer")
+
+    def test_expiry_and_budget_rejected_before_exchange(self):
+        for change in (
+            {"deadline": 80},
+            {"deadline": 101},
+            {"deadline": float("nan")},
+            {"host_deadline": 2659},
+            {"remaining_control_bytes": True},
+            {"remaining_control_bytes": 235520},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.call(**change)
+        self.exchange.assert_not_called()
+
+    def test_invalid_key_or_known_host_rejected_before_exchange(self):
+        (self.f.root / "known_hosts").write_bytes(b"drift")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_strict_reply_rejects_extra_text_bool_count_and_other_prior_binding(self):
+        for change in (
+            {"exception": "raw"},
+            {"source_files_verified": True},
+            {"host_admitted": True},
+            {"binding_created": True},
+            {"prior_binding_sha256": "d" * 64},
+            {"release_staged": False},
+        ):
+            with self.assertRaises(ValueError):
+                d.validate_reply(m.report(self.pin) | change, self.pin)
+
+    def test_late_reply_is_failure_not_success(self):
+        t = [0]
+
+        def exchange(*args):
+            t[0] = 101
+            return json.dumps(m.report(self.pin)).encode()
+
+        self.exchange.side_effect = exchange
+        with self.assertRaises(ValueError):
+            self.call(clock=lambda: t[0])
+        self.exchange.assert_called_once()
+
+    def test_local_post_reply_save_failure_retains_both_records(self):
+        save = d.sender.delivery.connection.issuer.base.save
+
+        def lost(path, value):
+            save(path, value)
+            if path.name == "result.json":
+                raise OSError("lost-save-ack")
+
+        with patch.object(d.sender.delivery.connection.issuer.base, "save", side_effect=lost):
+            with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+                self.call()
+        root = self.f.root / "source-transfer"
+        self.assertTrue((root / "result.json").exists())
+        failure = json.loads((root / "failure.json").read_bytes())
+        self.assertEqual(failure["release_state"], "unknown_after_transfer")
+        self.exchange.assert_called_once()
+
+
+class NativeTests(unittest.TestCase):
+    def setUp(self):
+        self.f = admission.AdmissionTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        # Relocate only this test's prebuilt fixture; prove the real installer
+        # supplies the exact release consumed by actual admission validators.
+        os.rename(self.f.entry.RELEASE, self.f.root / "fixture-release-reference")
+        self.stage = (
+            Path(self.enterContext(tempfile.TemporaryDirectory())).resolve() / "source-stage"
+        )
+        self.enterContext(patch.object(m, "ROOT", self.stage))
+        self.enterContext(patch.object(m, "FULLSIZE", self.f.root))
+        self.parts = d.payload()
+        self.bodies = dict(zip(m.PINS, self.parts[1:4], strict=True))
+        self.loaded = m.sources(self.bodies)
+        self.loaded["bind_sft_vm_native_admission_v1.py"] = self.f.binder
+        old = self.loaded["prepare_sft_vm_retention_release_v1.py"]
+        old.ROOT = self.f.root.parent
+        old.boundary = Mock()
+        self.builder = self.loaded["prepare_sft_vm_retention_release_v2.py"]
+        self.builder.helper = lambda: old
+        self.enterContext(patch.object(m, "sources", return_value=self.loaded))
+        self.f.bootstrap.owned = Mock()
+
+    def call(self, **kw):
+        return m._stage_once(
+            kw.get("request", self.f.request),
+            kw.get("pin", self.f.prior_pin),
+            self.bodies,
+            kw.get("archive", self.parts[-1]),
+        )
+
+    def test_frozen_install_then_existing_native_admission_complete_chain(self):
+        result = self.call()
+        self.assertEqual(result, m.report(self.f.prior_pin))
+        self.assertFalse((self.f.root / "retention-controller").exists())
+        members = m.unpack(self.parts[-1], self.loaded)
+        for name, raw in members.items():
+            path = self.f.entry.RELEASE / name
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+        admitted = self.f.call()
+        self.assertTrue(admitted["retention_binding_created"])
+        self.assertEqual(admitted["release_files_verified"], 21)
+        self.assertFalse(admitted["bucket_admitted"] or admitted["credentials_issued"])
+
+    def test_real_delivery_serialization_to_staging_then_admission(self):
+        channel = fixtures.ChannelTests()
+        channel.setUp()
+        self.addCleanup(channel.doCleanups)
+        channel.binding.update(self.f.request["volumes"])
+        connection = d.sender.delivery.connection
+        config = connection.ssh_config(
+            channel.binding, channel.key, channel.root / "known_hosts"
+        ).encode()
+        (channel.root / "ssh_config").write_bytes(config)
+        self.f.request.update(
+            schema="lumi.vm-detached-setup-request.v0.1", setup_deadline_boottime=1800
+        )
+        lengths = list(map(len, self.parts))
+
+        def wire(argv, body, timeout):
+            self.assertEqual(timeout, 80)
+            chunks, offset = [], 0
+            for size in lengths:
+                chunks.append(body[offset : offset + size])
+                offset += size
+            self.assertEqual(offset, len(body))
+            self.assertEqual(m.sha(chunks[0]), d.SOURCE_SHA)
+            bodies = dict(zip(m.PINS, chunks[1:4], strict=True))
+            self.assertEqual({name: m.sha(raw) for name, raw in bodies.items()}, m.PINS)
+            value = m._stage_once(self.f.request, self.f.prior_pin, bodies, chunks[4])
+            return json.dumps(value).encode()
+
+        with patch.object(d.sender, "pipe_exchange", side_effect=wire) as exchange:
+            delivered = d._deliver_once(
+                channel.root / "joined-delivery",
+                channel.binding,
+                channel.key,
+                channel.root,
+                m.sha(config),
+                channel.hosts_pin,
+                self.f.request,
+                self.f.prior_pin,
+                deadline=100,
+                host_deadline=14400,
+                remaining_control_bytes=4000000,
+                clock=lambda: 0,
+            )
+        exchange.assert_called_once()
+        self.assertTrue(delivered["source_delivery_completed"])
+        self.assertTrue(self.f.call()["retention_binding_created"])
+
+    def test_all_source_directories_remain_private(self):
+        self.call()
+        for path in self.f.entry.RELEASE.rglob("*"):
+            if path.is_dir():
+                self.assertEqual(path.stat().st_mode & 0o777, 0o700)
+
+    def test_wrong_archive_prior_hash_or_request_rejected_without_staging(self):
+        for changes in (
+            {"archive": self.parts[-1] + b"x"},
+            {"pin": "d" * 64},
+            {"request": dict(self.f.request, host_deadline_boottime=14400)},
+        ):
+            with self.subTest(changes=list(changes)), self.assertRaises(ValueError):
+                self.call(**changes)
+        self.assertFalse(self.stage.exists())
+        self.assertFalse(self.f.entry.RELEASE.exists())
+
+    def test_remaining_time_must_preserve_retention_window(self):
+        self.f.bootstrap.boot_time = lambda: 14300 - 2560 - 80
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(self.stage.exists())
+
+    def test_used_source_attempt_rejected_without_overwrite(self):
+        self.call()
+        before = (self.stage / "result.json").read_bytes()
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual((self.stage / "result.json").read_bytes(), before)
+
+    def test_existing_release_or_binding_rejected(self):
+        (self.f.root / "retention-controller").mkdir()
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(self.stage.exists())
+
+    def test_partial_install_preserved_no_second_attempt(self):
+        old = self.loaded["prepare_sft_vm_retention_release_v1.py"]
+        write = old.write
+
+        def fail(path, raw):
+            write(path, raw)
+            if path.name == "release-manifest.json":
+                raise OSError("private-path")
+
+        old.write = fail
+        with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+            self.call()
+        self.assertTrue((self.f.entry.RELEASE / "release-manifest.json").exists())
+        self.assertTrue((self.stage / "failed.json").exists())
+        self.assertNotIn("private-path", (self.stage / "failed.json").read_text())
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_late_native_completion_leaves_no_success_and_consumed_release(self):
+        self.f.bootstrap.boot_time = Mock(side_effect=[11000, 11000, 12000])
+        with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+            self.call()
+        self.assertTrue(self.f.entry.RELEASE.exists())
+        self.assertFalse((self.stage / "result.json").exists())
+
+    def test_write_caps_not_widened_and_no_worker_dispatch(self):
+        writer = self.f.bootstrap.write
+
+        def bounded(path, raw):
+            if len(raw) > 32768:
+                raise AssertionError("frozen_metadata_cap")
+            writer(path, raw)
+
+        self.f.bootstrap.write = bounded
+        self.assertTrue(self.call()["release_staged"])
+        self.assertEqual((self.stage / "retention-source.tar").stat().st_size, 235520)
+        self.assertFalse((self.f.root / "retention-parent").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

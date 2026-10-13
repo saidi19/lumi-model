@@ -1,0 +1,27 @@
+"""Identical cleanup core in a fresh attempt; credential stages are explicit."""
+
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_v05_host_cleanup_v2.py").read_text()
+source = source.replace("cleanup_sft_vm_v05_host_resources_v2.py",
+                        "cleanup_sft_vm_v05_host_resources_v3.py")
+inherited = types.ModuleType("cleanup_v3_inherited_tests")
+inherited.__file__ = str(ROOT / "tests/test_sft_vm_v05_host_cleanup_v2.py")
+exec(compile(source, inherited.__file__, "exec"), inherited.__dict__)
+
+
+class CleanupV3Tests(inherited.CleanupV2Tests):
+    def test_identical_cleanup_core_and_fresh_output(self):
+        old = (ROOT / "scripts/cleanup_sft_vm_v05_host_resources_v2.py").read_text()
+        new = (ROOT / "scripts/cleanup_sft_vm_v05_host_resources_v3.py").read_text()
+        def core(text):
+            return text.split("class Cleanup:", 1)[1].split("def main():", 1)[0]
+        self.assertEqual(core(old), core(new))
+        self.assertTrue(inherited.m.OUTPUT.endswith("v0.3"))
+        self.assertTrue(inherited.m.APPROVAL.endswith("v0.3.json"))
+        for stage in ("local_imports", "credential_export", "credential_schema",
+                      "credential_lifetime", "client_setup", "public_key_validation"):
+            self.assertIn('result["stage"] = "' + stage + '"', new)
+        self.assertIn("need(remaining > 660)", new)

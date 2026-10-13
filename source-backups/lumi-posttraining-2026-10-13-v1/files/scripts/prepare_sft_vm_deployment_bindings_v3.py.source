@@ -1,0 +1,38 @@
+"""Pure attempt-011 deployment scope. No cloud access or execution approval."""
+
+import hashlib
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DONOR_SHA = "cae2aab77ac49a0dee24ed1a49b54f4a0eeb891a6217f6311d7f5e62ef7cd06f"
+ATTEMPT = "ad7b734ba7894916b25d795ac3dab31c"
+PREVIOUS = "9b87f7f591a240ef8b10f46b8d008fa0"
+
+
+def bound_builder():
+    path = ROOT / "scripts/prepare_sft_vm_deployment_bindings_v1.py"
+    raw = path.read_bytes()
+    if path.is_symlink() or hashlib.sha256(raw).hexdigest() != DONOR_SHA:
+        raise ValueError("deployment_builder_binding_failed")
+    raw = raw.replace(b"242bd09f5fa84b1f9a4e46cb4592ad8b", ATTEMPT.encode())
+    raw = raw.replace(b"attempt-008", b"attempt-011").replace(b"v0.8", b"v0.11")
+    module = types.ModuleType("_attempt011_deployment")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    module.RELEASE = "artifacts/lumi-vm-attempt-011-source-v0.1"
+    module.RELEASE_SHA = "044fcf953518a1d85a72f067d7cae8be8d3357b6fde4c6e9011b968cf3bc92dc"
+    module.REPORT = "evidence/lumi-vm-attempt011-source-verification-v0.1.json"
+    module.REPORT_SHA = "cfe47d16f5a9331fd657e89f745bd73764491e48299c4cea75b8d94b1f1dc6fc"
+    module.OLD = PREVIOUS
+    return module
+
+
+def build():
+    module = bound_builder()
+    plan = module.build(*module.inputs())
+    return plan, module.approval_template(plan)
+
+
+def run(**_arguments):
+    raise ValueError("deployment_scope_is_not_execution_authority")

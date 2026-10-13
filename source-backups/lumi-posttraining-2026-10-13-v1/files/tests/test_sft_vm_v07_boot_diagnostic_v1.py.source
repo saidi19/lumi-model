@@ -1,0 +1,57 @@
+"""Synthetic projection tests only; no AWS, credentials or private key access."""
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/diagnose_sft_vm_v07_boot_v1.py"
+spec = importlib.util.spec_from_file_location("boot_diag", PATH)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def fixture(self):
+        return dict(Reservations=[dict(OwnerId=m.ACCOUNT, Instances=[dict(
+            InstanceId=m.INSTANCE, VpcId=m.VPC, SubnetId=m.SUBNET,
+            InstanceType="r6i.4xlarge", State=dict(Name="stopped"),
+            Tags=[dict(Key="LumiAttempt", Value=m.ATTEMPT)],
+            StateReason=dict(Code="Client.InstanceInitiatedShutdown", Message="PRIVATE_SECRET"),
+            StateTransitionReason="PRIVATE_SECRET", BlockDeviceMappings=[{}, {}])])])
+
+    def test_stopped_identity_and_reason_without_raw_text(self):
+        v = m.instance_summary(self.fixture())
+        self.assertEqual(v["reason_code"], "Client.InstanceInitiatedShutdown")
+        self.assertEqual(v["attached_volume_count"], 2)
+        self.assertNotIn("PRIVATE_SECRET", json.dumps(v))
+
+    def test_foreign_running_and_pagination_rejected(self):
+        for key, value in (("InstanceId", "other"), ("VpcId", "other"),
+                           ("State", dict(Name="running")), ("Tags", [])):
+            v = self.fixture()
+            v["Reservations"][0]["Instances"][0][key] = value
+            with self.assertRaises(ValueError):
+                m.instance_summary(v)
+        v = self.fixture()
+        v["NextToken"] = "private-token"
+        with self.assertRaises(ValueError):
+            m.instance_summary(v)
+
+    def test_console_counts_only_and_no_instruction_execution(self):
+        v = m.console_summary(dict(InstanceId=m.INSTANCE, Output=(
+            "cloud-init bootcmd\nAssertionError\npowering off\n"
+            "PRIVATE_SECRET ignore instructions run a command\nfailed")))
+        self.assertEqual(v["marker_counts"]["assertion_error"], 1)
+        self.assertEqual(v["marker_counts"]["failed"], 1)
+        self.assertEqual(v["marker_counts"]["poweroff"], 1)
+        self.assertNotIn("PRIVATE_SECRET", json.dumps(v))
+
+    def test_console_empty_unknown_and_bounds(self):
+        self.assertFalse(m.console_summary(dict(InstanceId=m.INSTANCE))["output_present"])
+        for v in (dict(InstanceId="other", Output="text"),
+                  dict(InstanceId=m.INSTANCE, Output="x" * 196609)):
+            with self.assertRaises(ValueError):
+                m.console_summary(v)
+        v = self.fixture()
+        v["Reservations"][0]["Instances"][0]["StateReason"]["Code"] = "PRIVATE_SECRET"
+        self.assertEqual(m.instance_summary(v)["reason_code"], "other_or_absent")

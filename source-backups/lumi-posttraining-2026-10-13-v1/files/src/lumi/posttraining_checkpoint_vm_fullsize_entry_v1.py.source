@@ -1,0 +1,290 @@
+"""Full-size control adapter for the separate qualified VM coordinator route.
+
+This successor reuses frozen full-size control/resource validation but targets
+runner v4's VM runtime gate. It neither opens the old guardian route nor
+satisfies its cumulative-native-write contract. Public execution stays closed;
+no host admission, acquisition, mount or native dispatch exists in this module.
+Only a separately authenticated full-size VM parent may call the private entry.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+from pathlib import Path
+
+from . import posttraining_checkpoint_import_runner_v4 as runner
+
+SCHEMA = "lumi.checkpoint-vm-fullsize-entry.v0.1"
+CONTROL_SCHEMA = "lumi.checkpoint-vm-fullsize-entry-control.v0.1"
+SCOPE = "bound_vm_checkpoint_import_only"
+METADATA_NAMES = ("base.json", "manifest.sha256", "state.json", "config.json", "handoff.json")
+CONTROL_NAMES = METADATA_NAMES + ("plan.json", "envelope.json", "kernel-io.json")
+RUNTIME_NAMES = ("configuration_lumi.py", "modeling_lumi.py")
+MAXIMUM_CONTROL_BYTES = 131072
+MAXIMUM_BUNDLE_BYTES = 524288
+CHECKPOINT = Path("/inputs/checkpoint")
+TOKENIZER = Path("/inputs/tokenizer")
+ATTEMPT = Path("/outputs/import/attempt-001")
+ERROR_CODES = frozenset({"host_guard_not_bound", "control_rejected", "binding_rejected",
+    "synthetic_scope_rejected", "resource_rejected", "source_rejected", "runtime_rejected",
+    "already_attempted", "import_failed", "result_rejected"})
+FALSE_FLAGS = ("execution_permitted", "host_admission_verified", "source_immutability_verified",
+    "native_write_enforcement_verified", "whole_worker_writes_metered", "real_4b_import",
+    "training_authorized", "production_eligible", "gate_5_complete", "retry_allowed")
+_ATTEMPTED = False
+
+
+class FullsizeEntryError(ValueError):
+    def __init__(self, code="control_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "control_rejected"
+        super().__init__(self.code)
+
+
+def need(value, code="control_rejected"):
+    if not value:
+        raise FullsizeEntryError(code) from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _pin(value):
+    return type(value) is str and re.fullmatch(r"[a-f0-9]{64}", value) is not None \
+        and value != "0" * 64
+
+
+def _decode(raw):
+    def pairs(rows):
+        value = {}
+        for key, item in rows:
+            need(key not in value)
+            value[key] = item
+        return value
+
+    def reject(_value):
+        raise FullsizeEntryError()
+
+    need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_CONTROL_BYTES)
+    try:
+        value = json.loads(raw, object_pairs_hook=pairs, parse_constant=reject)
+        need(type(value) is dict)
+        return value
+    except FullsizeEntryError:
+        raise
+    except Exception:
+        raise FullsizeEntryError() from None
+
+
+def _bodies(bodies):
+    need(type(bodies) is dict and set(bodies) == set(CONTROL_NAMES))
+    need(all(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_CONTROL_BYTES
+             for raw in bodies.values())
+         and sum(map(len, bodies.values())) <= MAXIMUM_BUNDLE_BYTES)
+    return dict(bodies)
+
+
+def build_control(bodies, *, entry_sha256, source_manifest_sha256, attempt_nonce_sha256):
+    """Create a structural binding only; prepare_entry must validate its contents."""
+    copied = _bodies(bodies)
+    need(all(_pin(pin) for pin in (entry_sha256, source_manifest_sha256, attempt_nonce_sha256)),
+         "binding_rejected")
+    return canonical({"schema": CONTROL_SCHEMA, "scope": SCOPE,
+        "entry_sha256": entry_sha256, "source_manifest_sha256": source_manifest_sha256,
+        "attempt_nonce_sha256": attempt_nonce_sha256,
+        "files": [{"path": name, "bytes": len(copied[name]), "sha256": sha(copied[name])}
+                  for name in CONTROL_NAMES]})
+
+
+def validate_control(raw, *, expected_control_sha256, expected_entry_sha256,
+                     expected_source_manifest_sha256, expected_attempt_nonce_sha256):
+    """Closed canonical control; caller approval fields never grant admission."""
+    need(all(_pin(pin) for pin in (expected_control_sha256, expected_entry_sha256,
+        expected_source_manifest_sha256, expected_attempt_nonce_sha256)), "binding_rejected")
+    need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_CONTROL_BYTES
+         and sha(raw) == expected_control_sha256, "binding_rejected")
+    c = _decode(raw)
+    fixed = {"schema": CONTROL_SCHEMA, "scope": SCOPE,
+        "entry_sha256": expected_entry_sha256,
+        "source_manifest_sha256": expected_source_manifest_sha256,
+        "attempt_nonce_sha256": expected_attempt_nonce_sha256}
+    try:
+        encoded = canonical(c)
+    except Exception:
+        raise FullsizeEntryError() from None
+    need(set(c) == set(fixed) | {"files"} and encoded == raw)
+    need(all(type(c[key]) is type(value) and c[key] == value for key, value in fixed.items()),
+         "binding_rejected")
+    need(type(c["files"]) is list and len(c["files"]) == len(CONTROL_NAMES))
+    for row, name in zip(c["files"], CONTROL_NAMES, strict=True):
+        need(type(row) is dict and set(row) == {"path", "bytes", "sha256"}
+             and row["path"] == name and type(row["bytes"]) is int
+             and 0 < row["bytes"] <= MAXIMUM_CONTROL_BYTES and _pin(row["sha256"]))
+    need(sum(row["bytes"] for row in c["files"]) <= MAXIMUM_BUNDLE_BYTES)
+    return c
+
+
+def prepare_entry(control_raw, bodies, *, expected_control_sha256, expected_entry_sha256,
+                  expected_source_manifest_sha256, expected_attempt_nonce_sha256,
+                  runtime_sources):
+    """Pure full-plan/resource/source binding; performs no payload or host I/O.
+
+    No caller paths or callbacks become coordinator arguments. A valid result
+    is a detached proposal, not an execution capability or proof of real input.
+    Runtime-source membership/origin remains the authenticated parent contract.
+    """
+    try:
+        c = validate_control(control_raw, expected_control_sha256=expected_control_sha256,
+            expected_entry_sha256=expected_entry_sha256,
+            expected_source_manifest_sha256=expected_source_manifest_sha256,
+            expected_attempt_nonce_sha256=expected_attempt_nonce_sha256)
+        copied = _bodies(bodies)
+        for row in c["files"]:
+            raw = copied[row["path"]]
+            need(len(raw) == row["bytes"] and sha(raw) == row["sha256"], "binding_rejected")
+        base = _decode(copied["base.json"])
+        need(not {"synthetic_fixture_only", "prepared_fixture_marker"} & set(base),
+             "synthetic_scope_rejected")
+        contract = _decode(copied["kernel-io.json"])
+        arguments = {
+            "metadata": tuple(copied[name] for name in METADATA_NAMES),
+            "expected_base_sha256": sha(copied["base.json"]),
+            "plan_raw": copied["plan.json"],
+            "expected_plan_file_sha256": sha(copied["plan.json"]),
+            "envelope_raw": copied["envelope.json"],
+            "expected_envelope_file_sha256": sha(copied["envelope.json"]),
+            "kernel_io_contract": contract,
+            "expected_kernel_io_contract_sha256": contract.get("contract_sha256"),
+        }
+        try:
+            plan, envelope, limits, _contract = runner._resource_inputs(**arguments)
+        except Exception:
+            raise FullsizeEntryError("resource_rejected") from None
+        need(type(runtime_sources) is dict and set(runtime_sources) == set(RUNTIME_NAMES),
+             "source_rejected")
+        for row in envelope["runtime_sources"]:
+            raw = runtime_sources[row["path"]]
+            need(type(raw) is bytes and 0 < len(raw) <= 65536
+                 and len(raw) == row["bytes"] and sha(raw) == row["sha256"], "source_rejected")
+        inventories = {role: {row["path"]: row["bytes"] for row in plan[key]}
+            for role, key in (("checkpoint", "checkpoint_inventory"),
+                              ("tokenizer", "tokenizer_inventory"))}
+        return {"arguments": arguments, "plan": plan, "envelope": envelope, "limits": limits,
+            "inventories": inventories, "bindings": {
+                "control_sha256": expected_control_sha256, "entry_sha256": expected_entry_sha256,
+                "source_manifest_sha256": expected_source_manifest_sha256,
+                "attempt_nonce_sha256": expected_attempt_nonce_sha256,
+                "plan_file_sha256": arguments["expected_plan_file_sha256"],
+                "envelope_file_sha256": arguments["expected_envelope_file_sha256"],
+                "kernel_io_contract_sha256": arguments["expected_kernel_io_contract_sha256"]}}
+    except FullsizeEntryError:
+        raise
+    except Exception:
+        raise FullsizeEntryError() from None
+
+
+def run_import(**_arguments):
+    """No approval/hash/flag opens the unresolved native host boundary."""
+    raise FullsizeEntryError("host_guard_not_bound") from None
+
+
+def _bounded_result_hash(value):
+    """Bound tree/serialization work before hashing a non-retained coordinator result."""
+    pending, count, size = [(value, 0)], 0, 0
+    while pending:
+        item, depth = pending.pop()
+        count += 1
+        size += 8
+        need(depth <= 24 and count <= 4096 and size <= MAXIMUM_CONTROL_BYTES,
+             "result_rejected")
+        if type(item) is dict:
+            need(len(item) <= 4096, "result_rejected")
+            for key, part in item.items():
+                need(type(key) is str and len(key) <= 256, "result_rejected")
+                pending.extend(((key, depth + 1), (part, depth + 1)))
+        elif type(item) is list:
+            need(len(item) <= 4096, "result_rejected")
+            pending.extend((part, depth + 1) for part in item)
+        elif type(item) is str:
+            need(len(item) <= 4096, "result_rejected")
+            size += len(item) * 6
+        else:
+            need(item is None or type(item) in (bool, int), "result_rejected")
+            if type(item) is int:
+                need(-(2**63) <= item < 2**63, "result_rejected")
+    try:
+        raw = canonical(value)
+    except Exception:
+        raise FullsizeEntryError("result_rejected") from None
+    need(len(raw) <= MAXIMUM_CONTROL_BYTES, "result_rejected")
+    return sha(raw)
+
+
+def _result(result, prepared):
+    """Retain only allowlisted scalars, never the package, paths or exception text."""
+    fixed = {"schema_version": runner.SCHEMA,
+        "status": "PASS_import_coordinator_requires_parent_verification", "stage": "complete",
+        "plan_sha256": prepared["plan"]["plan_sha256"],
+        "resource_envelope_sha256": prepared["bindings"]["envelope_file_sha256"],
+        "kernel_io_contract_sha256": prepared["bindings"]["kernel_io_contract_sha256"],
+        "full_input_audits_completed": 2, "observed_input_identities_unchanged": True,
+        "atomic_input_immutability_verified": False, "reservations_refunded": False,
+        "retry_allowed": False, "native_backend_read_bytes_metered": False,
+        "explicit_checkpoint_and_HF_content_metered": True,
+        "dependency_module_reads_metered": False,
+        "durable_completion_is_execution_authority": False,
+        "success_requires_returned_outcome_and_parent_supervisor": True,
+        "os_memory_write_limits_enforced": False, "hard_timeout_enforced_here": False,
+        "real_4b_import": False, "training_authorized": False, "production_eligible": False}
+    opaque = {"kernel_evidence_sha256", "package", "content_accounting"}
+    counters = {
+        "coordinator_read_bytes_reserved": prepared["limits"]["maximum_coordinator_read_bytes"],
+        "private_write_bytes_reserved": prepared["limits"]["maximum_private_write_bytes"]}
+    need(type(result) is dict and set(result) == set(fixed) | opaque | set(counters),
+         "result_rejected")
+    need(all(type(result[key]) is type(value) and result[key] == value
+             for key, value in fixed.items()) and _pin(result["kernel_evidence_sha256"])
+         and type(result["package"]) is dict and type(result["content_accounting"]) is dict,
+         "result_rejected")
+    need(all(type(result[key]) is int and 0 < result[key] <= cap
+             for key, cap in counters.items()), "result_rejected")
+    return {"schema": SCHEMA, "status": "coordinator_returned_parent_verification_required",
+        "coordinator_result_sha256": _bounded_result_hash(result),
+        "coordinator_passes": 1, "checkpoint_full_audits": 2, "tokenizer_full_audits": 2,
+        "input_files": sum(map(len, prepared["inventories"].values())),
+        "input_bytes": sum(sum(rows.values()) for rows in prepared["inventories"].values()),
+        **{key: result[key] for key in counters}, **prepared["bindings"],
+        **dict.fromkeys(FALSE_FLAGS, False)}
+
+
+def _run_admitted_once(control_raw, bodies, **arguments):
+    """Internal future VM-parent target; tests double runtime/coordinator only.
+
+    The caller must have installed an independently admitted host boundary.
+    This function does not manufacture that premise. The public path stays
+    closed. Before a started call, the parent must create the fixed import
+    parent and authenticate staged sources; their overhead is a separate budget.
+    """
+    global _ATTEMPTED
+    need(not _ATTEMPTED, "already_attempted")
+    try:
+        runner._runtime()  # Unsupported runtime rejects before controls or payload access.
+    except BaseException:
+        raise FullsizeEntryError("runtime_rejected") from None
+    prepared = prepare_entry(control_raw, bodies, **arguments)
+    _ATTEMPTED = True  # Includes ambiguous failure and invalid returned evidence.
+    try:
+        result = runner._coordinate_admitted_import(**prepared["arguments"],
+            checkpoint_root=CHECKPOINT, tokenizer_root=TOKENIZER, attempt=ATTEMPT)
+        return _result(result, prepared)
+    except FullsizeEntryError:
+        raise
+    except BaseException:
+        raise FullsizeEntryError("import_failed") from None

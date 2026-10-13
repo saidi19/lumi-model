@@ -1,0 +1,226 @@
+"""One-shot attempt-018 inert watchdog deployment; no CPU authority."""
+
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+import time
+from pathlib import Path
+
+from scripts import execute_sft_vm_inert_watchdog_v10 as qualified
+
+ROOT = Path(__file__).resolve().parents[1]
+QUALIFIED_SHA = "c45facd6ee654812d7efed59c7301c310e0fee8ce42aeaf71e7e9816b933ede1"
+HELPER = ROOT / "scripts/prepare_sft_vm_deployment_bindings_v12.py"
+HELPER_SHA = "d87e4df415d39779433853ec8821df75b904f5ab927df741fe0abf7ed8f1408b"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.1/plan.json"
+PLAN_SHA = "f361d8c0e285ee4c1593d837c780719b5115d6877fb069122010712da13e0f77"
+PROPOSAL = ROOT / "configs/lumi-vm-attempt-018-watchdog-execution-proposal-v0.1.json"
+APPROVAL = ROOT / "configs/lumi-vm-attempt-018-watchdog-execution-approval-v0.1.json"
+OUTPUT_NAME = "artifacts/lumi-vm-attempt-018-watchdog-deployment-v0.1"
+OUTPUT = ROOT / OUTPUT_NAME
+SECONDS, CALLS = 600, 45
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_inert_watchdog_rejected") from None
+
+
+def encode(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode()
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            need(key not in result)
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def read(path):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 131072)
+    raw = path.read_bytes()
+    need(len(raw) <= 131072)
+    return raw
+
+
+def sources():
+    need(sha(read(ROOT / "scripts/execute_sft_vm_inert_watchdog_v10.py")) == QUALIFIED_SHA)
+    need(sha(read(HELPER)) == HELPER_SHA and sha(read(PLAN)) == PLAN_SHA)
+    spec = importlib.util.spec_from_file_location("_attempt018_bindings", HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    manifest = helper.verify()
+    plan = decode(read(PLAN))
+    need(helper.encode(plan) == helper.encode(helper.build()))
+    evaluator_path = ROOT / "scripts/prepare_sft_vm_deployment_bindings_v1.py"
+    need(
+        sha(read(evaluator_path))
+        == "cae2aab77ac49a0dee24ed1a49b54f4a0eeb891a6217f6311d7f5e62ef7cd06f"
+    )
+    spec = importlib.util.spec_from_file_location("_attempt018_module_evaluator", evaluator_path)
+    evaluator = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evaluator)
+    evaluator.RELEASE = helper.RELEASE
+
+    def source(name):
+        relative = "scripts/" + name + ".py"
+        pin = manifest["outputs"][relative]
+        return helper.read(helper.RELEASE + "/" + relative, pin["sha256"], pin["bytes"])
+
+    worker = evaluator.module(source("sft_vm_external_watchdog_v1"), "sft_vm_external_watchdog_v1")
+    deployer = evaluator.module(
+        source("prepare_sft_vm_external_watchdog_v1"),
+        "prepare_sft_vm_external_watchdog_v1",
+        {"sft_vm_external_watchdog_v1": worker},
+    )
+    need(worker.ATTEMPT == deployer.ATTEMPT == plan["attempt"] == helper.ATTEMPT)
+    need(plan["watchdog"]["deployment_output"] == OUTPUT_NAME)
+    expected = base64.b64encode(hashlib.sha256(deployer.package()).digest()).decode()
+    need(expected == plan["watchdog"]["expected_code_sha256_base64"])
+    return plan, deployer
+
+
+def expected_proposal():
+    need(sha(read(PLAN)) == PLAN_SHA)
+    return {
+        "schema": "lumi.vm-attempt-018-watchdog-execution-proposal.v0.1",
+        "status": "prepared_not_authorized",
+        "plan_sha256": PLAN_SHA,
+        "helper_sha256": HELPER_SHA,
+        "entry_sha256": sha(read(Path(__file__))),
+        "output": OUTPUT_NAME,
+        "maximum_seconds": SECONDS,
+        "maximum_control_calls": CALLS,
+        "maximum_new_roles": 2,
+        "maximum_new_functions": 1,
+        "maximum_new_log_groups": 1,
+        "maximum_local_receipt_bytes": 1048576,
+        "invocation": False,
+        "schedule_creation": False,
+        "bucket_policy_mutation": False,
+        "instance_action": False,
+        "gpu": False,
+        "training": False,
+        "retry": False,
+        "rollback": False,
+        "execution_permitted": False,
+    }
+
+
+def expected_approval(message, proposal_sha256):
+    return {
+        "schema": "lumi.vm-attempt-018-watchdog-execution-approval.v0.1",
+        "status": "explicit_human_approval_recorded",
+        "human_message": message,
+        "proposal_sha256": proposal_sha256,
+        "entry_sha256": sha(read(Path(__file__))),
+        "plan_sha256": PLAN_SHA,
+        "scope": "one_inert_watchdog_deployment_only",
+        "approved_execution_count": 1,
+        "maximum_seconds": SECONDS,
+        "maximum_control_calls": CALLS,
+        "preserve_partial_resources_on_failure": True,
+        "invocation": False,
+        "schedule_creation": False,
+        "bucket_policy_mutation": False,
+        "instance_action": False,
+        "gpu": False,
+        "training": False,
+        "retry": False,
+        "rollback": False,
+    }
+
+
+def authorize():
+    raw = read(PROPOSAL)
+    need(encode(decode(raw)) == encode(expected_proposal()))
+    approval = decode(read(APPROVAL))
+    message = approval.get("human_message")
+    need(type(message) is str and 0 < len(message.strip()) <= 4096)
+    need(encode(approval) == encode(expected_approval(message, sha(raw))))
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    return approval
+
+
+def run(*, transport=None, clock=time.monotonic, wait=time.sleep):
+    approval = authorize()
+    plan, deployer = sources()
+    OUTPUT.mkdir(mode=0o700, parents=False, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = encode(value)
+        need(len(raw) <= 8192 and written + len(raw) <= 1048576 - 32768)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    save("entry-started.json", {
+        "approval_sha256": sha(encode(approval)),
+        "entry_sha256": sha(read(Path(__file__))),
+        "plan_sha256": PLAN_SHA,
+        "maximum_seconds": SECONDS,
+        "maximum_control_calls": CALLS,
+        "attempt": plan["attempt"],
+    })
+    cloud = qualified.BoundedCloud(
+        deployer, transport or qualified.Transport(), save, clock=clock, wait=wait
+    )
+    stage, deployment = "identity", None
+    try:
+        need(cloud.cli("sts", "get-caller-identity")["Account"] == plan["account"])
+        stage = "schedule_group_absence"
+        try:
+            cloud.cli("scheduler", "get-schedule-group", Name=deployer.GROUP)
+        except LookupError:
+            pass
+        else:
+            need(False)
+        stage = "pinned_inert_deployment"
+        deployment = deployer.deploy(OUTPUT / "deployment", cloud, wait=cloud.wait)
+        need(deployment["status"] == "deployed_unarmed_invocation_disabled")
+        status = "deployed_unarmed_invocation_disabled"
+    except Exception:
+        status = "stopped_no_retry_preserve_partial"
+    result = {
+        "status": status,
+        "stage": stage,
+        "total_control_calls": cloud.calls,
+        "mutation_dispatches": len(cloud.mutations),
+        "response_bytes": cloud.response_bytes,
+        "elapsed_seconds": round(clock() - cloud.start, 3),
+        "deployment": deployment,
+        "gate_5_complete": False,
+        "instance_actions": 0,
+        "invocation": False,
+        "schedule_creation": False,
+        "bucket_policy_mutation": False,
+        "gpu": False,
+        "training": False,
+        "retry": False,
+        "rollback": False,
+    }
+    save("entry-result.json", result)
+    return result
+
+
+if __name__ == "__main__":
+    print(encode(run()).decode(), end="")

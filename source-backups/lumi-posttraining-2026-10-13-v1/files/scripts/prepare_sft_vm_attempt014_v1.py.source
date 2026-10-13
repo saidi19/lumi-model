@@ -1,0 +1,176 @@
+"""Fresh source identity with initial-proof diagnostics. Offline preparation only."""
+
+import ast
+import json
+import os
+import re
+import types
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+
+ROOT = Path(__file__).resolve().parents[1]
+OLD = "d8664931c4984fe4a3121d2632af88a8"
+NEW = "3bef92a0d90b4d59aa3295da1f9d6ad4"
+CIDR = "172.31.96.128/27"
+BUCKET = "lumi-cleanup-" + NEW
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-014-source-v0.1"
+BASE = ROOT / "artifacts/lumi-vm-attempt-013-source-v0.1"
+INTEGRATION = ROOT / "artifacts/lumi-vm-initial-proof-integration-v0.1"
+BASE_SHA = "b8c4a274eaabe214eb677a8469ef53dabf9d419da9a666e55f20d431d78c6158"
+INTEGRATION_SHA = "e0c8263fbe69dd1608166065b210d471c1c088e8531c2459562ca8d99dc18463"
+PROOF = "evidence/lumi-vm-initial-proof-diagnostic-integration-verification-v0.1.json"
+PROOF_SHA = "ffb7c371a8125a7d209119028d1fbe7577eb0817041a788920ee5a0267f6ec41"
+BUILDER = "scripts/prepare_sft_vm_attempt013_v1.py"
+BUILDER_SHA = "4e45feab18d33a44115968ee722be90027ac535b6b10add584397a0c8046be39"
+INPUTS = "configs/lumi-vm-private-host-source-inputs-v0.1.json"
+
+
+def build():
+    closure.read(
+        ROOT / "scripts/prepare_sft_vm_attempt012_v1.py",
+        "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc",
+    )
+    proof = json.loads(closure.read(ROOT / PROOF, PROOF_SHA))
+    for name, pin in proof["bindings"].items():
+        closure.need(not Path(name).is_absolute() and ".." not in Path(name).parts)
+        closure.read(ROOT / name, pin["sha256"], pin["bytes"])
+    closure.need(proof["checks"]["tests_passed"] == 13)
+    closure.need(proof["limitations"]["historical_attempt_013_root_cause_resolved"] is False)
+    manifests = [
+        json.loads(closure.read(root / "release.json", digest))
+        for root, digest in ((BASE, BASE_SHA), (INTEGRATION, INTEGRATION_SHA))
+    ]
+    previous, integrated = [
+        {
+            name: closure.read(root / name, pin["sha256"], pin["bytes"])
+            for name, pin in manifest["outputs"].items()
+        }
+        for root, manifest in zip((BASE, INTEGRATION), manifests, strict=True)
+    ]
+    raw = closure.read(ROOT / BUILDER, BUILDER_SHA)
+    for before, after in (
+        (OLD, NEW),
+        ("attempt-013", "attempt-014"),
+        ("Attempt-013", "Attempt-014"),
+        ("attempt013", "attempt014"),
+        ("v0.14", "v0.15"),
+        ("172.31.96.96/27", CIDR),
+    ):
+        closure.need(before.encode() in raw)
+        raw = raw.replace(before.encode(), after.encode())
+    builder = types.ModuleType("_fresh_attempt014_identity_builder")
+    builder.__file__ = str(ROOT / BUILDER)
+    exec(compile(raw, builder.__file__, "exec"), builder.__dict__)
+    original, identity_report = builder.build()
+    closure.need(set(original) == set(previous) == set(integrated) and len(original) == 156)
+    ancestors = {name for name in original if name.endswith(".json") and "/" not in name}
+    mapping = {}
+    for name in original:
+        if name not in ancestors:
+            before, after = closure.sha(previous[name]), closure.sha(original[name])
+            closure.need(before not in mapping or mapping[before] == after)
+            mapping[before] = after
+    seeds = dict(original)
+    logical = set(manifests[1]["semantic_source_changes"])
+    closure.need(
+        logical
+        == {
+            "scripts/run_sft_vm_detached_delivery_v1.py",
+            "scripts/run_sft_vm_host_setup_v3.py",
+            "scripts/build_sft_vm_initial_boot_v1.py",
+            "scripts/build_sft_vm_initial_boot_v2.py",
+            "identity/build_sft_vm_initial_boot_v2.py",
+        }
+    )
+    # Rebase already-reviewed function changes onto the fresh identity graph.
+    # First undo integrated consequent hashes, then apply new identity hashes.
+    undo = {
+        closure.sha(integrated[n]): closure.sha(previous[n]) for n in previous if n not in ancestors
+    }
+    for name in logical:
+        body = re.sub(
+            rb"\b[0-9a-f]{64}\b",
+            lambda m: undo.get(m[0].decode(), m[0].decode()).encode(),
+            integrated[name],
+        )
+        body = body.replace(OLD.encode(), NEW.encode())
+        seeds[name] = re.sub(
+            rb"\b[0-9a-f]{64}\b", lambda m: mapping.get(m[0].decode(), m[0].decode()).encode(), body
+        )
+    inputs = json.loads(seeds[INPUTS])
+    for name in logical:
+        if Path(name).stem in inputs["sources"]:
+            inputs["sources"][Path(name).stem]["bytes"] = len(seeds[name])
+    seeds[INPUTS] = closure.encode(inputs)
+    final = closure.closure(original, seeds, ancestors)
+    for name, body in final.items():
+        if name.endswith(".py"):
+            ast.parse(body)
+        if name not in logical | {INPUTS}:
+            closure.need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", body)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if (
+            name in ancestors
+            or name.startswith("evidence/")
+            or name.endswith((".tar", ".gz", ".pem"))
+        ):
+            closure.need(body == original[name])
+        if name.startswith("scripts/"):
+            closure.need(OLD.encode() not in body)
+    for role, pin in json.loads(final[INPUTS])["sources"].items():
+        body = final["scripts/" + role + ".py"]
+        closure.need(len(body) == pin["bytes"] and closure.sha(body) == pin["sha256"])
+    report = dict(
+        schema="lumi.vm-attempt014-source.v0.1",
+        attempt=NEW,
+        operational_predecessor=OLD,
+        attempt_label="attempt-014",
+        outputs={
+            name: dict(bytes=len(body), sha256=closure.sha(body))
+            for name, body in sorted(final.items())
+        },
+        identity_composition=identity_report,
+        proof_sha256=PROOF_SHA,
+        builder_sha256=BUILDER_SHA,
+        integration_release_sha256=INTEGRATION_SHA,
+        cleanup_bucket=BUCKET,
+        selected_cidr=CIDR,
+        selected_cidr_live_absence_verified=False,
+        execution_permitted=False,
+        old_authorization_reused=False,
+        old_timer_reused=False,
+        fresh_controls_required=True,
+        predecessor_endpoint_still_retained=True,
+        live_endpoint_capacity_check_required=True,
+        historical_failure_root_cause_resolved=False,
+        timeout_or_policy_relaxation=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        logical_changes=sorted(logical | {INPUTS}),
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("source_preparation_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

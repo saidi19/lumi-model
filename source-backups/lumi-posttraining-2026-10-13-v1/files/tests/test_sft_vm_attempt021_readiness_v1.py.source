@@ -1,0 +1,78 @@
+"""Offline target binding and endpoint-slot checks; no cloud or process use."""
+
+import sys
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import inspect_sft_vm_attempt021_readiness_v1 as m
+from scripts import prepare_sft_vm_attempt021_controls_v1 as plan
+
+
+class Tests(unittest.TestCase):
+    def check(self, rows):
+        client = Mock()
+        client.describe_instance_connect_endpoints.return_value = dict(
+            InstanceConnectEndpoints=rows
+        )
+        report = dict(source_bindings={})
+        with patch.object(m.targets, "inspect", return_value=report):
+            return m.inspect({"ec2": client})
+
+    def test_retained_endpoint_is_explicit_block_not_import_admission(self):
+        result = self.check(
+            [
+                dict(
+                    OwnerId=m.targets.ACCOUNT,
+                    VpcId=m.targets.VPC,
+                    InstanceConnectEndpointId="eice-039630ac19d9a7694",
+                    SubnetId="subnet-0d25c06f30f8f812a",
+                    State="create-complete",
+                )
+            ]
+        )
+        self.assertFalse(result["frozen_vpc_endpoint_gate_passed"])
+        self.assertFalse(result["endpoint_deletion_authorized"])
+        self.assertEqual(result["status"], "fresh_targets_absent_network_slot_blocked")
+
+    def test_empty_slot_does_not_imply_full_admission(self):
+        result = self.check([])
+        self.assertTrue(result["frozen_vpc_endpoint_gate_passed"])
+        self.assertFalse(result["cpu_network_admitted"])
+
+    def test_owner_mismatch_is_fail_closed(self):
+        with self.assertRaises(ValueError):
+            self.check([dict(OwnerId="other", VpcId=m.targets.VPC)])
+
+    def test_sdk_mutations_objects_and_call_overrun_rejected(self):
+        client = Mock()
+        bounded = m.BoundedClients({"ec2": client, "s3": client})
+        for operation in ("run_instances", "delete_instance_connect_endpoint", "get_object"):
+            with self.assertRaises(ValueError):
+                getattr(bounded["ec2"], operation)()
+        self.assertEqual(bounded.calls, 0)
+        bounded.calls = 20
+        with self.assertRaises(ValueError):
+            bounded["ec2"].describe_instances()
+        self.assertFalse(client.mock_calls)
+
+    def test_fresh_plan_has_qualified_transfer_without_invented_control_proofs(self):
+        value = plan.fresh_plan()
+        self.assertEqual(
+            value["setup_transfer_native_qualification"]["files_readback_verified"], 19
+        )
+        self.assertEqual(value["required_control_proofs"], [])
+        self.assertIsNone(value["successful_readonly_preflight"])
+        self.assertFalse(value["execution_permitted"])
+        self.assertEqual(value["predecessor_state"]["operational_predecessor_attempt"], plan.OLD)
+        self.assertNotIn(plan.OLD, value["watchdog"]["function"])
+        self.assertEqual(value["cpu_scope_reference"]["maximum_instance_seconds"], 14400)
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

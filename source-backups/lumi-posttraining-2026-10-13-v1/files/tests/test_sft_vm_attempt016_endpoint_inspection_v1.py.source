@@ -1,0 +1,52 @@
+"""Read-only inspection rejects mutation and unsafe retained states."""
+
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import inspect_sft_vm_attempt016_endpoint_v1 as m
+from tests import test_sft_vm_attempt015_endpoint_cleanup_v1 as fixture
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.module = m.checker()
+        with patch.object(fixture, "m", self.module):
+            self.rows = fixture.fixture()
+        self.rows["describe-subnets"]["Subnets"][0]["CidrBlock"] = "172.31.96.192/27"
+        self.cloud = Mock()
+        self.cloud.call.side_effect = lambda operation: self.rows[operation]
+
+    def test_exact_state_is_inspection_not_authority(self):
+        result = m.inspect(self.module, self.cloud)
+        self.assertEqual(result["mutations"], 0)
+        self.assertFalse(result["deletion_authorized"])
+        self.assertFalse(result["cpu_launch_authorized"])
+        self.assertEqual(self.cloud.call.call_count, 7)
+
+    def test_delete_rejected_before_any_subprocess(self):
+        cloud = self.module.Cloud(lambda *args: None)
+        with patch.object(self.module.subprocess, "run") as process:
+            with self.assertRaises(ValueError):
+                cloud.call(self.module.DELETE)
+            process.assert_not_called()
+        self.assertEqual(cloud.writes, 0)
+
+    def test_running_vm_rejected(self):
+        self.rows["describe-instances"]["Reservations"][0]["Instances"][0]["State"] = {
+            "Name": "running"}
+        with self.assertRaises(ValueError):
+            m.inspect(self.module, self.cloud)
+
+    def test_foreign_endpoint_rejected(self):
+        self.rows["describe-instance-connect-endpoints"]["InstanceConnectEndpoints"][0][
+            "OwnerId"] = "foreign"
+        with self.assertRaises(ValueError):
+            m.inspect(self.module, self.cloud)
+
+    def test_source_drift_rejected(self):
+        with patch.object(m, "SOURCE_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.checker()
+
+
+if __name__ == "__main__":
+    unittest.main()

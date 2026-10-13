@@ -1,0 +1,261 @@
+"""Rebase source/control archives for attempt-008 without running their code.
+
+All inputs are pinned local source, control metadata or the existing SDK archive.
+No checkpoint, credentials, cloud clients, import worker or model is opened.
+Output is an isolated staging tree, not an installed or authorized launcher.
+"""
+
+import ast
+import base64
+import copy
+import hashlib
+import io
+import json
+import os
+import re
+import tarfile
+import zipfile
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+INPUTS = "configs/lumi-vm-recovery-release-inputs-v0.1.json"
+INPUTS_SHA = "d0158c3e89d16ef000ed21e56bbe591309316a2a1ea9b41959e9f3e278f1d404"
+IDENTITY = "artifacts/lumi-vm-recovery-identity-v0.8/manifest.json"
+IDENTITY_SHA = "bdd6839981164e07ff514fa9b9a73345a5caac9ef429c3134d66eb4d392a418f"
+OLD = "606d788073f1f0b66a39eabeb4b32c2c"
+NEW = "242bd09f5fa84b1f9a4e46cb4592ad8b"
+OUTPUT = "artifacts/lumi-vm-recovery-release-v0.8"
+LIMIT = 32 * 1024**2
+FULLSIZE = "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar"
+SETUP = "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar"
+RETENTION = "artifacts/lumi-vm-retention-source-release-v0.2/retention-source.tar"
+CONTROLLER = "artifacts/lumi-vm-root-controller-release-v0.1/root-controller.tar"
+ARCHIVES = (FULLSIZE, CONTROLLER, RETENTION, SETUP)
+
+
+def need(value):
+    if not value:
+        raise ValueError("recovery_release_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, size, pin):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and path.stat().st_size == size <= LIMIT)
+    raw = path.read_bytes()
+    need(len(raw) == size and sha(raw) == pin)
+    return raw
+
+
+def inputs():
+    raw = (ROOT / INPUTS).read_bytes()
+    need(len(raw) <= 32768 and sha(raw) == INPUTS_SHA)
+    pins = json.loads(raw)["files"]
+    need(len(pins) == 71 and sum(row["bytes"] for row in pins.values()) < LIMIT)
+    identity = (ROOT / IDENTITY).read_bytes()
+    need(sha(identity) == IDENTITY_SHA)
+    value = json.loads(identity)
+    need(value["new_attempt"] == NEW and value["predecessor_attempt"] == OLD)
+    need(value["execution_permitted"] is False)
+    return {name: read(ROOT / name, row["bytes"], row["sha256"]) for name, row in pins.items()}
+
+
+def pack(rows, bodies):
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for row in rows:
+            info = copy.copy(row)
+            body = bodies[row.name]
+            info.size = len(body)
+            archive.addfile(info, io.BytesIO(body))
+    return out.getvalue()
+
+
+def unpack(raw):
+    need(type(raw) is bytes and 0 < len(raw) <= 20 * 1024**2)
+    rows, bodies = [], {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for row in archive:
+            path = PurePosixPath(row.name)
+            need(not path.is_absolute() and ".." not in path.parts)
+            need(row.name not in bodies and str(path) == row.name)
+            need(row.type == tarfile.REGTYPE and not row.linkname and not row.pax_headers)
+            need(row.mode == 0o400 and row.uid == row.gid == row.mtime == 0)
+            need(len(rows) < 128 and 0 < row.size <= 20 * 1024**2)
+            with archive.extractfile(row) as stream:
+                body = stream.read(row.size + 1)
+            need(len(body) == row.size)
+            rows.append(row)
+            bodies[row.name] = body
+    need(sum(map(len, bodies.values())) <= 20 * 1024**2)
+    need(pack(rows, bodies) == raw)
+    return rows, bodies
+
+
+def code_pin(raw):
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        row = zipfile.ZipInfo("watchdog.py", (2026, 10, 1, 0, 0, 0))
+        row.external_attr = 0o100400 << 16
+        archive.writestr(row, raw)
+    return base64.b64encode(hashlib.sha256(out.getvalue()).digest())
+
+
+def catalog(blobs):
+    """Deduplicate identical content, including nested archives, by old digest."""
+    leaves, archives, paths, aliases = {}, {}, {}, {}
+
+    def add(path, raw):
+        key = sha(raw)
+        need(key not in leaves or leaves[key] == raw)
+        leaves[key] = raw
+        aliases.setdefault(key, set()).add(path)
+        return key
+
+    for name, raw in blobs.items():
+        paths[name] = add(name, raw)
+    for name in ARCHIVES:
+        rows, members = unpack(blobs[name])
+        children = {n: add(n, raw) for n, raw in members.items()}
+        archives[paths[name]] = (rows, children)
+    opaque = {
+        key for key, names in aliases.items() if any(n.endswith("sdk-release.tar") for n in names)
+    }
+    need(len(opaque) == 1)
+    need(all(key in archives or key in opaque or len(raw) <= 131072 for key, raw in leaves.items()))
+    return leaves, archives, paths, aliases, opaque
+
+
+def build(blobs, pins):
+    need(type(blobs) is dict and set(blobs) == set(pins))
+    need(
+        all(
+            len(raw) == pins[n]["bytes"] and sha(raw) == pins[n]["sha256"]
+            for n, raw in blobs.items()
+        )
+    )
+    original, archives, paths, aliases, opaque = catalog(blobs)
+    seeds = dict(original)
+    # Preserve the qualified v2 guard and endpoint polling fix as logical roles.
+    for target, source in (
+        ("build_sft_vm_initial_boot_v1", "build_sft_vm_initial_boot_v2"),
+        ("provision_sft_vm_host_v2", "provision_sft_vm_host_v4"),
+    ):
+        seeds[paths["scripts/" + target + ".py"]] = blobs["scripts/" + source + ".py"]
+    worker = paths["scripts/sft_vm_external_watchdog_v1.py"]
+    old_code = code_pin(original[worker])
+    old_nonce = sha(b"lumi.vm-fullsize-attempt.v0.1\0" + OLD.encode())
+    new_nonce = sha(b"lumi.vm-fullsize-attempt.v0.1\0" + NEW.encode())
+    current = dict(seeds)
+    for _iteration in range(80):
+        mapping = {key: sha(raw) for key, raw in current.items()}
+        mapping[old_nonce] = new_nonce
+        next_code = code_pin(current[worker])
+        following = {}
+        for key, raw in seeds.items():
+            if key in archives:
+                rows, children = archives[key]
+                following[key] = pack(rows, {n: current[k] for n, k in children.items()})
+            elif key in opaque:
+                following[key] = raw
+            else:
+                text = raw.decode("utf-8").replace(OLD, NEW)
+                body = re.sub(
+                    r"\b[0-9a-f]{64}\b", lambda m, mapping=mapping: mapping.get(m[0], m[0]), text
+                ).encode()
+                following[key] = body.replace(old_code, next_code)
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("recovery_release_hash_cycle") from None
+    changed = {key for key in original if current[key] != original[key]}
+    for key, raw in current.items():
+        if key in archives or key in opaque:
+            continue
+        need(OLD.encode() not in raw and old_nonce.encode() not in raw)
+        need(not any(old.encode() in raw for old in changed))
+        if any(n.endswith(".py") for n in aliases[key]):
+            ast.parse(raw)
+    # None of the checkpoint selection, model source, runtime lock or import
+    # controls changes. Only control.json's nonce and the attempt descriptor do.
+    full_rows, full_children = archives[paths[FULLSIZE]]
+    for name, key in full_children.items():
+        if name not in {"prepared-attempt.json", "controls/control.json"}:
+            need(current[key] == original[key])
+    for key in opaque:
+        need(current[key] == original[key])
+    outputs = {name: current[key] for name, key in paths.items()}
+    # Include guest src and runtime configuration dependencies for standalone
+    # source authentication. Never extract an archive to the local filesystem.
+    for archive in (FULLSIZE, RETENTION):
+        _, children = archives[paths[archive]]
+        for name, key in children.items():
+            if name.startswith(("scripts/", "src/", "configs/")):
+                need(name not in outputs or outputs[name] == current[key])
+                outputs[name] = current[key]
+    outputs["configs/lumi-sft-linux-cpu-release-v0.1.lock.json"] = current[
+        full_children["runtime-lock.json"]
+    ]
+    outputs["configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"] = current[
+        full_children["controls/input-selection.json"]
+    ]
+    # Paths intentionally retain logical names inside the isolated release;
+    # nothing is installed over the workspace's frozen files.
+    need(sum(map(len, outputs.values())) <= LIMIT)
+    summary = dict(
+        schema="lumi.vm-recovery-release.v0.1",
+        attempt=NEW,
+        identity_manifest_sha256=IDENTITY_SHA,
+        source_inputs_sha256=INPUTS_SHA,
+        iterations=_iteration + 1,
+        distinct_content_nodes=len(original),
+        changed_content_nodes=len(changed),
+        source_control_archives=len(archives),
+        checkpoint_selection_unchanged=True,
+        import_sources_and_controls_unchanged_except_attempt_nonce=True,
+        opaque_sdk_unchanged=True,
+        outputs={n: dict(bytes=len(raw), sha256=sha(raw)) for n, raw in sorted(outputs.items())},
+        installed=False,
+        cloud_calls=0,
+        execution_permitted=False,
+        gate_5_complete=False,
+        remaining=[
+            "Private subnet specialization and fresh outer loader are not integrated.",
+            "New watchdog deployment, scoped IAM and live admission are not performed.",
+        ],
+    )
+    return outputs, summary
+
+
+def prepare():
+    blobs = inputs()
+    pins = json.loads((ROOT / INPUTS).read_bytes())["files"]
+    outputs, summary = build(blobs, pins)
+    destination = ROOT / OUTPUT
+    need(not destination.exists() and not destination.is_symlink())
+    need(not any(p.is_symlink() for p in destination.parents))
+    destination.mkdir(mode=0o700)
+    outputs = outputs | {"release.json": encode(summary)}
+    need(sum(map(len, outputs.values())) <= LIMIT)
+    for name, raw in sorted(outputs.items()):
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+            stream.flush()
+            os.fsync(stream.fileno())
+        need(path.read_bytes() == raw)
+    return summary
+
+
+def run(**_arguments):
+    raise ValueError("source_release_is_not_execution_authority") from None

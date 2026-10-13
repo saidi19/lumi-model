@@ -1,0 +1,45 @@
+"""Synthetic tests for attempt-020 read-only control-target inspection."""
+
+import time
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import inspect_sft_vm_attempt020_control_targets_v1 as m
+
+
+class CodedError(Exception):
+    def __init__(self, code, status=400):
+        self.response = {
+            "Error": {"Code": code},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
+
+
+class Tests(unittest.TestCase):
+    def test_only_read_operations_are_reachable(self):
+        wrapper = m.Reads({"ec2": Mock()}, clock=time.monotonic, sleep=lambda _: None)
+        with self.assertRaises(ValueError):
+            wrapper.call("ec2", "run_instances")
+        self.assertEqual(wrapper.calls, 0)
+
+    def test_exact_absence_codes_are_accepted(self):
+        client = Mock()
+        client.get_role.side_effect = CodedError("NoSuchEntity")
+        wrapper = m.Reads({"iam": client}, sleep=lambda _: None)
+        self.assertTrue(wrapper.absent("iam", "get_role", RoleName="synthetic"))
+        self.assertEqual(wrapper.calls, 1)
+
+    def test_nonabsence_error_is_fail_closed(self):
+        client = Mock()
+        client.get_role.side_effect = CodedError("AccessDenied")
+        wrapper = m.Reads({"iam": client}, sleep=lambda _: None)
+        with self.assertRaises(CodedError):
+            wrapper.absent("iam", "get_role", RoleName="synthetic")
+
+    def test_source_helper_drift_is_rejected_before_clients(self):
+        with patch.object(m, "SOURCE_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.clients()
+
+
+if __name__ == "__main__":
+    unittest.main()

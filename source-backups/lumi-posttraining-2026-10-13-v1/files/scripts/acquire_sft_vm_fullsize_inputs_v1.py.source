@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""One acquisition child on a separately admitted Linux host; never a launcher.
+
+Uses the frozen transport/stager, not a new downloader. Root must authenticate
+the SDK/runtime, release, private disk and egress before dispatch. Credentials
+exist only in this process and its systemd credential mount. Process reaping,
+credential-source removal and read-only input handoff remain parent duties.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import re
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+RELEASE = Path("/work/release")
+ENTRY = RELEASE / "scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+SOURCE = RELEASE / "src/lumi"
+WORK = Path("/acquisition")
+RUNTIME = Path("/opt/lumi-sft-acquisition/venv")
+PACKAGE = "_lumi_acquisition_cold"
+SOURCES = {
+    "posttraining_vm_fullsize_staging_v1": (
+        "0dd28e571a9b01ef7a2270fc9df81545d5f903acfb1133ba2771ebce1c479c68"
+    ),
+    "posttraining_vm_fullsize_transport_v1": (
+        "cb6b21e6ab1011dcc2902305f67ecaf24687930ef40628b9b01b9ce40e123c30"
+    ),
+}
+CONSUMED = False
+STAGE = "boundary"
+STAGES = {
+    50: "boundary",
+    51: "source",
+    52: "selection",
+    53: "credentials",
+    54: "sdk",
+    55: "acquisition",
+    56: "report",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("acquisition_entry_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_private(path, cap=131072, modes=(0o400, 0o600, 0o644)):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        before = os.fstat(fd)
+        need(
+            stat.S_ISREG(before.st_mode)
+            and before.st_nlink == 1
+            and (before.st_uid, before.st_gid) == (os.geteuid(), os.getegid())
+            and stat.S_IMODE(before.st_mode) in modes
+            and 0 < before.st_size <= cap
+        )
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(cap + 1)
+        need(len(raw) == before.st_size and before == os.fstat(fd))
+    finally:
+        os.close(fd)
+    return raw
+
+
+def boundary(attempt):
+    need(
+        sys.platform == "linux"
+        and sys.flags.isolated
+        and sys.dont_write_bytecode
+        and Path(__file__) == ENTRY
+        and Path(sys.prefix) == RUNTIME
+        and Path(sys.executable) == RUNTIME / "bin/python"
+        and os.geteuid() == os.getegid() == 10001
+        and os.getgroups() in ([], [10001])
+        and type(attempt) is str
+        and re.fullmatch(r"[0-9a-f]{32}", attempt)
+    )
+    unit = f"lumi-vm-fullsize-v1-{attempt}-acquire.service"
+    with open("/proc/self/cgroup", "rb") as stream:
+        need(stream.read(4097).strip() == f"0::/system.slice/{unit}".encode())
+    for name, value in (("memory.max", 1024**3), ("memory.swap.max", 0), ("pids.max", 64)):
+        with (Path("/sys/fs/cgroup/system.slice") / unit / name).open("rb") as stream:
+            need(stream.read(65).strip() == str(value).encode())
+    credential = Path("/run/credentials") / unit / "aws-session.json"
+    for path in (RELEASE, SOURCE, RUNTIME, credential.parent):
+        need(os.statvfs(path).f_flag & os.ST_RDONLY)
+    need(not os.statvfs(WORK).f_flag & os.ST_RDONLY)
+    need(not any(p.is_symlink() for p in (WORK, *WORK.parents)))
+    info = WORK.lstat()
+    need(
+        stat.S_ISDIR(info.st_mode)
+        and stat.S_IMODE(info.st_mode) == 0o700
+        and info.st_uid == info.st_gid == 10001
+    )
+    return credential
+
+
+def load_transport():
+    # Authenticate both source bodies before executing either; no lumi.__init__,
+    # sys.path mutation, model library or mutable filesystem import race.
+    need(
+        not any(
+            name == PACKAGE
+            or name.startswith(PACKAGE + ".")
+            or name.split(".")[0] in {"lumi", "torch", "transformers", "botocore", "boto3"}
+            for name in sys.modules
+        )
+    )
+    bodies = {name: read_private(SOURCE / (name + ".py")) for name in SOURCES}
+    need(all(sha(bodies[name]) == pin for name, pin in SOURCES.items()))
+    package = types.ModuleType(PACKAGE)
+    package.__path__ = []
+    sys.modules[PACKAGE] = package
+    for name, body in bodies.items():
+        full_name = PACKAGE + "." + name
+        module = types.ModuleType(full_name)
+        module.__package__ = PACKAGE
+        module.__file__ = str(SOURCE / (name + ".py"))
+        sys.modules[full_name] = module
+        setattr(package, name, module)
+        exec(compile(body, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def no_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def credentials(path):
+    raw = read_private(path, 65536, modes=(0o400,))
+    value = json.loads(raw, object_pairs_hook=no_duplicate_keys)
+    need(
+        type(value) is dict
+        and set(value) == {"access_key", "secret_key", "session_token"}
+        and all(
+            type(v) is str and 1 <= len(v) <= 16384 and all(32 < ord(c) < 127 for c in v)
+            for v in value.values()
+        )
+    )
+    return value
+
+
+def sdk():
+    # Ignore manager-inherited AWS/profile/proxy/debug configuration. Explicit
+    # credentials are passed only to create_client by the frozen transport.
+    for key in list(os.environ):
+        if key.startswith(("AWS_", "BOTO_")) or key.lower().endswith("_proxy"):
+            del os.environ[key]
+    os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+    os.environ["AWS_CONFIG_FILE"] = "/dev/null"
+    os.environ["AWS_SHARED_CREDENTIALS_FILE"] = "/dev/null"
+    logging.disable(sys.maxsize)
+    from botocore.config import Config
+    from botocore.session import Session
+
+    session = Session()
+    session.set_config_variable("config_file", "/dev/null")
+    session.set_config_variable("credentials_file", "/dev/null")
+    session.set_config_variable("profile", None)
+    return session, Config
+
+
+def execute(attempt, entry_sha256, source_manifest_sha256):
+    global CONSUMED, STAGE
+    STAGE = "boundary"
+    need(not CONSUMED)
+    credential = boundary(attempt)
+    need(
+        all(
+            type(v) is str and re.fullmatch(r"[0-9a-f]{64}", v)
+            for v in (entry_sha256, source_manifest_sha256)
+        )
+    )
+    CONSUMED = True  # No in-process retry after boundary admission, even setup failure.
+    STAGE = "source"
+    need(
+        sha(read_private(ENTRY)) == entry_sha256
+        and sha(read_private(RELEASE / "release-manifest.json")) == source_manifest_sha256
+    )
+    transport = load_transport()
+    STAGE = "selection"
+    raw = read_private(RELEASE / "controls/input-selection.json")
+    transport.staging.selection(raw)
+    fd = os.open(WORK, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        transport.staging._directory(fd)
+        # Fresh directory, not merely a missing success report. Root owns its
+        # private ancestor. The frozen stager adds its own persistent marker.
+        need(os.listdir(fd) == [])
+        STAGE = "credentials"
+        secret = credentials(credential)
+        STAGE = "sdk"
+        session, config = sdk()
+        STAGE = "acquisition"
+        result = transport._acquire_admitted_once(
+            fd,
+            raw,
+            session=session,
+            config_type=config,
+            credentials=secret,
+            deadline=time.monotonic() + 3590,
+        )
+        STAGE = "report"
+        report = json.dumps(result, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        need(len(report) <= 8192)
+        out = os.open(
+            "acquisition.json",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=fd,
+        )
+        with os.fdopen(out, "wb") as stream:
+            need(stream.write(report) == len(report))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.fsync(fd)
+        return result
+    finally:
+        os.close(fd)
+        # No claim of secret erasure: only parent stop/reap removes this process.
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("attempt", "entry-sha256", "source-manifest-sha256"):
+        parser.add_argument("--" + name, required=True)
+    args = parser.parse_args()
+    try:
+        execute(**vars(args))
+    except BaseException:
+        parser.exit(
+            next((code for code, name in STAGES.items() if name == STAGE), 1),
+            "acquisition_entry_failed\n",
+        )
+
+
+if __name__ == "__main__":
+    main()

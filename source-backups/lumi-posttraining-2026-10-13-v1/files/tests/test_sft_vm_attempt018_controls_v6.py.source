@@ -1,0 +1,26 @@
+"""Offline tests for the v0.6 repaired-source control plan."""
+import unittest
+
+from scripts import prepare_sft_vm_attempt018_controls_v6 as m
+
+
+class Tests(unittest.TestCase):
+    def test_read_repair_is_bound_without_execution_authority(self):
+        plan = m.build()
+        repair = plan["source_repair"]
+        self.assertTrue(repair["bounded_transient_read_recovery"])
+        self.assertEqual(repair["read_attempts_per_call_maximum"], 3)
+        self.assertEqual(repair["read_retries_total_maximum"], 8)
+        self.assertEqual(repair["write_attempts_per_operation"], 1)
+        self.assertIsNone(plan["successful_readonly_preflight"])
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["gate_5_complete"])
+
+    def test_public_execution_entry_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,76 @@
+"""Stdlib-only cold loader for the separate VM worker, not an executable entry.
+
+Load this file directly with importlib.util, NOT via lumi.__init__, which can
+eagerly import ML. The future VM parent must authenticate the complete worker
+source closure at the fixed path and expose it read-only before calling this
+loader. This helper neither establishes that premise nor grants host admission.
+It loads the coordinator only; it does not read controls, payloads or launch work.
+The returned coordinator's runtime gate still precedes controls and ML imports.
+"""
+
+from __future__ import annotations
+
+import importlib
+import importlib.machinery
+import os
+import stat
+import sys
+import types
+from pathlib import Path
+
+SOURCE = Path("/work/release/src/lumi")
+ML_ROOTS = frozenset({"torch", "numpy", "transformers", "safetensors", "tokenizers",
+                      "jax", "tensorflow", "cupy"})
+_ATTEMPTED = False
+ERROR_CODES = frozenset({"cold_runtime_required", "source_rejected", "load_failed",
+                         "already_attempted"})
+
+
+class VMLoaderError(ValueError):
+    def __init__(self, code):
+        self.code = code if code in ERROR_CODES else "load_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code):
+    if not value:
+        raise VMLoaderError(code) from None
+
+
+def load_coordinator():
+    """Load one fixed module without executing Lumi's auto-registration hook.
+
+    This is source-loading plumbing, not the security boundary. A compromised
+    parent or source closure is outside this helper's guarantees. Any started
+    load failure consumes this interpreter; callers must not reset its state.
+    """
+    global _ATTEMPTED
+    _need(not _ATTEMPTED, "already_attempted")
+    _need(not any(name.split(".")[0] in ML_ROOTS | {"lumi"} for name in sys.modules),
+          "cold_runtime_required")
+    try:
+        _need(SOURCE.is_absolute() and ".." not in SOURCE.parts
+              and not any(p.is_symlink() for p in (SOURCE, *SOURCE.parents)), "source_rejected")
+        info = SOURCE.lstat()
+        _need(stat.S_ISDIR(info.st_mode) and not stat.S_IMODE(info.st_mode) & 0o022
+              and (info.st_uid, info.st_gid) == (os.geteuid(), os.getegid()), "source_rejected")
+    except VMLoaderError:
+        raise
+    except Exception:
+        raise VMLoaderError("source_rejected") from None
+    _ATTEMPTED = True
+    try:
+        # An explicit package namespace preserves the frozen kernels' absolute
+        # and relative Lumi imports without running __init__ or changing sys.path.
+        package = types.ModuleType("lumi")
+        package.__path__ = [str(SOURCE)]
+        package.__package__ = "lumi"
+        package.__spec__ = importlib.machinery.ModuleSpec("lumi", loader=None, is_package=True)
+        package.__spec__.submodule_search_locations = package.__path__
+        sys.modules["lumi"] = package
+        coordinator = importlib.import_module("lumi.posttraining_checkpoint_import_runner_v4")
+        _need(not any(name.split(".")[0] in ML_ROOTS for name in sys.modules), "load_failed")
+        return coordinator
+    except BaseException:
+        # Do not remove imported modules or attempt a second loader route.
+        raise VMLoaderError("load_failed") from None

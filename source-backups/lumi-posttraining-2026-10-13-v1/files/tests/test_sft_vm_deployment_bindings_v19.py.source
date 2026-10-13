@@ -1,0 +1,29 @@
+"""Offline checks for attempt-019 verified-control bindings."""
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v19 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_source_plan_and_controls(self):
+        manifest = m.verify()
+        plan = m.build()
+        self.assertEqual(len(manifest["outputs"]), 156)
+        self.assertEqual(plan["required_control_proofs"], [m.WATCH, m.STORE])
+        self.assertEqual(m.controls(), {m.WATCH: m.WATCH_SHA, m.STORE: m.STORE_SHA})
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_drift_rejected(self):
+        for key in ("SOURCE_BINDINGS_SHA", "PLAN_SHA", "WATCH_SHA", "STORE_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

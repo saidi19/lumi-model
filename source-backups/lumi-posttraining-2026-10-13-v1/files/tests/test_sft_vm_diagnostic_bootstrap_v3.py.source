@@ -1,0 +1,45 @@
+import json
+import unittest
+
+from scripts import sft_vm_diagnostic_bootstrap_v3 as m
+
+
+class Tests(unittest.TestCase):
+    def config(self):
+        return json.loads(m.user_data().split("\n", 1)[1])
+
+    def test_early_timer_has_no_sysinit_dependency_or_blocking_start(self):
+        command = self.config()["bootcmd"][0][2]
+        self.assertIn("systemd-run --no-block", command)
+        self.assertIn("--timer-property=DefaultDependencies=no", command)
+        self.assertIn("--property=DefaultDependencies=no", command)
+
+    def test_expiry_is_absolute_boot_time_not_delayed_activation(self):
+        command = self.config()["bootcmd"][0][2]
+        self.assertIn("--on-boot=600s", command)
+        self.assertIn("--timer-property=AccuracySec=1s", command)
+        self.assertNotIn("--on-active", command)
+
+    def test_key_remains_gated_on_active_timer(self):
+        command = self.config()["runcmd"][0][2]
+        self.assertLess(command.index("is-active --quiet"), command.index("LUMI_DIAG_HOSTKEY"))
+        self.assertIn("&&", command)
+        self.assertIn("expiry_not_active", command)
+        self.assertIn("systemctl --no-block poweroff", command)
+
+    def test_no_network_install_or_training(self):
+        for word in ("curl", "wget", "pip ", "aws ", "s3://", "checkpoint", "apt "):
+            self.assertNotIn(word, m.user_data())
+
+    def test_only_boot_and_final_commands_change(self):
+        before = json.loads(m.prior.user_data().split("\n", 1)[1])
+        self.assertEqual(set(before), set(self.config()))
+        self.assertEqual(set(before), {"bootcmd", "runcmd"})
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,248 @@
+"""Sealed worker READY / release / consumed protocol candidate.
+
+Two distinct, precreated local SOCK_SEQPACKET connections are required. The
+report endpoint carries READY then CONSUMED to the controller and stays open
+for the future entry report. The release endpoint receives G then an empty read
+with peer HUP from the independent guardian, whose frozen watcher closes its
+endpoint after sending G.
+Keeping these channels separate lets the worker acknowledge consumption after
+the guardian closes its release endpoint. All inherited copies must be excluded
+by the process supervisor; socket metadata alone never proves that premise.
+
+Preparation runs as root before privilege drop and sealing. After the v2 seal,
+only scalar read/write, poll, fstat/fcntl, clock, getpid and close are needed.
+The scalar writes are deliberately subject to the frozen reservation broker.
+No sendmsg, recvmsg, socket creation, credential probe or policy installation
+occurs after the seal. Raw syscalls avoid implicit Python EINTR retry.
+
+This component creates no sockets or processes. Public execution stays closed.
+All local tests replace native I/O. Only fixed errors and aggregate snapshots
+may be retained; exception objects and tracebacks are never safe to store.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import os
+import signal
+import threading
+import time
+
+from . import posttraining_checkpoint_write_guardian_v1 as guardian
+from . import posttraining_checkpoint_write_listener_v2 as listener
+
+SCHEMA = "lumi.checkpoint-write-protocol.v0.1"
+READY = b"R"
+CONSUMED = b"C"
+RELEASE = guardian.RELEASE_TOKEN
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "channel_rejected", "seal_rejected", "owner_mismatch", "already_attempted",
+    "already_failed",
+    "reentry", "deadline_exhausted", "packet_rejected", "io_failed", "close_failed",
+})
+FALSE_FLAGS = (
+    "channel_origin_authenticated", "channel_peers_exclusive",
+    "guardian_origin_authenticated", "parent_received_consumed_ack",
+    "release_queue_drained_verified",
+    "native_protocol_qualified", "native_write_enforcement_verified",
+    "bootstrap_integration_verified", "execution_permitted", "real_4b_import",
+    "gate_5_complete", "training_authorized", "production_eligible", "retry_allowed",
+)
+
+
+class ProtocolError(ValueError):
+    def __init__(self, code="io_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "io_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code):
+    if not condition:
+        raise ProtocolError(code) from None
+
+
+def run_worker_protocol(**_arguments):
+    raise ProtocolError("host_guard_not_bound") from None
+
+
+def _identity(fd):
+    """Postseal identity check uses only syscalls allowed by the frozen policy."""
+    value = os.fstat(fd)
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            fcntl.fcntl(fd, fcntl.F_GETFD), fcntl.fcntl(fd, fcntl.F_GETFL))
+
+
+def _owner():
+    value = os.getpid(), threading.get_ident()
+    _need(all(type(part) is int and part > 0 for part in value), "owner_mismatch")
+    return value
+
+
+def _read_packet(fd):
+    storage = ctypes.create_string_buffer(2)
+    result = listener.frozen._system_call(
+        0, ctypes.c_int(fd), ctypes.cast(storage, ctypes.c_void_p), ctypes.c_size_t(2),
+    )
+    _need(type(result) is int and 0 <= result <= 2, "io_failed")
+    return storage.raw[:result]
+
+
+def _write_token(fd, token):
+    _need(type(token) is bytes and token in (READY, CONSUMED), "packet_rejected")
+    storage = ctypes.create_string_buffer(token, len(token))
+    result = listener.frozen._system_call(
+        1, ctypes.c_int(fd), ctypes.cast(storage, ctypes.c_void_p), ctypes.c_size_t(1),
+    )
+    _need(type(result) is int and result == 1, "io_failed")
+
+
+class _PollFD(ctypes.Structure):
+    _fields_ = [("fd", ctypes.c_int), ("events", ctypes.c_short),
+                ("revents", ctypes.c_short)]
+
+
+def _poll_once(fd, mask, timeout_ms):
+    _need(all(type(value) is int for value in (fd, mask, timeout_ms))
+          and fd >= 3 and mask > 0 and 1 <= timeout_ms <= 3_600_000,
+          "io_failed")
+    value = _PollFD(fd, mask, 0)
+    result = listener.frozen._system_call(
+        7, ctypes.byref(value), ctypes.c_ulong(1), ctypes.c_int(timeout_ms),
+    )
+    _need(type(result) is int and result == 1 and value.fd == fd
+          and value.events == mask, "io_failed")
+    return value.revents
+
+
+class _WorkerProtocol:
+    """Borrow two endpoints; run consumes release ownership after seal admission.
+
+    Construction only probes descriptors and retains neither on failure. The
+    report endpoint remains borrowed throughout. Once run has admitted the
+    sealed owner and set started, it consumes release ownership, including every
+    subsequent failure. The caller must inspect snapshot.started before cleanup
+    if it survives an error; the intended bootstrap exits on all such errors.
+    No endpoint may be duplicated, replaced or shared during this lifetime.
+    """
+
+    def __init__(self, report_fd, release_fd, *, deadline_ns):
+        self._started = self._failed = self._closed = False
+        self._ready = self._released = self._empty_after_hup = self._ack = False
+        self._lock = threading.Lock()
+        try:
+            listener.frozen._runtime()
+            guardian._runtime()
+            _need(all(type(fd) is int and fd >= 3 for fd in (report_fd, release_fd))
+                  and report_fd != release_fd, "arguments_rejected")
+            now = time.monotonic_ns()
+            _need(type(now) is int and type(deadline_ns) is int and 0 <= now < deadline_ns
+                  < 2**63 and deadline_ns - now <= 3600 * 1_000_000_000,
+                  "deadline_exhausted")
+            for fd in (report_fd, release_fd):
+                guardian._release_descriptor(fd)
+                _need(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_NONBLOCK,
+                      "channel_rejected")
+            self._report_identity = _identity(report_fd)
+            self._release_identity = _identity(release_fd)
+            _need(self._report_identity[:2] != self._release_identity[:2],
+                  "channel_rejected")
+            self._owner = _owner()
+            self._report_fd, self._release_fd = report_fd, release_fd
+            self._deadline_ns = deadline_ns
+        except ProtocolError:
+            raise
+        except (listener.frozen.ListenerError, guardian.WriteGuardianError):
+            raise ProtocolError("runtime_rejected") from None
+        except BaseException:
+            raise ProtocolError("channel_rejected") from None
+
+    def _live(self):
+        _need(not self._failed, "already_failed")
+        _need(self._owner == _owner(), "owner_mismatch")
+        _need(signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN, "runtime_rejected")
+        now = time.monotonic_ns()
+        _need(type(now) is int and 0 <= now < self._deadline_ns, "deadline_exhausted")
+        _need(_identity(self._report_fd) == self._report_identity, "channel_rejected")
+        if self._release_fd is not None:
+            _need(_identity(self._release_fd) == self._release_identity, "channel_rejected")
+
+    def _await_packet(self):
+        self._live()
+        mask = 0x001 | 0x010 | 0x008  # POLLIN | POLLHUP | POLLERR.
+        now = time.monotonic_ns()
+        _need(type(now) is int and 0 <= now < self._deadline_ns,
+              "deadline_exhausted")
+        remaining = self._deadline_ns - now
+        flags = _poll_once(
+            self._release_fd, mask, max(1, (remaining + 999_999) // 1_000_000),
+        )
+        self._live()
+        _need(type(flags) is int and flags & mask and not flags & ~mask,
+              "packet_rejected")
+        raw = _read_packet(self._release_fd)
+        self._live()
+        return raw, bool(flags & 0x010)
+
+    def run_admitted_once(self):
+        acquired = False
+        try:
+            _need(self._owner == _owner(), "owner_mismatch")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            _need(not self._started and not self._failed, "already_attempted")
+            try:
+                listener._require_sealed_owner()
+            except BaseException:
+                raise ProtocolError("seal_rejected") from None
+            self._started = True
+            self._live()
+            _write_token(self._report_fd, READY)
+            self._live()
+            self._ready = True
+            raw, _hung_up = self._await_packet()
+            _need(type(raw) is bytes and raw == RELEASE, "packet_rejected")
+            self._released = True
+            raw, hung_up = self._await_packet()
+            # A queued zero-length seqpacket can also yield b"" with HUP while
+            # later packets remain queued. This only proves an empty read after
+            # HUP; single-writer/no-extra-packet topology remains external.
+            _need(type(raw) is bytes and raw == b"" and hung_up, "packet_rejected")
+            self._empty_after_hup = True
+            self._close_release()
+            self._live()
+            _write_token(self._report_fd, CONSUMED)
+            self._live()
+            self._ack = True
+            return self.snapshot()
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ProtocolError else "io_failed"
+            raise ProtocolError(code) from None
+        finally:
+            if acquired:
+                try:
+                    if self._started and self._release_fd is not None:
+                        self._close_release()
+                finally:
+                    self._lock.release()
+
+    def _close_release(self):
+        closing, self._release_fd = self._release_fd, None
+        try:
+            _need(_identity(closing) == self._release_identity, "channel_rejected")
+            os.close(closing)
+            self._closed = True
+        except BaseException:
+            self._failed = True
+            raise ProtocolError("close_failed") from None
+
+    def snapshot(self):
+        return {"schema": SCHEMA, "started": self._started,
+                "ready_write_returned": self._ready,
+                "release_token_read": self._released,
+                "release_empty_read_after_hup": self._empty_after_hup,
+                "release_fd_closed": self._closed, "consumed_write_returned": self._ack,
+                "report_fd_closed": False, "terminal_failed": self._failed,
+                **dict.fromkeys(FALSE_FLAGS, False)}

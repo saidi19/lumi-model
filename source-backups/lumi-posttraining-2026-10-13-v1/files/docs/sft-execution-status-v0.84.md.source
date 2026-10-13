@@ -1,0 +1,60 @@
+# SFT execution status v0.84
+
+2026-09-13. Three local implementation components are complete and tested:
+the full-size coordinator core, read-only input mount primitive, and complete
+proposed resource-envelope algebra. This advances the existing Gate 5 import
+work; it does not add another roadmap gate. Gate 5 is still incomplete.
+
+## Completed code and verification
+
+- Resource envelope v1: 34 tests. Accounts for both source audits, DCP payload
+  allowance, HF content reads, three package traversals, receipt/manifest and
+  terminal controls. The frozen private-write maximum is not raised.
+- Input mount v1: 37 tests. Checks exact native metadata identities, closed
+  inventories, worker ownership, fresh private namespace, read-only input
+  views and separate writable output. No source chmod/chown or content read.
+- Coordinator v3: 16 tests. Preserves the frozen kernel/package/audit sequence,
+  exclusive attempt markers, no retry, prepaid budgets and late-failure rules.
+  Its two fixed runtime source modules are hashed before any payload work;
+  those additional reads are explicitly prepaid and counted once.
+
+All 87 tests pass on Python 3.11.15 and 3.13.7. Final runs denied network,
+subprocess/native calls and ML imports during testing. Inputs were generated
+fixtures; kernel and mount operations were test doubles. Six new Python files
+passed syntax and 100-column checks. No new native Linux result or Ruff result
+is claimed.
+
+Review found and fixed two compatibility defects before handoff: runtime source
+files valid at 0644 must not be confused with the data-only 0600 requirement;
+and a known runtime source cannot exceed the HF control-read limit. Both fixes
+have regression tests. The old importer, host contract, evidence and CI remain
+unchanged. New code/evidence are local only; no commit or push was made.
+
+## Scope and remaining integration
+
+The new private coordinator can perform real import I/O when eventually invoked
+by an authenticated guardian. It was exercised here only with generated files
+and a kernel double. Its public `run_import` still rejects `host_guard_not_bound`.
+An underscore/private function is not a security boundary or permission grant.
+
+The mount primitive supplies input/output views, not a complete operating-system
+sandbox. The next existing task is to compose the authenticated rootfs and fixed
+guardian/bootstrap entry with the new components: preserve read-only software
+and input mounts through the final pivot, close authority descriptors, enforce
+network/cgroup/resource/privilege controls, and verify the composed successor on
+generated Linux fixtures. A later nonrecursive root rebind would discard the
+new submounts and must not be used as the integration method.
+
+Dedicated-host/runtime binding, input backing-store and external-writer exclusion,
+explicit approved full-size limits and real-host readback remain required before
+real acquisition/import. DCP serializer overhead and full-size control output
+sufficiency are not proven by synthetic tests. The eventual real import must
+still precede the documented GPU-worker/private-data/CUDA-smoke prerequisites
+and SFT. No step is being marked complete on component tests alone.
+
+No model/tokenizer/dataset payload, network/S3/instance, GPU, inference or training
+operation occurred. No GPU is needed for the next local integration-code work.
+
+Plan: `configs/lumi-4b-sft-checkpoint-import-adapter-development-v0.1.json`.
+Report: `evidence/lumi-4b-sft-checkpoint-import-adapter-development-v0.1.json`.
+Verification: matching `import-adapter-development-verification-v0.1.json`.

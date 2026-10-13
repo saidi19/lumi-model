@@ -1,0 +1,65 @@
+"""Offline source closure and immutable read-only admission boundary."""
+
+import ast
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import preflight_sft_vm_attempt022_v1 as m
+from scripts import prepare_sft_vm_attempt022_admission_bindings_v1 as builder
+
+
+class Tests(unittest.TestCase):
+    def test_plan_and_helper_reproduce_exact_new_attempt_paths(self):
+        raw = builder.read(builder.PLAN_DIR + "/plan.json")
+        release = builder.read(builder.PLAN_DIR + "/release.json")
+        self.assertEqual(builder.encode(builder.build_plan()), raw)
+        self.assertEqual(builder.helper_source(raw, release), builder.read(builder.HELPER))
+        self.assertIn("attempt-022", m.bindings.PLAN)
+        self.assertIn("attempt-022", m.bindings.WATCH)
+        self.assertIn("attempt-022", m.bindings.STORE)
+
+    def test_complete_local_graph_and_live_control_proofs_bound(self):
+        outer, manifest, pins = m.local()
+        self.assertEqual(manifest["attempt"], m.ATTEMPT)
+        self.assertEqual(manifest["receipt_file_count"], 19)
+        self.assertEqual(len(pins), 2)
+        self.assertTrue(callable(m.admission(outer)))
+        self.assertFalse(m.OUTPUT.exists())
+
+    def test_no_paid_runner_in_compiled_namespace(self):
+        callback = m.admission(None)
+        self.assertNotIn("run", callback.__globals__)
+        self.assertNotIn("authorized", callback.__globals__)
+        tree = ast.parse(Path(m.__file__).read_bytes())
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Attribute) and node.attr == "_run_network_host_once"
+                for node in ast.walk(tree)
+            )
+        )
+
+    def test_runtime_hash_drift_rejected(self):
+        for name in ("BINDINGS_SHA", "BUDGET_SHA", "SOURCE_SHA", "BOTOCORE_INIT_SHA"):
+            with self.subTest(name=name), patch.object(m, name, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.runtime()
+
+    def test_calls_and_identity_ledger_use_frozen_inclusive_guard(self):
+        self.assertEqual(m.MAX_CALLS, m.budget.MAX_CALLS)
+        self.assertEqual(m.MAX_SECONDS, m.budget.MAX_SECONDS)
+        code = Path(m.__file__).read_text()
+        self.assertIn("meter.clients(reader)", code)
+        self.assertIn("meter.inspect(inspect, bundle)", code)
+        self.assertNotIn("outer.credentials.Clients(reader)", code)
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

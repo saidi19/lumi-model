@@ -1,0 +1,142 @@
+"""Narrow source repair and producer/consumer checks for setup controls."""
+
+import ast
+import types
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_receipt_repair_rejected") from None
+
+
+def replace(raw, before, after):
+    need(raw.count(before) == 1)
+    return raw.replace(before, after)
+
+
+def repair_sender(raw):
+    raw = replace(raw, b'"files": 18,', b'"files": len(inputs.FILES),')
+    helper = b'''def validate_receipt_contract(raw):
+    """Compare the actual receiver receipt before any remote seed or transfer."""
+    produced = inputs.receipt(raw) | {
+        "staged_files_readback_match": True,
+        "readonly_mounts_established": False,
+    }
+    need(inputs.canonical(produced) == inputs.canonical(expected_receipt()))
+
+
+'''
+    raw = replace(raw, b"def run(**_arguments):", helper + b"def run(**_arguments):")
+    raw = replace(
+        raw,
+        b"    inputs.unpack(raw, ARCHIVE_SHA)\n",
+        b"    inputs.unpack(raw, ARCHIVE_SHA)\n    validate_receipt_contract(raw)\n",
+    )
+    raw = replace(
+        raw,
+        b"    inputs.sync(output)\n    try:\n",
+        b'    inputs.sync(output)\n    phase = "before_dispatch"\n    try:\n',
+    )
+    raw = replace(
+        raw,
+        b"        reply = pipe_exchange(argv, source + raw, LOCAL_SECONDS)\n",
+        b'        phase = "exchange"\n'
+        b"        reply = pipe_exchange(argv, source + raw, LOCAL_SECONDS)\n",
+    )
+    raw = replace(
+        raw,
+        b"        observed = delivery.decode(reply)\n",
+        b'        phase = "receipt_decode"\n        observed = delivery.decode(reply)\n',
+    )
+    raw = replace(
+        raw,
+        b"        need(inputs.canonical(observed) == inputs.canonical(expected_receipt()))\n",
+        b'        phase = "receipt_contract"\n'
+        b"        need(inputs.canonical(observed) == inputs.canonical(expected_receipt()))\n",
+    )
+    raw = replace(
+        raw,
+        b'        report["remote_completion_unknown"] = report["ssh_dispatch_attempted"]\n',
+        b'        report["failure_stage"] = phase\n'
+        b'        report["remote_completion_unknown"] = report["ssh_dispatch_attempted"]\n',
+    )
+    ast.parse(raw)
+    return raw
+
+
+def repair_bootstrap(raw):
+    raw = replace(
+        raw,
+        b"    INPUTS.unpack(content, sender.ARCHIVE_SHA)\n",
+        b"    INPUTS.unpack(content, sender.ARCHIVE_SHA)\n"
+        b"    sender.validate_receipt_contract(content)\n",
+    )
+    ast.parse(raw)
+    return raw
+
+
+def repair_outer(raw, sender_sha):
+    raw = replace(
+        raw,
+        b"PINS = {\n",
+        b'PINS = {\n    "send_sft_vm_setup_inputs_v5.py": "' + sender_sha.encode() + b'",\n',
+    )
+    hook = b"""    import send_sft_vm_setup_inputs_v5 as setup_sender
+
+    need(Path(setup_sender.__file__).resolve() == ROOT / "scripts/send_sft_vm_setup_inputs_v5.py")
+    archive = setup_sender.inputs.read(
+        ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar",
+        setup_sender.ARCHIVE_BYTES,
+    )
+    setup_sender.inputs.unpack(archive, setup_sender.ARCHIVE_SHA)
+    setup_sender.validate_receipt_contract(archive)
+
+
+"""
+    raw = replace(raw, b"\n\nclass ReadCloud:", b"\n" + hook + b"class ReadCloud:")
+    ast.parse(raw)
+    return raw
+
+
+def receipt_functions(sender_raw, receiver):
+    names = {"expected_receipt", "validate_receipt_contract"}
+    nodes = [node for node in ast.parse(sender_raw).body if getattr(node, "name", None) in names]
+    need(len(nodes) == 2)
+    tree = ast.parse(sender_raw)
+    constants = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target = node.targets[0]
+            if isinstance(target, ast.Name) and target.id in {"ARCHIVE_SHA", "ARCHIVE_BYTES"}:
+                constants[target.id] = ast.literal_eval(node.value)
+    namespace = {"inputs": receiver, "need": need, **constants}
+    exec(
+        compile(ast.Module(body=nodes, type_ignores=[]), "<setup-receipt-check>", "exec"), namespace
+    )
+    return namespace
+
+
+def receiver_module(raw, path):
+    module = types.ModuleType("_setup_receiver_contract")
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def check(sender_raw, receiver_raw, archive, path):
+    receiver = receiver_module(receiver_raw, path)
+    members = receiver.unpack(archive, receiver.sha(archive))
+    functions = receipt_functions(sender_raw, receiver)
+    functions["validate_receipt_contract"](archive)
+    expected = functions["expected_receipt"]()
+    produced = receiver.receipt(archive) | {
+        "staged_files_readback_match": True,
+        "readonly_mounts_established": False,
+    }
+    need(receiver.canonical(expected) == receiver.canonical(produced))
+    need(expected["files"] == len(members) == len(receiver.FILES) == 19)
+    return expected
+
+
+def run(**_arguments):
+    raise ValueError("local_source_repair_is_not_execution_authority") from None

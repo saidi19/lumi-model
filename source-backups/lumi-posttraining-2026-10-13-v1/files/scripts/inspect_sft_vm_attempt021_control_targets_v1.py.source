@@ -1,0 +1,240 @@
+"""Bounded read-only absence and predecessor-retention check for attempt-021."""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import inspect_sft_vm_attempt019_control_targets_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_SHA = "393a72b5c74aedb4666df2afd95c5b5faf852e9d0de0cf160699d74bdd447970"
+ATTEMPT = "07be75c955dc43fe8818192e8a9e3fc1"
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+VPC = "vpc-0905fbf9490a2dead"
+CIDR = "172.31.97.64/27"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-021-control-plan-v0.1/plan.json"
+PLAN_SHA = "dde30fcd32f58e16e2c1ef8f3ce814474204830380bcacc17dff23b4123fc6d8"
+SOURCE_PROOF = ROOT / "evidence/lumi-vm-attempt-021-source-verification-v0.1.json"
+SOURCE_PROOF_SHA = "e229517116e979636fa818ac20c921f52151bb644a9c24ebc28262e25a4fef87"
+PREDECESSOR_PROOF = (
+    ROOT / "evidence/lumi-vm-attempt-020-v025-execution-verification-v0.1.json"
+)
+PREDECESSOR_PROOF_SHA = "f18eae3048a52d319e6cf8c4d57e151be798f43a9505ce15af9ff3b4f92c42e1"
+PREDECESSOR_BINDING = (
+    ROOT
+    / "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/binding.json"
+)
+PREDECESSOR_BINDING_SHA = "643d962d424b073536d2f871a835aeaf5e6a4ca2477598949c769b0a23302663"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-021-control-target-absence-v0.1.json"
+FUNCTION = "lumi-stop-" + ATTEMPT
+WORKER_ROLE = "lumi-stop-worker-" + ATTEMPT
+SCHEDULE_ROLE = "lumi-stop-schedule-" + ATTEMPT
+GROUP = "lumi-stop-" + ATTEMPT
+LOG_GROUP = "/aws/lambda/" + FUNCTION
+BUCKET = "lumi-cleanup-" + ATTEMPT
+KEY = "lumi-fullsize-" + ATTEMPT
+SECURITY_GROUPS = [KEY + "-vm", KEY + "-endpoint"]
+IAM_USERS = ["lumi-acquire-" + ATTEMPT, "lumi-retain-" + ATTEMPT]
+IAM_ROLES = [WORKER_ROLE, SCHEDULE_ROLE, *IAM_USERS]
+MAX_CALLS = 20
+MAX_SECONDS = 300
+Reads = source.Reads
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt021_control_target_absence_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, digest, maximum=64 * 1024):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= maximum)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def clients():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_SHA)
+    return source.clients()
+
+
+def inspect(cloud):
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_SHA)
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    predecessor = json.loads(read(PREDECESSOR_PROOF, PREDECESSOR_PROOF_SHA))
+    binding = json.loads(read(PREDECESSOR_BINDING, PREDECESSOR_BINDING_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["network_candidate_cidr"] == CIDR
+        and plan["network_candidate_live_availability_verified"] is False
+        and plan["control_target_absence_evidence"] is None
+        and plan["execution_permitted"] is False
+        and proof["attempt"] == ATTEMPT
+        and proof["receipt_contract"]["file_count"] == 19
+        and proof["new_execution_authorized"] is False
+        and predecessor["attempt"] == binding["attempt"]
+        and predecessor["execution"]["retry"] is False
+        and predecessor["live_verification"]["instance_state"] == "stopped"
+        and set(predecessor["live_verification"]["encrypted_retained_volumes"])
+        == {binding["root_volume"], binding["work_volume"]}
+    )
+    reads = Reads(cloud)
+    identity = reads.call("sts", "get_caller_identity")
+    need(identity["Account"] == ACCOUNT)
+    subnets = reads.call(
+        "ec2",
+        "describe_subnets",
+        Filters=[
+            {"Name": "vpc-id", "Values": [VPC]},
+            {"Name": "cidr-block", "Values": [CIDR]},
+        ],
+    )["Subnets"]
+    endpoints = reads.call(
+        "ec2",
+        "describe_instance_connect_endpoints",
+        Filters=[{"Name": "tag:LumiAttempt", "Values": [ATTEMPT]}],
+    )["InstanceConnectEndpoints"]
+    instances = reads.call(
+        "ec2",
+        "describe_instances",
+        Filters=[{"Name": "tag:LumiAttempt", "Values": [ATTEMPT]}],
+        MaxResults=100,
+    )["Reservations"]
+    keys = reads.call("ec2", "describe_key_pairs", Filters=[{"Name": "key-name", "Values": [KEY]}])[
+        "KeyPairs"
+    ]
+    groups = reads.call(
+        "ec2",
+        "describe_security_groups",
+        Filters=[{"Name": "group-name", "Values": SECURITY_GROUPS}],
+    )["SecurityGroups"]
+    observations = {
+        "selected_cidr": CIDR,
+        "selected_cidr_subnets": len(subnets),
+        "attempt_instance_connect_endpoints": len(endpoints),
+        "attempt_tagged_instances": sum(len(item["Instances"]) for item in instances),
+        "attempt_key_pairs": len(keys),
+        "attempt_security_groups": len(groups),
+        "watchdog_function_exists": not reads.absent(
+            "lambda", "get_function_configuration", FunctionName=FUNCTION
+        ),
+        "watchdog_worker_role_exists": not reads.absent("iam", "get_role", RoleName=WORKER_ROLE),
+        "watchdog_schedule_role_exists": not reads.absent(
+            "iam", "get_role", RoleName=SCHEDULE_ROLE
+        ),
+        "acquisition_user_exists": not reads.absent("iam", "get_user", UserName=IAM_USERS[0]),
+        "retention_user_exists": not reads.absent("iam", "get_user", UserName=IAM_USERS[1]),
+        "acquisition_role_exists": not reads.absent("iam", "get_role", RoleName=IAM_ROLES[2]),
+        "retention_role_exists": not reads.absent("iam", "get_role", RoleName=IAM_ROLES[3]),
+        "watchdog_schedule_group_exists": not reads.absent(
+            "scheduler", "get_schedule_group", Name=GROUP
+        ),
+    }
+    log_groups = reads.call("logs", "describe_log_groups", logGroupNamePrefix=LOG_GROUP, limit=10)[
+        "logGroups"
+    ]
+    observations["watchdog_log_group_exists"] = any(
+        item["logGroupName"] == LOG_GROUP for item in log_groups
+    )
+    observations["dedicated_cleanup_bucket_exists"] = not reads.absent(
+        "s3", "head_bucket", Bucket=BUCKET, ExpectedBucketOwner=ACCOUNT
+    )
+    predecessor_instances = reads.call(
+        "ec2", "describe_instances", InstanceIds=[binding["instance"]]
+    )["Reservations"]
+    predecessor_items = [
+        item for reservation in predecessor_instances for item in reservation["Instances"]
+    ]
+    predecessor_volumes = reads.call(
+        "ec2",
+        "describe_volumes",
+        VolumeIds=[binding["root_volume"], binding["work_volume"]],
+    )["Volumes"]
+    need(
+        len(predecessor_items) == 1
+        and predecessor_items[0]["State"]["Name"] == "stopped"
+        and predecessor_items[0]["InstanceType"] == "r6i.4xlarge"
+        and {item["VolumeId"] for item in predecessor_volumes}
+        == {binding["root_volume"], binding["work_volume"]}
+        and all(item["Encrypted"] is True for item in predecessor_volumes)
+        and all(
+            item["Ebs"]["DeleteOnTermination"] is False
+            for item in predecessor_items[0]["BlockDeviceMappings"]
+        )
+    )
+    counts = [
+        value
+        for key, value in observations.items()
+        if key.endswith(("_subnets", "_endpoints", "_instances", "_pairs", "_groups"))
+    ]
+    flags = [value for key, value in observations.items() if key.endswith("_exists")]
+    need(all(value == 0 for value in counts) and all(value is False for value in flags))
+    now = dt.datetime.now(dt.UTC)
+    return {
+        "schema": "lumi.vm-attempt021-control-target-absence.v0.1",
+        "date": now.date().isoformat(),
+        "observed_at_utc": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "attempt": ATTEMPT,
+        "account": ACCOUNT,
+        "region": REGION,
+        "vpc": VPC,
+        "source_bindings": {
+            str(PLAN.relative_to(ROOT)): PLAN_SHA,
+            str(SOURCE_PROOF.relative_to(ROOT)): SOURCE_PROOF_SHA,
+            str(PREDECESSOR_PROOF.relative_to(ROOT)): PREDECESSOR_PROOF_SHA,
+            str(PREDECESSOR_BINDING.relative_to(ROOT)): PREDECESSOR_BINDING_SHA,
+        },
+        "observations": observations,
+        "predecessor_retention": {
+            "attempt": binding["attempt"],
+            "instance_state": "stopped",
+            "instance_type": "r6i.4xlarge",
+            "encrypted_volume_count": 2,
+            "delete_on_termination": False,
+            "mutated": False,
+        },
+        "read_only_aws_calls": reads.calls,
+        "bounded_transient_read_retries": reads.retries,
+        "max_calls": MAX_CALLS,
+        "max_seconds": MAX_SECONDS,
+        "cloud_mutations": 0,
+        "object_access": 0,
+        "instance_actions": 0,
+        "checkpoint_access": False,
+        "collision_free_for_control_preparation": True,
+        "execution_permitted": False,
+        "cpu_launch_authorized": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def run():
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    result = inspect(clients())
+    raw = encode(result)
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
+if __name__ == "__main__":
+    run()

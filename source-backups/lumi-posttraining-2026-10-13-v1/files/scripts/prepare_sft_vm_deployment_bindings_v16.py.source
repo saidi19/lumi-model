@@ -1,0 +1,90 @@
+"""Attempt-018 final corrected CPU-scope bindings; never execution authority."""
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v15 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = "3e52f542a37d49aafd292fb211682c81644372aba0f3ced6c70a4becf328ab80"
+ATTEMPT = source.ATTEMPT
+OLD = source.OLD
+BUCKET = source.BUCKET
+RELEASE = source.RELEASE
+RELEASE_SHA = source.RELEASE_SHA
+PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.5/plan.json"
+PLAN_SHA = "b85f942cb8ee24ace8a4633435c1561426b69074a70fd77c7ed079a0c9f881ae"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.5/release.json"
+PLAN_RELEASE_SHA = "d380b408582a4cecbf0186fd1891f321e918ea2f5f5142e7fda35f75a1b356d2"
+WATCH = source.WATCH
+STORE = source.STORE
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_binding_v16_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    return source.read(name, digest, size)
+
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(
+        plan_release["plan_sha256"] == PLAN_SHA
+        and plan_release["source_release_sha256"] == RELEASE_SHA
+        and plan_release["successful_readonly_preflight_sha256"]
+        == "c4ec0781342f87e192128361e73fa16ce021adffdcaf16585df383be4f5af709"
+        and plan_release["source_versions_bound"] is True
+        and plan_release["retention_implementation_bound"] is True
+        and plan_release["watchdog_launch_interlock_bound"] is True
+        and plan_release["wire_or_billing_byte_cap_claimed"] is False
+        and plan_release["execution_permitted"] is False
+    )
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    scope = plan["cpu_scope_reference"]
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and scope["source"]["source_versions_bound"] is True
+        and scope["source"]["hard_ip_packet_quotas_implemented"] is True
+        and scope["source"]["wire_or_billing_byte_cap_claimed"] is False
+        and scope["retention"]["status"]
+        == "implemented_requires_admitted_one_shot_credentials_and_readback"
+        and scope["watchdog_launch_interlock_bound"] is True
+        and scope["status"] == "guarded_execution_prepared_not_authorized"
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    build()
+    pins = source.controls()
+    need(set(pins) == {WATCH, STORE})
+    return pins
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

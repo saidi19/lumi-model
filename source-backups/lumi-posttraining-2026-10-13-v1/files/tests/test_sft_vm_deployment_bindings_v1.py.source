@@ -1,0 +1,175 @@
+"""Pure deployment scope/policy tests. No deployment or live policy access."""
+
+import base64
+import copy
+import hashlib
+import importlib
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("prepare_sft_vm_deployment_bindings_v1")
+
+
+class DeploymentBindingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.blobs, cls.pins = m.inputs()
+        cls.plan = m.build(cls.blobs, cls.pins)
+
+    def policy(self):
+        return dict(
+            Version="2012-10-17",
+            Id="synthetic-existing-policy",
+            Statement=[
+                dict(
+                    Sid="PreserveMe",
+                    Effect="Deny",
+                    Principal="*",
+                    Action="s3:DeleteBucket",
+                    Resource="arn:aws:s3:::synthetic",
+                )
+            ],
+        )
+
+    def merge(self, document):
+        raw = m.encode(document)
+        return m.merge_policy(raw, m.sha(raw), self.plan)
+
+    def test_exact_new_identity_and_closed_scope(self):
+        p = self.plan
+        self.assertEqual(p, m.build(self.blobs, self.pins))
+        self.assertEqual(p["attempt"], m.ATTEMPT)
+        self.assertFalse(p["execution_permitted"] or p["gate_5_complete"])
+        self.assertIsNone(p["approval_record"])
+        self.assertNotIn(m.OLD, json.dumps(p))
+        self.assertEqual(len(p["watchdog"]["roles"]), 2)
+        self.assertEqual(p["watchdog"]["reserved_concurrency"], 0)
+        self.assertFalse(p["watchdog"]["invocation_allowed"])
+        self.assertFalse(p["watchdog"]["schedule_creation_allowed"])
+
+    def test_real_watchdog_zip_hash_matches_bound_code(self):
+        worker = m.module(self.blobs[m.SOURCES[0]], "sft_vm_external_watchdog_v1")
+        inert = m.module(
+            self.blobs[m.SOURCES[1]],
+            "prepare_sft_vm_external_watchdog_v1",
+            {"sft_vm_external_watchdog_v1": worker},
+        )
+        pin = base64.b64encode(hashlib.sha256(inert.package()).digest()).decode()
+        self.assertEqual(pin, self.plan["watchdog"]["expected_code_sha256_base64"])
+        for row in self.plan["watchdog"]["roles"]:
+            self.assertIn(m.ATTEMPT, row["role"])
+            self.assertNotIn(m.OLD, json.dumps(row))
+
+    def test_stop_policy_is_tag_bound_and_not_general_compute_access(self):
+        worker = self.plan["watchdog"]["roles"][0]["inline_policy"]["Statement"]
+        allow = next(
+            r for r in worker if r.get("Action") == "ec2:StopInstances" and r["Effect"] == "Allow"
+        )
+        self.assertEqual(
+            allow["Condition"]["StringEquals"]["ec2:ResourceTag/LumiAttempt"], m.ATTEMPT
+        )
+        scheduler = self.plan["watchdog"]["roles"][1]["inline_policy"]["Statement"]
+        invoke = next(r for r in scheduler if r["Effect"] == "Allow")
+        self.assertEqual(invoke["Action"], "lambda:InvokeFunction")
+        self.assertTrue(invoke["Resource"].endswith(":lumi-stop-" + m.ATTEMPT))
+
+    def test_four_denials_only_new_cleanup_prefix_no_allow(self):
+        scope = self.plan["cleanup_store"]
+        self.assertEqual(scope["new_allows"], 0)
+        self.assertEqual(len(scope["deny_statements"]), 4)
+        for row in scope["deny_statements"]:
+            self.assertEqual(row["Effect"], "Deny")
+            self.assertEqual(
+                row["Resource"], "arn:aws:s3:::" + scope["bucket"] + "/" + scope["prefix"] + "*"
+            )
+        self.assertFalse(scope["standalone_policy_document"])
+
+    def test_merge_preserves_every_existing_statement_and_field(self):
+        before = self.policy()
+        saved = copy.deepcopy(before)
+        result = self.merge(before)
+        self.assertEqual(before, saved)
+        self.assertEqual(result["candidate"]["Id"], before["Id"])
+        self.assertEqual(result["candidate"]["Statement"][:-4], before["Statement"])
+        self.assertFalse(result["write_authorized"])
+        self.assertEqual(m.sha(m.encode(result["candidate"])), result["after_sha256"])
+
+    def test_existing_exact_rules_need_no_write(self):
+        policy = self.merge(self.policy())["candidate"]
+        result = self.merge(policy)
+        self.assertEqual(result["status"], "already_present_no_write")
+        self.assertIsNone(result["candidate"])
+        self.assertEqual(result["before_sha256"], result["after_sha256"])
+
+    def test_partial_or_conflicting_sid_rejected_without_mutation(self):
+        wanted = self.plan["cleanup_store"]["deny_statements"]
+        for rows in (wanted[:1], [dict(wanted[0], Resource="*")], wanted + wanted[:1]):
+            policy = self.policy()
+            policy["Statement"] += rows
+            with self.subTest(rows=len(rows)), self.assertRaises(ValueError):
+                self.merge(policy)
+
+    def test_stale_policy_hash_rejected(self):
+        with self.assertRaises(ValueError):
+            m.merge_policy(m.encode(self.policy()), "0" * 64, self.plan)
+
+    def test_duplicate_keys_and_oversized_policy_rejected(self):
+        raw = b'{"Statement":[],"Statement":[]}'
+        with self.assertRaises(ValueError):
+            m.merge_policy(raw, m.sha(raw), self.plan)
+        raw = m.encode(self.policy()) + b" " * 16384
+        with self.assertRaises(ValueError):
+            m.merge_policy(raw, m.sha(raw), self.plan)
+
+    def test_widened_policy_or_changed_budget_plan_rejected(self):
+        for field in ("policy", "host", "bool", "approval"):
+            plan = copy.deepcopy(self.plan)
+            if field == "policy":
+                plan["cleanup_store"]["deny_statements"][0]["Resource"] = "*"
+            elif field == "host":
+                plan["cpu_scope_reference"]["maximum_instance_seconds"] += 1
+            elif field == "bool":
+                plan["cpu_scope_reference"]["instance_count"] = True
+            else:
+                plan["execution_permitted"] = True
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                m.approval_template(plan)
+
+    def test_approval_template_cannot_authorize_cpu_or_bucket_write(self):
+        value = m.approval_template(self.plan)
+        self.assertEqual(value["plan_sha256"], m.sha(m.encode(self.plan)))
+        self.assertEqual(value["approved_execution_count"], 0)
+        self.assertIsNone(value["human_message"])
+        self.assertIsNone(value["deployment_entry_sha256"])
+        self.assertFalse(value["cpu_execution_approved"] or value["cleanup_policy_write_approved"])
+        with self.assertRaises(ValueError):
+            m.run(approved=True, approval=value)
+
+    def test_cpu_reference_preserves_original_limits(self):
+        host = m.decode(self.blobs[m.SOURCES[5]])
+        cpu = self.plan["cpu_scope_reference"]
+        self.assertEqual(cpu["storage"], host["storage"])
+        self.assertEqual(cpu["source"], host["transport"])
+        self.assertEqual(cpu["import_limits"], host["frozen_import_content_limits"])
+        self.assertEqual(cpu["retention"], host["retention_proposal"])
+        self.assertEqual(cpu["maximum_instance_seconds"], 14400)
+        self.assertIsNone(cpu["execution_entry_sha256"])
+
+    def test_each_tampered_source_rejected(self):
+        for name in self.blobs:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.build(self.blobs | {name: self.blobs[name] + b"\n"}, self.pins)
+
+    def test_frozen_release_manifest_tamper_rejected(self):
+        real = Path.read_bytes
+
+        def read(path):
+            raw = real(path)
+            return raw + b"\n" if path == m.ROOT / m.RELEASE / "release.json" else raw
+
+        with patch.object(Path, "read_bytes", read), self.assertRaises(ValueError):
+            m.inputs()

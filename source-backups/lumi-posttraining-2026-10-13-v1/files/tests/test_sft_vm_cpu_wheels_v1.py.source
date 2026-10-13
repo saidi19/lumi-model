@@ -1,0 +1,218 @@
+import configparser
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import signal
+import tempfile
+import types
+import unittest
+from email.message import Message
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+m = load("wheel_test", "scripts/acquire_sft_vm_cpu_wheels_v1.py")
+cpu = load("wheel_cpu_test", "scripts/install_sft_vm_cpu_runtime_v1.py")
+
+
+class Response(io.BytesIO):
+    def __init__(self, row, body=b"abc", status=200):
+        super().__init__(body)
+        self.row, self.status = row, status
+        self.headers = Message()
+        self.headers["Content-Length"] = str(row["bytes"])
+
+    def geturl(self):
+        return self.row["url"]
+
+
+class WheelTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.input = self.root / "input"
+        self.receipts = self.root / "receipts"
+        self.input.mkdir()
+        self.receipts.mkdir()
+        self.rows = [
+            dict(
+                filename=f"package{i}.whl",
+                bytes=3,
+                sha256=hashlib.sha256(b"abc").hexdigest(),
+                url=f"https://files.pythonhosted.org/package{i}.whl",
+            )
+            for i in range(34)
+        ]
+        self.calls = []
+        self.response = lambda row: Response(row)
+
+        def opened(request, timeout):
+            self.calls.append(request)
+            self.assertLessEqual(timeout, 30)
+            row = next(row for row in self.rows if row["url"] == request.full_url)
+            return self.response(row)
+
+        self.enterContext(patch.object(m, "INPUT", self.input))
+        self.enterContext(patch.object(m, "RECEIPTS", self.receipts))
+        self.enterContext(patch.object(m, "installer", return_value=cpu))
+        self.enterContext(patch.object(m, "boundary"))
+        self.enterContext(patch.object(cpu, "INPUT", self.input))
+        self.enterContext(patch.object(cpu, "helpers", return_value=None))
+        self.enterContext(patch.object(cpu, "lock", return_value=self.rows))
+        self.enterContext(patch.object(cpu, "owned", side_effect=lambda p, **kw: p.lstat()))
+        self.enterContext(
+            patch.object(m, "opener", return_value=types.SimpleNamespace(open=opened))
+        )
+        self.timer = self.enterContext(patch.object(m.signal, "setitimer"))
+        self.enterContext(patch.object(m.signal, "getitimer", return_value=(0, 0)))
+        self.enterContext(patch.object(m.signal, "getsignal", return_value=signal.SIG_DFL))
+
+    def acquire(self):
+        return m._acquire_admitted_once(deadline=200, clock=lambda: 0)
+
+    def test_34_one_shot_gets_frozen_installer_readback_and_no_retry(self):
+        result = self.acquire()
+        self.assertEqual(len(self.calls), 34)
+        self.assertEqual(result["verified_content_bytes"], 102)
+        self.assertTrue(result["all_wheel_readback_matches"])
+        self.assertFalse(result["runtime_installed"])
+        self.assertTrue(all(r.get_method() == "GET" for r in self.calls))
+        self.assertTrue(all(r.get_header("Accept-encoding") == "identity" for r in self.calls))
+        self.assertEqual(cpu.audit_wheels(self.rows), 102)
+        with self.assertRaises(FileExistsError):
+            self.acquire()
+        self.assertEqual(len(self.calls), 34)
+
+    def test_corrupt_short_and_oversize_body_preserved_without_next_get(self):
+        for body in (b"bad", b"ab", b"abcd"):
+            target = self.root / f"body-{len(body)}"
+            with self.assertRaises(ValueError):
+                m.fetch(
+                    self.rows[0],
+                    target,
+                    types.SimpleNamespace(
+                        open=lambda *a, body=body, **k: Response(self.rows[0], body)
+                    ),
+                    100,
+                    lambda: 0,
+                )
+            self.assertTrue(target.exists())
+
+    def test_failure_no_retry_no_exception_or_url_in_receipt(self):
+        def failed(row):
+            raise OSError("private text")
+
+        self.response = failed
+        with self.assertRaisesRegex(ValueError, "^cpu_wheel_acquisition_failed$"):
+            self.acquire()
+        raw = (self.receipts / "cpu-wheels-failed.json").read_bytes()
+        self.assertNotIn(b"private text", raw)
+        self.assertNotIn(b"https", raw)
+        self.assertEqual(json.loads(raw)["requests_started"], 1)
+        with self.assertRaises(FileExistsError):
+            self.acquire()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_origin_credentials_query_fragment_and_filename_changes_block_all_requests(self):
+        for url in (
+            "http://files.pythonhosted.org/package0.whl",
+            "https://evil.test/package0.whl",
+            "https://user@files.pythonhosted.org/package0.whl",
+            "https://files.pythonhosted.org/package0.whl?q=x",
+            "https://files.pythonhosted.org/package0.whl#x",
+            "https://files.pythonhosted.org/wrong.whl",
+        ):
+            rows = copy.deepcopy(self.rows)
+            rows[0]["url"] = url
+            with patch.object(cpu, "lock", return_value=rows), self.assertRaises(ValueError):
+                self.acquire()
+        self.assertFalse(self.calls)
+        self.assertFalse((self.input / "wheels").exists())
+
+    def test_bad_status_encoding_length_and_chunked_rejected(self):
+        for field, value in (
+            ("Content-Length", "4"),
+            ("Content-Encoding", "gzip"),
+            ("Transfer-Encoding", "chunked"),
+            ("status", 302),
+        ):
+            response = Response(self.rows[0])
+            if field == "status":
+                response.status = value
+            else:
+                del response.headers[field]
+                response.headers[field] = value
+            with self.assertRaises(ValueError):
+                m.fetch(
+                    self.rows[0],
+                    self.root / field,
+                    types.SimpleNamespace(open=lambda *a, response=response, **k: response),
+                    100,
+                    lambda: 0,
+                )
+            self.assertFalse((self.root / field).exists())
+
+    def test_existing_alarm_and_invalid_deadline_rejected_without_reset(self):
+        with (
+            patch.object(m.signal, "getitimer", return_value=(10, 0)),
+            self.assertRaises(ValueError),
+        ):
+            self.acquire()
+        self.timer.assert_not_called()
+        for deadline in (0, 301, True, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                m._acquire_admitted_once(deadline=deadline, clock=lambda: 0)
+        self.assertFalse(self.calls)
+
+    def test_deadline_before_response_body_stops(self):
+        with self.assertRaises(ValueError):
+            m.fetch(
+                self.rows[0],
+                self.root / "expired",
+                types.SimpleNamespace(open=lambda *a, **k: Response(self.rows[0])),
+                100,
+                iter([0, 100]).__next__,
+            )
+
+    def test_public_entry_and_redirect_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)
+        with self.assertRaises(ValueError):
+            m.NoRedirect().redirect_request(None, None, 302, "", {}, "https://evil.test")
+
+
+class FrozenContractTests(unittest.TestCase):
+    def test_actual_pinned_lock_urls_and_installer_source(self):
+        raw = (ROOT / "configs/lumi-sft-linux-cpu-release-v0.1.lock.json").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), cpu.LOCK_SHA)
+        m.urls(json.loads(raw)["requirements"])
+        self.assertEqual(
+            hashlib.sha256(
+                (ROOT / "scripts/install_sft_vm_cpu_runtime_v1.py").read_bytes()
+            ).hexdigest(),
+            m.INSTALLER_SHA,
+        )
+
+    def test_existing_services_supply_readonly_inputs_no_new_mount_layer(self):
+        for kind in ("cpu-runtime", "acquisition-sdk"):
+            parser = configparser.ConfigParser(interpolation=None)
+            parser.read(ROOT / f"configs/lumi-vm-{kind}-install-v0.1.service")
+            service = parser["Service"]
+            expected = "cpu" if kind == "cpu-runtime" else "sdk"
+            self.assertEqual(service["ReadOnlyPaths"], f"/opt/lumi-{expected}-input")
+            self.assertEqual(service["ProtectSystem"], "strict")
+            self.assertEqual(service["PrivateNetwork"], "yes")
+
+
+if __name__ == "__main__":
+    unittest.main()

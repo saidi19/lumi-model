@@ -1,0 +1,341 @@
+"""Independent read-only verification of attempt-019 control deployments."""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+from scripts import inspect_sft_vm_attempt019_control_targets_v1 as transport
+from scripts import sft_vm_dedicated_cleanup_bucket_v10 as bucket_source
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "c7124d8fb1a244798d7e41b7b5dfad61"
+ACCOUNT = "573978149073"
+FUNCTION = "lumi-stop-" + ATTEMPT
+WORKER_ROLE = "lumi-stop-worker-" + ATTEMPT
+SCHEDULE_ROLE = "lumi-stop-schedule-" + ATTEMPT
+GROUP = "lumi-stop-" + ATTEMPT
+LOG_GROUP = "/aws/lambda/" + FUNCTION
+BUCKET = "lumi-cleanup-" + ATTEMPT
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/network-cleanup/"
+WATCH_OUTPUT = ROOT / (
+    "evidence/lumi-vm-attempt-019-inert-watchdog-deployment-verification-v0.1.json"
+)
+STORE_OUTPUT = ROOT / "evidence/lumi-vm-attempt-019-cleanup-bucket-verification-v0.1.json"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-019-control-plan-v0.2/plan.json"
+PLAN_SHA = "07b44f0281e4ee07009ce93aeb433cf92aeaaf845f37dc71a6570d03197cb6ec"
+SOURCE_RELEASE = ROOT / "artifacts/lumi-vm-attempt-019-source-v0.1/release.json"
+SOURCE_RELEASE_SHA = "eae01e7ff3b23b801c69a6c29f1cf852830a8c33fe6d2605c7afa4c73f131dd0"
+SOURCE_BINDINGS = {
+    "scripts/prepare_sft_vm_deployment_bindings_v18.py": (
+        4342,
+        "7dbd2c244d5a91696487288b956b736a215a7bbfd62cf5eb3c5da9a3a180e294",
+    ),
+    "scripts/execute_sft_vm_inert_watchdog_v12.py": (
+        8143,
+        "abc5be19dcafc37bd58bf263c84c3da0e66ea662b9fd7806b817595744eadcc5",
+    ),
+    "scripts/sft_vm_dedicated_cleanup_bucket_v10.py": (
+        4138,
+        "0f3eacc33022bb524253ede45e88a943542a87594f33ca432e8022874c6bd476",
+    ),
+    "configs/lumi-vm-attempt-019-watchdog-execution-proposal-v0.1.json": (
+        808,
+        "fab07db3cbf17d1148521f16293f2b2a759680f36bbfeb51201255d7addb8be5",
+    ),
+    "configs/lumi-vm-attempt-019-watchdog-execution-approval-v0.1.json": (
+        1650,
+        "261748b123064084c421797b9f2facdd1f749a84c8a31aaca0409bb6a3ae0ad1",
+    ),
+    "configs/lumi-vm-attempt-019-cleanup-bucket-proposal-v0.1.json": (
+        780,
+        "cc4d2ffc7963d3ee98849ccc0b0d531de39ca9d7d5073d50c80ad4ddcc199471",
+    ),
+    "configs/lumi-vm-attempt-019-cleanup-bucket-approval-v0.1.json": (
+        1839,
+        "3b39a0b65b348b408a86e5cb4a42c9b570e101d6d0d3e1ccc3574dfedd48b23c",
+    ),
+    "artifacts/lumi-vm-attempt-019-control-plan-v0.2/plan.json": (20475, PLAN_SHA),
+    "artifacts/lumi-vm-attempt-019-source-v0.1/release.json": (
+        26822,
+        SOURCE_RELEASE_SHA,
+    ),
+    "artifacts/lumi-vm-attempt-019-watchdog-deployment-v0.1/entry-result.json": (
+        967,
+        "ab14867b117e88d0e30f272327bdcdd2b961fef0ee5ea2e12f92e0066b5bf487",
+    ),
+    "artifacts/lumi-vm-attempt-019-watchdog-deployment-v0.1/deployment/result.json": (
+        593,
+        "281b62a231dc0d5fe8fcd60d93ca74d3fe15e6353a0f493f7693d26940627d55",
+    ),
+    "artifacts/lumi-vm-attempt-019-cleanup-bucket-v0.1/result.json": (
+        440,
+        "381404b2fcb81bcbda854678274cdeec007380b141b9027054e36c9cc383fc30",
+    ),
+    "artifacts/lumi-vm-attempt-019-cleanup-bucket-v0.1/started.json": (
+        169,
+        "92079353cc15e586337a4ed1698e5cd7a12e8b642aa41adfcaf4a40f39ed0e74",
+    ),
+}
+MAX_CALLS = 28
+MAX_SECONDS = 300
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(relative, size, digest):
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and path.stat().st_size == size)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def local():
+    raw = {name: read(name, *pin) for name, pin in SOURCE_BINDINGS.items()}
+    plan = json.loads(raw[str(PLAN.relative_to(ROOT))])
+    watch = json.loads(
+        raw["artifacts/lumi-vm-attempt-019-watchdog-deployment-v0.1/entry-result.json"]
+    )
+    deployed = json.loads(
+        raw["artifacts/lumi-vm-attempt-019-watchdog-deployment-v0.1/deployment/result.json"]
+    )
+    store = json.loads(raw["artifacts/lumi-vm-attempt-019-cleanup-bucket-v0.1/result.json"])
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["execution_permitted"] is False
+        and watch["status"] == "deployed_unarmed_invocation_disabled"
+        and watch["deployment"] == deployed
+        and watch["total_control_calls"] <= 45
+        and watch["mutation_dispatches"] == 9
+        and watch["invocation"] is False
+        and watch["schedule_creation"] is False
+        and watch["instance_actions"] == 0
+        and watch["retry"] is False
+        and store["status"] == "created_private_cleanup_store_verified"
+        and store["calls"] <= 20
+        and store["mutation_dispatches"] == 6
+        and store["privacy_readback_verified"] is True
+        and store["shared_bucket_mutation"] is False
+        and store["object_access"] is False
+        and store["iam_mutation"] is False
+        and store["instance_action"] is False
+        and store["retry"] is False
+    )
+    return plan, watch, store
+
+
+class Reads:
+    def __init__(self, cloud, *, clock=time.monotonic, sleep=time.sleep):
+        self.cloud = cloud
+        self.clock = clock
+        self.sleep = sleep
+        self.start = clock()
+        self.calls = 0
+        self.retries = 0
+
+    def call(self, service, operation, **fields):
+        need(operation.startswith(("get_", "describe_", "list_", "head_")))
+        need(operation not in {"get_object", "list_objects", "list_objects_v2"})
+        for index, delay in enumerate((0, *transport.READ_DELAYS)):
+            need(self.calls < MAX_CALLS and self.clock() - self.start < MAX_SECONDS)
+            if delay:
+                need(self.retries < transport.MAX_READ_RETRIES)
+                self.retries += 1
+                self.sleep(delay)
+            self.calls += 1
+            try:
+                return getattr(self.cloud[service], operation)(**fields)
+            except Exception as error:
+                if index == len(transport.READ_DELAYS) or not transport.transient(error):
+                    raise
+        need(False)
+
+    def absent(self, service, operation, **fields):
+        try:
+            self.call(service, operation, **fields)
+        except Exception as error:
+            if transport.error_code(error) in transport.ABSENCE_CODES.get(service, set()):
+                return True
+            raise
+        return False
+
+
+def verify_live(cloud):
+    plan, watch, store = local()
+    reads = Reads(cloud)
+    need(reads.call("sts", "get_caller_identity")["Account"] == ACCOUNT)
+    configuration = reads.call("lambda", "get_function_configuration", FunctionName=FUNCTION)
+    need(
+        configuration["FunctionName"] == FUNCTION
+        and configuration["State"] == "Active"
+        and configuration["LastUpdateStatus"] == "Successful"
+        and configuration["CodeSha256"] == watch["deployment"]["code_sha256"]
+        and configuration["Runtime"] == "python3.13"
+        and configuration["Timeout"] == 180
+        and configuration["MemorySize"] == 128
+        and configuration["Environment"]["Variables"]
+        == {"LUMI_WATCHDOG_BINDING": '{"armed":false}'}
+    )
+    concurrency = reads.call("lambda", "get_function_concurrency", FunctionName=FUNCTION)
+    invoke = reads.call("lambda", "get_function_event_invoke_config", FunctionName=FUNCTION)
+    need(
+        concurrency["ReservedConcurrentExecutions"] == 0
+        and invoke["MaximumRetryAttempts"] == 0
+        and invoke["MaximumEventAgeInSeconds"] == 60
+    )
+    roles = {row["role"]: row for row in plan["watchdog"]["roles"]}
+    for name in (WORKER_ROLE, SCHEDULE_ROLE):
+        role = reads.call("iam", "get_role", RoleName=name)["Role"]
+        expected = roles[name]
+        need(
+            role["RoleName"] == name
+            and role["Path"] == "/lumi/temporary/"
+            and {item["Key"]: item["Value"] for item in role.get("Tags", [])}.get("LumiAttempt")
+            == ATTEMPT
+        )
+        policy = reads.call(
+            "iam",
+            "get_role_policy",
+            RoleName=name,
+            PolicyName=plan["watchdog"]["inline_policy_name"],
+        )
+        need(policy["PolicyDocument"] == expected["inline_policy"])
+    log_groups = reads.call("logs", "describe_log_groups", logGroupNamePrefix=LOG_GROUP, limit=10)[
+        "logGroups"
+    ]
+    exact_logs = [row for row in log_groups if row["logGroupName"] == LOG_GROUP]
+    need(len(exact_logs) == 1 and exact_logs[0]["retentionInDays"] == 7)
+    need(reads.absent("scheduler", "get_schedule_group", Name=GROUP))
+    fields = {"Bucket": BUCKET, "ExpectedBucketOwner": ACCOUNT}
+    location = reads.call("s3", "get_bucket_location", **fields)
+    public = reads.call("s3", "get_public_access_block", **fields)
+    ownership = reads.call("s3", "get_bucket_ownership_controls", **fields)
+    encryption = reads.call("s3", "get_bucket_encryption", **fields)
+    versioning = reads.call("s3", "get_bucket_versioning", **fields)
+    tagging = reads.call("s3", "get_bucket_tagging", **fields)
+    policy = reads.call("s3", "get_bucket_policy", **fields)
+    status = reads.call("s3", "get_bucket_policy_status", **fields)
+    lifecycle_absent = reads.absent("s3", "get_bucket_lifecycle_configuration", **fields)
+    block = public["PublicAccessBlockConfiguration"]
+    need(
+        location["LocationConstraint"] is None
+        and all(block[name] is True for name in bucket_source.BLOCK)
+        and ownership["OwnershipControls"]["Rules"]
+        == [{"ObjectOwnership": "BucketOwnerEnforced"}]
+        and encryption["ServerSideEncryptionConfiguration"] == bucket_source.ENCRYPTION
+        and versioning["Status"] == "Enabled"
+        and sorted(tagging["TagSet"], key=lambda row: row["Key"])
+        == sorted(bucket_source.TAGS, key=lambda row: row["Key"])
+        and json.loads(policy["Policy"]) == bucket_source.policy()
+        and status["PolicyStatus"]["IsPublic"] is False
+        and lifecycle_absent
+    )
+    common = {
+        "date": dt.datetime.now(dt.UTC).date().isoformat(),
+        "attempt": ATTEMPT,
+        "source_bindings": {
+            name: {"bytes": size, "sha256": digest}
+            for name, (size, digest) in SOURCE_BINDINGS.items()
+        },
+        "read_only_calls_total": reads.calls,
+        "bounded_transient_read_retries": reads.retries,
+        "cloud_mutations": 0,
+        "object_access": False,
+        "full_cpu_execution_authorized": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    watch_evidence = dict(
+        common,
+        schema="lumi.attempt019-inert-watchdog-deployment-verification.v0.1",
+        status="verified_deployed_unarmed_invocation_disabled",
+        result=watch,
+        independent_live_readback={
+            "function_state": configuration["State"],
+            "last_update_status": configuration["LastUpdateStatus"],
+            "code_sha256": configuration["CodeSha256"],
+            "runtime": configuration["Runtime"],
+            "timeout_seconds": configuration["Timeout"],
+            "memory_mib": configuration["MemorySize"],
+            "unarmed_environment_verified": True,
+            "reserved_concurrency": concurrency["ReservedConcurrentExecutions"],
+            "maximum_retry_attempts": invoke["MaximumRetryAttempts"],
+            "maximum_event_age_seconds": invoke["MaximumEventAgeInSeconds"],
+            "roles_and_inline_policies_verified": True,
+            "log_retention_days": exact_logs[0]["retentionInDays"],
+            "schedule_group_absent": True,
+        },
+    )
+    store_evidence = dict(
+        common,
+        schema="lumi.attempt019-cleanup-bucket-verification.v0.1",
+        status="verified_private_cleanup_bucket_created",
+        result=store,
+        storage={
+            "bucket": BUCKET,
+            "prefix": PREFIX,
+            "region": "us-east-1",
+            "ownership": "BucketOwnerEnforced",
+            "default_encryption": "AES256",
+            "versioning": "Enabled",
+            "public": False,
+            "lifecycle_configuration_present": False,
+            "object_access": False,
+        },
+        independent_readback={
+            "all_public_access_blocks_enabled": True,
+            "bucket_owner_enforced": True,
+            "aes256_default_encryption": True,
+            "versioning_enabled": True,
+            "attempt_and_purpose_tags_verified": True,
+            "deny_only_policy_verified": True,
+            "policy_is_public": False,
+            "lifecycle_absent": True,
+        },
+    )
+    return watch_evidence, store_evidence
+
+
+def run():
+    need(not WATCH_OUTPUT.exists() and not STORE_OUTPUT.exists())
+    cloud = transport.clients()
+    try:
+        watch, store = verify_live(cloud)
+    finally:
+        for client in cloud.values():
+            client.close()
+    for path, value in ((WATCH_OUTPUT, watch), (STORE_OUTPUT, store)):
+        raw = encode(value)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    print(
+        json.dumps(
+            {"watchdog": watch["status"], "cleanup_store": store["status"]},
+            sort_keys=True,
+        )
+    )
+    return watch, store
+
+
+if __name__ == "__main__":
+    run()

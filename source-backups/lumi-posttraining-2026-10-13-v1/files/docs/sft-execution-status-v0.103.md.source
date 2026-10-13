@@ -1,0 +1,87 @@
+# SFT execution status v0.103
+
+2026-09-22. The approved one-shot sharded SDK diagnostic has completed. Its
+workflow succeeded in reporting a per-shard limit; **the full SDK census and
+capacity recovery did not complete**. No SDK deletion, setup probe, model/data
+access, GPU, qualification or training occurred.
+
+## Published and tested
+
+Commit `c3cba987b2191ebfff1913a4a69ff05afe852daa` adds exactly four files and has
+parent `7da33c657497386dc0e5cf4c6fb1f66bf03cfc05`. The script counts every shard
+root (directory, regular file or symlink) as well as descendants. Re-listing
+already counted entries does not spend the remaining node allowance again.
+Only directories are opened inside the SDK; symlink targets and file contents
+are never opened. The fixed target is `/usr/local/lib/android/sdk` on the fresh
+GitHub VM, never the Mac.
+
+There are 46 new tests and 126 frozen regressions: 172 combined tests pass on
+both CPython 3.11.15 and 3.13.7. Ruff 0.15.1 and YAML checks pass. Independent
+scope review found no blocking issue under the trusted disposable-VM premise.
+Nineteen prior bound source/evidence hashes and the source-CI routing bindings
+were verified unchanged.
+
+Bounds were 250,000 accepted nodes per immediate-child shard (including its
+root), 1,000,000 aggregate accepted nodes, directory depth below 48, 32 MiB
+relative-name accounting per shard / 128 MiB aggregate, 64 GiB allocated blocks
+per shard and aggregate, and a 240-second inner deadline. Accepted-node counts
+are not total metadata syscall counts; re-list and identity checks repeat.
+No cap was changed after the run started, and no retry occurred.
+
+## Verified actual result
+
+[Run 35687186159](https://github.com/saidi19/lumi-model/actions/runs/35687186159),
+attempt 1, job `106616411256`, ran from 04:31:09Z to 04:31:32Z (23 seconds).
+All workflow steps succeeded. The report is an observed `budget_hit`, not a
+complete census:
+
+- 10 shards completed; shard 11 stopped at the 250,001st attempted node.
+- 308,008 nodes were accepted in total, including 250,000 in the incomplete shard.
+- The 1,000,000-node aggregate ceiling was not reached.
+- Allocated-block accounting was 11,749,097,472 bytes in total, including
+  2,789,654,528 bytes in the incomplete shard.
+- Derived completed-shard totals: 58,008 nodes and 8,959,442,944 allocated bytes
+  (about 8.34 GiB). These are not guaranteed physically reclaimable bytes.
+- All SDK mutation, payload-read, setup, model/data, GPU, training and
+  production-eligibility flags remain false.
+
+The exact artifact `10676603939` is a 621-byte ZIP with server SHA-256
+`c036321e3b1aff1daa45fa8c3a6bedb9ed87afe46e15ab407157759781401ff6`.
+Only its single 889-byte canonical aggregate is retained. Aggregate SHA-256:
+`1b83af8c0efcbf878b7da98beef5df2e6f0add5500000a99943fda1bdbb4cee7`.
+Two offline verification passes checked the report schema, exact hashes, plan
+bindings, result cross-bindings and derived totals. No raw job logs were fetched.
+
+This proves that one immediate-child shard exceeded the per-shard bound on this
+fresh image. It does not identify retained child names, prove the old run's
+historical cause, or determine total SDK size. Sharding at this level did not
+make a full-SDK cleanup ready. Gate 5 remains incomplete.
+
+## Concrete next option, not executed
+
+A separately approved partial cleanup could avoid raising the 250,000-node cap:
+select **at most the first 10 immediate SDK children in deterministic sorted
+order on a fresh VM**, fully census all selected shards before any deletion,
+bind their current identities, and delete only those selected targets. Leave
+all other SDK entries and the SDK root itself untouched. Stop before deletion
+if any selected shard violates a bound or identity/mount check. After deletion,
+measure actual free space and call setup only if the unchanged capacity floor
+passes; otherwise stop without expanding targets.
+
+This would be a new destructive authorization, not a continuation or retry of
+the diagnostic. Provider images can change, so these cannot be described as
+the same ten historical shards. Historical aggregate bytes must never replace
+fresh admission checks or actual free-space measurement. No such cleanup,
+successor implementation, workflow, cap increase or image acquisition has been
+started in this turn.
+
+All three workflows are now confirmed successful: this diagnostic, Spark
+`35687186097`, and Source `35687186060` (all four Source jobs passed; last job
+completed at 04:41:04Z). The remote branch tip remains the published commit.
+This CI success is not a full SDK census, capacity acceptance or Gate 5 pass.
+
+Local post-run receipts are the sharded aggregate and the matching result,
+verification and CI-result files under `evidence/`. They are not pushed. Exact
+automatic Source/Spark conclusions are recorded in
+`lumi-4b-sft-sdk-sharded-census-ci-result-v0.1.json`. No post-run push or extra
+execution was performed.

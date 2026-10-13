@@ -1,0 +1,263 @@
+#!/usr/bin/env python3
+"""Source-only retention release and private staging primitive. Never launch.
+
+An archive is not admission. Preserve the original controller/worker releases,
+bindings and evidence. Native installation remains a closed private operation;
+the only CLI action prepares a fresh local source archive and build receipt.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import stat
+import sys
+import tarfile
+import types
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+ROOT = Path("/var/lib/lumi-vm-fullsize")
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+CAP = 2 * 1024**2
+PINS = {
+    "scripts/run_sft_vm_parent_entry_v2.py": (
+        "4ec3f33ba9236f34f3ceb1b0c83f2c8abc46c9ec969b8f5c964bf5dd6f390197"
+    ),
+    "scripts/retain_sft_vm_package_v1.py": (
+        "f9b2965c257af4ffa7e091e92fcc3598849cbfb7497797f9d506a95b97d52e31"
+    ),
+    "scripts/acquire_sft_vm_fullsize_inputs_v1.py": (
+        "c3fe17fe42b7e5bf7df19e8a5f198568ce7d9efa89dc2af148d3f73e9fd89424"
+    ),
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json": (
+        "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061"
+    ),
+    "src/lumi/posttraining_vm_retention_unit_v1.py": (
+        "193b6995f0a25c0cbab127c2961f1eb92ac7e1b8a99b5dd592a4affb4280a017"
+    ),
+    "src/lumi/posttraining_vm_retention_continuation_v1.py": (
+        "d8618e73b9d5a0e03b2d89285065b9d96f6bc980c91daa31c66097ec66a53f0a"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_release_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+    )
+
+
+def read(path, cap=131072):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and 0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        need(
+            len(raw) == before.st_size
+            and all(getattr(before, k) == getattr(after, k) for k in fields)
+        )
+    return raw
+
+
+def metadata(raw, pin):
+    need(sha(raw) == pin)
+    module = types.ModuleType("_retention_release_metadata")
+    exec(compile(raw, "bound_metadata", "exec"), module.__dict__)
+    return module
+
+
+def closure(seeds):
+    need(set(seeds) == set(PINS))
+    need(all(sha(seeds[n]) == pin for n, pin in PINS.items()))
+    old = metadata(
+        seeds["scripts/run_sft_vm_parent_entry_v2.py"],
+        PINS["scripts/run_sft_vm_parent_entry_v2.py"],
+    )
+    child = metadata(
+        seeds["scripts/retain_sft_vm_package_v1.py"], PINS["scripts/retain_sft_vm_package_v1.py"]
+    )
+    expected = dict(PINS)
+    additions = {"src/lumi/" + n: pin for n, pin in old.SOURCE_PINS.items()}
+    for name, pin in child.PINS.items():
+        key = "src/lumi/" + name + ".py"
+        need(key not in additions or additions[key] == pin)
+        additions[key] = pin
+    need(child.HELPER_PIN == PINS["scripts/acquire_sft_vm_fullsize_inputs_v1.py"])
+    expected.update(additions)
+    need(len(expected) == 18)
+    return expected
+
+
+def validate(members):
+    expected = closure({n: members[n] for n in PINS})
+    need(set(members) == set(expected))
+    need(all(type(raw) is bytes and 0 < len(raw) <= 131072 for raw in members.values()))
+    need(all(sha(members[n]) == pin for n, pin in expected.items()))
+    need(sum(map(len, members.values())) <= 1024**2)
+    return expected
+
+
+def archive(members):
+    validate(members)
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, raw in sorted(members.items()):
+            item = tarfile.TarInfo(name)
+            item.size, item.mode = len(raw), 0o400
+            tar.addfile(item, io.BytesIO(raw))
+    raw = output.getvalue()
+    need(len(raw) <= CAP)
+    return raw
+
+
+def unpack(raw, expected_sha):
+    need(type(raw) is bytes and 0 < len(raw) <= CAP and sha(raw) == expected_sha)
+    members = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
+        for item in tar:
+            need(len(members) < 18 and item.name not in members)
+            need(item.type == tarfile.REGTYPE and not item.linkname and not item.pax_headers)
+            need(item.mode == 0o400 and item.uid == item.gid == item.mtime == 0)
+            need(0 < item.size <= 131072)
+            with tar.extractfile(item) as stream:
+                body = stream.read(item.size + 1)
+            need(len(body) == item.size)
+            members[item.name] = body
+    validate(members)  # Exact names AND pins before any filesystem write.
+    # Deterministic exact bytes also reject hidden/trailing archive content.
+    need(archive(members) == raw)
+    return members
+
+
+def assemble(repo=REPO):
+    seeds = {n: read(repo / n) for n in PINS}
+    expected = closure(seeds)
+    members = {n: seeds[n] if n in seeds else read(repo / n) for n in expected}
+    raw = archive(members)
+    need(unpack(raw, sha(raw)) == members)
+    return raw, members
+
+
+def write(path, raw):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def sync(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def prepare(destination):
+    raw, members = assemble()
+    need(not any(p.is_symlink() for p in (destination, *destination.parents)))
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    write(destination / "retention-source.tar", raw)
+    result = dict(
+        schema="lumi.vm-retention-release.v0.1",
+        attempt=ATTEMPT,
+        archive_bytes=len(raw),
+        archive_sha256=sha(raw),
+        members=len(members),
+        source_sha256=validate(members),
+        native_installed=False,
+        credentials_included=False,
+        model_dataset_included=False,
+        host_admitted=False,
+        execution_permitted=False,
+        gate_5_complete=False,
+    )
+    write(destination / "build.json", canonical(result))
+    sync(destination)
+    return result
+
+
+def boundary(machine_id):
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(type(machine_id) is str and len(machine_id) == 32)
+    with open("/etc/machine-id", "rb") as stream:
+        need(stream.read(65).strip() == machine_id.encode("ascii"))
+    root = ROOT / ATTEMPT
+    for path in (root, *root.parents, root / "controller", root / "stage"):
+        row = path.lstat()
+        need(stat.S_ISDIR(row.st_mode) and row.st_uid == 0 and not row.st_mode & 0o022)
+
+
+def _install_admitted_once(bundle, expected_sha, machine_id):
+    boundary(machine_id)
+    members = unpack(read(bundle, CAP), expected_sha)
+    destination = ROOT / ATTEMPT / "retention-release"
+    destination.mkdir(mode=0o700, exist_ok=False)
+    sync(destination.parent)
+    directories = {destination}
+    for name, raw in sorted(members.items()):
+        path = destination / name
+        for relative in reversed(path.relative_to(destination).parents):
+            parent = destination / relative
+            if parent not in directories:
+                parent.mkdir(mode=0o700)
+                directories.add(parent)
+        write(path, raw)
+    need(all(read(destination / n) == raw for n, raw in members.items()))
+    for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        sync(path)
+    return dict(
+        staged_file_hashes_verified=True,
+        binding_created=False,
+        host_admitted=False,
+        execution_permitted=False,
+        gate_5_complete=False,
+    )
+
+
+def install(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    try:
+        result = prepare(args.output)
+        print(json.dumps({k: v for k, v in result.items() if k != "source_sha256"}, sort_keys=True))
+    except BaseException:
+        parser.exit(1, "retention_release_failed\n")
+
+
+if __name__ == "__main__":
+    main()

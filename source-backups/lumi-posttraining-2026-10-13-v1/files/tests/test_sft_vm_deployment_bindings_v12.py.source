@@ -1,0 +1,95 @@
+"""Synthetic control evidence only; no cloud operations."""
+
+import copy
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v12 as m
+
+
+class Tests(unittest.TestCase):
+    def synthetic_controls(self):
+        plan = m.build()
+        pin = {
+            m.RELEASE + "/release.json": {
+                "sha256": m.RELEASE_SHA,
+                "bytes": len(m.read(m.RELEASE + "/release.json", m.RELEASE_SHA)),
+            }
+        }
+        watch = {
+            "attempt": m.ATTEMPT,
+            "source_bindings": pin,
+            "status": "verified_deployed_unarmed_invocation_disabled",
+            "result": {"deployment": {
+                "unarmed_verified": True,
+                "invocation_disabled_verified": True,
+                "code_sha256": plan["watchdog"]["expected_code_sha256_base64"],
+            }},
+        }
+        store = {
+            "attempt": m.ATTEMPT,
+            "source_bindings": pin,
+            "status": "verified_private_cleanup_bucket_created",
+            "storage": {"bucket": m.BUCKET, "prefix": plan["cleanup_store"]["prefix"]},
+            "result": {"privacy_readback_verified": True},
+        }
+        return watch, store
+
+    def check(self, watch, store):
+        original = m.read
+
+        def read(name, digest=None, size=None):
+            if name in {m.WATCH, m.STORE}:
+                return m.encode(watch if name == m.WATCH else store)
+            return original(name, digest, size)
+
+        with patch.object(m, "read", side_effect=read):
+            return m.controls()
+
+    def test_plan_and_all_156_sources_verify(self):
+        self.assertEqual(m.build()["attempt"], m.ATTEMPT)
+        self.assertEqual(len(m.verify()["outputs"]), 156)
+
+    def test_exact_synthetic_controls_return_hashes(self):
+        watch, store = self.synthetic_controls()
+        self.assertEqual(self.check(watch, store), {
+            m.WATCH: m.sha(m.encode(watch)),
+            m.STORE: m.sha(m.encode(store)),
+        })
+
+    def test_wrong_identity_code_or_privacy_rejected(self):
+        watch, store = self.synthetic_controls()
+        changes = []
+        value = copy.deepcopy(watch)
+        value["attempt"] = m.OLD
+        changes.append((value, store))
+        value = copy.deepcopy(watch)
+        value["result"]["deployment"]["code_sha256"] = "wrong"
+        changes.append((value, store))
+        value = copy.deepcopy(store)
+        value["result"]["privacy_readback_verified"] = False
+        changes.append((watch, value))
+        for left, right in changes:
+            with self.assertRaises(ValueError):
+                self.check(left, right)
+
+    def test_drift_and_execution_rejected(self):
+        for key in ("RELEASE_SHA", "PLAN_SHA", "PLAN_RELEASE_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

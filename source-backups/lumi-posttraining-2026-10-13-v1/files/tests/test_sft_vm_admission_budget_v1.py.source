@@ -1,0 +1,124 @@
+"""Synthetic SDK event tests for inclusive admission call accounting."""
+
+import types
+import unittest
+from unittest.mock import Mock
+
+from scripts import sft_vm_admission_budget_v1 as m
+
+
+class Events:
+    def __init__(self):
+        self.handlers = {}
+
+    def register(self, _event, handler, *, unique_id):
+        self.handlers[unique_id] = handler
+
+    def unregister(self, _event, *, unique_id):
+        self.handlers.pop(unique_id)
+
+    def emit(self, operation):
+        for handler in self.handlers.values():
+            handler(model=types.SimpleNamespace(name=operation))
+
+
+class Client:
+    def __init__(self):
+        self.meta = types.SimpleNamespace(
+            config=types.SimpleNamespace(retries={"total_max_attempts": 1}, proxies={}),
+            events=Events(),
+        )
+        self.close = Mock()
+
+
+class Tests(unittest.TestCase):
+    def meter(self):
+        identities = []
+
+        def identity(_metadata):
+            client = Client()
+            identities.append(client)
+            return client
+
+        credentials = types.SimpleNamespace(static_identity_client=identity)
+        now = [100]
+        meter = m.AdmissionBudget(credentials, clock=lambda: now[0])
+        return meter, credentials, identities, now
+
+    def test_identity_reads_and_refreshes_share_last_call_budget(self):
+        meter, credentials, identities, _ = self.meter()
+        original = credentials.static_identity_client
+        with meter:
+            first = credentials.static_identity_client({})
+            first.meta.events.emit("GetCallerIdentity")
+            regular = meter.register(Client(), "ec2")
+            for _ in range(77):
+                regular.meta.events.emit("DescribeInstances")
+            refresh = credentials.static_identity_client({})
+            refresh.meta.events.emit("GetCallerIdentity")
+            self.assertEqual(meter.calls, 79)
+            self.assertEqual(meter.credential_calls, 2)
+            with self.assertRaises(ValueError):
+                regular.meta.events.emit("DescribeInstances")
+            self.assertEqual(meter.calls, 79)
+        self.assertIs(credentials.static_identity_client, original)
+        self.assertTrue(all(not client.meta.events.handlers for client in identities))
+
+    def test_mutations_and_object_access_rejected_before_consuming_call(self):
+        meter, *_ = self.meter()
+        with meter:
+            for operation in ("RunInstances", "PutBucketPolicy", "GetObject", "HeadObject"):
+                client = meter.register(Client(), "ec2")
+                with self.subTest(operation=operation), self.assertRaises(ValueError):
+                    client.meta.events.emit(operation)
+            self.assertEqual(meter.calls, 0)
+
+    def test_deadline_and_sdk_retry_configuration_rejected(self):
+        meter, _, _, now = self.meter()
+        with meter:
+            client = Client()
+            client.meta.config.retries["total_max_attempts"] = 2
+            with self.assertRaises(ValueError):
+                meter.register(client, "ec2")
+            client = meter.register(Client(), "ec2")
+            now[0] += 1480
+            with self.assertRaises(ValueError):
+                client.meta.events.emit("DescribeInstances")
+            self.assertEqual(meter.calls, 0)
+
+    def test_failed_dispatch_stays_consumed(self):
+        meter, *_ = self.meter()
+        with meter:
+            client = meter.register(Client(), "ec2")
+            client.meta.events.emit("DescribeInstances")
+            # A transport exception after before-call cannot reset the dispatch count.
+            self.assertEqual(meter.report()["sdk_read_dispatches"], 1)
+
+    def test_success_ledger_saved_and_hooks_removed_before_workload(self):
+        meter, credentials, _, _ = self.meter()
+        original = credentials.static_identity_client
+        with meter:
+            identity = credentials.static_identity_client({})
+            identity.meta.events.emit("GetCallerIdentity")
+            client = meter.register(Client(), "ec2")
+            client.meta.events.emit("DescribeInstances")
+            result = meter.inspect(lambda _: {"total_control_calls": 1}, object())
+            self.assertEqual(result["admission_call_budget"]["sdk_read_dispatches"], 2)
+            self.assertIs(credentials.static_identity_client, original)
+            self.assertFalse(client.meta.events.handlers)
+            client.meta.events.emit("RunInstances")
+            self.assertEqual(meter.calls, 2)
+            with self.assertRaises(ValueError):
+                meter.inspect(lambda _: {"total_control_calls": 1}, object())
+
+    def test_component_count_mismatch_blocks_handoff(self):
+        meter, credentials, _, _ = self.meter()
+        with meter:
+            credentials.static_identity_client({}).meta.events.emit("GetCallerIdentity")
+            with self.assertRaises(ValueError):
+                meter.inspect(lambda _: {"total_control_calls": 8}, object())
+            self.assertTrue(meter.enabled)
+
+
+if __name__ == "__main__":
+    unittest.main()

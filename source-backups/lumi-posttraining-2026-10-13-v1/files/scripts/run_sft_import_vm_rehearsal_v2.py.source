@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Generated-only rehearsal on a separately admitted Linux VM; never a downloader."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    launch_parser = commands.add_parser("launch")
+    launch_parser.add_argument("--expected-machine-id", required=True)
+    launch_parser.add_argument("--attempt", required=True)
+    launch_parser.add_argument("--release-sha256", required=True)
+    worker_parser = commands.add_parser("worker")
+    worker_parser.add_argument("attempt")
+    worker_parser.add_argument("mode", choices=("chain", "timeout", "memory", "disk"))
+    args = parser.parse_args()
+    if sys.platform != "linux":
+        parser.exit(2, "host_rejected_linux_required\n")
+    root = Path("/opt/lumi-sft-rehearsal-v2")
+    if Path(__file__).resolve() != root / "scripts/run_sft_import_vm_rehearsal_v2.py":
+        parser.exit(2, "prepared_release_required\n")
+    sys.path.insert(0, str(root / "src"))
+    from lumi.posttraining_import_vm_rehearsal_v2 import RehearsalError, launch, worker
+
+    try:
+        if args.command == "worker":
+            worker(args.attempt, args.mode)
+        else:
+            result = launch(machine_id=args.expected_machine_id, attempt=args.attempt,
+                            release_sha256=args.release_sha256)
+            print(json.dumps(result, sort_keys=True))
+    except RehearsalError as error:
+        parser.exit(1, error.code + "\n")
+    except BaseException:
+        parser.exit(1, "rehearsal_failed\n")
+
+
+if __name__ == "__main__":
+    main()
+

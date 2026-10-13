@@ -1,0 +1,153 @@
+"""Post-import read-only host/volume observation, not new launch freshness.
+
+Original fresh-launch admission is unchanged. Recheck immutable launch/volume
+lineage and current private host controls without pretending the import took
+less than the original first-1350-second admission window.
+"""
+
+import datetime as dt
+import hashlib
+import json
+import math
+import time
+
+import prepare_sft_vm_host_connection_v3 as frozen
+
+
+def need(value):
+    if not value:
+        raise ValueError("retained_host_check_rejected") from None
+
+
+def lineage(observed, binding, proposal, launch):
+    start, end = frozen.validate_launch(launch, binding)
+    frozen.inspect_existing(observed, binding, proposal)
+    vm = frozen.one(frozen.one(observed["instances"]["Reservations"])["Instances"])
+    need(vm["ClientToken"] == binding["attempt"])
+    need(
+        start - dt.timedelta(seconds=5)
+        <= frozen.utc(vm["LaunchTime"])
+        <= end + dt.timedelta(seconds=5)
+    )
+    image = frozen.one(observed["image"]["Images"])
+    need(image["RootDeviceName"] == vm["RootDeviceName"] == "/dev/sda1")
+    mapping = frozen.image_root_mapping(image)
+    need(mapping["DeviceName"] == "/dev/sda1" and set(mapping) == {"DeviceName", "Ebs"})
+    root_snapshot = mapping["Ebs"]["SnapshotId"]
+    need(type(root_snapshot) is str and frozen.re.fullmatch(r"snap-[0-9a-f]{17}", root_snapshot))
+    volumes = {v["VolumeId"]: v for v in observed["volumes"]["Volumes"]}
+    need(volumes[binding["root_volume"]]["SnapshotId"] == root_snapshot)
+    for kind, device in (("root", "/dev/sda1"), ("work", "/dev/sdf")):
+        volume = volumes[binding[kind + "_volume"]]
+        need(
+            start - dt.timedelta(seconds=5)
+            <= frozen.utc(volume["CreateTime"])
+            <= end + dt.timedelta(seconds=5)
+        )
+        need(frozen.one(volume["Attachments"])["Device"] == device)
+        need(volume.get("MultiAttachEnabled") is False)
+    need(volumes[binding["work_volume"]]["SnapshotId"] == "")
+    group = next(
+        g for g in observed["group"]["SecurityGroups"] if g["GroupId"] == binding["vm_group"]
+    )
+    rule = frozen.one(group["IpPermissionsEgress"])
+    need(rule["IpProtocol"] == "tcp" and rule["FromPort"] == rule["ToPort"] == 443)
+    need(rule.get("IpRanges") == [{"CidrIp": "0.0.0.0/0"}])
+    need(not any(rule.get(k) for k in ("Ipv6Ranges", "PrefixListIds", "UserIdGroupPairs")))
+
+
+def inspect(cloud, binding, proposal_raw, launch, *, deadline, host_deadline, clock=time.monotonic):
+    need(type(proposal_raw) is bytes and len(proposal_raw) <= 32768)
+    need(hashlib.sha256(proposal_raw).hexdigest() == frozen.PROPOSAL_SHA)
+    proposal = json.loads(proposal_raw)
+    frozen.targets(binding, proposal)
+    frozen.validate_launch(launch, binding)
+    need(all(type(n) in {int, float} and math.isfinite(n) for n in (deadline, host_deadline)))
+    need(220 < deadline - clock() <= 240 and deadline <= host_deadline - 700)
+    calls = 0
+
+    class ReadOnly:
+        def cli(self, service, operation, **fields):
+            nonlocal calls
+            need(
+                (service == "sts" and operation == "get-caller-identity")
+                or (
+                    service == "ec2"
+                    and operation
+                    in {
+                        "describe-instances",
+                        "describe-instance-status",
+                        "describe-instance-attribute",
+                        "describe-images",
+                        "describe-instance-connect-endpoints",
+                        "describe-security-groups",
+                        "describe-volumes",
+                        "describe-route-tables",
+                        "describe-nat-gateways",
+                        "describe-internet-gateways",
+                    }
+                )
+            )
+            need(calls < 11 and deadline - clock() > 20)
+            calls += 1
+            value = cloud.cli(service, operation, **fields)
+
+            def encoded_datetime(item):
+                need(type(item) is dt.datetime)
+                return frozen.utc(item).isoformat()
+
+            need(type(value) is dict and not value.get("NextToken"))
+            need(
+                len(json.dumps(value, default=encoded_datetime, allow_nan=False).encode()) <= 262144
+            )
+            need(clock() < deadline)
+            return value
+
+    reader = ReadOnly()
+    queries = {
+        "identity": ("sts", "get-caller-identity", {}),
+        "instances": ("ec2", "describe-instances", dict(InstanceIds=[binding["instance"]])),
+        "health": ("ec2", "describe-instance-status", dict(InstanceIds=[binding["instance"]])),
+        "shutdown": (
+            "ec2",
+            "describe-instance-attribute",
+            dict(InstanceId=binding["instance"], Attribute="instanceInitiatedShutdownBehavior"),
+        ),
+        "image": ("ec2", "describe-images", dict(ImageIds=[proposal["host"]["ami"]])),
+        "endpoint": (
+            "ec2",
+            "describe-instance-connect-endpoints",
+            dict(InstanceConnectEndpointIds=[binding["endpoint"]]),
+        ),
+        "group": (
+            "ec2",
+            "describe-security-groups",
+            dict(GroupIds=[binding["vm_group"], binding["endpoint_group"]]),
+        ),
+        "volumes": (
+            "ec2",
+            "describe-volumes",
+            dict(VolumeIds=[binding["root_volume"], binding["work_volume"]]),
+        ),
+    }
+    try:
+        observed = {k: reader.cli(s, op, **kw) for k, (s, op, kw) in queries.items()}
+        lineage(observed, binding, proposal, launch)
+        route = frozen.read_route(reader, proposal)
+        need(route["private_egress_route_configured"] is True and calls == 11)
+    except BaseException:
+        raise ValueError("retained_host_check_failed_no_mutation") from None
+    return dict(
+        observation_calls=calls,
+        current_private_controls_verified=True,
+        original_launch_volume_lineage_verified=True,
+        delete_on_termination_disabled=True,
+        private_egress_route_configured=True,
+        host_admitted=False,
+        credentials_issued=False,
+        gate_5_complete=False,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_controller_required") from None

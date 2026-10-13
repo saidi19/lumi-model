@@ -1,0 +1,323 @@
+"""Actual patched transaction and two expiry readbacks, all synthetic/offline."""
+
+import ast
+import hashlib
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_network_diagnostics_v1 as builder
+
+# Run in a fresh process: load the exact predecessor dependencies, not root aliases.
+sys.path.insert(0, str(builder.BASE / "scripts"))
+base_network = importlib.import_module("run_sft_vm_private_network_v1")
+base_armer = importlib.import_module("arm_sft_vm_network_cleanup_v1")
+net_fixture = importlib.import_module("tests.test_sft_vm_private_network_transaction_v1")
+arm_fixture = importlib.import_module("tests.test_sft_vm_network_cleanup_arming_v1")
+
+PLAN = (builder.BASE / "configs/lumi-vm-private-network-plan-v0.1.json").read_bytes()
+
+
+def module(name, raw):
+    result = types.ModuleType(name)
+    result.__file__ = str(builder.BASE / "scripts" / (name + ".py"))
+    exec(compile(raw, result.__file__, "exec"), result.__dict__)
+    return result
+
+
+class DiagnosticsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files = builder.build()
+        cls.failure = module("sft_vm_safe_failure_v1", cls.files["sft_vm_safe_failure_v1.py"])
+        cls.enterClassContext(patch.dict(sys.modules, {"sft_vm_safe_failure_v1": cls.failure}))
+        cls.network = module(
+            "run_sft_vm_private_network_v1", cls.files["run_sft_vm_private_network_v1.py"]
+        )
+        cls.armer = module(
+            "arm_sft_vm_network_cleanup_v1", cls.files["arm_sft_vm_network_cleanup_v1.py"]
+        )
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.cloud = net_fixture.Cloud()
+        self.expiry = Mock()
+        self.work = Mock()
+        self.output = self.root / "network"
+
+    def admission(self):
+        value = net_fixture.fixture()
+        for i, cidr in enumerate(("172.31.96.0/27", "172.31.96.32/27")):
+            value["subnets"].append(
+                value["subnets"][1] | {"id": "subnet-" + str(i + 7) * 17, "cidr": cidr}
+            )
+        return value
+
+    def run_network(self):
+        return self.network._with_preflighted_network_once(
+            self.output,
+            plan_raw=PLAN,
+            cloud=self.cloud,
+            admit=self.admission,
+            expiry=self.expiry,
+            workload=self.work,
+            clock=lambda: self.cloud.clock,
+            wait=self.cloud.wait,
+        )
+
+    def report(self):
+        return json.loads(next(self.output.glob("*-result.json")).read_bytes())
+
+    def assert_private(self):
+        for p in self.root.rglob("*.json"):
+            self.assertNotIn("PRIVATE_SENTINEL", p.read_text())
+
+    def arm(self):
+        cloud = arm_fixture.Cloud()
+        arm = self.armer.Expiry(
+            self.root / "expiry",
+            cloud,
+            admit_claim_store=lambda bound: None,
+            clock=lambda: cloud.t,
+            wall=lambda: cloud.wall,
+            wait=cloud.wait,
+        )
+        bound = dict(attempt=self.armer.worker.ATTEMPT, nonce=arm_fixture.TOKEN, deadline=18100)
+        return arm, cloud, bound
+
+    def test_success_order_limits_cleanup_and_no_replay(self):
+        self.assertTrue(self.run_network()["empty_network_removed"])
+        operations = [op for _, op, _ in self.cloud.calls]
+        for op in self.network.WRITES:
+            self.assertLessEqual(operations.count(op), 1)
+        self.assertEqual(self.expiry.arm.call_args.kwargs["deadline"], 18100)
+        self.assertEqual(self.work.call_args.kwargs["deadline"], 16300)
+        self.assertEqual(self.cloud.rows, {"nat": self.cloud.rows["nat"]})
+        before = len(operations)
+        with self.assertRaises(FileExistsError):
+            self.run_network()
+        self.assertEqual(len(self.cloud.calls), before)
+
+    def test_second_verify_timeout_preserved_and_no_paid_allocation(self):
+        arm, cloud, bound = self.arm()
+        # The arm method performs its first real verification successfully.
+        arm.arm(**bound)
+        self.assertTrue((self.root / "expiry/armed.json").exists())
+        cloud.fail = "get-role"
+        self.expiry.verify.side_effect = lambda **kw: arm.verify(**bound)
+        with self.assertRaises(self.failure.Failure) as caught:
+            self.run_network()
+        diagnostic = self.failure.describe(caught.exception)
+        self.assertEqual(diagnostic, dict(stage="expiry_control", kind="timeout", check="get-role"))
+        self.assertEqual(self.report()["primary_failure_diagnostic"], diagnostic)
+        self.assertNotIn("allocate-address", [op for _, op, _ in self.cloud.calls])
+        self.assertTrue(self.report()["empty_network_removed"])
+        self.assert_private()
+
+    def test_second_verify_validation_is_localized(self):
+        arm, cloud, bound = self.arm()
+        arm.arm(**bound)
+        cloud.change = lambda op, row: dict(row, State="DISABLED") if op == "get-schedule" else row
+        with self.assertRaises(self.failure.Failure) as caught:
+            arm.verify(**bound)
+        self.assertEqual(
+            self.failure.describe(caught.exception),
+            dict(stage="expiry_verify", kind="validation", check="get-schedule"),
+        )
+
+    def test_two_expiry_verifications_succeed_without_extra_writes(self):
+        arm, cloud, bound = self.arm()
+        arm.arm(**bound)
+        writes = [(s, op) for s, op, _ in cloud.calls if op in self.armer.WRITES]
+        arm.verify(**bound)
+        self.assertEqual(writes, [(s, op) for s, op, _ in cloud.calls if op in self.armer.WRITES])
+        self.assertLess(arm.calls, 100)
+
+    def test_actual_bridge_second_verify_failure_stops_before_allocation(self):
+        arm, cloud, _ = self.arm()
+        bridge = importlib.import_module("sft_vm_network_cleanup_bridge_v1")
+        claimed = bridge.ClaimedCloud(self.cloud, arm_fixture.S3(), clock=lambda: cloud.t)
+        self.expiry = bridge.ExpiryBridge(claimed, arm)
+        original_cloud = self.cloud
+
+        # Share one synthetic clock across the real transaction/expiry/bridge.
+        def change(op, value):
+            if op == "get-role" and sum(x[1] == op for x in cloud.calls) == 5:
+                raise TimeoutError("PRIVATE_SENTINEL")
+            return value
+
+        cloud.change = change
+        with self.assertRaises(self.failure.Failure) as caught:
+            self.network._with_preflighted_network_once(
+                self.output,
+                plan_raw=PLAN,
+                cloud=claimed,
+                admit=self.admission,
+                expiry=self.expiry,
+                workload=self.work,
+                clock=lambda: cloud.t,
+                wait=cloud.wait,
+            )
+        self.assertEqual(
+            self.failure.describe(caught.exception),
+            dict(stage="expiry_control", kind="timeout", check="get-role"),
+        )
+        self.work.assert_not_called()
+        self.assertNotIn("allocate-address", [op for _, op, _ in original_cloud.calls])
+        self.assertTrue(self.report()["empty_network_removed"])
+        self.assertTrue((self.root / "expiry/armed.json").exists())
+        self.assert_private()
+
+    def test_arm_failure_retains_kind_no_retry(self):
+        arm, cloud, bound = self.arm()
+        cloud.fail = "create-schedule"
+        with self.assertRaises(self.failure.Failure) as caught:
+            arm.arm(**bound)
+        self.assertEqual(self.failure.describe(caught.exception)["kind"], "timeout")
+        raw = json.loads((self.root / "expiry/failed.json").read_bytes())
+        self.assertEqual(raw["primary_failure_diagnostic"]["check"], "create-schedule")
+        with self.assertRaises(ValueError):
+            arm.arm(**bound)
+        self.assertEqual(sum(op == "create-schedule" for _, op, _ in cloud.calls), 1)
+        self.assert_private()
+
+    def test_sdk_timeout_keeps_category(self):
+        cloud = self.network.SDKCloud.__new__(self.network.SDKCloud)
+        cloud.client = Mock()
+        cloud.client.create_subnet.side_effect = TimeoutError("PRIVATE_SENTINEL")
+        with self.assertRaises(self.failure.Failure) as caught:
+            cloud.cli("ec2", "create-subnet")
+        self.assertEqual(self.failure.describe(caught.exception)["kind"], "timeout")
+        self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+        cloud = self.armer.SDKCloud.__new__(self.armer.SDKCloud)
+        client = Mock()
+        client.get_role.side_effect = TimeoutError("PRIVATE_SENTINEL")
+        cloud.clients = {"iam": client}
+        with self.assertRaises(self.failure.Failure) as caught:
+            cloud.cli("iam", "get-role")
+        self.assertEqual(self.failure.describe(caught.exception)["kind"], "timeout")
+
+    def test_workload_interrupt_and_cleanup_failure_kept_separately(self):
+        self.work.side_effect = KeyboardInterrupt("PRIVATE_SENTINEL")
+        self.cloud.before_fail = "delete-route"
+        with self.assertRaises(self.failure.Failure) as caught:
+            self.run_network()
+        self.assertEqual(self.failure.describe(caught.exception)["kind"], "interrupted")
+        report = self.report()
+        self.assertTrue(report["cleanup_unresolved"])
+        self.assertEqual(report["cleanup_failure_diagnostic"]["kind"], "timeout")
+        self.assert_private()
+
+    def test_ambiguous_delete_observed_once_and_diagnostic_retained(self):
+        self.cloud.after_fail = "delete-nat-gateway"
+        report = self.run_network()
+        self.assertTrue(report["cost_resources_released"])
+        self.assertFalse(report["cleanup_unresolved"])
+        self.assertEqual(
+            report["cleanup_dispatch_diagnostics"]["delete-nat-gateway"]["kind"], "timeout"
+        )
+        self.assertEqual(sum(op == "delete-nat-gateway" for _, op, _ in self.cloud.calls), 1)
+
+    def test_success_requests_match_frozen_network_exactly(self):
+        with patch.object(
+            self.network.uuid, "uuid4", return_value=types.SimpleNamespace(hex="a" * 32)
+        ):
+            actual = self.run_network()
+            old = net_fixture.Cloud()
+            expected = base_network._with_preflighted_network_once(
+                self.root / "old-network",
+                plan_raw=PLAN,
+                cloud=old,
+                admit=self.admission,
+                expiry=Mock(),
+                workload=Mock(),
+                clock=lambda: old.clock,
+                wait=old.wait,
+            )
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.cloud.calls, old.calls)
+
+    def test_success_requests_match_frozen_expiry_exactly(self):
+        arm, cloud, bound = self.arm()
+        arm.arm(**bound)
+        arm.verify(**bound)
+        old_cloud = arm_fixture.Cloud()
+        old = base_armer.Expiry(
+            self.root / "old-expiry",
+            old_cloud,
+            admit_claim_store=lambda bound: None,
+            clock=lambda: old_cloud.t,
+            wall=lambda: old_cloud.wall,
+            wait=old_cloud.wait,
+        )
+        old.arm(**bound)
+        old.verify(**bound)
+        self.assertEqual(cloud.calls, old_cloud.calls)
+
+    def test_journal_failure_does_not_hide_primary(self):
+        original = self.network.Transaction.save
+
+        def save(transaction, stage, value):
+            if stage == "result":
+                raise OSError("PRIVATE_SENTINEL")
+            return original(transaction, stage, value)
+
+        self.expiry.verify.side_effect = TimeoutError("PRIVATE_SENTINEL")
+        with patch.object(self.network.Transaction, "save", save):
+            with self.assertRaises(self.failure.Failure) as caught:
+                self.run_network()
+        self.assertEqual(self.failure.describe(caught.exception)["kind"], "timeout")
+
+    def test_malicious_diagnostic_strings_rejected(self):
+        error = self.failure.Failure(
+            "PRIVATE_SENTINEL",
+            {"stage": "PRIVATE_SENTINEL", "kind": "timeout", "check": "get-role"},
+        )
+        diagnostic = self.failure.describe(error, "PRIVATE_SENTINEL", "PRIVATE_SENTINEL")
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(diagnostic))
+        self.assertEqual(diagnostic, dict(stage="unknown", kind="validation", check="none"))
+
+    def test_existing_outer_describe_preserves_new_diagnostic(self):
+        diagnostic = dict(stage="expiry_verify", kind="validation", check="get-schedule")
+        error = self.failure.Failure("redacted", diagnostic)
+        self.assertEqual(self.failure.describe(error), diagnostic)
+
+    def test_predecessor_pins_and_non_deployable_fragments(self):
+        for name, pin in builder.PINS.items():
+            self.assertEqual(
+                hashlib.sha256((builder.BASE / "scripts" / name).read_bytes()).hexdigest(), pin
+            )
+        self.assertEqual(len(self.files), 3)
+        self.assertEqual(self.files, builder.build())
+        with patch.object(builder, "OUTPUT", self.root / "fragment"):
+            report = builder.prepare()
+            self.assertFalse(report["execution_permitted"])
+            with self.assertRaises(ValueError):
+                builder.prepare()
+
+    def test_policy_package_and_budget_constants_unchanged(self):
+        for name in ("arm_sft_vm_network_cleanup_v1.py", "run_sft_vm_private_network_v1.py"):
+            before = ast.parse((builder.BASE / "scripts" / name).read_bytes())
+            after = ast.parse(self.files[name])
+
+            def selected(tree):
+                return [
+                    ast.dump(n, include_attributes=False)
+                    for n in tree.body
+                    if isinstance(n, ast.Assign)
+                    or (
+                        isinstance(n, ast.FunctionDef)
+                        and n.name != "_with_preflighted_network_once"
+                    )
+                ]
+
+            self.assertEqual(selected(before), selected(after))
+
+
+if __name__ == "__main__":
+    unittest.main()

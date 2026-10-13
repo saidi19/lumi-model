@@ -1,0 +1,112 @@
+"""Private read-only bucket admission component; never create clients or objects.
+
+Use only a trusted bounded controller transport. Eight control-plane reads at
+most, no list/HEAD/GET of objects, no IAM mutation, no credentials or approval
+flags. A report is not a replacement for live execution of these checks by the
+authenticated retention callback. Tests use synthetic cloud responses only.
+"""
+
+import hashlib
+import json
+import math
+import time
+
+ACCOUNT = "573978149073"
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/"
+PROPOSAL_SHA = "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061"
+BLOCK = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_bucket_rejected") from None
+
+
+def inspect(cloud, proposal_raw, *, deadline, clock=time.monotonic):
+    need(type(proposal_raw) is bytes and 0 < len(proposal_raw) <= 32768)
+    need(hashlib.sha256(proposal_raw).hexdigest() == PROPOSAL_SHA)
+    proposal = json.loads(proposal_raw)
+    target = proposal["retention_proposal"]
+    need(proposal["prepared_attempt"] == ATTEMPT)
+    need((target["bucket"], target["region"], target["prefix"]) == (BUCKET, "us-east-1", PREFIX))
+    need(type(deadline) in {int, float} and math.isfinite(deadline))
+    need(160 < deadline - clock() <= 180)
+    calls = 0
+
+    def read(service, operation, **fields):
+        nonlocal calls
+        need(calls < 8 and deadline - clock() > 20)
+        calls += 1
+        value = cloud.cli(service, operation, **fields)
+        need(type(value) is dict and len(json.dumps(value, allow_nan=False).encode()) <= 32768)
+        need(deadline - clock() > 0)
+        return value
+
+    def bucket(operation):
+        return read("s3api", operation, Bucket=BUCKET, ExpectedBucketOwner=ACCOUNT)
+
+    try:
+        identity = read("sts", "get-caller-identity")
+        need(identity["Account"] == ACCOUNT)
+        location = bucket("get-bucket-location")
+        need(
+            "LocationConstraint" in location
+            and location["LocationConstraint"] in {None, "us-east-1"}
+        )
+        block = bucket("get-public-access-block")["PublicAccessBlockConfiguration"]
+        need(set(block) == set(BLOCK) and all(block[key] is True for key in BLOCK))
+        ownership = bucket("get-bucket-ownership-controls")["OwnershipControls"]
+        need(ownership == {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]})
+        encryption = bucket("get-bucket-encryption")["ServerSideEncryptionConfiguration"]["Rules"]
+        need(len(encryption) == 1)
+        need(encryption[0]["ApplyServerSideEncryptionByDefault"] == {"SSEAlgorithm": "AES256"})
+        need(bucket("get-bucket-versioning").get("Status") == "Enabled")
+        need(bucket("get-bucket-policy-status")["PolicyStatus"]["IsPublic"] is False)
+        raw_policy = bucket("get-bucket-policy")["Policy"]
+        need(type(raw_policy) is str and len(raw_policy.encode()) <= 32768)
+        policy = json.loads(raw_policy)
+        statements = policy["Statement"]
+        need(type(statements) is list and len(statements) <= 64)
+        resources = {f"arn:aws:s3:::{BUCKET}", f"arn:aws:s3:::{BUCKET}/*"}
+        need(
+            any(
+                row.get("Effect") == "Deny"
+                and row.get("Principal") == "*"
+                and row.get("Action") == "s3:*"
+                and type(row.get("Resource")) is list
+                and set(row["Resource"]) == resources
+                and row.get("Condition") == {"Bool": {"aws:SecureTransport": "false"}}
+                for row in statements
+            )
+        )
+    except BaseException:
+        raise ValueError("retention_bucket_admission_failed_no_mutation") from None
+    return dict(
+        schema="lumi.vm-retention-bucket-check.v0.1",
+        attempt=ATTEMPT,
+        account=ACCOUNT,
+        bucket=BUCKET,
+        prefix=PREFIX,
+        region="us-east-1",
+        observation_calls=calls,
+        owner_expected_on_all_bucket_reads=True,
+        public_access_blocked=True,
+        policy_not_public=True,
+        bucket_owner_enforced=True,
+        aes256_default=True,
+        versioning_enabled=True,
+        deny_insecure_transport=True,
+        object_reads=0,
+        object_writes=0,
+        object_lists=0,
+        credentials_issued=False,
+        host_admitted=False,
+        offhost_retention_verified=False,
+        gate_5_complete=False,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_controller_required") from None

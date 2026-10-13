@@ -1,0 +1,139 @@
+"""Offline retained-resource and read-only result reconciliation tests."""
+
+import copy
+import sys
+import unittest
+
+from scripts import qualify_sft_vm_setup_transfer_v1 as q
+from scripts import verify_sft_vm_setup_transfer_result_v1 as v
+
+
+class Tests(unittest.TestCase):
+    def fixture(self, *, wrong_tag=False, volume_pending=False):
+        token_tag = [dict(Key="LumiDiagnostic", Value=q.TOKEN)]
+        owner_tag = [dict(Key="LumiAttempt", Value=q.OWNER_ATTEMPT)]
+        disposable = "i-00000000000000001"
+        execution = dict(instance=disposable, aws_sdk_calls=30)
+        responses = [
+            dict(Account=q.ACCOUNT),
+            dict(
+                Reservations=[
+                    dict(
+                        OwnerId=q.ACCOUNT,
+                        Instances=[
+                            dict(
+                                InstanceId=disposable,
+                                ClientToken=q.TOKEN,
+                                ImageId=q.AMI,
+                                InstanceType="t3.micro",
+                                Tags=token_tag,
+                                State=dict(Name="terminated"),
+                            )
+                        ],
+                    )
+                ]
+            ),
+            dict(
+                Reservations=[
+                    dict(
+                        OwnerId=q.ACCOUNT,
+                        Instances=[
+                            dict(
+                                InstanceId=q.RETAINED,
+                                State=dict(Name="stopped"),
+                                Tags=[dict(Key="LumiAttempt", Value="other")]
+                                if wrong_tag
+                                else owner_tag,
+                                BlockDeviceMappings=[
+                                    dict(Ebs=dict(VolumeId=n, DeleteOnTermination=False))
+                                    for n in q.VOLUMES
+                                ],
+                            )
+                        ],
+                    )
+                ]
+            ),
+            dict(
+                Volumes=[
+                    dict(
+                        VolumeId=n,
+                        Encrypted=True,
+                        State="in-use",
+                        Tags=owner_tag,
+                        Attachments=[dict(InstanceId=q.RETAINED)],
+                    )
+                    for n in q.VOLUMES
+                ]
+            ),
+            dict(
+                InstanceConnectEndpoints=[
+                    dict(
+                        InstanceConnectEndpointId=q.ENDPOINT,
+                        State="create-complete",
+                        SubnetId=q.SUBNET,
+                        Tags=owner_tag,
+                    )
+                ]
+            ),
+        ]
+
+        class Cloud:
+            def __init__(self):
+                self.calls, self.started, self.operations = 0, 0, []
+                self.clock = lambda: 0
+
+            def call(self, operation, **fields):
+                self.operations.append((operation, fields))
+                self.calls += 1
+                if self.calls <= len(responses):
+                    return copy.deepcopy(responses[self.calls - 1])
+                return dict(Volumes=[dict(Tags=token_tag)] if volume_pending else [])
+
+        return Cloud(), execution
+
+    def test_success_read_only_and_shared_budget(self):
+        cloud, report = self.fixture()
+        result = v.reconcile(cloud, report, sleep=lambda _: None)
+        self.assertTrue(result["disposable_instance_terminated_live_verified"])
+        self.assertTrue(result["disposable_tagged_volumes_deleted_live_verified"])
+        self.assertTrue(result["both_retained_encrypted_volumes_preserved_live_verified"])
+        self.assertEqual(result["verification_sdk_reads"], 6)
+        self.assertEqual(result["combined_execution_and_verification_sdk_calls"], 36)
+        self.assertTrue(all(op.startswith(("get_", "describe_")) for op, _ in cloud.operations))
+
+    def test_unknown_retained_owner_rejects(self):
+        cloud, report = self.fixture(wrong_tag=True)
+        with self.assertRaises(ValueError):
+            v.reconcile(cloud, report, sleep=lambda _: None)
+        self.assertEqual(cloud.calls, 3)
+
+    def test_pending_automatic_deletion_not_claimed_as_complete(self):
+        cloud, report = self.fixture(volume_pending=True)
+        result = v.reconcile(cloud, report, sleep=lambda _: None)
+        self.assertFalse(result["disposable_tagged_volumes_deleted_live_verified"])
+        self.assertEqual(cloud.calls, 10)
+        self.assertTrue(all(op.startswith(("get_", "describe_")) for op, _ in cloud.operations))
+
+    def test_cumulative_limit_before_dispatch(self):
+        cloud, report = self.fixture()
+        report["aws_sdk_calls"] = 99
+        with self.assertRaises(ValueError):
+            v.reconcile(cloud, report, sleep=lambda _: None)
+        self.assertEqual(cloud.calls, 1)
+
+    def test_expired_verification_stops_before_dispatch(self):
+        cloud, report = self.fixture()
+        cloud.clock = lambda: 180
+        with self.assertRaises(ValueError):
+            v.reconcile(cloud, report, sleep=lambda _: None)
+        self.assertEqual(cloud.calls, 0)
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

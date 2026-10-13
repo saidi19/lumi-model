@@ -1,0 +1,80 @@
+# SFT execution status v0.61
+
+Local-only result handoff, 2026-09-09. The nine-file implementation in v0.60 was
+committed and published as **`a0296d4dd80463023a154b5eb51bd4384158f513`**, parent
+`535ffc2c9be4f9611fd051a8e632b3696f30250d`. GitHub tree/commit identities and branch
+readback matched local objects; publication was a single non-force update on
+the existing private branch. Local origin tracking was advanced to the same SHA.
+Unrelated files and all prior private evidence remained unstaged and unchanged.
+
+## Source verification complete
+
+[Source run 34351673826](https://github.com/saidi19/lumi-model/actions/runs/34351673826)
+passed all four jobs on the exact published SHA:
+
+- `frozen-lint-integrity`: `102466203030`.
+- `source-only-validators`: `102466203177`.
+- `isolated-sft-controls`: `102466203282`.
+- `test`: `102466203438`.
+
+The source suite reports **5,124 passed, zero failed, 58 skipped, 329 deselected,
+36 warnings and 10,146 subtests passed in 441.22 seconds**. This is 70 additional
+passing source tests over the accepted parent, with no added skip or xfail.
+Partition status is `SOURCE_SCOPE_ACCOUNTED`: 5,182 source-selected, 327 private
+integrations `NOT_EXECUTED`, and two historical tests separately routed.
+`private_integration_passed=false` and `full_ci_passed=false` remain unchanged.
+The lint job preserves 815 historical findings; this is not a zero-debt claim.
+
+[Spark run 34351673825](https://github.com/saidi19/lumi-model/actions/runs/34351673825),
+job `102466202558`, passed **three tests, zero skips, in 106.19 seconds**.
+
+## Historical native work did not restart
+
+All three historical native workflows completed with **skipped**, as required:
+
+- [OCI candidate 34351673777](https://github.com/saidi19/lumi-model/actions/runs/34351673777).
+- [Origin diagnostic 34351673880](https://github.com/saidi19/lumi-model/actions/runs/34351673880).
+- [Lookup acceptance 34351673811](https://github.com/saidi19/lumi-model/actions/runs/34351673811).
+
+The two newly tightened historical job guards prevented the broad source-path
+triggers from repeating the old failed build/diagnostic. The accepted lookup
+guard was unchanged. There was no rerun, manual dispatch, dummy repush, new
+image build, image export or dedicated native OCI-handoff execution. Existing
+Linux synthetic tests remain part of the normal Source suite; their execution
+is not misrepresented as new guardian/OCI composition acceptance.
+
+Each completed Source/Spark log was read once in memory under a 2 MiB cap. Only
+aggregate counts, fixed partition status and hashes were retained, not raw logs:
+
+- Source: 60,508 bytes; SHA-256
+  `46c5236855e2939a33b8a69a9577912fb019f8525b22256fefc27360d5a9413d`.
+- Spark: 51,415 bytes; SHA-256
+  `20d7fe34010e1d4a9dce891f0242ca52e606304a1b671d6296e47c377396e440`.
+
+The new module's literal image/control/report pins were independently compared
+to the saved 2,182-byte accepted build report. Its SHA remains
+`24712f08f2522a0319da1179178aa8c73eef5969303faea73de16d89a23b386b`, and every binding
+matched. No native module was imported for that AST/JSON comparison. This does
+not imply that the large image archive was downloaded or rehashed locally.
+
+## Gate 5: precise handoff
+
+Completed here: source implementation and Source-CI verification of a bounded,
+one-shot created-OCI identity handoff, plus protection against unintended old
+workflow repeats. Live Docker compatibility of this new verifier has not yet
+been exercised. Full guardian/rootfs/worker composition is still unfinished.
+
+Next: use the accepted software in a bounded real guardian composition, with
+safe export/extraction provenance, a read-only rootfs bootstrap that does not
+substitute host runtime files, and explicit delivery of the accepted software
+identity into worker admission/controller agreement. Verify that actual workload
+processes, not merely a Docker CLI, are contained before release. Exercise that
+composition's positive and negative paths together; do not count synthetic
+metadata tests as native proof or repeat the old build to manufacture progress.
+
+The existing real-worker entry remains closed. Dedicated host/S3/data binding,
+approved H100/CUDA testing and actual SFT remain downstream. No GPU/instance,
+S3/SSH, real model/data, training, registry mutation, dataset seal or production
+promotion occurred. The Mac ran only lightweight source/synthetic/AST tests and
+metadata/publication commands. This result-only receipt is not pushed, avoiding
+another Source/Spark run solely for documentation.

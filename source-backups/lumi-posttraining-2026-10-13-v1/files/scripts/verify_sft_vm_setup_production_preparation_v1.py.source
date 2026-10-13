@@ -1,0 +1,111 @@
+"""Offline integrity and synthetic replay evidence, never Linux qualification."""
+
+import io
+import json
+import re
+import socket
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_setup_production_probe_v1 as builder
+from scripts import qualify_sft_vm_setup_production_v1 as probe
+
+ROOT = Path(__file__).resolve().parents[1]
+REPORT = ROOT / "evidence/lumi-setup-production-probe-preparation-v0.1.json"
+
+
+def validate(plan):
+    need = probe.need
+    need(plan["schema"] == "lumi.setup-production-qualification-plan.v0.1")
+    need(plan["status"] == "prepared_not_execution_authority")
+    need(plan["token"] == probe.TOKEN)
+    need(plan["entry_sha256"] == probe.sha(probe.read(Path(probe.__file__))))
+    need(plan["source_release_sha256"] == probe.RELEASE_SHA)
+    for name, digest in plan["pins"].items():
+        path = Path(name)
+        need(not path.is_absolute() and ".." not in path.parts)
+        need(type(digest) is str and re.fullmatch("[0-9a-f]{64}", digest))
+        need(probe.sha(probe.read(ROOT / path)) == digest)
+    need(probe.read(builder.ENTRY) == builder.source())
+    host, execution, readiness = (plan[k] for k in ("host", "execution", "read_only_readiness"))
+    need(host["instance_type"] == "t3.micro" and host["maximum_fresh_instances"] == 1)
+    need(host["controller_goal_seconds"] == 900 and host["sdk_dispatch_deadline_seconds"] == 850)
+    need(host["production_setup_guard_boottime_seconds"] == 1800)
+    need(host["production_host_guard_boottime_seconds"] == 14400)
+    need(host["hard_billing_cap_or_guaranteed_15_minute_lifetime_claimed"] is False)
+    need(execution["sdk_dispatch_limit"] == 100 and execution["pre_cleanup_sdk_limit"] == 70)
+    need(execution["maximum_ssh_processes"] == 3 and execution["native_alarm_seconds"] == 85)
+    need(execution["source_only_frame_bytes"] == 17061196 and execution["receiver_files"] == 19)
+    need(execution["maximum_terminate_dispatches"] == 1 and execution["retry_allowed"] is False)
+    need(readiness["maximum_sdk_reads"] == 12 and readiness["maximum_seconds"] == 240)
+    need(plan["new_explicit_paid_execution_approval_required"] is True)
+    need(plan["prior_paid_authorizations_reused"] is False)
+    for field in (
+        "linux_qualification",
+        "full_4b_host_qualification",
+        "real_4b_import",
+        "gate_5_complete",
+        "gpu",
+        "training",
+        "production_eligible",
+    ):
+        need(plan[field] is False)
+    return True
+
+
+def main():
+    raw = probe.read(probe.PLAN, 65536)
+    validate(json.loads(raw))
+    probe.need(
+        not probe.APPROVAL.exists() and not probe.OUT.exists() and not probe.READ_OUT.exists()
+    )
+    suite = unittest.defaultTestLoader.loadTestsFromNames(
+        [
+            "tests.test_sft_vm_setup_exchange_diagnostic_v1",
+            "tests.test_sft_vm_setup_production_probe_v1",
+            "tests.test_sft_vm_setup_production_preparation_v1",
+        ]
+    )
+    with (
+        patch.object(socket, "create_connection", side_effect=AssertionError("network_rejected")),
+        patch.object(probe.Cloud, "__init__", side_effect=AssertionError("cloud_rejected")),
+    ):
+        result = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+    probe.need(result.wasSuccessful() and result.testsRun == 26)
+    report = dict(
+        schema="lumi.setup-production-probe-preparation.v0.1",
+        status="local_preparation_verified_pending_readonly_admission_and_paid_approval",
+        plan_sha256=probe.sha(raw),
+        entry_sha256=probe.sha(probe.read(builder.ENTRY)),
+        verifier_sha256=probe.sha(probe.read(Path(__file__))),
+        verifier_test_sha256=probe.sha(
+            probe.read(ROOT / "tests/test_sft_vm_setup_production_preparation_v1.py")
+        ),
+        bound_file_hashes_verified=True,
+        reproducible_entry_verified=True,
+        production_bootstrap_byte_identity_verified=True,
+        synthetic_tests_run=result.testsRun,
+        synthetic_failures=len(result.failures),
+        synthetic_errors=len(result.errors),
+        aws_calls=0,
+        live_ssh_dispatches=0,
+        new_instances=0,
+        checkpoint_or_dataset_access=False,
+        prior_evidence_hashes_unchanged=True,
+        linux_qualification=False,
+        original_remote_failure_cause_confirmed=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        production_eligible=False,
+        prior_paid_authorizations_reused=False,
+        paid_approval_created=False,
+    )
+    probe.save(REPORT, report)
+    print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

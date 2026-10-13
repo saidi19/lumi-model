@@ -1,0 +1,495 @@
+"""Private Linux seccomp-listener adapter; public native use remains closed.
+
+This module binds the pure v0.111 policy and broker to Linux v6.8 candidate ABI
+layouts. Importing it performs no syscall, ioctl, descriptor or process action.
+Local tests replace every native boundary. Native success still requires an
+authenticated target-kernel qualification and a fixed supervisor integration.
+
+The trusted bootstrap installs the temporary listener filter, transfers exactly
+one CLOEXEC listener descriptor to its already-owned supervisor, receives an
+exact adoption acknowledgement, then closes its local listener copy. Only after
+the bootstrap transfer handshake is complete may it install the final closed
+seal. The final seal denies further seccomp installation and socket transports;
+therefore no post-seal ancillary or socket send/recv protocol is possible. A
+successor may use mediated scalar ``write`` and allowed ``read`` for fixed sealed
+READY/release bytes. Neither helper accepts a caller-selected filter, flag, ABI
+layout, syscall number or ioctl.
+
+The supervisor adopts a descriptor only through the private admitted function.
+It receives one zeroed notification at a time and exposes exact ID-validation
+and response callbacks for the scalar broker. Any native ambiguity, unexpected
+return, identity change, ownership mismatch, reentry, duplicate operation or
+close failure terminally consumes the adapter. No EINTR/ENOENT retry, response
+retry, descriptor replacement or cleanup rollback exists.
+
+Kernel USER_NOTIF CONTINUE has pointer TOCTOU limitations. This design uses only
+the immutable scalar requested-byte count across all FDs; Landlock, the closed
+filter, inherited-authority exclusion and other controls must constrain targets.
+Only fixed codes and aggregate snapshots are retention-safe. Never retain raw
+notifications, responses, descriptor identities, exceptions or tracebacks.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import os
+import platform
+import stat
+import threading
+
+from . import posttraining_checkpoint_write_broker_v1 as broker
+from . import posttraining_checkpoint_write_policy_v1 as policy
+
+SCHEMA = "lumi.checkpoint-write-listener.v0.1"
+SYS_SECCOMP = 317
+SYS_IOCTL = 16
+SYS_PRCTL = 157
+SECCOMP_SET_MODE_FILTER = 1
+SECCOMP_GET_ACTION_AVAIL = 2
+SECCOMP_GET_NOTIF_SIZES = 3
+SECCOMP_FILTER_FLAG_NEW_LISTENER = 1 << 3
+SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV = 1 << 5
+LISTENER_FLAGS = SECCOMP_FILTER_FLAG_NEW_LISTENER | SECCOMP_FILTER_FLAG_WAIT_KILLABLE_RECV
+PR_GET_SECCOMP = 21
+PR_SET_NO_NEW_PRIVS = 38
+PR_GET_NO_NEW_PRIVS = 39
+SECCOMP_MODE_FILTER = 2
+SECCOMP_IOCTL_NOTIF_RECV = 0xC0502100
+SECCOMP_IOCTL_NOTIF_SEND = 0xC0182101
+SECCOMP_IOCTL_NOTIF_ID_VALID = 0x40082102
+ADOPTED = b"LUMI-WRITE-LISTENER-ADOPTED-v1"
+ML_ROOTS = frozenset({"torch", "numpy", "transformers", "safetensors", "tokenizers",
+                      "tensorflow", "jax", "cupy", "cuda"})
+ERROR_CODES = frozenset({
+    "runtime_rejected", "abi_rejected", "already_attempted", "owner_mismatch", "reentry",
+    "installation_failed", "readback_failed", "listener_rejected", "transfer_rejected",
+    "seal_rejected", "notification_rejected", "notification_invalid", "response_rejected",
+    "close_failed", "already_failed", "host_guard_not_bound",
+})
+FALSE_FLAGS = (
+    "target_kernel_qualified", "listener_origin_authenticated_by_adoption",
+    "supervisor_liveness_verified", "independent_deadline_enforced",
+    "native_cumulative_write_enforcement_verified", "alternative_write_channels_closed",
+    "host_admission_verified", "execution_permitted", "real_import_permitted",
+    "gate_5_complete", "training_authorized", "production_eligible", "retry_allowed",
+)
+_PREPARE_LOCK = threading.Lock()
+_ADOPT_LOCK = threading.Lock()
+_PREPARE_OWNER = None
+_ADOPT_OWNER = None
+_TRANSFER_COMPLETED = False
+_LOCAL_LISTENER_CLOSED = False
+_SEAL_ATTEMPTED = False
+_PREPARE_FAILED = False
+
+
+class ListenerError(ValueError):
+    def __init__(self, code="listener_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "listener_rejected"
+        super().__init__(self.code)
+
+
+class SockFilter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
+
+
+class SockFprog(ctypes.Structure):
+    _fields_ = [("length", ctypes.c_ushort), ("filter", ctypes.POINTER(SockFilter))]
+
+
+class SeccompData(ctypes.Structure):
+    _fields_ = [("number", ctypes.c_int32), ("arch", ctypes.c_uint32),
+                ("instruction_pointer", ctypes.c_uint64), ("arguments", ctypes.c_uint64 * 6)]
+
+
+class SeccompNotif(ctypes.Structure):
+    _fields_ = [("identifier", ctypes.c_uint64), ("pid", ctypes.c_uint32),
+                ("flags", ctypes.c_uint32), ("data", SeccompData)]
+
+
+class SeccompNotifResp(ctypes.Structure):
+    _fields_ = [("identifier", ctypes.c_uint64), ("value", ctypes.c_int64),
+                ("error", ctypes.c_int32), ("flags", ctypes.c_uint32)]
+
+
+class SeccompNotifSizes(ctypes.Structure):
+    _fields_ = [("notification", ctypes.c_uint16), ("response", ctypes.c_uint16),
+                ("data", ctypes.c_uint16)]
+
+
+def _need(condition, code="listener_rejected"):
+    if not condition:
+        raise ListenerError(code) from None
+
+
+def _runtime():
+    try:
+        _need(sys_platform() == "linux" and platform.machine() == "x86_64"
+              and platform.python_implementation() == "CPython"
+              and python_version() == (3, 12) and no_site() and dont_write_bytecode()
+              and os.getresuid() == os.getresgid() == (0, 0, 0)
+              and threading.current_thread() is threading.main_thread()
+              and threading.active_count() == 1
+              and not any(name.split(".", 1)[0] in ML_ROOTS for name in loaded_modules()),
+              "runtime_rejected")
+    except ListenerError:
+        raise
+    except BaseException:
+        raise ListenerError("runtime_rejected") from None
+
+
+# Small indirections keep local tests native-free without replacing sys itself.
+def sys_platform():
+    import sys
+    return sys.platform
+
+
+def python_version():
+    import sys
+    return sys.version_info[:2]
+
+
+def no_site():
+    import sys
+    return sys.flags.no_site == 1
+
+
+def dont_write_bytecode():
+    import sys
+    return sys.dont_write_bytecode
+
+
+def loaded_modules():
+    import sys
+    return sys.modules
+
+
+def _abi():
+    import sys
+    _need(sys.byteorder == "little" and ctypes.sizeof(ctypes.c_void_p) == 8
+          and ctypes.sizeof(ctypes.c_long) == ctypes.sizeof(ctypes.c_ulong) == 8
+          and ctypes.sizeof(ctypes.c_uint) == 4 and ctypes.sizeof(ctypes.c_ushort) == 2
+          and ctypes.sizeof(SockFilter) == 8 and SockFilter.code.offset == 0
+          and SockFilter.jt.offset == 2 and SockFilter.jf.offset == 3
+          and SockFilter.k.offset == 4 and ctypes.sizeof(SockFprog) == 16
+          and SockFprog.length.offset == 0 and SockFprog.filter.offset == 8
+          and ctypes.sizeof(SeccompData) == broker.NOTIFICATION.size - 16 == 64
+          and SeccompData.number.offset == 0 and SeccompData.arch.offset == 4
+          and SeccompData.instruction_pointer.offset == 8
+          and SeccompData.arguments.offset == 16
+          and ctypes.sizeof(SeccompNotif) == broker.NOTIFICATION.size == 80
+          and SeccompNotif.identifier.offset == 0 and SeccompNotif.pid.offset == 8
+          and SeccompNotif.flags.offset == 12 and SeccompNotif.data.offset == 16
+          and ctypes.sizeof(SeccompNotifResp) == broker.RESPONSE.size == 24
+          and SeccompNotifResp.identifier.offset == 0 and SeccompNotifResp.value.offset == 8
+          and SeccompNotifResp.error.offset == 16 and SeccompNotifResp.flags.offset == 20
+          and ctypes.sizeof(SeccompNotifSizes) == 6
+          and SeccompNotifSizes.notification.offset == 0
+          and SeccompNotifSizes.response.offset == 2 and SeccompNotifSizes.data.offset == 4,
+          "abi_rejected")
+
+
+def _libc():
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _system_call(number, *arguments):
+    call = _libc().syscall
+    call.argtypes = [ctypes.c_long]  # libc syscall(2) is variadic after the number.
+    call.restype = ctypes.c_long
+    return call(ctypes.c_long(number), *arguments)
+
+
+def _prctl(option, value=0):
+    return _system_call(SYS_PRCTL, ctypes.c_int(option), ctypes.c_ulong(value),
+                        ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0))
+
+
+def _seccomp(operation, flags, pointer):
+    return _system_call(SYS_SECCOMP, ctypes.c_uint(operation), ctypes.c_uint(flags),
+                        ctypes.cast(pointer, ctypes.c_void_p))
+
+
+def _ioctl(fd, command, pointer):
+    return _system_call(SYS_IOCTL, ctypes.c_int(fd), ctypes.c_ulong(command),
+                        ctypes.cast(pointer, ctypes.c_void_p))
+
+
+def _identity(fd):
+    value = os.fstat(fd)
+    return value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode), value.st_uid, value.st_gid
+
+
+def _descriptor(fd):
+    _need(type(fd) is int and fd >= 3, "listener_rejected")
+    flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+    _need(type(flags) is int and flags & fcntl.FD_CLOEXEC, "listener_rejected")
+    identity = _identity(fd)
+    _need(identity[1] > 0, "listener_rejected")
+    return identity
+
+
+def _program(rows):
+    _need(type(rows) is tuple and rows in (policy.LISTENER_FILTER, policy.FILTER), "abi_rejected")
+    storage = (SockFilter * len(rows))(*(SockFilter(*row) for row in rows))
+    return storage, SockFprog(len(storage), storage)
+
+
+def _kernel_readback():
+    action = ctypes.c_uint32(policy.USER_NOTIF)
+    _need(_seccomp(SECCOMP_GET_ACTION_AVAIL, 0, ctypes.byref(action)) == 0
+          and action.value == policy.USER_NOTIF, "abi_rejected")
+    sizes = SeccompNotifSizes()
+    _need(_seccomp(SECCOMP_GET_NOTIF_SIZES, 0, ctypes.byref(sizes)) == 0
+          and (sizes.notification, sizes.response, sizes.data) == (80, 24, 64), "abi_rejected")
+
+
+def install_write_listener(**_arguments):
+    """No supplied approval, hashes or callbacks open native installation."""
+    raise ListenerError("host_guard_not_bound") from None
+
+
+def _prepare_listener_admitted_once(*, transfer):
+    """Install and transfer the temporary listener; do not install the final seal."""
+    global _PREPARE_OWNER, _TRANSFER_COMPLETED, _LOCAL_LISTENER_CLOSED, _PREPARE_FAILED
+    _runtime()
+    _need(callable(transfer), "transfer_rejected")
+    if not _PREPARE_LOCK.acquire(blocking=False):
+        _PREPARE_FAILED = True
+        raise ListenerError("reentry") from None
+    fd = None
+    started = transferred = closed = False
+    failure = None
+    try:
+        owner = os.getpid(), threading.get_ident()
+        if _PREPARE_OWNER is not None:
+            _PREPARE_FAILED = True
+            raise ListenerError("already_attempted") from None
+        _abi()
+        storage, program = _program(policy.LISTENER_FILTER)
+        _need(len(storage) == len(policy.LISTENER_FILTER), "abi_rejected")
+        _PREPARE_OWNER = owner
+        started = True
+        _kernel_readback()
+        _need(_prctl(PR_SET_NO_NEW_PRIVS, 1) == 0 and _prctl(PR_GET_NO_NEW_PRIVS) == 1,
+              "installation_failed")
+        fd = _seccomp(SECCOMP_SET_MODE_FILTER, LISTENER_FLAGS, ctypes.byref(program))
+        _need(type(fd) is int and fd >= 3, "installation_failed")
+        identity = _descriptor(fd)
+        _need(_prctl(PR_GET_SECCOMP) == SECCOMP_MODE_FILTER, "readback_failed")
+        callback_failed = False
+        try:
+            adopted = transfer(fd, identity, policy.LISTENER_FILTER_SHA256)
+        except BaseException:
+            adopted, callback_failed = None, True
+        try:
+            stable = _descriptor(fd) == identity
+        except BaseException:
+            stable = False
+        if not stable:
+            # The callback contract forbids consuming/mutating this local copy.
+            # Do not close a numeric descriptor that may now name unrelated data.
+            fd = None
+            raise ListenerError("transfer_rejected") from None
+        _need(not callback_failed and not _PREPARE_FAILED and adopted == ADOPTED,
+              "transfer_rejected")
+        transferred = True
+        closing, fd = fd, None  # Revoke local ownership before an ambiguous close.
+        try:
+            os.close(closing)
+        except BaseException:
+            raise ListenerError("close_failed") from None
+        closed = True
+        _TRANSFER_COMPLETED = _LOCAL_LISTENER_CLOSED = True
+    except BaseException as error:
+        failure = error.code if type(error) is ListenerError else "installation_failed"
+    finally:
+        if fd is not None:
+            closing, fd = fd, None
+            try:
+                os.close(closing)
+                closed = True
+            except BaseException:
+                failure = "close_failed"
+        _PREPARE_LOCK.release()
+    if failure is not None:
+        if started:
+            _PREPARE_FAILED = True
+        raise ListenerError(failure) from None
+    return {"schema": SCHEMA,
+            "status": "transfer_callback_acknowledged_not_native_adoption_or_seal",
+            "listener_filter_sha256": policy.LISTENER_FILTER_SHA256,
+            "listener_flags": LISTENER_FLAGS, "transfer_acknowledged": transferred,
+            "local_listener_closed": closed, "final_seal_installed": False,
+            **dict.fromkeys(FALSE_FLAGS, False)}
+
+
+def _seal_admitted_once():
+    """Install the fixed final seal after the admitted bootstrap handshake."""
+    global _SEAL_ATTEMPTED
+    _runtime()
+    _need(_PREPARE_OWNER == (os.getpid(), threading.get_ident())
+          and not _PREPARE_FAILED and _TRANSFER_COMPLETED and _LOCAL_LISTENER_CLOSED,
+          "seal_rejected")
+    _need(not _SEAL_ATTEMPTED, "already_attempted")
+    _SEAL_ATTEMPTED = True
+    try:
+        _abi()
+        storage, program = _program(policy.FILTER)
+        _need(len(storage) == len(policy.FILTER), "abi_rejected")
+        _kernel_readback()
+        _need(_prctl(PR_GET_NO_NEW_PRIVS) == 1
+              and _prctl(PR_GET_SECCOMP) == SECCOMP_MODE_FILTER, "readback_failed")
+        _need(_seccomp(SECCOMP_SET_MODE_FILTER, 0, ctypes.byref(program)) == 0,
+              "installation_failed")
+        _need(_prctl(PR_GET_NO_NEW_PRIVS) == 1
+              and _prctl(PR_GET_SECCOMP) == SECCOMP_MODE_FILTER, "readback_failed")
+    except BaseException as error:
+        code = error.code if type(error) is ListenerError else "installation_failed"
+        raise ListenerError(code) from None
+    return {"schema": SCHEMA, "status": "final_seal_installed_not_native_qualified",
+            "filter_sha256": policy.FILTER_SHA256, "listener_filter_inherited": True,
+            "final_seal_installed": True, **dict.fromkeys(FALSE_FLAGS, False)}
+
+
+def _adopt_listener_admitted_once(fd):
+    """After acquiring its lock, own one transferred FD and close it on failure."""
+    global _ADOPT_OWNER
+    _runtime()
+    _abi()
+    _need(type(fd) is int and fd >= 3, "listener_rejected")
+    _need(_ADOPT_LOCK.acquire(blocking=False), "reentry")
+    result = None
+    failure = None
+    owns_fd = True
+    try:
+        owner = os.getpid(), threading.get_ident()
+        _need(_ADOPT_OWNER is None, "already_attempted")
+        _ADOPT_OWNER = owner  # The first native readback/probe consumes adoption.
+        _kernel_readback()
+        identity = _descriptor(fd)
+        result = _Listener(fd, identity, owner)
+        owns_fd = False
+    except BaseException as error:
+        failure = error.code if type(error) is ListenerError else "listener_rejected"
+    finally:
+        if owns_fd:
+            try:
+                os.close(fd)
+            except BaseException:
+                failure = "close_failed"
+        _ADOPT_LOCK.release()
+    if failure is not None:
+        raise ListenerError(failure) from None
+    return result
+
+
+class _Listener:
+    def __init__(self, fd, identity, owner):
+        self._fd, self._identity, self._owner = fd, identity, owner
+        self._lock = threading.Lock()
+        self._outstanding = None
+        self._outstanding_validated = False
+        self._received = self._validated = self._continued = 0
+        self._failed = self._closed = False
+
+    def _enter(self):
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+            _need(not self._closed and not self._failed, "already_failed")
+            _need(self._lock.acquire(blocking=False), "reentry")
+            _need(_descriptor(self._fd) == self._identity, "listener_rejected")
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ListenerError else "listener_rejected"
+            raise ListenerError(code) from None
+
+    def receive_admitted_once(self):
+        """Potentially blocking kernel receive; deadline watching must be external."""
+        self._enter()
+        try:
+            _need(self._outstanding is None, "notification_rejected")
+            value = SeccompNotif()  # Kernel requires the whole supplied buffer to be zero.
+            _need(bytes(value) == b"\0" * 80, "abi_rejected")
+            _need(_ioctl(self._fd, SECCOMP_IOCTL_NOTIF_RECV, ctypes.byref(value)) == 0,
+                  "notification_rejected")
+            raw = bytes(value)
+            parsed = broker.parse_notification(raw)
+            _need(not self._failed, "notification_rejected")
+            self._outstanding = parsed["id"]
+            self._outstanding_validated = False
+            self._received += 1
+            return raw
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ListenerError else "notification_rejected"
+            raise ListenerError(code) from None
+        finally:
+            self._lock.release()
+
+    def id_valid(self, identifier):
+        self._enter()
+        try:
+            _need(type(identifier) is int and 0 <= identifier < 2**64
+                  and identifier == self._outstanding and not self._outstanding_validated,
+                  "notification_invalid")
+            value = ctypes.c_uint64(identifier)
+            _need(_ioctl(self._fd, SECCOMP_IOCTL_NOTIF_ID_VALID, ctypes.byref(value)) == 0,
+                  "notification_invalid")
+            _need(not self._failed, "notification_invalid")
+            self._outstanding_validated = True
+            self._validated += 1
+            return True
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ListenerError else "notification_invalid"
+            raise ListenerError(code) from None
+        finally:
+            self._lock.release()
+
+    def send_response(self, raw):
+        self._enter()
+        try:
+            _need(type(raw) is bytes and len(raw) == broker.RESPONSE.size,
+                  "response_rejected")
+            identifier, value, error, flags = broker.RESPONSE.unpack(raw)
+            _need(identifier == self._outstanding and self._outstanding_validated
+                  and value == error == 0
+                  and flags == broker.CONTINUE, "response_rejected")
+            response = SeccompNotifResp(identifier, value, error, flags)
+            _need(bytes(response) == raw
+                  and _ioctl(self._fd, SECCOMP_IOCTL_NOTIF_SEND,
+                             ctypes.byref(response)) == 0, "response_rejected")
+            _need(not self._failed, "response_rejected")
+            self._outstanding = None
+            self._outstanding_validated = False
+            self._continued += 1
+        except BaseException as caught:
+            self._failed = True
+            code = caught.code if type(caught) is ListenerError else "response_rejected"
+            raise ListenerError(code) from None
+        finally:
+            self._lock.release()
+
+    def snapshot(self):
+        return {"schema": SCHEMA, "notifications_received": self._received,
+                "ids_validated": self._validated, "responses_continued": self._continued,
+                "outstanding_notification": self._outstanding is not None,
+                "terminal_failed": self._failed, "listener_closed": self._closed,
+                **dict.fromkeys(FALSE_FLAGS, False)}
+
+    def close_admitted_once(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        _need(not self._closed, "already_failed")
+        self._closed = True  # Consume ownership before identity/close ambiguity.
+        try:
+            _need(_descriptor(self._fd) == self._identity, "listener_rejected")
+            closing, self._fd = self._fd, -1
+            os.close(closing)
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ListenerError else "close_failed"
+            raise ListenerError(code) from None
+        return self.snapshot()

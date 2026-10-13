@@ -1,0 +1,74 @@
+"""Synthetic checks for attempt-022 inert watchdog deployment."""
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import execute_sft_vm_inert_watchdog_v15 as m
+from tests import test_sft_vm_external_watchdog_v1 as fixture
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "OUTPUT", self.root / "output"))
+        self.enterContext(patch.object(m, "PROPOSAL", self.root / "proposal.json"))
+        self.enterContext(patch.object(m, "APPROVAL", self.root / "approval.json"))
+        m.PROPOSAL.write_bytes(m.encode(m.expected_proposal()))
+        m.APPROVAL.write_bytes(
+            m.encode(m.expected_approval("SYNTHETIC ONLY", m.sha(m.PROPOSAL.read_bytes())))
+        )
+        self.plan, self.deployer = m.sources()
+        self.enterContext(patch.object(fixture, "d", self.deployer))
+        self.cloud = fixture.DeploymentCloud()
+        original = self.cloud.cli
+
+        def cli(service, operation, **fields):
+            if operation == "get-schedule-group":
+                self.cloud.calls.append((service, operation, fields))
+                raise LookupError("absent")
+            return original(service, operation, **fields)
+
+        self.cloud.cli = cli
+
+    def test_success_is_unarmed_and_has_no_instance_or_invocation(self):
+        result = m.run(transport=self.cloud, wait=lambda _seconds: None)
+        self.assertEqual(result["status"], "deployed_unarmed_invocation_disabled")
+        self.assertEqual(self.cloud.concurrency, 0)
+        self.assertEqual(self.cloud.function["Environment"], self.deployer.UNARMED)
+        self.assertEqual(result["instance_actions"], 0)
+        self.assertFalse(result["invocation"])
+        self.assertFalse(result["schedule_creation"])
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_requests_use_only_fresh_identity(self):
+        for payloads in m.qualified.allowed_requests(self.deployer).values():
+            for raw in payloads:
+                self.assertNotIn(m.ATTEMPT.encode(), b"07be75c955dc43fe8818192e8a9e3fc1")
+                self.assertNotIn(b"07be75c955dc43fe8818192e8a9e3fc1", raw)
+        self.assertEqual(self.deployer.ATTEMPT, m.ATTEMPT)
+
+    def test_bad_approval_rejected_before_output_or_cloud(self):
+        approval = json.loads(m.APPROVAL.read_bytes())
+        for change in (
+            {"training": True},
+            {"approved_execution_count": 2},
+            {"human_message": ""},
+        ):
+            m.APPROVAL.write_bytes(m.encode(dict(approval, **change)))
+            with self.assertRaises(ValueError):
+                m.run(transport=self.cloud, wait=lambda _seconds: None)
+            self.assertFalse(m.OUTPUT.exists())
+            self.assertFalse(self.cloud.calls)
+
+    def test_schedule_collision_stops_before_mutation(self):
+        cloud = fixture.DeploymentCloud()
+        result = m.run(transport=cloud, wait=lambda _seconds: None)
+        self.assertEqual(result["stage"], "schedule_group_absence")
+        self.assertEqual(result["mutation_dispatches"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

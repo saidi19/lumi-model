@@ -1,0 +1,97 @@
+"""Attempt-021 verified-control bindings for fresh read-only admission."""
+
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt021_deployment_bindings_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = 'f6457f1d7b25d52eeaf8627236f4e3931c222e6c7d57495cae206bfdc6b5ceab'
+ATTEMPT = source.ATTEMPT
+OLD = source.OLD
+BUCKET = source.BUCKET
+RELEASE = source.RELEASE
+RELEASE_SHA = source.RELEASE_SHA
+SOURCE_PROOF = source.SOURCE_PROOF
+SOURCE_PROOF_SHA = source.SOURCE_PROOF_SHA
+ABSENCE = source.ABSENCE
+ABSENCE_SHA = source.ABSENCE_SHA
+PLAN = "artifacts/lumi-vm-attempt-021-control-plan-v0.3/plan.json"
+PLAN_SHA = 'bf27391c8a94075a1bc5df0373a228adbe821185d707744d5bbc16c4209f90f5'
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-021-control-plan-v0.3/release.json"
+PLAN_RELEASE_SHA = 'b7703d12d3f00748311a2477c4fb0e39b6eb4d112f345b324baceeea03965eb1'
+WATCH = "evidence/lumi-vm-attempt-021-inert-watchdog-deployment-verification-v0.1.json"
+WATCH_SHA = 'b27a8baa8215fd367f3830e890e149ec90a6b9df092f02eae71a0f3a36175c53'
+STORE = "evidence/lumi-vm-attempt-021-cleanup-bucket-verification-v0.1.json"
+STORE_SHA = 'bd0a44fea4b523b6e5c7d4b914cd7f9b340c319b379ae8828f9266ee22886aec'
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt021_binding_v22_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    return source.read(name, digest, size)
+
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    watch = json.loads(read(WATCH, WATCH_SHA))
+    store = json.loads(read(STORE, STORE_SHA))
+    need(
+        plan_release["attempt"] == ATTEMPT
+        and plan_release["plan_sha256"] == PLAN_SHA
+        and plan_release["source_release_sha256"] == RELEASE_SHA
+        and plan_release["watchdog_verification_sha256"] == WATCH_SHA
+        and plan_release["cleanup_store_verification_sha256"] == STORE_SHA
+        and plan_release["live_controls_verified"] is True
+        and plan_release["execution_permitted"] is False
+        and watch["attempt"] == ATTEMPT
+        and watch["status"] == "verified_deployed_unarmed_invocation_disabled"
+        and watch["full_cpu_execution_authorized"] is False
+        and store["attempt"] == ATTEMPT
+        and store["status"] == "verified_private_cleanup_bucket_created"
+        and store["full_cpu_execution_authorized"] is False
+    )
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["required_control_proofs"] == [WATCH, STORE]
+        and plan["successful_readonly_preflight"] is None
+        and plan["watchdog"]["status"] == "deployed_unarmed_invocation_disabled_verified"
+        and plan["cleanup_store"]["status"] == "private_cleanup_store_verified"
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    build()
+    return {WATCH: WATCH_SHA, STORE: STORE_SHA}
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

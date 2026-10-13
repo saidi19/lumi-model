@@ -1,0 +1,149 @@
+"""Rebind attempt-018 controls to the immutable-version source repair."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.3"
+RELEASE_SHA = "990e6f1630db21e64ee06034dce54c41beb84feb2548d7addb2f481b26da30cc"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-018-source-v0.3-verification-v0.1.json"
+SOURCE_PROOF_SHA = "205f5f97729aa7534f00c9d380c52a9f4dad2b8d3dc99081cabe43130b17c059"
+DENIAL = "evidence/lumi-vm-attempt-018-v021-launch-denial-v0.1.json"
+DENIAL_SHA = "d74b741f9e20f44307c6c3bcf6e9d8399819918fdc1b9839d88437cc5f67ab64"
+BASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.2/plan.json"
+BASE_SHA = "e86366507eab51d23b76c19e04219a5d4a4e6aab87cedb9f6c1ffc92ba0f55b5"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.3"
+BINDINGS = (
+    "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json",
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+    "identity/host-proposal.json",
+    "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar",
+    "scripts/issue_sft_vm_acquisition_credentials_v1.py",
+    "scripts/prepare_sft_vm_acquisition_permissions_v2.py",
+    "src/lumi/posttraining_vm_fullsize_staging_v1.py",
+    "src/lumi/posttraining_vm_fullsize_transport_v1.py",
+    "scripts/arm_sft_vm_external_watchdog_v2.py",
+    "scripts/build_sft_vm_network_expiry_v3.py",
+    "src/lumi/posttraining_vm_retention_unit_v1.py",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_control_plan_v3_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    path = Path(name)
+    need(not path.is_absolute() and ".." not in path.parts)
+    path = ROOT / path
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def build():
+    release = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    source = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    denial = json.loads(read(DENIAL, DENIAL_SHA))
+    need(
+        release["attempt"] == source["attempt"] == denial["attempt"] == ATTEMPT
+        and release["source_versions_bound"] is True
+        and release["versioned_object_count"] == 22
+        and release["iam_source_action"] == "s3:GetObjectVersion"
+        and source["status"] == "offline_source_repair_verified"
+        and source["source_release_sha256"] == RELEASE_SHA
+        and denial["process_started"] is False
+        and denial["cloud_mutations"] == 0
+        and denial["retry_performed"] is False
+    )
+    for name, pin in release["outputs"].items():
+        raw = read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    plan = json.loads(read(BASE, BASE_SHA))
+    plan["schema"] = "lumi.vm-attempt-018-control-plan.v0.3"
+    plan["status"] = "source_repaired_controls_rebound_preflight_required"
+    plan["release_manifest_sha256"] = RELEASE_SHA
+    plan["source_preparation_evidence"] = {"path": SOURCE_PROOF, "sha256": SOURCE_PROOF_SHA}
+    plan["v021_launch_denial_evidence"] = {"path": DENIAL, "sha256": DENIAL_SHA}
+    plan["source_bindings"] = {
+        RELEASE + "/" + name: release["outputs"][name] for name in BINDINGS
+    }
+    plan["source_repair"] = {
+        "versioned_object_count": 22,
+        "s3_action": "s3:GetObjectVersion",
+        "version_query_and_response_binding": True,
+        "retention_implementation_preserved": True,
+        "watchdog_launch_interlock_preserved": True,
+        "network_quota_kind": "nftables_ip_packet_quota",
+        "wire_or_billing_byte_cap_claimed": False,
+    }
+    review = plan["readiness_review"]
+    review["confirmed_defect"] = (
+        "v0.21 was denied before process start because source versions and proposal control "
+        "claims were incomplete or stale; v0.3 binds all 22 selected S3 VersionIds and "
+        "accurately distinguishes nftables IP-packet quotas from billing-wire metering."
+    )
+    review["decision"] = "fresh_readonly_preflight_then_explicit_v022_cpu_approval"
+    review["required_before_paid_execution"] = [
+        "Fresh v0.4 read-only preflight binds this exact v0.3 release and rechecks controls",
+        "Fresh v0.22 proposal and explicit approval bind all final hashes",
+        "Immediate pre-launch identity, image, offering, quota, disk, watchdog and price checks",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-018-control-plan-release.v0.3",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": RELEASE_SHA,
+        "source_verification_sha256": SOURCE_PROOF_SHA,
+        "v021_denial_sha256": DENIAL_SHA,
+        "source_versions_bound": True,
+        "versioned_object_count": 22,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

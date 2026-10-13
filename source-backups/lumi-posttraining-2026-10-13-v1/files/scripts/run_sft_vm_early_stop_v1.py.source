@@ -1,0 +1,293 @@
+"""Initial boot shutdown guard; private native entry, never native admission.
+
+Installed by the future bound EC2 user-data before SSH delivery. The external
+controller must still reconcile and STOP a launch whose cloud-init never runs.
+Deadlines here are boottime, not a guarantee about AWS billing or stopped state.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import selectors
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+SOURCE = Path("/opt/lumi-early-stop/run_sft_vm_early_stop_v1.py")
+OUTPUT = Path("/var/lib/lumi-early-stop") / ATTEMPT
+SYSTEMD = Path("/run/systemd/system")
+SETUP = "lumi-fullsize-early-setup-v1"
+HOST = "lumi-fullsize-early-host-v1"
+BASE = dict(host_admitted=False, binding_created=False, gate_5_complete=False, retry_allowed=False)
+
+
+def need(value):
+    if not value:
+        raise ValueError("early_stop_rejected") from None
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def unique(pairs):
+    answer = {}
+    for key, value in pairs:
+        need(key not in answer)
+        answer[key] = value
+    return answer
+
+
+def owned(path):
+    for parent in (path, *path.parents):
+        row = parent.lstat()
+        need(stat.S_ISDIR(row.st_mode) and row.st_uid == 0 and not row.st_mode & 0o022)
+
+
+def read(path, cap=32768, *, mode=0o400):
+    owned(path.parent)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_uid == before.st_gid == 0)
+        need(before.st_nlink == 1 and stat.S_IMODE(before.st_mode) == mode)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, k) == getattr(after, k)
+            for k in ("st_dev", "st_ino", "st_size", "st_mode", "st_mtime_ns", "st_ctime_ns")
+        )
+    )
+    return raw
+
+
+def sync(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write(path, raw):
+    need(type(raw) is bytes and 0 < len(raw) <= 32768)
+    owned(path.parent)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync(path.parent)
+    need(read(path) == raw)
+
+
+def command(argv):
+    end = time.monotonic() + 5
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+    )
+    raw = bytearray()
+    try:
+        with selectors.DefaultSelector() as selector:
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ)
+            while selector.get_map():
+                need(time.monotonic() < end)
+                for key, _ in selector.select(min(0.1, max(0, end - time.monotonic()))):
+                    chunk = os.read(key.fd, 4097)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    else:
+                        raw.extend(chunk)
+                        need(len(raw) <= 4096)
+            need(process.wait(timeout=max(0.01, end - time.monotonic())) == 0)
+        return bytes(raw).strip()
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, 9)
+        process.wait(timeout=5)
+        process.stdout.close()
+
+
+def stop():
+    command(["/usr/bin/systemctl", "--no-block", "poweroff"])
+
+
+def identity():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    # Fixed kernel/OS metadata only, never model or candidate data.
+    values = []
+    for name, pattern in (
+        ("/etc/machine-id", r"[0-9a-f]{32}"),
+        ("/proc/sys/kernel/random/boot_id", r"[0-9a-f-]{36}"),
+    ):
+        with open(name, "rb") as stream:
+            value = stream.read(65).decode().strip()
+        need(re.fullmatch(pattern, value))
+        values.append(value)
+    return dict(machine_id=values[0], boot_id=values[1])
+
+
+def boot_time():
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def units():
+    answer = {}
+    for stem, seconds in ((SETUP, 1800), (HOST, 14400)):
+        action = (
+            f"/usr/bin/python3 -I -B {SOURCE} setup-check"
+            if stem == SETUP
+            else "/usr/bin/systemctl --no-block poweroff"
+        )
+        answer[stem + ".service"] = (
+            "[Unit]\nDescription=Lumi initial shutdown guard\nFailureAction=poweroff\n"
+            "[Service]\nType=oneshot\nRestart=no\nTimeoutStartSec=20s\n"
+            "UMask=0077\nMemoryMax=64M\nMemorySwapMax=0\nTasksMax=16\n"
+            "StandardInput=null\nStandardOutput=null\nStandardError=null\n"
+            f"ExecStart={action}\n"
+        ).encode()
+        answer[stem + ".timer"] = (
+            "[Unit]\nDescription=Lumi initial boot deadline\n"
+            f"[Timer]\nOnBootSec={seconds}s\nUnit={stem}.service\n"
+            "WakeSystem=yes\nAccuracySec=1us\nRandomizedDelaySec=0\n"
+        ).encode()
+    return answer
+
+
+def show(unit, prop):
+    return command(["/usr/bin/systemctl", "show", unit, "--property=" + prop, "--value"])
+
+
+def _proof():
+    ids = identity()
+    need(0 < boot_time() < 1350)
+    context = json.loads(read(OUTPUT / "context.json", 4096), object_pairs_hook=unique)
+    digest = hashlib.sha256(read(SOURCE)).hexdigest()
+    need(canonical(context) == canonical(dict(attempt=ATTEMPT, source_sha256=digest, **ids)))
+    for name, body in units().items():
+        need(read(SYSTEMD / name) == body)
+        need(show(name, "FragmentPath") == str(SYSTEMD / name).encode())
+        need(show(name, "DropInPaths") == b"" and show(name, "LoadState") == b"loaded")
+        if name.endswith(".timer"):
+            need(show(name, "ActiveState") == b"active" and show(name, "SubState") == b"waiting")
+        else:
+            need(
+                show(name, "ActiveState") == b"inactive"
+                and show(name, "FailureAction") == b"poweroff"
+            )
+    return dict(
+        attempt=ATTEMPT,
+        source_sha256=digest,
+        **ids,
+        **BASE,
+        early_timers_armed=True,
+        setup_deadline_boottime=1800,
+        host_deadline_boottime=14400,
+        observed_boottime=boot_time(),
+    )
+
+
+def _install_once():
+    ids = identity()
+    need(0 < boot_time() < 1200)
+    raw = read(SOURCE)
+    owned(OUTPUT.parent.parent)
+    OUTPUT.parent.mkdir(mode=0o700, exist_ok=False)  # Reboot/replay fails closed.
+    sync(OUTPUT.parent.parent)
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    write(
+        OUTPUT / "context.json",
+        canonical(dict(attempt=ATTEMPT, source_sha256=hashlib.sha256(raw).hexdigest(), **ids)),
+    )
+    for name, body in units().items():
+        need(show(name, "LoadState") == b"not-found")
+        write(SYSTEMD / name, body)
+    command(
+        ["/usr/bin/systemd-analyze", "verify", "--man=no", *[str(SYSTEMD / n) for n in units()]]
+    )
+    command(["/usr/bin/systemctl", "daemon-reload"])
+    # The unconditional host timer is started first.
+    for stem in (HOST, SETUP):
+        command(["/usr/bin/systemctl", "start", stem + ".timer"])
+    return _proof()
+
+
+def _setup_complete():
+    ids = identity()
+    context = json.loads(read(OUTPUT / "context.json", 4096), object_pairs_hook=unique)
+    need(
+        canonical(context)
+        == canonical(
+            dict(attempt=ATTEMPT, **ids, source_sha256=hashlib.sha256(read(SOURCE)).hexdigest())
+        )
+    )
+    need(1800 <= boot_time() < 14400)
+    receipts = (
+        (
+            Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "detached-setup/reaped.json",
+            0o400,
+            dict(state="completed", setup_unit_reaped=True, **BASE),
+        ),
+        (
+            Path("/var/lib/lumi-vm-input-deployment") / ATTEMPT / "network-guard/result.json",
+            0o400,
+            dict(
+                wheel_and_offline_setup_verified=True,
+                setup_gate_removed=True,
+                watchdog_left_running=True,
+                expiry_left_armed=True,
+                host_admitted=False,
+                gate_5_complete=False,
+                retry_allowed=False,
+            ),
+        ),
+        (
+            Path("/var/lib/lumi-vm-setup") / ATTEMPT / "result.json",
+            0o600,
+            dict(setup_components_completed=["cpu", "sdk", "worker_source", "root_source"], **BASE),
+        ),
+    )
+    for path, mode, expected in receipts:
+        actual = json.loads(read(path, 4096, mode=mode), object_pairs_hook=unique)
+        need(canonical(actual) == canonical(expected))
+    return True
+
+
+def run(**_arguments):
+    raise ValueError("fullsize_host_admission_not_bound") from None
+
+
+def _main(argv):
+    try:
+        need(argv in (["install"], ["setup-check"]))
+        if argv == ["install"]:
+            _install_once()
+        else:
+            _setup_complete()
+        return 0
+    except BaseException:
+        try:
+            stop()
+        except BaseException:
+            pass
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

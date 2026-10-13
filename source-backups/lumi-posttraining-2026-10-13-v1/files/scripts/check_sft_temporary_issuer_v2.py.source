@@ -1,0 +1,86 @@
+"""Successor CLI adapter: public request JSON in argv, secret responses in pipes.
+
+v1 remains frozen with its pre-IAM CLI-input failure. IAM requests here never
+contain a secret key or session token. AccessKeyId is an identifier for deletion,
+not an authentication secret. All lifecycle and deny-all gates remain in v1.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import resource
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+import check_sft_temporary_issuer_v1 as base
+
+
+class Cloud(base.Cloud):
+    def cli(self, service, operation, **fields):
+        payload = base.compact(fields)
+        if "SecretAccessKey" in payload or "SessionToken" in payload:
+            raise base.CloudError("secret_request_rejected")
+        env = dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER="")
+        for name in list(env):
+            if name.startswith("AWS_") and name not in {"AWS_MAX_ATTEMPTS", "AWS_PAGER"}:
+                del env[name]
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                service,
+                operation,
+                "--cli-input-json",
+                payload,
+                "--region",
+                base.REGION,
+                "--output",
+                "json",
+                "--no-cli-pager",
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=35,
+            check=False,
+        )
+        if result.returncode:
+            raise base.CloudError(
+                "absent" if "(NoSuchEntity)" in result.stderr else "aws_call_failed"
+            )
+        return json.loads(result.stdout) if result.stdout.strip() else {}
+
+
+def main():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    output = Path(sys.argv[1])
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    name = "lumi-issuer-check-" + uuid.uuid4().hex[:12]
+    base.save(
+        output / "started.json",
+        {
+            "name": name,
+            "account": base.ACCOUNT,
+            "scope": "temporary IAM user/key/deny-all role; one STS call; teardown",
+            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "lifecycle_sha256": hashlib.sha256(Path(base.__file__).read_bytes()).hexdigest(),
+        },
+    )
+    result = base.qualify(Cloud(), name)
+    result["schema"] = "lumi-temporary-issuer-check-v0.2"
+    base.save(output / "result.json", result)
+    print(base.compact(result))
+    return 0 if result["contract_expiry_pass"] and result["cleanup_verified"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

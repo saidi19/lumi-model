@@ -1,0 +1,69 @@
+# SFT execution status v0.107
+
+2026-09-23. Full-size control binding and a private one-shot worker-call adapter
+are implemented and locally tested. Pure guard-side plan/mount inventory
+binding is also implemented. **Native guardian integration and Gate 5 are not
+complete.** No S3 transfer, model import, remote action or GPU execution occurred.
+
+## Completed code
+
+- `posttraining_checkpoint_fullsize_entry_v1.py` binds the exact eight control
+  bodies, entry/source/attempt pins and runtime-source bytes, reuses the frozen
+  resource validators, and provides a private fixed-path coordinator adapter.
+  Once a coordinator call starts, success, failure or malformed returned evidence
+  consumes that worker-process attempt. Returned evidence is limited to a
+  bounded digest and allowlisted scalars.
+- `posttraining_checkpoint_fullsize_guard_v1.py` binds the exact plan inventories
+  to the existing mount validator and derives proposed memory/deadline limits
+  from the envelope. It does not install these limits, start a clock, prove
+  supplied host identities or implement the native guardian lifecycle.
+
+Both new public APIs still immediately reject `host_guard_not_bound`.
+The private adapter is only a future independently admitted guardian target;
+all local calls used runtime/coordinator doubles. Hashes bind supplied bytes,
+not origin, permission, input immutability or host admission.
+
+## Verification
+
+All **249 unique tests passed on both CPython 3.11.15 and 3.13.7**:
+32 new entry tests, 16 new guard tests and 201 unchanged regression tests.
+The generated full-size metadata case describes 4,002,376,704 parameters with
+a 64 GiB worker proposal and 3,600-second deadline. It performs integer-only
+planning, not tensor allocation or actual checkpoint conversion.
+
+Ruff passed for all four new source/test files. A fresh isolated import loaded
+no ML modules and confirmed both public calls reject. Independent review
+confirmed the scoped control bindings, fixed paths, consumed-attempt behavior
+and honest execution boundary.
+
+All 21 existing readiness bindings and 78 qualified native source hashes
+remain unchanged. Tracked and staged diffs are empty; these additions and
+other pre-existing untracked work remain local. The new sources have not been
+added to the frozen native qualification manifest or remotely qualified.
+
+Development binding:
+`configs/lumi-4b-sft-fullsize-entry-development-v0.1.json`
+
+SHA-256: `3f6e28fbc39c0ac7194974571f8ca3813a706e078a142bbf44b8ad34d4bf7d28`.
+
+Verification:
+`evidence/lumi-4b-sft-fullsize-entry-development-verification-v0.1.json`.
+
+## Next actual work
+
+Implement the full-size native guardian/controller/bootstrap lifecycle with
+independent PID/cgroup supervision and hard timeout, testing it locally with
+syscall doubles first. Resolve cumulative native-write enforcement and
+separately bounded setup, OS, scratch and report writes before enabling real
+execution. Existing cooperative content reservations and filesystem capacity
+do not prove those writes are cumulatively enforced.
+
+The existing host/runtime/source admission, immutable backing or writer
+exclusion, mount/resource readback and combined execution/transfer approval
+requirements remain open. No new policy gate is introduced here, and the old
+eight-field host contract is unchanged. A real import must wait for those
+premises and its exact authorization; training and production remain disabled.
+
+The previously bound pretrained base remains the S3-backed checkpoint recorded
+in v0.106; current S3 availability was not rechecked. No GPU needs to be turned
+on for the next local implementation work.

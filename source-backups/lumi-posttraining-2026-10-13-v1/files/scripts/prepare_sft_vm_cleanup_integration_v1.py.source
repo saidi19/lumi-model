@@ -1,0 +1,95 @@
+"""Offline successor graph for cleanup repair; consumed identity is not authority."""
+
+import ast
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+from scripts import prepare_sft_vm_attempt014_local_repair_v1 as repair
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-cleanup-integration-v0.1"
+INPUTS = "configs/lumi-vm-private-host-source-inputs-v0.1.json"
+CLOSURE_SHA = "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc"
+REPAIR_SHA = "36a14962c427fc8c7987dac1b3385d276c991ad8a110520c75725d344acef1b1"
+PROOF = "evidence/lumi-vm-attempt-014-local-cleanup-repair-verification-v0.1.json"
+PROOF_SHA = "1d335a52433f0661b5926583fc3ccdba2b40868852bef7be53a57cbecba410da"
+
+
+def build():
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt012_v1.py", CLOSURE_SHA)
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt014_local_repair_v1.py", REPAIR_SHA)
+    proof = json.loads(closure.read(ROOT / PROOF, PROOF_SHA))
+    for name, pin in proof["bindings"].items():
+        closure.read(ROOT / name, pin["sha256"], pin["bytes"])
+    manifest = json.loads(closure.read(repair.BASE / "release.json", repair.BASE_SHA))
+    original = {
+        name: closure.read(repair.BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    closure.need(len(original) == 156)
+    fragments = {name: text.encode() for name, text in repair.build().items()}
+    closure.need({n: closure.sha(b) for n, b in fragments.items()} == proof["candidate_sha256"])
+    seeds = original | fragments
+    inputs = json.loads(seeds[INPUTS])
+    for name, raw in fragments.items():
+        role = Path(name).stem
+        if role in inputs["sources"]:
+            inputs["sources"][role]["bytes"] = len(raw)
+    seeds[INPUTS] = closure.encode(inputs)
+    ancestors = {n for n in original if n.endswith(".json") and "/" not in n}
+    final = closure.closure(original, seeds, ancestors)
+    for name, raw in final.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name not in set(fragments) | {INPUTS}:
+            closure.need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if name.startswith("evidence/") or name in ancestors:
+            closure.need(raw == original[name])
+        if name.endswith((".gz", ".tar", ".pem")):
+            closure.need(raw == original[name])
+    for role, pin in json.loads(final[INPUTS])["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        closure.need(len(raw) == pin["bytes"] and closure.sha(raw) == pin["sha256"])
+    report = dict(
+        schema="lumi.cleanup-integration.v0.1",
+        status="offline_successor_not_execution_authority",
+        base_release_sha256=repair.BASE_SHA,
+        local_repair_verification_sha256=PROOF_SHA,
+        semantic_source_changes=sorted(fragments),
+        changed_files=[n for n in final if final[n] != original[n]],
+        consumed_identity_retained=True,
+        fresh_identity_and_authorization_required_before_execution=True,
+        execution_permitted=False,
+        historical_failure_root_cause_proven=False,
+        cleanup_wait_seconds=2,
+        prior_evidence_unchanged=True,
+        gpu=False,
+        training=False,
+        retry=False,
+        gate_5_complete=False,
+        outputs={n: dict(bytes=len(b), sha256=closure.sha(b)) for n, b in sorted(final.items())},
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("offline_integration_not_execution_authority")

@@ -1,0 +1,126 @@
+# SFT execution status v0.66
+
+Local-only diagnostic result, 2026-09-09. Exact published source:
+`f3d8554d8999e32bb750fb8aa9020fca6818bf72`, tree
+`b792470f3d2ae418720dfd27609d434e167bf6c7`, direct parent
+`11486aa570657e8c71589ced46054459972d1493`. The nine new files in v0.65 were
+published once, non-force, with matching local/GitHub tree and commit objects.
+Plan SHA-256: `e11b219d14e88fd7b90a6ae2cb9337bc02d6a6d918deed2a69b016e38e7238be`.
+This result receipt does not publish or launch another run.
+
+## Confirmed first blocker
+
+[Diagnostic run 34363848352](https://github.com/saidi19/lumi-model/actions/runs/34363848352),
+attempt 1, job `102507402716`, completed successfully. Linux source preflight,
+accepted-software acquisition/hash verification, the one inspect diagnostic,
+owned-input retirement and small evidence upload all passed. Acquisition ran
+14:28:49Z–14:30:10Z; the native diagnostic ran 14:30:10Z–14:30:39Z. There was no
+retry, rebuild, pull or invocation of the previous guardian attempt.
+
+The diagnostic result is **not an admission pass**:
+
+- `status=passed` means the diagnostic completed and its closed-schema result
+  was validated.
+- `admission_passed=false`, `code=profile_rejected`.
+- `phase=configuration`, `predicate=configuration_labels_equal`.
+- The image has a present `Labels` field whose value is `null`.
+- The created container has a present `Labels` field whose value is an empty
+  dictionary `{}`; no label strings or values were retained.
+
+The old verifier compares canonical JSON for every configuration field. Thus
+`null` and `{}` fail that exact equality predicate. This is the observed first
+blocker, not a guessed mismatch. The retained booleans establish the exact two
+shapes; no raw inspect response or exception text was stored.
+This proves the first rejection in this fresh diagnostic; it does not
+retrospectively prove the exact cause of the earlier opaque guardian report.
+
+Inference from the unchanged predicate order: earlier runtime/image/container
+metadata checks and equality checks for `Env`, `Entrypoint`, `Cmd`, `User` and
+`WorkingDir` completed before `Labels` rejected. These are trusted-daemon
+metadata observations, not proof of running containment. Later configuration
+predicates and all export/rootfs/guardian/worker checks were **not reached**.
+There is no claim that this is the only remaining defect.
+
+## Scope and cleanup
+
+Exactly the accepted image was loaded and one container was created, never
+started. There was no export, extraction, cgroup, adapter, worker, GPU,
+inference, model/data/S3 access or SFT. No software binding or continuation was
+released. The source-bound verifier retains the old predicate expressions and
+short-circuit order; no admission/profile/parser policy changed.
+
+This run explicitly attests cleanup: after single removal attempts, successful
+bounded inventory observations found the owned image and container absent;
+owned root files/directories were retired. The separate input receipt attests
+one downloaded input file and one input directory retired by exact identities.
+Cleanup is verified under the trusted-host/exclusive-daemon premises; there is
+no broader host-cleanliness or hostile-root claim.
+
+All old source/evidence remains byte-for-byte unchanged. The previous guardian
+workflow did not trigger; old OCI release run `34363848256` was skipped. No old
+failed run or artifact was deleted.
+
+## Private evidence and verification
+
+Evidence artifact `10109060039`,
+`sft-oci-inspect-diagnostic-f3d8554d8999e32bb750fb8aa9020fca6818bf72`, is 1,531 bytes,
+SHA-256 `64b9f11faa76f33b059f5e08a644664c3c1e6d1ea8f2732cbaff70fd592ebe42`.
+It was read once under 65,536 bytes/45 seconds. Digest, exact three ZIP members,
+member sizes/canonical bytes and closed report schemas were verified in memory.
+The diagnostic report was checked by the independently hash-bound pure validator.
+
+Only the exact aggregate members and a structural-verification receipt are
+stored under
+`artifacts/lumi-sft-oci-inspect-diagnostic-evidence-f3d8554d8999e32bb750fb8aa9020fca6818bf72/`.
+Directory mode `0700`; retained files `0400`. No large artifact or model/data was
+downloaded on the Mac. No raw CI logs or inspect responses were saved.
+Structural-verification receipt: 1,797 bytes, SHA-256
+`b363ce3301695e815db5edcf34478d3b9a9990825486eeabcd3621e0406cc274`.
+
+| Aggregate member | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `aggregate-acquisition.json` | 766 | `9163602b770b26ab09f332c6149efd3edf118ae9356a7c3a684426870e37af39` |
+| `aggregate-diagnostic.json` | 1,540 | `e828ba303f517d217e9afba8cea389eec591523704dc9919e9a8e4104400c732` |
+| `aggregate-input-cleanup.json` | 211 | `c035fedb481f6eb23e2b69741f8b54df9d4fe5f980a13c21e3edcfff7356e52f` |
+
+## Source checks
+
+Before publication, all 220 new/existing synthetic tests passed on each of
+Python 3.11.15, 3.13.7 and 3.14.6, with exact Ruff clean. Linux diagnostic
+preflight subsequently passed its 150 new tests before software acquisition.
+
+[Spark run 34363848303](https://github.com/saidi19/lumi-model/actions/runs/34363848303),
+job `102507402564`, passed 3 tests in 105.77 seconds. Completed log read once
+under 2 MiB/45 seconds, retaining aggregates/hash only: 51,274 bytes, SHA-256
+`f394fc9a1610ef8a6ec07d95c12d19e16b2c992d06da60246f5b2cf1cfa02f88`.
+
+[Source run 34363848270](https://github.com/saidi19/lumi-model/actions/runs/34363848270):
+all four jobs passed, including main source suite `102507402912`, lint, isolated
+controls and source-only validators. Final source-suite totals: **5,591 passed,
+58 skipped, 329 deselected, 36 warnings and 10,619 subtests passed in 349.35s**.
+Partition: `SOURCE_SCOPE_ACCOUNTED`, 5,649 source items selected, 327 private
+integrations `NOT_EXECUTED`, two history tests routed separately. Private
+integration and full-CI claims explicitly remain false; a passing Source run
+does not make those blocked tests passed.
+
+Completed Source log read once under 2 MiB/45 seconds, retaining only test and
+partition aggregates plus hash: 62,199 bytes, SHA-256
+`ec0af6575477c1c3b152ba34f84e8b294a90e9a164d7155b9dfd656f8d25d033`.
+
+## Next boundary
+
+Gate 5 is still partial. This authorized diagnostic is complete; it does not
+authorize changing admission policy or starting an acceptance successor.
+
+The narrow proposed correction is limited to the proven present-image
+`Labels=null` / present-container `Labels={}` pair. It must not treat absent
+fields, empty strings/lists, non-empty labels, arbitrary false-like values or
+other fields as equivalent. Preserve every other predicate, typed error,
+source pin, no-retry rule and negative-control requirement. Synthetic tests
+must demonstrate that exact exception and rejection of neighboring shapes
+before a separately approved bounded native acceptance successor.
+
+No such correction or successor has been implemented/published/executed in this
+turn. No H100 is needed for this inspect/configuration correction. Dedicated
+host/S3/data binding, H100/CUDA validation and actual SFT remain downstream;
+production/private-integration/full-CI and real-SFT claims remain false.

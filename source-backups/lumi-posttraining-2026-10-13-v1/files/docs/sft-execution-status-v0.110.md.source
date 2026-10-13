@@ -1,0 +1,78 @@
+# SFT execution status v0.110
+
+2026-09-23. The full-size input/output layout adapter is implemented and locally
+tested. **Gate 5 remains incomplete and execution stays closed.** No native
+layout, checkpoint/tokenizer payload read, S3 request, GPU operation or training
+occurred. All five new files remain local and unpushed.
+
+## Completed this step
+
+The new private adapter accepts separately acquired checkpoint/tokenizer siblings
+without copying, hashing or changing permissions on either input. Supplied
+source/control bindings and exact plan inventory sizes are validated first.
+Two metadata-only tree passes reject changed identities, aliases, unexpected
+entries and wrong ownership/mode/size/link count.
+
+Before any mutation it reserves the combined source/target node and content
+capacity. It creates four tracked empty rootfs mount targets and two fresh
+output/mountpoint siblings, then invokes the unchanged source/control addon,
+which freezes the owned root. Final private mount controls bind post-creation
+parent metadata, the prepared root and targets, and pinned input/output roots.
+Started failures taint and retain the partial attempt; there is no retry or
+cleanup. Public `prepare_layout` always rejects with `host_guard_not_bound`.
+
+This completes the local adapter, not input acquisition/authentication,
+immutable backing or external-writer exclusion. Returned paths and identity
+maps remain private; only the aggregate receipt is suitable for retention.
+The existing source-addon content cap remains 5,191,700 bytes and excludes
+filesystem metadata, OS overhead and separate acquisition/import work.
+
+## Verification
+
+**521 unique tests pass on CPython 3.11.15 and 3.13.7**, with zero errors,
+failures or skips: 30 new tests and 491 prior regressions. The actual metadata
+walk/listing helpers execute against in-memory syscall doubles; input files
+have metadata only, with no payload bytes allocated or read.
+
+Independent review found and resolved an empty-list versus empty-set mismatch
+that would have rejected successful layouts after freeze. Final review found
+no remaining substantive source/test defect or accidental native call. Tests
+check leaked descriptors after every rejection path and reject reuse after
+started failures. Final root follow-up strengthened late-close testing and
+reran the entire suite on both runtimes.
+
+Syntax/AST, 100-column and trailing-whitespace checks pass. Ruff was not rerun:
+the previous temporary executable is gone, and no replacement was downloaded.
+All 44 prior development/readiness bindings, 78 qualified native source rows
+and 39 worker source rows still match. Earlier evidence and manifests are
+unchanged; tracked and staged diffs remain empty.
+
+Development record:
+`configs/lumi-4b-sft-fullsize-layout-development-v0.1.json`.
+
+SHA-256: `171c6bc1d37a2bc2ab06852c616e76f1cd8eaafe67489341f110698bc7595933`.
+
+Verification:
+`evidence/lumi-4b-sft-fullsize-layout-development-verification-v0.1.json`.
+
+## What remains, in order
+
+1. Native cumulative-write enforcement and bounded setup/scratch/report handling.
+   The existing guard does not implement this; disk capacity and coordinator
+   counters cannot substitute for the frozen requirement. A closed syscall
+   profile with a parent listener precharging scalar writes is a possible
+   implementation, not implemented or Linux-ABI-qualified in this step. Vector,
+   async, copy/reflink, shared-mapping, truncate and other bypasses need closure.
+   Data-byte accounting must not be described as physical disk/journal accounting.
+2. Executable dispatcher output isolation and the lifecycle containment limitation
+   recorded in v0.108. The new parent-side source dependency set still needs its
+   complete authenticated successor closure; the frozen worker manifest is intact.
+3. Bounded Linux qualification, then the existing dedicated-host/runtime/source
+   admission, input backing/writer exclusion, actual resource/mount readback,
+   combined budgets and exact real-import authorization.
+
+These are remaining engineering/admission requirements, not newly invented
+policy gates. No earlier gate is completed by synthetic tests alone. The
+S3-backed pretrained checkpoint remains the intended base; its current remote
+availability was not checked. Training and production stay disabled. A GPU is
+not needed for the next local implementation work.

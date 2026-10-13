@@ -1,0 +1,43 @@
+"""Bind only the lifecycle sender successor; no cloud execution or authority."""
+
+import hashlib
+from pathlib import Path
+
+from scripts import prepare_sft_vm_setup_exchange_lifecycle_v1 as lifecycle
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "scripts/qualify_sft_vm_setup_production_v3.py"
+BASE_SHA = "345296a4a5a10dce0705b501d2edd6ed8ab1bff0f3d99244d9b50a9156bb0034"
+OUTPUT = ROOT / "scripts/qualify_sft_vm_setup_production_v4.py"
+
+
+def build():
+    raw = BASE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("lifecycle_probe_base_rejected") from None
+    sender = lifecycle.OUTPUT.read_bytes()
+    if sender != lifecycle.build():
+        raise ValueError("lifecycle_sender_binding_rejected") from None
+    digest = hashlib.sha256(sender).hexdigest()
+    text = raw.decode()
+    anchors = (
+        (
+            "prepare_sft_vm_setup_exchange_diagnostic_v1 as diagnostic",
+            "prepare_sft_vm_setup_exchange_lifecycle_v1 as diagnostic",
+        ),
+        ("877ed7f14d1b9e1fa888f7da96230e4225b79861dafb4ed81e5af11227c33569", digest),
+        ("_production_sender_v6", "_production_sender_v7"),
+        ("lumi-setup-production-20261013-c93f481a", "lumi-setup-production-20261013-8a6d207c"),
+        ("lumi-setup-production-qualification-v0.3", "lumi-setup-production-qualification-v0.4"),
+        (
+            "lumi-setup-production-qualification-approval-v0.3",
+            "lumi-setup-production-qualification-approval-v0.4",
+        ),
+        ("lumi-setup-production-readiness-v0.3", "lumi-setup-production-readiness-v0.4"),
+    )
+    for old, new in anchors:
+        if not text.count(old):
+            raise ValueError("lifecycle_probe_anchor_rejected") from None
+        text = text.replace(old, new)
+    compile(text, str(OUTPUT), "exec")
+    return text.encode()

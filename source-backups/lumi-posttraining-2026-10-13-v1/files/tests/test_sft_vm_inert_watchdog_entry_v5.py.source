@@ -1,0 +1,271 @@
+"""Synthetic clouds only: no AWS operations or real authorization."""
+
+import ast
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("execute_sft_vm_inert_watchdog_v5")
+legacy = importlib.import_module("tests.test_sft_vm_external_watchdog_v1")
+
+
+class Tests(unittest.TestCase):
+    def test_saved_template_does_not_authorize_deployment(self):
+        template = (
+            m.ROOT / "configs/lumi-vm-attempt-012-watchdog-execution-approval-template-v0.1.json"
+        )
+        m.APPROVAL.write_bytes(template.read_bytes())
+        with self.assertRaises(ValueError):
+            self.run_once()
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_source_or_plan_drift_rejected_before_output(self):
+        for name in ("HELPER_SHA", "PLAN_SHA"):
+            with patch.object(m, name, "0" * 64), self.assertRaises(ValueError):
+                self.run_once()
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_no_predecessor_identity_in_any_request(self):
+        for payloads in m.allowed_requests(self.deployer).values():
+            for raw in payloads:
+                self.assertNotIn(b"ad7b734ba7894916b25d795ac3dab31c", raw)
+        self.assertEqual(self.deployer.ATTEMPT, "58907eb20ec649a7bc340a144541ee32")
+
+    def test_transport_budget_and_request_logic_identical_to_qualified_entry(self):
+        old = (m.ROOT / "scripts/execute_sft_vm_inert_watchdog_v1.py").read_text()
+        new = Path(m.__file__).read_text()
+
+        def nodes(source):
+            return {
+                n.name: ast.dump(n)
+                for n in ast.parse(source).body
+                if isinstance(n, (ast.ClassDef, ast.FunctionDef))
+                and n.name not in {"sources", "expected_proposal", "authorize"}
+            }
+
+        self.assertEqual(nodes(old), nodes(new))
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.output = self.root / "attempt"
+        self.enterContext(patch.object(m, "OUTPUT", self.output))
+        self.enterContext(patch.object(m, "PROPOSAL", self.root / "proposal.json"))
+        self.enterContext(patch.object(m, "APPROVAL", self.root / "approval.json"))
+        m.PROPOSAL.write_bytes(m.encode(m.expected_proposal()))
+        self.approval = dict(
+            schema="lumi.vm-attempt-012-watchdog-execution-approval.v0.1",
+            status="explicit_human_approval_recorded",
+            human_message="SYNTHETIC ONLY",
+            proposal_sha256=m.sha(m.PROPOSAL.read_bytes()),
+            entry_sha256=m.sha(Path(m.__file__).read_bytes()),
+            plan_sha256=m.PLAN_SHA,
+            scope="one_inert_watchdog_deployment_only",
+            approved_execution_count=1,
+            maximum_seconds=600,
+            maximum_control_calls=45,
+            preserve_partial_resources_on_failure=True,
+            invocation=False,
+            schedule_creation=False,
+            bucket_policy_mutation=False,
+            instance_action=False,
+            gpu=False,
+            training=False,
+            retry=False,
+            rollback=False,
+        )
+        m.APPROVAL.write_bytes(m.encode(self.approval))
+        self.plan, self.deployer = m.sources()
+        self.enterContext(patch.object(legacy, "d", self.deployer))
+        self.cloud = legacy.DeploymentCloud()
+        self.original = self.cloud.cli
+
+        def cli(service, operation, **fields):
+            if operation == "get-schedule-group":
+                self.cloud.calls.append((service, operation, fields))
+                raise LookupError("absent")
+            return self.original(service, operation, **fields)
+
+        self.cloud.cli = cli
+
+    def run_once(self):
+        return m.run(transport=self.cloud, wait=lambda _: None)
+
+    def test_success_uses_frozen_deployer_and_new_identity(self):
+        result = self.run_once()
+        self.assertEqual(result["status"], "deployed_unarmed_invocation_disabled")
+        self.assertEqual(len(self.cloud.roles), 2)
+        self.assertEqual(len(self.cloud.groups), 1)
+        self.assertEqual(self.cloud.concurrency, 0)
+        self.assertEqual(self.cloud.function["Environment"], self.deployer.UNARMED)
+        self.assertEqual(result["total_control_calls"], len(self.cloud.calls))
+        self.assertLessEqual(result["total_control_calls"], 45)
+        self.assertTrue(all(self.plan["attempt"] in role for role in self.cloud.roles))
+        self.assertFalse(
+            any(
+                op
+                in {
+                    "invoke",
+                    "create-schedule",
+                    "create-schedule-group",
+                    "run-instances",
+                    "stop-instances",
+                    "put-bucket-policy",
+                }
+                for _, op, _ in self.cloud.calls
+            )
+        )
+        self.assertLess(sum(p.stat().st_size for p in self.output.rglob("*.json")), 1048576)
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_absence_or_wrong_approval_before_output_and_cloud(self):
+        for change in (
+            dict(training=True),
+            dict(approved_execution_count=True),
+            dict(entry_sha256="0" * 64),
+            dict(scope="one_cpu_import"),
+            dict(maximum_seconds=601),
+            dict(human_message=""),
+        ):
+            m.APPROVAL.write_bytes(m.encode(dict(self.approval, **change)))
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.run_once()
+            self.assertFalse(self.output.exists())
+        m.APPROVAL.unlink()
+        with self.assertRaises(ValueError):
+            self.run_once()
+        self.assertFalse(self.cloud.calls)
+
+    def test_proposal_tamper_rejected_before_cloud(self):
+        value = json.loads(m.PROPOSAL.read_bytes())
+        value["maximum_new_roles"] = 3
+        m.PROPOSAL.write_bytes(m.encode(value))
+        with self.assertRaises(ValueError):
+            self.run_once()
+        self.assertFalse(self.cloud.calls)
+
+    def test_source_hash_tamper_rejected(self):
+        with patch.object(m, "HELPER_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.sources()
+
+    def test_schedule_collision_prevents_any_mutation(self):
+        self.cloud.cli = self.original
+        result = self.run_once()
+        self.assertEqual(result["stage"], "schedule_group_absence")
+        self.assertEqual(result["mutation_dispatches"], 0)
+
+    def test_role_collision_prevents_mutation(self):
+        self.cloud.roles[self.deployer.WORKER_ROLE] = {}
+        result = self.run_once()
+        self.assertEqual(result["status"], "stopped_no_retry_preserve_partial")
+        self.assertEqual(result["mutation_dispatches"], 0)
+
+    def test_wrong_account_prevents_schedule_and_mutation(self):
+        self.cloud.cli = lambda *args, **kwargs: {"Account": "wrong"}
+        result = self.run_once()
+        self.assertEqual(result["stage"], "identity")
+        self.assertEqual(result["total_control_calls"], 1)
+        self.assertEqual(result["mutation_dispatches"], 0)
+
+    def test_partial_failure_keeps_receipts_and_no_retry(self):
+        self.cloud.fail = "create-function"
+        result = self.run_once()
+        self.assertEqual(result["status"], "stopped_no_retry_preserve_partial")
+        self.assertEqual(len(self.cloud.roles), 2)
+        self.assertEqual(sum(op == "create-function" for _, op, _ in self.cloud.calls), 1)
+        self.assertFalse(any(op.startswith("delete-") for _, op, _ in self.cloud.calls))
+        raw = b"".join(p.read_bytes() for p in self.output.rglob("*.json"))
+        self.assertNotIn(b"private-error", raw)
+        self.assertIn(b"unconfirmed_no_retry", raw)
+        count = len(self.cloud.calls)
+        with self.assertRaises(ValueError):
+            self.run_once()
+        self.assertEqual(len(self.cloud.calls), count)
+
+    def test_deadline_blocks_before_first_cloud_call(self):
+        ticks = iter((0, 601))
+        result = m.run(transport=self.cloud, clock=lambda: next(ticks, 601), wait=lambda _: None)
+        self.assertEqual(result["total_control_calls"], 0)
+        self.assertFalse(self.cloud.calls)
+
+    def test_call_cap_wait_and_duplicate_mutation(self):
+        cloud = m.BoundedCloud(self.deployer, self.cloud, lambda *args: None, wait=lambda _: None)
+        cloud.calls = 45
+        with self.assertRaises(ValueError):
+            cloud.cli("sts", "get-caller-identity")
+        cloud.calls = 0
+        fields = dict(
+            logGroupName=self.deployer.LOG_GROUP, tags={"LumiAttempt": self.deployer.ATTEMPT}
+        )
+        cloud.cli("logs", "create-log-group", **fields)
+        with self.assertRaises(ValueError):
+            cloud.cli("logs", "create-log-group", **fields)
+        with self.assertRaises(ValueError):
+            cloud.wait(60)
+
+    def test_allowlist_rejects_other_name_widened_role_or_invocation(self):
+        cloud = m.BoundedCloud(self.deployer, self.cloud, lambda *args: None)
+        bad = [
+            ("lambda", "invoke", {"FunctionName": self.deployer.FUNCTION}),
+            ("iam", "get-role", {"RoleName": "old-attempt"}),
+            (
+                "lambda",
+                "put-function-concurrency",
+                {"FunctionName": self.deployer.FUNCTION, "ReservedConcurrentExecutions": 1},
+            ),
+        ]
+        for service, operation, fields in bad:
+            with self.assertRaises(ValueError):
+                cloud.cli(service, operation, **fields)
+        self.assertFalse(self.cloud.calls)
+
+    def test_transport_fields_validate_against_offline_sdk(self):
+        import botocore.session
+        import botocore.validate
+
+        session = botocore.session.Session()
+        for (service, operation), payloads in m.allowed_requests(self.deployer).items():
+            name = "".join(word.capitalize() for word in operation.split("-"))
+            shape = session.get_service_model(service).operation_model(name).input_shape
+            for raw in payloads:
+                botocore.validate.validate_parameters(json.loads(raw), shape)
+
+    def test_transport_absence_is_only_read_operation(self):
+        failed = types.SimpleNamespace(returncode=1, stdout=b"", stderr=b"(NoSuchEntity)")
+        with patch.object(m.subprocess, "run", return_value=failed) as invoke:
+            with self.assertRaises(LookupError):
+                m.Transport().cli("iam", "get-role", RoleName="synthetic")
+            with self.assertRaises(ValueError):
+                m.Transport().cli("iam", "create-role", RoleName="synthetic")
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+        self.assertEqual(invoke.call_args.kwargs["timeout"], 40)
+
+    def test_receipt_written_before_mutation_dispatch(self):
+        original = self.cloud.cli
+
+        def observe(service, operation, **fields):
+            if operation.startswith(("create-", "put-")):
+                rows = [json.loads(p.read_bytes()) for p in self.output.glob("call-*-started.json")]
+                self.assertTrue(
+                    any(
+                        r["operation"] == operation
+                        and r["request_sha256"] == m.sha(m.encode(fields))
+                        for r in rows
+                    )
+                )
+            return original(service, operation, **fields)
+
+        self.cloud.cli = observe
+        self.assertEqual(self.run_once()["status"], "deployed_unarmed_invocation_disabled")
+
+
+if __name__ == "__main__":
+    unittest.main()

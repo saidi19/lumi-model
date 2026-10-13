@@ -1,0 +1,435 @@
+"""Synthetic metadata/syscall doubles only: no live mount, namespace or payload."""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import os
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_input_mount_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+mount = importlib.import_module(PACKAGE + ".posttraining_checkpoint_input_mount_v1")
+PRIVATE = "synthetic-private-error-not-to-be-retained"
+PARENT = "/tmp/lumi-private-" + "a" * 32
+
+
+def metadata(inode, mode, uid=0, size=0, nlink=1):
+    return types.SimpleNamespace(st_dev=9, st_ino=inode, st_mode=mode,
+                                 st_uid=uid, st_gid=uid, st_nlink=nlink,
+                                 st_size=size, st_mtime_ns=12, st_ctime_ns=13)
+
+
+def identity(value):
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_uid, value.st_gid,
+            value.st_nlink, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+
+class Entries:
+    def __init__(self, names):
+        self.names = names
+
+    def __enter__(self):
+        return iter(types.SimpleNamespace(name=name) for name in self.names)
+
+    def __exit__(self, *_args):
+        return False
+
+
+class InputMountTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(patch.object(mount, "_ATTEMPT_OWNER", None))
+        self.runtime = self.enterContext(patch.object(mount.netns, "_runtime"))
+        self.enterContext(patch.object(mount, "sys", types.SimpleNamespace(version_info=(3, 12))))
+        self.options = {
+            "checkpoint_path": PARENT + "/checkpoint",
+            "tokenizer_path": PARENT + "/tokenizer",
+            "output_path": PARENT + "/output",
+            "root_path": PARENT + "/root",
+            "inventories": {"checkpoint": {"weights.bin": 19},
+                            "tokenizer": {"tokenizer/tokenizer.json": 7}},
+        }
+        paths = {
+            "parent": PARENT, "checkpoint": self.options["checkpoint_path"],
+            "tokenizer": self.options["tokenizer_path"], "output": self.options["output_path"],
+            "root": self.options["root_path"], "inputs": self.options["root_path"] + "/inputs",
+            "target_checkpoint": self.options["root_path"] + "/inputs/checkpoint",
+            "target_tokenizer": self.options["root_path"] + "/inputs/tokenizer",
+            "target_output": self.options["root_path"] + "/outputs",
+        }
+        self.paths, self.nodes = paths, {}
+        for index, role in enumerate(mount.ROLES, 1):
+            worker = role in {"checkpoint", "tokenizer", "output"}
+            mode = 0o755 if role in {"root", "inputs"} else 0o700
+            self.nodes[paths[role]] = metadata(index, stat.S_IFDIR | mode,
+                                               uid=10001 if worker else 0)
+        self.nodes[paths["checkpoint"] + "/weights.bin"] = metadata(
+            20, stat.S_IFREG | 0o600, uid=10001, size=19,
+        )
+        self.nodes[paths["tokenizer"] + "/tokenizer"] = metadata(
+            21, stat.S_IFDIR | 0o700, uid=10001,
+        )
+        self.nodes[paths["tokenizer"] + "/tokenizer/tokenizer.json"] = metadata(
+            22, stat.S_IFREG | 0o600, uid=10001, size=7,
+        )
+        self.options["expected_identities"] = {
+            role: identity(self.nodes[path]) for role, path in paths.items()
+        }
+        self.fds, self.bindings, self.pins, self.closed, self.events = {}, {}, [], [], []
+        self.next_fd, self.generation = 20, 0
+        self.os = types.SimpleNamespace(
+            **{name: getattr(os, name) for name in (
+                "O_RDONLY", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK",
+            )}, getpid=Mock(return_value=4000), open=Mock(side_effect=self.open),
+            fstat=Mock(side_effect=lambda fd: self.nodes[self.fds[fd]]),
+            close=Mock(side_effect=self.close), scandir=Mock(side_effect=self.scandir),
+        )
+        self.enterContext(patch.object(mount, "os", self.os))
+        self.pin = self.enterContext(patch.object(mount, "_pin", side_effect=self.pin_path))
+        self.fcntl = self.enterContext(patch.object(
+            mount.fcntl, "fcntl", return_value=mount.fcntl.FD_CLOEXEC,
+        ))
+        self.namespace = self.enterContext(patch.object(
+            mount.mount_root, "_open_namespace", side_effect=self.namespace_open,
+        ))
+        self.namespace_identity = self.enterContext(patch.object(
+            mount.mount_root, "_namespace_identity",
+            side_effect=lambda fd: (10, self.nodes[self.fds[fd]].st_ino),
+        ))
+        self.unshare = self.enterContext(patch.object(
+            mount.mount_root, "_unshare", side_effect=self.unshare_call,
+        ))
+        self.mount_call = self.enterContext(patch.object(
+            mount.mount_root, "_mount", side_effect=self.mounting,
+        ))
+        self.seal = self.enterContext(patch.object(
+            mount.mount_root, "_seal", side_effect=lambda *args, **kw:
+            self.events.append(("seal", args, kw)),
+        ))
+        self.readback = self.enterContext(patch.object(
+            mount.mount_root, "_readback", side_effect=lambda *args, **kw:
+            self.events.append(("readback", args, kw)),
+        ))
+        self.native = self.enterContext(patch.object(
+            mount.mount_root.ctypes, "CDLL", side_effect=AssertionError("no_live_native"),
+        ))
+
+    def tearDown(self):
+        self.assertFalse(mount._SETUP_LOCK.locked())
+        self.assertEqual(len(self.closed), len(set(self.closed)))
+        self.native.assert_not_called()
+
+    def allocate(self, path):
+        descriptor, self.next_fd = self.next_fd, self.next_fd + 1
+        self.fds[descriptor] = path
+        return descriptor
+
+    def pin_path(self, path, owned):
+        resolved = self.bindings.get(path, path)
+        descriptor = self.allocate(resolved)
+        owned.append(descriptor)
+        self.pins.append((path, descriptor, self.generation))
+        return descriptor
+
+    def open(self, path, flags, *, dir_fd=None):
+        if path.startswith("/proc/self/fd/"):
+            self.assertEqual(flags, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NONBLOCK)
+            return self.allocate(self.fds[int(path.rpartition("/")[2])])
+        self.assertTrue(flags & mount.mount_root.O_PATH)
+        self.assertTrue(flags & os.O_NOFOLLOW)
+        self.assertTrue(flags & os.O_CLOEXEC)
+        return self.allocate(self.fds[dir_fd] + "/" + path)
+
+    def close(self, descriptor):
+        self.closed.append(descriptor)
+        del self.fds[descriptor]
+
+    def scandir(self, descriptor):
+        prefix = self.fds[descriptor] + "/"
+        return Entries(sorted({name[len(prefix):].split("/", 1)[0]
+                               for name in self.nodes if name.startswith(prefix)}))
+
+    def namespace_open(self, owned):
+        path = "namespace-" + str(self.generation)
+        self.nodes[path] = metadata(80 + self.generation, stat.S_IFREG | 0o444)
+        descriptor = self.allocate(path)
+        owned.append(descriptor)
+        return descriptor
+
+    def unshare_call(self):
+        self.generation += 1
+        self.events.append(("unshare",))
+
+    def mounting(self, source, target, filesystem, flags, **kwargs):
+        self.events.append(("mount", source, target, filesystem, flags))
+        if flags & mount.mount_root.MS_BIND:
+            self.assertEqual(flags, mount.mount_root.MS_BIND)
+            source_fd, target_fd = [int(item.rpartition("/")[2]) for item in (source, target)]
+            self.assertIn((self.fds[source_fd], source_fd, 1), self.pins)
+            self.assertIn((self.fds[target_fd], target_fd, 1), self.pins)
+            self.assertEqual(kwargs, {"failure_code": "bind_mount_failed"})
+            self.bindings[self.fds[target_fd]] = self.fds[source_fd]
+
+    def run_setup(self, **changes):
+        return mount.mount_input_views(**(self.options | changes))
+
+    def error(self, code, **changes):
+        with self.assertRaises(mount.InputMountError) as caught:
+            self.run_setup(**changes)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+
+    def update_binding(self, role):
+        self.options["expected_identities"][role] = identity(self.nodes[self.paths[role]])
+
+    def test_success_receipt_is_partial_and_all_owned_fds_closed(self):
+        result = self.run_setup()
+        self.assertEqual(result["declared_metadata_files_verified"], 2)
+        self.assertEqual(result["source_payload_bytes_read"], 0)
+        for name in ("fresh_mount_namespace", "private_propagation",
+                     "input_views_readonly_nosuid_nodev_noexec",
+                     "output_view_writable_nosuid_nodev_noexec"):
+            self.assertIs(result[name], True)
+        for name in ("other_writable_aliases_excluded", "source_immutability_verified",
+                     "input_content_authenticated", "old_root_detached",
+                     "ambient_descriptors_closed", "resource_limits_verified",
+                     "complete_os_sandbox_verified", "worker_dispatched",
+                     "real_import_execution_permitted", "training_authorized",
+                     "production_eligible", "source_metadata_mutated"):
+            self.assertIs(result[name], False)
+        self.assertEqual(self.fds, {})
+        self.runtime.assert_called_once_with()
+
+    def test_fresh_namespace_private_before_exact_three_nonrecursive_binds(self):
+        self.run_setup()
+        self.assertEqual(self.events[:2], [
+            ("unshare",), ("mount", None, "/", None,
+                            mount.mount_root.MS_REC | mount.mount_root.MS_PRIVATE),
+        ])
+        binds = [call for call in self.mount_call.call_args_list
+                 if call.args[3] & mount.mount_root.MS_BIND]
+        self.assertEqual(len(binds), 3)
+        old = [fd for _path, fd, generation in self.pins if generation == 0]
+        self.assertTrue(set(old).issubset(self.closed))
+
+    def test_recursive_input_seals_and_writable_output_seal(self):
+        self.run_setup()
+        self.assertEqual([call.args[1] for call in self.seal.call_args_list], [15, 15, 14])
+        self.assertTrue(all(call.kwargs == {"recursive": True}
+                            for call in self.seal.call_args_list))
+        self.assertTrue(all(call.args[0].startswith("/proc/self/fd/")
+                            for call in self.seal.call_args_list))
+        self.assertEqual(self.readback.call_args_list[-1].args[1:], (14, 1))
+
+    def test_readonly_flags_checked_for_every_input_directory_and_file(self):
+        self.run_setup()
+        flags = [call.args[1] for call in self.readback.call_args_list]
+        self.assertEqual(flags.count(15), 7)  # 2 bound roots plus 5 declared nodes.
+        self.assertEqual(flags.count(14), 1)
+
+    def test_tokenizer_subdirectory_preserved(self):
+        self.run_setup()
+        opened = [call.args[0] for call in self.os.open.call_args_list]
+        self.assertEqual(opened.count("tokenizer"), 2)
+        self.assertEqual(opened.count("tokenizer.json"), 2)
+
+    def test_metadata_only_api_has_no_source_mutators_or_content_reads(self):
+        tree = ast.parse(Path(mount.__file__).read_text())
+        forbidden = {"read", "read_bytes", "write", "write_bytes", "chmod", "chown",
+                     "mkdir", "unlink", "rename", "replace", "rmdir", "execve", "fork"}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                self.assertNotIn(node.func.attr, forbidden)
+        self.run_setup()
+
+    def test_invalid_paths_rejected_before_runtime_and_pin(self):
+        for value in ("/", "relative", PARENT + "/a/../checkpoint", PARENT + "//checkpoint",
+                      PARENT + "/checkpoint/", PARENT + "/checkpoint\n", "/elsewhere/thing"):
+            self.error("input_rejected", checkpoint_path=value)
+        self.error("input_rejected", output_path=self.options["checkpoint_path"])
+        self.runtime.assert_not_called()
+        self.pin.assert_not_called()
+
+    def test_manifest_path_size_and_count_bounds(self):
+        for value in ({}, {"../bad": 3}, {"/absolute": 3}, {"x": True}, {"x": 0},
+                      {"x": 64 * 1024**3 + 1}, {"a": 1, "a/b": 2},
+                      {str(n): 1 for n in range(130)}):
+            self.error("input_rejected", inventories={"checkpoint": value,
+                                                      "tokenizer": {"x": 1}})
+        self.pin.assert_not_called()
+
+    def test_manifest_closed_roles_and_identity_shape(self):
+        self.error("input_rejected", inventories=self.options["inventories"] | {"extra": {}})
+        value = dict(self.options["expected_identities"])
+        value["checkpoint"] = list(value["checkpoint"])
+        self.error("input_rejected", expected_identities=value)
+        self.error("input_rejected", expected_identities={})
+        self.pin.assert_not_called()
+
+    def test_explicit_root_alias_rejected_before_runtime(self):
+        value = dict(self.options["expected_identities"])
+        value["output"] = value["checkpoint"]
+        self.error("alias_rejected", expected_identities=value)
+        self.runtime.assert_not_called()
+
+    def test_runtime_wrong_platform_or_version_rejected_before_source_access(self):
+        mount.sys.version_info = (3, 13)
+        self.error("runtime_rejected")
+        self.pin.assert_not_called()
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        self.error("runtime_rejected")
+
+    def test_root_identity_mismatch_terminal_before_unshare(self):
+        self.nodes[self.paths["checkpoint"]].st_ino += 100
+        self.error("identity_rejected")
+        self.unshare.assert_not_called()
+        self.error("already_attempted")
+        self.assertEqual(self.fds, {})
+
+    def test_private_parent_not_worker_owned_or_public(self):
+        self.nodes[PARENT].st_mode = stat.S_IFDIR | 0o755
+        self.update_binding("parent")
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+
+    def test_worker_directory_root_owner_is_not_permission_equivalent(self):
+        self.nodes[self.paths["checkpoint"]].st_uid = 0
+        self.update_binding("checkpoint")
+        self.error("layout_rejected")
+
+    def test_worker_file_root_owner_rejected(self):
+        self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_uid = 0
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+
+    def test_worker_file_0400_rejected_not_silently_chmodded(self):
+        self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_mode = stat.S_IFREG | 0o400
+        self.error("layout_rejected")
+
+    def test_hardlink_rejected(self):
+        self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_nlink = 2
+        self.error("layout_rejected")
+
+    def test_symlink_rejected_by_metadata(self):
+        self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_mode = stat.S_IFLNK | 0o600
+        self.error("layout_rejected")
+
+    def test_file_size_mismatch_rejected_without_content_read(self):
+        self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_size = 20
+        self.error("layout_rejected")
+
+    def test_input_file_alias_across_trees_rejected(self):
+        self.nodes[self.paths["tokenizer"] + "/tokenizer/tokenizer.json"].st_ino = 20
+        self.error("alias_rejected")
+
+    def test_missing_or_undeclared_file_rejected(self):
+        self.nodes[self.paths["checkpoint"] + "/extra"] = metadata(40, stat.S_IFREG | 0o600, 10001)
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+
+    def test_nonempty_output_rejected_before_unshare(self):
+        self.nodes[self.paths["output"] + "/old"] = metadata(40, stat.S_IFREG | 0o600, 10001)
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+
+    def test_nonempty_target_rejected_before_unshare(self):
+        self.nodes[self.paths["target_checkpoint"] + "/old"] = metadata(40, stat.S_IFREG | 0o600)
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+
+    def test_directory_enumeration_is_bounded(self):
+        self.os.scandir.side_effect = lambda _fd: Entries(str(n) for n in range(300))
+        self.error("layout_rejected")
+        self.unshare.assert_not_called()
+
+    def test_missing_cloexec_rejected(self):
+        self.fcntl.return_value = 0
+        self.error("source_rejected")
+
+    def test_unchanged_namespace_rejected_before_mount(self):
+        self.unshare.side_effect = None
+        self.error("namespace_unchanged")
+        self.mount_call.assert_not_called()
+
+    def test_fresh_namespace_identity_swap_rejected(self):
+        def change():
+            self.unshare_call()
+            self.nodes[self.paths["checkpoint"]].st_ino += 100
+        self.unshare.side_effect = change
+        self.error("identity_rejected")
+        self.assertEqual(self.mount_call.call_count, 1)
+
+    def test_bound_tree_mutation_rejected(self):
+        original = self.mount_call.side_effect
+        def changed(*args, **kwargs):
+            original(*args, **kwargs)
+            if args[3] == mount.mount_root.MS_BIND:
+                self.nodes[self.paths["checkpoint"] + "/weights.bin"].st_mtime_ns += 1
+        self.mount_call.side_effect = changed
+        self.error("identity_rejected")
+
+    def test_mount_failure_no_retry_and_owned_descriptors_closed(self):
+        self.mount_call.side_effect = mount.mount_root.MountRootError("bind_mount_failed")
+        self.error("bind_mount_failed")
+        calls = self.mount_call.call_count
+        self.error("already_attempted")
+        self.assertEqual(self.mount_call.call_count, calls)
+        self.assertEqual(self.fds, {})
+
+    def test_seal_failure_fixed_code_no_rollback(self):
+        self.seal.side_effect = mount.mount_root.MountRootError("seal_failed")
+        self.error("seal_failed")
+        self.assertEqual(self.unshare.call_count, 1)
+
+    def test_readback_failure_fixed_code(self):
+        self.readback.side_effect = mount.mount_root.MountRootError("readback_failed")
+        self.error("readback_failed")
+
+    def test_private_exception_redacted(self):
+        self.pin.side_effect = OSError(PRIVATE)
+        self.error("setup_failed")
+
+    def test_close_failure_is_never_retried(self):
+        original = self.os.close.side_effect
+        def failed(descriptor):
+            original(descriptor)
+            raise OSError(PRIVATE)
+        self.os.close.side_effect = failed
+        self.error("close_failed")
+        self.assertEqual(self.fds, {})
+
+    def test_owner_change_rejected(self):
+        self.run_setup()
+        self.os.getpid.return_value = 4001
+        self.error("owner_mismatch")
+
+    def test_reentrant_call_rejected_without_changing_owner(self):
+        mount._SETUP_LOCK.acquire()
+        try:
+            self.error("reentry")
+        finally:
+            mount._SETUP_LOCK.release()
+        self.pin.assert_not_called()
+
+    def test_success_is_also_one_shot(self):
+        self.run_setup()
+        self.error("already_attempted")
+        self.assertEqual(self.unshare.call_count, 1)
+
+    def test_approval_boolean_is_not_an_api_parameter(self):
+        with self.assertRaises(TypeError):
+            self.run_setup(approved=True)
+        self.pin.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

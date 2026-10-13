@@ -1,0 +1,126 @@
+"""Pure full-size guardian-side bindings, not a native guardian or admission.
+
+Already acquired control bytes are validated by the versioned entry adapter.
+The frozen input/rootfs validator checks only the supplied mount metadata; this
+module binds its exact inventories to the validated plan without reading files,
+starting a clock, importing an ML runtime, or invoking any native operation.
+
+The proposed memory/deadline values are not installed limits or host readback.
+The public launch remains unconditionally closed. A source hash, native-looking
+identity tuple, approval field or success-shaped receipt cannot authorize it.
+Existing unresolved host requirements remain unresolved; the local binding
+adapter does not implement the controller/guardian/bootstrap lifecycle.
+
+Coordinator content reservations exclude source staging, entry/control setup,
+acquisition, retained guardian reports and dependency/OS/scratch writes. Capacity
+or quota is not cumulative-write accounting; no arbitrary-native-write claim is
+made. This successor never changes a frozen helper or the tiny qualified entry.
+"""
+
+from __future__ import annotations
+
+import copy
+
+from . import posttraining_checkpoint_fullsize_entry_v1 as entry
+from . import posttraining_checkpoint_import_rootfs_v2 as mount
+
+SCHEMA = "lumi.sft-checkpoint-fullsize-guard-bindings.v0.1"
+STATUS = "PASS_local_guard_bindings_not_native_guardian_or_admission"
+ENTRY_ARGUMENT_FIELDS = frozenset({
+    "control_raw", "bodies", "expected_control_sha256", "expected_entry_sha256",
+    "expected_source_manifest_sha256", "expected_attempt_nonce_sha256", "runtime_sources",
+})
+FALSE_FLAGS = (
+    "native_guardian_implemented", "host_admission_verified", "host_capacity_verified",
+    "runtime_bound", "source_immutability_verified", "external_writer_exclusion_verified",
+    "os_limits_enforced", "independent_pid_cgroup_supervision_installed",
+    "hard_timeout_enforced", "native_cumulative_write_enforcement_verified",
+    "arbitrary_native_writes_metered", "dependency_module_reads_metered",
+    "physical_device_io_measured", "execution_permitted", "real_4b_import",
+    "real_4b_import_verified",
+    "gate_5_complete", "training_authorized", "production_eligible", "retry_allowed",
+)
+UNRESOLVED_HOST_REQUIREMENTS = (
+    "dedicated_host_identity", "runtime_artifact_binding", "successor_source_closure",
+    "input_backing_store_strategy", "native_mount_and_full_size_runner_adapter",
+    "approved_resource_envelope", "host_control_readback", "real_import_authorization",
+)
+UNRESOLVED_WRITE_SCOPES = (
+    "source_staging", "entry_and_control_setup", "software_and_input_acquisition",
+    "guardian_reports_and_aggregate_retention", "dependency_and_os_writes",
+    "scratch_and_shared_memory_writes",
+)
+ERROR_CODES = frozenset({
+    "arguments_rejected", "entry_rejected", "mount_rejected", "inventory_binding_rejected",
+    "prepared_result_rejected", "host_guard_not_bound",
+})
+
+
+class FullsizeGuardError(ValueError):
+    def __init__(self, code="arguments_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "arguments_rejected"
+        super().__init__(self.code)
+
+
+def _need(value, code):
+    if not value:
+        raise FullsizeGuardError(code) from None
+
+
+def run_fullsize_guard(**_arguments):
+    """No caller input can open the unimplemented authenticated native path."""
+    raise FullsizeGuardError("host_guard_not_bound") from None
+
+
+def prepare_guard(*, entry_arguments, mount_arguments):
+    """Bind detached pure entry/mount proposals; never return a launch capability.
+
+    Inventory equality includes every checkpoint row, including opaque trainer
+    files, and every tokenizer row. Native identities remain unverified supplied
+    metadata. No monotonic deadline is started and no one-shot native state is
+    consumed by this repeatable local preparation operation.
+    """
+    _need(type(entry_arguments) is dict and set(entry_arguments) == ENTRY_ARGUMENT_FIELDS
+          and type(mount_arguments) is dict, "arguments_rejected")
+    try:
+        prepared = entry.prepare_entry(**entry_arguments)
+    except Exception:
+        raise FullsizeGuardError("entry_rejected") from None
+    try:
+        copied_mount = mount.validate_arguments(**mount_arguments)
+    except Exception:
+        raise FullsizeGuardError("mount_rejected") from None
+    try:
+        _need(type(prepared) is dict and {
+            "arguments", "plan", "envelope", "limits", "inventories", "bindings",
+        } <= set(prepared), "prepared_result_rejected")
+        inventories = prepared["inventories"]
+        _need(type(inventories) is dict and set(inventories) == {"checkpoint", "tokenizer"}
+              and all(type(rows) is dict for rows in inventories.values()),
+              "prepared_result_rejected")
+        _need(copied_mount["inventories"] == inventories, "inventory_binding_rejected")
+        envelope = prepared["envelope"]
+        memory, seconds = envelope["worker_memory_max_bytes"], envelope["maximum_seconds"]
+        _need(type(memory) is int and 0 < memory <= 2**63 - 1
+              and type(seconds) is int and 0 < seconds <= 86400
+              and type(prepared["limits"]["maximum_seconds"]) is int
+              and prepared["limits"]["maximum_seconds"] == seconds,
+              "prepared_result_rejected")
+        return {
+            "schema_version": SCHEMA, "status": STATUS,
+            "prepared_entry": copy.deepcopy(prepared),
+            "mount_arguments": copied_mount,
+            "proposed_guard_limits": {"memory_max_bytes": memory, "swap_max_bytes": 0,
+                                      "maximum_seconds": seconds},
+            "resource_envelope_is_planning_only": True,
+            "exact_plan_mount_inventory_binding": True,
+            "deadline_clock_started": False,
+            "coordinator_write_scope": "explicit_hf_package_config_control_content_only",
+            "write_overhead_outside_coordinator_budget_unresolved": list(UNRESOLVED_WRITE_SCOPES),
+            "unresolved": dict.fromkeys(UNRESOLVED_HOST_REQUIREMENTS),
+            **dict.fromkeys(FALSE_FLAGS, False),
+        }
+    except FullsizeGuardError:
+        raise
+    except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
+        raise FullsizeGuardError("prepared_result_rejected") from None

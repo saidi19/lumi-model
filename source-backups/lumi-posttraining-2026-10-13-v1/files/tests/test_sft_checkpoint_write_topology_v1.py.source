@@ -1,0 +1,364 @@
+"""Synthetic pre-fork descriptor-topology tests; no socket or process exists."""
+
+from __future__ import annotations
+
+import fcntl
+import importlib
+import os
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, call, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_topology_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_topology_v1")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+
+PRIVATE = "SYNTHETIC-PRIVATE-PAYLOAD"
+
+
+class Endpoint:
+    def __init__(self, fd, events):
+        self.fd = fd
+        self.events = events
+        self.fail_close = False
+        self.closed = False
+
+    def fileno(self):
+        return self.fd
+
+    def close(self):
+        self.events.append(("close", self.fd))
+        if self.closed:
+            raise AssertionError("duplicate close")
+        if self.fail_close:
+            raise OSError(PRIVATE)
+        self.closed = True
+
+
+class TopologyTests(unittest.TestCase):
+    def setUp(self):
+        self.reset_synthetic_state()
+
+        m._ATTEMPTED = False
+        self.runtime = self.enterContext(patch.object(m, "_runtime", return_value=None))
+        self.factory = self.enterContext(patch.object(
+            m, "_make_pair", side_effect=self.make_pair,
+        ))
+        self.identity = self.enterContext(patch.object(
+            m, "_endpoint_identity", side_effect=self.endpoint_identity,
+        ))
+        self.clock = self.enterContext(patch.object(
+            m.time, "monotonic_ns", side_effect=lambda: self.now,
+        ))
+        self.getpid = self.enterContext(patch.object(
+            m.os, "getpid", side_effect=lambda: self.pid,
+        ))
+        self.getppid = self.enterContext(patch.object(
+            m.os, "getppid", side_effect=lambda: self.ppid,
+        ))
+
+    def reset_synthetic_state(self):
+        self.events = []
+        self.pid = 100
+        self.ppid = 50
+        self.now = 100
+        self.deadline = 200
+        self.endpoints = [Endpoint(fd, self.events) for fd in range(10, 22)]
+        self.pair_index = 0
+        self.identity_overrides = {}
+
+    def tearDown(self):
+        self.assertFalse(m._ATTEMPTED is False and self.factory.called)
+
+    def make_pair(self):
+        index = 2 * self.pair_index
+        self.pair_index += 1
+        return self.endpoints[index], self.endpoints[index + 1]
+
+    def endpoint_identity(self, endpoint):
+        if endpoint.fd in self.identity_overrides:
+            value = self.identity_overrides[endpoint.fd]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+        return (
+            endpoint.fd, 1, endpoint.fd + 1000, stat.S_IFSOCK,
+            0, 0, fcntl.FD_CLOEXEC, os.O_RDWR | os.O_NONBLOCK,
+        )
+
+    def create(self):
+        return m._precreate_admitted_once(deadline_ns=self.deadline)
+
+    def closed_fds(self):
+        return [fd for action, fd in self.events if action == "close"]
+
+    def assert_closed_once(self, fds):
+        self.assertEqual(sorted(self.closed_fds()), sorted(fds))
+        self.assertEqual(len(self.closed_fds()), len(set(self.closed_fds())))
+
+    def test_import_is_inert_and_public_entry_is_closed(self):
+        roots = m.listener.ML_ROOTS
+        self.assertFalse(any(name.split(".", 1)[0] in roots
+                             for name in IMPORT_ADDITIONS))
+        with self.assertRaises(m.TopologyError) as caught:
+            m.create_write_topology(approval=True, deadline_ns=self.deadline)
+        self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.runtime.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_final_role_sets_are_disjoint_and_cover_all_endpoints(self):
+        final = (
+            m.STAGE_ENDPOINTS["controller"],
+            m.STAGE_ENDPOINTS["broker"],
+            m.STAGE_ENDPOINTS["worker"],
+            m.STAGE_ENDPOINTS["guardian_watch"],
+        )
+        all_names = {name for pair in m.PAIR_ENDPOINTS for name in pair}
+        self.assertEqual(len(all_names), 12)
+        self.assertEqual(set().union(*final), all_names)
+        for index, left in enumerate(final):
+            for right in final[index + 1:]:
+                self.assertFalse(left & right)
+        self.assertEqual(
+            m.STAGE_ENDPOINTS["guardian_prefork"],
+            all_names - m.STAGE_ENDPOINTS["controller"],
+        )
+
+    def test_runtime_rejection_precedes_deadline_and_socket_creation(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        with self.assertRaises(m.TopologyError) as caught:
+            m._precreate_admitted_once(deadline_ns=True)
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+        self.assertFalse(m._ATTEMPTED)
+        self.factory.assert_not_called()
+
+    def test_deadline_validation_precedes_attempt_and_socket_creation(self):
+        for deadline in (None, True, 0, 100, 2**63, 100.0,
+                         100 + 3600 * 1_000_000_000 + 1):
+            with self.subTest(deadline=deadline):
+                with self.assertRaises(m.TopologyError) as caught:
+                    m._precreate_admitted_once(deadline_ns=deadline)
+                self.assertEqual(caught.exception.code, "arguments_rejected")
+                self.assertFalse(m._ATTEMPTED)
+        self.factory.assert_not_called()
+
+    def test_six_pairs_are_created_once_with_aggregate_only_snapshot(self):
+        topology = self.create()
+        self.assertEqual(self.factory.call_count, 6)
+        report = topology.snapshot()
+        expected = {
+            "schema": m.SCHEMA, "stage": "initial", "pairs_created": 6,
+            "endpoints_created": 12, "live_endpoints": 12,
+            "closed_endpoints": 0, "ambiguous_endpoints": 0,
+            "fork_child_adoptions": 0, "terminal_failed": False,
+            "controller_final_endpoints": 4,
+            "guardian_prefork_endpoints": 8,
+            "broker_final_endpoints": 3, "worker_final_endpoints": 3,
+            "guardian_watch_final_endpoints": 2,
+            **dict.fromkeys(m.FALSE_FLAGS, False),
+        }
+        self.assertEqual(report, expected)
+        self.assertFalse(set(report) & {name for pair in m.PAIR_ENDPOINTS for name in pair})
+        topology.close_all_admitted_once()
+
+    def test_second_started_attempt_is_rejected_without_more_pairs(self):
+        topology = self.create()
+        with self.assertRaises(m.TopologyError) as caught:
+            self.create()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertEqual(self.factory.call_count, 6)
+        topology.close_all_admitted_once()
+
+    def test_pair_factory_failure_closes_every_created_endpoint_once(self):
+        original = self.make_pair
+
+        def fail_third():
+            if self.pair_index == 2:
+                raise OSError(PRIVATE)
+            return original()
+
+        self.factory.side_effect = fail_third
+        with self.assertRaises(m.TopologyError) as caught:
+            self.create()
+        self.assertEqual(caught.exception.code, "socket_rejected")
+        self.assert_closed_once(range(10, 14))
+        self.assertTrue(m._ATTEMPTED)
+
+    def test_duplicate_descriptor_identity_is_rejected_and_closed_once(self):
+        self.identity_overrides[11] = (
+            11, 1, 1010, stat.S_IFSOCK, 0, 0,
+            fcntl.FD_CLOEXEC, os.O_RDWR | os.O_NONBLOCK,
+        )
+        with self.assertRaises(m.TopologyError) as caught:
+            self.create()
+        self.assertEqual(caught.exception.code, "socket_rejected")
+        self.assert_closed_once((10, 11))
+
+    def test_cleanup_failure_during_construction_is_not_retried(self):
+        self.endpoints[0].fail_close = True
+        original = self.make_pair
+
+        def fail_second():
+            if self.pair_index == 1:
+                raise OSError(PRIVATE)
+            return original()
+
+        self.factory.side_effect = fail_second
+        with self.assertRaises(m.TopologyError) as caught:
+            self.create()
+        self.assertEqual(caught.exception.code, "cleanup_unconfirmed")
+        self.assertEqual(self.closed_fds().count(10), 1)
+        self.assertEqual(self.closed_fds().count(11), 1)
+
+    def test_controller_transition_keeps_exact_four_and_closes_eight(self):
+        topology = self.create()
+        kept = topology.transition_admitted_once("controller", extra_keep=(99,))
+        expected_names = m.STAGE_ENDPOINTS["controller"]
+        expected_fds = sorted(topology._identities[name][0] for name in expected_names)
+        self.assertEqual(kept, tuple(expected_fds) + (99,))
+        self.assertEqual(set(topology._live), expected_names)
+        self.assertEqual(topology.snapshot()["closed_endpoints"], 8)
+        topology.close_all_admitted_once()
+        self.assert_closed_once(range(10, 22))
+
+    def test_guardian_and_nested_children_follow_only_allowed_transitions(self):
+        for final, count in (("broker", 3), ("worker", 3), ("guardian_watch", 2)):
+            with self.subTest(final=final):
+                self.reset_synthetic_state()
+                m._ATTEMPTED = False
+                self.factory.reset_mock()
+                self.identity.reset_mock()
+                topology = self.create()
+                self.pid, self.ppid = 200, 100
+                adopted = topology.adopt_fork_child_admitted_once()
+                self.assertEqual(adopted["fork_child_adoptions"], 1)
+                topology.transition_admitted_once("guardian_prefork")
+                if final != "guardian_watch":
+                    self.pid, self.ppid = 300, 200
+                    topology.adopt_fork_child_admitted_once()
+                topology.transition_admitted_once(final)
+                self.assertEqual(topology.snapshot()["live_endpoints"], count)
+                self.assertEqual(set(topology._live), m.STAGE_ENDPOINTS[final])
+                topology.close_all_admitted_once()
+
+    def test_wrong_child_parent_rejects_adoption_without_unlock_leak(self):
+        topology = self.create()
+        self.pid, self.ppid = 200, 999
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.adopt_fork_child_admitted_once()
+        self.assertEqual(caught.exception.code, "transition_rejected")
+        self.assertTrue(topology.snapshot()["terminal_failed"])
+        self.assertFalse(topology._lock.locked())
+        self.pid, self.ppid = 100, 50
+        topology.close_all_admitted_once()
+
+    def test_expired_child_adoption_is_rejected(self):
+        topology = self.create()
+        self.pid, self.ppid, self.now = 200, 100, self.deadline
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.adopt_fork_child_admitted_once()
+        self.assertEqual(caught.exception.code, "transition_rejected")
+        self.assertFalse(topology._lock.locked())
+        self.pid, self.ppid, self.now = 100, 50, 100
+        topology.close_all_admitted_once()
+
+    def test_invalid_transition_is_terminal_but_explicit_cleanup_remains(self):
+        topology = self.create()
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.transition_admitted_once("broker")
+        self.assertEqual(caught.exception.code, "transition_rejected")
+        self.assertTrue(topology.snapshot()["terminal_failed"])
+        report = topology.close_all_admitted_once()
+        self.assertEqual(report["live_endpoints"], 0)
+        self.assert_closed_once(range(10, 22))
+
+    def test_topology_endpoint_cannot_be_smuggled_as_extra_keep(self):
+        topology = self.create()
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.transition_admitted_once("controller", extra_keep=(10,))
+        self.assertEqual(caught.exception.code, "arguments_rejected")
+        self.assertEqual(topology.snapshot()["closed_endpoints"], 0)
+        topology.close_all_admitted_once()
+
+    def test_descriptor_change_is_not_closed_as_a_replacement(self):
+        topology = self.create()
+        original = topology._identities["control_controller"]
+        self.identity_overrides[original[0]] = (
+            original[0], original[1], original[2] + 99, *original[3:],
+        )
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.transition_admitted_once("controller")
+        self.assertEqual(caught.exception.code, "descriptor_changed")
+        with self.assertRaises(m.TopologyError) as cleanup:
+            topology.close_all_admitted_once()
+        self.assertEqual(cleanup.exception.code, "cleanup_unconfirmed")
+        self.assertNotIn(original[0], self.closed_fds())
+        self.assertEqual(topology.snapshot()["ambiguous_endpoints"], 1)
+
+    def test_close_failure_is_consumed_once_and_other_endpoints_are_closed(self):
+        topology = self.create()
+        self.endpoints[5].fail_close = True
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.transition_admitted_once("controller")
+        self.assertEqual(caught.exception.code, "cleanup_unconfirmed")
+        self.assertEqual(self.closed_fds().count(self.endpoints[5].fd), 1)
+        self.assertEqual(topology.snapshot()["ambiguous_endpoints"], 1)
+        self.assertEqual(topology.snapshot()["live_endpoints"], 0)
+
+    def test_deadline_failure_releases_lock_and_requires_cleanup(self):
+        topology = self.create()
+        self.now = self.deadline
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.transition_admitted_once("controller")
+        self.assertEqual(caught.exception.code, "transition_rejected")
+        self.assertFalse(topology._lock.locked())
+        self.now = 100
+        topology.close_all_admitted_once()
+
+    def test_reentry_poison_does_not_release_a_lock_it_did_not_acquire(self):
+        topology = self.create()
+        self.assertTrue(topology._lock.acquire(blocking=False))
+        try:
+            with self.assertRaises(m.TopologyError) as caught:
+                topology.transition_admitted_once("controller")
+            self.assertEqual(caught.exception.code, "reentry")
+            self.assertTrue(topology._lock.locked())
+        finally:
+            topology._lock.release()
+        topology.close_all_admitted_once()
+
+    def test_endpoint_access_revalidates_identity(self):
+        topology = self.create()
+        endpoint = topology.endpoint_admitted("control_controller")
+        self.assertIs(endpoint, self.endpoints[0])
+        identity = topology._identities["control_controller"]
+        self.identity_overrides[identity[0]] = (
+            identity[0], identity[1], identity[2] + 1, *identity[3:],
+        )
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.endpoint_admitted("control_controller")
+        self.assertEqual(caught.exception.code, "descriptor_changed")
+        self.assertTrue(topology.snapshot()["terminal_failed"])
+
+    def test_endpoint_access_requires_the_adopted_process_owner(self):
+        topology = self.create()
+        self.pid, self.ppid = 200, 100
+        with self.assertRaises(m.TopologyError) as caught:
+            topology.endpoint_admitted("control_guardian")
+        self.assertEqual(caught.exception.code, "transition_rejected")
+        self.assertFalse(topology._lock.locked())
+        self.pid, self.ppid = 100, 50
+        topology.close_all_admitted_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

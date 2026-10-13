@@ -1,0 +1,72 @@
+"""Exact-key selection with synthetic metadata; never calls AWS or opens payloads."""
+import copy
+import importlib.util
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('metadata_selection',
+    ROOT/'scripts/prepare_sft_vm_fullsize_metadata_v1.py')
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class SelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.base = {'s3_backup':{'bucket':'bound-bucket','prefix':'bound-prefix'},
+                     'checkpoint':{'step':76294,'manifest_sha256':'a'*64},
+                     'run_fingerprint':'b'*64}
+        self.plan = {'checkpoint_inventory':[
+            {'path':'model/.metadata','bytes':3,'sha256':'c'*64},
+            {'path':'trainer-rank-00000.pt','bytes':9,'sha256':'d'*64}],
+            'tokenizer_inventory':[{'path':'tokenizer/tokenizer.json','bytes':4,'sha256':'e'*64}]}
+        self.backup = {'bucket':'bound-bucket','archive_prefix':'bound-prefix/archive/',
+                       'run_fingerprint':'b'*64,'checkpoint_manifest_sha256':'a'*64,
+                       'objects':[]}
+        for name, row in [('training/checkpoint-00076294/'+r['path'],r)
+                         for r in self.plan['checkpoint_inventory']] + [
+                             ('tokenizer/tokenizer.json',self.plan['tokenizer_inventory'][0])]:
+            self.backup['objects'].append({'relative_path':name,
+                'key':'bound-prefix/archive/'+name,'bytes':row['bytes'],'sha256':row['sha256']})
+
+    def test_tokenizer_prefix_not_doubled_and_root_trainer_retained(self):
+        rows = m.select_objects(self.base, self.plan, self.backup)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(sum(r['bytes'] for r in rows), 16)
+        self.assertEqual(rows[-1]['key'], 'bound-prefix/archive/tokenizer/tokenizer.json')
+        self.assertEqual(rows[1]['target_relative_path'], 'trainer-rank-00000.pt')
+
+    def test_wrong_hash_size_or_exact_key_rejected(self):
+        for field, value in [('bytes',10),('sha256','f'*64),('key','another/object')]:
+            backup = copy.deepcopy(self.backup)
+            backup['objects'][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                m.select_objects(self.base, self.plan, backup)
+
+    def test_different_lineage_bucket_prefix_rejected(self):
+        for key in ('bucket','archive_prefix','run_fingerprint','checkpoint_manifest_sha256'):
+            backup = copy.deepcopy(self.backup)
+            backup[key] = 'different'
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                m.select_objects(self.base, self.plan, backup)
+
+    def test_duplicate_relative_object_rejected(self):
+        self.backup['objects'].append(self.backup['objects'][0])
+        with self.assertRaises(ValueError):
+            m.select_objects(self.base, self.plan, self.backup)
+
+    def test_missing_trainer_fails_instead_of_partial_restore(self):
+        self.backup['objects'].pop(1)
+        with self.assertRaises(KeyError):
+            m.select_objects(self.base, self.plan, self.backup)
+
+    def test_unrelated_backup_rows_not_selected(self):
+        self.backup['objects'].append({'relative_path':'unrelated.json','key':'unrelated',
+                                       'bytes':700,'sha256':'f'*64})
+        rows = m.select_objects(self.base, self.plan, self.backup)
+        self.assertEqual(len(rows), 3)
+        self.assertFalse(any(r['key']=='unrelated' for r in rows))
+
+
+if __name__ == '__main__':
+    unittest.main()

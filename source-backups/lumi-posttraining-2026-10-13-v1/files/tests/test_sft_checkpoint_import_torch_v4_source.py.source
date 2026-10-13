@@ -1,0 +1,122 @@
+"""Source-only successor checks; no native imports or real input access."""
+
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+V3 = ROOT / "src/lumi/posttraining_checkpoint_import_torch_v3.py"
+V4 = ROOT / "src/lumi/posttraining_checkpoint_import_torch_v4.py"
+
+
+def definitions(path):
+    return {node.name: node for node in ast.parse(path.read_bytes()).body
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+
+
+class SuccessorSourceTests(unittest.TestCase):
+    def test_frozen_predecessor_bytes_unchanged(self):
+        self.assertEqual(hashlib.sha256(V3.read_bytes()).hexdigest(),
+                         "dc4221f32a30302601f243527b4e03038b4cd9ffad41fed38a853c9a1644a475")
+
+    def test_all_existing_helpers_preserved(self):
+        old, new = definitions(V3), definitions(V4)
+        for name in old.keys() - {"_convert", "convert_and_verify"}:
+            with self.subTest(name=name):
+                self.assertEqual(ast.dump(old[name]), ast.dump(new[name]))
+
+    def test_conversion_predicates_unchanged_except_explicit_reader_and_receipt(self):
+        old, new = definitions(V3)["_convert"], copy.deepcopy(definitions(V4)["_convert"])
+        self.assertEqual(new.args.args.pop().arg, "checkpoint_read_contract")
+        flattened = []
+        for node in new.body:
+            if (isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id == "checkpoint_read_contract"):
+                continue
+            if (isinstance(node, ast.With) and isinstance(node.items[0].context_expr, ast.Call)
+                    and isinstance(node.items[0].context_expr.func, ast.Name)
+                    and node.items[0].context_expr.func.id == "verified_dcp_reader"):
+                self.assertEqual(ast.unparse(node.body[0]), "reader = lease.reader")
+                self.assertEqual(ast.unparse(node.body[-1]),
+                                 "dcp_read_verification = lease.summary()")
+                original = next(item for item in old.body if isinstance(item, ast.Assign)
+                                and ast.unparse(item).startswith("reader = "))
+                flattened.extend([original, *node.body[1:-1]])
+            else:
+                flattened.append(node)
+        new.body = flattened
+        for node in ast.walk(new):
+            if isinstance(node, ast.Dict):
+                for index in reversed(range(len(node.keys))):
+                    key = node.keys[index]
+                    if isinstance(key, ast.Constant) and key.value == "dcp_read_verification":
+                        node.keys.pop(index)
+                        node.values.pop(index)
+            if (isinstance(node, ast.Constant)
+                    and node.value == "lumi.sft-checkpoint-import-kernel.v0.4"):
+                node.value = "lumi.sft-checkpoint-import-kernel.v0.3"
+        self.assertEqual(ast.dump(old), ast.dump(new))
+
+    def test_read_contract_is_strict_and_copied(self):
+        from lumi import posttraining_checkpoint_import_torch_v4 as m
+
+        good = {"expected_manifest_sha256": "1" * 64, "maximum_file_bytes": 100,
+                "maximum_read_bytes": 1000, "maximum_read_call_bytes": 100}
+        copied = m._read_contract(good)
+        good["maximum_read_bytes"] = 1
+        self.assertEqual(copied["maximum_read_bytes"], 1000)
+        for delta in ({"maximum_read_bytes": True}, {"maximum_file_bytes": 0},
+                      {"maximum_read_call_bytes": 1024**3 + 1}, {"extra": 1},
+                      {"expected_manifest_sha256": "private-value"}):
+            with self.subTest(delta=delta), self.assertRaisesRegex(
+                m.ImportKernelError, "dcp_read_contract_rejected"
+            ):
+                m._read_contract(good | delta)
+
+    def test_bad_read_contract_rejected_before_file_or_ml_access(self):
+        from lumi import posttraining_checkpoint_import_torch_v4 as m
+
+        with (patch.object(m, "_private_path") as path,
+              patch.object(m, "require_dependencies") as ml):
+            with self.assertRaisesRegex(m.ImportKernelError, "dcp_read_contract_rejected"):
+                m.convert_and_verify(None, None, None, "bfloat16", maximum_parameters=1,
+                    maximum_tensor_bytes=1, maximum_output_bytes=1, check_budget=lambda: None,
+                    checkpoint_read_contract={})
+            path.assert_not_called()
+            ml.assert_not_called()
+
+    def test_only_exact_typed_validation_code_survives_context_scrubbing(self):
+        from lumi import posttraining_checkpoint_import_torch_v4 as m
+
+        for cause, expected in (
+            (m.ImportKernelError("tied_alias_mismatch"), "tied_alias_mismatch"),
+            (RuntimeError("PRIVATE TOKEN"), "dcp_read_failed"),
+        ):
+            error = m.DCPReadError("operation_failed")
+            error.__context__ = cause
+            with patch.object(m, "_convert", side_effect=error):
+                with self.assertRaises(m.ImportKernelError) as caught:
+                    m.convert_and_verify(None, None, None, None, maximum_parameters=1,
+                        maximum_tensor_bytes=1, maximum_output_bytes=1, check_budget=None,
+                        checkpoint_read_contract={})
+            self.assertEqual(caught.exception.args, (expected,))
+
+    def test_cleanup_error_takes_precedence_over_prior_validation_code(self):
+        from lumi import posttraining_checkpoint_import_torch_v4 as m
+
+        error = m.DCPReadError("close_failed")
+        error.__context__ = m.ImportKernelError("tied_alias_mismatch")
+        with patch.object(m, "_convert", side_effect=error):
+            with self.assertRaisesRegex(m.ImportKernelError, "^dcp_read_failed$"):
+                m.convert_and_verify(None, None, None, None, maximum_parameters=1,
+                    maximum_tensor_bytes=1, maximum_output_bytes=1, check_budget=None,
+                    checkpoint_read_contract={})
+
+
+if __name__ == "__main__":
+    unittest.main()

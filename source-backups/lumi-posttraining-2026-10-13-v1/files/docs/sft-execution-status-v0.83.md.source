@@ -1,0 +1,77 @@
+# SFT execution status v0.83
+
+2026-09-13. The local control-only real-import preparation is complete. This
+adds no new roadmap gate and does not execute a checkpoint import. Gate 5
+remains incomplete. The successful v0.2 tiny Linux CPU qualification and both
+CI runs are preserved; they were not rerun.
+
+## What was completed
+
+A pure metadata contract now binds the exact frozen import plan and successful
+qualification verification. Its deterministic preparer verifies twelve fixed
+control/source files (260,864 bytes per pass) and evaluates only the newly
+written standard-library contract module. Two sequential zero-network
+preparation passes produced identical results. The saved contract is
+`configs/lumi-4b-sft-checkpoint-host-contract-v0.1.json`.
+
+The first 19 synthetic contract tests were expanded with nine file-binding and
+preparer tests: 28 tests pass on local Python 3.13.7. Their fixture inputs are
+generated control JSON, not model or dataset payloads. The final test run denied
+network, subprocess, native-library loading and ML imports. New Python files
+also passed syntax and 100-column checks. No new Linux-native run or Ruff result
+is claimed.
+
+The checks cover budget arithmetic, boolean/invalid limits, omitted conversion
+and package reads, missing config/control write reserves, insufficient disk/RAM,
+wrong owner/mode requirements, altered bindings and attempts to turn a planning
+document into execution permission. Errors expose fixed codes only.
+
+Independent source review found no blocker for this inert scope. The proposed
+envelope checker is deliberately not a full-size sufficiency proof: the real
+package finalizer traverses payload/tokenizer content three times and also
+reads/writes receipt and manifest controls. The successor must derive and test
+that complete budget before admission; the current sufficiency flag is false.
+
+## Concrete full-size requirements
+
+The frozen plan declares 48,839,117,190 checkpoint bytes and 4,648,253 tokenizer
+bytes. Two full audits total 97,687,530,886 logical source bytes. That is not the
+whole read budget: DCP model reads, HF output reads and packaging reads are
+additional. The DCP cap already includes the first full checkpoint audit, so
+only one additional checkpoint audit belongs in the coordinator formula.
+
+Planning RAM is at least 68,719,476,736 bytes (64 GiB). Private output writes
+remain capped at 8,415,205,181 bytes. The 57,258,970,624-byte staging figure covers
+checkpoint, tokenizer and output; the selected host must additionally reserve
+space for accepted software, scratch and other explicitly accounted storage.
+These are planning figures, not actual host admission or performance estimates.
+
+The frozen checkpoint reader requires UID/GID 10001 in the planned worker,
+directories 0700 and files 0600. Read-only mount flags are separate from those
+permission bits. Existing files must not be changed to root-owned/0400 as a
+shortcut. Proposed `/inputs/checkpoint`, `/inputs/tokenizer` and `/outputs`
+targets are namespace layout requirements, not acquired host paths. Other
+writable aliases/writers must be excluded; a read-only bind alone is not an
+immutability proof. The original tokenizer subdirectory semantics stay intact.
+
+The tiny qualification's 4 GiB memory, 90-second guard and 512 MiB scratch are
+not full-size admission limits. They remain unchanged.
+
+## Exact remaining work
+
+1. Implement and test the separately versioned real-input mount/full-size runner
+   adapter. The existing `run_import` remains closed with `host_guard_not_bound`.
+2. Bind a dedicated host, accepted runtime/source closure, input backing-store
+   strategy and explicitly approved full-size read/write/time/resource envelope.
+   Observe the host/mount/control readbacks before acquiring or importing data.
+3. Execute the separately authorized real checkpoint import, then complete the
+   already documented GPU-worker, private-data and CUDA/smoke prerequisites
+   before SFT. This preparation does not skip any of them.
+
+No host was selected or provisioned. No network, S3, GPU, inference, training,
+real payload reads, source mutation, registry change, commit or push occurred.
+The new preparation files are local only. GPU is not needed for the current
+control-code work; do not turn it on for this step.
+
+Report: `evidence/lumi-4b-sft-checkpoint-host-preparation-v0.1.json`.
+Structural verification: matching `host-preparation-verification-v0.1.json`.

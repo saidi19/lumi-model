@@ -1,0 +1,464 @@
+"""Joined synthetic acquisition; SDK/OS admission doubled, no cloud or payload."""
+
+import importlib
+import importlib.util
+import json
+import logging
+import os
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_fullsize_transport_handoff_v1 as fixture
+
+unit = importlib.import_module(fixture.PACKAGE + ".posttraining_vm_fullsize_acquisition_unit_v1")
+
+
+def load():
+    spec = importlib.util.spec_from_file_location(
+        "acquisition_entry_test", fixture.ROOT / "scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class JoinedTests(unittest.TestCase):
+    before = fixture.TransportTests.before
+    respond = fixture.TransportTests.respond
+
+    def setUp(self):
+        fixture.TransportTests.setUp(self)
+        self.m = load()
+        self.m.WORK = self.root
+        self.script, self.manifest = b"synthetic entry", b"synthetic manifest"
+        self.pins = {
+            "entry_sha256": self.m.sha(self.script),
+            "source_manifest_sha256": self.m.sha(self.manifest),
+        }
+        self.boundary = self.enterContext(
+            patch.object(self.m, "boundary", return_value=Path("/synthetic/credential"))
+        )
+        self.source = self.enterContext(
+            patch.object(self.m, "load_transport", return_value=fixture.t)
+        )
+        self.read = self.enterContext(
+            patch.object(self.m, "read_private", side_effect=self.read_control)
+        )
+        self.secret = self.enterContext(
+            patch.object(self.m, "credentials", return_value=fixture.CREDS)
+        )
+        self.sdk = self.enterContext(
+            patch.object(self.m, "sdk", return_value=(self.session, self.config))
+        )
+
+    def read_control(self, path, *_args, **_kwargs):
+        if path == self.m.ENTRY:
+            return self.script
+        if path.name == "release-manifest.json":
+            return self.manifest
+        self.assertEqual(path.name, "input-selection.json")
+        return self.raw
+
+    def execute(self):
+        return self.m.execute(fixture.ID, **self.pins)
+
+    def test_entry_frozen_transport_staging_and_report_joined(self):
+        result = self.execute()
+        report = self.root / "acquisition.json"
+        self.assertEqual(json.loads(report.read_bytes()), result)
+        self.assertEqual(result["http_sends"], 2)
+        self.assertEqual(report.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.root / "inputs/checkpoint/model/a").read_bytes(), b"opaque")
+        self.assertEqual((self.root / "inputs/tokenizer/tokenizer/a").read_bytes(), b"{}")
+        self.http.close.assert_called_once()
+        self.assertFalse(result["credentials_erased"])
+        self.assertFalse(result["real_4b_import"])
+
+    def test_failed_boundary_no_source_or_secret_reads(self):
+        self.boundary.side_effect = ValueError("boundary")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.read.assert_not_called()
+        self.secret.assert_not_called()
+
+    def test_wrong_entry_pin_before_loader_or_secret(self):
+        self.pins["entry_sha256"] = "a" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.source.assert_not_called()
+        self.secret.assert_not_called()
+
+    def test_wrong_manifest_pin_before_loader(self):
+        self.pins["source_manifest_sha256"] = "a" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.source.assert_not_called()
+
+    def test_changed_selection_never_reads_credentials_or_calls_sdk(self):
+        self.raw += b" "
+        with self.assertRaises(fixture.t.staging.StagingError):
+            self.execute()
+        self.secret.assert_not_called()
+        self.sdk.assert_not_called()
+
+    def test_existing_directory_is_not_reused_even_without_marker(self):
+        (self.root / "old-evidence").touch()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.secret.assert_not_called()
+        self.assertTrue((self.root / "old-evidence").exists())
+
+    def test_failed_credential_setup_consumes_process_attempt(self):
+        self.secret.side_effect = ValueError("private text")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertTrue(self.m.CONSUMED)
+        self.assertEqual(self.m.STAGE, "credentials")
+        self.sdk.assert_not_called()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(self.secret.call_count, 1)
+
+    def test_hash_failure_preserves_marker_no_report_no_retry(self):
+        self.data["bound/model/a"] = b"bad!!!"
+        with self.assertRaises(fixture.t.staging.StagingError):
+            self.execute()
+        self.assertTrue((self.root / "acquisition.started").exists())
+        self.assertFalse((self.root / "acquisition.json").exists())
+        self.http.close.assert_called_once()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(self.client.get_object.call_count, 1)
+
+    def test_success_replay_does_not_send_again(self):
+        self.execute()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(self.client.get_object.call_count, 2)
+
+
+class WiringTests(unittest.TestCase):
+    def test_command_credentials_only_loadcredential_no_secret_env_or_argv(self):
+        args = unit.command(fixture.ID, entry_sha256="a" * 64, source_manifest_sha256="b" * 64)
+        props = unit.properties(fixture.ID)
+        self.assertEqual(
+            props["BindPaths"],
+            f"/var/lib/lumi-vm-fullsize/{fixture.ID}/stage/acquisition:/acquisition",
+        )
+        self.assertNotIn("stage:/", props["BindPaths"])
+        self.assertEqual(
+            props["LoadCredential"],
+            f"aws-session.json:/var/lib/lumi-vm-fullsize/{fixture.ID}/credentials/aws-session.json",
+        )
+        self.assertFalse(any("ACCESS_KEY" in arg or "SESSION_TOKEN" in arg for arg in args))
+        self.assertEqual(props["StandardError"], "null")
+        self.assertEqual(props["MemoryMax"], str(1024**3))
+        self.assertEqual(props["MemorySwapMax"], "0")
+        self.assertEqual(props["RuntimeMaxSec"], "3600")
+        self.assertEqual(props["Restart"], "no")
+        self.assertEqual(
+            args[args.index("--") + 1 : args.index("--") + 4], [unit.PYTHON, "-I", "-B"]
+        )
+
+    def test_import_network_remains_disabled(self):
+        self.assertEqual(
+            unit.handoff.controls.import_properties(fixture.ID)["PrivateNetwork"], "yes"
+        )
+        self.assertEqual(unit.properties(fixture.ID)["PrivateNetwork"], "no")
+
+    def test_bad_attempt_and_pin_rejected(self):
+        for attempt, pin in (("../escape", "a" * 64), (fixture.ID, "bad")):
+            with self.assertRaises(ValueError):
+                unit.command(attempt, entry_sha256=pin, source_manifest_sha256="b" * 64)
+
+    def test_native_boundary_rejects_local_process(self):
+        with self.assertRaises(ValueError):
+            load().boundary(fixture.ID)
+
+    def test_credentials_reject_duplicate_extra_empty_whitespace(self):
+        entry = load()
+        for raw in (
+            b'{"access_key":"a","access_key":"b"}',
+            b"{}",
+            json.dumps(fixture.CREDS | {"extra": "bad"}).encode(),
+            json.dumps(fixture.CREDS | {"session_token": ""}).encode(),
+            json.dumps(fixture.CREDS | {"secret_key": "bad value"}).encode(),
+        ):
+            with (
+                patch.object(entry, "read_private", return_value=raw),
+                self.assertRaises(ValueError),
+            ):
+                entry.credentials(Path("/synthetic"))
+
+    def test_credentials_fixed_private_read(self):
+        entry = load()
+        with patch.object(
+            entry, "read_private", return_value=json.dumps(fixture.CREDS).encode()
+        ) as read:
+            self.assertEqual(entry.credentials(Path("/synthetic")), fixture.CREDS)
+        read.assert_called_once_with(Path("/synthetic"), 65536, modes=(0o400,))
+
+    def test_sdk_scrubs_inherited_configuration_and_uses_null_config(self):
+        entry, session = load(), Mock()
+        config = types.ModuleType("botocore.config")
+        config.Config = Mock()
+        sessions = types.ModuleType("botocore.session")
+        sessions.Session = Mock(return_value=session)
+        old_logging = logging.root.manager.disable
+        self.addCleanup(logging.disable, old_logging)
+        with (
+            patch.dict(sys.modules, {"botocore.config": config, "botocore.session": sessions}),
+            patch.dict(
+                os.environ,
+                {
+                    "AWS_PROFILE": "bad",
+                    "AWS_ACCESS_KEY_ID": "private",
+                    "HTTPS_PROXY": "bad",
+                    "BOTO_CONFIG": "bad",
+                },
+            ),
+        ):
+            entry.sdk()
+            self.assertNotIn("AWS_ACCESS_KEY_ID", os.environ)
+            self.assertNotIn("AWS_PROFILE", os.environ)
+            self.assertNotIn("HTTPS_PROXY", os.environ)
+            self.assertNotIn("BOTO_CONFIG", os.environ)
+            self.assertEqual(os.environ["AWS_CONFIG_FILE"], "/dev/null")
+            self.assertEqual(os.environ["AWS_EC2_METADATA_DISABLED"], "true")
+        self.assertEqual(session.set_config_variable.call_count, 3)
+
+    def test_changed_frozen_source_rejected_before_execution(self):
+        entry = load()
+        with patch.object(
+            entry, "read_private", return_value=b"raise RuntimeError('not executed')"
+        ):
+            with self.assertRaisesRegex(ValueError, "acquisition_entry_rejected"):
+                entry.load_transport()
+        self.assertNotIn(entry.PACKAGE, sys.modules)
+
+
+class ParentTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.destination = self.root / fixture.ID
+        self.stage = self.destination / "stage"
+        self.stage.mkdir(parents=True, mode=0o700)
+        self.destination.chmod(0o700)
+        self.acquisition = self.stage / "acquisition"
+        self.acquisition.mkdir(mode=0o700)
+        self.enterContext(patch.object(unit.handoff, "ROOT", self.root))
+        self.enterContext(patch.object(unit.handoff.frozen, "root_owned"))
+        self.enterContext(patch.object(unit.handoff.frozen, "host_check"))
+        self.enterContext(patch.object(unit, "_worker_directory", side_effect=lambda p: p.lstat()))
+        self.events = []
+        self.run = self.enterContext(
+            patch.object(unit.handoff.frozen, "run_command", side_effect=self.commands)
+        )
+        self.observe = self.enterContext(
+            patch.object(unit.handoff.frozen, "observe", return_value=fixture.SUCCESS)
+        )
+        self.empty = self.enterContext(
+            patch.object(unit.handoff.frozen, "cgroup_empty", return_value=True)
+        )
+        self.stop = self.enterContext(patch.object(unit.handoff, "_stop_and_reap"))
+        self.read = self.enterContext(
+            patch.object(unit.completion, "_read_worker_report", return_value=(b"synthetic", {}))
+        )
+        self.receipt = self.enterContext(patch.object(unit, "_validate_receipt"))
+        self.pins = {"entry_sha256": "a" * 64, "source_manifest_sha256": "a" * 64}
+
+    def commands(self, args, *_args, **_kwargs):
+        self.events.append(args)
+        if args[0] == "/usr/bin/systemd-run":
+            (self.acquisition / "inputs").mkdir(mode=0o700)
+            (self.acquisition / "inputs/synthetic").write_bytes(b"opaque")
+        return types.SimpleNamespace(returncode=0, stdout=b"not-found\n")
+
+    def execute(self):
+        return unit._run_acquisition_admitted_once(
+            fixture.ID, self.pins, machine_id="b" * 32, deadline=time.monotonic() + 3610
+        )
+
+    def test_parent_moves_only_after_success_empty_cgroup_and_receipt(self):
+        self.execute()
+        self.assertEqual((self.stage / "inputs/synthetic").read_bytes(), b"opaque")
+        self.assertFalse((self.acquisition / "inputs").exists())
+        self.assertTrue((self.destination / "acquisition-dispatch.started").exists())
+        self.empty.assert_called_once()
+        self.receipt.assert_called_once()
+        # Handoff, not this adapter, stops a successful exited unit before import.
+        self.stop.assert_not_called()
+
+    def test_live_child_prevents_move_and_receipt_read(self):
+        self.empty.return_value = False
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.read.assert_not_called()
+        self.assertFalse((self.stage / "inputs").exists())
+        self.assertTrue((self.acquisition / "inputs/synthetic").exists())
+        self.stop.assert_called_once()
+
+    def test_failed_unit_preserves_inputs_stops_and_no_retry(self):
+        self.observe.return_value = fixture.SUCCESS | {
+            "ExecMainStatus": "55",
+            "Result": "exit-code",
+        }
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.stop.assert_called_once()
+        self.assertTrue((self.destination / "acquisition-failed.json").exists())
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(sum(cmd[0] == "/usr/bin/systemd-run" for cmd in self.events), 1)
+
+    def test_ambiguous_dispatch_stopped_without_retry(self):
+        def timeout(args, *a, **kw):
+            response = self.commands(args, *a, **kw)
+            if args[0] == "/usr/bin/systemd-run":
+                raise TimeoutError("private SDK details")
+            return response
+
+        self.run.side_effect = timeout
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.stop.assert_called_once()
+        self.assertNotIn("private", (self.destination / "acquisition-failed.json").read_text())
+
+    def test_bad_receipt_blocks_move(self):
+        self.receipt.side_effect = ValueError("receipt")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertFalse((self.stage / "inputs").exists())
+        self.stop.assert_called_once()
+
+    def test_existing_target_never_overwritten(self):
+        (self.stage / "inputs").mkdir()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.run.assert_not_called()
+
+    def test_joined_workflow_calls_completion_after_acquisition_handoff(self):
+        def complete(*_a, **_kw):
+            self.assertTrue((self.stage / "inputs/synthetic").exists())
+            return {"gate_5_complete": False, "offhost_retention_verified": False}
+
+        with patch.object(unit.completion, "_complete_admitted_once", side_effect=complete) as done:
+            result = unit._run_workflow_admitted_once(
+                fixture.ID,
+                self.pins,
+                fixture.PINS,
+                machine_id="b" * 32,
+                deadline=time.monotonic() + 8430,
+            )
+        done.assert_called_once()
+        self.stop.assert_called_once()
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_mixed_source_release_rejected_before_acquisition(self):
+        with self.assertRaises(ValueError):
+            unit._run_workflow_admitted_once(
+                fixture.ID,
+                self.pins,
+                fixture.PINS | {"source_manifest_sha256": "b" * 64},
+                machine_id="b" * 32,
+                deadline=time.monotonic() + 8430,
+            )
+        self.run.assert_not_called()
+
+    def test_completion_early_failure_still_stops_acquisition(self):
+        with patch.object(
+            unit.completion, "_complete_admitted_once", side_effect=ValueError("failed")
+        ):
+            with self.assertRaises(ValueError):
+                unit._run_workflow_admitted_once(
+                    fixture.ID,
+                    self.pins,
+                    fixture.PINS,
+                    machine_id="b" * 32,
+                    deadline=time.monotonic() + 8430,
+                )
+        self.stop.assert_called_once()
+
+    def test_public_workflow_cannot_be_opened_by_approval_flag(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            unit.run_workflow(approved=True)
+
+
+class ReceiptTests(unittest.TestCase):
+    def test_fixed_receipt_values_and_no_bool_integer_confusion(self):
+        report = {
+            "schema": "lumi.vm-fullsize-acquisition.v0.1",
+            "http_sends": 22,
+            "sdk_http_session_closed_on_return": True,
+            "credentials_erased": False,
+            "acquisition_cgroup_reaped": False,
+            "real_4b_import": False,
+            "gate_5_complete": False,
+            "staging": {
+                "schema": "lumi.vm-fullsize-staging.v0.1",
+                "status": "copied_hash_verified",
+                "selection_sha256": unit.staging.SELECTION_SHA256,
+                "objects": 22,
+                "content_bytes_written": unit.staging.MAX_INPUT_BYTES,
+                "maximum_body_bytes_returned": unit.staging.MAX_INPUT_BYTES + 22,
+                "readonly_mount_verified": False,
+                "acquisition_cgroup_reaped": False,
+                "real_4b_import": False,
+                "gate_5_complete": False,
+            },
+        }
+        unit._validate_receipt(report)
+        for wrong in (
+            report | {"http_sends": 23},
+            report | {"real_4b_import": 0},
+            report | {"unexpected": "not allowed"},
+        ):
+            with self.assertRaises(ValueError):
+                unit._validate_receipt(wrong)
+
+
+class ColdReadTests(unittest.TestCase):
+    def test_actual_frozen_sources_load_without_sdk_or_model_import(self):
+        entry = load()
+        entry.SOURCE = fixture.ROOT / "src/lumi"
+        with patch.dict(sys.modules):
+            # Test harness may have installed an inert lumi namespace for other
+            # suites. Production must reject it; this fixture models a cold child.
+            for name in list(sys.modules):
+                if name == "lumi" or name.startswith("lumi."):
+                    del sys.modules[name]
+            with patch.object(entry, "read_private", side_effect=lambda p: p.read_bytes()):
+                transport = entry.load_transport()
+            self.assertEqual(transport.staging.SELECTION_SHA256, unit.staging.SELECTION_SHA256)
+            self.assertNotIn("botocore", sys.modules)
+            self.assertNotIn("torch", sys.modules)
+            with self.assertRaises(ValueError):
+                entry.load_transport()
+
+    def test_private_file_size_mode_link_and_type_rejection(self):
+        entry = load()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder).resolve() / "synthetic"
+            path.write_bytes(b"synthetic")
+            path.chmod(0o400)
+            self.assertEqual(entry.read_private(path), b"synthetic")
+            with self.assertRaises(ValueError):
+                entry.read_private(path, 2)
+            path.chmod(0o644)
+            with self.assertRaises(ValueError):
+                entry.read_private(path, modes=(0o400,))
+            link = path.with_name("link")
+            link.symlink_to(path)
+            with self.assertRaises(ValueError):
+                entry.read_private(link)
+            with self.assertRaises(ValueError):
+                entry.read_private(path.parent)
+
+
+if __name__ == "__main__":
+    unittest.main()

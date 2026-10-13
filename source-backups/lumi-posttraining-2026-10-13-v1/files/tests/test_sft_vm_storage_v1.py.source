@@ -1,0 +1,214 @@
+import copy
+import hashlib
+import importlib.util
+import stat
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "storage_test", ROOT / "scripts/check_sft_vm_storage_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class StorageTests(unittest.TestCase):
+    def setUp(self):
+        self.raw = (
+            b"1 0 259:1 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p1 rw\n"
+            b"2 1 259:2 / /var/lib/lumi-vm-fullsize rw,nodev,nosuid,noatime "
+            b"- ext4 /dev/nvme1n1 rw\n"
+        )
+        self.rows = m.mounts(self.raw)
+        self.binding = dict(root_volume="vol-" + "1" * 17, work_volume="vol-" + "2" * 17)
+        self.disks = dict(
+            root=dict(volume=self.binding["root_volume"], bytes=32 * m.GIB, disk="nvme0n1"),
+            work=dict(volume=self.binding["work_volume"], bytes=128 * m.GIB, disk="nvme1n1"),
+        )
+        self.devices = dict(root="259:1", work="259:2")
+
+    def validate(self, rows=None, disks=None, binding=None, devices=None, work_free=100 * m.GIB):
+        return m.validate(
+            self.rows if rows is None else rows,
+            self.disks if disks is None else disks,
+            self.binding if binding is None else binding,
+            self.devices if devices is None else devices,
+            work_free,
+            4 * m.GIB,
+        )
+
+    def test_exact_root_partition_work_disk_and_capacity(self):
+        result = self.validate()
+        self.assertTrue(result["work_volume_matches"])
+        self.assertFalse(result["host_admitted"])
+        self.assertFalse(result["other_namespace_writer_exclusion_proven"])
+        self.assertFalse(result["cloud_encryption_or_preservation_rechecked"])
+
+    def test_swapped_wrong_volume_size_or_same_physical_disk_rejected(self):
+        for field, value in (
+            ("volume", self.binding["root_volume"]),
+            ("bytes", 32 * m.GIB),
+            ("disk", "nvme0n1"),
+        ):
+            disks = copy.deepcopy(self.disks)
+            disks["work"][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.validate(disks=disks)
+        with self.assertRaises(ValueError):
+            self.validate(binding=self.binding | {"work_volume": self.binding["root_volume"]})
+
+    def test_wrong_stat_device_and_insufficient_space_rejected(self):
+        with self.assertRaises(ValueError):
+            self.validate(devices=self.devices | {"work": "259:3"})
+        with self.assertRaises(ValueError):
+            self.validate(work_free=100 * m.GIB - 1)
+
+    def test_bind_alias_readonly_alias_and_nested_mount_rejected(self):
+        for raw in (
+            b"3 1 259:2 / /elsewhere rw - ext4 /dev/nvme1n1 rw\n",
+            b"3 1 259:2 / /elsewhere ro - ext4 /dev/nvme1n1 rw\n",
+            b"3 2 0:10 / /var/lib/lumi-vm-fullsize/hidden rw - tmpfs tmpfs rw\n",
+        ):
+            with self.assertRaises(ValueError):
+                self.validate(rows=m.mounts(self.raw + raw))
+
+    def test_shared_missing_flags_root_alias_overlay_and_stacked_mount_rejected(self):
+        changes = [
+            dict(propagation=["shared:7"]),
+            dict(propagation=["master:2"]),
+            dict(options={"rw", "nosuid", "noatime"}),
+            dict(root="/subdir"),
+            dict(fs="overlay"),
+            dict(super_options={"ro"}),
+        ]
+        for change in changes:
+            rows = copy.deepcopy(self.rows)
+            rows[1].update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.validate(rows=rows)
+        with self.assertRaises(ValueError):
+            self.validate(rows=self.rows + [self.rows[1]])
+
+    def test_runtime_redirection_mount_rejected(self):
+        for point in ("/opt", "/opt/lumi-sft-rehearsal", "/opt/lumi-sft-acquisition/venv"):
+            row = f"3 1 259:3 / {point} rw - ext4 /dev/nvme2n1 rw\n".encode()
+            with self.assertRaises(ValueError):
+                self.validate(rows=m.mounts(self.raw + row))
+
+    def test_parser_bounds_duplicate_ids_and_escaped_paths(self):
+        for raw in (b"x" * (1024**2 + 1), self.raw + self.raw, b"malformed"):
+            with self.assertRaises(ValueError):
+                m.mounts(raw)
+        self.assertEqual(m.unescape(r"/has\040space"), "/has space")
+        with self.assertRaises(ValueError):
+            m.unescape(r"/bad\012line")
+
+    def test_sysfs_partition_serial_mapping_without_block_device_access(self):
+        node = Path("/sys/devices/pci/nvme/nvme0/nvme0n1/nvme0n1p1")
+        values = dict(
+            dev=b"259:1",
+            partition=b"1",
+            ro=b"0",
+            model=b"Amazon Elastic Block Store",
+            serial=("vol" + "1" * 17).encode(),
+            size=str(32 * m.GIB // 512).encode(),
+        )
+
+        def small(path, *args):
+            self.assertTrue(str(path).startswith("/sys/devices/"))
+            return values[path.name]
+
+        with (
+            patch.object(Path, "resolve", return_value=node),
+            patch.object(Path, "exists", return_value=True),
+            patch.object(Path, "iterdir", return_value=iter(())),
+            patch.object(m, "small", side_effect=small),
+        ):
+            self.assertEqual(m.disk_identity("259:1"), self.disks["root"])
+            values["model"] = b"Amazon EC2 NVMe Instance Storage"
+            with self.assertRaises(ValueError):
+                m.disk_identity("259:1")
+
+    def test_native_boundary_rejects_mac_before_mount_reads(self):
+        with (
+            patch.object(m.sys, "platform", "darwin"),
+            patch.object(m, "small") as read,
+            self.assertRaises(ValueError),
+        ):
+            m.inspect(self.binding)
+        read.assert_not_called()
+
+    def inspect_fixture(self, after, same_namespace=True):
+        directory = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0)
+
+        def namespace(path):
+            return types.SimpleNamespace(st_ino=1 if same_namespace or "self" in path else 2)
+
+        space = types.SimpleNamespace(f_flag=0, f_bavail=110 * m.GIB, f_frsize=1)
+        with (
+            patch.object(m.sys, "platform", "linux"),
+            patch.object(m.os, "geteuid", return_value=0),
+            patch.object(m.os, "getegid", return_value=0),
+            patch.object(m.os, "stat", side_effect=namespace),
+            patch.object(Path, "lstat", return_value=directory),
+            patch.object(Path, "stat", return_value=directory),
+            patch.object(m, "small", side_effect=[self.raw, after]),
+            patch.object(
+                m,
+                "disk_identity",
+                side_effect=lambda d: self.disks["root" if d == "259:1" else "work"],
+            ),
+            patch.object(
+                m, "device_number", side_effect=lambda p: "259:2" if p == m.WORK else "259:1"
+            ),
+            patch.object(m.os, "statvfs", return_value=space),
+        ):
+            return m.inspect(self.binding)
+
+    def test_complete_snapshot_accepts_stable_mounts_but_rejects_drift(self):
+        self.assertTrue(self.inspect_fixture(self.raw)["work_volume_matches"])
+        with self.assertRaises(ValueError):
+            self.inspect_fixture(self.raw + b"3 2 0:5 / /new rw - tmpfs tmpfs rw\n")
+
+    def test_non_initial_namespace_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.inspect_fixture(self.raw, same_namespace=False)
+
+    def test_storage_failure_blocks_setup_loading(self):
+        with (
+            patch.object(m, "inspect", side_effect=ValueError),
+            patch.object(m, "load_setup") as load,
+            self.assertRaises(ValueError),
+        ):
+            m._run_storage_checked_setup(self.binding, "b" * 32, 1800)
+        load.assert_not_called()
+
+    def test_snapshot_precedes_setup_and_keeps_exact_existing_deadline(self):
+        events = []
+        setup = Mock()
+        setup._run_admitted_once.side_effect = lambda *a: (
+            events.append("setup") or {"host_admitted": False}
+        )
+        with (
+            patch.object(
+                m, "inspect", side_effect=lambda b: events.append("storage") or self.validate()
+            ),
+            patch.object(m, "load_setup", return_value=setup),
+        ):
+            result = m._run_storage_checked_setup(self.binding, "b" * 32, 12345)
+        self.assertEqual(events, ["storage", "setup"])
+        setup._run_admitted_once.assert_called_once_with("b" * 32, 12345)
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_setup_pin_matches_preserved_source_and_public_run_stays_closed(self):
+        self.assertEqual(
+            hashlib.sha256(
+                (ROOT / "scripts/run_sft_vm_setup_sequence_v1.py").read_bytes()
+            ).hexdigest(),
+            m.SETUP_SHA,
+        )
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)

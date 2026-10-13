@@ -1,0 +1,181 @@
+"""Retained old CIDR regression; real control logic, synthetic cloud only."""
+
+import ast
+import copy
+import importlib
+import json
+import re
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_recovery_outer_v1 as recovery
+from tests.test_sft_vm_private_network_v1 import fixture as original_fixture
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+builder = importlib.import_module("prepare_sft_vm_cidr_successor_v1")
+
+
+def retained_fixture(extra=False):
+    value = original_fixture()
+    value["subnets"].append(
+        dict(
+            value["subnets"][0], id="subnet-09acdd244d70aa502", cidr=builder.OLD, available_ipv4=25
+        )
+    )
+    if extra:
+        value["subnets"].append(
+            dict(value["subnets"][0], id="subnet-" + "e" * 17, cidr=builder.NEW, available_ipv4=25)
+        )
+    return value
+
+
+class CidrSuccessorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.baseline, cls.pins = builder.inputs()
+        cls.files, cls.report = builder.build(cls.baseline, cls.pins)
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-cidr-successor-fixture-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.package = Path(cls.temp.name).resolve()
+        for name, raw in cls.files.items():
+            path = cls.package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def setUp(self):
+        self.enterContext(patch.object(recovery.outer_fake, "fixture", retained_fixture))
+        recovery.RecoveryOuterTests.setUp(self)
+
+    def test_source_hash_graph_authenticates(self):
+        self.m.authenticate()
+        self.m.loading.fresh_identity()
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertFalse(self.report["consumed_execution_renewed"])
+
+    def test_plan_create_and_ownership_use_same_cidr(self):
+        plan = json.loads(self.files[builder.PLAN])
+        self.assertEqual(plan["targets"]["new_private_subnet_cidr"], builder.NEW)
+        source = self.files[builder.NETWORK]
+        self.assertEqual(source.count(builder.NEW.encode()), 2)
+        self.assertNotIn(builder.OLD.encode(), source)
+        old = json.loads(self.baseline[builder.PLAN])
+        old["targets"]["new_private_subnet_cidr"] = builder.NEW
+        self.assertEqual(old, plan)
+
+    def test_retained_subnet_skipped_without_mutating_observation(self):
+        value = retained_fixture()
+        saved = copy.deepcopy(value)
+        result = self.m.network.selection.plan(value)
+        self.assertEqual(result["targets"]["new_private_subnet_cidr"], builder.NEW)
+        self.assertEqual(value, saved)
+
+    def admission(self, raw):
+        clients = {
+            k: self.case.bundle.clients[k] for k in ("sts", "ec2", "service-quotas", "pricing")
+        }
+        return self.m.NetworkAdmission(clients, raw, clock=lambda: self.case.net.clock)
+
+    def test_old_target_stops_after_third_read_before_any_marker(self):
+        admission = self.admission(self.baseline[builder.PLAN])
+        with self.assertRaisesRegex(ValueError, "network_target_occupied"):
+            admission()
+        self.assertEqual(admission.report["calls"], 3)
+        self.assertEqual(
+            [op for _, op, _ in self.case.calls],
+            ["get-caller-identity", "describe-vpcs", "describe-subnets"],
+        )
+        self.assertFalse((self.case.root / "outer").exists())
+        self.assertFalse(self.case.net.rows)
+
+    def test_new_target_becoming_occupied_stops_before_mutation(self):
+        with patch.object(recovery.outer_fake, "fixture", lambda: retained_fixture(extra=True)):
+            admission = self.admission(self.files[builder.PLAN])
+            with self.assertRaisesRegex(ValueError, "network_target_occupied"):
+                admission()
+        self.assertEqual(admission.report["calls"], 3)
+        self.assertFalse(self.case.net.rows)
+
+    def test_corrected_plan_full_network_admission_passes(self):
+        admission = self.admission(self.files[builder.PLAN])
+        observation = admission()
+        self.assertEqual(admission.report["calls"], 14)
+        self.assertEqual(
+            self.m.network.selection.plan(observation)["targets"],
+            json.loads(self.files[builder.PLAN])["targets"],
+        )
+        self.assertFalse(self.case.net.rows or self.case.host_calls)
+
+    def test_full_synthetic_outer_binds_corrected_subnet_and_cleans(self):
+        result = self.case.run_once()
+        self.assertTrue(result["host_lifecycle_completed"], result)
+        self.assertTrue(result["network_cleanup_verified"], result)
+        created = [fields for _, op, fields in self.case.calls if op == "create-subnet"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]["CidrBlock"], builder.NEW)
+        self.assertEqual(len(self.case.host_calls), 1)
+        self.assertFalse(
+            any(
+                "subnet-09acdd244d70aa502" in json.dumps(fields, default=str)
+                for _, op, fields in self.case.calls
+                if not op.startswith(("get-", "describe-", "list-"))
+            )
+        )
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_ownership_rejects_old_cidr_with_correct_tags(self):
+        transaction = self.m.network.Transaction(
+            self.case.root / "owner-check", self.case.net, clock=lambda: self.case.net.clock
+        )
+        row = dict(
+            SubnetId="subnet-" + "a" * 17,
+            VpcId=self.m.network.selection.VPC,
+            OwnerId=self.m.network.selection.ACCOUNT,
+            CidrBlock=builder.NEW,
+            AvailabilityZone=self.m.network.selection.AZ,
+            MapPublicIpOnLaunch=False,
+            AssignIpv6AddressOnCreation=False,
+            Tags=transaction.tags("subnet")[0]["Tags"],
+        )
+        self.assertEqual(transaction.owned("subnet", row), row["SubnetId"])
+        with self.assertRaises(ValueError):
+            transaction.owned("subnet", dict(row, CidrBlock=builder.OLD))
+
+    def test_payload_archives_checkpoint_and_history_unchanged(self):
+        for name, raw in self.baseline.items():
+            if (
+                name.endswith((".tar", ".gz", ".pem"))
+                or name.startswith("evidence/")
+                or "input-selection" in name
+            ):
+                self.assertEqual(self.files[name], raw, name)
+
+    def test_only_three_logic_changes_others_hash_only(self):
+        for name, raw in self.files.items():
+            if name not in {builder.PLAN, builder.NETWORK, builder.OUTER}:
+                self.assertEqual(
+                    re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw),
+                    re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", self.baseline[name]),
+                    name,
+                )
+            if name.endswith(".py"):
+                ast.parse(raw)
+
+    def test_tampered_input_and_execution_rejected(self):
+        changed = dict(self.baseline)
+        changed[builder.NETWORK] += b"\n"
+        with self.assertRaises(ValueError):
+            builder.build(changed, self.pins)
+        with self.assertRaises(ValueError):
+            builder.run(approved=True)
+
+    def test_deterministic_compilation(self):
+        files, report = builder.build(self.baseline, self.pins)
+        self.assertEqual(files, self.files)
+        self.assertEqual(report, self.report)
+
+
+if __name__ == "__main__":
+    unittest.main()

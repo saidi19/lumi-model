@@ -1,0 +1,191 @@
+"""Exact-key S3 transport connected to the frozen opaque staging primitive.
+
+No ambient credential lookup, SDK import or network occurs on module import.
+The independently admitted acquisition child supplies an authenticated SDK
+session and explicit short-lived credentials. Never run in the import worker.
+SDK/runtime origin, its TLS setup and OS network/time bounds belong to the
+parent. Only aggregate staging receipts escape; no credentials or SDK errors.
+"""
+from __future__ import annotations
+
+import time
+from urllib.parse import quote
+
+from . import posttraining_vm_fullsize_staging_v1 as staging
+
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+ENDPOINT = "https://s3.us-east-1.amazonaws.com"
+OBJECT_ENDPOINT = "https://" + BUCKET + ".s3.us-east-1.amazonaws.com/"
+ERROR_CODES = frozenset({"credentials_rejected", "sdk_rejected", "request_rejected",
+    "response_rejected", "deadline", "transport_failed", "transport_close_failed",
+    "host_guard_not_bound"})
+
+
+class TransportError(ValueError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERROR_CODES else "transport_failed"
+        super().__init__(self.code)
+
+
+def need(condition, code):
+    if not condition:
+        raise TransportError(code) from None
+
+
+def client_options(credentials, config_type):
+    """Explicit credentials, endpoint, TLS and no proxy/profile-selected endpoint.
+
+    The before-send guard below, not SDK retry-count conventions, enforces at
+    most one physical HTTP send per selected object (including S3 redirects).
+    """
+    need(type(credentials) is dict and set(credentials) ==
+         {"access_key", "secret_key", "session_token"}, "credentials_rejected")
+    need(all(type(v) is str and 1 <= len(v) <= 16384
+             and all(32 < ord(c) < 127 for c in v) for v in credentials.values()),
+         "credentials_rejected")
+    return {"region_name": REGION, "endpoint_url": ENDPOINT, "use_ssl": True,
+        "verify": True, "aws_access_key_id": credentials["access_key"],
+        "aws_secret_access_key": credentials["secret_key"],
+        "aws_session_token": credentials["session_token"],
+        "config": config_type(signature_version="s3v4", connect_timeout=10, read_timeout=30,
+            max_pool_connections=1, proxies={}, ignore_configured_endpoint_urls=True,
+            retries={"max_attempts": 1, "mode": "standard"},
+            s3={"addressing_style": "virtual", "use_accelerate_endpoint": False},
+            use_dualstack_endpoint=False, use_fips_endpoint=False)}
+
+
+class _ExactResponses:
+    def __init__(self, client, selected, deadline):
+        need(selected["account"] == ACCOUNT and selected["region"] == REGION
+             and selected["bucket"] == BUCKET, "request_rejected")
+        self.client, self.deadline = client, deadline
+        self.rows = {row["key"]: row for row in selected["objects"]}
+        self.used, self.active, self.sent = set(), None, False
+        self.http_sends = 0
+        # Catch ALL S3 sends, including SDK-generated HeadBucket/redirect paths.
+        client.meta.events.register_first("before-send.s3", self.before_send,
+                                         unique_id="lumi-fullsize-one-send")
+        # SDK error parsing can otherwise eagerly read an unbounded error body
+        # before get_object returns. Validate raw status/headers BEFORE parsing.
+        # This private SDK integration requires its separately pinned runtime.
+        client._endpoint.http_session = _RawResponseGate(client._endpoint.http_session, self)
+
+    def before_send(self, request, **_kwargs):
+        need(time.monotonic() < self.deadline, "deadline")
+        need(self.active is not None and not self.sent
+             and request.method == "GET"
+             and request.url == OBJECT_ENDPOINT + quote(self.active, safe="/"),
+             "request_rejected")
+        # No arbitrary query, range/resume, redirect, alternate host or proxy.
+        self.sent = True
+        self.http_sends += 1
+        need(self.http_sends <= len(self.rows), "request_rejected")
+
+    def open(self, bucket, key):
+        need(time.monotonic() < self.deadline, "deadline")
+        need(bucket == BUCKET and key in self.rows and key not in self.used
+             and self.active is None, "request_rejected")
+        self.used.add(key)  # A started failure consumes this object too.
+        self.active, self.sent = key, False
+        response, handed_off = None, False
+        try:
+            response = self.client.get_object(Bucket=BUCKET, Key=key,
+                                             ExpectedBucketOwner=ACCOUNT)
+            need(self.sent and type(response) is dict, "response_rejected")
+            meta = response.get("ResponseMetadata", {})
+            need(type(meta) is dict and meta.get("HTTPStatusCode") == 200
+                 and type(meta.get("RetryAttempts")) is int and meta["RetryAttempts"] == 0
+                 and type(response.get("ContentLength")) is int
+                 and response["ContentLength"] == self.rows[key]["bytes"]
+                 and "ContentRange" not in response
+                 and response.get("ContentEncoding", "identity") == "identity"
+                 and callable(getattr(response.get("Body"), "read", None))
+                 and callable(getattr(response.get("Body"), "close", None)),
+                 "response_rejected")
+            handed_off = True  # Frozen staging now owns body.close(), even on failure.
+            return response["ContentLength"], response["Body"]
+        except TransportError:
+            raise
+        except BaseException:
+            raise TransportError("transport_failed") from None
+        finally:
+            self.active = None
+            if not handed_off and type(response) is dict and "Body" in response:
+                try:
+                    response["Body"].close()
+                except BaseException:
+                    raise TransportError("transport_close_failed") from None
+
+
+class _RawResponseGate:
+    def __init__(self, underlying, owner):
+        self.underlying, self.owner = underlying, owner
+
+    def send(self, request):
+        owner = self.owner
+        need(owner.active is not None and owner.sent, "request_rejected")
+        response = self.underlying.send(request)
+        accepted = False
+        try:
+            need(time.monotonic() < owner.deadline, "deadline")
+            need(response.status_code == 200, "response_rejected")
+            headers = {str(k).lower(): v for k, v in response.headers.items()}
+            need(headers.get("content-length") == str(owner.rows[owner.active]["bytes"])
+                 and "content-range" not in headers
+                 and "transfer-encoding" not in headers
+                 and headers.get("content-encoding", "identity") == "identity",
+                 "response_rejected")
+            accepted = True
+            return response
+        finally:
+            if not accepted:
+                try:
+                    response.raw.close()
+                except BaseException:
+                    raise TransportError("transport_close_failed") from None
+
+    def close(self):
+        self.underlying.close()
+
+
+def acquire_inputs(**_arguments):
+    raise TransportError("host_guard_not_bound") from None
+
+
+def _acquire_admitted_once(parent_fd, selection_raw, *, session, config_type,
+                           credentials, deadline):
+    """Connect exact transport to actual staging; does not create a client on Mac.
+
+    A future admitted child must disable SDK debug logging and isolate the
+    credential-bearing process; closing the client does NOT erase credentials
+    from memory. Reaping the unit is mandatory before launching cold import.
+    """
+    staging._runtime()
+    selected = staging.selection(selection_raw)
+    need(selected["account"] == ACCOUNT and selected["region"] == REGION
+         and selected["bucket"] == BUCKET, "request_rejected")
+    need(type(deadline) in {int, float} and 0 < deadline-time.monotonic() <= 3600, "deadline")
+    options = client_options(credentials, config_type)
+    client = None
+    try:
+        client = session.create_client("s3", **options)
+        transport = _ExactResponses(client, selected, deadline)
+        result = staging._stage_admitted_once(parent_fd, selection_raw,
+                                              transport.open, deadline=deadline)
+        need(transport.http_sends == len(selected["objects"]), "request_rejected")
+        return {"schema": "lumi.vm-fullsize-acquisition.v0.1", "staging": result,
+                "http_sends": transport.http_sends, "sdk_http_session_closed_on_return": True,
+                "credentials_erased": False, "acquisition_cgroup_reaped": False,
+                "real_4b_import": False, "gate_5_complete": False}
+    except (TransportError, staging.StagingError):
+        raise
+    except BaseException:
+        raise TransportError("transport_failed") from None
+    finally:
+        if client is not None:
+            try:
+                client._endpoint.http_session.close()
+            except BaseException:
+                raise TransportError("transport_close_failed") from None

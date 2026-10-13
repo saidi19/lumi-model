@@ -1,0 +1,25 @@
+"""Offline tests for attempt-020 pre-control bindings."""
+
+import unittest
+
+from scripts import prepare_sft_vm_deployment_bindings_v21 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_repaired_source_and_live_absence(self):
+        manifest = m.verify()
+        plan = m.build()
+        self.assertEqual(manifest["attempt"], m.ATTEMPT)
+        self.assertEqual(manifest["nested_setup_members_verified"], 19)
+        self.assertTrue(plan["network_candidate_live_availability_verified"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_controls_and_execution_are_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_created"):
+            m.controls()
+        with self.assertRaisesRegex(ValueError, "not_execution_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

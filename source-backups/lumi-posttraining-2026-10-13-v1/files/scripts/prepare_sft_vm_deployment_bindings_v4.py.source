@@ -1,0 +1,148 @@
+"""Bind verified dedicated cleanup storage; no cloud or CPU authority."""
+
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = "artifacts/lumi-vm-dedicated-cleanup-source-v0.1"
+RELEASE_SHA = "f80873927a33724d37932560238352d524e744744ab4c98a9a5bd8cec65768d1"
+BASE = "artifacts/lumi-vm-attempt-011-source-v0.1"
+BASE_SHA = "044fcf953518a1d85a72f067d7cae8be8d3357b6fde4c6e9011b968cf3bc92dc"
+OLD_PLAN = "configs/lumi-vm-attempt-011-deployment-plan-v0.1.json"
+OLD_PLAN_SHA = "9f60b8588d9e6bb5561e52f8693b82c8763e250fc477f1b0f707979bd4a72f83"
+STORE_PROOF = "evidence/lumi-vm-dedicated-cleanup-bucket-verification-v0.2.json"
+STORE_SHA = "bece4dab90ba9cbfee46788d2661798db5d342e0b68be4b5ef19ae6d1cebc1a9"
+WATCH_PROOF = "evidence/lumi-vm-attempt-011-inert-watchdog-deployment-verification-v0.2.json"
+WATCH_SHA = "22a5151766d61ae142fa8e0ca645cf64b3442a9c7de1f9bda067091a1a64e5d8"
+ATTEMPT = "ad7b734ba7894916b25d795ac3dab31c"
+BUCKET = "lumi-cleanup-" + ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("dedicated_control_binding_rejected") from None
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, expected, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 20 * 1024**2)
+    raw = path.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == expected)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verify():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    baseline = json.loads(read(BASE + "/release.json", BASE_SHA))
+    need(manifest["attempt"] == baseline["attempt"] == ATTEMPT)
+    need(manifest["base_release_sha256"] == BASE_SHA)
+    need(baseline["source_identity_bound"] is True)
+    need(baseline["operational_predecessor"] != ATTEMPT)
+    need(baseline["fresh_watchdog_deployment_required"] is True)
+    need(manifest["execution_permitted"] is False and manifest["cpu_entry_bound"] is False)
+    need(manifest["cleanup_bucket"] == BUCKET)
+    need(manifest["checkpoint_and_retention_bucket"] == "lumi-corpus-prod-27777c02b29b76efcac3")
+    need(len(manifest["outputs"]) == 156)
+    expected_names = (
+        set(baseline["outputs"])
+        | set(baseline["ancillary"])
+        | {"scripts/check_sft_vm_cleanup_bucket_v1.py"}
+    )
+    need(set(manifest["outputs"]) == expected_names)
+    total = 0
+    for name, pin in manifest["outputs"].items():
+        total += len(read(RELEASE + "/" + name, pin["sha256"], pin["bytes"]))
+    need(total < 32 * 1024**2)
+    # Original host/config inputs, retention code and watchdog deployment remain byte-identical.
+    for name, pin in (baseline["outputs"] | baseline["ancillary"]).items():
+        if (
+            name.startswith("configs/")
+            or name in baseline["ancillary"]
+            or name.endswith((".tar", ".gz", ".pem"))
+            or name
+            in {
+                "scripts/check_sft_vm_retention_bucket_v1.py",
+                "scripts/issue_sft_vm_retention_credentials_v1.py",
+                "scripts/prepare_sft_vm_external_watchdog_v1.py",
+                "scripts/sft_vm_external_watchdog_v1.py",
+            }
+        ):
+            need(manifest["outputs"][name] == pin)
+    proofs = []
+    for name, digest in ((STORE_PROOF, STORE_SHA), (WATCH_PROOF, WATCH_SHA)):
+        proof = json.loads(read(name, digest))
+        for path, pin in proof["source_bindings"].items():
+            read(path, pin["sha256"], pin["bytes"])
+        proofs.append(proof)
+    store, watch = proofs
+    need(store["status"] == "verified_private_cleanup_bucket_created")
+    need(store["storage"]["bucket"] == BUCKET and store["result"]["privacy_readback_verified"])
+    need(store["source_bindings"][RELEASE + "/release.json"]["sha256"] == RELEASE_SHA)
+    need(watch["attempt"] == ATTEMPT)
+    need(watch["status"] == "verified_deployed_unarmed_invocation_disabled")
+    need(watch["result"]["deployment"]["unarmed_verified"] is True)
+    need(watch["result"]["deployment"]["invocation_disabled_verified"] is True)
+    return manifest, store, watch
+
+
+def build():
+    manifest, store, watch = verify()
+    plan = json.loads(read(OLD_PLAN, OLD_PLAN_SHA))
+    plan.update(
+        schema="lumi.vm-attempt-011-deployment-plan.v0.2",
+        release_manifest_sha256=RELEASE_SHA,
+        integration_report_sha256=STORE_SHA,
+        verified_control_evidence={STORE_PROOF: STORE_SHA, WATCH_PROOF: WATCH_SHA},
+    )
+    plan["source_bindings"] = {
+        RELEASE + "/" + name.removeprefix(BASE + "/"): manifest["outputs"][
+            name.removeprefix(BASE + "/")
+        ]
+        for name in plan["source_bindings"]
+    }
+    plan["cpu_scope_reference"]["output"] = (
+        "artifacts/lumi-vm-private-outer-execution-v0.12/attempt-011"
+    )
+    plan["watchdog"].update(
+        deployment_output="artifacts/lumi-vm-attempt-011-watchdog-deployment-v0.2",
+        existing_deployment_evidence_sha256=WATCH_SHA,
+        redeployment_authorized=False,
+        status="saved_unarmed_deployment_verified_fresh_live_admission_required",
+    )
+    oldbucket = plan["cleanup_store"]["bucket"]
+    cleanup = plan["cleanup_store"]
+    for row in cleanup["deny_statements"]:
+        row["Resource"] = row["Resource"].replace(oldbucket, BUCKET)
+    cleanup.update(
+        bucket=BUCKET,
+        evidence_sha256=STORE_SHA,
+        status="saved_dedicated_store_verified_fresh_live_admission_required",
+        shared_bucket_policy_update_required=False,
+        policy_application_authorized=False,
+        application_rule="Do not apply policy fragments. Dedicated bucket already created; "
+        "fresh read-only owner/privacy/claim/lifecycle admission remains mandatory.",
+    )
+    need(cleanup["prefix"] == store["storage"]["prefix"])
+    need(
+        plan["watchdog"]["expected_code_sha256_base64"]
+        == watch["result"]["deployment"]["code_sha256"]
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Bind CPU entry and obtain separate one-shot CPU/import/private-retention approval.",
+        "Fresh account, host/quota/price, unarmed watchdog, network and dedicated store admission.",
+        "Saved controls do not prove current availability or reserve resources.",
+    ]
+    return plan
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority")

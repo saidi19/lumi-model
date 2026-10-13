@@ -1,0 +1,175 @@
+"""Private fixed full-size bootstrap plumbing; public execution stays closed.
+
+The independently admitted parent must authenticate the runtime, source closure,
+entry, controls and attempt, own the cgroup and exclude external input writers.
+No such premise is established by this component or its supplied hash strings.
+The fixed fullsize_entry.py must belong to a future authenticated staged closure;
+this module neither installs that entry nor acquires any software or input.
+
+The frozen recursive input/rootfs readback, authority descriptor closure,
+network/IPC/filesystem isolation and privilege-drop helpers are reused without
+modifying their globals. RAM and hard deadlines remain independent guardian
+responsibilities. Writable paths and capacity do not enforce cumulative native
+writes. Native qualification, host admission and real execution remain pending.
+Never invoke the private native path on a Mac. Tests double every native call.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import resource
+import stat
+
+from . import posttraining_checkpoint_guard_bootstrap_v3 as frozen
+
+RUNTIME = frozen.RUNTIME
+ENTRY = "/opt/lumi-release/guardian/fullsize_entry.py"
+ARGV = (RUNTIME, "-I", "-B", ENTRY, "--bound-checkpoint-import")
+FIXED_ENV = dict(frozen.FIXED_ENV)
+HASH_ENV = frozenset({
+    "LUMI_IMPORT_SOURCE_MANIFEST_SHA256", "LUMI_FULLSIZE_ENTRY_SHA256",
+    "LUMI_FULLSIZE_CONTROL_SHA256", "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256",
+})
+READ_ONLY_PATHS = frozen.READ_ONLY_PATHS
+WRITABLE_PATHS = frozen.WRITABLE_PATHS
+DEVICE_PATHS = frozen.DEVICE_PATHS
+READY = dict(frozen.READY)
+STAGES = frozen.STAGES
+ERROR_CODES = frozen.ERROR_CODES | {"host_guard_not_bound"}
+_ATTEMPTED = False
+
+# Only fixed frozen operations; no caller-provided callbacks or module objects.
+cgroup = frozen.cgroup
+netns = frozen.netns
+mount = frozen.mount
+landlock = frozen.landlock
+ipc = frozen.ipc
+guardian = frozen.guardian
+_sanitize = frozen._sanitize
+_close_except = frozen._close_except
+_descriptors = frozen._descriptors
+_send = frozen._send
+_release = frozen._release
+
+
+class FullsizeBootstrapError(ValueError):
+    def __init__(self, code="bootstrap_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "bootstrap_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code="bootstrap_failed"):
+    if not value:
+        raise FullsizeBootstrapError(code) from None
+
+
+def _runtime():
+    """Require the unchanged Linux x86_64 root CPython 3.12 -S -B runtime."""
+    try:
+        frozen._runtime()
+    except BaseException:
+        raise FullsizeBootstrapError("runtime_rejected") from None
+
+
+def validate_environment(environment):
+    """Return detached closed strings; pins are content bindings, not approval."""
+    _need(type(environment) is dict and set(environment) == set(FIXED_ENV) | HASH_ENV
+          and all(type(key) is str and type(value) is str
+                  for key, value in environment.items()), "environment_rejected")
+    _need(all(environment[key] == value for key, value in FIXED_ENV.items())
+          and all(re.fullmatch(r"[0-9a-f]{64}", environment[key]) is not None
+                  and environment[key] != "0" * 64 for key in HASH_ENV),
+          "environment_rejected")
+    return dict(environment)
+
+
+def validate_mount_arguments(value):
+    """Reuse exact frozen pure validation and detached mount metadata copies."""
+    try:
+        return frozen.validate_mount_arguments(value)
+    except Exception:
+        raise FullsizeBootstrapError("arguments_rejected") from None
+
+
+def _arguments(group_fd, channel):
+    try:
+        frozen._arguments(group_fd, channel)
+    except Exception:
+        raise FullsizeBootstrapError("arguments_rejected") from None
+
+
+def bootstrap(**_arguments):
+    """Never launch from a public call, irrespective of pins or approval flags."""
+    raise FullsizeBootstrapError("host_guard_not_bound") from None
+
+
+def _bootstrap_admitted(group_fd, channel, *, mount_arguments, environment):
+    """One future independently admitted child; successful native exec never returns.
+
+    Pure/runtime rejection precedes mutation and does not consume an attempt.
+    Every started failure consumes it, attempts at most one fixed failure frame
+    when the authority channel remains available, and exits 2. There is no retry,
+    cleanup, host provisioning, arbitrary argv or callback entry in this API.
+    """
+    global _ATTEMPTED
+    _runtime()
+    copied_environment = validate_environment(environment)
+    _arguments(group_fd, channel)
+    copied_mount = validate_mount_arguments(mount_arguments)
+    identity = copied_mount["expected_identities"]["root"]
+    root_identity = (identity[0], identity[1], stat.S_IFMT(identity[2]), identity[3], identity[4])
+    _need(not _ATTEMPTED, "already_attempted")
+    _ATTEMPTED = True
+    stage = "sanitize"
+    report_channel = channel
+    try:
+        _sanitize(group_fd, channel.fileno())
+        stage = "attach"
+        cgroup.enter_current_process(group_fd)
+        stage = "network"
+        network = netns.create_loopback_namespace()
+        _need(network["namespace_changed"] is True and network["only_loopback_interface"] is True)
+        stage = "mount"
+        mounted = mount.enter_import_rootfs(**copied_mount)
+        _need(mounted["old_root_detached"] is True
+              and mounted["readonly_software_root"] is True
+              and mounted["input_output_mounts_survive_pivot"] is True)
+        stage = "landlock"
+        policy = landlock.restrict_filesystem(
+            read_only_paths=READ_ONLY_PATHS, writable_paths=WRITABLE_PATHS,
+            device_paths=DEVICE_PATHS, expected_root_identity=root_identity,
+        )
+        _need(policy["filesystem_content_policy_enforced"] is True
+              and type(policy["abi_version"]) is int and policy["abi_version"] >= 5)
+        stage = "ipc"
+        _need(ipc.install_ipc_filter() == dict(ipc.RECEIPT))
+        stage = "limits"
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (1024, 1024))
+        stage = "drop"
+        guardian.drop_worker_privileges(10001, 10001)
+        os.close(group_fd)
+        _close_except({channel.fileno()})
+        _need(os.getresuid() == os.getresgid() == (10001, 10001, 10001)
+              and os.getgroups() == []
+              and _descriptors() == {0, 1, 2, channel.fileno()})
+        stage = "ready"
+        _send(channel, READY)
+        stage = "release"
+        _release(channel)
+        stage = "exec"
+        os.chdir("/opt/lumi-release/source")
+        os.dup2(channel.fileno(), 1)
+        report_channel = None
+        _close_except(set())
+        _need(_descriptors() == {0, 1, 2})
+        os.execve(RUNTIME, list(ARGV), copied_environment)
+        raise FullsizeBootstrapError("bootstrap_failed")
+    except BaseException:
+        try:
+            if report_channel is not None:
+                _send(report_channel, {"phase": "bootstrap_failed", "stage": stage})
+        except BaseException:
+            pass
+        os._exit(2)

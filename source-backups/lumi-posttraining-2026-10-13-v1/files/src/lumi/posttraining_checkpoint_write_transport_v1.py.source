@@ -1,0 +1,383 @@
+"""Private Linux x86-64 listener handoff; no public or native qualification.
+
+Import is inert. The caller must first bind a dedicated, parent-protected broker
+and independent absolute-deadline guardian. Supplied descriptors, SO_PEERCRED and
+successful framing do not prove process origin or channel exclusivity. The
+connected AF_UNIX/SEQPACKET channel is borrowed and never closed here. Its owner
+must exclude concurrent use/replacement and close it before the worker seal.
+
+All native operations are single libc calls: no EINTR, EAGAIN, partial-send or
+handshake retry. The same absolute deadline is checked around every operation.
+Receive uses the fixed Linux MSG_CMSG_CLOEXEC flag. An offer owns its received
+descriptor until take_admitted_once explicitly transfers ownership to the
+caller, or close_admitted_once relinquishes it. The caller must resolve adoption
+preflight ownership BEFORE taking it; frozen listener adoption does not consume
+the descriptor on every preflight failure. ACK requires the exact adopted v1
+listener object after that transfer. It never establishes its kernel origin.
+
+Only fixed codes and aggregate reports may be retained, never packets, file
+descriptors, identities, exceptions or tracebacks. All tests replace native
+boundaries; the public entry remains closed.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import os
+import stat
+import struct
+import threading
+import time
+
+from . import posttraining_checkpoint_write_listener_v1 as listener
+
+SCHEMA = "lumi.checkpoint-write-transport.v0.1"
+SOL_SOCKET, SCM_RIGHTS, SCM_PIDFD, SO_TYPE, SO_DOMAIN = 1, 1, 4, 3, 39
+AF_UNIX, SOCK_SEQPACKET = 1, 5
+MSG_DONTWAIT, MSG_NOSIGNAL, MSG_CMSG_CLOEXEC = 0x40, 0x4000, 0x40000000
+POLLIN, POLLOUT = 1, 4
+F_GETFD, F_GETFL, FD_CLOEXEC, O_ACCMODE, O_RDWR = 1, 3, 1, 3, 2
+MAX_RIGHTS = 253
+CMSG_HEADER = struct.Struct("<Qii")
+FD = struct.Struct("<i")
+CONTROL_BYTES = 16 + ((MAX_RIGHTS * 4 + 7) & ~7)
+OFFER = b"LUMI-WRITE-LISTENER-OFFER-v1\0" + bytes.fromhex(
+    listener.policy.LISTENER_FILTER_SHA256)
+ACK = listener.ADOPTED + b"\0" + bytes.fromhex(listener.policy.LISTENER_FILTER_SHA256)
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "channel_rejected", "deadline_exhausted",
+    "already_attempted", "owner_mismatch", "transport_failed", "packet_rejected",
+    "listener_rejected", "adoption_rejected", "close_failed", "already_failed", "reentry",
+})
+FALSE_FLAGS = (
+    "target_kernel_qualified", "channel_origin_verified", "channel_exclusivity_verified",
+    "listener_origin_verified", "broker_origin_verified", "parent_protection_verified",
+    "independent_deadline_enforced", "native_enforcement_verified", "execution_permitted",
+    "real_import_permitted", "gate_5_complete", "training_authorized", "production_eligible",
+    "retry_allowed",
+)
+
+
+class TransportError(ValueError):
+    def __init__(self, code="transport_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "transport_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code="transport_failed"):
+    if not condition:
+        raise TransportError(code) from None
+
+
+class _IOVec(ctypes.Structure):
+    _fields_ = [("base", ctypes.c_void_p), ("length", ctypes.c_size_t)]
+
+
+class _MsgHdr(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_void_p), ("namelen", ctypes.c_uint32),
+                ("iov", ctypes.POINTER(_IOVec)), ("iovlen", ctypes.c_size_t),
+                ("control", ctypes.c_void_p), ("controllen", ctypes.c_size_t),
+                ("flags", ctypes.c_int)]
+
+
+class _PollFD(ctypes.Structure):
+    _fields_ = [("fd", ctypes.c_int), ("events", ctypes.c_short), ("revents", ctypes.c_short)]
+
+
+def _function(name, arguments, result):
+    function = getattr(ctypes.CDLL(None, use_errno=True), name)
+    function.argtypes, function.restype = arguments, result
+    return function
+
+
+def _socket_option(fd, option):
+    value, size = ctypes.c_int(), ctypes.c_uint32(4)
+    function = _function("getsockopt", [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_void_p, ctypes.c_void_p], ctypes.c_int)
+    _need(function(fd, SOL_SOCKET, option, ctypes.byref(value), ctypes.byref(size)) == 0
+          and size.value == 4, "channel_rejected")
+    return value.value
+
+
+def _connected(fd):
+    address, size = ctypes.create_string_buffer(128), ctypes.c_uint32(128)
+    function = _function("getpeername", [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p],
+                         ctypes.c_int)
+    _need(function(fd, address, ctypes.byref(size)) == 0 and 2 <= size.value <= 128
+          and bytes(address)[:2] == b"\x01\0", "channel_rejected")
+
+
+def _channel(fd):
+    try:
+        _need(type(fd) is int and 3 <= fd < 2**31, "channel_rejected")
+        info = os.fstat(fd)
+        _need(stat.S_ISSOCK(info.st_mode) and info.st_uid == info.st_gid == 0
+              and fcntl.fcntl(fd, F_GETFD) == FD_CLOEXEC
+              and fcntl.fcntl(fd, F_GETFL) & O_ACCMODE == O_RDWR
+              and _socket_option(fd, SO_DOMAIN) == AF_UNIX
+              and _socket_option(fd, SO_TYPE) == SOCK_SEQPACKET, "channel_rejected")
+        _connected(fd)
+        return info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid
+    except TransportError:
+        raise
+    except BaseException:
+        raise TransportError("channel_rejected") from None
+
+
+def _runtime():
+    listener._runtime()
+    listener._abi()
+    _need(ctypes.sizeof(_IOVec) == 16 and ctypes.sizeof(_MsgHdr) == 56
+          and _MsgHdr.iov.offset == 16 and _MsgHdr.control.offset == 32
+          and _MsgHdr.flags.offset == 48 and ctypes.sizeof(_PollFD) == 8,
+          "runtime_rejected")
+
+
+def _poll(fd, event, timeout_ms):
+    value = _PollFD(fd, event, 0)
+    function = _function("poll", [ctypes.POINTER(_PollFD), ctypes.c_ulong, ctypes.c_int],
+                         ctypes.c_int)
+    _need(function(ctypes.byref(value), 1, timeout_ms) == 1 and value.revents == event)
+
+
+def _sendmsg(fd, packet, rights):
+    payload = ctypes.create_string_buffer(packet)
+    vector = _IOVec(ctypes.cast(payload, ctypes.c_void_p), len(packet))
+    control = b"" if rights is None else CMSG_HEADER.pack(20, SOL_SOCKET, SCM_RIGHTS) + FD.pack(
+        rights) + b"\0" * 4
+    ancillary = ctypes.create_string_buffer(control) if control else None
+    message = _MsgHdr(None, 0, ctypes.pointer(vector), 1,
+                      ctypes.cast(ancillary, ctypes.c_void_p) if ancillary else None,
+                      len(control), 0)
+    function = _function("sendmsg", [ctypes.c_int, ctypes.POINTER(_MsgHdr), ctypes.c_int],
+                         ctypes.c_ssize_t)
+    return function(fd, ctypes.byref(message), MSG_DONTWAIT | MSG_NOSIGNAL)
+
+
+def _recvmsg(fd, maximum):
+    payload, control = ctypes.create_string_buffer(maximum), ctypes.create_string_buffer(
+        CONTROL_BYTES)
+    vector = _IOVec(ctypes.cast(payload, ctypes.c_void_p), maximum)
+    message = _MsgHdr(None, 0, ctypes.pointer(vector), 1,
+                      ctypes.cast(control, ctypes.c_void_p), CONTROL_BYTES, 0)
+    function = _function("recvmsg", [ctypes.c_int, ctypes.POINTER(_MsgHdr), ctypes.c_int],
+                         ctypes.c_ssize_t)
+    count = function(fd, ctypes.byref(message), MSG_DONTWAIT | MSG_CMSG_CLOEXEC)
+    _need(type(count) is int and count >= 0)
+    # Keep the available ancillary bytes even on bad size/flags so they can be retired.
+    return (bytes(payload)[:min(count, maximum)], bytes(control)[:message.controllen],
+            message.flags, count <= maximum and message.controllen <= CONTROL_BYTES)
+
+
+def _rights(control):
+    """Collect every representable delivered right before rejecting packet shape."""
+    rights, offset, records, valid = [], 0, 0, True
+    if type(control) is not bytes or len(control) > CONTROL_BYTES:
+        return [], False
+    while offset < len(control):
+        if len(control) - offset < 16:
+            valid = False
+            break
+        size, level, kind = CMSG_HEADER.unpack_from(control, offset)
+        if size < 16:
+            valid = False
+            break
+        end = min(offset + size, len(control))
+        body = control[offset + 16:end]
+        if level == SOL_SOCKET and kind in (SCM_RIGHTS, SCM_PIDFD):
+            rights.extend(FD.unpack_from(body, i)[0] for i in range(0, len(body) - 3, 4))
+            if kind == SCM_RIGHTS:
+                records += 1
+                valid &= size == 20 and len(body) == 4
+            else:
+                # Linux SCM_PIDFD also installs an FD. It is never accepted,
+                # but every complete delivered integer must still be retired.
+                valid = False
+        else:
+            valid = False
+        if offset + size > len(control):
+            valid = False
+            break
+        aligned = (size + 7) & ~7
+        offset += aligned
+        if offset > len(control) and end != len(control):
+            valid = False
+    return rights, bool(valid and records == 1 and len(rights) == 1
+                        and 3 <= rights[0] < 2**31)
+
+
+def _close_rights(rights):
+    failed = False
+    for fd in dict.fromkeys(rights):
+        if type(fd) is int and 0 <= fd < 2**31:
+            try:
+                os.close(fd)
+            except BaseException:
+                failed = True
+    _need(not failed, "close_failed")
+
+
+def transfer_write_listener(**_arguments):
+    raise TransportError("host_guard_not_bound") from None
+
+
+class _OwnedOffer:
+    """Own one received right until a deliberate caller ownership transition."""
+
+    def __init__(self, fd, identity, owner):
+        self._fd, self._identity, self._owner = fd, identity, owner
+        self._taken = False
+
+    def take_admitted_once(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        _need(self._fd is not None, "already_attempted")
+        fd, self._fd = self._fd, None
+        try:
+            _need(listener._descriptor(fd) == self._identity, "listener_rejected")
+        except TransportError:
+            raise
+        except BaseException:
+            raise TransportError("listener_rejected") from None
+        self._taken = True
+        return fd
+
+    def close_admitted_once(self):
+        fd = self.take_admitted_once()
+        self._taken = False
+        _close_rights([fd])
+
+
+class _Transport:
+    """One offer/ACK transaction over an already-owned borrowed channel."""
+
+    def __init__(self, channel_fd, *, deadline_ns):
+        try:
+            _runtime()
+        except BaseException as error:
+            code = error.code if type(error) is TransportError else "runtime_rejected"
+            raise TransportError(code) from None
+        try:
+            now = time.monotonic_ns()
+            _need(type(now) is int and type(deadline_ns) is int
+                  and 0 <= now < deadline_ns < 2**63
+                  and deadline_ns - now <= 3600 * 1_000_000_000, "deadline_exhausted")
+            identity = _channel(channel_fd)
+        except BaseException as error:
+            code = error.code if type(error) is TransportError else "channel_rejected"
+            raise TransportError(code) from None
+        self._channel_fd, self._identity = channel_fd, identity
+        self._deadline_ns, self._owner = deadline_ns, (os.getpid(), threading.get_ident())
+        self._lock = threading.Lock()
+        self._attempted = self._failed = self._acked = False
+        self._offer = None
+        self._received_fd = None
+        self._received_identity = None
+
+    def _live(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        _need(not self._failed, "already_failed")
+        now = time.monotonic_ns()
+        _need(type(now) is int and 0 <= now < self._deadline_ns, "deadline_exhausted")
+        _need(_channel(self._channel_fd) == self._identity, "channel_rejected")
+        return now
+
+    def _ready(self, event):
+        now = self._live()
+        milliseconds = (self._deadline_ns - now + 999999) // 1000000
+        _poll(self._channel_fd, event, milliseconds)
+        self._live()
+
+    def _enter(self):
+        try:
+            self._live()
+            _need(self._lock.acquire(blocking=False), "reentry")
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TransportError else "transport_failed"
+            raise TransportError(code) from None
+
+    def _packet(self, expected, *, offer):
+        rights = []
+        try:
+            self._ready(POLLIN)
+            packet, control, flags, bounded = _recvmsg(self._channel_fd, len(expected) + 1)
+            rights, valid = _rights(control)
+            _need(type(packet) is bytes and packet == expected and bounded is True
+                  and type(flags) is int and flags == 0
+                  and (valid if offer else control == b""), "packet_rejected")
+            self._live()
+            if offer:
+                identity = listener._descriptor(rights[0])
+                return rights.pop(), identity
+            return None
+        except BaseException:
+            _close_rights(rights)
+            raise
+
+    def transfer(self, fd, identity, digest):
+        """Exact worker callback for frozen listener root preparation."""
+        self._enter()
+        try:
+            _need(not self._attempted, "already_attempted")
+            self._attempted = True
+            _need(type(digest) is str and digest == listener.policy.LISTENER_FILTER_SHA256
+                  and type(fd) is int and fd >= 3 and listener._descriptor(fd) == identity,
+                  "listener_rejected")
+            self._ready(POLLOUT)
+            _need(_sendmsg(self._channel_fd, OFFER, fd) == len(OFFER))
+            self._packet(ACK, offer=False)
+            _need(listener._descriptor(fd) == identity, "listener_rejected")
+            self._live()
+            self._acked = True
+            return listener.ADOPTED
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TransportError else "transport_failed"
+            raise TransportError(code) from None
+        finally:
+            self._lock.release()
+
+    def receive_admitted_once(self):
+        self._enter()
+        try:
+            _need(not self._attempted, "already_attempted")
+            self._attempted = True
+            fd, identity = self._packet(OFFER, offer=True)
+            self._offer = _OwnedOffer(fd, identity, self._owner)
+            self._received_fd, self._received_identity = fd, identity
+            return self._offer
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TransportError else "transport_failed"
+            raise TransportError(code) from None
+        finally:
+            self._lock.release()
+
+    def acknowledge_admitted_once(self, adopted):
+        """ACK only an exact live listener that owns this received, taken right."""
+        self._enter()
+        try:
+            _need(not self._acked and type(self._offer) is _OwnedOffer
+                  and self._offer._fd is None and self._offer._taken is True
+                  and type(adopted) is listener._Listener
+                  and adopted._owner == self._owner and adopted._fd == self._received_fd
+                  and adopted._identity == self._received_identity
+                  and not adopted._closed and not adopted._failed
+                  and listener._descriptor(adopted._fd) == adopted._identity,
+                  "adoption_rejected")
+            self._ready(POLLOUT)
+            _need(_sendmsg(self._channel_fd, ACK, None) == len(ACK))
+            self._live()
+            self._acked = True
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TransportError else "transport_failed"
+            raise TransportError(code) from None
+        finally:
+            self._lock.release()
+
+    def snapshot(self):
+        return {"schema": SCHEMA, "offer_attempted": self._attempted,
+                "acknowledged": self._acked, "terminal_failed": self._failed,
+                **dict.fromkeys(FALSE_FLAGS, False)}

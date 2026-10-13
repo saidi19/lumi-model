@@ -1,0 +1,35 @@
+"""Fixed full-size import unit properties; construction only, never dispatch.
+
+The separate root parent must admit the host, verify the source/runtime pins,
+reap acquisition, exclude writable aliases and check disk backing and capacity.
+These settings do not prove any of those premises and do not meter cumulative
+native writes. Tiny tmpfs is scratch only; 48.8 GB inputs and outputs use disk.
+"""
+from __future__ import annotations
+
+import importlib.util
+import re
+from pathlib import Path
+
+
+def _base():
+    spec = importlib.util.spec_from_file_location("_fullsize_fixed_vm_helpers",
+        Path(__file__).with_name("posttraining_import_vm_rehearsal_v3.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.properties("chain")
+
+
+def import_properties(attempt):
+    if type(attempt) is not str or not re.fullmatch(r"[0-9a-f]{32}", attempt):
+        raise ValueError("attempt_rejected") from None
+    stage = f"/var/lib/lumi-vm-fullsize/{attempt}/stage"
+    result = _base()
+    result.update({
+        "MemoryMax": str(64 * 1024**3),
+        "RuntimeMaxSec": "3600",
+        "InaccessiblePaths": "/tmp /var/tmp -/dev/shm",
+        "BindReadOnlyPaths": f"{stage}/release:/work/release {stage}/inputs:/inputs",
+        "BindPaths": f"{stage}/outputs:/outputs",
+    })
+    return result

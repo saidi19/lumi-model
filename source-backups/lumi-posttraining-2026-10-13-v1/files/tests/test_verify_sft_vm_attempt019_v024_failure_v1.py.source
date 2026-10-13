@@ -1,0 +1,145 @@
+"""Synthetic and local checks for v0.24 failure verification."""
+import copy
+import unittest
+
+from scripts import verify_sft_vm_attempt019_v024_failure_v1 as m
+
+
+def tags(network=False):
+    rows = [{"Key": "LumiAttempt", "Value": m.ATTEMPT}]
+    if network:
+        rows.append({"Key": "LumiNetworkNonce", "Value": m.NONCE})
+    return rows
+
+
+class Fake:
+    def __init__(self):
+        self.calls = self.bytes = 0
+        disks = [
+            {
+                "Ebs": {
+                    "VolumeId": volume,
+                    "DeleteOnTermination": False,
+                }
+            }
+            for volume in sorted(m.VOLUMES)
+        ]
+        self.values = {
+            "identity": {"Account": m.ACCOUNT},
+            "instance": {
+                "Reservations": [
+                    {
+                        "OwnerId": m.ACCOUNT,
+                        "Instances": [
+                            {
+                                "InstanceId": m.INSTANCE,
+                                "State": {"Name": "stopped"},
+                                "InstanceType": "r6i.4xlarge",
+                                "SubnetId": m.SUBNET,
+                                "ClientToken": m.ATTEMPT,
+                                "Tags": tags(),
+                                "BlockDeviceMappings": disks,
+                            }
+                        ],
+                    }
+                ]
+            },
+            "volumes": {
+                "Volumes": [
+                    {
+                        "VolumeId": volume,
+                        "Encrypted": True,
+                        "State": "in-use",
+                        "Tags": tags(),
+                        "Attachments": [
+                            {
+                                "InstanceId": m.INSTANCE,
+                                "DeleteOnTermination": False,
+                            }
+                        ],
+                    }
+                    for volume in sorted(m.VOLUMES)
+                ]
+            },
+            "subnet": {
+                "Subnets": [
+                    {
+                        "SubnetId": m.SUBNET,
+                        "OwnerId": m.ACCOUNT,
+                        "CidrBlock": "172.31.97.0/27",
+                        "Tags": tags(True),
+                    }
+                ]
+            },
+            "table": {
+                "RouteTables": [
+                    {
+                        "RouteTableId": m.TABLE,
+                        "OwnerId": m.ACCOUNT,
+                        "Tags": tags(True),
+                        "Associations": [{"SubnetId": m.SUBNET}],
+                        "Routes": [{"DestinationCidrBlock": "172.31.0.0/16"}],
+                    }
+                ]
+            },
+            "nat": {"NatGateways": [{"NatGatewayId": m.NAT, "State": "deleted"}]},
+            "eip": {"Addresses": []},
+            "endpoint": {
+                "InstanceConnectEndpoints": [
+                    {
+                        "InstanceConnectEndpointId": m.ENDPOINT,
+                        "State": "create-complete",
+                        "SubnetId": m.SUBNET,
+                        "SecurityGroupIds": [m.ENDPOINT_GROUP],
+                        "Tags": tags(),
+                    }
+                ]
+            },
+            "groups": {
+                "SecurityGroups": [
+                    {"GroupId": m.VM_GROUP, "Tags": tags()},
+                    {"GroupId": m.ENDPOINT_GROUP, "Tags": tags()},
+                ]
+            },
+            "key": {"KeyPairs": [{"KeyName": m.KEY, "Tags": tags()}]},
+        }
+
+    def call(self, name):
+        self.calls += 1
+        return copy.deepcopy(self.values[name])
+
+
+class Tests(unittest.TestCase):
+    def test_local_failure_and_archive_mismatch_are_bound(self):
+        result = m.local_verify()
+        self.assertEqual(result["member_count"], 19)
+        self.assertEqual(result["mismatch_count"], 12)
+        self.assertTrue(result["failure_before_remote_seed_dispatch"])
+
+    def test_synthetic_live_state_passes(self):
+        result = m.live_verify(Fake())
+        self.assertTrue(result["one_instance_verified"])
+        self.assertEqual(result["instance_state"], "stopped")
+        self.assertTrue(result["eip_absent"])
+        self.assertEqual(result["mutations"], 0)
+
+    def test_running_instance_or_existing_eip_rejected(self):
+        for name in ("running", "eip"):
+            fake = Fake()
+            if name == "running":
+                fake.values["instance"]["Reservations"][0]["Instances"][0]["State"] = {
+                    "Name": "running"
+                }
+            else:
+                fake.values["eip"]["Addresses"] = [{"AllocationId": m.EIP}]
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.live_verify(fake)
+
+    def test_transport_rejects_unlisted_or_mutating_operation(self):
+        cloud = m.Cloud(clock=lambda: 0)
+        with self.assertRaises(ValueError):
+            cloud.call("delete-instance")
+
+
+if __name__ == "__main__":
+    unittest.main()

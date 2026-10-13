@@ -1,0 +1,384 @@
+"""Real stdlib child handoff plus failure tests; no ML or real authorization."""
+
+import hashlib
+import importlib
+import json
+import socket
+import sys
+import time
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from . import test_sft_private_bootstrap_v1 as fixture
+
+module = importlib.import_module(
+    fixture.fixture.bridge_fixture.PACKAGE + ".posttraining_sft_bootstrapped_peers_v1")
+
+# PUBLIC fixed synthetic source only. Reads no file, imports no project or ML.
+# Validates rank/deadline and echoes the exact canonical packet digest, then
+# stays alive until parent release. This is NOT the real child authenticator.
+SOURCE = b'''import hashlib,json,os,socket,sys,time
+rank,left,right,deadline=map(int,sys.argv[1:])
+assert not os.get_inheritable(left) and not os.get_inheritable(right)
+ledger=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM,fileno=left)
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM,fileno=right)
+def exact(n):
+ value=b''
+ while len(value)<n:
+  remaining=(deadline-time.monotonic_ns())/1e9
+  assert remaining>0
+  control.settimeout(remaining)
+  block=control.recv(n-len(value))
+  assert block
+  value+=block
+ return value
+size=int.from_bytes(exact(4),'big'); assert 0<size<=65536
+raw=exact(size); packet=json.loads(raw)
+assert packet['rank']==rank and packet['runtime_metadata']['deadline_ns']==deadline
+assert json.dumps(packet,sort_keys=True,separators=(',',':'),ensure_ascii=True).encode()==raw
+ack=dict(status='bootstrap_received',sha256=hashlib.sha256(raw).hexdigest())
+control.sendall(json.dumps(ack,sort_keys=True,separators=(',',':')).encode())
+ledger.sendall(bytes([rank]))
+assert exact(1)==b'X'
+ledger.close(); control.close()
+'''
+BAD_SOURCE = SOURCE.replace(b"sha256=hashlib.sha256(raw).hexdigest()",
+                           b"sha256=('0'*64 if rank==3 else hashlib.sha256(raw).hexdigest())")
+
+# Same bounded bootstrap followed by fixed synthetic ledger/phase traffic.
+# No model, dataset, optimizer tensors or checkpoint files are involved.
+PROTOCOL_SOURCE = SOURCE[:SOURCE.index(b"ledger.sendall(bytes([rank]))")] + b'''
+epoch=packet['epoch']; token=packet['token']; sequence=1; requests=0
+ledger.settimeout(3)
+def frame(value):
+ raw=json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+ return len(raw).to_bytes(4,'big')+raw
+def receive(sock):
+ def read(n):
+  value=b''
+  while len(value)<n:
+   block=sock.recv(n-len(value)); assert block; value+=block
+  return value
+ size=int.from_bytes(read(4),'big'); assert 0<size<=4096
+ raw=read(size)
+ return json.loads(raw),size.to_bytes(4,'big')+raw
+def request(operation,arguments):
+ global sequence,requests
+ value=dict(schema_version='lumi.sft-epoch-ledger-request.v0.2',epoch=epoch,
+  rank=rank,token=token,sequence=sequence,operation=operation,arguments=arguments)
+ ledger.sendall(frame(value)); ack,raw=receive(ledger)
+ assert ack==dict(schema_version='lumi.sft-epoch-ledger-ack.v0.2',epoch=epoch,
+  rank=rank,sequence=sequence,operation=operation,status='reserved')
+ ledger.sendall(frame(dict(value,operation='confirm_ack',
+  arguments=dict(ack_sha256=hashlib.sha256(raw).hexdigest()))))
+ sequence+=1; requests+=1
+def phase(name,step):
+ control.sendall(frame(dict(status='phase',phase=name,step=step)))
+ assert receive(control)[0]==dict(status='phase_committed',phase=name,step=step)
+phase('inputs',0); phase('restored',0)
+for step in range(1,3):
+ if rank==0: request('reserve_step',dict(from_step=step-1,to_step=step))
+ phase('reserved',step)
+ phase('updated',step)
+ request('step_complete',dict(to_step=step))
+ assert receive(ledger)[0]==dict(schema_version='lumi.sft-worker-step-fence.v0.2',
+  epoch=epoch,rank=rank,to_step=step,status='committed')
+ phase('completed',step); phase('checkpoint',step)
+summary=dict(schema_version='lumi.sft-worker-run-summary.v0.2',state='complete',stage='complete',
+ failure_code=None,failure_stage=None,completed_steps=2,saved_checkpoints=2,restored_checkpoints=0,
+ os_admission_verified=False,os_resource_enforcement=False,real_sft_execution_permitted=False,
+ production_eligible=False)
+control.sendall(frame(dict(status='report',summary=summary,requests=requests)))
+assert receive(control)[0]==dict(status='release')
+control.sendall(frame(dict(status='closed')))
+ledger.close(); control.close()
+'''
+
+
+class BootstrappedPeersTests(unittest.TestCase):
+    def setUp(self):
+        self.config = fixture.fixture.WorkerEntryTests()
+        self.config.setUp()
+        self.deadline = time.monotonic_ns()+5_000_000_000
+        options = self.config.options()
+        options["runtime_metadata"]["deadline_ns"] = self.deadline
+        self.packets = tuple(fixture.packet(options, rank=rank,
+            token=hashlib.sha256(str(rank).encode()).hexdigest()) for rank in range(8))
+        self.raw = tuple(fixture.bootstrap.encode_packet(value) for value in self.packets)
+        self.auth = Mock(return_value=None)
+        self.backend = module.ProcessPeers(
+            worker_source=SOURCE, source_sha256=hashlib.sha256(SOURCE).hexdigest(),
+            python_executable=str(Path(sys.executable).resolve()), deadline_ns=self.deadline,
+            cleanup_milliseconds=1500, admit=lambda: None)
+        self.adapter = None
+        self.sockets = []
+
+    def tearDown(self):
+        try:
+            if self.adapter is not None:
+                self.adapter.retire(False)
+            else:
+                self.backend.retire(False)
+        except module.BootstrappedPeersError:
+            pass
+        for sock in self.sockets:
+            sock.close()
+        self.config.tearDown()
+
+    def make(self, **changes):
+        self.adapter = module.BootstrappedPeers(**{
+            "peers": self.backend, "packets": self.packets,
+            "maximum_wire_bytes": 2**20, "maximum_reads": 1000,
+            "authorize": self.auth, **changes})
+        return self.adapter
+
+    def error(self, code, call):
+        with self.assertRaises(module.BootstrappedPeersError) as caught:
+            call()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn("PRIVATE", str(caught.exception))
+
+    def doubles(self, *, bad_rank=None):
+        pairs = []
+        for rank in range(8):
+            ledger, peer = socket.socketpair()
+            control, other = socket.socketpair()
+            self.sockets.extend((ledger, peer, control, other))
+            ack = fixture.bootstrap.BootstrapWire._ack(None, self.raw[rank])
+            if rank == bad_rank:
+                ack = ack.replace(b'bootstrap_received', b'bootstrap_rejected')
+            other.sendall(ack)
+            pairs.append((ledger, control))
+        stack = ExitStack()
+        self.acquire = stack.enter_context(patch.object(self.backend, "acquire",
+                                                       return_value=tuple(pairs)))
+        self.health = stack.enter_context(patch.object(self.backend, "check_health",
+                                                      return_value=None))
+        self.retirement = stack.enter_context(patch.object(self.backend, "retire",
+                                                          return_value=None))
+        return stack, tuple(pairs)
+
+    def test_inert_constructor_and_private_summary(self):
+        with patch.object(self.backend, "acquire") as acquire:
+            adapter = self.make()
+            self.auth.assert_not_called()
+            acquire.assert_not_called()
+        self.assertNotIn("/work", repr(adapter))
+        self.assertNotIn(self.packets[0]["token"], json.dumps(adapter.summary()))
+
+    def test_exact_fresh_same_owner_backend_required(self):
+        self.error("invalid_arguments", lambda: self.make(peers=object()))
+        self.backend._state = "active"
+        self.error("invalid_arguments", self.make)
+        self.backend._state = "idle"
+
+    def test_bad_order_duplicate_token_deadline_and_metadata_rejected(self):
+        changes = [
+            {"rank": 1}, {"token": self.packets[1]["token"]},
+            {"runtime_metadata": {**self.packets[0]["runtime_metadata"],
+                                  "deadline_ns": self.deadline+1}},
+            {"runtime_metadata": {**self.packets[0]["runtime_metadata"], "port": 12345}},
+            {"invocation_index": 1}]
+        for change in changes:
+            values = ({**self.packets[0], **change}, *self.packets[1:])
+            self.error("packet_rejected", lambda values=values: self.make(packets=values))
+        self.auth.assert_not_called()
+
+    def test_minimum_cumulative_caps_are_required_before_spawn(self):
+        for change in ({"maximum_wire_bytes": 1}, {"maximum_reads": 7},
+                       {"maximum_reads": True}):
+            self.error("invalid_arguments", lambda change=change: self.make(**change))
+
+    def test_authority_rejection_consumes_before_spawn(self):
+        adapter = self.make()
+        self.auth.return_value = True
+        with patch.object(self.backend, "acquire") as acquire:
+            self.error("authority_rejected", adapter.acquire)
+            self.error("already_consumed", adapter.acquire)
+            acquire.assert_not_called()
+        self.assertEqual(adapter.summary()["wire_bytes_reserved"], 0)
+
+    def test_authority_exception_text_suppressed(self):
+        adapter = self.make()
+        self.auth.side_effect = ValueError("PRIVATE")
+        self.error("authority_rejected", adapter.acquire)
+
+    def test_snapshot_is_immutable_and_not_changed_by_caller(self):
+        adapter = self.make()
+        self.packets[0]["token"] = "f"*64
+        stack, pairs = self.doubles()
+        with stack:
+            self.assertEqual(adapter.acquire(), pairs)
+            self.auth.assert_called_once_with(self.raw)
+            self.assertTrue(all(type(raw) is bytes for raw in self.auth.call_args.args[0]))
+            adapter.retire(False)
+
+    def test_expiry_precedes_auth_and_spawn(self):
+        adapter = self.make()
+        with patch.object(module.time, "monotonic_ns", return_value=self.deadline):
+            self.error("deadline_exhausted", adapter.acquire)
+        self.auth.assert_not_called()
+
+    def test_expiry_during_authorization_prevents_spawn(self):
+        adapter = self.make()
+        with patch.object(module.time, "monotonic_ns",
+                          side_effect=[self.deadline-1,self.deadline]), \
+                patch.object(self.backend, "acquire") as acquire:
+            self.error("deadline_exhausted", adapter.acquire)
+            acquire.assert_not_called()
+
+    def test_swallowed_authority_reentry_is_terminal(self):
+        adapter = self.make()
+        def authorize(raw):
+            self.error("reentry", adapter.acquire)
+        self.auth.side_effect = authorize
+        with patch.object(self.backend, "acquire") as acquire:
+            self.error("reentry", adapter.acquire)
+            acquire.assert_not_called()
+
+    def test_success_transfers_all_sockets_and_counts_cumulative_traffic(self):
+        adapter = self.make()
+        stack, pairs = self.doubles()
+        with stack:
+            self.assertEqual(adapter.acquire(), pairs)
+            self.assertEqual(adapter.summary()["handoffs_acknowledged"], 8)
+            self.assertEqual(adapter.summary()["read_calls"], 8)
+            expected = sum(4+len(raw)+len(fixture.bootstrap.BootstrapWire._ack(None,raw))
+                           +module.ANCILLARY_BYTES for raw in self.raw)
+            self.assertEqual(adapter.summary()["wire_bytes_reserved"], expected)
+            adapter.check_health(False)
+            adapter.retire(True)
+            adapter.retire(True)
+            self.retirement.assert_called_once_with(True)
+            self.assertTrue(all(sock.fileno() >= 0 for pair in pairs for sock in pair))
+
+    def test_partial_ack_failure_reaps_and_closes_every_parent_socket(self):
+        adapter = self.make()
+        stack, pairs = self.doubles(bad_rank=3)
+        with stack:
+            self.error("handoff_failed", adapter.acquire)
+            self.assertEqual(adapter.summary()["handoffs_acknowledged"], 3)
+            self.assertTrue(all(sock.fileno() == -1 for pair in pairs for sock in pair))
+            adapter.retire(False)
+            self.retirement.assert_called_once_with(False)
+            self.error("already_consumed", adapter.acquire)
+
+    def test_health_failure_after_last_ack_still_closes_all(self):
+        adapter = self.make()
+        stack, pairs = self.doubles()
+        with stack:
+            self.health.side_effect = [None]*8 + [ValueError("PRIVATE")]
+            self.error("health_failed", adapter.acquire)
+            self.assertEqual(adapter.summary()["handoffs_acknowledged"], 8)
+            self.assertTrue(all(sock.fileno() == -1 for pair in pairs for sock in pair))
+
+    def test_read_budget_is_shared_across_workers_not_reset_per_worker(self):
+        adapter = self.make(maximum_reads=8)
+        stack, pairs = self.doubles()
+        original = module.BootstrapWire._read
+        def fragmented(wire, count):
+            split = count//2
+            return original(wire, split) + original(wire, count-split)
+        with stack, patch.object(module.BootstrapWire, "_read", fragmented):
+            self.error("handoff_failed", adapter.acquire)
+            self.assertEqual(adapter.summary()["handoffs_acknowledged"], 4)
+            self.assertEqual(adapter.summary()["read_calls"], 8)
+            self.assertTrue(all(sock.fileno() == -1 for pair in pairs for sock in pair))
+
+    def test_wire_budget_is_shared_and_fragmentation_cannot_overspend(self):
+        cap = sum(4+len(raw)+len(fixture.bootstrap.BootstrapWire._ack(None,raw))
+                  +module.ANCILLARY_BYTES for raw in self.raw)
+        adapter = self.make(maximum_wire_bytes=cap)
+        stack, pairs = self.doubles()
+        original = module.BootstrapWire._read
+        def fragmented(wire, count):
+            split = count//2
+            return original(wire, split) + original(wire, count-split)
+        with stack, patch.object(module.BootstrapWire, "_read", fragmented):
+            self.error("handoff_failed", adapter.acquire)
+            self.assertLess(adapter.summary()["handoffs_acknowledged"], 8)
+            self.assertLessEqual(adapter.summary()["wire_bytes_reserved"], cap)
+            self.assertTrue(all(sock.fileno() == -1 for pair in pairs for sock in pair))
+
+    def test_backend_acquisition_failure_never_attempts_handoff(self):
+        adapter = self.make()
+        with patch.object(self.backend, "acquire", side_effect=ValueError("PRIVATE")):
+            self.error("acquisition_failed", adapter.acquire)
+        self.assertEqual(adapter.summary()["handoffs_acknowledged"], 0)
+
+    def test_cleanup_failure_keeps_first_error_and_never_retries(self):
+        adapter = self.make()
+        stack, pairs = self.doubles(bad_rank=0)
+        with stack:
+            self.retirement.side_effect = ValueError("PRIVATE")
+            self.error("handoff_failed", adapter.acquire)
+            self.error("handoff_failed", lambda: adapter.retire(False))
+            self.retirement.assert_called_once()
+            self.assertTrue(adapter.summary()["cleanup_failed"])
+            self.assertTrue(all(sock.fileno() == -1 for pair in pairs for sock in pair))
+
+    def test_wrong_owner_cannot_consume(self):
+        adapter = self.make()
+        owner = adapter._owner
+        adapter._owner = (-1,-1)
+        self.error("owner_mismatch", adapter.acquire)
+        adapter._owner = owner
+        self.assertEqual(adapter.summary()["state"], "idle")
+
+    def test_real_eight_cold_execs_handoff_exit_and_guardian_reap(self):
+        adapter = self.make()
+        pairs = adapter.acquire()
+        self.sockets.extend(sock for pair in pairs for sock in pair)
+        for rank, (ledger, control) in enumerate(pairs):
+            ledger.settimeout(2)
+            self.assertEqual(ledger.recv(1), bytes([rank]))
+            control.sendall(b"X")
+            self.assertEqual(ledger.recv(1), b"")
+        adapter.retire(True)
+        summary = self.backend.summary()
+        self.assertEqual(summary["worker_exit_reports"], 8)
+        self.assertEqual(summary["worker_failures"], 0)
+        self.assertTrue(summary["guardian_cleanup_ack"])
+        self.assertTrue(summary["guardian_reaped"])
+        self.assertEqual(adapter.summary()["state"], "retired")
+        self.error("already_consumed", adapter.acquire)
+
+    def test_real_partial_handoff_failure_reaps_guardian(self):
+        self.backend._source = BAD_SOURCE  # Fixed public negative-case child, no real ML.
+        adapter = self.make()
+        self.error("handoff_failed", adapter.acquire)
+        self.assertEqual(adapter.summary()["handoffs_acknowledged"], 3)
+        self.assertTrue(self.backend.summary()["guardian_reaped"])
+        self.assertTrue(self.backend.summary()["guardian_cleanup_ack"])
+        self.assertFalse(adapter.summary()["cleanup_failed"])
+
+    def test_real_process_bootstrap_then_parent_transport_all_phases(self):
+        parent_fixture = fixture.fixture.bridge_fixture.ParentBridgeTests()
+        parent_fixture.setUp()
+        transport = importlib.import_module(
+            fixture.fixture.bridge_fixture.PACKAGE + ".posttraining_sft_socket_transport_v2")
+        self.backend._source = PROTOCOL_SOURCE
+        self.packets = tuple({**value, "epoch": parent_fixture.epoch,
+                              "token": parent_fixture.tokens[rank]}
+                             for rank, value in enumerate(self.packets))
+        adapter = self.make()
+        parent = transport.SocketTransport(
+            bridge_options=dict(supervisor=parent_fixture.ledger, epoch=parent_fixture.epoch,
+                rank_tokens=parent_fixture.tokens, invocation_index=0,
+                maximum_wire_bytes=2**20, maximum_feeds=1000),
+            admit=lambda: None, acquire=adapter.acquire, check_health=adapter.check_health,
+            observe_memory=lambda: (256,[64]*8), retire=adapter.retire,
+            deadline_ns=self.deadline, maximum_exchange_ns=1_000_000_000,
+            maximum_wire_bytes=2**22, maximum_reads=1000)
+        result = parent.run()
+        self.assertEqual(result["state"], "complete")
+        self.assertEqual(result["eof_channels"], 16)
+        self.assertEqual(adapter.summary()["handoffs_acknowledged"], 8)
+        self.assertEqual(parent_fixture.ledger.summary()["global_optimizer_steps_completed"], 2)
+        self.assertTrue(self.backend.summary()["guardian_reaped"])
+        self.assertTrue(self.backend.summary()["guardian_cleanup_ack"])
+        self.assertEqual(self.backend.summary()["worker_exit_reports"], 8)
+        self.assertEqual(self.backend.summary()["worker_failures"], 0)

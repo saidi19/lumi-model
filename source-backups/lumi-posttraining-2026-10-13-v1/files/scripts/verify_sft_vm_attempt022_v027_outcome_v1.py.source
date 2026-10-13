@@ -1,0 +1,195 @@
+"""Bounded read-only STOP/retention/network-cleanup outcome verification."""
+
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+from scripts import execute_sft_vm_private_outer_v27 as entry
+
+ROOT = entry.ROOT
+BASE = "artifacts/lumi-vm-private-outer-execution-v0.27/attempt-022"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-022-v027-outcome-verification-v0.1"
+EVIDENCE = ROOT / "evidence/lumi-vm-attempt-022-v027-execution-verification-v0.1.json"
+MAX_CALLS, MAX_SECONDS = 12, 180
+need, read, sha, encode = entry.need, entry.bindings.read, entry.sha, entry.encode
+PINS = {
+    "scripts/execute_sft_vm_private_outer_v27.py":
+        "466a84dfb28379428b2ccb45195e58ea05fa3c8d756c7dff3b7dfbc6bde8bc5f",
+    "configs/lumi-vm-private-outer-execution-approval-v0.27.json":
+        "fb5bea16e1e36cacf277e0e86406e8e085a7b21e0ed29bcfbb3ec006c9d8e1eb",
+    "artifacts/lumi-vm-private-outer-preflight-v0.27/admission.json":
+        "280ef79e8e6d5f06dc33118e7e33805dfef23095f693efcc0617f524d36fdecc",
+    "artifacts/lumi-vm-private-outer-execution-v0.27/entry-result.json":
+        "9c3fd03ec876bf7ab74b87b6ebb0f50dac1392349cddc70ef151d23455fbc2e6",
+    BASE + "/host/execution/host/binding.json":
+        "4a5c77423a14e87823d57bc0a2350a431f250cd5859a4c6679693c7694d2f91d",
+    BASE + "/host/execution/host/launch.json":
+        "4efb86bff6b84e5de3fe52374d621379627765ce4e29b53d3e3ba99825963b7e",
+    BASE + "/host/execution/host/result.json":
+        "1b4cd218b2b509696f796763225a85464cde6a76d6e8e553e4d63ba2316f826c",
+    BASE + "/host/execution/host/host-setup/result.json":
+        "2448aa1a029e84f90aee95a5bb3e0211201b62f7d5778a92a45a462aeb8c8b45",
+    BASE + "/host/execution/host/host-setup/setup/controls/control-transfer/result.json":
+        "ff4ebad50b86d3988e06f08f4ee9b9f3c38b348d6127d06baf42d746d35b8c23",
+    BASE + "/network/0015-result.json":
+        "5142e8d1c219cdf1dcc85c96782019c59f191a2f33c01c9d0fe329b0e0c3b6bc",
+    BASE + "/network/0003-created-subnet.json":
+        "c9e225b364df1239fcd724d65e02492690f5cb5d01a80f557527f0a5a1b4fa8e",
+    BASE + "/network/0005-created-table.json":
+        "1c3c9bffc9cabb1542711af18dd862af951ef23d2b00f6a44772d1de846b1940",
+    BASE + "/network/0008-created-address.json":
+        "7422133a609a03f7c51cad82649f1c2f27c0fbcf2e04c1941643b9f213d76e6d",
+    BASE + "/network/0010-created-nat.json":
+        "52a93dcaffa453c51acb9419998aade2eec9532f1646962e0bcb6b76cb481f08",
+}
+
+
+def load(name):
+    return json.loads(read(name, PINS[name]))
+
+
+def local():
+    for name, digest in PINS.items():
+        read(name, digest)
+    approved = load(str(entry.APPROVAL.relative_to(ROOT)))
+    need(encode(approved) == encode(entry.expected_approval(approved["human_message"])))
+    result = load("artifacts/lumi-vm-private-outer-execution-v0.27/entry-result.json")
+    host = load(BASE + "/host/execution/host/result.json")
+    transfer = load(BASE + "/host/execution/host/host-setup/setup/controls/"
+                    "control-transfer/result.json")
+    network = load(BASE + "/network/0015-result.json")
+    need(result["status"] == "failed_preserve_component_evidence_no_retry")
+    need(result["execution_marker_created"] and result["outer_invoked"])
+    need(result["network_cleanup_verified"] and not result["host_lifecycle_completed"])
+    need(host["launch_attempted"] and host["stopped_verified"])
+    need(not host["setup_completed"] and not host["host_admitted"])
+    need(not host["stop_verification_unresolved"])
+    need(transfer["failure_stage"] == "exchange" and transfer["remote_completion_unknown"])
+    need(not transfer["remote_staging_confirmed"] and not transfer["retry_allowed"])
+    need(network["cost_resources_released"] and not network["cleanup_unresolved"])
+    need(network["subnet_preserved_for_dependencies"])
+    need(not network["unknown_creation_kinds"] and not network["cleanup_stages_unresolved"])
+    binding = load(BASE + "/host/execution/host/binding.json")
+    need(binding["attempt"] == entry.bindings.ATTEMPT)
+    ids = [load(BASE + "/network/" + name)["identifier"] for name in (
+        "0003-created-subnet.json", "0005-created-table.json",
+        "0008-created-address.json", "0010-created-nat.json",
+    )]
+    outer, _, _ = entry.local()
+    return outer, binding, ids
+
+
+class Meter(entry.budget.AdmissionBudget):
+    def consume(self, service, **fields):
+        need(self.calls < MAX_CALLS and 0 <= self.clock() - self.start < MAX_SECONDS - 20)
+        return super().consume(service, **fields)
+
+
+def run():
+    outer, binding, ids = local()
+    need(not OUTPUT.exists() and not EVIDENCE.exists())
+    OUTPUT.mkdir(mode=0o700)
+    outer.loading.save(OUTPUT / "started.json", encode(dict(
+        verifier_sha256=sha(Path(__file__).read_bytes()), maximum_sdk_reads=MAX_CALLS,
+        maximum_seconds=MAX_SECONDS, cloud_mutations=0, retry=False,
+    )))
+    report = dict(
+        schema="lumi.vm-attempt022-v027-execution-verification.v0.1",
+        status="started", attempt=entry.bindings.ATTEMPT,
+        failed_stage="setup_control_transfer_exchange", exact_remote_failure_cause_proven=False,
+        cpu_instance_launched=True, instance=binding["instance"],
+        retained_volumes=[binding["root_volume"], binding["work_volume"]],
+        consumed_execution_preserved=True, cloud_mutations=0, object_access=0, instance_actions=0,
+        retry=False, real_4b_import=False, gate_5_complete=False,
+        gpu=False, training=False, production_eligible=False, observations={},
+    )
+    bundle = None
+    with Meter(outer.credentials) as meter:
+        try:
+            first = True
+            start = float(math.floor(time.monotonic()))
+
+            def clock():
+                nonlocal first
+                if first:
+                    first = False
+                    return start
+                return time.monotonic()
+
+            bundle = meter.clients(outer.credentials.Reader(start + 18000, clock=clock))
+
+            def call(service, operation, **fields):
+                value = getattr(bundle.clients[service], operation)(**fields)
+                need(type(value) is dict and len(json.dumps(value, default=str)) <= 262144)
+                need(not any(value.get(k) for k in ("NextToken", "Marker", "IsTruncated")))
+                return value
+
+            need(call("sts", "get_caller_identity")["Account"] == "573978149073")
+            observed = call("ec2", "describe_instances", InstanceIds=[
+                binding["instance"], "i-015114693b56c75e3"])
+            rows = [i for reservation in observed["Reservations"] for i in reservation["Instances"]]
+            instances = {i["InstanceId"]: i for i in rows}
+            need(len(rows) == 2 and set(instances) == {binding["instance"], "i-015114693b56c75e3"})
+            need(all(i["State"]["Name"] == "stopped" for i in rows))
+            current = instances[binding["instance"]]
+            need(current["InstanceType"] == "r6i.4xlarge")
+            need(current["ClientToken"] == binding["attempt"])
+            need(all(not device["Ebs"]["DeleteOnTermination"]
+                     for i in rows for device in i["BlockDeviceMappings"]))
+            report["observations"]["new_instance_and_predecessor_stopped"] = True
+            volumes = {binding["root_volume"], binding["work_volume"],
+                       "vol-0e654866571fa99fd", "vol-0e6c46311964511ac"}
+            stored = call("ec2", "describe_volumes", VolumeIds=sorted(volumes))["Volumes"]
+            need(len(stored) == 4 and {v["VolumeId"] for v in stored} == volumes)
+            need(all(v["Encrypted"] and v["State"] == "in-use" for v in stored))
+            report["observations"]["new_and_predecessor_encrypted_volumes_retained"] = True
+            subnet, table, address, nat = ids
+            active_nat = call("ec2", "describe_nat_gateways", Filter=[
+                dict(Name="nat-gateway-id", Values=[nat]),
+                dict(Name="state", Values=["pending", "available", "deleting"]),
+            ])["NatGateways"]
+            need(not active_nat)
+            report["observations"]["nat_deleted"] = True
+            try:
+                addresses = call("ec2", "describe_addresses", AllocationIds=[address])["Addresses"]
+                need(not addresses)
+            except Exception as error:
+                need(getattr(error, "response", {}).get("Error", {}).get("Code")
+                     == "InvalidAllocationID.NotFound")
+            report["observations"]["eip_released"] = True
+            subnets = call("ec2", "describe_subnets", SubnetIds=[subnet])["Subnets"]
+            need(len(subnets) == 1 and subnets[0]["CidrBlock"] == "172.31.97.64/27")
+            need(current["SubnetId"] == subnet)
+            tables = call("ec2", "describe_route_tables", RouteTableIds=[table])["RouteTables"]
+            need(len(tables) == 1 and not any(r.get("DestinationCidrBlock") == "0.0.0.0/0"
+                                            for r in tables[0]["Routes"]))
+            report["observations"]["dependent_subnet_table_retained_default_route_removed"] = True
+            endpoints = call("ec2", "describe_instance_connect_endpoints",
+                             InstanceConnectEndpointIds=[binding["endpoint"]])[
+                                 "InstanceConnectEndpoints"]
+            need(len(endpoints) == 1 and endpoints[0]["State"] == "create-complete")
+            need(endpoints[0]["SubnetId"] == subnet)
+            report["observations"]["dependent_private_ssh_endpoint_preserved"] = True
+            report["status"] = "failed_setup_instance_stop_and_network_cleanup_verified_no_retry"
+        except BaseException:
+            report["status"] = "outcome_readback_stopped_preserve_no_retry"
+        finally:
+            if bundle is not None:
+                bundle.close()
+            report["read_budget"] = meter.report()
+            report["readback_maximum_calls"] = MAX_CALLS
+            report["readback_maximum_seconds"] = MAX_SECONDS
+            report["elapsed_seconds"] = round(time.monotonic() - meter.start, 3)
+    report["pins"] = PINS | {str(Path(__file__).relative_to(ROOT)):
+                             sha(Path(__file__).read_bytes())}
+    outer.loading.save(OUTPUT / "result.json", encode(report))
+    outer.loading.save(EVIDENCE, encode(report))
+    print(json.dumps(report, sort_keys=True))
+    return report
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--verify-once"])
+    run()

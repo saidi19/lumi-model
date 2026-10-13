@@ -1,0 +1,363 @@
+"""Fresh fake deployment + actual frozen transaction; no AWS requests."""
+
+import base64
+import copy
+import hashlib
+import importlib
+import io
+import json
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from unittest.mock import Mock
+
+from tests.test_sft_vm_network_cleanup_v1 import S3, TOKEN
+from tests.test_sft_vm_private_network_transaction_v1 import PLAN
+from tests.test_sft_vm_private_network_transaction_v1 import Cloud as Network
+from tests.test_sft_vm_private_network_v1 import fixture
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("arm_sft_vm_network_cleanup_v1")
+bridge = importlib.import_module("sft_vm_network_cleanup_bridge_v1")
+transaction = importlib.import_module("run_sft_vm_private_network_v1")
+
+
+class Cloud:
+    def __init__(self):
+        self.roles, self.policies, self.calls = {}, {}, []
+        self.cfg = self.group = self.schedule = self.retry = self.concurrent = None
+        self.t, self.wall = 100.0, 2000000000.0
+        self.fail = None
+        self.change = lambda op, value: value
+
+    def wait(self, seconds):
+        self.t += seconds
+        self.wall += seconds
+
+    def cli(self, service, op, **kw):
+        self.calls.append((service, op, copy.deepcopy(kw)))
+        value = self.action(op, kw)
+        if op == self.fail:
+            raise TimeoutError("PRIVATE_SENTINEL")
+        return self.change(op, copy.deepcopy(value))
+
+    def action(self, op, kw):
+        if op == "get-caller-identity":
+            return {"Account": m.worker.ACCOUNT}
+        if op == "get-role":
+            if kw["RoleName"] not in self.roles:
+                raise LookupError("absent")
+            return {"Role": self.roles[kw["RoleName"]]}
+        if op == "create-role":
+            row = dict(
+                Arn=f"arn:aws:iam::{m.worker.ACCOUNT}:role{m.ROLE_PATH}{kw['RoleName']}",
+                RoleId="SYNTHETIC_" + kw["RoleName"],
+                AssumeRolePolicyDocument=json.loads(kw["AssumeRolePolicyDocument"]),
+            )
+            self.roles[kw["RoleName"]] = row
+            return {"Role": row}
+        if op == "put-role-policy":
+            self.policies[kw["RoleName"]] = json.loads(kw["PolicyDocument"])
+            return {}
+        if op == "get-role-policy":
+            return {"PolicyDocument": self.policies[kw["RoleName"]]}
+        if op == "list-role-policies":
+            return {"PolicyNames": [m.POLICY], "IsTruncated": False}
+        if op == "list-attached-role-policies":
+            return {"AttachedPolicies": [], "IsTruncated": False}
+        if op == "create-function":
+            self.cfg = {
+                k: kw[k]
+                for k in (
+                    "Role",
+                    "Runtime",
+                    "Handler",
+                    "Timeout",
+                    "MemorySize",
+                    "Architectures",
+                    "EphemeralStorage",
+                    "Environment",
+                )
+            }
+            self.cfg.update(
+                FunctionArn=f"arn:aws:lambda:{m.worker.REGION}:{m.worker.ACCOUNT}:function:{kw['FunctionName']}",
+                CodeSha256=base64.b64encode(
+                    hashlib.sha256(kw["Code"]["ZipFile"]).digest()
+                ).decode(),
+                State="Active",
+                LastUpdateStatus="Successful",
+            )
+            return {}
+        if op == "get-function-configuration":
+            if self.cfg is None:
+                raise LookupError("absent")
+            return self.cfg
+        if op == "put-function-concurrency":
+            self.concurrent = {"ReservedConcurrentExecutions": kw["ReservedConcurrentExecutions"]}
+            return self.concurrent
+        if op == "get-function-concurrency":
+            return self.concurrent
+        if op == "put-function-event-invoke-config":
+            self.retry = {k: kw[k] for k in ("MaximumRetryAttempts", "MaximumEventAgeInSeconds")}
+            return self.retry
+        if op == "get-function-event-invoke-config":
+            return self.retry
+        if op in {"get-policy", "get-function-url-config"}:
+            raise LookupError("absent")
+        if op == "list-event-source-mappings":
+            return {"EventSourceMappings": []}
+        if op == "create-schedule-group":
+            self.group = dict(
+                Arn=f"arn:aws:scheduler:{m.worker.REGION}:{m.worker.ACCOUNT}:schedule-group/{kw['Name']}",
+                State="ACTIVE",
+            )
+            return self.group
+        if op == "get-schedule-group":
+            if self.group is None:
+                raise LookupError("absent")
+            return self.group
+        if op == "create-schedule":
+            self.schedule = {k: v for k, v in kw.items() if k != "ClientToken"}
+            self.schedule["Arn"] = (
+                f"arn:aws:scheduler:{m.worker.REGION}:{m.worker.ACCOUNT}:schedule/{kw['GroupName']}/{kw['Name']}"
+            )
+            return {"ScheduleArn": self.schedule["Arn"]}
+        if op == "get-schedule":
+            return self.schedule
+        raise AssertionError(op)
+
+
+class ArmingTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.cloud = Cloud()
+        self.admit = Mock(return_value=None)
+        self.arm = m.Expiry(
+            self.root / "arm",
+            self.cloud,
+            admit_claim_store=self.admit,
+            clock=lambda: self.cloud.t,
+            wall=lambda: self.cloud.wall,
+            wait=self.cloud.wait,
+        )
+        self.bound = dict(attempt=m.worker.ATTEMPT, nonce=TOKEN, deadline=18100)
+
+    def test_arm_verify_original_deadline_and_all_requests_against_sdk(self):
+        self.arm.arm(**self.bound)
+        self.arm.verify(**self.bound)
+        self.assertEqual(self.arm.bound["expires_at"], 2000018000)
+        self.assertEqual(self.arm.bound["not_before"], 2000017100)
+        self.assertEqual(self.cloud.schedule["Target"]["RetryPolicy"]["MaximumRetryAttempts"], 0)
+        self.assertLess(self.arm.calls, 100)
+        self.assertTrue((self.root / "arm/armed.json").is_file())
+        self.admit.assert_called_once_with(self.arm.bound)
+        import botocore.session
+        import botocore.validate
+
+        session = botocore.session.Session()
+        for service, op, fields in self.cloud.calls:
+            name = "".join(part.capitalize() for part in op.split("-"))
+            shape = session.get_service_model(service).operation_model(name).input_shape
+            botocore.validate.validate_parameters(fields, shape)
+
+    def test_code_package_exact_frozen_worker_and_deterministic(self):
+        first = m.package()
+        self.assertEqual(first, m.package())
+        with zipfile.ZipFile(io.BytesIO(first)) as archive:
+            self.assertEqual(archive.namelist(), ["cleanup.py"])
+            self.assertEqual(hashlib.sha256(archive.read("cleanup.py")).hexdigest(), m.WORKER_SHA)
+
+    def test_lost_create_ack_never_retried_and_failed_record_redacted(self):
+        self.cloud.fail = "create-schedule"
+        with self.assertRaisesRegex(RuntimeError, "^network_expiry_arming_failed$"):
+            self.arm.arm(**self.bound)
+        with self.assertRaises(ValueError):
+            self.arm.arm(**self.bound)
+        self.assertEqual(sum(op == "create-schedule" for _, op, _ in self.cloud.calls), 1)
+        self.assertNotIn("PRIVATE_SENTINEL", (self.root / "arm/failed.json").read_text())
+        self.assertFalse((self.root / "arm/armed.json").exists())
+
+    def test_existing_role_or_output_blocks_create(self):
+        self.cloud.roles[m.names(TOKEN)["worker"]] = {}
+        with self.assertRaises(RuntimeError):
+            self.arm.arm(**self.bound)
+        self.assertFalse(any(op in m.WRITES for _, op, _ in self.cloud.calls))
+        fresh = m.Expiry(
+            self.root / "arm",
+            self.cloud,
+            admit_claim_store=self.admit,
+            clock=lambda: self.cloud.t,
+            wall=lambda: self.cloud.wall,
+        )
+        before = len(self.cloud.calls)
+        with self.assertRaises(FileExistsError):
+            fresh.arm(**self.bound)
+        self.assertEqual(len(self.cloud.calls), before)
+
+    def test_claim_store_failure_or_false_is_not_admission(self):
+        self.admit.return_value = False
+        with self.assertRaises(RuntimeError):
+            self.arm.arm(**self.bound)
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_code_policy_timer_and_retry_drift_rejected(self):
+        self.arm.arm(**self.bound)
+        changes = [
+            ("get-function-configuration", lambda v: dict(v, CodeSha256="wrong")),
+            ("get-role-policy", lambda v: dict(v, PolicyDocument={})),
+            ("get-function-event-invoke-config", lambda v: dict(v, MaximumRetryAttempts=1)),
+            ("get-function-concurrency", lambda v: dict(v, ReservedConcurrentExecutions=2)),
+            ("get-schedule", lambda v: dict(v, State="DISABLED")),
+            ("list-role-policies", lambda v: dict(v, PolicyNames=[m.POLICY, "foreign"])),
+            ("list-event-source-mappings", lambda v: dict(v, NextMarker="more")),
+        ]
+        for op, change in changes:
+            # Independent verification contexts have their own read budget, not new arming.
+            self.arm.calls = 0
+            self.cloud.change = lambda actual, v, op=op, change=change: (
+                change(v) if actual == op else v
+            )
+            with self.subTest(op=op), self.assertRaises(ValueError):
+                self.arm.verify(**self.bound)
+
+    def test_expiry_cannot_be_rebound_or_extended(self):
+        self.arm.arm(**self.bound)
+        for change in ({"deadline": 18101}, {"nonce": "b" * 32}, {"attempt": "other"}):
+            with self.assertRaises(ValueError):
+                self.arm.verify(**dict(self.bound, **change))
+
+    def test_clock_jump_and_elapsed_budget_stop_before_paid_network(self):
+        def jump(op, value):
+            self.cloud.wall += 6
+            return value
+
+        self.cloud.change = jump
+        with self.assertRaises(RuntimeError):
+            self.arm.arm(**self.bound)
+        self.assertEqual(len(self.cloud.calls), 1)
+
+    def test_frozen_network_transaction_uses_real_armer_before_allocation(self):
+        network = Network()
+        claims = S3()
+        claimed = bridge.ClaimedCloud(network, claims, clock=lambda: self.cloud.t)
+        expiry = bridge.ExpiryBridge(claimed, self.arm)
+        work = Mock()
+        original = network.cli
+
+        def check(service, op, **fields):
+            if op == "allocate-address":
+                self.assertIsNotNone(self.cloud.schedule)
+                self.assertTrue((self.root / "arm/armed.json").is_file())
+                self.assertEqual(self.arm.original["nonce"], claimed.claims.token)
+            return original(service, op, **fields)
+
+        network.cli = check
+        report = transaction._with_preflighted_network_once(
+            self.root / "network",
+            plan_raw=PLAN,
+            cloud=claimed,
+            admit=fixture,
+            expiry=expiry,
+            workload=work,
+            clock=lambda: self.cloud.t,
+            wait=self.cloud.wait,
+        )
+        self.assertTrue(report["cost_resources_released"])
+        work.assert_called_once()
+        self.assertEqual(len(claims.objects), 2)
+
+    def test_worker_policy_has_only_cost_mutations_and_exact_two_claims(self):
+        self.arm.arm(**self.bound)
+        n = m.names(TOKEN)
+        policy = self.cloud.policies[n["worker"]]
+        allow = [s for s in policy["Statement"] if s["Effect"] == "Allow"]
+        actions = set()
+        for statement in allow:
+            values = statement["Action"]
+            actions.update([values] if type(values) is str else values)
+        self.assertEqual(
+            actions,
+            {
+                "ec2:DescribeNatGateways",
+                "ec2:DescribeAddresses",
+                "ec2:DeleteNatGateway",
+                "ec2:ReleaseAddress",
+                "s3:PutObject",
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+            },
+        )
+        put = next(s for s in allow if s["Action"] == "s3:PutObject")
+        self.assertEqual(len(put["Resource"]), 2)
+        self.assertTrue(all(TOKEN in arn and not arn.endswith("*") for arn in put["Resource"]))
+        self.assertEqual(put["Condition"]["StringEquals"]["s3:if-none-match"], "*")
+
+    def test_shared_sdk_clients_have_fixed_transport_and_public_entry_closed(self):
+        from tests.test_sft_vm_controller_credentials_v1 import CredentialTests
+
+        fixture = CredentialTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        credentials = importlib.import_module("sft_vm_controller_credentials_v1")
+        bundle = credentials.Clients(fixture.reader)
+        self.addCleanup(bundle.close)
+        cloud = m.SDKCloud({k: bundle.clients[k] for k in m.OPS})
+        self.assertIs(cloud.clients["iam"], bundle.clients["iam"])
+        with self.assertRaises(ValueError):
+            cloud.cli("ec2", "delete-nat-gateway", NatGatewayId="nat-" + "4" * 17)
+        with self.assertRaisesRegex(ValueError, "network_expiry_outer_admission_required"):
+            m.run(approved=True)
+
+    def test_failed_arming_blocks_eip_nat_and_workload_in_actual_transaction(self):
+        network = Network()
+        claimed = bridge.ClaimedCloud(network, S3(), clock=lambda: self.cloud.t)
+        expiry = bridge.ExpiryBridge(claimed, self.arm)
+        self.cloud.fail = "create-schedule"
+        work = Mock()
+        with self.assertRaises(ValueError):
+            transaction._with_preflighted_network_once(
+                self.root / "network",
+                plan_raw=PLAN,
+                cloud=claimed,
+                admit=fixture,
+                expiry=expiry,
+                workload=work,
+                clock=lambda: self.cloud.t,
+                wait=self.cloud.wait,
+            )
+        work.assert_not_called()
+        operations = [op for _, op, _ in network.calls]
+        self.assertNotIn("allocate-address", operations)
+        self.assertNotIn("create-nat-gateway", operations)
+        self.assertIn("delete-subnet", operations)
+
+    def test_long_arming_and_retry_transport_settings_rejected(self):
+        self.arm.arm(**self.bound)
+        self.cloud.wait(600)
+        with self.assertRaises(ValueError):
+            self.arm.verify(**self.bound)
+        clients = {}
+        for service in m.OPS:
+            client = Mock()
+            client.meta.endpoint_url = (
+                "https://iam.amazonaws.com"
+                if service == "iam"
+                else f"https://{service}.{m.worker.REGION}.amazonaws.com"
+            )
+            client.meta.region_name = m.worker.REGION
+            client.meta.config.proxies = {}
+            client.meta.config.retries = {"total_max_attempts": 1}
+            client.meta.config.connect_timeout = 3
+            client.meta.config.read_timeout = 5
+            clients[service] = client
+        m.SDKCloud(clients)
+        clients["lambda"].meta.config.retries = {"total_max_attempts": 2}
+        with self.assertRaises(ValueError):
+            m.SDKCloud(clients)
+
+
+if __name__ == "__main__":
+    unittest.main()

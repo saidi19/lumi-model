@@ -1,0 +1,569 @@
+"""Pure synthetic full-size controls and mocked entry; no native ML or payload I/O."""
+
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import importlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_fullsize_entry_pure_tests_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_fullsize_entry_v1")
+IMPORTED = set(sys.modules) - before
+planner = importlib.import_module(PACKAGE + ".posttraining_checkpoint_import_plan_v1")
+io = importlib.import_module(PACKAGE + ".posttraining_checkpoint_io_contract_v1")
+NAMES = ("base.json", "manifest.sha256", "state.json", "config.json", "handoff.json",
+         "plan.json", "envelope.json", "kernel-io.json")
+ENTRY_PIN, SOURCE_PIN, NONCE_PIN = "a" * 64, "b" * 64, "9" * 64
+
+
+def canonical(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":"), allow_nan=False).encode()
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def generated_documents():
+    tree = ast.parse((ROOT / "tests/test_sft_checkpoint_import_plan_v1.py").read_bytes())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "documents")
+    namespace = {"canonical": canonical, "sha": digest}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "generated-controls", "exec"),
+         namespace)
+    return namespace["documents"]()
+
+
+def fixture(*, fullsize=False):
+    metadata = generated_documents()
+    if fullsize:
+        # Pinned 4B geometry represented only by integer metadata. All declared
+        # payload checksums remain synthetic; no weights are loaded or allocated.
+        config = json.loads(metadata[3])
+        config.update(vocab_size=65536, hidden_size=3072, intermediate_size=8384,
+            num_hidden_layers=36, num_attention_heads=64, num_key_value_heads=8,
+            head_dim=64, max_position_embeddings=4096, rope_theta=1000000.0)
+        metadata[3] = canonical(config)
+        state = json.loads(metadata[2])
+        state["run_specification"]["config_sha256"] = digest(metadata[3])
+        metadata[2] = canonical(state)
+        handoff = json.loads(metadata[4])
+        rows = [row for row in handoff["files"] if row["path"] != "manifest.sha256"]
+        for row in rows:
+            if row["path"] == "distributed-training-state.json":
+                row.update(bytes=len(metadata[2]), sha256=digest(metadata[2]))
+        metadata[1] = "".join(f"{row['sha256']}  {row['path']}\n" for row in rows).encode()
+        handoff["files"] = rows + [{"path": "manifest.sha256", "bytes": len(metadata[1]),
+                                    "sha256": digest(metadata[1])}]
+        handoff["handoff_sha256"] = digest(canonical({key: value for key, value in handoff.items()
+                                                     if key != "handoff_sha256"}))
+        metadata[4] = canonical(handoff)
+        base = json.loads(metadata[0])
+        base["checkpoint"]["manifest_sha256"] = digest(metadata[1])
+        base["handoff"] = {"sha256": handoff["handoff_sha256"],
+                           "file_sha256": digest(metadata[4])}
+        metadata[0] = canonical(base)
+    plan = planner.build_import_plan(*metadata,
+        expected_base_sha256=digest(metadata[0]), dtype="bfloat16")
+    runtime_sources = {"configuration_lumi.py": b"# synthetic config\n",
+                       "modeling_lumi.py": b"# synthetic model\n"}
+    source_rows = [{"path": name, "bytes": len(raw), "sha256": digest(raw)}
+                   for name, raw in runtime_sources.items()]
+    source_bytes = sum(row["bytes"] for row in source_rows)
+    b, control = plan["resource_bounds"], 131072
+    rows = {row["path"]: row for row in plan["checkpoint_inventory"]}
+    dcp_payload = max(b["source_fp32_tensor_bytes_including_aliases"], sum(
+        row["bytes"] for name, row in rows.items() if name.endswith(".distcp")))
+    dcp_payload += 2 * rows["model/.metadata"]["bytes"]
+    tokens, backend = b["tokenizer_inventory_bytes"], b["maximum_backend_output_bytes"]
+    envelope = {"schema_version": "lumi.sft-checkpoint-resource-envelope.v0.1",
+        "plan_sha256": plan["plan_sha256"], "dcp_payload_read_cap_bytes": dcp_payload,
+        "dcp_read_cap_bytes": b["checkpoint_inventory_bytes"] + dcp_payload,
+        "hf_read_cap_bytes": backend + 2 * source_bytes + len(metadata[3]),
+        "package_read_cap_bytes": 3 * backend + 3 * tokens + 5 * control,
+        "hf_write_cap_bytes": backend, "package_write_cap_bytes": tokens + 2 * control,
+        "config_bytes": len(metadata[3]), "source_config_sha256": digest(metadata[3]),
+        "control_bytes": control, "package_receipt_cap_bytes": control,
+        "package_manifest_cap_bytes": control, "runtime_sources": source_rows,
+        "private_write_cap_bytes": b["maximum_private_output_write_bytes"],
+        "worker_memory_max_bytes": b["minimum_host_ram_planning_bytes"],
+        "output_capacity_bytes": b["maximum_private_output_write_bytes"],
+        "extra_host_disk_reserve_bytes": 1024**3,
+        "host_disk_capacity_bytes": b["minimum_staged_disk_planning_bytes"] + 1024**3,
+        "maximum_seconds": 3600 if fullsize else 30}
+    if fullsize:
+        envelope["worker_memory_max_bytes"] = 64 * 1024**3
+    envelope["coordinator_read_cap_bytes"] = (envelope["dcp_read_cap_bytes"]
+        + envelope["hf_read_cap_bytes"] + b["checkpoint_inventory_bytes"]
+        + b["tokenizer_audit_read_bytes"] + envelope["package_read_cap_bytes"] + source_bytes)
+    contract = io.build_kernel_io_contract(plan, checkpoint_read_contract={
+        "expected_manifest_sha256": plan["metadata"]["checkpoint_manifest_sha256"],
+        "maximum_file_bytes": max(row["bytes"] for row in rows.values()),
+        "maximum_read_bytes": envelope["dcp_read_cap_bytes"], "maximum_read_call_bytes": 1048576},
+        hf_io_contract={"maximum_read_bytes": envelope["hf_read_cap_bytes"],
+                        "maximum_write_bytes": backend, "maximum_file_bytes": min(backend, 2**31),
+                        "maximum_control_bytes": 65536, "target_shard_bytes": 268435456})
+    bodies = dict(zip(NAMES[:5], metadata, strict=True))
+    bodies.update({"plan.json": canonical(plan), "envelope.json": canonical(envelope),
+                   "kernel-io.json": canonical(contract)})
+    return bodies, runtime_sources
+
+
+def control_for(bodies):
+    return m.build_control(bodies, entry_sha256=ENTRY_PIN,
+        source_manifest_sha256=SOURCE_PIN, attempt_nonce_sha256=NONCE_PIN)
+
+
+def arguments(bodies, runtime_sources, raw=None):
+    control_raw = control_for(bodies) if raw is None else raw
+    return {"control_raw": control_raw, "bodies": bodies,
+            "expected_control_sha256": digest(control_raw), "expected_entry_sha256": ENTRY_PIN,
+            "expected_source_manifest_sha256": SOURCE_PIN,
+            "expected_attempt_nonce_sha256": NONCE_PIN, "runtime_sources": runtime_sources}
+
+
+class FullsizeControlTests(unittest.TestCase):
+    def setUp(self):
+        self.bodies, self.sources = fixture()
+
+    def prepare(self, **overrides):
+        kwargs = arguments(self.bodies, self.sources)
+        kwargs.update(overrides)
+        return m.prepare_entry(**kwargs)
+
+    def test_imports_no_native_or_primary_package(self):
+        self.assertFalse({name.split(".")[0] for name in IMPORTED} & {
+            "lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers", "jax"})
+
+    def test_fullsize_geometry_uses_envelope_limits_without_allocating_model(self):
+        bodies, sources = fixture(fullsize=True)
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            prepared = m.prepare_entry(**arguments(bodies, sources))
+        self.assertEqual(prepared["plan"]["model_parameters"], 4002376704)
+        self.assertEqual(prepared["envelope"]["worker_memory_max_bytes"], 64 * 1024**3)
+        self.assertEqual(prepared["limits"]["maximum_seconds"], 3600)
+        self.assertGreater(prepared["limits"]["maximum_private_write_bytes"], 4 * 1024**3)
+        self.assertGreater(prepared["limits"]["maximum_coordinator_read_bytes"], 4 * 1024**3)
+        self.assertFalse(prepared["plan"]["execution_permitted"])
+
+    def test_valid_controls_are_pure_and_return_fixed_copied_inputs(self):
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            result = self.prepare()
+        self.assertEqual(set(result), {"arguments", "plan", "envelope", "limits",
+                                       "inventories", "bindings"})
+        self.assertEqual(result["plan"]["model_parameters"], 736)
+        self.assertFalse(result["plan"]["execution_permitted"])
+        self.assertEqual(result["arguments"]["metadata"],
+                         tuple(self.bodies[name] for name in NAMES[:5]))
+        self.assertNotIn("checkpoint_root", result["arguments"])
+        result["plan"]["checkpoint_inventory"][0]["bytes"] = 0
+        self.assertGreater(self.prepare()["plan"]["checkpoint_inventory"][0]["bytes"], 0)
+
+    def test_every_independent_pin_is_required(self):
+        for key in ("expected_control_sha256", "expected_entry_sha256",
+                    "expected_source_manifest_sha256", "expected_attempt_nonce_sha256"):
+            with self.subTest(key=key), self.assertRaises(m.FullsizeEntryError):
+                self.prepare(**{key: "0" * 64})
+
+    def test_control_is_canonical_with_eight_exact_file_bindings(self):
+        raw = control_for(self.bodies)
+        value = json.loads(raw)
+        self.assertEqual(raw, canonical(value))
+        self.assertEqual([row["path"] for row in value["files"]], list(NAMES))
+        for row in value["files"]:
+            body = self.bodies[row["path"]]
+            self.assertEqual(row, {"path": row["path"], "bytes": len(body),
+                                   "sha256": digest(body)})
+
+    def test_control_keys_are_closed_against_approval_and_path_injection(self):
+        original = json.loads(control_for(self.bodies))
+        for key in (*original, "approved", "execution_permitted", "checkpoint_root",
+                    "runtime_callback", "retry_allowed"):
+            value = copy.deepcopy(original)
+            if key in value:
+                del value[key]
+            else:
+                value[key] = True
+            raw = canonical(value)
+            with self.subTest(key=key), self.assertRaises(m.FullsizeEntryError):
+                self.prepare(control_raw=raw, expected_control_sha256=digest(raw))
+
+    def test_control_duplicate_nonfinite_noncanonical_and_oversize_rejected(self):
+        for raw in (b'{"x":1,"x":2}', b'{"x":NaN}', b'{"x":Infinity}', b'[]', b'{',
+                    control_for(self.bodies) + b"\n", b" " * (1048576 + 1)):
+            with self.subTest(length=len(raw)), self.assertRaises(m.FullsizeEntryError):
+                self.prepare(control_raw=raw, expected_control_sha256=digest(raw))
+
+    def test_control_file_records_have_closed_types_order_names_and_hashes(self):
+        original = json.loads(control_for(self.bodies))
+        mutations = [lambda v: v["files"].reverse(),
+                     lambda v: v["files"].append(v["files"][0]),
+                     lambda v: v["files"][0].update(path="../base.json"),
+                     lambda v: v["files"][0].update(bytes=True),
+                     lambda v: v["files"][0].update(bytes=0),
+                     lambda v: v["files"][0].update(bytes=1048577),
+                     lambda v: v["files"][0].update(sha256="A" * 64),
+                     lambda v: v["files"][0].update(approved=True)]
+        for mutate in mutations:
+            value = copy.deepcopy(original)
+            mutate(value)
+            raw = canonical(value)
+            with self.subTest(control=value), self.assertRaises(m.FullsizeEntryError):
+                self.prepare(control_raw=raw, expected_control_sha256=digest(raw))
+
+    def test_body_set_and_types_are_closed(self):
+        for change in ("missing", "extra", "bytearray", "oversize"):
+            bodies = dict(self.bodies)
+            if change == "missing":
+                del bodies["config.json"]
+            elif change == "extra":
+                bodies["approval.json"] = b"{}"
+            elif change == "bytearray":
+                bodies["base.json"] = bytearray(bodies["base.json"])
+            else:
+                bodies["base.json"] = b" " * (1048576 + 1)
+            with self.subTest(change=change), self.assertRaises(m.FullsizeEntryError):
+                m.prepare_entry(**arguments(bodies, self.sources))
+
+    def test_each_body_corruption_is_rejected_without_rebinding(self):
+        raw = control_for(self.bodies)
+        for name in NAMES:
+            bodies = dict(self.bodies)
+            bodies[name] += b" "
+            with self.subTest(name=name), self.assertRaises(m.FullsizeEntryError):
+                m.prepare_entry(**arguments(bodies, self.sources, raw))
+
+    def test_json_body_duplicates_and_nonfinite_rejected_after_rebinding(self):
+        for name in set(NAMES) - {"manifest.sha256"}:
+            for raw in (b'{"x":1,"x":2}', b'{"x":NaN}'):
+                bodies = dict(self.bodies)
+                bodies[name] = raw
+                with self.subTest(name=name, length=len(raw)), \
+                        self.assertRaises(m.FullsizeEntryError):
+                    m.prepare_entry(**arguments(bodies, self.sources))
+
+    def test_rebound_plan_envelope_and_contract_whitespace_preserves_exact_bytes(self):
+        for name in ("plan.json", "envelope.json", "kernel-io.json"):
+            bodies = dict(self.bodies)
+            bodies[name] += b"\n"
+            with self.subTest(name=name):
+                prepared = m.prepare_entry(**arguments(bodies, self.sources))
+                self.assertEqual(prepared["plan"]["model_parameters"], 736)
+                control = json.loads(control_for(bodies))
+                row = next(row for row in control["files"] if row["path"] == name)
+                self.assertEqual(row["sha256"], digest(bodies[name]))
+
+    def test_body_bundle_total_cap_is_checked_independently_of_per_file_cap(self):
+        bodies = {name: b" " * (m.MAXIMUM_BUNDLE_BYTES // len(NAMES) + 1)
+                  for name in NAMES}
+        self.assertTrue(all(len(raw) <= m.MAXIMUM_CONTROL_BYTES for raw in bodies.values()))
+        with self.assertRaises(m.FullsizeEntryError):
+            control_for(bodies)
+
+    def test_builder_pin_types_and_values_are_closed(self):
+        pins = {"entry_sha256": ENTRY_PIN, "source_manifest_sha256": SOURCE_PIN,
+                "attempt_nonce_sha256": NONCE_PIN}
+        for key in pins:
+            for value in (True, None, "", "A" * 64, "0" * 64, "a" * 63):
+                with self.subTest(key=key, value=value), self.assertRaises(m.FullsizeEntryError):
+                    m.build_control(self.bodies, **(pins | {key: value}))
+
+    def test_inventory_sizes_and_all_derived_runner_bindings_are_exact(self):
+        prepared = self.prepare()
+        for role, key in (("checkpoint", "checkpoint_inventory"),
+                          ("tokenizer", "tokenizer_inventory")):
+            self.assertEqual(prepared["inventories"][role], {
+                row["path"]: row["bytes"] for row in prepared["plan"][key]})
+        args = prepared["arguments"]
+        self.assertEqual(args["expected_base_sha256"], digest(self.bodies["base.json"]))
+        self.assertEqual(args["expected_plan_file_sha256"], digest(self.bodies["plan.json"]))
+        self.assertEqual(args["expected_envelope_file_sha256"],
+                         digest(self.bodies["envelope.json"]))
+        self.assertEqual(args["expected_kernel_io_contract_sha256"],
+                         json.loads(self.bodies["kernel-io.json"])["contract_sha256"])
+        self.assertEqual(prepared["limits"]["maximum_coordinator_read_bytes"],
+                         prepared["envelope"]["coordinator_read_cap_bytes"])
+        self.assertEqual(prepared["limits"]["maximum_private_write_bytes"],
+                         prepared["envelope"]["private_write_cap_bytes"])
+
+    def test_synthetic_markers_cannot_admit_fixture_controls(self):
+        for marker in ("synthetic_fixture_only", "prepared_fixture_marker"):
+            base = json.loads(self.bodies["base.json"])
+            base[marker] = True if marker == "synthetic_fixture_only" else {
+                "schema": "fixture", "generation_nonce_sha256": NONCE_PIN}
+            bodies = dict(self.bodies, **{"base.json": canonical(base)})
+            with self.subTest(marker=marker), self.assertRaises(m.FullsizeEntryError):
+                m.prepare_entry(**arguments(bodies, self.sources))
+
+    def test_runtime_sources_exact_names_bytes_and_hashes_required(self):
+        for change in ("wrong", "missing", "extra", "bytearray", "prefixed"):
+            sources = dict(self.sources)
+            if change == "wrong":
+                sources["modeling_lumi.py"] = b"changed"
+            elif change == "missing":
+                del sources["modeling_lumi.py"]
+            elif change == "extra":
+                sources["extra.py"] = b"code"
+            elif change == "bytearray":
+                sources["modeling_lumi.py"] = bytearray(sources["modeling_lumi.py"])
+            else:
+                sources = {"lumi/" + key: value for key, value in sources.items()}
+            with self.subTest(change=change), self.assertRaises(m.FullsizeEntryError):
+                self.prepare(runtime_sources=sources)
+
+    def test_resource_undercaps_reject_before_any_io(self):
+        fields = ("coordinator_read_cap_bytes", "dcp_read_cap_bytes", "hf_read_cap_bytes",
+                  "hf_write_cap_bytes", "package_read_cap_bytes", "package_write_cap_bytes",
+                  "private_write_cap_bytes", "worker_memory_max_bytes", "output_capacity_bytes",
+                  "host_disk_capacity_bytes")
+        for field in fields:
+            bodies = dict(self.bodies)
+            envelope = json.loads(bodies["envelope.json"])
+            envelope[field] = 1
+            bodies["envelope.json"] = canonical(envelope)
+            with self.subTest(field=field), patch("os.open", side_effect=AssertionError), \
+                    self.assertRaises(m.FullsizeEntryError):
+                m.prepare_entry(**arguments(bodies, self.sources))
+
+    def test_tampered_plan_cannot_be_self_authorized_by_internal_rehash(self):
+        for change in ("count", "checkpoint", "tokenizer", "approval"):
+            bodies = dict(self.bodies)
+            plan = json.loads(bodies["plan.json"])
+            if change == "count":
+                plan["model_parameters"] += 1
+            elif change == "checkpoint":
+                plan["checkpoint_inventory"][0]["bytes"] += 1
+            elif change == "tokenizer":
+                plan["tokenizer_inventory"][0]["sha256"] = "0" * 64
+            else:
+                plan["execution_permitted"] = True
+            plan["plan_sha256"] = digest(canonical({key: value for key, value in plan.items()
+                                                    if key != "plan_sha256"}))
+            bodies["plan.json"] = canonical(plan)
+            with self.subTest(change=change), self.assertRaises(m.FullsizeEntryError):
+                m.prepare_entry(**arguments(bodies, self.sources))
+
+    def test_public_entry_rejects_before_parsing_runtime_or_coordinator_effects(self):
+        with patch.object(m, "prepare_entry") as prepare, \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^host_guard_not_bound$"):
+                m.run_import(approved=True, checkpoint_root="/real/checkpoint", callback=object())
+        prepare.assert_not_called()
+
+
+def coordinator_result(prepared):
+    """Synthetic exact runner result; deliberately includes opaque private text."""
+    return {"schema_version": m.runner.SCHEMA,
+        "status": "PASS_import_coordinator_requires_parent_verification", "stage": "complete",
+        "plan_sha256": prepared["plan"]["plan_sha256"],
+        "resource_envelope_sha256": prepared["bindings"]["envelope_file_sha256"],
+        "kernel_io_contract_sha256": prepared["bindings"]["kernel_io_contract_sha256"],
+        "full_input_audits_completed": 2, "observed_input_identities_unchanged": True,
+        "atomic_input_immutability_verified": False, "reservations_refunded": False,
+        "retry_allowed": False, "native_backend_read_bytes_metered": False,
+        "explicit_checkpoint_and_HF_content_metered": True,
+        "dependency_module_reads_metered": False,
+        "durable_completion_is_execution_authority": False,
+        "success_requires_returned_outcome_and_parent_supervisor": True,
+        "os_memory_write_limits_enforced": False, "hard_timeout_enforced_here": False,
+        "real_4b_import": False, "training_authorized": False, "production_eligible": False,
+        "kernel_evidence_sha256": "c" * 64,
+        "package": {"private_path": "/secret/private-input", "untrusted": "never retain text"},
+        "content_accounting": {"private_path": "/secret/private-output"},
+        "coordinator_read_bytes_reserved": prepared["limits"]["maximum_coordinator_read_bytes"],
+        "private_write_bytes_reserved": prepared["limits"]["maximum_private_write_bytes"]}
+
+
+class FullsizeOneShotTests(unittest.TestCase):
+    def setUp(self):
+        bodies, sources = fixture()
+        self.kwargs = arguments(bodies, sources)
+        self.prepared = m.prepare_entry(**self.kwargs)
+        self.result = coordinator_result(self.prepared)
+        self.state = patch.object(m, "_ATTEMPTED", False)
+        self.state.start()
+        self.addCleanup(self.state.stop)
+
+    def test_runtime_gate_precedes_prepare_and_all_io(self):
+        with patch.object(m.runner.sys, "platform", "darwin"), \
+                patch.object(m, "prepare_entry") as prepare, \
+                patch.object(m.runner, "_coordinate_admitted_import") as coordinate, \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^runtime_rejected$"):
+                m._run_admitted_once(**self.kwargs)
+        prepare.assert_not_called()
+        coordinate.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_runtime_exceptions_are_closed_and_do_not_consume_attempt(self):
+        for error in (RuntimeError("private runtime text"), KeyboardInterrupt(), SystemExit(4)):
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(m.runner, "_runtime", side_effect=error), \
+                    patch.object(m.runner, "_coordinate_admitted_import") as coordinate:
+                with self.assertRaises(m.FullsizeEntryError) as caught:
+                    m._run_admitted_once(**self.kwargs)
+            self.assertEqual(caught.exception.args, ("runtime_rejected",))
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertFalse(m._ATTEMPTED)
+            coordinate.assert_not_called()
+
+    def test_invalid_controls_do_not_reach_coordinator_or_consume_attempt(self):
+        bad = self.kwargs | {"expected_entry_sha256": "f" * 64}
+        with patch.object(m.runner, "_runtime"), \
+                patch.object(m.runner, "_coordinate_admitted_import") as coordinate:
+            with self.assertRaises(m.FullsizeEntryError):
+                m._run_admitted_once(**bad)
+        coordinate.assert_not_called()
+        self.assertFalse(m._ATTEMPTED)
+
+    def test_success_calls_fixed_coordinator_once_and_returns_only_closed_nonclaims(self):
+        with patch.object(m.runner, "_runtime") as runtime, \
+                patch.object(m.runner, "_coordinate_admitted_import", return_value=self.result) \
+                as coordinate:
+            result = m._run_admitted_once(**self.kwargs)
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^already_attempted$"):
+                m._run_admitted_once(**self.kwargs)
+        runtime.assert_called_once_with()
+        coordinate.assert_called_once_with(**self.prepared["arguments"],
+            checkpoint_root=Path("/inputs/checkpoint"), tokenizer_root=Path("/inputs/tokenizer"),
+            attempt=Path("/outputs/import/attempt-001"))
+        self.assertTrue(m._ATTEMPTED)
+        self.assertEqual(result["schema"], m.SCHEMA)
+        self.assertEqual(result["status"], "coordinator_returned_parent_verification_required")
+        self.assertEqual(result["coordinator_passes"], 1)
+        self.assertEqual((result["checkpoint_full_audits"], result["tokenizer_full_audits"]),
+                         (2, 2))
+        self.assertEqual(result["input_files"], 9)
+        self.assertEqual(result["input_bytes"], sum(
+            sum(rows.values()) for rows in self.prepared["inventories"].values()))
+        self.assertTrue(all(result[key] is False for key in m.FALSE_FLAGS))
+        self.assertFalse(any(type(value) in {dict, list} for value in result.values()))
+        self.assertNotIn("/secret/", canonical(result).decode())
+        self.assertNotIn("never retain text", canonical(result).decode())
+        self.assertEqual(result["coordinator_result_sha256"], digest(canonical(self.result)))
+        for key, value in self.prepared["bindings"].items():
+            self.assertEqual(result[key], value)
+
+    def test_coordinator_failure_is_closed_consumed_and_never_retried(self):
+        errors = (RuntimeError("/secret/raw backend error"), KeyboardInterrupt(), SystemExit(9))
+        for error in errors:
+            with self.subTest(error=type(error).__name__), patch.object(m, "_ATTEMPTED", False), \
+                    patch.object(m.runner, "_runtime") as runtime, \
+                    patch.object(m.runner, "_coordinate_admitted_import", side_effect=error) \
+                    as coordinate:
+                with self.assertRaises(m.FullsizeEntryError) as caught:
+                    m._run_admitted_once(**self.kwargs)
+                self.assertEqual(caught.exception.args, ("import_failed",))
+                self.assertTrue(caught.exception.__suppress_context__)
+                self.assertTrue(m._ATTEMPTED)
+                with self.assertRaisesRegex(m.FullsizeEntryError, "^already_attempted$"):
+                    m._run_admitted_once(**self.kwargs)
+                coordinate.assert_called_once()
+                runtime.assert_called_once()
+
+    def test_invalid_result_is_consumed_and_cannot_be_retried(self):
+        with patch.object(m.runner, "_runtime"), \
+                patch.object(m.runner, "_coordinate_admitted_import", return_value={}) \
+                as coordinate:
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^result_rejected$"):
+                m._run_admitted_once(**self.kwargs)
+            self.assertTrue(m._ATTEMPTED)
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^already_attempted$"):
+                m._run_admitted_once(**self.kwargs)
+        coordinate.assert_called_once()
+
+    def test_result_missing_extra_and_changed_claims_are_rejected(self):
+        for key in (*self.result, "approved", "gate_5_complete"):
+            result = copy.deepcopy(self.result)
+            if key in result:
+                del result[key]
+            else:
+                result[key] = True
+            with self.subTest(key=key), self.assertRaisesRegex(m.FullsizeEntryError,
+                                                                   "^result_rejected$"):
+                m._result(result, self.prepared)
+        changes = {"full_input_audits_completed": True, "stage": "partial",
+                   "observed_input_identities_unchanged": 1, "retry_allowed": True,
+                   "training_authorized": True, "production_eligible": True,
+                   "os_memory_write_limits_enforced": True, "hard_timeout_enforced_here": True,
+                   "resource_envelope_sha256": "f" * 64, "plan_sha256": "f" * 64,
+                   "kernel_io_contract_sha256": "f" * 64, "package": [],
+                   "content_accounting": [], "kernel_evidence_sha256": "0" * 64}
+        for key, value in changes.items():
+            with self.subTest(key=key), self.assertRaisesRegex(m.FullsizeEntryError,
+                                                                   "^result_rejected$"):
+                m._result(self.result | {key: value}, self.prepared)
+
+    def test_returned_counters_cannot_exceed_prepared_limits_or_use_bool(self):
+        for key in ("coordinator_read_bytes_reserved", "private_write_bytes_reserved"):
+            for value in (True, 0, -1, self.result[key] + 1, "1", 1.0):
+                with self.subTest(key=key, value=value), \
+                        self.assertRaisesRegex(m.FullsizeEntryError, "^result_rejected$"):
+                    m._result(self.result | {key: value}, self.prepared)
+
+    def test_opaque_nested_evidence_is_hashed_but_never_retained(self):
+        changed = copy.deepcopy(self.result)
+        changed["package"]["untrusted"] = "different private text"
+        before = m._result(self.result, self.prepared)
+        after = m._result(changed, self.prepared)
+        self.assertNotEqual(before["coordinator_result_sha256"], after["coordinator_result_sha256"])
+        self.assertNotIn("different private text", canonical(after).decode())
+        self.assertNotIn("package", after)
+        self.assertNotIn("content_accounting", after)
+
+    def test_nested_result_tree_caps_types_cycles_and_integers_are_closed(self):
+        cycle = {}
+        cycle["again"] = cycle
+        deep = {}
+        for _ in range(26):
+            deep = {"again": deep}
+        malformed = [object(), 1.0, float("nan"), float("inf"), 2**63, -(2**63) - 1,
+                     "x" * 4097, {"x" * 257: 1}, [0] * 4097, cycle, deep,
+                     {str(i): "x" * 4096 for i in range(6)}]
+        for value in malformed:
+            result = self.result | {"package": {"invalid": value}}
+            with self.subTest(kind=type(value).__name__), \
+                    self.assertRaisesRegex(m.FullsizeEntryError, "^result_rejected$"):
+                m._result(result, self.prepared)
+
+    def test_malformed_nested_return_is_terminal_and_no_new_attempt_is_allowed(self):
+        malformed = self.result | {"package": {"invalid": object()}}
+        with patch.object(m.runner, "_runtime") as runtime, \
+                patch.object(m.runner, "_coordinate_admitted_import", return_value=malformed) \
+                as coordinate:
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^result_rejected$"):
+                m._run_admitted_once(**self.kwargs)
+            self.assertTrue(m._ATTEMPTED)
+            with self.assertRaisesRegex(m.FullsizeEntryError, "^already_attempted$"):
+                m._run_admitted_once(**self.kwargs)
+            runtime.assert_called_once()
+            coordinate.assert_called_once()
+
+    def test_error_codes_never_include_unrecognized_text(self):
+        for value in ("private /home/path traceback", None, True, {}, ["runtime_rejected"]):
+            error = m.FullsizeEntryError(value)
+            self.assertEqual(error.args, ("control_rejected",))
+            self.assertIn(error.code, m.ERROR_CODES)
+
+
+if __name__ == "__main__":
+    unittest.main()

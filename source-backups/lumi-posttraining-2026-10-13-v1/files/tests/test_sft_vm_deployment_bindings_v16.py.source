@@ -1,0 +1,34 @@
+"""Offline verification for final corrected CPU-scope bindings."""
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v16 as m
+
+
+class Tests(unittest.TestCase):
+    def test_final_scope_and_sources_verify(self):
+        manifest = m.verify()
+        plan = m.build()
+        scope = plan["cpu_scope_reference"]
+        self.assertEqual(len(manifest["outputs"]), 156)
+        self.assertTrue(scope["source"]["source_versions_bound"])
+        self.assertFalse(scope["source"]["wire_or_billing_byte_cap_claimed"])
+        self.assertTrue(scope["watchdog_launch_interlock_bound"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_prior_controls_still_verify(self):
+        self.assertEqual(set(m.controls()), {m.WATCH, m.STORE})
+
+    def test_drift_rejected(self):
+        for key in ("SOURCE_BINDINGS_SHA", "PLAN_SHA", "PLAN_RELEASE_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

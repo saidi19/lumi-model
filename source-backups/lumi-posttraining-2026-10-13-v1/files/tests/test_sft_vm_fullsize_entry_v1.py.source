@@ -1,0 +1,167 @@
+"""Cold-entry wiring with real synthetic control validation, never real weights."""
+import importlib
+import importlib.util
+import json
+import os
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_checkpoint_fullsize_entry_v1 as fixture
+
+ROOT = Path(__file__).resolve().parents[1]
+adapter = importlib.import_module(fixture.PACKAGE + ".posttraining_checkpoint_vm_fullsize_entry_v1")
+
+
+def load():
+    spec = importlib.util.spec_from_file_location("fullsize_entry_test",
+        ROOT / "scripts/run_sft_vm_fullsize_entry_v1.py")
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    return entry
+
+
+class EntryTests(unittest.TestCase):
+    def setUp(self):
+        self.m = load()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.m.OUTPUT = self.root
+        self.m.ATTEMPT = self.root / "import/attempt-001"
+        self.m.SUMMARY = self.root / "summary.json"
+        self.bodies, self.sources = fixture.fixture(fullsize=True)
+        self.script, self.manifest = b"synthetic source entry", b"synthetic source manifest"
+        self.pins = {"entry_sha256": self.m.digest(self.script),
+                     "source_manifest_sha256": self.m.digest(self.manifest),
+                     "attempt_nonce_sha256": "c" * 64}
+        self.raw = adapter.build_control(self.bodies, **self.pins)
+        self.pins["control_sha256"] = self.m.digest(self.raw)
+        self.complete = {"package": {"manifest_file_sha256": "d" * 64}}
+        self.result = {"coordinator_result_sha256": self.m.digest(
+            adapter.runner.canonical(self.complete)), "real_4b_import": False}
+        self.enterContext(patch.object(self.m, "boundary"))
+        self.enterContext(patch.object(self.m, "load_runner", return_value=adapter.runner))
+        self.enterContext(patch.object(adapter.runner, "_runtime"))
+        self.enterContext(patch.object(self.m, "read_private", side_effect=self.read))
+        self.enterContext(patch.object(self.m.os, "statvfs", side_effect=lambda p:
+            types.SimpleNamespace(f_flag=0 if p == self.root else os.ST_RDONLY)))
+        self.enterContext(patch.object(self.m.importlib, "import_module", return_value=adapter))
+        self.coordinate = self.enterContext(patch.object(adapter, "_run_admitted_once",
+                                                          return_value=self.result))
+
+    def read(self, path, *_args):
+        if path == self.m.ENTRY:
+            return self.script
+        if path == self.m.RELEASE / "release-manifest.json":
+            return self.manifest
+        if path == self.m.CONTROL_ROOT / "control.json":
+            return self.raw
+        if path.name == adapter.runner.COMPLETE:
+            return adapter.runner.canonical(self.complete) + b"\n"
+        return (self.bodies | self.sources)[path.name]
+
+    def execute(self):
+        return self.m.execute("1"*32, self.pins)
+
+    def test_real_control_validation_then_adapter_and_bound_summary(self):
+        result = self.execute()
+        self.assertEqual(self.coordinate.call_count, 1)
+        self.assertEqual(result["package_manifest_sha256"], "d" * 64)
+        self.assertFalse(result["independent_checksum_consumer"])
+        self.assertEqual(json.loads(self.m.SUMMARY.read_bytes()), result)
+        self.assertEqual(self.m.ATTEMPT.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_wrong_script_pin_stops_before_coordinator(self):
+        self.pins["entry_sha256"] = "9"*64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.coordinate.assert_not_called()
+        self.assertFalse(self.m.ATTEMPT.parent.exists())
+
+    def test_invalid_control_stops_before_output_mutation(self):
+        self.raw += b" "
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.coordinate.assert_not_called()
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_writable_input_rejected_before_control_reads(self):
+        with patch.object(self.m.os, "statvfs", return_value=types.SimpleNamespace(f_flag=0)):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.m.read_private.assert_not_called()
+        self.coordinate.assert_not_called()
+
+    def test_old_output_parent_not_reused_and_entry_consumed(self):
+        self.m.ATTEMPT.parent.mkdir(mode=0o700)
+        with self.assertRaises(FileExistsError):
+            self.execute()
+        self.coordinate.assert_not_called()
+        self.assertTrue(self.m.CONSUMED)
+        with self.assertRaises(ValueError):
+            self.execute()
+
+    def test_import_failure_consumes_and_does_not_write_summary(self):
+        self.coordinate.side_effect = ValueError("private details")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertTrue(self.m.CONSUMED)
+        self.assertFalse(self.m.SUMMARY.exists())
+        self.assertEqual(self.m.STAGE, "import")
+
+    def test_terminal_must_match_returned_result(self):
+        self.complete["package"]["manifest_file_sha256"] = "e" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertFalse(self.m.SUMMARY.exists())
+        self.assertEqual(self.m.STAGE, "result")
+
+    def test_summary_exclusive_does_not_overwrite(self):
+        self.m.SUMMARY.touch()
+        with self.assertRaises(FileExistsError):
+            self.execute()
+        self.assertEqual(self.m.SUMMARY.stat().st_size, 0)
+
+    def test_boundary_precedes_loader(self):
+        self.m.boundary.side_effect = ValueError("boundary")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.m.load_runner.assert_not_called()
+
+    def test_fullsize_output_literal_not_passed_to_frozen_depth_validator(self):
+        # Explicit regression for the old /work depth bug: /outputs is also
+        # depth two. Validate its mode directly, then let runner check /outputs/import.
+        with patch.object(adapter.runner, "_path") as paths:
+            self.execute()
+        paths.assert_not_called()
+        self.assertEqual(load().ATTEMPT, Path("/outputs/import/attempt-001"))
+
+
+class ReadTests(unittest.TestCase):
+    def test_small_private_read_and_reject_link_mode_size(self):
+        entry = load()
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            path = root / "control"
+            path.write_bytes(b"synthetic")
+            path.chmod(0o400)
+            self.assertEqual(entry.read_private(path), b"synthetic")
+            with self.assertRaises(ValueError):
+                entry.read_private(path, 3)
+            path.chmod(0o666)
+            with self.assertRaises(ValueError):
+                entry.read_private(path)
+            link = root / "link"
+            link.symlink_to(path)
+            with self.assertRaises(ValueError):
+                entry.read_private(link)
+
+    def test_fixed_native_boundary_rejects_local_process(self):
+        entry = load()
+        with self.assertRaises(ValueError):
+            entry.boundary("1" * 32)
+
+
+if __name__ == "__main__":
+    unittest.main()

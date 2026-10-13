@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Independent read-only CPU package check using the EXISTING SFT consumer.
+
+Runs only in its fixed admitted Linux unit after import teardown. No checkpoint
+conversion, tensor deserialization, acquisition, training or retention upload.
+Local tests use tiny files and the unchanged consumer functions from source.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+RELEASE = Path("/work/release")
+SCRIPT = RELEASE / "scripts/verify_sft_vm_fullsize_package_v1.py"
+PACKAGE = Path("/package")
+RESULT = Path("/results/verification.json")
+MAX_PACKAGE_BYTES = 8_415_205_181
+MAX_MANIFEST_BYTES = 131072
+CONSUMED = False
+
+
+def need(value):
+    if not value:
+        raise ValueError("package_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def private_tree(root, expected_manifest):
+    """Metadata plus bounded manifest before consumer content reads.
+
+    Uniqueness closes the frozen consumer's repeated-line accounting gap.
+    The independent parent must exclude external writers; read-only mounts
+    alone are not a substitute for that premise.
+    """
+    need(type(expected_manifest) is str and re.fullmatch(r"[0-9a-f]{64}", expected_manifest))
+    need(not any(p.is_symlink() for p in (root, *root.parents)))
+    paths = [root]
+    inventory, total, manifest_bytes = set(), 0, 0
+    for index, path in enumerate(_walk(root, paths), 1):
+        need(index <= 1024)
+        info = path.lstat()
+        need((info.st_uid, info.st_gid) == (os.geteuid(), os.getegid()))
+        if stat.S_ISDIR(info.st_mode):
+            need(stat.S_IMODE(info.st_mode) == 0o700)
+            continue
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+             and stat.S_IMODE(info.st_mode) == 0o600 and 0 < info.st_size <= 2**31)
+        name = path.relative_to(root).as_posix()
+        need(len(name) <= 256 and len(inventory) < 512)
+        inventory.add(name)
+        total += info.st_size
+        need(total <= MAX_PACKAGE_BYTES)
+        if name == "manifest.sha256":
+            manifest_bytes = info.st_size
+    need(0 < manifest_bytes <= MAX_MANIFEST_BYTES)
+    fd = os.open(root / "manifest.sha256", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        raw = stream.read(MAX_MANIFEST_BYTES+1)
+    need(len(raw) == manifest_bytes and sha(raw) == expected_manifest)
+    declared = {"manifest.sha256"}
+    for line in raw.decode("utf-8").splitlines():
+        digest, separator, name = line.partition("  ")
+        need(separator and re.fullmatch(r"[0-9a-f]{64}", digest)
+             and name not in declared and name in inventory)
+        declared.add(name)
+    need(len(declared) >= 3 and declared == inventory)
+    # Our preflight reads manifest once, consumer reads it twice and each
+    # remaining file once. No extra checkpoint/tokenizer input audit here.
+    return {"files": len(inventory), "package_bytes": total,
+            "maximum_content_read_bytes": total + 2*manifest_bytes}
+
+
+def _walk(root, pending):
+    # Never recurse through a symlink. Directory entry count is bounded before
+    # materializing the whole tree; the caller enforces file count/size/modes.
+    visited = 0
+    while pending:
+        path = pending.pop()
+        yield path
+        if stat.S_ISDIR(path.lstat().st_mode):
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    visited += 1
+                    need(visited <= 1024 and len(Path(entry.path).relative_to(root).parts) <= 8)
+                    pending.append(Path(entry.path))
+
+
+def boundary(attempt):
+    need(sys.platform == "linux" and Path(__file__) == SCRIPT
+         and sys.flags.isolated and sys.dont_write_bytecode
+         and os.geteuid() == os.getegid() == 10001 and os.getgroups() in ([], [10001])
+         and type(attempt) is str and re.fullmatch(r"[0-9a-f]{32}", attempt))
+    unit = f"lumi-vm-fullsize-v1-{attempt}-verify.service"
+    with open("/proc/self/cgroup", "rb") as stream:
+        need(stream.read(4097).strip() == f"0::/system.slice/{unit}".encode())
+    for name, value in (("memory.max", 2*1024**3), ("memory.swap.max", 0), ("pids.max", 64)):
+        with (Path("/sys/fs/cgroup/system.slice") / unit / name).open("rb") as stream:
+            need(stream.read(65).strip() == str(value).encode())
+    need(os.statvfs(RELEASE).f_flag & os.ST_RDONLY
+         and os.statvfs(PACKAGE).f_flag & os.ST_RDONLY
+         and not os.statvfs(RESULT.parent).f_flag & os.ST_RDONLY)
+
+
+def consumer(source_pin):
+    need(type(source_pin) is str and re.fullmatch(r"[0-9a-f]{64}", source_pin))
+    spec = importlib.util.spec_from_file_location("_verify_entry_helpers",
+        RELEASE / "scripts/run_sft_vm_fullsize_entry_v1.py")
+    helpers = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helpers)
+    raw = helpers.read_private(RELEASE / "release-manifest.json")
+    need(sha(raw) == source_pin)
+    manifest = json.loads(raw)
+    need(sha(helpers.read_private(SCRIPT)) == manifest["scripts/" + SCRIPT.name])
+    helpers.load_runner()  # Same stdlib cold loader; does not run the coordinator.
+    from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+    return _verify_checksum_manifest
+
+
+def verify_package(root, expected, check):
+    totals = private_tree(root, expected)
+    need(check(root, expected_manifest_sha256=expected, require_exact_inventory=True,
+               require_private=True) == expected)
+    return {"schema": "lumi.vm-fullsize-package-verification.v0.1", "status": "passed",
+            "package_manifest_sha256": expected, **totals,
+            "independent_checksum_consumer": True, "offhost_retention_verified": False,
+            "real_4b_import": False, "gate_5_complete": False, "training_authorized": False}
+
+
+def execute(attempt, manifest_pin, source_pin):
+    global CONSUMED
+    need(not CONSUMED)
+    boundary(attempt)
+    check = consumer(source_pin)
+    CONSUMED = True
+    report = verify_package(PACKAGE, manifest_pin, check)
+    raw = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+    need(len(raw) <= 4096)
+    fd = os.open(RESULT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--attempt", required=True)
+    parser.add_argument("--package-manifest-sha256", required=True)
+    parser.add_argument("--source-manifest-sha256", required=True)
+    args = parser.parse_args()
+    try:
+        execute(args.attempt, args.package_manifest_sha256, args.source_manifest_sha256)
+    except BaseException:
+        parser.exit(1, "package_verification_failed\n")
+
+
+if __name__ == "__main__":
+    main()

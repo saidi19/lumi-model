@@ -1,0 +1,320 @@
+"""Detached root protocol for an independently admitted/bound Linux controller.
+
+No cloud launch or SSH. The final admitted root entry must call these private
+operations and expose only aggregate status. Public execution remains closed.
+The entry script is not supplied by this module: it must be staged and hash
+bound by the final native admission/bootstrap before dispatch is possible.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import os
+import select
+import stat
+import time
+from pathlib import Path
+
+from . import posttraining_vm_fullsize_credential_setup_v1 as setup
+
+handoff = setup.handoff
+RUNTIME = 8435
+WAIT_INPUT = 30
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_parent_rejected") from None
+
+
+def paths(attempt):
+    handoff.unit_name(attempt, "import")
+    root = handoff.ROOT / attempt
+    setup.workflow._directory(root)
+    return root, root / "credential-delivery.fifo"
+
+
+def unit(attempt):
+    handoff.unit_name(attempt, "import")
+    return f"lumi-vm-fullsize-v1-{attempt}-parent.service"
+
+
+def marker(root, name, value):
+    handoff.frozen.write_new(root / name, value)
+    setup.completion._fsync_directory(root)
+
+
+def fifo_info(path):
+    info = path.lstat()
+    need(
+        stat.S_ISFIFO(info.st_mode)
+        and info.st_uid == setup.workflow.ROOT_UID
+        and info.st_gid == setup.workflow.ROOT_GID
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 1
+    )
+    return info.st_dev, info.st_ino
+
+
+def command(attempt, entry_pin):
+    root, _ = paths(attempt)
+    entry = root / "controller" / "parent.py"
+    need(handoff.frozen.hex_id(entry_pin, 64))
+    handoff.frozen.root_owned(entry)
+    need(hashlib.sha256(handoff.frozen.small(entry, 131072)).hexdigest() == entry_pin)
+    # Must use the host mount namespace: the existing source tmpfs must be
+    # visible to systemd's separate acquisition LoadCredential operation.
+    props = {
+        "User": "root",
+        "Group": "root",
+        "Restart": "no",
+        "RuntimeMaxSec": str(RUNTIME),
+        "TimeoutStartSec": "15",
+        "TimeoutStopSec": "60",
+        "KillMode": "control-group",
+        "SendSIGKILL": "yes",
+        "OOMPolicy": "kill",
+        "LimitCORE": "0",
+        "UMask": "0077",
+        "MemoryMax": str(1024**3),
+        "MemorySwapMax": "0",
+        "TasksMax": "64",
+        "PrivateMounts": "no",
+        "PrivateNetwork": "no",
+        "RestrictAddressFamilies": "AF_UNIX",
+        "WorkingDirectory": str(root),
+        "StandardInput": "null",
+        "StandardOutput": "null",
+        "StandardError": "null",
+        "RemainAfterExit": "no",
+        "ExecStopPost": f"/usr/bin/python3 -I -B {entry} stop {attempt}",
+    }
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + unit(attempt),
+        ]
+        + [f"--property={key}={value}" for key, value in props.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", str(entry), "serve", attempt]
+    )
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _dispatch_admitted_once(attempt, entry_pin, *, machine_id):
+    handoff.frozen.host_check(machine_id)
+    root, fifo = paths(attempt)
+    launch = command(attempt, entry_pin)
+    state = handoff.frozen.run_command(
+        ["/usr/bin/systemctl", "show", unit(attempt), "--property=LoadState", "--value"],
+        5,
+        capture=True,
+    )
+    need(
+        state.returncode in {0, 1, 4}
+        and state.stdout.strip() == b"not-found"
+        and handoff.frozen.cgroup_empty(unit(attempt))
+    )
+    marker(root, "detached-dispatch.started.json", {"retry_allowed": False})
+    os.mkfifo(fifo, 0o600)
+    fifo_info(fifo)
+    setup.completion._fsync_directory(root)
+    # The marker stays consumed if dispatch fails or its outcome is ambiguous.
+    need(handoff.frozen.run_command(launch, 15).returncode == 0)
+    return {"dispatch_requested": True, "workflow_completed": False}
+
+
+def _submit_admitted_once(attempt, raw, *, machine_id):
+    handoff.frozen.host_check(machine_id)
+    root, fifo = paths(attempt)
+    need(type(raw) in {bytes, bytearray} and 0 < len(raw) <= setup.MAX_INPUT)
+    # Validate without weakening the frozen normalization/expiry contract.
+    setup._normalize(raw, time.time())
+    need((root / "detached-dispatch.started.json").is_file())
+    identity = fifo_info(fifo)
+    marker(root, "credential-delivery.started.json", {"retry_allowed": False})
+    deadline, fd = time.monotonic() + 10, None
+    try:
+        while fd is None and time.monotonic() < deadline:
+            need(fifo_info(fifo) == identity)
+            try:
+                fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                time.sleep(0.02)  # Wait for the ONE reader, not a delivery retry.
+        need(fd is not None)
+        opened = os.fstat(fd)
+        need((opened.st_dev, opened.st_ino) == identity)
+        offset = 0
+        while offset < len(raw):
+            remaining = deadline - time.monotonic()
+            need(remaining > 0 and select.select([], [fd], [], remaining)[1] == [fd])
+            try:
+                count = os.write(fd, raw[offset:])
+            except BlockingIOError:
+                continue
+            need(count > 0)
+            offset += count
+    except BaseException:
+        # Partial writes are ambiguous. Never reopen/reset the consumed marker.
+        raise ValueError("credential_delivery_failed") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    marker(
+        root,
+        "credential-delivery.sent.json",
+        {"bytes_sent": len(raw), "receiver_acceptance_proven": False, "retry_allowed": False},
+    )
+    return {"delivery_sent": True, "workflow_completed": False}
+
+
+def _stop_children_admitted(attempt):
+    """ExecStopPost must run this even after root-parent timeout/kill.
+
+    Child jobs are separate systemd units, not descendants in the parent cgroup.
+    Never unmount/delete ambiguous credential sources or output on this path.
+    """
+    root, _ = paths(attempt)
+    marker(root, "detached-stop.started.json", {"retry_allowed": False})
+    errors = []
+    for name in (
+        handoff.unit_name(attempt, "acquire"),
+        handoff.unit_name(attempt, "import"),
+        setup.completion.verify_unit(attempt),
+    ):
+        try:
+            state = handoff.frozen.run_command(
+                ["/usr/bin/systemctl", "show", name, "--property=LoadState", "--value"],
+                5,
+                capture=True,
+            )
+            need(state.returncode in {0, 1, 4})
+            if state.stdout.strip() != b"not-found":
+                need(state.returncode == 0 and state.stdout.strip() == b"loaded")
+                handoff._stop_and_reap(name)
+            need(handoff.frozen.cgroup_empty(name))
+        except BaseException:
+            errors.append(name.rsplit("-", 1)[-1].split(".")[0])
+    marker(
+        root,
+        "detached-stop.result.json",
+        {"children_reaped": not errors, "failed_phases": errors, "output_deletion_allowed": False},
+    )
+    need(not errors)
+
+
+def _serve_admitted_once(attempt, acquisition_pins, import_pins, *, machine_id):
+    """Invoked by the future authenticated entry in this exact systemd unit."""
+    handoff.frozen.host_check(machine_id)
+    need(
+        handoff.frozen.small(Path("/proc/self/cgroup")).strip()
+        == f"0::/system.slice/{unit(attempt)}".encode()
+    )
+    root, fifo = paths(attempt)
+    deadline = time.monotonic() + RUNTIME
+    need((root / "detached-dispatch.started.json").is_file())
+    marker(root, "detached-parent.started.json", {"retry_allowed": False})
+    phase, fd = "receive", None
+    try:
+        identity = fifo_info(fifo)
+        fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC)
+        opened = os.fstat(fd)
+        need((opened.st_dev, opened.st_ino) == identity)
+        need(select.select([fd], [], [], min(WAIT_INPUT, deadline - time.monotonic()))[0] == [fd])
+        need(fifo_info(fifo) == identity)
+        fifo.unlink()  # Open kernel pipe persists; no new reader/writer can join.
+        setup.completion._fsync_directory(root)
+        phase = "workflow"
+        result = setup._run_admitted_once(
+            attempt,
+            acquisition_pins,
+            import_pins,
+            machine_id=machine_id,
+            credential_fd=fd,
+            deadline=deadline,
+        )
+        need(type(result) is dict and result.get("gate_5_complete") is False)
+        marker(
+            root,
+            "detached-parent.result.json",
+            {
+                "state": "workflow_returned",
+                "gate_5_complete": False,
+                "offhost_retention_verified": False,
+            },
+        )
+    except BaseException:
+        marker(
+            root,
+            "detached-parent.failed.json",
+            {
+                "state": "failed",
+                "phase": phase,
+                "retry_allowed": False,
+                "output_deletion_allowed": False,
+            },
+        )
+        raise ValueError("detached_parent_failed") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _status_admitted(attempt):
+    """Read only, no redispatch or credential input. Never copy worker output."""
+    root, _ = paths(attempt)
+    state = "not_started"
+    for name, code in (
+        ("detached-dispatch.started.json", "dispatch_requested"),
+        ("detached-parent.started.json", "running"),
+        ("detached-parent.result.json", "workflow_returned"),
+        ("detached-parent.failed.json", "failed"),
+    ):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            handoff.frozen.root_owned(path)
+            # Validate small metadata; return the code, never arbitrary contents.
+            need(type(json.loads(handoff.frozen.small(path))) is dict)
+            state = code
+    result = handoff.frozen.run_command(
+        ["/usr/bin/systemctl", "show", unit(attempt), "--property=ActiveState,SubState,Result"],
+        5,
+        capture=True,
+    )
+    need(result.returncode in {0, 1, 4})
+    rows = dict(line.split("=", 1) for line in result.stdout.decode("ascii").splitlines())
+    if rows.get("ActiveState") == "failed" and state != "failed":
+        state = "failed_or_interrupted"
+    empty = handoff.frozen.cgroup_empty(unit(attempt))
+    if state == "running" and empty and rows.get("ActiveState") in {"inactive", "failed"}:
+        state = "interrupted"
+    reaped = False
+    stop = root / "detached-stop.result.json"
+    if stop.exists() or stop.is_symlink():
+        handoff.frozen.root_owned(stop)
+        receipt = json.loads(handoff.frozen.small(stop))
+        reaped = receipt.get("children_reaped") is True and all(
+            handoff.frozen.cgroup_empty(name)
+            for name in (
+                handoff.unit_name(attempt, "acquire"),
+                handoff.unit_name(attempt, "import"),
+                setup.completion.verify_unit(attempt),
+            )
+        )
+    return {
+        "state": state,
+        "parent_cgroup_empty": empty,
+        "children_reaped": reaped,
+        "gate_5_complete": False,
+        "retry_allowed": False,
+    }

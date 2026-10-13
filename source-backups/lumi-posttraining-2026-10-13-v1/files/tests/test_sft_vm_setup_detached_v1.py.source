@@ -1,0 +1,299 @@
+import builtins
+import copy
+import io
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests.test_sft_vm_watchdog_report_channel_v1 import module
+
+m = module("run_sft_vm_setup_detached_v1")
+b = module("run_sft_vm_network_bootstrap_v2")
+MACHINE, BOOT = "a" * 32, "11111111-2222-3333-4444-555555555555"
+
+
+def request():
+    return {
+        "schema": "lumi.vm-detached-setup-request.v0.1",
+        "attempt": m.ATTEMPT,
+        "machine_id": MACHINE,
+        "boot_id": BOOT,
+        "volumes": {"root_volume": "vol-" + "3" * 17, "work_volume": "vol-" + "4" * 17},
+        "setup_deadline_boottime": 1800,
+        "host_deadline_boottime": 14000,
+    }
+
+
+def seed_receipt():
+    return {
+        "schema": "lumi.vm-setup-seed.v0.1",
+        "attempt": m.ATTEMPT,
+        "machine_id": MACHINE,
+        "boot_id": BOOT,
+        "observed_boottime": 50.0,
+        "setup_deadline_boottime": 1800,
+        "receipt_parents_created": True,
+        "host_admitted": False,
+        "expiry_enforced": False,
+        "execution_permitted": False,
+        "retry_allowed": False,
+    }
+
+
+class NativeSetupTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.parent = self.root / "receipts"
+        self.parent.mkdir()
+        self.out = self.parent / "detached"
+        self.source = self.root / "entry.py"
+        self.network = self.root / "network"
+        self.enterContext(patch.object(m, "OUTPUT", self.out))
+        self.enterContext(patch.object(m, "SOURCE", self.source))
+        self.enterContext(patch.object(m, "load_bootstrap", return_value=b))
+        self.enterContext(patch.object(b, "OUTPUT", self.network))
+        self.enterContext(patch.object(b, "owned"))
+        self.enterContext(patch.object(b, "native_identity"))
+        self.boot = self.enterContext(patch.object(b, "boot_time", return_value=100))
+
+        def read(path, cap=131072, *, mode=0o400):
+            self.assertEqual(path.stat().st_mode & 0o777, mode)
+            raw = path.read_bytes()
+            self.assertLessEqual(len(raw), cap)
+            return raw
+
+        self.enterContext(patch.object(b, "read", side_effect=read))
+        self.command = self.enterContext(patch.object(b, "command", return_value=b""))
+        self.enterContext(patch.object(b, "show", return_value=b"not-found"))
+        self.stop = self.enterContext(patch.object(b, "stop_host"))
+        self.wheel = types.SimpleNamespace(preflight=Mock())
+        self.enterContext(patch.object(b, "load", return_value=self.wheel))
+        self.helper = types.SimpleNamespace(
+            observe=Mock(
+                return_value={
+                    "ActiveState": "active",
+                    "SubState": "exited",
+                    "Result": "success",
+                    "ExecMainCode": "1",
+                    "ExecMainStatus": "0",
+                }
+            ),
+            validate_terminal=Mock(),
+            cgroup_empty=Mock(return_value=True),
+        )
+        self.enterContext(patch.object(m, "helpers", return_value=self.helper))
+        original_open = builtins.open
+
+        def opened(path, *args, **kwargs):
+            if str(path) == "/proc/swaps":
+                return io.BytesIO(b"Filename Type Size Used Priority\n")
+            if str(path) == "/proc/self/cgroup":
+                return io.BytesIO(f"0::/system.slice/{m.UNIT}\n".encode())
+            return original_open(path, *args, **kwargs)
+
+        self.enterContext(patch("builtins.open", side_effect=opened))
+        b.write(self.parent / "seed.json", b.encode(seed_receipt()))
+
+    def dispatch(self):
+        return m._deploy_and_dispatch_once(request(), b"# bounded synthetic source\n")
+
+    def prepare_serve(self):
+        self.dispatch()
+        self.network.mkdir()
+        b.write(self.network / "result.json", b.encode(m.EXPECTED))
+        return self.enterContext(
+            patch.object(b, "_bootstrap_admitted_once", return_value=dict(m.EXPECTED))
+        )
+
+    def test_dispatch_detaches_once_with_original_deadline_and_no_binding(self):
+        value = self.dispatch()
+        self.assertEqual(value, m.result("dispatch_requested"))
+        argv = self.command.call_args.args[0]
+        self.assertIn("--no-block", argv)
+        self.assertIn("--property=RuntimeMaxSec=1685", argv)
+        for prop in ("FailureAction=poweroff", "MemorySwapMax=0", "Restart=no", "LimitCORE=0"):
+            self.assertIn("--property=" + prop, argv)
+        compile(argv[-1], "bound-unit-entry", "exec")
+        self.assertEqual(self.command.call_args.kwargs, {"seconds": 15})
+        self.assertFalse((self.out / "binding.json").exists())
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.assertEqual(self.command.call_count, 1)
+
+    def test_bad_request_deadline_volume_or_seed_blocks_before_dispatch(self):
+        cases = [
+            request() | {"host_deadline_boottime": v} for v in (True, 14401, float("nan"), 1800)
+        ]
+        cases += [
+            request() | {"setup_deadline_boottime": 1900},
+            request() | {"approved": True},
+            request()
+            | {"volumes": {"root_volume": "vol-" + "3" * 17, "work_volume": "vol-" + "3" * 17}},
+        ]
+        for value in cases:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                m._deploy_and_dispatch_once(value, b"source")
+        self.boot.return_value = 1470
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.command.assert_not_called()
+        self.assertFalse(self.out.exists())
+
+    def test_failed_or_ambiguous_dispatch_preserved_no_retry(self):
+        self.command.side_effect = TimeoutError("private exception")
+        with self.assertRaisesRegex(ValueError, "detached_setup_dispatch_failed"):
+            self.dispatch()
+        self.stop.assert_called_once()
+        self.assertNotIn(b"private exception", (self.out / "failed.json").read_bytes())
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.assertEqual(self.command.call_count, 1)
+
+    def test_serve_forwards_original_deadline_and_requires_exact_receipt(self):
+        bootstrap = self.prepare_serve()
+        m._serve_once()
+        bootstrap.assert_called_once_with(
+            MACHINE, BOOT, request()["volumes"], original_deadline_boot_seconds=14000
+        )
+        self.assertEqual(m._status(request()), m.result("setup_returned"))
+        with self.assertRaises(FileExistsError):
+            m._serve_once()
+        self.assertEqual(bootstrap.call_count, 1)
+
+    def test_receipt_before_exit_is_not_completion(self):
+        self.prepare_serve()
+        m._serve_once()
+        self.helper.observe.return_value["SubState"] = "running"
+        self.assertEqual(m._status(request())["state"], "running")
+        with self.assertRaises(ValueError):
+            m._finish_once(request())
+
+    def test_active_descendants_block_finish(self):
+        self.prepare_serve()
+        m._serve_once()
+        self.helper.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            m._finish_once(request())
+        self.assertFalse((self.out / "reap-started").exists())
+
+    def test_wrong_terminal_result_blocks_finish(self):
+        self.prepare_serve()
+        m._serve_once()
+        self.helper.validate_terminal.side_effect = ValueError("failed unit")
+        with self.assertRaises(ValueError):
+            m._finish_once(request())
+        self.assertFalse((self.out / "reap-started").exists())
+
+    def test_numeric_bool_in_saved_receipt_rejected(self):
+        self.prepare_serve()
+        m._serve_once()
+        path = self.out / "result.json"
+        path.chmod(0o600)
+        path.write_bytes(b.encode(dict(m.result("setup_returned"), gate_5_complete=0)))
+        path.chmod(0o400)
+        with self.assertRaises(ValueError):
+            m._status(request())
+
+    def test_seed_changed_after_dispatch_rejected(self):
+        self.dispatch()
+        path = self.parent / "seed.json"
+        path.chmod(0o600)
+        path.write_bytes(b.encode(dict(seed_receipt(), machine_id="c" * 32)))
+        path.chmod(0o400)
+        with self.assertRaises(ValueError):
+            m._serve_once()
+        self.assertFalse((self.out / "serve-started").exists())
+
+    def test_finish_stops_once_and_checks_empty_cgroup(self):
+        self.prepare_serve()
+        m._serve_once()
+        self.helper.observe.side_effect = [
+            dict(self.helper.observe.return_value),
+            {"ActiveState": "inactive", "SubState": "dead", "Result": "success"},
+        ]
+        self.assertEqual(m._finish_once(request()), m.result("completed", reaped=True))
+        self.assertEqual(self.command.call_args.args[0], ["/usr/bin/systemctl", "stop", m.UNIT])
+        self.assertEqual(self.command.call_args.kwargs, {"seconds": 10})
+        self.assertTrue((self.out / "reaped.json").exists())
+
+    def test_failed_bootstrap_blocks_result_and_requests_shutdown(self):
+        bootstrap = self.prepare_serve()
+        bootstrap.side_effect = RuntimeError("private text")
+        with self.assertRaises(ValueError):
+            m._serve_once()
+        self.stop.assert_called_once()
+        self.assertFalse((self.out / "result.json").exists())
+        self.assertNotIn(b"private text", (self.out / "failed.json").read_bytes())
+
+    def test_mismatched_receipt_fails_closed(self):
+        bootstrap = self.prepare_serve()
+        bootstrap.return_value = dict(m.EXPECTED, host_admitted=True)
+        with self.assertRaises(ValueError):
+            m._serve_once()
+        self.stop.assert_called_once()
+
+    def test_request_mismatch_blocks_status_and_shutdown(self):
+        self.dispatch()
+        wrong = copy.deepcopy(request())
+        wrong["volumes"]["work_volume"] = "vol-" + "9" * 17
+        for fn in (m._status, m._abort_once):
+            with self.assertRaises(ValueError):
+                fn(wrong)
+        self.stop.assert_not_called()
+
+    def test_expiry_does_not_disable_bound_abort_and_abort_is_once(self):
+        self.dispatch()
+        self.boot.return_value = 1900
+        self.assertEqual(m._abort_once(request())["state"], "shutdown_requested")
+        with self.assertRaises(FileExistsError):
+            m._abort_once(request())
+        self.stop.assert_called_once()
+
+    def test_public_approval_flag_cannot_admit(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+class ExistingBootstrapJoinTests(unittest.TestCase):
+    def test_real_frozen_bootstrap_join_with_native_effects_doubled(self):
+        from tests import test_sft_vm_network_bootstrap_v2 as fixture
+
+        fixture.NetworkBootstrapTests.setUp(self)
+        outer = self.root / "detached"
+        outer.mkdir()
+        bmod = fixture.m
+        bmod.write(outer / "request.json", bmod.encode(request()))
+        original_open = builtins.open
+
+        def opened(path, *args, **kwargs):
+            if str(path) == "/proc/self/cgroup":
+                return io.BytesIO(f"0::/system.slice/{m.UNIT}\n".encode())
+            return original_open(path, *args, **kwargs)
+
+        with (
+            patch.object(m, "OUTPUT", outer),
+            patch.object(m, "load_bootstrap", return_value=bmod),
+            patch.object(m, "validate_request", side_effect=lambda r, *a, **k: r),
+            patch("builtins.open", side_effect=opened),
+        ):
+            m._serve_once()
+        self.assertEqual(
+            self.events, ["verify", "check", "timer", "install", "watch", "setup", "transition"]
+        )
+        self.assertEqual(
+            json.loads((outer / "result.json").read_text()), m.result("setup_returned")
+        )
+        self.shutdown.assert_not_called()
+
+    from tests.test_sft_vm_network_bootstrap_v2 import NetworkBootstrapTests as _fixture
+
+    setup = _fixture.setup
+    show = _fixture.show
+    command = _fixture.command
+
+
+if __name__ == "__main__":
+    unittest.main()

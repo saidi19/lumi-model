@@ -1,0 +1,360 @@
+"""Read-only synthetic claim-store checks and concrete arming integration."""
+
+import copy
+import datetime as dt
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_retention_admission_v1 as bucket_tests
+from tests.test_sft_vm_network_cleanup_arming_v1 import Cloud as ArmingCloud
+from tests.test_sft_vm_network_cleanup_v1 import S3, TOKEN, ApiError
+from tests.test_sft_vm_private_network_transaction_v1 import PLAN
+from tests.test_sft_vm_private_network_transaction_v1 import Cloud as Network
+from tests.test_sft_vm_private_network_v1 import fixture
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("check_sft_vm_cleanup_store_v1")
+PROPOSAL = bucket_tests.PROPOSAL
+
+
+class StoreTests(unittest.TestCase):
+    def setUp(self):
+        old = bucket_tests.BucketTests()
+        old.setUp()
+        self.values = copy.deepcopy(old.values)
+        self.values["get-bucket-lifecycle-configuration"] = {"Rules": []}
+        self.policy = json.loads(self.values["get-bucket-policy"]["Policy"])
+        self.policy["Statement"].extend(m.required_denials())
+        self.calls = []
+        self.t, self.wall = 100, 2000000000
+        self.bound = dict(
+            armed=True,
+            attempt=m.worker.ATTEMPT,
+            nonce=TOKEN,
+            not_before=self.wall + 17100,
+            expires_at=self.wall + 18000,
+        )
+        self.cloud = types.SimpleNamespace(cli=self.read)
+        self.check = self.admission()
+
+    def admission(self):
+        return m.Admission(self.cloud, PROPOSAL, clock=lambda: self.t, wall=lambda: self.wall)
+
+    def read(self, service, op, **fields):
+        self.calls.append((service, op, copy.deepcopy(fields)))
+        if op == "get-bucket-policy":
+            return {"Policy": json.dumps(self.policy)}
+        return copy.deepcopy(self.values[op])
+
+    def test_nine_exact_control_reads_and_aggregate_report(self):
+        self.assertIsNone(self.check(self.bound))
+        self.assertEqual(self.check.report["observation_calls"], 9)
+        self.assertFalse(self.check.report["write_authority_granted"])
+        self.assertNotIn(TOKEN, json.dumps(self.check.report))
+        import botocore.session
+        import botocore.validate
+
+        sdk = botocore.session.Session()
+        for service, op, fields in self.calls:
+            need_service = "s3" if service == "s3api" else service
+            name = "".join(p.capitalize() for p in op.split("-"))
+            shape = sdk.get_service_model(need_service).operation_model(name).input_shape
+            botocore.validate.validate_parameters(fields, shape)
+            self.assertNotIn(op, {"get-object", "head-object", "put-object", "list-objects-v2"})
+            if service == "s3api":
+                self.assertEqual(
+                    fields, dict(Bucket=m.worker.BUCKET, ExpectedBucketOwner=m.worker.ACCOUNT)
+                )
+
+    def test_missing_each_required_deny_fails_without_mutations(self):
+        for index in range(1, 5):
+            check = self.admission()
+            policy = copy.deepcopy(self.policy)
+            policy["Statement"].pop(index)
+            with (
+                patch.object(self, "policy", policy),
+                self.assertRaisesRegex(ValueError, "^cleanup_store_admission_failed_no_mutation$"),
+            ):
+                check(self.bound)
+            self.assertIsNone(check.report)
+
+    def test_wrong_action_condition_principal_and_prefix_do_not_count(self):
+        for update in (
+            {"Action": "s3:DeleteObject"},
+            {"Principal": {"AWS": "owner"}},
+            {"Resource": "arn:aws:s3:::other/*"},
+            {"NotPrincipal": "*"},
+            {"Condition": {"StringEquals": {"aws:PrincipalArn": "only-someone"}}},
+        ):
+            policy = copy.deepcopy(self.policy)
+            policy["Statement"][1].update(update)
+            with self.subTest(update=update), self.assertRaises(ValueError):
+                m.protected(policy, self.bound)
+
+    def test_exact_nonce_keys_and_sufficient_timed_protection_accepted(self):
+        keys = [
+            f"arn:aws:s3:::{m.worker.BUCKET}/{m.worker.claim_key(TOKEN, op)}"
+            for op in m.worker.OPERATIONS
+        ]
+        end = dt.datetime.fromtimestamp(self.bound["expires_at"], dt.UTC).isoformat()
+        for row in self.policy["Statement"][1:]:
+            row["Resource"] = keys
+            row.setdefault("Condition", {})["DateLessThan"] = {"aws:CurrentTime": end}
+        self.check(self.bound)
+        row = self.policy["Statement"][1]
+        row["Condition"]["DateLessThan"]["aws:CurrentTime"] = dt.datetime.fromtimestamp(
+            self.bound["expires_at"] - 1, dt.UTC
+        ).isoformat()
+        with self.assertRaises(ValueError):
+            self.admission()(self.bound)
+
+    def test_original_privacy_controls_remain_required(self):
+        self.values["get-public-access-block"]["PublicAccessBlockConfiguration"][
+            "BlockPublicAcls"
+        ] = False
+        with self.assertRaises(ValueError):
+            self.check(self.bound)
+        self.assertEqual(len(self.calls), 3)
+
+    def test_daily_new_claim_expiry_and_irrelevant_past_rule_allowed(self):
+        self.values["get-bucket-lifecycle-configuration"]["Rules"] = [
+            dict(
+                ID="daily",
+                Status="Enabled",
+                Filter={"Prefix": m.worker.PREFIX},
+                Expiration={"Days": 1},
+            ),
+            dict(
+                ID="unrelated",
+                Status="Enabled",
+                Prefix="unrelated/",
+                Expiration={"Date": dt.datetime(2000, 1, 1, tzinfo=dt.UTC)},
+            ),
+        ]
+        self.check(self.bound)
+        self.assertEqual(self.check.report["potentially_matching_rules"], 1)
+
+    def test_immediate_lifecycle_and_past_dates_rejected_even_with_policy_denies(self):
+        for action in (
+            {"Days": 0},
+            {"Days": True},
+            {"Date": dt.datetime(2000, 1, 1, tzinfo=dt.UTC)},
+        ):
+            self.values["get-bucket-lifecycle-configuration"]["Rules"] = [
+                dict(
+                    Status="Enabled",
+                    Filter={
+                        "And": {"Prefix": m.worker.PREFIX, "Tags": [{"Key": "x", "Value": "y"}]}
+                    },
+                    Expiration=action,
+                )
+            ]
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.admission()(self.bound)
+
+    def test_future_date_and_disabled_rules_allowed(self):
+        self.values["get-bucket-lifecycle-configuration"]["Rules"] = [
+            dict(
+                Status="Enabled",
+                Filter={},
+                Expiration={
+                    "Date": dt.datetime.fromtimestamp(self.bound["expires_at"] + 3600, dt.UTC)
+                },
+            ),
+            dict(Status="Disabled", Expiration={"Days": 0}),
+        ]
+        self.check(self.bound)
+
+    def test_unknown_filter_or_bad_rule_rejected(self):
+        for rule in (
+            {"Status": "Unknown"},
+            {"Status": "Enabled", "Filter": {"Unknown": "x"}},
+            {"Status": "Enabled", "Prefix": "x", "Filter": {"Prefix": "y"}},
+            {"Status": "Enabled", "UnknownAction": {}},
+        ):
+            with self.subTest(rule=rule), self.assertRaises(ValueError):
+                m.lifecycle_safe({"Rules": [rule]}, self.bound)
+
+    def test_duplicate_json_oversize_and_transport_failure_are_redacted(self):
+        for response in ({"Policy": '{"Statement":[],"Statement":[]}'}, {"Policy": "x" * 32769}):
+            cloud = types.SimpleNamespace(
+                cli=Mock(
+                    side_effect=lambda service, op, response=response, **kw: (
+                        response if op == "get-bucket-policy" else self.read(service, op, **kw)
+                    )
+                )
+            )
+            check = m.Admission(cloud, PROPOSAL, clock=lambda: self.t, wall=lambda: self.wall)
+            with self.assertRaisesRegex(ValueError, "^cleanup_store_admission_failed_no_mutation$"):
+                check(self.bound)
+        cloud = types.SimpleNamespace(cli=Mock(side_effect=RuntimeError("PRIVATE_SENTINEL")))
+        with self.assertRaisesRegex(ValueError, "^cleanup_store_admission_failed_no_mutation$"):
+            m.Admission(cloud, PROPOSAL, clock=lambda: self.t, wall=lambda: self.wall)(self.bound)
+        cloud.cli.assert_called_once()
+
+    def test_old_binding_clock_drift_and_replay_rejected(self):
+        for update in (
+            {"expires_at": self.wall + 18001, "not_before": self.wall + 17101},
+            {"not_before": self.wall - 1, "expires_at": self.wall + 899},
+        ):
+            with self.assertRaises(ValueError):
+                self.admission()(dict(self.bound, **update))
+        self.assertEqual(self.calls, [])
+        self.check(self.bound)
+        count = len(self.calls)
+        with self.assertRaises(ValueError):
+            self.check(self.bound)
+        self.assertEqual(len(self.calls), count)
+        original = self.cloud.cli
+
+        def drift(*args, **kw):
+            value = original(*args, **kw)
+            self.wall += 6
+            return value
+
+        self.cloud.cli = drift
+        with self.assertRaises(ValueError):
+            self.admission()(self.bound)
+
+    def test_wrong_proposal_and_source_pin_no_cloud_reads(self):
+        with self.assertRaises(ValueError):
+            m.Admission(self.cloud, PROPOSAL + b" ", clock=lambda: self.t, wall=lambda: self.wall)(
+                self.bound
+            )
+        with (
+            patch.dict(m.PINS, {"sft_vm_network_cleanup_v1.py": "0" * 64}),
+            self.assertRaises(ValueError),
+        ):
+            self.admission()(self.bound)
+        self.assertEqual(self.calls, [])
+
+    def test_late_control_response_and_pagination_do_not_pass(self):
+        original = self.cloud.cli
+
+        def late(*args, **kw):
+            value = original(*args, **kw)
+            self.t += 201
+            self.wall += 201
+            return value
+
+        self.cloud.cli = late
+        with self.assertRaises(ValueError):
+            self.check(self.bound)
+        self.assertEqual(len(self.calls), 1)
+        self.cloud.cli = original
+        self.values["get-bucket-lifecycle-configuration"]["NextToken"] = "hidden"
+        with self.assertRaises(ValueError):
+            self.admission()(self.bound)
+
+    def test_actual_admission_armer_bridge_and_network_join(self):
+        control, net, claims = ArmingCloud(), Network(), S3()
+        admission = m.Admission(
+            self.cloud, PROPOSAL, clock=lambda: control.t, wall=lambda: control.wall
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            expiry = m.armer.Expiry(
+                root / "expiry",
+                control,
+                admit_claim_store=admission,
+                clock=lambda: control.t,
+                wall=lambda: control.wall,
+                wait=control.wait,
+            )
+            cloud = m.bridge.ClaimedCloud(net, claims, clock=lambda: control.t)
+            report = m.network._with_preflighted_network_once(
+                root / "net",
+                plan_raw=PLAN,
+                cloud=cloud,
+                admit=fixture,
+                expiry=m.bridge.ExpiryBridge(cloud, expiry),
+                workload=Mock(),
+                clock=lambda: control.t,
+                wait=control.wait,
+            )
+            self.assertTrue(report["cost_resources_released"])
+            self.assertEqual(admission.report["observation_calls"], 9)
+            self.assertEqual(len(claims.objects), 2)
+
+    def test_missing_protection_blocks_role_creation_and_paid_network(self):
+        self.policy["Statement"] = self.policy["Statement"][:1]
+        control, net = ArmingCloud(), Network()
+        admission = m.Admission(
+            self.cloud, PROPOSAL, clock=lambda: control.t, wall=lambda: control.wall
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder).resolve()
+            expiry = m.armer.Expiry(
+                root / "expiry",
+                control,
+                admit_claim_store=admission,
+                clock=lambda: control.t,
+                wall=lambda: control.wall,
+                wait=control.wait,
+            )
+            cloud = m.bridge.ClaimedCloud(net, S3(), clock=lambda: control.t)
+            with self.assertRaises(ValueError):
+                m.network._with_preflighted_network_once(
+                    root / "net",
+                    plan_raw=PLAN,
+                    cloud=cloud,
+                    admit=fixture,
+                    expiry=m.bridge.ExpiryBridge(cloud, expiry),
+                    workload=Mock(),
+                    clock=lambda: control.t,
+                    wait=control.wait,
+                )
+        self.assertEqual(control.calls, [])
+        self.assertNotIn("allocate-address", [op for _, op, _ in net.calls])
+
+    def test_sdk_lifecycle_absence_only_and_fixed_read_only_fields(self):
+        clients = {}
+        for service in ("sts", "s3api"):
+            client = Mock()
+            name = "s3" if service == "s3api" else service
+            client.meta.region_name = "us-east-1"
+            client.meta.endpoint_url = f"https://{name}.us-east-1.amazonaws.com"
+            client.meta.config.retries = {"total_max_attempts": 1}
+            client.meta.config.proxies = {}
+            client.meta.config.connect_timeout = 3
+            client.meta.config.read_timeout = 5
+            clients[service] = client
+        cloud = m.ReadCloud(clients)
+        method = clients["s3api"].get_bucket_lifecycle_configuration
+        fields = dict(Bucket=m.worker.BUCKET, ExpectedBucketOwner=m.worker.ACCOUNT)
+        method.side_effect = ApiError("NoSuchLifecycleConfiguration")
+        self.assertEqual(
+            cloud.cli("s3api", "get-bucket-lifecycle-configuration", **fields), {"Rules": []}
+        )
+        method.side_effect = ApiError("AccessDenied")
+        with self.assertRaisesRegex(ValueError, "cleanup_lifecycle_read_failed"):
+            cloud.cli("s3api", "get-bucket-lifecycle-configuration", **fields)
+        with self.assertRaises(ValueError):
+            cloud.cli("s3api", "put-bucket-policy", **fields)
+
+    def test_concrete_factory_reuses_shared_clients_without_api_calls(self):
+        from tests.test_sft_vm_controller_credentials_v1 import CredentialTests
+
+        fixture = CredentialTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        credentials = importlib.import_module("sft_vm_controller_credentials_v1")
+        bundle = credentials.Clients(fixture.reader)
+        self.addCleanup(bundle.close)
+        cloud, expiry, admission = m._components(Path("/unused"), bundle.clients, PROPOSAL)
+        self.assertIs(cloud.s3, bundle.clients["s3"])
+        self.assertIs(expiry.expiry.admit, admission)
+        self.assertIs(admission.cloud.clients["s3api"], bundle.clients["s3"])
+        self.assertFalse(admission.used)
+        with self.assertRaisesRegex(ValueError, "cleanup_store_outer_authority_required"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,105 @@
+"""Attempt-018 v0.4 authenticated-source, plan, and prior-control bindings."""
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v13 as controls_v13
+
+ROOT = Path(__file__).resolve().parents[1]
+CONTROLS_SHA = "188232d67a5ec00cace0fe6104d2c957e44ae8b365e3ba2a9c04410e17f27894"
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD = controls_v13.OLD
+BUCKET = controls_v13.BUCKET
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.4"
+RELEASE_SHA = "29b71cbaf944c97867bc8466e19aa8ff3e89834ec12641ff0744f651b70d9bfb"
+PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.4/plan.json"
+PLAN_SHA = "afe0b2cbb823250f61034b3d393eb89473a9ffaa430cb6915a2c0099c6a24c86"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.4/release.json"
+PLAN_RELEASE_SHA = "2cd7ae9d70d065f8c000de67392f376796cef7efb89b13545a3a33502196a8eb"
+WATCH = controls_v13.WATCH
+STORE = controls_v13.STORE
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_binding_v15_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verify():
+    need(sha(Path(controls_v13.__file__).read_bytes()) == CONTROLS_SHA)
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    need(
+        manifest["attempt"] == ATTEMPT
+        and manifest["source_versions_bound"] is True
+        and manifest["versioned_object_count"] == 22
+        and manifest["iam_source_action"] == "s3:GetObjectVersion"
+        and manifest["repair"] == "propagate_sha256_and_byte_count_bindings"
+        and manifest["execution_permitted"] is False
+        and len(manifest["outputs"]) == 156
+    )
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(
+        plan_release["plan_sha256"] == PLAN_SHA
+        and plan_release["source_release_sha256"] == RELEASE_SHA
+        and plan_release["sha256_and_byte_count_closure"] is True
+        and plan_release["outer_source_authentication_verified"] is True
+        and plan_release["execution_permitted"] is False
+    )
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["source_repair"]["versioned_object_count"] == 22
+        and plan["source_repair"]["s3_action"] == "s3:GetObjectVersion"
+        and plan["source_repair"]["sha256_and_byte_count_closure"] is True
+        and plan["source_repair"]["outer_source_authentication_verified"] is True
+        and plan["source_repair"]["wire_or_billing_byte_cap_claimed"] is False
+        and plan["execution_permitted"] is False
+        and plan["approval_record"] is None
+        and plan["required_control_proofs"] == [WATCH, STORE]
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    """Verify preserved deployed-control evidence without rewriting its lineage."""
+    build()
+    need(sha(Path(controls_v13.__file__).read_bytes()) == CONTROLS_SHA)
+    pins = controls_v13.controls()
+    need(set(pins) == {WATCH, STORE})
+    return pins
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

@@ -1,0 +1,171 @@
+"""Actual local source composition with synthetic cloud replies, no AWS calls."""
+
+import copy
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_dedicated_cleanup_source_v1 as b
+from scripts import sft_vm_dedicated_cleanup_bucket_v1 as control
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name).resolve() / "candidate"
+        with patch.object(b, "OUTPUT", cls.root):
+            cls.report = b.prepare()
+        scripts = str(cls.root / "scripts")
+        sys.path.insert(0, scripts)
+        cls.addClassCleanup(sys.path.remove, scripts)
+        cls.store = importlib.import_module("check_sft_vm_cleanup_store_v1")
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        assert Path(cls.store.__file__).resolve().is_relative_to(cls.root)
+        cls.proposal = (cls.root / "configs/lumi-vm-fullsize-host-proposal-v0.1.json").read_bytes()
+
+    def setUp(self):
+        self.calls = []
+        self.values = {
+            "get-caller-identity": {"Account": control.ACCOUNT},
+            "get-bucket-location": {"LocationConstraint": None},
+            "get-public-access-block": {"PublicAccessBlockConfiguration": control.BLOCK},
+            "get-bucket-ownership-controls": {
+                "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+            },
+            "get-bucket-encryption": {"ServerSideEncryptionConfiguration": control.ENCRYPTION},
+            "get-bucket-versioning": {"Status": "Enabled"},
+            "get-bucket-policy-status": {"PolicyStatus": {"IsPublic": False}},
+            "get-bucket-policy": {"Policy": control.encode(control.policy()).decode()},
+            "get-bucket-lifecycle-configuration": {"Rules": []},
+        }
+        self.bound = dict(
+            armed=True,
+            attempt=control.ATTEMPT,
+            nonce="a" * 32,
+            not_before=2000017100,
+            expires_at=2000018000,
+        )
+
+    def read(self, service, op, **fields):
+        self.calls.append((service, op, fields))
+        return copy.deepcopy(self.values[op])
+
+    def admit(self):
+        obj = self.store.Admission(
+            types.SimpleNamespace(cli=self.read),
+            self.proposal,
+            clock=lambda: 100,
+            wall=lambda: 2000000000,
+        )
+        obj(self.bound)
+        return obj.report
+
+    def test_actual_nine_read_admission_new_bucket_only(self):
+        report = self.admit()
+        self.assertEqual(report["observation_calls"], 9)
+        for service, _, fields in self.calls:
+            if service == "s3api":
+                self.assertEqual(
+                    fields, dict(Bucket=control.BUCKET, ExpectedBucketOwner=control.ACCOUNT)
+                )
+
+    def test_original_host_source_and_retention_are_unchanged(self):
+        original, manifest = b.inputs()
+        for name, raw in original.items():
+            current = (self.root / name).read_bytes()
+            if (
+                name in manifest["ancillary"]
+                or name.startswith("configs/")
+                or name.endswith((".tar", ".gz", ".pem"))
+            ):
+                self.assertEqual(current, raw, name)
+        self.assertEqual(self.store.joined.bucket.BUCKET, b.OLD_BUCKET)
+        self.assertEqual(self.store.worker.BUCKET, control.BUCKET)
+        self.assertEqual(json.loads(self.proposal)["retention_proposal"]["bucket"], b.OLD_BUCKET)
+
+    def test_new_bucket_policy_preserves_all_cleanup_denials(self):
+        self.store.protected(control.policy(), self.bound)
+        for index in range(1, 5):
+            policy = control.policy()
+            policy["Statement"].pop(index)
+            with self.assertRaises(ValueError):
+                self.store.protected(policy, self.bound)
+
+    def test_private_readback_failures_reject_admission(self):
+        for op in [k for k in self.values if k != "get-bucket-lifecycle-configuration"]:
+            original = self.values[op]
+            self.values[op] = {}
+            with self.subTest(operation=op), self.assertRaises(ValueError):
+                self.admit()
+            self.values[op] = original
+
+    def test_policy_for_old_bucket_does_not_satisfy_new_bucket(self):
+        raw = self.values["get-bucket-policy"]["Policy"].replace(control.BUCKET, b.OLD_BUCKET)
+        self.values["get-bucket-policy"] = {"Policy": raw}
+        with self.assertRaises(ValueError):
+            self.admit()
+
+    def test_claim_and_derived_iam_both_target_control_bucket(self):
+        puts = []
+        s3 = types.SimpleNamespace(
+            put_object=lambda **kw: puts.append(kw) or {"ResponseMetadata": {"HTTPStatusCode": 200}}
+        )
+        claims = self.store.worker.Claims(s3, "a" * 32)
+        self.assertTrue(claims.take("delete-nat-gateway", "nat-" + "1" * 17))
+        self.assertFalse(claims.take("delete-nat-gateway", "nat-" + "1" * 17))
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0]["Bucket"], control.BUCKET)
+        self.assertEqual(puts[0]["IfNoneMatch"], "*")
+        raw = json.dumps(self.store.armer.policies(self.bound))
+        self.assertIn(control.BUCKET, raw)
+        self.assertNotIn(b.OLD_BUCKET, raw)
+        self.assertLess(len(self.store.armer.package()), 32768)
+
+    def test_transport_does_not_fall_back_to_retention_bucket(self):
+        transport = object.__new__(self.store.ReadCloud)
+        transport.clients = {
+            "s3api": types.SimpleNamespace(
+                get_bucket_location=lambda **kw: self.read("s3api", "get-bucket-location", **kw)
+            )
+        }
+        self.assertEqual(
+            transport.cli(
+                "s3api",
+                "get-bucket-location",
+                Bucket=control.BUCKET,
+                ExpectedBucketOwner=control.ACCOUNT,
+            ),
+            {"LocationConstraint": None},
+        )
+        with self.assertRaises(ValueError):
+            transport.cli(
+                "s3api",
+                "get-bucket-location",
+                Bucket=b.OLD_BUCKET,
+                ExpectedBucketOwner=control.ACCOUNT,
+            )
+        with self.assertRaises(ValueError):
+            transport.cli(
+                "s3api", "put-object", Bucket=control.BUCKET, ExpectedBucketOwner=control.ACCOUNT
+            )
+
+    def test_pin_graph_authenticates_without_host_or_cloud(self):
+        self.outer.authenticate()
+        for name, digest in self.store.PINS.items():
+            self.assertEqual(b.sha((self.root / "scripts" / name).read_bytes()), digest)
+        self.assertFalse(self.report["execution_permitted"])
+
+    def test_prepare_is_exclusive(self):
+        with patch.object(b, "OUTPUT", self.root), self.assertRaises(ValueError):
+            b.prepare()
+
+
+if __name__ == "__main__":
+    unittest.main()

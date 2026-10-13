@@ -1,0 +1,55 @@
+"""Offline checks for the selector-corrected control plan."""
+
+import hashlib
+import json
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt018_controls_v2 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plan = json.loads((m.OUTPUT / "plan.json").read_bytes())
+        cls.release = json.loads((m.OUTPUT / "release.json").read_bytes())
+
+    def test_saved_plan_rebuilds_exactly(self):
+        self.assertEqual(self.plan, m.build())
+        raw = (m.OUTPUT / "plan.json").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), self.release["plan_sha256"])
+
+    def test_corrected_release_and_controls_are_bound(self):
+        self.assertEqual(self.plan["network_candidate_cidr"], m.NEW_CIDR)
+        self.assertEqual(self.plan["release_manifest_sha256"], m.RELEASE_SHA)
+        self.assertEqual(self.plan["required_control_proofs"], [m.WATCH, m.STORE])
+        self.assertEqual(len(self.plan["source_bindings"]), 7)
+
+    def test_cpu_envelope_unchanged(self):
+        base = json.loads(m.read(m.BASE_PLAN, m.BASE_PLAN_SHA))
+        new, old = self.plan["cpu_scope_reference"], base["cpu_scope_reference"]
+        for key in ("instance_count", "instance_type", "vcpu", "memory_mib",
+                    "maximum_instance_seconds", "import_limits", "storage"):
+            self.assertEqual(new[key], old[key])
+        self.assertEqual(self.plan["cost_disclosure"], base["cost_disclosure"])
+
+    def test_no_execution_authority_or_overwrite(self):
+        self.assertFalse(self.plan["execution_permitted"])
+        self.assertFalse(self.plan["gate_5_complete"])
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "OUTPUT", m.OUTPUT), self.assertRaises(ValueError):
+            m.prepare()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

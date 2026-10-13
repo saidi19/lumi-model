@@ -1,0 +1,315 @@
+"""One fresh synthetic CPU watchdog attempt; exact approval required first."""
+
+import base64
+import gzip
+import hashlib
+import importlib.util
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "artifacts/lumi-vm-watchdog-native-attempt-v0.2"
+APPROVAL = ROOT / "configs/lumi-vm-watchdog-native-approval-v0.2.json"
+BINDINGS = {
+    "execute_sft_vm_network_native_v5.py": (
+        "d9a9e37808171dcce86ff67df859bfe4c093bf266cea193e663edf23a6b15640"
+    ),
+    "probe_sft_vm_watchdog_native_v3.py": (
+        "597b602874e731520baeee3f4784e533d3c6fc40c097b286963066ba59b7f42f"
+    ),
+    "run_sft_vm_network_bootstrap_v2.py": (
+        "3034eca29487b089729aafb29748da2333a54f6ac4cc630d24a7cb3867c07202"
+    ),
+    "build_sft_vm_network_expiry_v3.py": (
+        "caa0d6b551e9ee81599e3ed78f936e26705b2555e5e5b5716817160de6ea0833"
+    ),
+}
+FLAGS = {
+    "synthetic_receipt_only": True,
+    "complete_bootstrap_qualified": False,
+    "host_admitted": False,
+    "real_4b_import": False,
+    "gate_5_complete": False,
+    "gpu_inference_training": False,
+    "retry_allowed": False,
+}
+CHECKS = {
+    "identity",
+    "fresh_paths",
+    "units_verified",
+    "policy_installed",
+    "watchdog_active",
+    "synthetic_transition",
+    "watchdog_failure_receipt",
+    "watchdog_exit_code",
+    "before_timer_deadline",
+}
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate_key")
+        result[key] = value
+    return result
+
+
+def validate_approval():
+    expected = {
+        "schema": "lumi.watchdog-native-approval.v0.2",
+        "approved": True,
+        "instance_count": 1,
+        "instance_type": "t3.small",
+        "max_instance_seconds": 1800,
+        "synthetic_only": True,
+        "retry_allowed": False,
+        "existing_instance_access": False,
+        "s3_model_dataset_access": False,
+        "gpu_inference_training": False,
+        "package_downloads": False,
+        "cleanup_new_resources_only": True,
+        "controller_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "bindings": BINDINGS,
+    }
+    if not APPROVAL.is_file():
+        raise RuntimeError("fresh_watchdog_approval_required")
+    raw = APPROVAL.read_bytes()
+    if len(raw) > 4096:
+        raise ValueError("approval_rejected")
+    value = json.loads(raw, object_pairs_hook=unique)
+    if type(value) is not dict or set(value) != set(expected):
+        raise ValueError("approval_rejected")
+    if any(type(value[k]) is not type(v) or value[k] != v for k, v in expected.items()):
+        raise ValueError("approval_rejected")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def bound_source(name):
+    raw = (ROOT / "scripts" / name).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BINDINGS[name]:
+        raise ValueError("source_binding_rejected")
+    return raw
+
+
+def cloud_config():
+    names = [name for name in BINDINGS if not name.startswith("execute_")]
+    bundle = json.dumps({name: bound_source(name).decode() for name in names}).encode()
+    pins = {name: BINDINGS[name] for name in names}
+    seed = (
+        "import hashlib,json,os;from pathlib import Path;"
+        "p=Path('/opt/lumi-bootstrap-input');b=p/'sources.json';"
+        "assert b.stat().st_size<65536;d=json.loads(b.read_bytes());"
+        f"pins={pins!r};assert set(d)==set(pins);"
+        "assert all(type(d[n]) is str and hashlib.sha256(d[n].encode()).hexdigest()==pins[n]"
+        " for n in pins);"
+        "\nfor n in pins:\n with (p/n).open('xb') as f: f.write(d[n].encode())\n"
+        " (p/n).chmod(0o400)\n"
+        "assert all(hashlib.sha256((p/n).read_bytes()).hexdigest()==pins[n] for n in pins)"
+    )
+    files = [
+        {
+            "path": "/opt/lumi-bootstrap-input/sources.json",
+            "permissions": "0400",
+            "owner": "root:root",
+            "encoding": "gz+b64",
+            "content": base64.b64encode(gzip.compress(bundle, mtime=0)).decode(),
+        }
+    ]
+    config = {
+        "package_update": False,
+        "package_upgrade": False,
+        "write_files": files,
+        "runcmd": [
+            ["/usr/bin/python3", "-I", "-B", "-c", seed],
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                "/opt/lumi-bootstrap-input/probe_sft_vm_watchdog_native_v3.py",
+                "--native-once",
+            ],
+        ],
+    }
+    raw = ("#cloud-config\n" + json.dumps(config)).encode()
+    if len(raw) > 16384:
+        raise ValueError("user_data_limit")
+    return raw, BINDINGS["probe_sft_vm_watchdog_native_v3.py"]
+
+
+def decode_native_console(console):
+    if type(console) is not str or len(console) > 262144:
+        return None
+    if "LUMI_WATCHDOG_PROBE_V2:" not in console:
+        try:
+            console = base64.b64decode(console, validate=True).decode()
+        except (ValueError, UnicodeError):
+            return None
+    matches = re.findall(
+        r"LUMI_WATCHDOG_PROBE_V2:([0-9a-f]{64}):([0-9]{1,2})/([0-9]{1,2}):"
+        r"([A-Za-z0-9+/=]{1,512})(?=[\r\n]|$)",
+        console,
+    )
+    if not matches or len(matches) > 128:
+        return None
+    groups = {}
+    for digest, index, total, chunk in matches:
+        index, total = int(index), int(total)
+        if not 1 <= index <= total <= 24:
+            return None
+        chunks = groups.setdefault((digest, total), {})
+        if index in chunks and chunks[index] != chunk:
+            return None
+        chunks[index] = chunk
+    if len(groups) > 3:
+        return None
+    final = None
+    failed = None
+    for (digest, total), chunks in groups.items():
+        if set(chunks) != set(range(1, total + 1)):
+            continue
+        try:
+            raw = base64.b64decode("".join(chunks[i] for i in range(1, total + 1)), validate=True)
+            if len(raw) > 8192 or hashlib.sha256(raw).hexdigest() != digest:
+                return None
+            value = json.loads(raw, object_pairs_hook=unique)
+            expected_keys = {"schema", "status", "checks", *FLAGS}
+            if type(value) is not dict or set(value) != expected_keys:
+                return None
+            if value["schema"] != "lumi.watchdog-native-probe.v0.2":
+                return None
+            if any(value[k] is not v for k, v in FLAGS.items()):
+                return None
+            if type(value["checks"]) is not dict:
+                return None
+            if value["status"] == "failed":
+                checks = value["checks"]
+                stage = checks.get("failed_stage")
+                stages = {
+                    "identity",
+                    "fresh_paths",
+                    "units_verified",
+                    "policy_installed",
+                    "watchdog_active",
+                    "synthetic_transition",
+                    "fault_dispatched",
+                    "shutdown_receipt",
+                }
+                if type(stage) is not str or stage not in stages:
+                    return None
+                if not set(checks) <= CHECKS | {"failed_stage"}:
+                    return None
+                if any(v is not True for k, v in checks.items() if k != "failed_stage"):
+                    return None
+                failed = value
+            elif value["status"] == "watchdog_failure_receipt_verified":
+                if set(value["checks"]) != CHECKS or any(
+                    v is not True for v in value["checks"].values()
+                ):
+                    return None
+                if final is not None and final != value:
+                    return None
+                final = value
+            elif value["status"] != "ready_for_deliberate_policy_fault":
+                return None
+        except (ValueError, UnicodeError, TypeError):
+            return None
+    return failed if failed is not None else final
+
+
+def qualified_result(value):
+    native = value.get("native_report")
+    return (
+        type(native) is dict
+        and native.get("status") == "watchdog_failure_receipt_verified"
+        and type(native.get("checks")) is dict
+        and set(native["checks"]) == CHECKS
+        and all(v is True for v in native["checks"].values())
+        and all(native.get(k) is v for k, v in FLAGS.items())
+        and value.get("stopped_observed") is True
+        and all(
+            value.get(k) is True
+            for k in (
+                "terminated_verified",
+                "volumes_absent_verified",
+                "security_group_absent_verified",
+            )
+        )
+        and "controller_error" not in value
+    )
+
+
+def main():
+    # All preparation and authorization checks precede any network or mutation.
+    validate_approval()
+    cloud_config()
+    bound_source("execute_sft_vm_network_native_v5.py")
+    spec = importlib.util.spec_from_file_location(
+        "_frozen_ec2_transport", ROOT / "scripts/execute_sft_vm_network_native_v5.py"
+    )
+    transport = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(transport)
+    transport.OUT, transport.APPROVAL = OUT, APPROVAL
+    transport.validate_approval = validate_approval
+    transport.cloud_config = cloud_config
+    failure_report = None
+
+    def decode(console):
+        nonlocal failure_report
+        value = decode_native_console(console)
+        if value is not None and value["status"] == "failed":
+            failure_report = value
+        return value
+
+    transport.decode_native_console = decode
+    original_aws, original_visible = transport.aws, transport.visible
+    stopped = False
+
+    def visible(operation, **kwargs):
+        nonlocal stopped
+        value = original_visible(operation, **kwargs)
+        if operation == "describe-instances" and value["State"]["Name"] == "stopped":
+            stopped = True
+        return value
+
+    def aws(service, operation, **kwargs):
+        # EC2 console snapshots can lag STOP. Only bounded read-only observation
+        # is repeated; never repeat a launch, guest pass or other mutation.
+        if service != "ec2" or operation != "get-console-output" or not stopped:
+            return original_aws(service, operation, **kwargs)
+        limit = transport.time.monotonic() + 60
+        result = original_aws(service, operation, **kwargs)
+        while (
+            decode_native_console(result.get("Output", "")) is None
+            and transport.time.monotonic() + 27 < limit
+        ):
+            transport.time.sleep(2)
+            result = original_aws(service, operation, **kwargs)
+        return result
+
+    transport.visible, transport.aws = visible, aws
+    original_save = transport.save
+
+    def save(name, value):
+        if name == "authorization.json":
+            value.update(
+                scope="One fresh CPU VM; synthetic native watchdog only; no downloads",
+                controller_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                bindings=BINDINGS,
+                guest_fallback_shutdown_boottime_seconds=1500,
+            )
+        if name == "result.json":
+            if failure_report is not None:
+                original_save("native-failure-report.json", failure_report)
+                value["native_report"] = failure_report
+            value["native_watchdog_qualified"] = qualified_result(value)
+            value["complete_bootstrap_qualified"] = False
+        original_save(name, value)
+
+    transport.save = save
+    transport.main()
+
+
+if __name__ == "__main__":
+    main()

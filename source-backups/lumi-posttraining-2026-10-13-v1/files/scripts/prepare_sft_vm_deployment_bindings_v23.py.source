@@ -1,0 +1,93 @@
+"""Attempt-020 bindings after verified predecessor endpoint cleanup."""
+
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v22 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = "9fe6d5e67363ac1b5cbd23b65ea7b33d7cc9999b8ab5de9f7c2da0219f23054d"
+ATTEMPT = source.ATTEMPT
+OLD = source.OLD
+BUCKET = source.BUCKET
+RELEASE = source.RELEASE
+RELEASE_SHA = source.RELEASE_SHA
+SOURCE_PROOF = source.SOURCE_PROOF
+SOURCE_PROOF_SHA = source.SOURCE_PROOF_SHA
+ABSENCE = source.ABSENCE
+ABSENCE_SHA = source.ABSENCE_SHA
+PLAN = source.PLAN
+PLAN_SHA = source.PLAN_SHA
+PLAN_RELEASE = source.PLAN_RELEASE
+PLAN_RELEASE_SHA = source.PLAN_RELEASE_SHA
+WATCH = source.WATCH
+WATCH_SHA = source.WATCH_SHA
+STORE = source.STORE
+STORE_SHA = source.STORE_SHA
+CONSUMED_PREFLIGHT = "evidence/lumi-vm-attempt-020-readonly-preflight-failure-v0.1.json"
+CONSUMED_PREFLIGHT_SHA = "f371c5516c9a22d927e3acf1dd13da66fbe8c57f61654882f866a8310c742170"
+ENDPOINT_CLEANUP = "evidence/lumi-vm-attempt-019-endpoint-cleanup-verification-v0.1.json"
+ENDPOINT_CLEANUP_SHA = "18f1a67c30cbfaf50fdd2c9a959d9ff54512c18a35e80b1ea25ec02650c72738"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_binding_v23_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return source.encode(value)
+
+
+def read(name, digest=None, size=None):
+    return source.read(name, digest, size)
+
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    failed = json.loads(read(CONSUMED_PREFLIGHT, CONSUMED_PREFLIGHT_SHA))
+    cleanup = json.loads(read(ENDPOINT_CLEANUP, ENDPOINT_CLEANUP_SHA))
+    need(
+        failed["attempt"] == ATTEMPT
+        and failed["result"]["status"] == "stopped_no_retry"
+        and failed["result"]["failed_stage"] == "network"
+        and failed["result"]["retry_performed"] is False
+        and failed["localization"]["blocking_endpoint"]["instance_connect_endpoint_id"]
+        == cleanup["endpoint"]
+        and cleanup["attempt"] == OLD
+        and cleanup["status"] == "endpoint_removed_preserved_resources_verified"
+        and cleanup["endpoint_interface_absent"] is True
+        and cleanup["delete_dispatches"] == 1
+        and cleanup["retry"] is False
+        and cleanup["preserved"]["pre_and_post_checks_passed"] is True
+        and cleanup["cpu_launch_authorized"] is False
+        and cleanup["gate_5_complete"] is False
+    )
+    return manifest
+
+
+def build():
+    verify()
+    plan = source.build()
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["successful_readonly_preflight"] is None
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    return plan
+
+
+def controls():
+    build()
+    return source.controls()
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

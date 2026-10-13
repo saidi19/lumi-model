@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""Extend the unchanged v1 source release with a bound detached retention entry.
+
+Only prepares/stages source. Never creates the independent retention binding,
+credentials or running units. No changes to previous archive/evidence bytes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import stat
+import tarfile
+import types
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+HELPER_SHA = "bdf67917259e28e02e64ef57c48fc62cef5606eca5b22f2533f74119f34c705c"
+ADDED = {
+    "scripts/run_sft_vm_retention_parent_v1.py": (
+        "1e78705b8779a6011ee236267b0db87039fa45537b225b786d99cfe9043a4493"
+    ),
+    "src/lumi/posttraining_vm_retention_parent_v1.py": (
+        "f6ee949a4f0c924a972db5fa218fc356c9b18f76998118473a5ab3f75e596f55"
+    ),
+    "src/lumi/posttraining_vm_retention_continuation_v2.py": (
+        "f1dcc60c65981ba01da835aca175cad2b227e48b6b722e1c5478cabccffbc82e"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_release_v2_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def helper():
+    path = REPO / "scripts/prepare_sft_vm_retention_release_v1.py"
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    with path.open("rb") as stream:
+        row = os.fstat(stream.fileno())
+        need(stat.S_ISREG(row.st_mode) and row.st_nlink == 1 and 0 < row.st_size <= 131072)
+        raw = stream.read(131073)
+    need(len(raw) == row.st_size and sha(raw) == HELPER_SHA)
+    m = types.ModuleType("_retention_release_frozen_builder")
+    m.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), m.__dict__)
+    return m
+
+
+def validate(members, old):
+    base = {n: raw for n, raw in members.items() if n not in ADDED and n != "release-manifest.json"}
+    old.validate(base)
+    need(set(members) == set(base) | set(ADDED) | {"release-manifest.json"})
+    need(
+        len(members) == 22
+        and all(type(raw) is bytes and 0 < len(raw) <= 131072 for raw in members.values())
+    )
+    need(all(sha(members[n]) == pin for n, pin in ADDED.items()))
+    sources = base | {n: members[n] for n in ADDED}
+    manifest = old.canonical({n: sha(raw) for n, raw in sources.items()})
+    need(members["release-manifest.json"] == manifest)
+    entry = old.metadata(
+        members["scripts/run_sft_vm_retention_parent_v1.py"],
+        ADDED["scripts/run_sft_vm_retention_parent_v1.py"],
+    )
+    expected = {"src/lumi/" + n + ".py": pin for n, pin in entry.SOURCES.items()} | entry.EXTRA
+    expected["scripts/run_sft_vm_retention_parent_v1.py"] = ADDED[
+        "scripts/run_sft_vm_retention_parent_v1.py"
+    ]
+    need(expected == {n: sha(raw) for n, raw in sources.items()})
+
+
+def archive(members, old):
+    validate(members, old)
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, raw in sorted(members.items()):
+            row = tarfile.TarInfo(name)
+            row.size, row.mode = len(raw), 0o400
+            tar.addfile(row, io.BytesIO(raw))
+    raw = out.getvalue()
+    need(len(raw) <= old.CAP)
+    return raw
+
+
+def unpack(raw, pin, old):
+    need(type(raw) is bytes and 0 < len(raw) <= old.CAP and sha(raw) == pin)
+    members = {}
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
+        for row in tar:
+            need(len(members) < 22 and row.name not in members)
+            need(row.type == tarfile.REGTYPE and not row.linkname and not row.pax_headers)
+            need(
+                row.mode == 0o400
+                and row.uid == row.gid == row.mtime == 0
+                and 0 < row.size <= 131072
+            )
+            with tar.extractfile(row) as stream:
+                body = stream.read(row.size + 1)
+            need(len(body) == row.size)
+            members[row.name] = body
+    validate(members, old)
+    need(archive(members, old) == raw)
+    return members
+
+
+def assemble():
+    old = helper()
+    _raw, base = old.assemble(REPO)
+    members = base | {n: old.read(REPO / n) for n in ADDED}
+    members["release-manifest.json"] = old.canonical({n: sha(raw) for n, raw in members.items()})
+    raw = archive(members, old)
+    need(unpack(raw, sha(raw), old) == members)
+    return old, raw, members
+
+
+def prepare(destination):
+    old, raw, members = assemble()
+    need(not any(p.is_symlink() for p in (destination, *destination.parents)))
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    old.write(destination / "retention-source.tar", raw)
+    report = dict(
+        schema="lumi.vm-retention-release.v0.2",
+        attempt=old.ATTEMPT,
+        archive_sha256=sha(raw),
+        archive_bytes=len(raw),
+        members=len(members),
+        release_manifest_sha256=sha(members["release-manifest.json"]),
+        source_sha256={n: sha(body) for n, body in members.items()},
+        native_installed=False,
+        binding_created=False,
+        execution_permitted=False,
+        credentials_included=False,
+        model_dataset_included=False,
+        gate_5_complete=False,
+    )
+    old.write(destination / "build.json", old.canonical(report))
+    old.sync(destination)
+    return report
+
+
+def _install_admitted_once(bundle, pin, machine_id):
+    old = helper()
+    old.boundary(machine_id)
+    members = unpack(old.read(bundle, old.CAP), pin, old)
+    destination = old.ROOT / old.ATTEMPT / "retention-release"
+    destination.mkdir(mode=0o700, exist_ok=False)
+    old.sync(destination.parent)
+    directories = {destination}
+    for name, body in sorted(members.items()):
+        path = destination / name
+        for relative in reversed(path.relative_to(destination).parents):
+            parent = destination / relative
+            if parent not in directories:
+                parent.mkdir(mode=0o700)
+                directories.add(parent)
+        old.write(path, body)
+    need(all(old.read(destination / n) == body for n, body in members.items()))
+    for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        old.sync(path)
+    return dict(staged_file_hashes_verified=True, binding_created=False, execution_permitted=False)
+
+
+def install(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    try:
+        result = prepare(args.output)
+        print(json.dumps({k: v for k, v in result.items() if k != "source_sha256"}, sort_keys=True))
+    except BaseException:
+        parser.exit(1, "retention_release_v2_failed\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,25 @@
+"""Offline tests for attempt-019 endpoint cleanup verification."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt019_endpoint_cleanup_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_cleanup(self):
+        result = m.verify()
+        self.assertEqual(result["status"], "endpoint_removed_preserved_resources_verified")
+        self.assertTrue(result["endpoint_interface_absent"])
+        self.assertEqual(result["delete_dispatches"], 1)
+        self.assertFalse(result["retry"])
+        self.assertTrue(result["preserved"]["pre_and_post_checks_passed"])
+        self.assertFalse(result["cpu_launch_authorized"])
+
+    def test_drift_rejected(self):
+        with patch.object(m, "RESULT_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

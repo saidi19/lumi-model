@@ -1,0 +1,172 @@
+"""Standalone read-only use of the frozen CPU admission; never invokes run()."""
+
+import datetime as dt
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+import execute_sft_vm_private_outer_v10 as entry
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-010-readonly-admission-v0.1"
+PINS = {
+    "scripts/execute_sft_vm_private_outer_v10.py": (
+        "0cd82b222f10d67ac7c011da66dd5e0235a88db413fc37044249bbe88c639758"
+    ),
+    "evidence/lumi-vm-attempt-010-cleanup-policy-update-verification-v0.1.json": (
+        "a97ba3ed4038133aab23f3f84b3ae007dfd04c31326dc4404bc5ee006b10a551"
+    ),
+    "evidence/lumi-vm-attempt-010-inert-watchdog-deployment-verification-v0.2.json": (
+        "aa64ab1d86f63f2291ebc518171676a6f82e1160b2283143ff07118d9b74f0a8"
+    ),
+}
+ALLOWED = {
+    "sts": {"GetCallerIdentity"},
+    "iam": {"GetUser", "GetRole", "GetRolePolicy", "ListRolePolicies", "ListAttachedRolePolicies"},
+    "lambda": {
+        "GetFunctionConfiguration",
+        "GetFunctionConcurrency",
+        "GetFunctionEventInvokeConfig",
+    },
+    "scheduler": {"GetScheduleGroup", "GetSchedule", "ListSchedules"},
+    "pricing": {"GetProducts"},
+    "service-quotas": {"GetServiceQuota"},
+    "s3": {
+        "GetBucketLocation",
+        "GetPublicAccessBlock",
+        "GetBucketOwnershipControls",
+        "GetBucketEncryption",
+        "GetBucketVersioning",
+        "GetBucketPolicyStatus",
+        "GetBucketPolicy",
+        "GetBucketLifecycleConfiguration",
+    },
+}
+
+
+def permitted(service, operation):
+    return (service == "ec2" and operation.startswith("Describe")) or operation in ALLOWED.get(
+        service, set()
+    )
+
+
+def validate():
+    for name, digest in PINS.items():
+        path = ROOT / name
+        entry.need(not path.is_symlink() and entry.sha(path.read_bytes()) == digest)
+        if name.startswith("evidence/"):
+            for source, pin in json.loads(path.read_bytes())["source_bindings"].items():
+                raw = entry.bounded(ROOT / source)
+                entry.need(len(raw) == pin["bytes"] and entry.sha(raw) == pin["sha256"])
+    entry.need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    entry.need(
+        not entry.OUTPUT.exists() and not entry.AUDIT.exists() and not entry.APPROVAL.exists()
+    )
+    entry.local_preconditions()
+
+
+def run():
+    validate()
+    from botocore.client import BaseClient
+
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = entry.encode(value)
+        entry.need(written + len(raw) <= 1048576)
+        with os.fdopen(
+            os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        ) as f:
+            f.write(raw)
+            f.flush()
+            os.fsync(f.fileno())
+        written += len(raw)
+
+    start = time.monotonic()
+    calls = []
+    original = BaseClient._make_api_call
+
+    def readonly(client, operation, parameters):
+        service = client.meta.service_model.service_name
+        entry.need(permitted(service, operation))
+        entry.need(len(calls) < 79 and time.monotonic() - start < 1380)
+        if service == "s3":
+            entry.need(
+                parameters
+                == {
+                    "Bucket": "lumi-corpus-prod-27777c02b29b76efcac3",
+                    "ExpectedBucketOwner": "573978149073",
+                }
+            )
+        row = {"service": service, "operation": operation, "status": "started"}
+        calls.append(row)
+        save(f"call-{len(calls):02d}-started.json", row)
+        try:
+            value = original(client, operation, parameters)
+        except Exception:
+            row["status"] = "exception_or_expected_absence"
+            raise
+        else:
+            row["status"] = "acknowledged"
+            return value
+        finally:
+            save(f"call-{len(calls):02d}-result.json", row)
+
+    report = dict(
+        status="started",
+        authorization_message="ok shuru kor",
+        cloud_mutations=0,
+        object_access=0,
+        execution_marker_created=False,
+        host_launch_authorized=False,
+        gpu=False,
+        training=False,
+        gate_5_complete=False,
+        retry=False,
+    )
+    save(
+        "started.json",
+        dict(
+            report,
+            started_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+            source_pins=PINS,
+            entry_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            maximum_calls_including_credential_identity=79,
+            maximum_seconds=1400,
+        ),
+    )
+    bundle = None
+    BaseClient._make_api_call = readonly
+    phase = "credentials"
+    try:
+        reader = entry.outer.credentials.Reader(start + 1500)
+        bundle = entry.outer.credentials.Clients(reader)
+        phase = "readonly_admission"
+        admission = entry.inspect_before_marker(bundle)
+        save("admission.json", admission)
+        report.update(status="all_readonly_admission_passed", admission=admission)
+    except Exception as error:
+        report.update(
+            status="stopped_no_retry", failed_phase=phase, error_type=type(error).__name__
+        )
+    finally:
+        if bundle is not None:
+            report["credential_generations"] = bundle.reader.calls
+            bundle.close()
+        BaseClient._make_api_call = original
+        report.update(
+            total_control_calls_including_credential_identity=len(calls),
+            calls=calls,
+            elapsed_seconds=round(time.monotonic() - start, 3),
+        )
+        save("result.json", report)
+    print(json.dumps(report, sort_keys=True))
+    return report
+
+
+if __name__ == "__main__":
+    run()

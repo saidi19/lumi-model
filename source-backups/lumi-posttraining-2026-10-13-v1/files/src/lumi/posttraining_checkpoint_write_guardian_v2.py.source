@@ -1,0 +1,357 @@
+"""Versioned write guardian with explicit atomic authority transfer.
+
+Guardian v1 validates the cgroup lease and release descriptor before recording
+that it owns them.  A validation callback can therefore fail after partially
+touching an authority while the caller cannot tell whether it should clean up.
+
+This successor preserves v1 byte-for-byte and reuses its frozen runtime,
+descriptor, pidfd, polling, release and retirement primitives.  The caller
+first places the exact lease and release descriptor in one private authority
+bundle.  After runtime and scalar admission and after acquiring the guardian
+lock, the watcher consumes that bundle through a callback-free in-memory state
+transition.  From that point every failure attempts lease retirement and
+release-descriptor closure.  Before consumption the caller still owns both;
+after consumption it owns neither.  The bundle snapshot exposes only that
+aggregate transition, so cleanup responsibility is never inferred from an
+exception code.
+
+Import is inert, public execution remains closed and local tests replace every
+native boundary.  This module does not create processes, authenticate channel
+peers, receive READY/CONSUMED, reap a child or qualify Linux enforcement.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import select
+import signal
+import threading
+import time
+
+from . import posttraining_checkpoint_write_guardian_v1 as frozen
+from .posttraining_sft_cgroup_v1 import CgroupLease
+
+SCHEMA = "lumi.checkpoint-write-guardian.v0.2"
+RELEASE_TOKEN = frozen.RELEASE_TOKEN
+REASONS = frozen.REASONS
+ERROR_CODES = frozen.ERROR_CODES | frozenset({
+    "owner_mismatch", "already_attempted", "already_failed",
+})
+FALSE_FLAGS = frozen.FALSE_FLAGS + (
+    "process_topology_verified", "authority_bundle_native_qualified",
+)
+_WATCH_LOCK = threading.Lock()
+
+
+class WriteGuardianV2Error(ValueError):
+    def __init__(self, code="guardian_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "guardian_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code="guardian_failed"):
+    if not condition:
+        raise WriteGuardianV2Error(code) from None
+
+
+def watch_write_guardian(**_arguments):
+    """No bundle, pidfd, hash or approval opens the private watcher."""
+    raise WriteGuardianV2Error("host_guard_not_bound") from None
+
+
+class _AuthorityBundle:
+    """One callback-free, inspectable transfer of lease and release ownership."""
+
+    def __init__(self, lease, release_fd):
+        _need(type(lease) is CgroupLease and type(release_fd) is int
+              and 3 <= release_fd < 2**31, "invalid_arguments")
+        self._owner = os.getpid(), threading.get_ident()
+        _need(all(type(value) is int and value > 0 for value in self._owner),
+              "owner_mismatch")
+        self._lease, self._release_fd = lease, release_fd
+        self._taken = self._failed = False
+        self._lock = threading.Lock()
+
+    def take_admitted_once(self):
+        acquired = False
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()),
+                  "owner_mismatch")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            _need(not self._failed, "already_failed")
+            _need(not self._taken and self._lease is not None
+                  and self._release_fd is not None, "already_attempted")
+            lease, release_fd = self._lease, self._release_fd
+            self._lease = self._release_fd = None
+            self._taken = True
+            return lease, release_fd
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is WriteGuardianV2Error else "guardian_failed"
+            raise WriteGuardianV2Error(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def snapshot(self):
+        return {
+            "schema": SCHEMA,
+            "consumed": self._taken,
+            "terminal_failed": self._failed,
+            "caller_retains_authority": not self._taken,
+            "guardian_consumed_authority": self._taken,
+            **dict.fromkeys(FALSE_FLAGS, False),
+        }
+
+
+def _failure_code(error):
+    if type(error) is WriteGuardianV2Error:
+        return error.code
+    if type(error) is frozen.WriteGuardianError and error.code in ERROR_CODES:
+        return error.code
+    return "guardian_failed"
+
+
+def _close_release(fd, identity):
+    """Close one transferred descriptor; never retry an ambiguous close."""
+    if identity is not None:
+        _need(frozen._release_descriptor(fd) == identity, "release_rejected")
+    os.close(fd)
+
+
+def _watch_admitted_once(authorities, *, expected_parent_pid, broker_pidfd,
+                         deadline_ns, cleanup_timeout_ms):
+    """Consume the authority bundle, release once, watch and retire once."""
+    try:
+        frozen._runtime()
+    except BaseException:
+        raise WriteGuardianV2Error("runtime_rejected") from None
+    _need(type(authorities) is _AuthorityBundle
+          and type(expected_parent_pid) is int and 1 < expected_parent_pid < 2**31
+          and type(broker_pidfd) is int and broker_pidfd >= 3
+          and type(deadline_ns) is int and 0 < deadline_ns < 2**63
+          and type(cleanup_timeout_ms) is int and 1 <= cleanup_timeout_ms <= 10_000,
+          "invalid_arguments")
+    _need(_WATCH_LOCK.acquire(blocking=False), "reentry")
+    lease = release_fd = parent_fd = broker_fd = None
+    parent_identity = broker_identity = release_identity = None
+    owns_lease = owns_release = owns_broker_fd = broker_bound = False
+    parent_bound = released = broker_stop_attempted = workload_retired = False
+    parent_closed = broker_closed = release_closed = False
+    cleanup_ok = True
+    reason = failure = None
+    try:
+        lease, release_fd = authorities.take_admitted_once()
+        # No external operation occurs between the bundle transition and these
+        # flags. The fixed runtime has one thread and no callable signal handler.
+        owns_lease = owns_release = True
+        _need(release_fd != broker_pidfd, "invalid_arguments")
+        lease.verify_limits()
+        _need(frozen._populated(lease) == 1, "lease_rejected")
+        release_identity = frozen._release_descriptor(release_fd)
+        frozen._pidfd_identity(broker_pidfd, "broker_binding_rejected")
+        try:
+            broker_fd = fcntl.fcntl(broker_pidfd, fcntl.F_DUPFD_CLOEXEC, 3)
+        except BaseException:
+            raise WriteGuardianV2Error("broker_binding_rejected") from None
+        _need(type(broker_fd) is int and broker_fd >= 3
+              and broker_fd not in {broker_pidfd, release_fd},
+              "broker_binding_rejected")
+        owns_broker_fd = True
+        broker_identity = frozen._pidfd_identity(
+            broker_fd, "broker_binding_rejected",
+        )
+        _need(frozen._alive(broker_fd), "broker_binding_rejected")
+        _need(frozen._pidfd_identity(broker_fd, "broker_binding_rejected")
+              == broker_identity, "broker_binding_rejected")
+        broker_bound = True
+        if os.getppid() != expected_parent_pid:
+            reason = "parent_lost"
+        elif time.monotonic_ns() >= deadline_ns:
+            reason = "deadline_exhausted"
+        else:
+            try:
+                parent_fd = os.pidfd_open(expected_parent_pid, 0)
+            except ProcessLookupError:
+                reason = "parent_lost"
+            if parent_fd is not None:
+                parent_identity = frozen._pidfd_identity(
+                    parent_fd, "parent_binding_rejected",
+                )
+                poller = select.poll()
+                mask = select.POLLIN | select.POLLHUP | select.POLLERR
+                poller.register(parent_fd, mask)
+                poller.register(broker_fd, mask)
+                if os.getppid() != expected_parent_pid or not frozen._alive(parent_fd):
+                    reason = "parent_lost"
+                else:
+                    parent_bound = True
+                    if time.monotonic_ns() >= deadline_ns:
+                        reason = "deadline_exhausted"
+                    elif not frozen._alive(broker_fd):
+                        reason = "broker_lost"
+                    else:
+                        _need(frozen._release_descriptor(release_fd)
+                              == release_identity, "release_rejected")
+                        parent_event, broker_event = frozen._poll_ready(
+                            poller, parent_fd, broker_fd, mask, 0,
+                        )
+                        if (parent_event or os.getppid() != expected_parent_pid
+                                or not frozen._alive(parent_fd)):
+                            reason = "parent_lost"
+                        elif time.monotonic_ns() >= deadline_ns:
+                            reason = "deadline_exhausted"
+                        elif broker_event or not frozen._alive(broker_fd):
+                            reason = "broker_lost"
+                        else:
+                            released = True
+                            try:
+                                _need(signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN,
+                                      "release_rejected")
+                                written = frozen._send_release(release_fd)
+                            except BaseException as error:
+                                raise WriteGuardianV2Error(
+                                    _failure_code(error)
+                                    if type(error) is WriteGuardianV2Error
+                                    else "release_rejected"
+                                ) from None
+                            _need(type(written) is int
+                                  and written == len(RELEASE_TOKEN),
+                                  "release_rejected")
+                            closing, release_fd = release_fd, None
+                            owns_release = False
+                            try:
+                                _close_release(closing, release_identity)
+                                release_closed = True
+                            except BaseException:
+                                raise WriteGuardianV2Error(
+                                    "cleanup_unconfirmed"
+                                ) from None
+                while reason is None:
+                    _need(frozen._pidfd_identity(
+                        parent_fd, "parent_binding_rejected",
+                    ) == parent_identity, "parent_binding_rejected")
+                    _need(frozen._pidfd_identity(
+                        broker_fd, "broker_binding_rejected",
+                    ) == broker_identity, "broker_binding_rejected")
+                    parent_event, broker_event = frozen._poll_ready(
+                        poller, parent_fd, broker_fd, mask, 0,
+                    )
+                    if (parent_event or os.getppid() != expected_parent_pid
+                            or not frozen._alive(parent_fd)):
+                        reason = "parent_lost"
+                    elif time.monotonic_ns() >= deadline_ns:
+                        reason = "deadline_exhausted"
+                    elif broker_event or not frozen._alive(broker_fd):
+                        reason = "broker_lost"
+                    else:
+                        empty = frozen._populated(lease) == 0
+                        parent_event, broker_event = frozen._poll_ready(
+                            poller, parent_fd, broker_fd, mask, 0,
+                        )
+                        if (parent_event or os.getppid() != expected_parent_pid
+                                or not frozen._alive(parent_fd)):
+                            reason = "parent_lost"
+                        elif time.monotonic_ns() >= deadline_ns:
+                            reason = "deadline_exhausted"
+                        elif broker_event or not frozen._alive(broker_fd):
+                            reason = "broker_lost"
+                        elif empty:
+                            reason = "workload_empty"
+                        else:
+                            remaining_ms = max(
+                                1,
+                                (deadline_ns - time.monotonic_ns()) // 1_000_000,
+                            )
+                            parent_event, broker_event = frozen._poll_ready(
+                                poller, parent_fd, broker_fd, mask,
+                                min(50, remaining_ms),
+                            )
+                            if (parent_event
+                                    or os.getppid() != expected_parent_pid
+                                    or not frozen._alive(parent_fd)):
+                                reason = "parent_lost"
+                            elif time.monotonic_ns() >= deadline_ns:
+                                reason = "deadline_exhausted"
+                            elif broker_event or not frozen._alive(broker_fd):
+                                reason = "broker_lost"
+        _need(reason in REASONS, "guardian_failed")
+    except BaseException as error:
+        failure = _failure_code(error)
+    finally:
+        if owns_lease:
+            try:
+                frozen.frozen._retire(
+                    lease, cleanup_timeout_ms=cleanup_timeout_ms,
+                )
+                workload_retired = True
+            except BaseException:
+                failure = "cleanup_unconfirmed"
+        if owns_release and release_fd is not None:
+            closing, release_fd = release_fd, None
+            owns_release = False
+            try:
+                _close_release(closing, release_identity)
+                release_closed = True
+            except BaseException:
+                cleanup_ok = False
+        if broker_bound:
+            broker_stop_attempted = True
+            try:
+                _need(frozen._pidfd_identity(
+                    broker_fd, "broker_binding_rejected",
+                ) == broker_identity, "broker_binding_rejected")
+                try:
+                    signal.pidfd_send_signal(
+                        broker_fd, signal.SIGKILL, None, 0,
+                    )
+                except ProcessLookupError:
+                    pass
+            except BaseException:
+                cleanup_ok = False
+        if owns_broker_fd and broker_fd is not None:
+            closing, broker_fd = broker_fd, None
+            owns_broker_fd = False
+            try:
+                if broker_identity is not None:
+                    _need(frozen._pidfd_identity(
+                        closing, "broker_binding_rejected",
+                    ) == broker_identity, "broker_binding_rejected")
+                os.close(closing)
+                broker_closed = True
+            except BaseException:
+                cleanup_ok = False
+        if parent_fd is not None:
+            closing, parent_fd = parent_fd, None
+            try:
+                if parent_identity is not None:
+                    _need(frozen._pidfd_identity(
+                        closing, "parent_binding_rejected",
+                    ) == parent_identity, "parent_binding_rejected")
+                os.close(closing)
+                parent_closed = True
+            except BaseException:
+                cleanup_ok = False
+        _WATCH_LOCK.release()
+    if owns_lease and (not workload_retired or not cleanup_ok):
+        raise WriteGuardianV2Error("cleanup_unconfirmed") from None
+    if failure is not None:
+        raise WriteGuardianV2Error(failure) from None
+    return {
+        "schema": SCHEMA,
+        "reason": reason,
+        "authority_bundle_consumed": True,
+        "release_sent": released,
+        "release_fd_bound": release_identity is not None,
+        "release_fd_closed": release_closed,
+        "workload_retired": workload_retired,
+        "broker_pidfd_bound": broker_bound,
+        "broker_stop_attempted": broker_stop_attempted,
+        "borrowed_broker_pidfd_closed": False,
+        "owned_broker_pidfd_closed": broker_closed,
+        "parent_pidfd_bound": parent_bound,
+        "parent_pidfd_closed": parent_closed,
+        **dict.fromkeys(FALSE_FLAGS, False),
+    }

@@ -1,0 +1,38 @@
+"""Offline tests for the fresh attempt-019 control plan."""
+import json
+import unittest
+
+from scripts import prepare_sft_vm_attempt019_controls_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_fresh_control_plan_has_no_execution_authority(self):
+        plan = m.build()
+        raw = m.encode(plan)
+        self.assertEqual(plan["attempt"], m.ATTEMPT)
+        self.assertEqual(plan["network_candidate_cidr"], m.CIDR)
+        self.assertFalse(plan["network_candidate_live_availability_verified"])
+        self.assertIsNone(plan["control_target_absence_evidence"])
+        self.assertEqual(plan["required_control_proofs"], [])
+        self.assertIsNone(plan["successful_readonly_preflight"])
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["gate_5_complete"])
+        self.assertNotIn(m.OLD.encode(), m.encode(plan["watchdog"]))
+        self.assertNotIn(m.OLD.encode(), m.encode(plan["cleanup_store"]))
+        self.assertIn(m.OLD, json.loads(raw)["predecessor_state"].values())
+
+    def test_source_bindings_are_fresh_and_closed(self):
+        plan = m.build()
+        self.assertEqual(len(plan["source_bindings"]), len(m.BINDINGS))
+        self.assertTrue(all(name.startswith(m.RELEASE + "/") for name in plan["source_bindings"]))
+        self.assertTrue(plan["source_repair"]["fresh_attempt_identity"])
+        self.assertEqual(plan["source_repair"]["write_attempts_per_operation"], 1)
+
+    def test_public_execution_entry_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

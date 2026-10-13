@@ -1,0 +1,433 @@
+"""Verify the attempt-019 v0.24 fail-closed outcome and retained AWS state."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import subprocess
+import tarfile
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "c7124d8fb1a244798d7e41b7b5dfad61"
+ACCOUNT, REGION = "573978149073", "us-east-1"
+INSTANCE = "i-068358c462d98a32a"
+VOLUMES = {"vol-0e1c912b1eb8ef89c", "vol-0d22435afc196a589"}
+SUBNET = "subnet-0af788acdfd4d17a1"
+TABLE = "rtb-0d520ddf61f7615f0"
+NAT = "nat-0aaa610bcebc37a73"
+EIP = "eipalloc-081262189514302d6"
+ENDPOINT = "eice-00c5b6339d93e0085"
+VM_GROUP = "sg-087cb90968b2a9def"
+ENDPOINT_GROUP = "sg-0b55bcd63758a16a4"
+KEY = "lumi-fullsize-" + ATTEMPT
+NONCE = "f85c233dd6eb46e4b64d4a494d44faad"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-019-v024-execution-failure-verification-v0.1.json"
+SOURCE = "artifacts/lumi-vm-attempt-019-source-v0.1"
+ARCHIVE = SOURCE + "/artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar"
+ARCHIVE_SHA = "588dec8de659bd245f98aacd53ce2d0609c1b5872d6ffd9fa591953cf88eada5"
+STAGER = SOURCE + "/scripts/stage_sft_vm_setup_inputs_v5.py"
+STAGER_SHA = "d9f20c2018d7e3b1b72fde648d93885bd77c8a8084af19f422a684c7db46f77b"
+FILES = {
+    "configs/lumi-vm-private-outer-execution-proposal-v0.24.json":
+        "b6daef11640cfc924c8249daccc7d8b147dcd5492db910e4e0545727b1765079",
+    "configs/lumi-vm-private-outer-execution-approval-v0.24.json":
+        "8c56d0d0183c4dfca9d766bf6b8295db80f67e70064433585d20ba12bd190c2d",
+    "scripts/execute_sft_vm_private_outer_v24.py":
+        "d3b08d68e8a01788007685bc06e4efade2a70e7edb5902d46865f25a6d06d3f6",
+    "artifacts/lumi-vm-private-outer-preflight-v0.24/started.json":
+        "37ed3a92b1cce031645174b512330a794b35f30d318381ddbb4febb2746d0e2d",
+    "artifacts/lumi-vm-private-outer-preflight-v0.24/admission.json":
+        "76ee3f33997585e5d3717a775af7fa93a1546283c99fdb4404cd7c676d1fe91c",
+    "artifacts/lumi-vm-private-outer-preflight-v0.24/result.json":
+        "2d3c036d6ea2f3009f7c81333c171099b2681629e1abb2e3bf894ff78879ee20",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/entry-started.json":
+        "91c6502a8e708a582e54df54f55ca6274df7f58fcfe1ea0709170c5bb0cb4a0c",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/entry-result.json":
+        "2d3c036d6ea2f3009f7c81333c171099b2681629e1abb2e3bf894ff78879ee20",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/network/0015-result.json":
+        "7e6c2a2de47fdf3ba6e1ea4a645a1fa691c5362a2f7a086a1b27dc2be9342134",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/launch.json":
+        "4605d14e5f17fc7f296d14367e1a4cf88e4cb2707c583764f406af73c365209f",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/binding.json":
+        "a4b7e7924c7a4e77acfb4b5b6ca645b66d25a61c8dcd175498062935cac3990f",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/host-setup/initial-proof.json":
+        "9ba24381acb71fbb3ce6db67609ec7e4fb7aeab6e21a61916f1cedb28b460940",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/host-setup/result.json":
+        "2448aa1a029e84f90aee95a5bb3e0211201b62f7d5778a92a45a462aeb8c8b45",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/result.json":
+        "9438aa95accf654e788ee68338d5c0b95271a2c3eb48465690b16de7421e356b",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/result.json":
+        "2493e2de7b955f1e956cc83d1c379bd4898b555350949765b6d391092f77041e",
+    "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/result.json":
+        "9e407196008b029a9e659af1b03554af91eb6dd497314925203bf8748657f661",
+    ARCHIVE: ARCHIVE_SHA,
+    STAGER: STAGER_SHA,
+}
+OPS = {
+    "identity": ("sts", "get-caller-identity", {}),
+    "instance": ("ec2", "describe-instances", {"InstanceIds": [INSTANCE]}),
+    "volumes": ("ec2", "describe-volumes", {"VolumeIds": sorted(VOLUMES)}),
+    "subnet": ("ec2", "describe-subnets", {"SubnetIds": [SUBNET]}),
+    "table": ("ec2", "describe-route-tables", {"RouteTableIds": [TABLE]}),
+    "nat": ("ec2", "describe-nat-gateways", {"NatGatewayIds": [NAT]}),
+    "eip": ("ec2", "describe-addresses", {"AllocationIds": [EIP]}),
+    "endpoint": (
+        "ec2",
+        "describe-instance-connect-endpoints",
+        {"InstanceConnectEndpointIds": [ENDPOINT]},
+    ),
+    "groups": (
+        "ec2",
+        "describe-security-groups",
+        {"GroupIds": [VM_GROUP, ENDPOINT_GROUP]},
+    ),
+    "key": ("ec2", "describe-key-pairs", {"KeyNames": [KEY]}),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_v024_failure_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def load_json(name):
+    return json.loads(read(name, FILES[name]))
+
+
+def tag(row, key):
+    values = [item.get("Value") for item in row.get("Tags", []) if item.get("Key") == key]
+    need(len(values) == 1)
+    return values[0]
+
+
+def archive_diagnostic():
+    raw = read(ARCHIVE, ARCHIVE_SHA)
+    stager_path = ROOT / STAGER
+    spec = importlib.util.spec_from_file_location("_attempt019_setup_stager", stager_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    need(module.sha(Path(stager_path).read_bytes()) == STAGER_SHA)
+    members, rows = set(), []
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        for item in archive:
+            need(item.name in module.FILES and item.name not in members)
+            members.add(item.name)
+            with archive.extractfile(item) as stream:
+                body = stream.read(item.size + 1)
+            expected = module.FILES[item.name][1]
+            observed = sha(body)
+            if observed != expected:
+                rows.append(
+                    {
+                        "member": item.name,
+                        "bytes": len(body),
+                        "expected_sha256": expected,
+                        "observed_sha256": observed,
+                    }
+                )
+    need(members == set(module.FILES) and len(members) == 19 and len(rows) == 12)
+    for row in rows:
+        source = module.FILES[row["member"]][0]
+        need(sha(read(SOURCE + "/" + source, row["expected_sha256"])) == row["expected_sha256"])
+    return {
+        "outer_archive_sha256_verified": True,
+        "member_count": 19,
+        "matching_members": 7,
+        "mismatching_members": rows,
+        "mismatch_count": 12,
+        "source_release_members_match_contract": True,
+        "failure_before_remote_seed_dispatch": True,
+        "confirmed_defect": (
+            "The pinned outer setup-input archive contains 12 members whose hashes disagree "
+            "with the attempt-019 stage contract and corresponding release files."
+        ),
+    }
+
+
+def local_verify():
+    for name, digest in FILES.items():
+        read(name, digest)
+    approval = load_json("configs/lumi-vm-private-outer-execution-approval-v0.24.json")
+    admission = load_json("artifacts/lumi-vm-private-outer-preflight-v0.24/admission.json")
+    entry = load_json("artifacts/lumi-vm-private-outer-execution-v0.24/entry-result.json")
+    network = load_json(
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/network/0015-result.json"
+    )
+    launch = load_json(
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/launch.json"
+    )
+    binding = load_json(
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/binding.json"
+    )
+    setup = load_json(
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/host-setup/result.json"
+    )
+    host = load_json(
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/host/result.json"
+    )
+    lifecycle = load_json(
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/host/execution/result.json"
+    )
+    setup_output = (
+        ROOT
+        / "artifacts/lumi-vm-private-outer-execution-v0.24"
+        / "attempt-019/host/execution/host/host-setup/setup"
+    )
+    need(
+        approval["status"] == "explicit_human_approval_recorded"
+        and approval["approved_execution_count"] == 1
+        and approval["no_retry"] is True
+        and admission["status"] == "all_readonly_admission_passed_before_execution_marker"
+        and admission["total_control_calls"] == 56
+        and admission["cloud_mutations"] == admission["object_access"] == 0
+        and entry["status"] == "failed_preserve_component_evidence_no_retry"
+        and entry["execution_marker_created"] is True
+        and entry["outer_invoked"] is True
+        and entry["network_cleanup_verified"] is True
+        and entry["retry_allowed"] is False
+        and launch["attempt"] == ATTEMPT
+        and launch["instance"] == INSTANCE
+        and launch["request"]["InstanceType"] == "r6i.4xlarge"
+        and launch["request"]["MinCount"] == launch["request"]["MaxCount"] == 1
+        and binding["instance"] == INSTANCE
+        and {binding["root_volume"], binding["work_volume"]} == VOLUMES
+        and setup["failed_stage"] == "guarded_setup"
+        and setup["fresh_host_control_plane_verified"] is True
+        and setup["initial_boot_timers_verified"] is True
+        and setup["setup_completed"] is False
+        and setup["host_admitted"] is False
+        and host["launch_attempted"] is True
+        and host["failed_stage"] == "setup"
+        and host["stop_attempted"] is True
+        and host["stopped_verified"] is True
+        and host["stop_verification_unresolved"] is False
+        and host["resource_deletion_performed"] is False
+        and host["disk_deletion_requested"] is False
+        and host["real_4b_import"] is False
+        and host["retry_allowed"] is False
+        and lifecycle["failed_phase"] == "guarded_provision"
+        and lifecycle["real_4b_import"] is False
+        and lifecycle["training_authorized"] is False
+        and network["cost_resources_released"] is True
+        and network["cleanup_unresolved"] is False
+        and network["subnet_preserved_for_dependencies"] is True
+        and setup_output.is_dir()
+        and not any(setup_output.iterdir())
+    )
+    return archive_diagnostic()
+
+
+class Cloud:
+    def __init__(self, *, clock=time.monotonic):
+        self.clock, self.start, self.calls, self.bytes = clock, clock(), 0, 0
+
+    def call(self, name):
+        need(name in OPS and self.calls < 10 and self.clock() - self.start < 290)
+        service, operation, fields = OPS[name]
+        need(operation.startswith(("get-", "describe-")))
+        self.calls += 1
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("AWS_")
+            and key.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        environment.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                REGION,
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+                "--no-cli-pager",
+                service,
+                operation,
+                "--cli-input-json",
+                json.dumps(fields),
+                "--output",
+                "json",
+                "--no-paginate",
+            ],
+            capture_output=True,
+            timeout=30,
+            env=environment,
+        )
+        need(len(result.stdout) <= 262144 and len(result.stderr) <= 8192)
+        self.bytes += len(result.stdout) + len(result.stderr)
+        need(self.bytes <= 4 * 1024**2)
+        if name == "eip" and result.returncode != 0:
+            need(b"InvalidAllocationID.NotFound" in result.stderr)
+            return {"Addresses": []}
+        need(result.returncode == 0)
+        value = json.loads(result.stdout or b"{}")
+        need(not any(value.get(key) for key in ("NextToken", "nextToken", "IsTruncated")))
+        return value
+
+
+def live_verify(cloud):
+    need(cloud.call("identity")["Account"] == ACCOUNT)
+    reservations = cloud.call("instance")["Reservations"]
+    need(len(reservations) == 1 and reservations[0]["OwnerId"] == ACCOUNT)
+    instance = reservations[0]["Instances"]
+    need(len(instance) == 1)
+    instance = instance[0]
+    need(
+        instance["InstanceId"] == INSTANCE
+        and instance["State"]["Name"] == "stopped"
+        and instance["InstanceType"] == "r6i.4xlarge"
+        and instance["SubnetId"] == SUBNET
+        and instance["ClientToken"] == ATTEMPT
+        and tag(instance, "LumiAttempt") == ATTEMPT
+        and {item["Ebs"]["VolumeId"] for item in instance["BlockDeviceMappings"]} == VOLUMES
+        and all(
+            item["Ebs"]["DeleteOnTermination"] is False
+            for item in instance["BlockDeviceMappings"]
+        )
+    )
+    volumes = cloud.call("volumes")["Volumes"]
+    need(len(volumes) == 2 and {item["VolumeId"] for item in volumes} == VOLUMES)
+    for volume in volumes:
+        need(
+            volume["Encrypted"] is True
+            and volume["State"] == "in-use"
+            and tag(volume, "LumiAttempt") == ATTEMPT
+            and len(volume["Attachments"]) == 1
+            and volume["Attachments"][0]["InstanceId"] == INSTANCE
+            and volume["Attachments"][0]["DeleteOnTermination"] is False
+        )
+    subnet = cloud.call("subnet")["Subnets"]
+    need(len(subnet) == 1)
+    subnet = subnet[0]
+    need(
+        subnet["SubnetId"] == SUBNET
+        and subnet["OwnerId"] == ACCOUNT
+        and subnet["CidrBlock"] == "172.31.97.0/27"
+        and tag(subnet, "LumiAttempt") == ATTEMPT
+        and tag(subnet, "LumiNetworkNonce") == NONCE
+    )
+    table = cloud.call("table")["RouteTables"]
+    need(len(table) == 1)
+    table = table[0]
+    need(
+        table["RouteTableId"] == TABLE
+        and table["OwnerId"] == ACCOUNT
+        and tag(table, "LumiAttempt") == ATTEMPT
+        and tag(table, "LumiNetworkNonce") == NONCE
+        and len(table["Associations"]) == 1
+        and table["Associations"][0]["SubnetId"] == SUBNET
+        and not any(route.get("DestinationCidrBlock") == "0.0.0.0/0" for route in table["Routes"])
+    )
+    nat = cloud.call("nat")["NatGateways"]
+    need(len(nat) == 1 and nat[0]["NatGatewayId"] == NAT and nat[0]["State"] == "deleted")
+    need(cloud.call("eip")["Addresses"] == [])
+    endpoint = cloud.call("endpoint")["InstanceConnectEndpoints"]
+    need(len(endpoint) == 1)
+    endpoint = endpoint[0]
+    need(
+        endpoint["InstanceConnectEndpointId"] == ENDPOINT
+        and endpoint["State"] == "create-complete"
+        and endpoint["SubnetId"] == SUBNET
+        and endpoint["SecurityGroupIds"] == [ENDPOINT_GROUP]
+        and tag(endpoint, "LumiAttempt") == ATTEMPT
+    )
+    groups = cloud.call("groups")["SecurityGroups"]
+    need(len(groups) == 2 and {item["GroupId"] for item in groups} == {VM_GROUP, ENDPOINT_GROUP})
+    need(all(tag(item, "LumiAttempt") == ATTEMPT for item in groups))
+    key = cloud.call("key")["KeyPairs"]
+    need(len(key) == 1 and key[0]["KeyName"] == KEY and tag(key[0], "LumiAttempt") == ATTEMPT)
+    return {
+        "instance_state": "stopped",
+        "instance_type": "r6i.4xlarge",
+        "one_instance_verified": True,
+        "encrypted_retained_volumes": sorted(VOLUMES),
+        "volume_delete_on_termination": False,
+        "nat_gateway_state": "deleted",
+        "eip_absent": True,
+        "default_route_absent": True,
+        "retained_private_network_shell": True,
+        "retained_endpoint_state": "create-complete",
+        "retained_key_pair_verified": True,
+        "reads": cloud.calls,
+        "response_bytes": cloud.bytes,
+        "mutations": 0,
+        "object_access": 0,
+    }
+
+
+def run():
+    diagnostic = local_verify()
+    cloud = Cloud()
+    live = live_verify(cloud)
+    result = {
+        "schema": "lumi.vm-attempt-019-v024-execution-failure-verification.v0.1",
+        "attempt": ATTEMPT,
+        "status": "verified_fail_closed_before_remote_seed_or_checkpoint_access",
+        "authorization_sha256": FILES[
+            "configs/lumi-vm-private-outer-execution-approval-v0.24.json"
+        ],
+        "proposal_sha256": FILES[
+            "configs/lumi-vm-private-outer-execution-proposal-v0.24.json"
+        ],
+        "entry_sha256": FILES["scripts/execute_sft_vm_private_outer_v24.py"],
+        "source_bindings": dict(FILES),
+        "execution": {
+            "execution_marker_created": True,
+            "run_instances_dispatch_count": 1,
+            "failed_stage": "guarded_setup",
+            "host_admitted": False,
+            "remote_seed_dispatch_started": False,
+            "checkpoint_download_started": False,
+            "real_4b_import": False,
+            "retry_allowed": False,
+        },
+        "archive_diagnostic": diagnostic,
+        "live_verification": live,
+        "cleanup": {
+            "instance_stopped_live_verified": True,
+            "retained_ebs_verified": True,
+            "public_cost_resources_released": True,
+            "private_subnet_route_table_endpoint_groups_key_preserved_for_stopped_host": True,
+            "cleanup_unresolved": False,
+        },
+        "production_eligible": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "cloud_mutations": 0,
+        "object_access": 0,
+    }
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    print(json.dumps({"status": result["status"], "reads": live["reads"]}, sort_keys=True))
+    return result
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,510 @@
+import base64
+import copy
+import datetime as dt
+import gzip
+import hashlib
+import io
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests.test_sft_vm_watchdog_report_channel_v1 import module, report
+
+# No import-time IPv6 bind is needed for SDK request validation/signing fixtures.
+with patch("socket.has_ipv6", False):
+    import botocore.exceptions
+    import botocore.handlers
+    import botocore.validate
+
+m = module("execute_sft_vm_watchdog_object_v1")
+builder = m.load("prepare_sft_vm_watchdog_object_v1.py")
+channel = m.load("sft_vm_watchdog_report_channel_v1.py")
+ATTEMPT = "a" * 32
+INSTANCE, GROUP = "i-" + "1" * 17, "sg-" + "2" * 17
+
+
+def failure(code):
+    return botocore.exceptions.ClientError({"Error": {"Code": code}}, "Synthetic")
+
+
+class Clock:
+    value = 1000
+
+    def now(self):
+        return self.value
+
+    def sleep(self, duration):
+        self.value += duration
+
+
+class FakeAPI:
+    """Validates every request against the installed SDK; performs no I/O."""
+
+    def __init__(self, clients, clock):
+        self.clients, self.deadline = clients, clock.now() + 1800
+        self.calls, self.failures = [], {}
+        self.bucket = self.group = self.instance = False
+        self.state = "stopped"
+        self.egress = [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+        self.foreign = False
+        self.sticky_volume = False
+        self.reports = {slot: report(slot) for slot in ("boot", "ready", "observer")}
+        self.policy = None
+
+    def row(self):
+        return dict(
+            InstanceId=INSTANCE,
+            ClientToken=ATTEMPT,
+            VpcId=m.VPC,
+            ImageId=m.AMI,
+            InstanceType="t3.small",
+            State={"Name": self.state},
+            Tags=[{"Key": "LumiAttempt", "Value": "foreign" if self.foreign else ATTEMPT}],
+        )
+
+    def call(self, service, operation, **params):
+        need = self.clients[service].meta.method_to_api_mapping[operation]
+        shape = self.clients[service].meta.service_model.operation_model(need).input_shape
+        wire_params = copy.deepcopy(params)
+        if operation == "run_instances":
+            # The real SDK performs this registered hook before shape validation.
+            botocore.handlers.base64_encode_user_data(wire_params)
+        botocore.validate.validate_parameters(wire_params, shape)
+        self.calls.append((operation, copy.deepcopy(params)))
+        if operation in self.failures:
+            callback = self.failures.pop(operation)
+            callback()
+        if operation == "get_caller_identity":
+            return {"Account": m.ACCOUNT}
+        if operation == "describe_images":
+            return {
+                "Images": [
+                    dict(State="available", Architecture="x86_64", RootDeviceName="/dev/sda1")
+                ]
+            }
+        if operation == "describe_subnets":
+            return {"Subnets": [dict(VpcId=m.VPC, State="available")]}
+        if operation == "head_bucket":
+            if not self.bucket:
+                raise failure("404")
+            return {}
+        if operation == "create_bucket":
+            self.bucket = True
+        elif operation == "get_public_access_block":
+            return {"PublicAccessBlockConfiguration": m.PUBLIC_BLOCK}
+        elif operation == "get_bucket_ownership_controls":
+            return {"OwnershipControls": m.OWNERSHIP}
+        elif operation == "get_bucket_encryption":
+            return {"ServerSideEncryptionConfiguration": m.ENCRYPTION}
+        elif operation == "create_security_group":
+            self.group = True
+            return {"GroupId": GROUP}
+        elif operation == "describe_security_groups":
+            return {
+                "SecurityGroups": [
+                    dict(
+                        GroupId=GROUP,
+                        GroupName="lumi-watchdog-object-" + ATTEMPT,
+                        VpcId=m.VPC,
+                        Tags=[{"Key": "LumiAttempt", "Value": ATTEMPT}],
+                        IpPermissions=[],
+                        IpPermissionsEgress=self.egress,
+                    )
+                ]
+                if self.group
+                else []
+            }
+        elif operation == "revoke_security_group_egress":
+            self.egress = []
+        elif operation == "authorize_security_group_egress":
+            self.egress = params["IpPermissions"]
+        elif operation == "run_instances":
+            self.instance = True
+            return {"Instances": [self.row()]}
+        elif operation == "describe_instances":
+            return {"Reservations": [{"Instances": [self.row()] if self.instance else []}]}
+        elif operation == "terminate_instances":
+            self.state = "terminated"
+        elif operation == "describe_volumes":
+            return {"Volumes": [{"VolumeId": "vol-" + "3" * 17}] if self.sticky_volume else []}
+        elif operation == "describe_network_interfaces":
+            return {"NetworkInterfaces": []}
+        elif operation == "delete_security_group":
+            self.group = False
+        elif operation == "get_object":
+            slot = params["Key"].split("/")[1].split(".")[0]
+            if slot not in self.reports:
+                raise failure("NoSuchKey")
+            raw = channel.encode(ATTEMPT, builder.BINDINGS, slot, self.reports[slot])
+            return dict(ContentLength=len(raw), ServerSideEncryption="AES256", Body=io.BytesIO(raw))
+        elif operation == "put_bucket_policy":
+            self.policy = params["Policy"]
+        elif operation == "get_bucket_policy":
+            return {"Policy": self.policy}
+        elif operation == "delete_bucket":
+            self.bucket = False
+        return {}
+
+
+class ObjectControllerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.clients = m.clients(
+            dict(
+                aws_access_key_id="AKIASYNTHETIC00000000",
+                aws_secret_access_key="NOT_A_SECRET",
+                aws_session_token="SYNTHETIC_SESSION_TOKEN",
+            )
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        for client in cls.clients.values():
+            client.close()
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.clock = Clock()
+        self.enterContext(patch.object(m.time, "monotonic", self.clock.now))
+        self.enterContext(patch.object(m.time, "sleep", self.clock.sleep))
+        self.api = FakeAPI(self.clients, self.clock)
+        self.writer = m.Evidence(self.root / "attempt")
+        self.attempt = m.Attempt(self.api, self.writer, ATTEMPT, channel, builder)
+
+    def operations(self):
+        return [operation for operation, _ in self.api.calls]
+
+    def throws(self, code="AccessDenied"):
+        def raise_error():
+            raise failure(code)
+
+        return raise_error
+
+    def test_complete_flow_qualifies_only_native_probe_and_cleans_all(self):
+        result = self.attempt.execute()
+        self.assertEqual(result["errors"], [])
+        self.assertTrue(result["native_watchdog_qualified"])
+        self.assertTrue(result["cleanup_verified"])
+        for flag in (
+            "gate_5_complete",
+            "real_4b_import",
+            "gpu_inference_training",
+            "complete_bootstrap_qualified",
+            "production_eligible",
+        ):
+            self.assertIs(result[flag], False)
+        self.assertFalse(self.api.bucket or self.api.group)
+        self.assertEqual(self.api.state, "terminated")
+        ops = self.operations()
+        self.assertEqual(ops.count("run_instances"), 1)
+        self.assertEqual(ops.count("get_object"), 4)
+        self.assertEqual(ops.count("delete_object"), 4)
+        self.assertLess(ops.index("terminate_instances"), ops.index("get_object"))
+        self.assertLess(ops.index("get_bucket_policy"), ops.index("delete_object"))
+        self.assertLess(ops.index("delete_object"), ops.index("delete_bucket"))
+
+    def test_every_report_read_and_delete_is_exact_key_and_owner(self):
+        self.attempt.execute()
+        for op, params in self.api.calls:
+            if "Bucket" in params:
+                self.assertEqual(params["Bucket"], channel.target(ATTEMPT, "boot")[0])
+                if op != "create_bucket":
+                    self.assertEqual(params["ExpectedBucketOwner"], m.ACCOUNT)
+            if op in {"get_object", "delete_object"}:
+                self.assertIn(params["Key"], [channel.target(ATTEMPT, s)[1] for s in channel.SLOTS])
+        self.assertFalse(any("list" in op or "console" in op for op in self.operations()))
+
+    def test_no_secrets_or_user_data_are_persisted(self):
+        self.attempt.execute()
+        raw = b"".join(path.read_bytes() for path in self.writer.path.iterdir())
+        for secret in (b"X-Amz-", b"SYNTHETIC_SESSION_TOKEN", b"NOT_A_SECRET", b'"UserData"'):
+            self.assertNotIn(secret, raw)
+        self.assertLessEqual(len(raw), m.BOUNDS["local_evidence_bytes"])
+
+    def test_run_request_encodes_binary_gzip_exactly_once(self):
+        self.attempt.execute()
+        request = next(params for op, params in self.api.calls if op == "run_instances")
+        payload = request["UserData"]
+        self.assertIsInstance(payload, bytes)
+        self.assertLessEqual(len(payload), 16384)
+        self.assertTrue(gzip.decompress(payload).startswith(b"#cloud-config\n"))
+        botocore.handlers.base64_encode_user_data(request)
+        self.assertEqual(base64.b64decode(request["UserData"], validate=True), payload)
+        self.assertNotIn("IamInstanceProfile", request)
+        self.assertNotIn("KeyName", request)
+        self.assertEqual(request["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 8)
+
+    def test_ambiguous_launch_resolves_without_second_launch(self):
+        def ambiguous():
+            self.api.instance = True
+            raise TimeoutError("SECRET_SENTINEL")
+
+        self.api.failures["run_instances"] = ambiguous
+        result = self.attempt.execute()
+        self.assertEqual(self.operations().count("run_instances"), 1)
+        self.assertTrue(result["cleanup_verified"])
+        self.assertFalse(result["native_watchdog_qualified"])
+        self.assertEqual(result["errors"], ["launch"])
+        self.assertNotIn("SECRET_SENTINEL", json.dumps(result))
+
+    def test_unresolved_launch_is_not_false_cleanup_success(self):
+        self.api.failures["run_instances"] = self.throws()
+        result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertEqual(self.operations().count("run_instances"), 1)
+        self.assertIn("instance_cleanup", result["errors"])
+
+    def test_ambiguous_bucket_create_is_resolved_and_removed(self):
+        def ambiguous():
+            self.api.bucket = True
+            raise TimeoutError("SECRET_SENTINEL")
+
+        self.api.failures["create_bucket"] = ambiguous
+        result = self.attempt.execute()
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(self.operations().count("create_bucket"), 1)
+        self.assertNotIn("run_instances", self.operations())
+
+    def test_unresolved_bucket_create_does_not_claim_single_404_cleanup(self):
+        self.api.failures["create_bucket"] = self.throws()
+        result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertGreater(self.operations().count("head_bucket"), 2)
+
+    def test_existing_or_inaccessible_bucket_is_never_modified(self):
+        for existing in (True, False):
+            with self.subTest(existing=existing):
+                api = FakeAPI(self.clients, self.clock)
+                api.bucket = existing
+                if not existing:
+                    api.failures["head_bucket"] = self.throws()
+                attempt = m.Attempt(
+                    api, m.Evidence(self.root / str(existing)), ATTEMPT, channel, builder
+                )
+                result = attempt.execute()
+                ops = [op for op, _ in api.calls]
+                self.assertEqual(result["errors"], ["preflight"])
+                self.assertNotIn("create_bucket", ops)
+                self.assertNotIn("delete_bucket", ops)
+
+    def test_failed_bucket_configuration_never_launches_and_cleans(self):
+        self.api.failures["put_public_access_block"] = self.throws()
+        result = self.attempt.execute()
+        self.assertTrue(result["cleanup_verified"])
+        self.assertNotIn("run_instances", self.operations())
+
+    def test_failed_group_configuration_cleans_new_bucket_and_group(self):
+        self.api.failures["authorize_security_group_egress"] = self.throws()
+        result = self.attempt.execute()
+        self.assertTrue(result["cleanup_verified"])
+        self.assertNotIn("run_instances", self.operations())
+
+    def test_known_group_id_with_no_visibility_does_not_claim_cleanup(self):
+        self.attempt.group_started = True
+        self.attempt.group = GROUP
+        with self.assertRaises(TimeoutError):
+            self.attempt.cleanup_group()
+        self.assertGreater(self.operations().count("describe_security_groups"), 2)
+        self.assertNotIn("security_group_absent_verified", self.attempt.result)
+
+    def test_incorrect_private_bucket_readback_blocks_launch(self):
+        original = self.api.call
+
+        def call(service, operation, **params):
+            result = original(service, operation, **params)
+            if operation == "get_public_access_block":
+                result = {
+                    "PublicAccessBlockConfiguration": dict(m.PUBLIC_BLOCK, BlockPublicPolicy=False)
+                }
+            return result
+
+        with patch.object(self.api, "call", call):
+            result = self.attempt.execute()
+        self.assertEqual(result["errors"], ["bucket_private_configuration"])
+        self.assertNotIn("run_instances", self.operations())
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_stale_capabilities_stop_before_launch_and_cleanup(self):
+        original = self.attempt.setup_group
+
+        def setup():
+            original()
+            self.attempt.urls_expire_at = 0
+
+        with patch.object(self.attempt, "setup_group", setup):
+            result = self.attempt.execute()
+        self.assertEqual(result["errors"], ["capability_freshness"])
+        self.assertNotIn("run_instances", self.operations())
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_cleanup_error_does_not_skip_other_cleanups(self):
+        self.api.failures["terminate_instances"] = self.throws()
+        result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertIn("delete_security_group", self.operations())
+        self.assertIn("get_object", self.operations())
+        self.assertIn("put_bucket_policy", self.operations())
+        self.assertNotIn("delete_bucket", self.operations())  # Sender/capability still live.
+
+    def test_foreign_instance_is_never_terminated(self):
+        self.api.foreign = True
+        result = self.attempt.execute()
+        self.assertFalse(result["native_watchdog_qualified"])
+        self.assertNotIn("terminate_instances", self.operations())
+
+    def test_volume_cleanup_failure_does_not_skip_group_or_bucket(self):
+        self.api.sticky_volume = True
+        result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertIn("delete_bucket", self.operations())
+        self.assertIn("delete_security_group", self.operations())
+
+    def test_group_delete_is_not_retried_and_bucket_cleanup_still_runs(self):
+        self.api.failures["delete_security_group"] = self.throws("DependencyViolation")
+        result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertEqual(self.operations().count("delete_security_group"), 1)
+        self.assertIn("delete_bucket", self.operations())
+
+    def test_failed_report_collection_revokes_but_preserves_bucket_evidence(self):
+        self.api.failures["get_object"] = self.throws()
+        result = self.attempt.execute()
+        self.assertTrue(result["terminated_verified"])
+        self.assertFalse(result["reports_persisted"])
+        self.assertFalse(result["cleanup_verified"])
+        self.assertIn("put_bucket_policy", self.operations())
+        self.assertNotIn("delete_object", self.operations())
+
+    def test_missing_report_is_not_a_success_but_cleanup_completes(self):
+        del self.api.reports["observer"]
+        result = self.attempt.execute()
+        self.assertTrue(result["cleanup_verified"])
+        self.assertFalse(result["native_watchdog_qualified"])
+
+    def test_main_failure_report_overrides_successful_observer(self):
+        self.api.reports["failure"] = report("failure")
+        result = self.attempt.execute()
+        self.assertTrue(result["cleanup_verified"])
+        self.assertFalse(result["native_watchdog_qualified"])
+
+    def test_report_disk_failure_prevents_bucket_deletion(self):
+        original = self.writer.save
+
+        def save(name, value):
+            if name == "reports.json":
+                raise OSError("PRIVATE_SENTINEL")
+            return original(name, value)
+
+        with patch.object(self.writer, "save", save):
+            result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertNotIn("delete_object", self.operations())
+
+    def test_failed_revoke_policy_never_deletes_report_objects(self):
+        self.api.failures["put_bucket_policy"] = self.throws()
+        result = self.attempt.execute()
+        self.assertFalse(result["cleanup_verified"])
+        self.assertNotIn("delete_object", self.operations())
+        self.assertTrue((self.writer.path / "reports.json").is_file())
+
+    def test_timeout_stops_observation_then_cleans_without_qualification(self):
+        self.api.state = "running"
+        result = self.attempt.execute()
+        self.assertFalse(result["native_watchdog_qualified"])
+        self.assertFalse(result["stopped_observed"])
+        self.assertTrue(result["cleanup_verified"])
+        self.assertLess(result["controller_seconds"], 1800)
+
+    def test_oversized_package_rejected_before_cloud_mutations(self):
+        with patch.object(builder, "build", side_effect=ValueError("secret")):
+            result = self.attempt.execute()
+        self.assertEqual(result["errors"], ["package"])
+        self.assertNotIn("create_bucket", self.operations())
+
+    def test_output_claim_cannot_be_reused_or_symlinked(self):
+        with self.assertRaises(FileExistsError):
+            m.Evidence(self.writer.path)
+        link = self.root / "link"
+        link.symlink_to(self.writer.path)
+        with self.assertRaises(ValueError):
+            m.Evidence(link)
+        self.writer.save("first.json", {"ok": True})
+        with self.assertRaises(FileExistsError):
+            self.writer.save("first.json", {"ok": False})
+        with self.assertRaises(ValueError):
+            self.writer.save("huge.json", "a" * 131072)
+
+    def test_approval_missing_wrong_hash_bool_and_expansion_rejected(self):
+        path = self.root / "approval.json"
+        with patch.object(m, "APPROVAL", path):
+            with self.assertRaises(ValueError):
+                m.validate_approval()
+            expected = m.approval_contract()
+            variants = []
+            for key, value in (("approved", 1), ("controller_sha256", "0" * 64)):
+                variants.append(dict(expected, **{key: value}))
+            expanded = copy.deepcopy(expected)
+            expanded["bounds"]["instance_count"] = 2
+            variants.append(expanded)
+            for value in variants:
+                path.write_bytes(m.canonical(value))
+                with self.assertRaises(ValueError):
+                    m.validate_approval()
+            raw = m.canonical(expected)
+            path.write_bytes(raw)
+            self.assertEqual(m.validate_approval(), hashlib.sha256(raw).hexdigest())
+
+    def test_credentials_require_temporary_session_and_enough_lifetime(self):
+        expiry = dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+        value = dict(
+            Version=1,
+            AccessKeyId="synthetic",
+            SecretAccessKey="secret",
+            SessionToken="token",
+            Expiration=expiry.isoformat(),
+        )
+        reply = types.SimpleNamespace(returncode=0, stdout=m.canonical(value), stderr=b"secret")
+        with patch.object(m.subprocess, "run", return_value=reply) as run:
+            self.assertEqual(m.credentials()["aws_session_token"], "token")
+            self.assertNotIn("secret", repr(run.call_args))
+        value["Expiration"] = dt.datetime.now(dt.UTC).isoformat()
+        reply.stdout = m.canonical(value)
+        with patch.object(m.subprocess, "run", return_value=reply), self.assertRaises(ValueError):
+            m.credentials()
+
+    def test_cli_missing_approval_never_reads_credentials_or_claims_output(self):
+        with (
+            patch.object(m, "APPROVAL", self.root / "absent.json"),
+            patch.object(m, "credentials") as credentials,
+            patch.object(m, "Evidence") as evidence,
+            patch.object(m.resource, "setrlimit"),
+            patch.object(m.logging, "disable"),
+            patch.object(m.os, "umask"),
+            patch.object(m.sys, "argv", ["controller", "--execute-approved-once"]),
+            self.assertRaises(ValueError),
+        ):
+            m.main()
+        credentials.assert_not_called()
+        evidence.assert_not_called()
+
+    def test_sdk_has_fixed_endpoints_explicit_credentials_no_proxy_or_retry(self):
+        for service, client in self.clients.items():
+            self.assertEqual(client.meta.endpoint_url, f"https://{service}.us-east-1.amazonaws.com")
+            self.assertEqual(client.meta.config.retries["total_max_attempts"], 1)
+            self.assertEqual(client.meta.config.proxies, {})
+            self.assertEqual(client.meta.config.connect_timeout, 3)
+            self.assertEqual(client.meta.config.read_timeout, 5)
+
+    def test_api_deadline_blocks_further_calls(self):
+        stub = Mock()
+        api = m.API({"ec2": stub}, self.clock.now())
+        with self.assertRaises(ValueError):
+            api.call("ec2", "run_instances")
+        stub.run_instances.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

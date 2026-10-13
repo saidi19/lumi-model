@@ -1,0 +1,234 @@
+"""Bounded parent reservation ledger before every native write continuation.
+
+Import is inert and public execution remains closed. The private session uses
+the frozen listener and broker, but does not establish authenticated transport,
+spawn processes, release a worker, or own workload termination. An independently
+admitted controller must own the offer/ACK channel and consume its ledger while
+a separate guardian can terminate the workload and broker at the same deadline.
+
+One fixed 24-byte offer and 8-byte ACK are permitted per notification. Parent
+storage precedes ACK; the session requires that ACK before invoking the frozen
+broker. Thus the parent's last accepted reservation is a conservative requested
+byte upper bound even when the guardian kills a broker blocked in RECV. It is
+not a final successful-write or successful-response count. Any ambiguity consumes
+the stream; there is no retry, refund, replacement listener, or deadline renewal.
+Only fixed codes and aggregate snapshots may be retained, never wire bytes,
+notification IDs, exception objects, or exception text.
+"""
+
+from __future__ import annotations
+
+import os
+import struct
+import threading
+import time
+
+from . import posttraining_checkpoint_write_broker_v1 as broker
+from . import posttraining_checkpoint_write_listener_v1 as listener
+
+SCHEMA = "lumi.checkpoint-write-ledger.v0.1"
+OFFER = struct.Struct("<QQQ")
+ACK = struct.Struct("<Q")
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "budget_rejected", "deadline_exhausted", "owner_mismatch",
+    "already_failed", "reentry", "frame_rejected", "sequence_rejected", "budget_exhausted",
+    "listener_rejected", "listener_failed", "duplicate_notification", "ack_rejected",
+    "callback_rejected", "broker_failed", "ledger_failed",
+})
+FALSE_FLAGS = (
+    "authenticated_transport_verified", "native_listener_origin_verified",
+    "native_write_enforcement_verified", "final_successful_response_count_verified",
+    "physical_or_metadata_write_accounting", "independent_deadline_enforced",
+    "broker_reaped", "host_admission_verified", "execution_permitted",
+    "real_import_permitted", "gate_5_complete", "training_authorized",
+    "production_eligible", "retry_allowed", "reservations_refunded",
+)
+
+
+class LedgerError(ValueError):
+    def __init__(self, code="ledger_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "ledger_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code):
+    if not condition:
+        raise LedgerError(code) from None
+
+
+def encode_offer(ordinal, requested_bytes, cumulative_bytes):
+    """Encode aggregate scalars only; no notification ID enters this channel."""
+    _need(all(type(value) is int and 0 <= value < 2**64
+              for value in (ordinal, requested_bytes, cumulative_bytes))
+          and ordinal > 0, "frame_rejected")
+    return OFFER.pack(ordinal, requested_bytes, cumulative_bytes)
+
+
+def decode_offer(raw):
+    _need(type(raw) is bytes and len(raw) == OFFER.size, "frame_rejected")
+    values = OFFER.unpack(raw)
+    _need(values[0] > 0, "frame_rejected")
+    return values
+
+
+def encode_ack(ordinal):
+    _need(type(ordinal) is int and 0 < ordinal < 2**64, "frame_rejected")
+    return ACK.pack(ordinal)
+
+
+def run_write_ledger(**_arguments):
+    raise LedgerError("host_guard_not_bound") from None
+
+
+class _OwnedStream:
+    def __init__(self, budget, *, deadline_ns):
+        try:
+            self._budget = broker._budget(budget)
+        except BaseException:
+            raise LedgerError("budget_rejected") from None
+        now = time.monotonic_ns()
+        _need(type(now) is int and now >= 0 and type(deadline_ns) is int
+              and now < deadline_ns < 2**63
+              and deadline_ns - now <= broker.MAXIMUM_SECONDS * 1_000_000_000,
+              "deadline_exhausted")
+        self._deadline_ns = deadline_ns
+        self._owner = os.getpid(), threading.get_ident()
+        self._lock = threading.Lock()
+        self._failed = False
+
+    def _enter(self):
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+            _need(self._lock.acquire(blocking=False), "reentry")
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is LedgerError else "ledger_failed"
+            raise LedgerError(code) from None
+
+    def _live(self):
+        _need(not self._failed, "already_failed")
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        now = time.monotonic_ns()
+        _need(type(now) is int and 0 <= now < self._deadline_ns, "deadline_exhausted")
+
+    def _next(self, ordinal, count, cumulative, previous_ordinal, previous_total):
+        _need(ordinal == previous_ordinal + 1, "sequence_rejected")
+        _need(ordinal <= self._budget["maximum_notifications"]
+              and count <= self._budget["maximum_call_bytes"]
+              and count <= self._budget["maximum_bytes"] - previous_total,
+              "budget_exhausted")
+        _need(cumulative == previous_total + count, "sequence_rejected")
+
+
+class _ParentLedger(_OwnedStream):
+    """One controller's aggregate upper bound, stored before each ACK attempt."""
+
+    def __init__(self, budget, *, deadline_ns):
+        super().__init__(budget, deadline_ns=deadline_ns)
+        self._accepted = 0
+        self._reserved = self._budget["precharged_bytes"]
+        self._ack_attempts = 0
+
+    def _accept_admitted_once(self, raw, *, send_ack):
+        self._enter()
+        try:
+            self._live()
+            _need(callable(send_ack), "callback_rejected")
+            ordinal, count, cumulative = decode_offer(raw)
+            self._next(ordinal, count, cumulative, self._accepted, self._reserved)
+            self._live()
+            self._accepted, self._reserved = ordinal, cumulative
+            self._ack_attempts += 1
+            _need(send_ack(encode_ack(ordinal)) is None, "ack_rejected")
+            self._live()
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is LedgerError else "ledger_failed"
+            raise LedgerError(code) from None
+        finally:
+            self._lock.release()
+
+    def snapshot(self):
+        self._enter()
+        try:
+            return {
+                "schema": SCHEMA, "role": "parent",
+                "offers_accepted": self._accepted, "reserved_bytes": self._reserved,
+                "ack_attempts": self._ack_attempts, "terminal_failed": self._failed,
+                "maximum_offer_bytes": self._budget["maximum_notifications"] * OFFER.size,
+                "maximum_ack_bytes": self._budget["maximum_notifications"] * ACK.size,
+                **dict.fromkeys(FALSE_FLAGS, False),
+            }
+        finally:
+            self._lock.release()
+
+
+class _BrokerSession(_OwnedStream):
+    """Private single-flight listener service with a parent ACK before CONTINUE.
+
+    The listener is borrowed and must outlive this session. The admitted caller
+    owns its termination and close. ``exchange_offer`` is a trusted transport
+    boundary: it must return only the exact ACK received from the parent. Merely
+    returning manufactured bytes is not proof of parent persistence or origin.
+    """
+
+    def __init__(self, bound_listener, budget, *, deadline_ns):
+        _need(type(bound_listener) is listener._Listener, "listener_rejected")
+        super().__init__(budget, deadline_ns=deadline_ns)
+        self._listener = bound_listener
+        self._core = broker._Broker(self._budget, deadline_ns=deadline_ns)
+        self._seen = set()
+        self._attempted = self._confirmed = 0
+        self._reserved = self._confirmed_bytes = self._budget["precharged_bytes"]
+
+    def _service_admitted_once(self, *, exchange_offer):
+        self._enter()
+        try:
+            self._live()
+            _need(callable(exchange_offer), "callback_rejected")
+            try:
+                raw = self._listener.receive_admitted_once()
+                parsed = broker.parse_notification(raw)
+            except BaseException:
+                raise LedgerError("listener_failed") from None
+            self._live()
+            identifier, count = parsed["id"], parsed["requested_bytes"]
+            _need(identifier not in self._seen, "duplicate_notification")
+            ordinal, cumulative = self._attempted + 1, self._reserved + count
+            self._next(ordinal, count, cumulative, self._attempted, self._reserved)
+            self._seen.add(identifier)
+            self._attempted, self._reserved = ordinal, cumulative
+            self._live()
+            acknowledgment = exchange_offer(encode_offer(ordinal, count, cumulative))
+            _need(type(acknowledgment) is bytes and acknowledgment == encode_ack(ordinal),
+                  "ack_rejected")
+            self._live()
+            self._confirmed, self._confirmed_bytes = ordinal, cumulative
+            try:
+                self._core._service_admitted_once(
+                    raw, id_valid=self._listener.id_valid,
+                    send_response=self._listener.send_response,
+                )
+            except BaseException:
+                raise LedgerError("broker_failed") from None
+            self._live()
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is LedgerError else "ledger_failed"
+            raise LedgerError(code) from None
+        finally:
+            self._lock.release()
+
+    def snapshot(self):
+        self._enter()
+        try:
+            return {
+                "schema": SCHEMA, "role": "broker",
+                "offers_attempted": self._attempted, "reserved_bytes": self._reserved,
+                "parent_acknowledged_offers": self._confirmed,
+                "parent_acknowledged_bytes": self._confirmed_bytes,
+                "terminal_failed": self._failed,
+                **dict.fromkeys(FALSE_FLAGS, False),
+            }
+        finally:
+            self._lock.release()

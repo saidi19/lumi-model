@@ -1,0 +1,405 @@
+"""Fixed generated-only Linux/systemd rehearsal, not a real-input launcher.
+
+The operator must separately admit a dedicated VM and authenticate its runtime
+and staged source release. Nothing here acquires data, provisions a VM, grants
+training authority, or satisfies the old cumulative-native-write contract.
+Systemd, not a new Python guardian/broker, owns the worker's cgroup and deadline.
+Mac tests exercise dispatch logic with doubles, never native containment.
+"""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path("/opt/lumi-sft-rehearsal-v2")
+SCRIPT = ROOT / "scripts/run_sft_import_vm_rehearsal_v2.py"
+PYTHON = Path("/opt/lumi-sft-rehearsal/venv/bin/python")
+ATTEMPTS = Path("/var/lib/lumi-sft-rehearsal")
+WORK = Path("/work")
+CGROUP = Path("/sys/fs/cgroup")
+MODES = ("chain", "timeout", "memory", "disk")
+MIB = 1024**2
+LIMITS = {
+    "chain": (2048 * MIB, 120),
+    "timeout": (128 * MIB, 2),
+    "memory": (96 * MIB, 15),
+    "disk": (256 * MIB, 15),
+}
+TMP_BYTES = 64 * MIB
+TOTAL_SECONDS = 240
+FIELDS = ("ActiveState", "SubState", "Result", "ExecMainCode", "ExecMainStatus")
+ENV = {
+    "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "TMPDIR": "/work",
+    "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1", "HF_HUB_DISABLE_TELEMETRY": "1",
+    "HF_HUB_DISABLE_PROGRESS_BARS": "1", "TOKENIZERS_PARALLELISM": "false",
+    "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+    "AWS_EC2_METADATA_DISABLED": "true",
+}
+ERRORS = frozenset({"arguments", "host", "release", "attempt_used", "dispatch",
+                    "deadline", "observation", "case_failed", "cleanup",
+                    "worker_boundary", "fixture_failed", "probe_failed"})
+REQUIRED = frozenset({
+    "scripts/run_sft_import_vm_rehearsal_v2.py",
+    "src/lumi/posttraining_import_vm_rehearsal_v2.py",
+    "src/lumi/posttraining_checkpoint_import_torch_v5.py",
+    "src/lumi/posttraining_checkpoint_package_v2.py",
+    "src/lumi/posttraining_sft_runtime_v4.py",
+    "tests/test_sft_checkpoint_import_integration_v2.py",
+})
+
+
+class RehearsalError(ValueError):
+    def __init__(self, code):
+        self.code = code if code in ERRORS else "dispatch"
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise RehearsalError(code) from None
+
+
+def hex_id(value, length):
+    return type(value) is str and re.fullmatch(rf"[a-f0-9]{{{length}}}", value) is not None
+
+
+def unit_name(attempt, mode):
+    need(hex_id(attempt, 32) and mode in MODES, "arguments")
+    return f"lumi-sft-rehearsal-{attempt}-{mode}.service"
+
+
+def properties(mode):
+    need(mode in MODES, "arguments")
+    memory, seconds = LIMITS[mode]
+    return {
+        "User": "10001", "Group": "10001", "SupplementaryGroups": "",
+        "Restart": "no", "RemainAfterExit": "yes",
+        "RuntimeMaxSec": str(seconds), "RuntimeRandomizedExtraSec": "0",
+        "TimeoutStartSec": "10", "TimeoutStopSec": "5",
+        "TimeoutStopFailureMode": "kill", "KillMode": "control-group",
+        "SendSIGKILL": "yes", "OOMPolicy": "kill",
+        "MemoryMax": str(memory), "MemorySwapMax": "0", "TasksMax": "64",
+        "CPUQuota": "100%", "LimitCORE": "0", "UMask": "0077",
+        "NoNewPrivileges": "yes", "CapabilityBoundingSet": "",
+        "AmbientCapabilities": "", "RestrictSUIDSGID": "yes",
+        "ProtectSystem": "strict", "ProtectHome": "yes",
+        "ProtectKernelTunables": "yes", "ProtectKernelModules": "yes",
+        "ProtectControlGroups": "yes", "PrivateDevices": "yes",
+        "PrivateNetwork": "yes", "PrivateIPC": "yes",
+        "RestrictAddressFamilies": "AF_UNIX",
+        "InaccessiblePaths": "/tmp /var/tmp -/inputs -/outputs -/dev/shm",
+        "TemporaryFileSystem": (
+            f"/work:rw,nosuid,nodev,noexec,size={TMP_BYTES},mode=0700,uid=10001,gid=10001"
+        ),
+        "WorkingDirectory": "/work", "StandardInput": "null",
+        "StandardOutput": "null", "StandardError": "null",
+    }
+
+
+def launch_command(attempt, mode):
+    name = unit_name(attempt, mode)
+    # No shell, caller-selected executable, input path, model size or import flag.
+    command = ["/usr/bin/systemd-run", "--quiet", "--no-ask-password",
+               "--service-type=exec", f"--unit={name}"]
+    command += [f"--property={key}={value}" for key, value in properties(mode).items()]
+    command += [f"--setenv={key}={value}" for key, value in ENV.items()]
+    return command + ["--", str(PYTHON), "-I", "-B", str(SCRIPT), "worker", attempt, mode]
+
+
+def small(path, maximum=4096):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        need(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "observation")
+        raw = stream.read(maximum + 1)
+    need(len(raw) <= maximum, "observation")
+    return raw
+
+
+def root_owned(path):
+    for item in (path, *path.parents):
+        info = item.lstat()
+        need(not stat.S_ISLNK(info.st_mode) and info.st_uid == 0
+             and not stat.S_IMODE(info.st_mode) & 0o022, "release")
+
+
+def verify_release(expected):
+    """Verify a pre-staged source-only manifest, not a runtime origin proof."""
+    need(hex_id(expected, 64), "arguments")
+    manifest = ROOT / "release-manifest.json"
+    root_owned(manifest)
+    raw = small(manifest, 1024 * 1024)
+    need(hashlib.sha256(raw).hexdigest() == expected, "release")
+    rows = json.loads(raw)
+    need(type(rows) is dict and REQUIRED <= set(rows) and len(rows) <= 4096, "release")
+    total = 0
+    for name, digest in rows.items():
+        need(type(name) is str and re.fullmatch(
+            r"(?:src/lumi|tests|scripts)/[A-Za-z0-9_]+\.py", name)
+             and hex_id(digest, 64), "release")
+        source = ROOT / name
+        root_owned(source)
+        need(source.stat().st_nlink == 1, "release")
+        content = small(source, 1024 * 1024)
+        total += len(content)
+        need(total <= 64 * MIB and hashlib.sha256(content).hexdigest() == digest, "release")
+    actual = set()
+    for folder in ("src/lumi", "tests", "scripts"):
+        for source in (ROOT / folder).iterdir():
+            need(not source.is_symlink() and source.is_file(), "release")
+            actual.add(source.relative_to(ROOT).as_posix())
+            need(len(actual) <= 4096, "release")
+    need(actual == set(rows), "release")
+    # The independently authenticated preinstalled venv may link to system Python.
+    root_owned(PYTHON.resolve(strict=True))
+
+
+def host_check(machine_id):
+    need(sys.platform == "linux" and os.geteuid() == 0
+         and hex_id(machine_id, 32), "host")
+    need(small(Path("/etc/machine-id")).strip().decode("ascii") == machine_id, "host")
+    need(small(Path("/proc/1/comm")).strip() == b"systemd"
+         and (CGROUP / "cgroup.controllers").is_file(), "host")
+    need({"memory", "pids", "cpu"} <= set(small(CGROUP / "cgroup.controllers")
+                                          .decode("ascii").split()), "host")
+    version = run_command(["/usr/bin/systemctl", "--version"], 5, capture=True)
+    match = re.match(rb"systemd ([0-9]+)\b", version.stdout)
+    need(version.returncode == 0 and match is not None and int(match[1]) >= 255, "host")
+
+
+def run_command(command, timeout, *, capture=False):
+    # Only fixed systemd commands are admitted by the callers, never worker logs.
+    result = subprocess.run(
+        command, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"}, close_fds=True,
+    )
+    if capture:
+        need(type(result.stdout) is bytes and len(result.stdout) <= 4096, "observation")
+    return result
+
+
+def observe(unit):
+    result = run_command(["/usr/bin/systemctl", "show", unit, "--no-pager",
+                          "--property=" + ",".join(FIELDS)], 5, capture=True)
+    need(result.returncode == 0, "observation")
+    values = {}
+    for line in result.stdout.decode("ascii").splitlines():
+        key, separator, value = line.partition("=")
+        need(separator and key in FIELDS and key not in values, "observation")
+        values[key] = value
+    need(set(values) == set(FIELDS), "observation")
+    return values
+
+
+def validate_terminal(mode, values):
+    expected = {"chain": "success", "disk": "success", "timeout": "timeout",
+                "memory": "oom-kill"}[mode]
+    need(values["Result"] == expected, "case_failed")
+    if expected == "success":
+        need(values["ActiveState"] == "active" and values["SubState"] == "exited"
+             and values["ExecMainCode"] == "1" and values["ExecMainStatus"] == "0",
+             "case_failed")
+    else:
+        need(values["ActiveState"] == "failed" and values["SubState"] == "failed"
+             and values["ExecMainCode"] in {"1", "2", "3"}, "case_failed")
+
+
+def cgroup_empty(unit):
+    directory = CGROUP / "system.slice" / unit
+    if not directory.exists():
+        return True
+    rows = dict(line.split() for line in small(directory / "cgroup.events")
+                .decode("ascii").splitlines())
+    return rows.get("populated") == "0"
+
+
+def run_case(attempt, mode, overall_deadline):
+    unit = unit_name(attempt, mode)
+    deadline = min(overall_deadline, time.monotonic() + LIMITS[mode][1] + 20)
+    existing = run_command(["/usr/bin/systemctl", "show", unit,
+                            "--property=LoadState", "--value"], 5, capture=True)
+    need(existing.returncode in {0, 1, 4} and existing.stdout.strip() == b"not-found",
+         "attempt_used")
+
+    def remaining(maximum):
+        seconds = min(maximum, deadline - time.monotonic())
+        need(seconds > 0, "deadline")
+        return seconds
+
+    try:
+        # Marked before dispatch by launch(); ambiguous dispatch is not retried.
+        need(run_command(launch_command(attempt, mode), remaining(15)).returncode == 0,
+             "dispatch")
+        while time.monotonic() < deadline:
+            values = observe(unit)
+            if values["SubState"] in {"exited", "failed", "dead"}:
+                validate_terminal(mode, values)
+                break
+            time.sleep(0.2)
+        else:
+            raise RehearsalError("deadline")
+    finally:
+        # Even a failed/ambiguous start gets one exact-unit stop attempt. Systemd's
+        # independent RuntimeMaxSec still applies if this controller disappears.
+        stopped = run_command(["/usr/bin/systemctl", "stop", unit], 10)
+        need(stopped.returncode == 0 and cgroup_empty(unit), "cleanup")
+    return {"case": mode, "status": "passed", "cgroup_empty": True}
+
+
+def write_new(path, document):
+    raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    need(len(raw) <= 4096, "observation")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        need(os.write(fd, raw) == len(raw), "observation")
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def launch(*, machine_id, attempt, release_sha256):
+    """Operator-invoked generated-only run on an already approved dedicated VM."""
+    need(hex_id(attempt, 32), "arguments")
+    host_check(machine_id)  # Wrong host/Mac rejects before mutation or process launch.
+    verify_release(release_sha256)
+    root_owned(ATTEMPTS)
+    need(stat.S_IMODE(ATTEMPTS.stat().st_mode) == 0o700, "host")
+    destination = ATTEMPTS / attempt
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        raise RehearsalError("attempt_used") from None
+    write_new(destination / "started.json", {
+        "scope": "generated_only", "release_sha256": release_sha256,
+        "machine_id_sha256": hashlib.sha256(machine_id.encode()).hexdigest(),
+    })
+    deadline = time.monotonic() + TOTAL_SECONDS
+    completed = []
+    try:
+        for mode in MODES:
+            need(time.monotonic() < deadline, "deadline")
+            completed.append(run_case(attempt, mode, deadline))
+        report = {
+            "schema": "lumi.sft-vm-rehearsal.v0.2", "status": "passed_generated_only",
+            "cases": completed, "real_4b_import": False, "training_authorized": False,
+            "production_eligible": False, "cumulative_native_writes_bounded": False,
+            "instance_billing_or_shutdown_managed": False,
+        }
+        write_new(destination / "result.json", report)
+        return report
+    except BaseException as error:
+        code = error.code if isinstance(error, RehearsalError) else "dispatch"
+        write_new(destination / "failure.json", {
+            "status": "failed", "code": code, "completed_cases": len(completed),
+            "retry_allowed": False,
+        })
+        raise RehearsalError(code) from None
+
+
+def worker_check(attempt, mode):
+    need(sys.platform == "linux" and os.geteuid() == os.getegid() == 10001
+         and os.getgroups() in ([], [10001])
+         and sys.flags.isolated and sys.dont_write_bytecode,
+         "worker_boundary")
+    unit = unit_name(attempt, mode)
+    need(small(Path("/proc/self/cgroup")).strip()
+         == f"0::/system.slice/{unit}".encode(), "worker_boundary")
+    group = CGROUP / "system.slice" / unit
+    for name, expected in (("memory.max", LIMITS[mode][0]), ("memory.swap.max", 0),
+                           ("pids.max", 64)):
+        need(small(group / name).strip() == str(expected).encode(), "worker_boundary")
+    info = WORK.stat()
+    space = os.statvfs(WORK)
+    need(info.st_uid == 10001 and stat.S_IMODE(info.st_mode) == 0o700
+         and space.f_blocks * space.f_frsize == TMP_BYTES, "worker_boundary")
+    need(all(os.environ.get(key) == value for key, value in ENV.items()), "worker_boundary")
+
+
+def copy_worker_sources():
+    """Immutable root release -> exact worker-owned ephemeral source fixture.
+
+    ContentIO intentionally requires source control files to share the worker's
+    UID. Keep that invariant and the root release; do not chown either original.
+    The fixed child starts fresh so cached root-owned modules cannot leak in.
+    """
+    manifest = json.loads(small(ROOT / "release-manifest.json", 1024 * 1024))
+    need(type(manifest) is dict and REQUIRED <= set(manifest)
+         and len(manifest) <= 4096, "release")
+    destination = WORK / "release"
+    destination.mkdir(mode=0o700, exist_ok=False)
+    total = 0
+    for name, digest in manifest.items():
+        need(type(name) is str and re.fullmatch(
+            r"(?:src/lumi|tests|scripts)/[A-Za-z0-9_]+\.py", name)
+             and hex_id(digest, 64), "release")
+        raw = small(ROOT / name, 1024 * 1024)
+        total += len(raw)
+        need(total <= 2 * MIB and hashlib.sha256(raw).hexdigest() == digest, "release")
+        output = destination / name
+        output.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw), "release")
+        need(hashlib.sha256(small(output, 1024 * 1024)).hexdigest() == digest, "release")
+    return destination
+
+
+CHAIN_ENTRY = (
+    "import sys,unittest;"
+    "sys.path[:0]=['/work/release/src','/work/release'];"
+    "s=unittest.defaultTestLoader.loadTestsFromName("
+    "'tests.test_sft_checkpoint_import_integration_v2');"
+    "r=unittest.TextTestRunner().run(s);"
+    "sys.exit(0 if r.testsRun==4 and r.wasSuccessful() and not r.skipped else 1)"
+)
+
+
+def worker(attempt, mode):
+    worker_check(attempt, mode)  # Before ML imports, allocation or any fixture write.
+    if mode == "chain":
+        copy_worker_sources()
+        result = subprocess.run(
+            [str(PYTHON), "-I", "-B", "-c", CHAIN_ENTRY],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=115, check=False, close_fds=True, cwd=WORK, env=dict(ENV),
+        )
+        need(result.returncode == 0, "fixture_failed")
+    elif mode == "timeout":
+        # A descendant intentionally outlives the leader unless systemd kills
+        # the complete cgroup. This is not an arbitrary command interface.
+        child = os.fork()
+        if child == 0:
+            time.sleep(60)
+            os._exit(90)
+        time.sleep(60)
+        raise RehearsalError("probe_failed")
+    elif mode == "memory":
+        chunks = []
+        # Bounded even if the OS limit is broken; absence of OOM must fail.
+        for _ in range(64):
+            chunks.append(bytearray(8 * MIB))
+        raise RehearsalError("probe_failed")
+    elif mode == "disk":
+        written = 0
+        try:
+            with (WORK / "capacity-probe").open("xb", buffering=0) as output:
+                for _ in range(128):
+                    count = output.write(bytes(MIB))
+                    need(type(count) is int and 0 < count <= MIB, "probe_failed")
+                    written += count  # A short final write is valid before ENOSPC.
+        except OSError as error:
+            need(error.errno == errno.ENOSPC and TMP_BYTES - MIB <= written <= TMP_BYTES,
+                 "probe_failed")
+        else:
+            raise RehearsalError("probe_failed")

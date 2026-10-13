@@ -1,0 +1,68 @@
+# SFT execution status v0.115
+
+2026-09-26. The pre-fork descriptor topology for the write-guard process
+composition is implemented and locally verified. **This fixes the channel and
+inherited-FD plan, but it does not yet spawn the processes; Gate 5 remains
+incomplete.** No real socket, process, cgroup, pidfd, listener, payload, remote
+mutation, GPU operation, inference or training occurred.
+
+## Completed
+
+- Six fixed local seqpacket pairs cover guardian control, parent reservation
+  ledger, broker report, worker report, guardian release and listener transfer.
+  All twelve endpoints require root ownership, CLOEXEC, O_RDWR, O_NONBLOCK,
+  local connected seqpacket type and distinct descriptor/socket identities.
+- Final ownership is exact and disjoint: controller keeps 4 endpoints, broker
+  3, worker 3 and guardian watcher 2. Together they cover all 12 endpoints.
+  The guardian-prefork copy keeps exactly the eight non-controller endpoints
+  needed to create its two children.
+- The only allowed state paths are `initial → controller`,
+  `initial → guardian_prefork`, then `guardian_prefork → broker|worker|guardian_watch`.
+  A nested fork child must explicitly adopt its inherited copy by matching the
+  recorded immediate parent PID, single main thread and unchanged deadline.
+- Endpoint access and every transition recheck process ownership, deadline and
+  descriptor identity under the topology lock. External keep-FDs cannot alias
+  topology descriptors.
+- Every close is consumed once. Descriptor replacement is never closed as the
+  original, close failures are never retried, and ambiguous socket objects stay
+  retained so object destruction cannot later close a reused numeric FD.
+- Snapshots are aggregate-only: counts and fixed false claims, with no FD,
+  socket identity, PID, packet or exception text.
+
+## Verification
+
+**857 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 21 topology tests plus the previous 836 regressions. All new
+runtime, clock, PID-lineage, pair, identity and close boundaries are synthetic.
+
+Syntax/AST checks pass for the two new files on both runtimes; maximum line
+length is 92 and trailing whitespace is zero. Tests used `-B`, and no bytecode
+file for the new component is present. Ruff was unavailable and no replacement
+was downloaded.
+
+Development record:
+`configs/lumi-4b-sft-write-process-topology-development-v0.1.json`.
+
+SHA-256: `7023ead421070e237ff3841433cce8d6f0272967cc6305241b05d01044695c45`.
+
+Verification:
+`evidence/lumi-4b-sft-write-process-topology-development-verification-v0.1.json`.
+
+SHA-256: `b88b2d1d03b7839042aaf188638fecbf072ff7eb7ac22171b8eeb77a941fa7e8`.
+
+## Exact next work and unchanged boundary
+
+The next successor must execute this topology in a fully doubled private
+composition: the outer controller forks and pidfd-binds the guardian; the
+guardian adopts its copy, creates the cgroup lease, forks and pidfd-binds broker
+and worker; and each copy closes down to its exact final set.
+
+The controller then needs one fixed event loop for READY verification before
+guardian arm, parent reservation and ACK before every broker CONTINUE, CONSUMED
+verification, aggregate broker/guardian/worker reports, deadline termination
+and waitid-based reaping. After that come listener/drop/seal/full-size bootstrap
+integration, authenticated source closure and separately authorized Linux
+native qualification.
+
+GPU is still unnecessary. No S3 or other remote availability check was made.
+Real import, training and production remain disabled.

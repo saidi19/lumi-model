@@ -1,0 +1,168 @@
+import importlib.util
+import io
+import json
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests.test_sft_vm_parent_entry_v2 import load as load_entry
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "root_stage_test", ROOT / "scripts/stage_sft_vm_root_controller_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+def archive(members):
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, body in sorted(members.items()):
+            row = tarfile.TarInfo(name)
+            row.size = len(body)
+            tar.addfile(row, io.BytesIO(body))
+    return output.getvalue()
+
+
+class StageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # No private artifact dependency in portable unit tests. Actual prepared
+        # archive/readback is checked separately during local release preparation.
+        entry = load_entry()
+        imp = dict(
+            entry_sha256="1" * 64,
+            source_manifest_sha256="2" * 64,
+            control_sha256="3" * 64,
+            attempt_nonce_sha256=m.sha(b"lumi.vm-fullsize-attempt.v0.1\0" + m.ATTEMPT.encode()),
+        )
+        descriptor = dict(
+            schema="lumi.vm-fullsize-prepared-attempt.v0.1",
+            attempt=m.ATTEMPT,
+            acquisition_pins=dict(entry_sha256="4" * 64, source_manifest_sha256="2" * 64),
+            import_pins=imp,
+            host_admitted=False,
+            sdk_runtime_bound=False,
+            execution_permitted=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            training_authorized=False,
+        )
+        cls.members = {
+            "parent.py": (ROOT / m.ENTRY).read_bytes(),
+            "prepared-attempt.json": m.canonical(descriptor),
+        }
+        cls.members.update(
+            {
+                "src/lumi/" + name: (ROOT / "src/lumi" / name).read_bytes()
+                for name in entry.SOURCE_PINS
+            }
+        )
+        cls.raw = archive(cls.members)
+
+    def setUp(self):
+        self.enterContext(
+            patch.object(m, "DESCRIPTOR_SHA", m.sha(self.members["prepared-attempt.json"]))
+        )
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.attempt = self.root / m.ATTEMPT
+        self.worker = self.attempt / "stage/release"
+        self.worker.mkdir(parents=True)
+        self.worker_descriptor = self.worker / "prepared-attempt.json"
+        self.worker_descriptor.write_bytes(self.members["prepared-attempt.json"])
+        self.bundle = self.root / "root-controller.tar"
+        self.bundle.write_bytes(self.raw)
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.enterContext(patch.object(m, "boundary"))
+        original = m.validate
+
+        def validate(members):
+            entry = original(members)
+            entry.root_file = lambda path: path.read_bytes()  # Only native ownership doubled.
+            return entry
+
+        self.enterContext(patch.object(m, "validate", side_effect=validate))
+
+    def install(self):
+        return m.install(self.bundle, m.sha(self.raw), "b" * 32)
+
+    def test_exact_pinned_overlay_and_no_binding_or_execution(self):
+        self.assertEqual(len(self.members), 11)
+        self.assertEqual(m.sha(self.members["parent.py"]), m.ENTRY_SHA)
+        result = self.install()
+        controller = self.attempt / "controller"
+        actual = {
+            str(p.relative_to(controller)): p.read_bytes()
+            for p in controller.rglob("*")
+            if p.is_file()
+        }
+        self.assertEqual(actual, self.members)
+        self.assertFalse((controller / "binding.json").exists())
+        self.assertFalse((controller / "binding.sha256").exists())
+        self.assertFalse(result["execution_permitted"])
+        self.assertEqual(self.worker_descriptor.read_bytes(), self.members["prepared-attempt.json"])
+        with self.assertRaises(FileExistsError):
+            self.install()
+
+    def test_prepare_is_exclusive_and_archive_readback_matches(self):
+        destination = self.root / "prepared"
+        with patch.object(m, "assemble", return_value=self.raw):
+            result = m.prepare(destination)
+            with self.assertRaises(FileExistsError):
+                m.prepare(destination)
+        self.assertEqual((destination / "root-controller.tar").read_bytes(), self.raw)
+        self.assertEqual(result["archive_sha256"], m.sha(self.raw))
+
+    def test_changed_worker_descriptor_blocks_before_controller_creation(self):
+        self.worker_descriptor.write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertFalse((self.attempt / "controller").exists())
+
+    def test_unknown_binding_or_traversal_member_rejected(self):
+        for name in ("binding.json", "../outside", "src/lumi/unlisted.py"):
+            raw = archive(self.members | {name: b"untrusted"})
+            with self.assertRaises(ValueError):
+                m.unpack(raw, m.sha(raw))
+
+    def test_changed_source_rejected_even_with_new_outer_hash(self):
+        raw = archive(self.members | {"parent.py": self.members["parent.py"] + b"\n"})
+        with self.assertRaises(ValueError):
+            m.unpack(raw, m.sha(raw))
+
+    def test_links_and_duplicate_names_rejected(self):
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.REGTYPE):
+            output = io.BytesIO()
+            with tarfile.open(fileobj=output, mode="w") as tar:
+                row = tarfile.TarInfo("parent.py")
+                row.size = 1
+                tar.addfile(row, io.BytesIO(b"x"))
+                second = tarfile.TarInfo("parent.py")
+                second.type = kind
+                second.linkname = "target" if kind != tarfile.REGTYPE else ""
+                tar.addfile(second)
+            raw = output.getvalue()
+            with self.assertRaises(ValueError):
+                m.unpack(raw, m.sha(raw))
+
+    def test_partial_install_preserved_and_cannot_retry(self):
+        write = m.write
+
+        def fail(path, body):
+            if path.name == "prepared-attempt.json":
+                raise OSError("synthetic private exception")
+            return write(path, body)
+
+        with patch.object(m, "write", side_effect=fail), self.assertRaises(ValueError):
+            self.install()
+        self.assertTrue((self.attempt / "controller/parent.py").exists())
+        report = (self.attempt / "controller-stage-failed.json").read_bytes()
+        self.assertNotIn(b"private exception", report)
+        self.assertTrue(json.loads(report)["partial_files_preserved"])
+        with self.assertRaises(FileExistsError):
+            self.install()

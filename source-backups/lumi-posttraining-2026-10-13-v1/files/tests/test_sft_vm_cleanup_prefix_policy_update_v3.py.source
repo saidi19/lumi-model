@@ -1,0 +1,228 @@
+"""Synthetic one-write policy merge; no live AWS transport."""
+
+import copy
+import hashlib
+import importlib
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("apply_sft_vm_cleanup_prefix_protection_v3")
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.output = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve() / "attempt"
+        self.old = dict(
+            Version="2012-10-17",
+            Id="preserved",
+            Statement=[
+                dict(
+                    Sid="Original",
+                    Effect="Deny",
+                    Principal="*",
+                    Action="s3:*",
+                    Resource=[f"arn:aws:s3:::{m.BUCKET}", f"arn:aws:s3:::{m.BUCKET}/*"],
+                    Condition={"Bool": {"aws:SecureTransport": "false"}},
+                )
+            ],
+        )
+        proposal = json.loads(m.PROPOSAL.read_bytes())
+        proposal["expected_before_canonical_sha256"] = m.digest(self.old)
+        proposal["existing_statement_count"] = 1
+        proposal["expected_after_canonical_sha256"] = m.digest(
+            dict(self.old, Statement=self.old["Statement"] + proposal["statements_to_add"])
+        )
+        self.raw = m.canonical(proposal).encode()
+        self.enterContext(
+            patch.object(m, "PROPOSAL", types.SimpleNamespace(read_bytes=lambda: self.raw))
+        )
+        self.enterContext(patch.object(m, "PROPOSAL_SHA", hashlib.sha256(self.raw).hexdigest()))
+        self.enterContext(patch.object(m, "OUTPUT", self.output))
+        self.approval = self.output.parent / "approval.json"
+        self.enterContext(patch.object(m, "APPROVAL", self.approval))
+        self.approval_value = dict(
+            schema="lumi.vm-attempt-008-cleanup-policy-approval.v0.1",
+            status="explicit_human_approval_recorded",
+            proposal_sha256=m.PROPOSAL_SHA,
+            entry_sha256=hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest(),
+            human_message="SYNTHETIC ONLY",
+            scope="one_exact_cleanup_prefix_policy_merge",
+            approved_execution_count=1,
+            no_other_policy_writers_during_update_confirmed=True,
+            maximum_policy_puts=1,
+            retry=False,
+            rollback=False,
+            watchdog_deployment=False,
+            instance_action=False,
+            gpu=False,
+            training=False,
+        )
+        self.approval.write_text(m.canonical(self.approval_value))
+        self.policy, self.calls = copy.deepcopy(self.old), []
+        self.lost_ack = self.fail_before = self.drift_after = False
+
+    def call(self, service, operation, **fields):
+        self.calls.append((service, operation, copy.deepcopy(fields)))
+        if operation == "get-caller-identity":
+            return {"Account": m.ACCOUNT}
+        if operation == "get-bucket-policy":
+            return {"Policy": m.canonical(self.policy)}
+        if operation == "put-bucket-policy":
+            if self.fail_before:
+                raise TimeoutError("PRIVATE_SENTINEL")
+            self.policy = json.loads(fields["Policy"])
+            if self.drift_after:
+                self.policy["Id"] = "external-change"
+            if self.lost_ack:
+                raise TimeoutError("PRIVATE_SENTINEL")
+            return {}
+        if operation == "get-bucket-policy-status":
+            return {"PolicyStatus": {"IsPublic": False}}
+        raise AssertionError(operation)
+
+    def run_once(self):
+        return m.run_once(self.output, types.SimpleNamespace(call=self.call))
+
+    def test_success_preserves_every_original_field_and_statement(self):
+        report = self.run_once()
+        self.assertEqual(report["status"], "applied_and_verified")
+        self.assertEqual(report["cloud_calls"], 5)
+        self.assertEqual(self.policy["Statement"][:1], self.old["Statement"])
+        self.assertEqual(self.policy["Id"], self.old["Id"])
+        self.assertEqual(self.policy["Version"], self.old["Version"])
+        self.assertEqual(len(self.policy["Statement"]), 5)
+
+    def test_precondition_drift_never_writes(self):
+        self.policy["Id"] = "changed"
+        report = self.run_once()
+        self.assertFalse(report["put_attempted"])
+        self.assertEqual(report["failed_stage"], "policy_precondition")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_lost_write_ack_verified_without_retry(self):
+        self.lost_ack = True
+        report = self.run_once()
+        self.assertEqual(report["status"], "applied_and_verified")
+        self.assertFalse(report["put_acknowledged"])
+        self.assertEqual(sum(op == "put-bucket-policy" for _, op, _ in self.calls), 1)
+
+    def test_failed_write_is_not_retried_or_misreported(self):
+        self.fail_before = True
+        report = self.run_once()
+        self.assertEqual(report["status"], "stopped_unconfirmed")
+        self.assertFalse(report["exact_readback_verified"])
+        self.assertEqual(self.policy, self.old)
+        self.assertEqual(sum(op == "put-bucket-policy" for _, op, _ in self.calls), 1)
+        self.assertNotIn("PRIVATE_SENTINEL", (self.output / "result.json").read_text())
+
+    def test_concurrent_change_not_rolled_back(self):
+        self.drift_after = True
+        report = self.run_once()
+        self.assertEqual(report["status"], "stopped_unconfirmed")
+        self.assertEqual(self.policy["Id"], "external-change")
+        self.assertEqual(sum(op == "put-bucket-policy" for _, op, _ in self.calls), 1)
+
+    def test_output_reuse_refused_before_cloud_call(self):
+        self.run_once()
+        count = len(self.calls)
+        with self.assertRaises(FileExistsError):
+            self.run_once()
+        self.assertEqual(len(self.calls), count)
+
+    def test_fields_match_offline_sdk(self):
+        import botocore.session
+        import botocore.validate
+
+        self.run_once()
+        sdk = botocore.session.Session()
+        for service, operation, fields in self.calls:
+            name = "".join(p.capitalize() for p in operation.split("-"))
+            shape = (
+                sdk.get_service_model("s3" if service == "s3api" else service)
+                .operation_model(name)
+                .input_shape
+            )
+            botocore.validate.validate_parameters(fields, shape)
+
+    def test_transport_uses_json_argument_no_stdin_or_retry(self):
+        answer = types.SimpleNamespace(stdout=b"{}", stderr=b"", returncode=0)
+        fields = dict(Bucket=m.BUCKET, ExpectedBucketOwner=m.ACCOUNT, Policy="{}")
+        with patch.object(m.subprocess, "run", return_value=answer) as call:
+            self.assertEqual(m.Cloud().call("s3api", "put-bucket-policy", **fields), {})
+        args, kwargs = call.call_args
+        command = args[0]
+        payload = command[command.index("--cli-input-json") + 1]
+        self.assertEqual(json.loads(payload), fields)
+        self.assertEqual(kwargs["stdin"], m.subprocess.DEVNULL)
+        self.assertNotIn("input", kwargs)
+        self.assertEqual(kwargs["timeout"], 20)
+        self.assertEqual(kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+
+    def test_transport_rejects_other_bucket_and_object_operations(self):
+        with patch.object(m.subprocess, "run") as call:
+            with self.assertRaises(ValueError):
+                m.Cloud().call("s3api", "get-object", Bucket=m.BUCKET, Key="not-allowed")
+            with self.assertRaises(ValueError):
+                m.Cloud().call(
+                    "s3api", "get-bucket-policy", Bucket="other", ExpectedBucketOwner=m.ACCOUNT
+                )
+        call.assert_not_called()
+
+    def test_missing_approval_fails_before_output_or_cloud(self):
+        self.approval.unlink()
+        with self.assertRaises(ValueError):
+            self.run_once()
+        self.assertFalse(self.output.exists())
+        self.assertEqual(self.calls, [])
+
+    def test_approval_hash_scope_and_writer_coordination_rejected(self):
+        for key, value in (
+            ("no_other_policy_writers_during_update_confirmed", False),
+            ("entry_sha256", "0" * 64),
+            ("proposal_sha256", "0" * 64),
+            ("scope", "inert_watchdog_only"),
+            ("approved_execution_count", True),
+            ("training", True),
+            ("human_message", ""),
+        ):
+            changed = dict(self.approval_value, **{key: value})
+            self.approval.write_text(m.canonical(changed))
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.run_once()
+            self.assertFalse(self.output.exists())
+            self.assertEqual(self.calls, [])
+
+    def test_unbound_after_hash_stops_before_put(self):
+        proposal = json.loads(self.raw)
+        proposal["expected_after_canonical_sha256"] = "0" * 64
+        self.raw = m.canonical(proposal).encode()
+        with patch.object(m, "PROPOSAL_SHA", hashlib.sha256(self.raw).hexdigest()):
+            self.approval_value["proposal_sha256"] = m.PROPOSAL_SHA
+            self.approval.write_text(m.canonical(self.approval_value))
+            report = self.run_once()
+        self.assertFalse(report["put_attempted"])
+        self.assertEqual(report["failed_stage"], "policy_precondition")
+
+    def test_other_output_rejected_before_cloud(self):
+        with self.assertRaises(ValueError):
+            m.run_once(self.output.parent / "wrong", types.SimpleNamespace(call=self.call))
+        self.assertEqual(self.calls, [])
+
+    def test_deadline_expiry_stops_before_first_call(self):
+        times = iter((0, 121))
+        report = m.run_once(
+            self.output, types.SimpleNamespace(call=self.call), clock=lambda: next(times)
+        )
+        self.assertEqual(report["failed_stage"], "identity")
+        self.assertFalse(report["put_attempted"])
+        self.assertEqual(self.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

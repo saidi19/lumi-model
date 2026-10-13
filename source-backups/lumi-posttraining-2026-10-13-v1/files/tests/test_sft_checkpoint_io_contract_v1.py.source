@@ -1,0 +1,205 @@
+"""Pure tiny metadata contract tests; no checkpoint, tokenizer or ML execution."""
+
+from __future__ import annotations
+
+import copy
+import unittest
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_plan_v1 as planner
+from lumi import posttraining_checkpoint_io_contract_v1 as m
+from lumi.posttraining_final_base_metadata_v1 import canonical, sha
+from tests.test_sft_checkpoint_import_plan_v1 import documents
+
+
+def fixture_plan():
+    source = documents()
+    return planner.build_import_plan(*source, expected_base_sha256=sha(source[0]),
+                                     dtype="bfloat16")
+
+
+def fixture_contract(plan):
+    bounds = plan["resource_bounds"]
+    return m.build_kernel_io_contract(
+        plan, checkpoint_read_contract={
+            "expected_manifest_sha256": plan["metadata"]["checkpoint_manifest_sha256"],
+            "maximum_file_bytes": max(row["bytes"] for row in plan["checkpoint_inventory"]),
+            "maximum_read_bytes": 3 * bounds["checkpoint_inventory_bytes"],
+            "maximum_read_call_bytes": 1048576,
+        }, hf_io_contract={
+            "maximum_read_bytes": 4 * bounds["maximum_backend_output_bytes"],
+            "maximum_write_bytes": bounds["maximum_backend_output_bytes"],
+            "maximum_file_bytes": bounds["maximum_backend_output_bytes"],
+            "maximum_control_bytes": 65536, "target_shard_bytes": 65536,
+        },
+    )
+
+
+class KernelIOContractTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = fixture_plan()
+        self.contract = fixture_contract(self.plan)
+
+    def validate(self, **changes):
+        return m.validate_kernel_io_contract(
+            changes.get("plan", self.plan), changes.get("contract", self.contract),
+            changes.get("expected_sha256", self.contract["contract_sha256"]))
+
+    def repin(self, value):
+        value["contract_sha256"] = sha(canonical({
+            key: child for key, child in value.items() if key != "contract_sha256"}))
+        return value
+
+    def reject(self, code, **changes):
+        with self.assertRaises(m.KernelIOContractError) as caught:
+            self.validate(**changes)
+        self.assertEqual(caught.exception.args, (code,))
+
+    def modified(self, group, key, value):
+        contract = copy.deepcopy(self.contract)
+        contract[group][key] = value
+        self.repin(contract)
+        return {"contract": contract, "expected_sha256": contract["contract_sha256"]}
+
+    def test_exact_schema_hash_and_plan_preserved(self):
+        before = canonical(self.plan)
+        with patch("builtins.open", side_effect=AssertionError("no file access")):
+            result = self.validate()
+        self.assertEqual(set(result), m.FIELDS)
+        self.assertEqual(result["schema_version"], m.SCHEMA)
+        self.assertEqual(result["plan_sha256"], self.plan["plan_sha256"])
+        self.assertEqual(canonical(self.plan), before)
+        self.assertEqual(result["contract_sha256"], sha(canonical({
+            key: value for key, value in result.items() if key != "contract_sha256"})))
+
+    def test_defensive_copies_for_builder_and_validator(self):
+        result = self.validate()
+        self.assertIsNot(result, self.contract)
+        result["hf_io_contract"]["maximum_read_bytes"] = 1
+        self.assertNotEqual(result, self.contract)
+        dcp = copy.deepcopy(self.contract["checkpoint_read_contract"])
+        hf = copy.deepcopy(self.contract["hf_io_contract"])
+        built = m.build_kernel_io_contract(self.plan, checkpoint_read_contract=dcp,
+                                          hf_io_contract=hf)
+        dcp["maximum_read_bytes"] = 1
+        hf["maximum_read_bytes"] = 1
+        self.assertEqual(built, self.contract)
+
+    def test_wrong_external_or_internal_hash(self):
+        self.reject("contract_binding", expected_sha256="0" * 64)
+        contract = copy.deepcopy(self.contract)
+        contract["hf_io_contract"]["maximum_read_bytes"] += 1
+        self.reject("contract_binding", contract=contract)
+
+    def test_invalid_pin_type_and_shape(self):
+        for pin in (True, None, "a" * 63, "G" * 64):
+            self.reject("contract_binding", expected_sha256=pin)
+
+    def test_unknown_or_missing_contract_key(self):
+        for key, value in (("new", False), ("maximum_projected_live_tensor_bytes", 2**40)):
+            contract = copy.deepcopy(self.contract)
+            contract[key] = value
+            self.repin(contract)
+            self.reject("contract_shape", contract=contract,
+                        expected_sha256=contract["contract_sha256"])
+        contract = copy.deepcopy(self.contract)
+        contract.pop("hf_io_contract")
+        self.repin(contract)
+        self.reject("contract_shape", contract=contract,
+                    expected_sha256=contract["contract_sha256"])
+
+    def test_wrong_contract_schema_or_plan_pin(self):
+        for key, value in (("schema_version", "legacy"), ("plan_sha256", "0" * 64)):
+            contract = copy.deepcopy(self.contract)
+            contract[key] = value
+            self.repin(contract)
+            self.reject("contract_shape", contract=contract,
+                        expected_sha256=contract["contract_sha256"])
+
+    def test_original_plan_not_silently_rebound(self):
+        plan = copy.deepcopy(self.plan)
+        plan["resource_bounds"]["maximum_projected_live_tensor_bytes"] += 1
+        self.reject("plan_binding", plan=plan)
+
+    def test_original_plan_false_flags_required(self):
+        for key in planner.FALSE_FLAGS:
+            plan = copy.deepcopy(self.plan)
+            plan[key] = True
+            plan["plan_sha256"] = sha(canonical({
+                name: value for name, value in plan.items() if name != "plan_sha256"}))
+            self.reject("plan_binding", plan=plan)
+
+    def test_plan_inventory_arithmetic_and_manifest_binding(self):
+        for mutate in (lambda p: p["checkpoint_inventory"][0].update(bytes=1),
+                       lambda p: p["metadata"].update(checkpoint_manifest_sha256="0" * 64),
+                       lambda p: p["resource_bounds"].update(checkpoint_inventory_files=True)):
+            plan = copy.deepcopy(self.plan)
+            mutate(plan)
+            plan["plan_sha256"] = sha(canonical({
+                key: value for key, value in plan.items() if key != "plan_sha256"}))
+            self.reject("plan_binding", plan=plan)
+
+    def test_dcp_manifest_pin_bound_to_original(self):
+        self.reject("checkpoint_contract", **self.modified(
+            "checkpoint_read_contract", "expected_manifest_sha256", "0" * 64))
+
+    def test_dcp_maximum_file_covers_largest_but_not_beyond_inventory(self):
+        minimum = max(row["bytes"] for row in self.plan["checkpoint_inventory"])
+        total = self.plan["resource_bounds"]["checkpoint_inventory_bytes"]
+        for value in (minimum - 1, total + 1):
+            self.reject("checkpoint_contract", **self.modified(
+                "checkpoint_read_contract", "maximum_file_bytes", value))
+        self.validate(**self.modified("checkpoint_read_contract", "maximum_file_bytes", total))
+
+    def test_dcp_read_cap_covers_initial_full_audit(self):
+        size = self.plan["resource_bounds"]["checkpoint_inventory_bytes"]
+        self.reject("checkpoint_contract", **self.modified(
+            "checkpoint_read_contract", "maximum_read_bytes", size - 1))
+        self.validate(**self.modified("checkpoint_read_contract", "maximum_read_bytes", size))
+
+    def test_hf_writes_and_individual_file_cannot_raise_old_plan_cap(self):
+        maximum = self.plan["resource_bounds"]["maximum_backend_output_bytes"]
+        for key in ("maximum_write_bytes", "maximum_file_bytes"):
+            self.reject("hf_contract", **self.modified("hf_io_contract", key, maximum + 1))
+
+    def test_frozen_kernel_strict_positive_types_and_limits(self):
+        for group, keys, code in (("checkpoint_read_contract", (
+                "maximum_file_bytes", "maximum_read_bytes", "maximum_read_call_bytes"),
+                "checkpoint_contract"), ("hf_io_contract", (
+                "maximum_read_bytes", "maximum_write_bytes", "maximum_file_bytes",
+                "maximum_control_bytes", "target_shard_bytes"), "hf_contract")):
+            for key in keys:
+                for value in (True, 0, -1, 1.0, 2**63):
+                    with self.subTest(group=group, key=key, value=value):
+                        # Oversized integers are rejected by the pre-copy bound.
+                        expected = "contract_shape" if value == 2**63 else code
+                        self.reject(expected, **self.modified(group, key, value))
+
+    def test_frozen_kernel_operational_caps_are_not_widened(self):
+        for group, key, value, code in (
+            ("checkpoint_read_contract", "maximum_read_call_bytes", 2**30 + 1,
+             "checkpoint_contract"),
+            ("hf_io_contract", "maximum_control_bytes", 65537, "hf_contract"),
+            ("hf_io_contract", "target_shard_bytes", 268435457, "hf_contract"),
+        ):
+            self.reject(code, **self.modified(group, key, value))
+
+    def test_nested_unknown_keys_rejected(self):
+        for group, code in (("checkpoint_read_contract", "checkpoint_contract"),
+                            ("hf_io_contract", "hf_contract")):
+            self.reject(code, **self.modified(group, "extra", 1))
+
+    def test_oversized_and_deep_contract_rejected_before_serialization(self):
+        contract = copy.deepcopy(self.contract)
+        contract["extra"] = "x" * planner.MAX_PLAN_BYTES
+        self.reject("contract_shape", contract=contract)
+        contract = copy.deepcopy(self.contract)
+        nested = contract
+        for _ in range(30):
+            nested["extra"] = {}
+            nested = nested["extra"]
+        self.reject("contract_shape", contract=contract)
+
+
+if __name__ == "__main__":
+    unittest.main()

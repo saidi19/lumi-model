@@ -1,0 +1,281 @@
+"""Tiny stdlib-only source admission/staging and fixture control tests; no Linux setup."""
+
+from __future__ import annotations
+
+import copy
+import importlib.util
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_guard_fixture_v1 as fixture
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts/run_checkpoint_guarded_import_v1.py"
+SPEC = importlib.util.spec_from_file_location("guard_import_entry_test", SCRIPT)
+entry = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(entry)
+
+
+class SourceAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="lumi-source-admission-test-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.root.chmod(0o700)
+        self.source = self.root / "src"
+        (self.source / "lumi").mkdir(parents=True, mode=0o700)
+        self.files = {"lumi/__init__.py": b"# synthetic original initializer\n",
+                      "lumi/posttraining_checkpoint_guard_fixture_v1.py": b"# synthetic source\n"}
+        for name, raw in self.files.items():
+            (self.source / name).write_bytes(raw)
+            (self.source / name).chmod(0o644)
+        self.manifest = self.root / "manifest.json"
+        self.document = {"schema": entry.SOURCE_SCHEMA, "files": [
+            {"path": name, "bytes": len(raw), "sha256": entry.digest(raw)}
+            for name, raw in sorted(self.files.items())]}
+        self.save_manifest()
+        original = entry.require_owned
+
+        def own_fixture(info, *, directory=False, owner=0):
+            # Simulate only root ownership; preserve actual type/mode/link tests.
+            translated = SimpleNamespace(st_mode=info.st_mode, st_uid=0,
+                                         st_nlink=info.st_nlink)
+            return original(translated, directory=directory, owner=owner)
+
+        self.ownership = patch.object(entry, "require_owned", side_effect=own_fixture)
+
+    def save_manifest(self):
+        self.raw = entry.canonical(self.document)
+        self.manifest.write_bytes(self.raw)
+        self.manifest.chmod(0o644)
+        self.pin = entry.digest(self.raw)
+
+    def verify(self, **changes):
+        with self.ownership:
+            return entry.verify_source_tree(changes.get("source", self.source),
+                                            changes.get("manifest", self.manifest),
+                                            changes.get("pin", self.pin))
+
+    def reject(self, **changes):
+        with self.assertRaises((entry.EntryError, OSError)):
+            self.verify(**changes)
+
+    def test_bound_original_initializer_and_source_verified(self):
+        files, result = self.verify()
+        self.assertEqual(files, self.files)
+        self.assertNotEqual(files["lumi/__init__.py"], b"")
+        self.assertEqual(result["source_manifest_sha256"], self.pin)
+        self.assertEqual(result["source_files_verified"], 2)
+        self.assertEqual(result["source_bytes_verified"], sum(map(len, self.files.values())))
+        self.assertEqual(result["source_verification_read_bytes"],
+                         len(self.raw) + sum(map(len, self.files.values())))
+
+    def test_no_lumi_or_ml_import_during_source_validation(self):
+        with patch.object(entry.importlib, "import_module", side_effect=AssertionError("import")):
+            self.verify()
+
+    def test_pure_manifest_validator_never_uses_filesystem(self):
+        with patch.object(entry.os, "open", side_effect=AssertionError("no file access")):
+            rows = entry.validate_source_manifest(self.raw, self.pin)
+        self.assertEqual(set(rows), set(self.files))
+        for name, raw in self.files.items():
+            self.assertEqual(rows[name]["sha256"], entry.digest(raw))
+
+    def test_manifest_external_hash_before_source_reads(self):
+        original = entry.read_file
+        reads = []
+
+        def read(path, **kwargs):
+            reads.append(path)
+            return original(path, **kwargs)
+
+        with patch.object(entry, "read_file", side_effect=read):
+            self.reject(pin="f" * 64)
+        self.assertEqual(reads, [self.manifest])
+
+    def test_source_hash_and_size_mismatches(self):
+        path = self.source / "lumi/__init__.py"
+        path.write_bytes(b"x" * len(self.files["lumi/__init__.py"]))
+        self.reject()
+        path.write_bytes(b"x")
+        self.reject()
+
+    def test_manifest_duplicate_keys_rejected(self):
+        raw = b'{"schema":"x","schema":"y","files":[]}'
+        self.manifest.write_bytes(raw)
+        self.reject(pin=entry.digest(raw))
+
+    def test_manifest_exact_outer_and_row_keys(self):
+        for change in (lambda d: d.update(extra=False),
+                       lambda d: d["files"][0].update(extra=False),
+                       lambda d: d.update(schema="legacy")):
+            previous = copy.deepcopy(self.document)
+            change(self.document)
+            self.save_manifest()
+            self.reject()
+            self.document = previous
+
+    def test_strict_source_names_and_duplicate_paths(self):
+        original = copy.deepcopy(self.document)
+        for name in ("../outside.py", "lumi/../outside.py", "lumi/nested/file.py", "other/a.py",
+                     "lumi/name.pyc", "lumi/name-name.py"):
+            self.document = copy.deepcopy(original)
+            self.document["files"][0]["path"] = name
+            self.save_manifest()
+            self.reject()
+        self.document = copy.deepcopy(original)
+        self.document["files"].append(self.document["files"][0])
+        self.save_manifest()
+        self.reject()
+
+    def test_source_byte_and_count_caps_before_source_content(self):
+        for value in (True, -1, entry.MAXIMUM_SOURCE_FILE_BYTES + 1):
+            self.document["files"][0]["bytes"] = value
+            self.save_manifest()
+            self.reject()
+        self.document["files"] = [self.document["files"][0]] * 129
+        self.save_manifest()
+        self.reject()
+
+    def test_extra_file_or_root_directory_rejected(self):
+        (self.source / "extra").mkdir()
+        self.reject()
+        (self.source / "extra").rmdir()
+        (self.source / "lumi/extra.py").write_bytes(b"x")
+        self.reject()
+
+    def test_missing_required_module_rejected(self):
+        self.document["files"][1]["path"] = "lumi/other.py"
+        self.save_manifest()
+        self.reject()
+
+    def test_source_symlink_hardlink_and_public_write_modes_rejected(self):
+        path = self.source / "lumi/__init__.py"
+        for mode in (0o664, 0o646):
+            path.chmod(mode)
+            self.reject()
+        path.chmod(0o644)
+        os.link(path, self.root / "alias")
+        self.reject()
+
+    def test_symlink_source_ancestor_rejected(self):
+        link = self.root / "linked"
+        link.symlink_to(self.source, target_is_directory=True)
+        self.reject(source=link)
+
+    def test_staging_exact_bytes_private_modes_and_counts(self):
+        before = {name: (self.source / name).read_bytes() for name in self.files}
+        staged, result = entry.stage_private_sources(self.root, self.files)
+        self.assertNotEqual(staged, self.source)
+        for name, raw in self.files.items():
+            path = staged / name
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+            self.assertEqual(path.stat().st_uid, os.geteuid())
+        self.assertEqual(result["private_source_copy_bytes_reserved"],
+                         sum(map(len, before.values())))
+        self.assertEqual(result["private_source_copy_readback_bytes"],
+                         sum(map(len, before.values())))
+        self.assertFalse(result["private_source_copies_rootfs_immutable"])
+        self.assertFalse(result["hostile_owner_code_immutability_verified"])
+        self.assertEqual(before, {name: (self.source / name).read_bytes() for name in before})
+
+    def test_staging_uses_new_directory_for_each_call_never_reuses(self):
+        first, _ = entry.stage_private_sources(self.root, self.files)
+        second, _ = entry.stage_private_sources(self.root, self.files)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.is_dir())
+
+    def test_short_staging_write_preserved_not_retried(self):
+        real = os.write
+        seen = []
+
+        def short(fd, raw):
+            seen.append(len(raw))
+            return real(fd, raw[:1])
+
+        with patch.object(entry.os, "write", side_effect=short), \
+                self.assertRaises(entry.EntryError):
+            entry.stage_private_sources(self.root, self.files)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(len(list(self.root.glob("lumi-import-code-*"))), 1)
+
+    def test_staging_invalid_name_or_cap_before_temp_creation(self):
+        for files in ({"../escape": b"x", "lumi/a.py": b"y"},
+                      {"lumi/a.py": b"x" * (entry.MAXIMUM_SOURCE_FILE_BYTES + 1),
+                       "lumi/b.py": b"y"}):
+            with patch.object(entry.tempfile, "mkdtemp") as create, \
+                    self.assertRaises(entry.EntryError):
+                entry.stage_private_sources(self.root, files)
+            create.assert_not_called()
+
+
+class EntryAndFixtureControlTests(unittest.TestCase):
+    def test_root_ownership_is_mandatory(self):
+        info = SimpleNamespace(st_mode=stat.S_IFREG | 0o644, st_uid=10001, st_nlink=1)
+        with self.assertRaises(entry.EntryError):
+            entry.require_owned(info)
+        info.st_uid = 0
+        entry.require_owned(info)
+
+    def test_fixed_environment_has_no_home_pythonpath_or_credentials(self):
+        self.assertFalse({"HOME", "PYTHONPATH", "AWS_ACCESS_KEY_ID"}.intersection(entry.FIXED_ENV))
+        self.assertEqual(len(entry.PIN_KEYS), 2)
+        self.assertEqual(entry.FIXED_ENV["CUDA_VISIBLE_DEVICES"], "")
+
+    def test_wrong_cli_denied_before_platform_or_file_access(self):
+        with patch.object(entry.os, "uname") as uname, \
+                patch.object(entry.os, "open") as opened, self.assertRaises(entry.EntryError):
+            entry.runtime_check([str(entry.ENTRY)], {})
+        uname.assert_not_called()
+        opened.assert_not_called()
+
+    def test_fixed_fixture_geometry_has_no_caller_override(self):
+        self.assertEqual(fixture.CONFIG["vocab_size"], 17)
+        self.assertEqual(fixture.CONFIG["hidden_size"], 8)
+        self.assertEqual(fixture.CONFIG["num_hidden_layers"], 1)
+        self.assertEqual(fixture.CONFIG["tie_word_embeddings"], True)
+        self.assertLessEqual(fixture.LIMITS["maximum_seconds"], 30)
+
+    def test_nonempty_fixture_root_fails_before_generation(self):
+        with tempfile.TemporaryDirectory() as path:
+            root = Path(path).resolve()
+            (root / "prior").write_bytes(b"preserve")
+            with patch.object(fixture, "_generate") as generate, \
+                    self.assertRaises(fixture.GuardFixtureError):
+                fixture.run_tiny_fixture(root, check_budget=lambda: None)
+            generate.assert_not_called()
+            self.assertEqual((root / "prior").read_bytes(), b"preserve")
+
+    def test_budget_rejects_before_filesystem(self):
+        with patch.object(fixture, "_root") as root, self.assertRaises(fixture.GuardFixtureError):
+            fixture.run_tiny_fixture(Path("/absent"), check_budget=lambda: True)
+        root.assert_not_called()
+
+    def test_generated_metadata_contains_only_tiny_bound_fixture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            checkpoint, tokens = root / "checkpoint", root / "tokens"
+            checkpoint.mkdir(mode=0o700)
+            tokens.mkdir(mode=0o700)
+            (checkpoint / "model").mkdir()
+            (checkpoint / "model/.metadata").write_bytes(b"opaque tiny")
+            (checkpoint / "model/__0_0.distcp").write_bytes(b"opaque tiny")
+            metadata = fixture._metadata(checkpoint, tokens, lambda: None)
+            from lumi.posttraining_checkpoint_import_plan_v1 import build_import_plan
+            from lumi.posttraining_final_base_metadata_v1 import json_object
+            base = json_object(metadata[0])
+            self.assertIs(base["synthetic_fixture_only"], True)
+            plan = build_import_plan(*metadata, expected_base_sha256=fixture.sha(metadata[0]),
+                                     dtype="bfloat16")
+            self.assertLess(plan["model_parameters"], 4096)
+            self.assertEqual(len(plan["tokenizer_inventory"]), 3)
+            self.assertEqual(len(plan["checkpoint_inventory"]), 6)
+
+
+if __name__ == "__main__":
+    unittest.main()

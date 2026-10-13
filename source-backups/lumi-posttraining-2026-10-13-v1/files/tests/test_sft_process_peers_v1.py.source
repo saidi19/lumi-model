@@ -1,0 +1,276 @@
+"""Local stdlib OS children only; no real model, dataset, network or GPU."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import os
+import signal
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from . import test_sft_smoke_bridge_v1 as fixture
+
+peers = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_process_peers_v1")
+transport = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_socket_transport_v1")
+
+SOURCE = b'''import os,sys,socket
+rank,left,right,deadline=map(int,sys.argv[1:])
+assert 0<=rank<8
+assert not os.get_inheritable(left) and not os.get_inheritable(right)
+assert not any(key in os.environ for key in ('AWS_SECRET_ACCESS_KEY','GITHUB_TOKEN','PYTHONPATH'))
+ledger=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM,fileno=left)
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM,fileno=right)
+ledger.sendall(bytes([rank]))
+assert control.recv(1)==b'X'
+ledger.close(); control.close()
+'''
+
+# Synthetic protocol traffic only. Reports deliberately represent no tensors,
+# optimizer, checkpoint or model work. Two one-byte temporary flags coordinate
+# the native peers without a timing guess or extra production protocol message.
+ROUNDTRIP = b'''import hashlib,json,os,socket,sys,time
+rank,left,right,deadline=map(int,sys.argv[1:])
+root=__FIXTURE_ROOT__
+ledger=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM,fileno=left)
+control=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM,fileno=right)
+ledger.settimeout(3); control.settimeout(3)
+def secret(label): return hashlib.sha256(label.encode('ascii')).hexdigest()
+epoch=secret('epoch-0'); token=secret('token-0-'+str(rank)); sequence=1; requests=0
+def encode(value):
+ raw=json.dumps(value,sort_keys=True,separators=(',',':')).encode('ascii')
+ return len(raw).to_bytes(4,'big')+raw
+def receive(sock):
+ def exact(n):
+  value=b''
+  while len(value)<n:
+   block=sock.recv(n-len(value))
+   if not block: raise ValueError()
+   value+=block
+  return value
+ size=int.from_bytes(exact(4),'big')
+ assert 0<size<=4096
+ raw=exact(size)
+ return json.loads(raw),size.to_bytes(4,'big')+raw
+def request(operation,arguments):
+ global sequence,requests
+ message=dict(schema_version='lumi.sft-epoch-ledger-request.v0.2',epoch=epoch,
+  rank=rank,token=token,sequence=sequence,operation=operation,arguments=arguments)
+ ledger.sendall(encode(message)); ack,raw=receive(ledger)
+ assert ack==dict(schema_version='lumi.sft-epoch-ledger-ack.v0.2',epoch=epoch,
+  rank=rank,sequence=sequence,operation=operation,status='reserved')
+ ledger.sendall(encode(dict(message,operation='confirm_ack',
+  arguments=dict(ack_sha256=hashlib.sha256(raw).hexdigest()))))
+ sequence+=1; requests+=1
+def phase(name,step):
+ control.sendall(encode(dict(status='phase',phase=name,step=step)))
+ assert receive(control)[0]==dict(status='phase_committed',phase=name,step=step)
+phase('inputs',0); phase('restored',0)
+for step in range(2):
+ flag=root+'/'+str(step)
+ if rank==0:
+  request('reserve_step',dict(from_step=step,to_step=step+1))
+  # Same-stream follow-up ACK proves parent consumed reserve_step confirmation.
+  request('reserve',dict(private_write_bytes=1))
+  fd=os.open(flag,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  os.write(fd,b'1'); os.close(fd)
+ else:
+  while not os.path.exists(flag):
+   if time.monotonic_ns()>=deadline: raise ValueError()
+   time.sleep(.001)
+ request('step_complete',dict(to_step=step+1))
+ assert receive(ledger)[0]==dict(schema_version='lumi.sft-worker-step-fence.v0.2',
+  epoch=epoch,rank=rank,to_step=step+1,status='committed')
+ phase('checkpoint',step+1)
+summary=dict(schema_version='lumi.sft-worker-run-summary.v0.2',state='complete',stage='complete',
+ failure_code=None,failure_stage=None,completed_steps=2,saved_checkpoints=2,restored_checkpoints=0,
+ os_admission_verified=False,os_resource_enforcement=False,real_sft_execution_permitted=False,
+ production_eligible=False)
+control.sendall(encode(dict(status='report',summary=summary,requests=requests)))
+assert receive(control)[0]==dict(status='release')
+control.sendall(encode(dict(status='closed')))
+ledger.close(); control.close()
+'''
+
+
+class ProcessPeersTests(unittest.TestCase):
+    def setUp(self):
+        self.owners, self.sockets = [], []
+
+    def tearDown(self):
+        for owner in self.owners:
+            try:
+                owner.retire(False)
+            except peers.ProcessPeersError:
+                pass
+            if owner._process is not None:
+                self.assertIsNotNone(owner._process.returncode, "synthetic guardian not reaped")
+        for sock in self.sockets:
+            sock.close()
+
+    def make(self, source=SOURCE, **changes):
+        options = dict(worker_source=source, source_sha256=hashlib.sha256(source).hexdigest(),
+                       python_executable=str(Path(sys.executable).resolve()),
+                       deadline_ns=time.monotonic_ns() + 5_000_000_000,
+                       cleanup_milliseconds=1500, admit=lambda: None)
+        owner = peers.ProcessPeers(**{**options, **changes})
+        self.owners.append(owner)
+        return owner
+
+    def acquire(self, owner):
+        pairs = owner.acquire()
+        self.sockets += [sock for pair in pairs for sock in pair]
+        return pairs
+
+    def error(self, code, operation):
+        with self.assertRaises(peers.ProcessPeersError) as caught:
+            operation()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_constructor_inert_and_bad_hash_rejected(self):
+        with patch.object(peers.subprocess, "Popen") as spawn:
+            owner = self.make()
+            self.assertEqual(owner.summary()["state"], "idle")
+            self.error("source_rejected", lambda: self.make(source_sha256="0" * 64))
+            spawn.assert_not_called()
+
+    def test_real_eight_execs_private_socket_handoff_and_clean_exit(self):
+        with patch.dict(os.environ, {"AWS_SECRET_ACCESS_KEY": "SYNTHETIC",
+                                     "GITHUB_TOKEN": "SYNTHETIC", "PYTHONPATH": "/synthetic"}):
+            owner = self.make()
+            pairs = self.acquire(owner)
+        for rank, (ledger, _control) in enumerate(pairs):
+            ledger.settimeout(2)
+            self.assertEqual(ledger.recv(1), bytes([rank]))
+        owner.check_health(False)
+        for ledger, control in pairs:
+            control.sendall(b"X")
+            self.assertEqual(ledger.recv(1), b"")
+        owner.retire(True)
+        result = owner.summary()
+        self.assertEqual(result["worker_exit_reports"], 8)
+        self.assertEqual(result["worker_failures"], 0)
+        self.assertTrue(result["guardian_cleanup_ack"])
+        self.assertTrue(result["guardian_reaped"])
+        self.assertEqual(result["state"], "retired")
+        self.error("already_consumed", owner.acquire)
+
+    def test_denied_admission_never_spawns_or_opens_sockets(self):
+        owner = self.make(admit=lambda: True)
+        with patch.object(peers.subprocess, "Popen") as spawn:
+            with patch.object(peers.socket, "socketpair") as pair:
+                self.error("admission_rejected", owner.acquire)
+                spawn.assert_not_called()
+                pair.assert_not_called()
+        self.error("already_consumed", owner.acquire)
+
+    def test_spawn_failure_is_consumed_and_sanitized(self):
+        owner = self.make()
+        with patch.object(peers.subprocess, "Popen", side_effect=OSError("PRIVATE")) as spawn:
+            self.error("spawn_failed", owner.acquire)
+            self.error("already_consumed", owner.acquire)
+            spawn.assert_called_once()
+        self.assertIsNone(owner._life)
+        self.assertIsNone(owner._status)
+
+    def test_expired_deadline_never_spawns(self):
+        owner = self.make(deadline_ns=1)
+        with patch.object(peers.subprocess, "Popen") as spawn:
+            self.error("deadline_exhausted", owner.acquire)
+            spawn.assert_not_called()
+
+    def test_owner_mismatch(self):
+        owner = self.make()
+        with patch.object(peers.os, "getpid", return_value=-1):
+            self.error("owner_mismatch", owner.acquire)
+
+    def test_independent_deadline_stops_workers_without_transport_poll(self):
+        source = (b"import signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
+                  b"time.sleep(10)\n")
+        owner = self.make(source, deadline_ns=time.monotonic_ns() + 750_000_000)
+        self.acquire(owner)
+        # No check_health or socket pump: the OTHER process owns the deadline.
+        owner._process.wait(timeout=3)
+        self.assertEqual(owner._process.returncode, -signal.SIGKILL)
+        owner.retire(False)
+        self.assertTrue(owner.summary()["guardian_cleanup_ack"])
+
+    def test_lifetime_pipe_eof_stops_workers_without_transport_poll(self):
+        owner = self.make(b"import time\ntime.sleep(10)\n")
+        self.acquire(owner)
+        fd, owner._life = owner._life, None
+        os.close(fd)  # Same EOF the kernel delivers when the owning parent dies.
+        owner._process.wait(timeout=3)
+        owner.retire(False)
+        self.assertTrue(owner.summary()["guardian_cleanup_ack"])
+
+    def test_nonzero_exit_never_becomes_success(self):
+        owner = self.make(b"raise RuntimeError('SYNTHETIC-PRIVATE')\n")
+        self.acquire(owner)
+        self.error("cleanup_failed", lambda: owner.retire(True))
+        self.error("cleanup_failed", lambda: owner.retire(False))
+        self.assertEqual(owner.summary()["retained_child_text_bytes"], 0)
+        self.assertGreater(owner.summary()["worker_failures"], 0)
+
+    def test_early_clean_exit_rejected_by_health(self):
+        owner = self.make(b"pass\n")
+        self.acquire(owner)
+        end = time.monotonic() + 2
+        while not owner._exits and time.monotonic() < end:
+            owner._status_read(.01)
+        self.error("worker_failed", lambda: owner.check_health(False))
+        owner.retire(False)
+
+    def test_socket_transport_failure_stops_all_real_children(self):
+        f = fixture.ParentBridgeTests()
+        f.setUp()
+        owner = self.make(b"import time\ntime.sleep(10)\n")
+        entry = transport.SocketTransport(
+            bridge_options=dict(supervisor=f.ledger, epoch=f.epoch, rank_tokens=f.tokens,
+                                invocation_index=0, maximum_wire_bytes=2**20, maximum_feeds=100),
+            admit=lambda: None, acquire=owner.acquire, check_health=owner.check_health,
+            observe_memory=lambda: (256, [64]*8), retire=owner.retire,
+            deadline_ns=time.monotonic_ns() + 500_000_000, maximum_exchange_ns=100_000_000,
+            maximum_wire_bytes=2**20, maximum_reads=100)
+        with self.assertRaises(transport.TransportError):
+            entry.run()
+        self.assertTrue(owner.summary()["guardian_reaped"])
+        self.assertTrue(owner.summary()["guardian_cleanup_ack"])
+        self.assertEqual(f.ledger.summary()["state"], "failed")
+        self.assertEqual(entry.summary()["eof_channels"], 0)
+
+    def test_no_numeric_pid_signalling_from_parent_adapter(self):
+        owner = self.make()
+        pairs = self.acquire(owner)
+        with patch.object(peers.os, "killpg", side_effect=AssertionError("wrong process")):
+            owner.retire(False)
+        self.assertTrue(owner.summary()["guardian_reaped"])
+        self.assertEqual(len(pairs), 8)
+
+    def test_real_process_backend_composes_with_real_socket_transport(self):
+        f = fixture.ParentBridgeTests()
+        f.setUp()
+        with tempfile.TemporaryDirectory(prefix="lumi-native-peer-flags-") as temporary:
+            source = ROUNDTRIP.replace(b"__FIXTURE_ROOT__", repr(temporary).encode('ascii'))
+            owner = self.make(source)
+            entry = transport.SocketTransport(
+                bridge_options=dict(supervisor=f.ledger, epoch=f.epoch, rank_tokens=f.tokens,
+                                    invocation_index=0, maximum_wire_bytes=2**20,
+                                    maximum_feeds=1000),
+                admit=lambda: None, acquire=owner.acquire, check_health=owner.check_health,
+                observe_memory=lambda: (256, [64]*8), retire=owner.retire,
+                deadline_ns=owner._deadline, maximum_exchange_ns=1_000_000_000,
+                maximum_wire_bytes=2**22, maximum_reads=1000)
+            result = entry.run()
+            self.assertEqual(result['state'], 'complete')
+            self.assertEqual(result['closed_reports'], 8)
+            self.assertEqual(result['eof_channels'], 16)
+            self.assertTrue(owner.summary()['guardian_reaped'])
+            self.assertEqual(owner.summary()['worker_exit_reports'], 8)
+            self.assertEqual(f.ledger.summary()['global_optimizer_steps_completed'], 2)
+            self.assertEqual(sorted(p.name for p in Path(temporary).iterdir()), ['0', '1'])

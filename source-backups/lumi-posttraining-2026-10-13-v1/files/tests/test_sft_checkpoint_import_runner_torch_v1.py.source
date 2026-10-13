@@ -1,0 +1,124 @@
+"""Genuine tiny CPU coordinator/package integration, never the actual 4B input."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_runner_v1 as runner
+from lumi import posttraining_checkpoint_import_torch_v3 as kernel
+from lumi.posttraining_final_base_metadata_v1 import canonical, sha
+from tests import test_sft_checkpoint_import_torch_v3 as fixtures
+from tests.test_sft_checkpoint_import_runner_v1 import fixture_limits, seal_fixture
+
+
+class TinyRunnerIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.CheckpointImportTorchTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.CheckpointImportTorchTests.tearDownClass()
+
+    def setUp(self):
+        self.fixture = fixtures.CheckpointImportTorchTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        f = self.fixture
+        config = f.config_class(**f.payload)
+        f.payload = {key: getattr(config, key) for key in kernel.MODEL_FIELDS}
+        f.payload["model_type"] = "lumi"
+        self.config_raw = canonical(f.payload)
+        f.config_path.write_bytes(self.config_raw)
+        f._checkpoint()
+        f.checkpoint_path.chmod(0o700)
+        self.tokens = f.root / "token-input"
+        self.tokens.mkdir(mode=0o700)
+        self.metadata = seal_fixture(f.checkpoint_path, self.tokens, config_raw=self.config_raw)
+        self.attempt = f.root / "coordinator-attempt"
+
+    def execute(self):
+        with patch.object(self.fixture.model_class, "forward",
+                          side_effect=AssertionError("forward")):
+            return runner.run_synthetic_import(
+                metadata=self.metadata, expected_base_sha256=sha(self.metadata[0]),
+                checkpoint_root=self.fixture.checkpoint_path, tokenizer_root=self.tokens,
+                attempt=self.attempt, dtype="bfloat16", limits=fixture_limits(),
+            )
+
+    def test_complete_actual_cpu_package_chain_with_frozen_consumer(self):
+        result = self.execute()
+        self.assertEqual(result["status"], "PASS_synthetic_coordinator_not_real_import")
+        self.assertEqual(result["full_input_audits_completed"], 2)
+        self.assertTrue(result["observed_input_identities_unchanged"])
+        for flag in ("real_4b_import", "training_authorized", "production_eligible",
+                     "hard_timeout_enforced_here", "native_backend_read_bytes_metered",
+                     "os_memory_write_limits_enforced", "atomic_input_immutability_verified"):
+            self.assertIs(result[flag], False)
+        self.assertTrue((self.attempt / runner.STARTED).is_file())
+        self.assertTrue((self.attempt / runner.COMPLETE).is_file())
+        self.assertFalse((self.attempt / runner.FAILED).exists())
+        saved = json.loads((self.attempt / runner.COMPLETE).read_bytes())
+        self.assertEqual(saved, result)
+        package = self.attempt / "checkpoint"
+        for entry in json.loads(self.metadata[0])["tokenizer"]["files"]:
+            raw = (package / entry["relative_path"]).read_bytes()
+            self.assertEqual(len(raw), entry["bytes"])
+            self.assertEqual(sha(raw), entry["sha256"])
+        from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+        manifest = package / "manifest.sha256"
+        # Independent direct consumer, not the bounded adapter under test. This
+        # extra verification is test-only on a tiny output under the parent timeout.
+        observed = _verify_checksum_manifest(
+            package, expected_manifest_sha256=sha(manifest.read_bytes()), require_private=True
+        )
+        self.assertEqual(observed, sha(manifest.read_bytes()))
+
+    def test_completed_attempt_cannot_start_second_kernel(self):
+        self.execute()
+        with patch.object(kernel, "convert_and_verify") as convert:
+            with self.assertRaisesRegex(runner.ImportRunnerError, "attempt_exists_no_retry"):
+                self.execute()
+            convert.assert_not_called()
+
+    def test_source_mutation_during_conversion_cannot_complete(self):
+        original = kernel.convert_and_verify
+
+        def mutate(*args, **kwargs):
+            result = original(*args, **kwargs)
+            path = self.fixture.checkpoint_path / "trainer-rank-00000.pt"
+            path.write_bytes(b"different synthetic trainer")
+            return result
+
+        with patch.object(kernel, "convert_and_verify", side_effect=mutate):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "input_audit_failed"):
+                self.execute()
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+        self.assertTrue((self.attempt / runner.FAILED).exists())
+        self.assertTrue((self.attempt / "checkpoint/manifest.sha256").exists())
+
+    def test_late_failure_keeps_completion_explicitly_non_authoritative(self):
+        original = runner._write_new
+
+        def fail(root, name, raw, ledger, **kwargs):
+            if name == runner.FAILED:
+                raise OSError("cannot record synthetic failure")
+            original(root, name, raw, ledger, **kwargs)
+            if name == runner.COMPLETE:
+                raise OSError("synthetic late close failure")
+
+        with patch.object(runner, "_write_new", side_effect=fail):
+            with self.assertRaisesRegex(runner.ImportRunnerError, "runner_failed"):
+                self.execute()
+        saved = json.loads((self.attempt / runner.COMPLETE).read_bytes())
+        self.assertIs(saved["durable_completion_is_execution_authority"], False)
+        self.assertIs(saved["success_requires_returned_outcome_and_parent_supervisor"], True)
+        self.assertFalse((self.attempt / runner.FAILED).exists())
+        with self.assertRaisesRegex(runner.ImportRunnerError, "attempt_exists_no_retry"):
+            self.execute()
+
+
+if __name__ == "__main__":
+    unittest.main()

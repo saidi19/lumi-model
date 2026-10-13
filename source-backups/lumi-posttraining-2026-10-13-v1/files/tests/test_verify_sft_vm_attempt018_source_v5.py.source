@@ -1,0 +1,32 @@
+"""Offline tests for the v0.5 source recovery verifier."""
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt018_source_v5 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_release_preserves_fail_closed_nonclaims(self):
+        result = m.verify()
+        self.assertTrue(result["bounded_transient_reads_verified"])
+        self.assertTrue(result["write_retry_prohibited_verified"])
+        self.assertTrue(result["outer_source_authentication_verified"])
+        self.assertFalse(result["execution_authority_created"])
+        self.assertFalse(result["real_4b_import"])
+        self.assertFalse(result["gate_5_complete"])
+        self.assertFalse(result["gpu"])
+
+    def test_release_hash_drift_rejected(self):
+        original = m.read
+
+        def changed(path, digest, size=None, maximum=32 * 1024**2):
+            if path == m.RELEASE / "release.json":
+                digest = "0" * 64
+            return original(path, digest, size, maximum)
+
+        with patch.object(m, "read", changed), self.assertRaises(ValueError):
+            m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

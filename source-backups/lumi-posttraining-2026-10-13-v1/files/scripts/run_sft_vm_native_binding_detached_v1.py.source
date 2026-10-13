@@ -1,0 +1,295 @@
+"""Pinned private native binding service, independent of short SSH exchanges.
+
+Only a trusted authenticated controller with separate cloud/retention admission
+and host-bound execution authority may call this. Public entry stays closed.
+Cancellation stops the writer but does not revoke a possibly committed binding:
+the outer host STOP supervisor remains mandatory. Never retry or delete evidence.
+"""
+
+import hashlib
+import os
+import signal
+import stat
+import sys
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ROOT = Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "native-binding"
+FULLSIZE = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+UNIT = "lumi-native-binding-v1.service"
+BINDER_SHA = "8c649038548fd16d6fce88cc92e1730f3cdce117c82e9e36954f6a1c175dbe88"
+TRUST = "dedicated-vm-trusted-admin-root-os-v1"
+FALSE = (
+    "host_admitted",
+    "cloud_admission_established",
+    "retention_admission_established",
+    "adversarial_privileged_writer_exclusion_claimed",
+    "cumulative_native_write_limit_claimed",
+    "real_4b_import",
+    "gate_5_complete",
+    "training_authorized",
+    "production_eligible",
+    "retry_allowed",
+)
+TRUE = ("binding_created", "native_ml_runtime_qualified", "original_host_deadline_preserved")
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_native_binding_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def binder(raw):
+    need(type(raw) is bytes and 0 < len(raw) <= 32768 and sha(raw) == BINDER_SHA)
+    module = types.ModuleType("_pinned_native_binder")
+    module.__file__ = str(ROOT / "binder.py")
+    exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def context(expected, raw):
+    # Source arrives over authenticated transport; hash before executing it.
+    module = binder(raw)
+    module.boundary()
+    detached, _ = module.helpers()
+    bootstrap, helper, request = detached.context(expected)
+    return module, bootstrap, helper, request
+
+
+def read_root(path, cap=32768):
+    # Bootstrap the service without importing unauthenticated local source.
+    for parent in path.parents:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(not info.st_mode & 0o022)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(before.st_uid == before.st_gid == 0 and stat.S_IMODE(before.st_mode) == 0o400)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, k) == getattr(after, k)
+            for k in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        )
+    )
+    return raw
+
+
+def validate_report(value):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "schema",
+            "attempt",
+            "trust_scope",
+            "binding_sha256",
+            "census_before",
+            "census_after",
+            *TRUE,
+            *FALSE,
+        }
+    )
+    need(value["schema"] == "lumi.vm-native-binding.v0.1" and value["attempt"] == ATTEMPT)
+    need(value["trust_scope"] == TRUST)
+    pin = value["binding_sha256"]
+    need(type(pin) is str and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin))
+    need(all(value[k] is True for k in TRUE) and all(value[k] is False for k in FALSE))
+    for key in ("census_before", "census_after"):
+        counts = value[key]
+        need(
+            type(counts) is dict
+            and set(counts) == {"processes", "threads", "vanished", "bytes_read"}
+        )
+        need(all(type(n) is int for n in counts.values()))
+        need(0 < counts["processes"] <= 4096 and 0 < counts["threads"] <= 8192)
+        need(0 <= counts["vanished"] < counts["threads"])
+        need(0 < counts["bytes_read"] <= 16 * 1024**2)
+    need(sum(value[k]["bytes_read"] for k in ("census_before", "census_after")) <= 16 * 1024**2)
+    return value
+
+
+def result(state, *, observation=None):
+    return dict(
+        state=state,
+        observation=observation,
+        binding_may_exist=True,
+        host_admitted=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+
+
+def command(pin):
+    need(type(pin) is str and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin))
+    # Root-private source was exclusively staged and re-read before dispatch.
+    code = (
+        "import hashlib,runpy;from pathlib import Path;"
+        f"p=Path({str(ROOT / 'receiver.py')!r});raw=p.read_bytes();"
+        f"assert hashlib.sha256(raw).hexdigest()=={pin!r};"
+        "runpy.run_path(str(p),run_name='__native_binding__')['_serve_once']()"
+    )
+    properties = dict(
+        User="root",
+        Group="root",
+        UMask="0077",
+        Restart="no",
+        RemainAfterExit="yes",
+        RuntimeMaxSec="240",
+        TimeoutStopSec="10",
+        KillMode="control-group",
+        SendSIGKILL="yes",
+        FailureAction="poweroff",
+        MemoryMax="256M",
+        MemorySwapMax="0",
+        TasksMax="64",
+        LimitCORE="0",
+        NoNewPrivileges="yes",
+        StandardInput="null",
+        StandardOutput="null",
+        StandardError="null",
+    )
+    # Frozen readiness requires PID1 mount/network namespaces; retain them.
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + UNIT,
+        ]
+        + [f"--property={k}={v}" for k, v in properties.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", "-c", code]
+    )
+
+
+def dispatch(expected, request, raw, receiver):
+    module, bootstrap, helper, original = context(expected, raw)
+    need(request == original)
+    need(type(receiver) is bytes and 0 < len(receiver) <= 32768)
+    need(0 <= bootstrap.boot_time() < request["host_deadline_boottime"] - 11315 - 260)
+    need(not os.path.lexists(ROOT) and not os.path.lexists(FULLSIZE / "native-admission"))
+    need(bootstrap.show(UNIT, "LoadState") == b"not-found" and helper.cgroup_empty(UNIT))
+    for name in ("binding.json", "binding.sha256"):
+        need(not os.path.lexists(FULLSIZE / "controller" / name))
+    bootstrap.owned(ROOT.parent)
+    ROOT.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(ROOT.parent)
+    for name, body in (
+        ("binder.py", raw),
+        ("receiver.py", receiver),
+        ("request.json", bootstrap.encode(request)),
+    ):
+        bootstrap.write(ROOT / name, body)
+        need(module.root_read(ROOT / name) == body)
+    bootstrap.write(ROOT / "dispatch.json", bootstrap.encode(result("dispatch_requested")))
+    bootstrap.command(command(sha(receiver)), seconds=15)
+    return result("dispatch_requested")
+
+
+def _serve_once():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(Path(__file__) == ROOT / "receiver.py")
+    raw = read_root(ROOT / "binder.py")
+    module = binder(raw)
+    request = module.decode(read_root(ROOT / "request.json"))
+    expected = {k: request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")}
+    _, bootstrap, _, original = context(expected, raw)
+    need(request == original and bootstrap.show(UNIT, "ActiveState") == b"active")
+    need(bootstrap.boot_time() < request["host_deadline_boottime"] - 11315 - 240)
+    bootstrap.write(ROOT / "started.json", bootstrap.encode(result("running")))
+
+    def expired(*_):
+        raise TimeoutError("native_binding_deadline")
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.alarm(220)
+    try:
+        report = validate_report(module._bind_same_host(expected))
+        bootstrap.write(ROOT / "result.json", bootstrap.encode(report))
+    except BaseException:
+        bootstrap.write(ROOT / "failed.json", bootstrap.encode(result("failed")))
+        raise ValueError("native_binding_service_failed") from None
+    finally:
+        signal.alarm(0)
+
+
+def binding_report(module, bootstrap, request):
+    value = validate_report(module.decode(module.root_read(ROOT / "result.json")))
+    need(module.decode(module.root_read(FULLSIZE / "native-admission/result.json")) == value)
+    expected = dict(
+        schema="lumi.vm-root-host-binding.v0.1",
+        attempt=ATTEMPT,
+        machine_id=request["machine_id"],
+        boot_id=request["boot_id"],
+        host_started_boottime=0,
+        host_deadline_boottime=request["host_deadline_boottime"],
+        prepared_sha256="f6aab162e22e2c5a6b871f270766d7687080a5ec3350d328af5cd549cc8719fd",
+    )
+    raw = module.root_read(FULLSIZE / "controller/binding.json")
+    need(raw == bootstrap.encode(expected) and sha(raw) == value["binding_sha256"])
+    need(module.root_read(FULLSIZE / "controller/binding.sha256") == (sha(raw) + "\n").encode())
+    return value
+
+
+def status(expected, request, raw):
+    module, bootstrap, helper, original = context(expected, raw)
+    need(original == request and module.decode(module.root_read(ROOT / "request.json")) == request)
+    need(not os.path.lexists(ROOT / "failed.json") and not os.path.lexists(ROOT / "cancel.started"))
+    observed = helper.observe(UNIT)
+    if (observed["ActiveState"], observed["SubState"]) in {
+        ("active", "running"),
+        ("activating", "start"),
+    }:
+        return result("running")
+    helper.validate_terminal("chain", observed)
+    need(helper.cgroup_empty(UNIT))
+    return result("returned", observation=binding_report(module, bootstrap, request))
+
+
+def finish(expected, request, raw):
+    answer = status(expected, request, raw)
+    need(answer["state"] == "returned")
+    module, bootstrap, helper, _ = context(expected, raw)
+    bootstrap.write(ROOT / "finish.started", b"consumed\n")
+    bootstrap.command(["/usr/bin/systemctl", "stop", UNIT], seconds=10)
+    need(helper.cgroup_empty(UNIT) and bootstrap.show(UNIT, "ActiveState") == b"inactive")
+    need(binding_report(module, bootstrap, request) == answer["observation"])
+    bootstrap.write(ROOT / "reaped.json", bootstrap.encode(result("completed")))
+    return result("completed", observation=answer["observation"])
+
+
+def cancel(expected, request, raw):
+    _, bootstrap, helper, original = context(expected, raw)
+    need(original == request)
+    # Even interrupted staging can be cancelled; absence is not success.
+    bootstrap.write(ROOT / "cancel.started", b"consumed\n")
+    bootstrap.command(["/usr/bin/systemctl", "stop", UNIT], seconds=10)
+    need(helper.cgroup_empty(UNIT) and bootstrap.show(UNIT, "ActiveState") == b"inactive")
+    return result("cancelled")  # Binding may already exist; outer STOP is still required.
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_native_binding_controller_required") from None

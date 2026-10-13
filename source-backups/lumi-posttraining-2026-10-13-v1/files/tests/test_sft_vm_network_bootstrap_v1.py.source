@@ -1,0 +1,401 @@
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import shlex
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_network_expiry_v1 as prior
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "network_bootstrap_test", ROOT / "scripts/run_sft_vm_network_bootstrap_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+policy = prior.m
+
+
+class NetworkBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.out = self.root / "network"
+        self.units = self.root / "units"
+        self.units.mkdir()
+        self.source = self.root / "source.py"
+        self.source.write_bytes(b"# synthetic deployed source\n")
+        self.source.chmod(0o400)
+        self.result = self.root / "setup-result.json"
+        for name, value in (
+            ("OUTPUT", self.out),
+            ("SYSTEMD", self.units),
+            ("SOURCE", self.source),
+            ("SETUP_RESULT", self.result),
+        ):
+            self.enterContext(patch.object(m, name, value))
+        self.identity = self.enterContext(patch.object(m, "native_identity"))
+        self.enterContext(patch.object(m, "host_network_inode", return_value=1))
+        self.enterContext(patch.object(m, "owned"))
+        self.enterContext(patch.object(m, "boot_time", return_value=100))
+        self.enterContext(patch.object(m.time, "monotonic", return_value=500))
+        self.rows = prior.snapshot()
+        self.events = []
+        self.failure = None
+        self.bad_readback = False
+        self.bad_receipt = False
+        self.wheel = types.SimpleNamespace(
+            preflight=Mock(), _run_network_admitted_once=Mock(side_effect=self.setup)
+        )
+        self.enterContext(
+            patch.object(
+                m, "load", side_effect=lambda n: policy if n.startswith("build_") else self.wheel
+            )
+        )
+
+        def read(path, cap=131072, *, mode=0o400):
+            self.assertEqual(path.stat().st_mode & 0o777, mode)
+            raw = path.read_bytes()
+            self.assertLessEqual(len(raw), cap)
+            return raw
+
+        self.enterContext(patch.object(m, "read", side_effect=read))
+        self.enterContext(patch.object(m, "command", side_effect=self.command))
+        self.enterContext(patch.object(m, "show", side_effect=self.show))
+        self.shutdown = self.enterContext(patch.object(m, "stop_host"))
+
+    def setup(self, machine, volumes, deadline):
+        self.events.append("setup")
+        self.assertTrue((self.out / "watch-ready").is_dir())
+        self.assertEqual(deadline, 2200)  # Existing 1800 boot deadline, not now+1800.
+        value = copy.deepcopy(m.EXPECTED_SETUP)
+        if self.bad_receipt:
+            value["setup_components_completed"] = ["cpu"]
+        self.result.write_bytes(m.encode(value))
+        self.result.chmod(0o600)
+        return value
+
+    def show(self, unit, prop):
+        if prop == "LoadState":
+            return b"not-found"
+        if prop == "FragmentPath":
+            return str(self.units / unit).encode()
+        if prop == "DropInPaths":
+            return b""
+        if prop in {"FailureAction", "SuccessAction"}:
+            return b"poweroff"
+        if prop == "ActiveState":
+            return b"active"
+        return b"waiting" if unit == policy.TIMER else b"running"
+
+    def command(self, argv, *args, **kwargs):
+        if argv[0] == "/usr/sbin/nft" and "list" in argv:
+            if self.bad_readback:
+                return b"{}"
+            return prior.encode(self.rows)
+        if argv[0] == "/usr/bin/systemd-analyze":
+            self.events.append("verify")
+        elif argv[0] == "/usr/sbin/nft":
+            phase = (
+                "check"
+                if "--check" in argv
+                else ("transition" if "transition.json" in argv[-1] else "install")
+            )
+            self.events.append(phase)
+            if self.failure == phase:
+                raise TimeoutError("do not retain exception text")
+            if phase == "transition":
+                self.rows.pop()
+        elif argv[-1] == policy.TIMER:
+            self.events.append("timer")
+        elif argv[-1] == m.WATCH:
+            self.events.append("watch")
+            if self.failure == "watch":
+                raise TimeoutError("private data")
+            (self.out / "watch-ready").mkdir(mode=0o700)
+        return b""
+
+    def call(self):
+        return m._bootstrap_admitted_once(
+            "a" * 32, "b" * 36, {"root_volume": "synthetic"}, original_deadline_boot_seconds=14000
+        )
+
+    def test_guard_before_setup_then_single_transition(self):
+        result = self.call()
+        self.assertEqual(
+            self.events, ["verify", "check", "timer", "install", "watch", "setup", "transition"]
+        )
+        self.assertFalse(result["host_admitted"])
+        self.assertTrue(result["watchdog_left_running"])
+        self.shutdown.assert_not_called()
+        self.assertTrue(m.setup_finished(policy))
+
+    def test_started_attempt_cannot_retry(self):
+        self.call()
+        with self.assertRaisesRegex(ValueError, "network_bootstrap_rejected"):
+            self.call()
+        self.assertEqual(self.events.count("setup"), 1)
+        self.assertEqual(self.events.count("install"), 1)
+
+    def test_ambiguous_install_shutdown_without_setup(self):
+        self.failure = "install"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.shutdown.assert_called_once()
+        self.wheel._run_network_admitted_once.assert_not_called()
+        failure = (self.out / "failed.json").read_bytes()
+        self.assertNotIn(b"exception", failure)
+        self.assertEqual(json.loads(failure)["failed_phase"], "install")
+
+    def test_watch_failure_blocks_dispatch(self):
+        self.failure = "watch"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.shutdown.assert_called_once()
+        self.wheel._run_network_admitted_once.assert_not_called()
+
+    def test_bad_policy_blocks_dispatch(self):
+        self.bad_readback = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.shutdown.assert_called_once()
+        self.wheel._run_network_admitted_once.assert_not_called()
+
+    def test_bad_setup_never_opens_gate(self):
+        self.bad_receipt = True
+        with self.assertRaises(ValueError):
+            self.call()
+        self.shutdown.assert_called_once()
+        self.assertNotIn("transition", self.events)
+        self.assertFalse((self.out / "setup-finished").exists())
+
+    def test_ambiguous_transition_no_retry(self):
+        self.failure = "transition"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.events.count("transition"), 1)
+        self.shutdown.assert_called_once()
+        self.assertFalse((self.out / "result.json").exists())
+
+    def test_inactive_guard_blocks_dispatch(self):
+        with patch.object(m, "active", side_effect=ValueError("inactive")):
+            with self.assertRaises(ValueError):
+                self.call()
+        self.shutdown.assert_called_once()
+        self.wheel._run_network_admitted_once.assert_not_called()
+
+    def test_expired_setup_rejected_before_attempt(self):
+        with patch.object(m, "boot_time", return_value=1470):
+            with self.assertRaises(ValueError):
+                self.call()
+        self.assertFalse(self.out.exists())
+        self.assertFalse(self.events)
+
+    def test_shutdown_even_if_failure_receipt_write_fails(self):
+        self.failure = "install"
+        original = m.write
+
+        def write(path, raw):
+            if path.name == "failed.json":
+                raise OSError("synthetic full disk")
+            return original(path, raw)
+
+        with patch.object(m, "write", side_effect=write), self.assertRaises(OSError):
+            self.call()
+        self.shutdown.assert_called_once()
+
+    def test_observer_transition_requires_authenticated_setup_marker(self):
+        previous = policy.inspect(prior.encode(self.rows))
+        self.rows.pop()
+        with patch.object(m, "setup_finished", return_value=False), self.assertRaises(ValueError):
+            m.observe(policy, previous, False)
+        with patch.object(m, "setup_finished", return_value=True):
+            _, changed, done = m.observe(policy, previous, False)
+            self.assertTrue(changed and done)
+
+    def test_observer_never_reverts_transition(self):
+        previous = policy.inspect(prior.encode(self.rows))
+        with patch.object(m, "setup_finished", return_value=True), self.assertRaises(ValueError):
+            m.observe(policy, previous, True)
+
+    def test_watch_unit_entry_and_failure_action(self):
+        unit = m.watch_unit("a" * 64)
+        for value in (
+            "FailureAction=poweroff",
+            "SuccessAction=poweroff",
+            "Restart=no",
+            "MemoryMax=64M",
+            "MemorySwapMax=0",
+            "TasksMax=16",
+            "RestrictAddressFamilies=AF_UNIX AF_NETLINK",
+            "StandardError=null",
+        ):
+            self.assertIn(value, unit)
+        entry = next(
+            line.removeprefix("ExecStart=")
+            for line in unit.splitlines()
+            if line.startswith("ExecStart=")
+        )
+        argv = shlex.split(entry)
+        self.assertEqual(argv[:4], ["/usr/bin/python3", "-I", "-B", "-c"])
+        compile(argv[4], "watch-entry", "exec")
+        self.assertIn("hashlib.sha256", argv[4])
+
+    def test_frozen_pins_and_closed_public_entry(self):
+        for name, sha in m.PINS.items():
+            self.assertEqual(
+                hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest(), sha
+            )
+        with self.assertRaisesRegex(ValueError, "fullsize_host_admission_not_bound"):
+            m.run(approved=True)
+
+    def test_watch_enforces_original_setup_deadline(self):
+        self.out.mkdir(mode=0o700)
+        m.write(
+            self.out / "context.json",
+            m.encode(
+                {
+                    "machine_id": "a" * 32,
+                    "boot_id": "b" * 36,
+                    "original_deadline_boot_seconds": 14000,
+                    "host_net_inode": 1,
+                }
+            ),
+        )
+        with patch.object(m, "boot_time", return_value=1800), self.assertRaises(ValueError):
+            m._watch()
+        self.assertTrue((self.out / "watch-ready").is_dir())
+        self.assertEqual(
+            json.loads((self.out / "watch-failed.json").read_bytes())["status"],
+            "network_or_deadline_guard_failed",
+        )
+        self.identity.assert_called_with("a" * 32, "b" * 36, watcher=True, host_net_inode=1)
+
+    def test_watch_exits_on_quota_depletion(self):
+        self.out.mkdir(mode=0o700)
+        m.write(
+            self.out / "context.json",
+            m.encode(
+                {
+                    "machine_id": "a" * 32,
+                    "boot_id": "b" * 36,
+                    "original_deadline_boot_seconds": 14000,
+                    "host_net_inode": 1,
+                }
+            ),
+        )
+        depleted = copy.deepcopy(self.rows)
+        depleted[1]["quota"]["used"] = policy.QUOTAS["all_in"]
+        with (
+            patch.object(
+                m, "snapshot", side_effect=[prior.encode(self.rows), prior.encode(depleted)]
+            ),
+            self.assertRaises(ValueError),
+        ):
+            m._watch()
+
+    def test_dropin_override_blocks_dispatch(self):
+        original = self.show
+        with (
+            patch.object(
+                m,
+                "show",
+                side_effect=lambda u, p: b"override" if p == "DropInPaths" else original(u, p),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            self.call()
+        self.shutdown.assert_called_once()
+        self.wheel._run_network_admitted_once.assert_not_called()
+
+
+class BoundedCommandTests(unittest.TestCase):
+    def test_watcher_mount_namespace_and_exact_cgroup(self):
+        machine = "a" * 32
+        boot = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        files = {
+            "/etc/machine-id": machine.encode(),
+            "/proc/sys/kernel/random/boot_id": boot.encode(),
+            "/proc/self/cgroup": f"0::/system.slice/{m.WATCH}\n".encode(),
+        }
+
+        def opened(path, *args):
+            return io.BytesIO(files[path])
+
+        def stat(path):
+            if path == "/proc/1/ns/net":
+                raise PermissionError("watcher must not need ptrace access to PID1")
+            return types.SimpleNamespace(st_ino=2 if path == "/proc/self/ns/mnt" else 1)
+
+        with (
+            patch.object(m.sys, "platform", "linux"),
+            patch.object(m.sys, "version_info", (3, 12)),
+            patch.object(m.sys, "flags", types.SimpleNamespace(isolated=1)),
+            patch.object(m.sys, "dont_write_bytecode", True),
+            patch.object(m.os, "geteuid", return_value=0),
+            patch.object(m.os, "getegid", return_value=0),
+            patch.object(m.os, "stat", side_effect=stat),
+            patch("builtins.open", side_effect=opened),
+        ):
+            m.native_identity(machine, boot, watcher=True, host_net_inode=1)
+            with self.assertRaises(ValueError):
+                m.native_identity(machine, boot, watcher=True, host_net_inode=2)
+            with self.assertRaises(ValueError):
+                m.native_identity(machine, boot)
+            files["/proc/self/cgroup"] = b"0::/wrong.service\n"
+            with self.assertRaises(ValueError):
+                m.native_identity(machine, boot, watcher=True, host_net_inode=1)
+
+    def test_loadstate_nonzero_only_for_loadstate(self):
+        with patch.object(m, "command", return_value=b"not-found\n") as call:
+            self.assertEqual(m.show(m.WATCH, "LoadState"), b"not-found")
+            self.assertEqual(call.call_args.kwargs["allowed_codes"], (0, 1, 4))
+            m.show(m.WATCH, "ActiveState")
+            self.assertEqual(call.call_args.kwargs["allowed_codes"], (0,))
+
+    def test_bounded_stdout_and_process_reaping(self):
+        for overflow in (False, True):
+            with self.subTest(overflow=overflow):
+                process = Mock(
+                    stdout=Mock(), poll=Mock(return_value=None), wait=Mock(return_value=0)
+                )
+                selector = Mock()
+                selector.select.return_value = [True]
+                manager = Mock()
+                manager.__enter__ = Mock(return_value=selector)
+                manager.__exit__ = Mock(return_value=False)
+                blocks = [b"x" * 4096] * (9 if overflow else 1) + [b""]
+                with (
+                    patch.object(m.subprocess, "Popen", return_value=process),
+                    patch.object(m.selectors, "DefaultSelector", return_value=manager),
+                    patch.object(m.os, "read", side_effect=blocks),
+                ):
+                    if overflow:
+                        with self.assertRaises(ValueError):
+                            m.command(["synthetic"])
+                    else:
+                        self.assertEqual(m.command(["synthetic"]), b"x" * 4096)
+                process.kill.assert_called_once()
+                process.stdout.close.assert_called_once()
+
+    def test_command_timeout_kills_and_reaps(self):
+        process = Mock(stdout=Mock(), poll=Mock(return_value=None), wait=Mock(return_value=0))
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=Mock(select=Mock(return_value=[])))
+        manager.__exit__ = Mock(return_value=False)
+        with (
+            patch.object(m.subprocess, "Popen", return_value=process),
+            patch.object(m.selectors, "DefaultSelector", return_value=manager),
+            self.assertRaises(ValueError),
+        ):
+            m.command(["synthetic"])
+        process.kill.assert_called_once()
+        process.wait.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

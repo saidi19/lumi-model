@@ -1,0 +1,72 @@
+"""Offline full-graph repair verification; consumed attempt cannot execute."""
+
+import hashlib
+import importlib
+import json
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt017_v3 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = json.loads((m.OUTPUT / "release.json").read_bytes())
+        sys.path.insert(0, str(m.OUTPUT / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        cls.outer.authenticate()
+        cls.outer.loading.fresh_identity()
+
+    def test_all_156_hashes(self):
+        self.assertEqual(len(self.manifest["outputs"]), 156)
+        for name, pin in self.manifest["outputs"].items():
+            raw = (m.OUTPUT / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), pin["sha256"])
+
+    def test_only_declared_semantic_change(self):
+        self.assertEqual(self.manifest["semantic_source_changes"], [m.TARGET])
+        self.assertFalse(self.manifest["execution_permitted"])
+        self.assertTrue(self.manifest["fresh_identity_required"])
+
+    def test_specializer_builds_exact_consumed_proposal_offline(self):
+        sources = importlib.import_module("prepare_sft_vm_private_host_sources_v4")
+        directory = m.ROOT / (
+            "artifacts/lumi-vm-private-outer-execution-v0.20/attempt-017/"
+            "host-preparation/binding"
+        )
+        proposal = directory / "host-proposal-v0.2.json"
+        files, result = sources.build(proposal.read_bytes(), proposal)
+        self.assertEqual(len(files), 34)
+        self.assertEqual(len(result["modules"]), 34)
+        specialized = result["watchdog_code_sha256_base64"]
+        self.assertNotEqual(specialized, m.NEW)
+        arm = next(raw for name, raw in files.items()
+                   if name.startswith("arm_sft_vm_external_watchdog_v2"))
+        self.assertEqual(arm.count(specialized.encode()), 1)
+        self.assertFalse(result["live_execution_authorized"])
+
+    def test_old_and_new_baseline_relationship(self):
+        source = (m.OUTPUT / m.TARGET).read_text()
+        self.assertNotIn(m.OLD, source)
+        self.assertEqual(source.count(m.NEW), 1)
+        self.assertEqual(source.replace(m.NEW, m.OLD), (m.BASE / m.TARGET).read_text())
+
+    def test_no_execution_authority_and_no_overwrite(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "OUTPUT", m.OUTPUT), self.assertRaises(ValueError):
+            m.prepare()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+    sys.addaudithook(guard)
+    unittest.main()

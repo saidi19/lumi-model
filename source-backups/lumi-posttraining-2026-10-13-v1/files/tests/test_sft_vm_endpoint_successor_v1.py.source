@@ -1,0 +1,150 @@
+"""Exercise actual successor admission/controller against synthetic AWS only."""
+
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import execute_sft_vm_private_outer_v9 as entry
+from scripts import prepare_sft_vm_endpoint_successor_v1 as builder
+from tests import test_sft_vm_cidr_successor_v1 as cidr
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base, cls.pins = builder.inputs()
+        cls.files, cls.report = builder.build(cls.base, cls.pins)
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-endpoint-successor-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.package = Path(cls.temp.name).resolve()
+        for name, raw in cls.files.items():
+            path = cls.package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def setUp(self):
+        self.enterContext(patch.object(cidr.recovery.outer_fake, "fixture", cidr.retained_fixture))
+        cidr.recovery.RecoveryOuterTests.setUp(self)
+        self.reply = {"InstanceConnectEndpoints": []}
+        original = self.case.dispatch
+
+        def dispatch(service, op, fields):
+            if op == "describe-instance-connect-endpoints":
+                self.assertEqual(service, "ec2")
+                self.assertEqual(
+                    fields,
+                    dict(
+                        Filters=[dict(Name="vpc-id", Values=[self.m.network.selection.VPC])],
+                        MaxResults=20,
+                    ),
+                )
+                self.case.calls.append((service, op, fields))
+                return copy.deepcopy(self.reply)
+            return original(service, op, fields)
+
+        for client in self.case.bundle.clients.values():
+            client.send = dispatch
+
+    def admission(self):
+        return self.m.NetworkAdmission(
+            {k: self.case.bundle.clients[k] for k in ("sts", "ec2", "service-quotas", "pricing")},
+            self.files["configs/lumi-vm-private-network-plan-v0.1.json"],
+            clock=lambda: self.case.net.clock,
+        )
+
+    def row(self, state="create-complete"):
+        return dict(
+            InstanceConnectEndpointId="eice-08b3cb5ef65152517",
+            OwnerId=self.m.network.selection.ACCOUNT,
+            VpcId=self.m.network.selection.VPC,
+            State=state,
+        )
+
+    def test_existing_endpoint_stops_after_two_reads(self):
+        for state in (
+            "create-complete",
+            "create-in-progress",
+            "delete-in-progress",
+            "delete-failed",
+            "unknown",
+        ):
+            self.reply = {"InstanceConnectEndpoints": [self.row(state)]}
+            a = self.admission()
+            with self.assertRaisesRegex(ValueError, "vpc_endpoint_slot_occupied"):
+                a()
+            self.assertEqual(a.report["calls"], 2)
+            self.assertFalse(self.case.net.rows or self.case.host_calls)
+
+    def test_empty_or_deleted_endpoint_passes_full_selection(self):
+        for rows in ([], [self.row("delete-complete")]):
+            self.reply = {"InstanceConnectEndpoints": rows}
+            a = self.admission()
+            a()
+            self.assertEqual(a.report["calls"], 15)
+
+    def test_wrong_owner_vpc_or_paginated_response_fails_closed(self):
+        for reply in (
+            {"InstanceConnectEndpoints": [self.row() | {"OwnerId": "foreign"}]},
+            {"InstanceConnectEndpoints": [self.row() | {"VpcId": "foreign"}]},
+            {"InstanceConnectEndpoints": [], "NextToken": "more"},
+            {"InstanceConnectEndpoints": None},
+        ):
+            self.reply = reply
+            with self.assertRaises((ValueError, TypeError)):
+                self.admission()()
+            self.assertFalse(self.case.net.rows or self.case.host_calls)
+
+    def test_transport_rejects_unscoped_endpoint_query(self):
+        cloud = self.m.ReadCloud(
+            {k: self.case.bundle.clients[k] for k in ("sts", "ec2", "service-quotas", "pricing")},
+            clock=lambda: 100,
+        )
+        with self.assertRaises(ValueError):
+            cloud.cli("ec2", "describe-instance-connect-endpoints", MaxResults=100)
+        self.assertFalse(self.case.calls)
+
+    def test_full_outer_collision_makes_zero_allocations(self):
+        self.reply = {"InstanceConnectEndpoints": [self.row()]}
+        result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"])
+        self.assertFalse(self.case.net.rows or self.case.host_calls)
+        self.assertEqual(self.case.watchdog.updates, 0)
+        self.assertTrue(
+            all(op.startswith(("get-", "describe-", "list-")) for _, op, _ in self.case.calls)
+        )
+
+    def test_empty_slot_full_synthetic_outer_still_completes(self):
+        result = self.case.run_once()
+        self.assertTrue(result["host_lifecycle_completed"], result)
+        self.assertTrue(result["network_cleanup_verified"])
+        self.assertEqual(len(self.case.host_calls), 1)
+
+    def test_entry_pre_marker_inspection_uses_the_same_gate(self):
+        self.reply = {"InstanceConnectEndpoints": [self.row()]}
+        with (
+            patch.object(entry, "outer", self.m),
+            patch.object(entry, "RELEASE", self.package),
+            patch.object(entry, "Preflight") as cpu,
+        ):
+            cpu.return_value.check.return_value = {"calls": 18}
+            with self.assertRaisesRegex(ValueError, "vpc_endpoint_slot_occupied"):
+                entry.inspect_before_marker(
+                    self.case.bundle, clock=lambda: self.case.net.clock, wall=lambda: 2000000000
+                )
+        self.assertFalse(self.case.net.rows or self.case.host_calls)
+
+    def test_archives_limits_and_history_unchanged_not_execution_authority(self):
+        for name, raw in self.base.items():
+            if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+                self.assertEqual(self.files[name], raw)
+        plan = "configs/lumi-vm-private-network-plan-v0.1.json"
+        self.assertEqual(json.loads(self.files[plan]), json.loads(self.base[plan]))
+        self.assertFalse(
+            self.report["execution_permitted"] or self.report["fresh_operational_identity_bound"]
+        )
+        with self.assertRaises(ValueError):
+            builder.run()
+        self.m.authenticate()

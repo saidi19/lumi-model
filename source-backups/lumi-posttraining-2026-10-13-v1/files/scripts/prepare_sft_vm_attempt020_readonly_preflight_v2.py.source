@@ -1,0 +1,149 @@
+"""Prepare, but never execute, the fresh attempt-020 read-only successor."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v23 as bindings
+
+ROOT = Path(__file__).resolve().parents[1]
+BINDINGS = "scripts/prepare_sft_vm_deployment_bindings_v23.py"
+BINDINGS_SHA = "34715dc6858d36ff749d1cd73785b77c22322f39d9865da8bc9f40615e5a2f9e"
+BINDINGS_TEST = "tests/test_sft_vm_deployment_bindings_v23.py"
+BINDINGS_TEST_SHA = "d4dd41b458244a2f2461fc9ebee927e4eb60363d6230f8ba45bbfb074445d67e"
+ENTRY = "scripts/preflight_sft_vm_attempt020_v2.py"
+ENTRY_SHA = "5f32faeee4e3c7bd09ae0960a911995cbe9e00c3b6c1ff7fe311fa889dbb5c02"
+TEST = "tests/test_sft_vm_attempt020_readonly_preflight_v2.py"
+TEST_SHA = "d5d464b4a370acadb8178797fdd1e59b39d855186a903c000ca9dfc366b613d3"
+CLEANUP = "evidence/lumi-vm-attempt-019-endpoint-cleanup-verification-v0.1.json"
+CLEANUP_SHA = "18f1a67c30cbfaf50fdd2c9a959d9ff54512c18a35e80b1ea25ec02650c72738"
+FAILURE = "evidence/lumi-vm-attempt-020-readonly-preflight-failure-v0.1.json"
+FAILURE_SHA = "f371c5516c9a22d927e3acf1dd13da66fbe8c57f61654882f866a8310c742170"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-020-readonly-preflight-plan-v0.2"
+RUN_OUTPUT = "artifacts/lumi-vm-attempt-020-readonly-preflight-v0.2"
+CONSUMED_OUTPUT = "artifacts/lumi-vm-attempt-020-readonly-preflight-v0.1"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_preflight_v2_preparation_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def build():
+    for name, digest in (
+        (BINDINGS, BINDINGS_SHA),
+        (BINDINGS_TEST, BINDINGS_TEST_SHA),
+        (ENTRY, ENTRY_SHA),
+        (TEST, TEST_SHA),
+        (CLEANUP, CLEANUP_SHA),
+        (FAILURE, FAILURE_SHA),
+    ):
+        read(name, digest)
+    need(sha(Path(bindings.__file__).read_bytes()) == BINDINGS_SHA)
+    controls = bindings.controls()
+    cleanup = json.loads(read(CLEANUP, CLEANUP_SHA))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    need(
+        cleanup["status"] == "endpoint_removed_preserved_resources_verified"
+        and cleanup["endpoint_interface_absent"] is True
+        and cleanup["retry"] is False
+        and cleanup["gate_5_complete"] is False
+        and failure["attempt"] == bindings.ATTEMPT
+        and failure["result"]["status"] == "stopped_no_retry"
+        and failure["result"]["retry_performed"] is False
+        and failure["localization"]["blocking_endpoint"]["instance_connect_endpoint_id"]
+        == cleanup["endpoint"]
+        and not (ROOT / RUN_OUTPUT).exists()
+        and (ROOT / CONSUMED_OUTPUT).is_dir()
+    )
+    return {
+        "schema": "lumi.vm-attempt020-readonly-preflight-plan.v0.2",
+        "attempt": bindings.ATTEMPT,
+        "status": "fresh_successor_prepared_not_executed",
+        "bindings": {
+            BINDINGS: BINDINGS_SHA,
+            BINDINGS_TEST: BINDINGS_TEST_SHA,
+            ENTRY: ENTRY_SHA,
+            TEST: TEST_SHA,
+            CLEANUP: CLEANUP_SHA,
+            FAILURE: FAILURE_SHA,
+        },
+        "control_evidence": controls,
+        "consumed_output_preserved": CONSUMED_OUTPUT,
+        "fresh_output": RUN_OUTPUT,
+        "limits": {
+            "maximum_aws_read_calls": 79,
+            "maximum_seconds": 1500,
+            "cloud_mutations": 0,
+            "s3_object_access": 0,
+            "instance_actions": 0,
+        },
+        "retry_of_consumed_pass": False,
+        "read_only_preflight_execution_permitted": False,
+        "cpu_launch_authorized": False,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "next_required": "Explicit approval to execute this fresh read-only successor once.",
+    }
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    release = {
+        "schema": "lumi.vm-attempt020-readonly-preflight-plan-release.v0.2",
+        "attempt": bindings.ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "entry_sha256": ENTRY_SHA,
+        "bindings_sha256": BINDINGS_SHA,
+        "endpoint_cleanup_verification_sha256": CLEANUP_SHA,
+        "fresh_output": RUN_OUTPUT,
+        "executed": False,
+        "execution_permitted": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(release))):
+        fd = os.open(
+            OUTPUT / name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+        )
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return release
+
+
+def run(**_arguments):
+    raise ValueError("preparation_is_not_preflight_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

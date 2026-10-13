@@ -1,0 +1,114 @@
+"""Semantic and authority boundaries for the fresh local two-control package."""
+
+import json
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import execute_sft_vm_inert_watchdog_v15 as watch
+from scripts import prepare_sft_vm_attempt022_control_package_v1 as package
+from scripts import sft_vm_dedicated_cleanup_bucket_v13 as bucket
+
+
+class Tests(unittest.TestCase):
+    def test_package_reproduces_and_predecessor_files_are_unchanged(self):
+        for name, digest in package.PINS.items():
+            package.read(name, digest)
+        plan = package.read(package.PLAN_DIR + "/plan.json")
+        release = package.read(package.PLAN_DIR + "/release.json")
+        helper = package.read(package.HELPER)
+        self.assertEqual(plan, package.encode(package.build_plan()))
+        self.assertEqual(helper, package.helper_source(package.sha(plan), package.sha(release)))
+        for origin, output in (
+            ("scripts/execute_sft_vm_inert_watchdog_v14.py", package.WATCH),
+            ("scripts/sft_vm_dedicated_cleanup_bucket_v12.py", package.BUCKET),
+        ):
+            self.assertEqual(
+                package.read(output),
+                package.control_source(origin, package.sha(helper), package.sha(plan)),
+            )
+
+    def test_new_requests_cannot_touch_predecessor_or_shared_bucket(self):
+        _, deployer = watch.sources()
+        for values in watch.qualified.allowed_requests(deployer).values():
+            for raw in values:
+                self.assertNotIn(package.OLD.encode(), raw)
+                self.assertNotIn(b"3179537f150b45548946f8114e8b73ca", raw)
+        for fields in bucket.requests().values():
+            raw = bucket.encode(fields)
+            self.assertNotIn(package.OLD.encode(), raw)
+            self.assertNotIn(b"lumi-corpus-prod-", raw)
+
+    def test_approval_absent_blocks_before_cloud_and_output(self):
+        fake = Mock()
+        for entry in (watch, bucket):
+            self.assertFalse(entry.APPROVAL.exists())
+            self.assertFalse(entry.OUTPUT.exists())
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            watch.run(transport=fake)
+        with self.assertRaises((ValueError, FileNotFoundError)):
+            bucket.run(cloud=fake)
+        self.assertFalse(fake.mock_calls)
+
+    def test_source_and_evidence_drift_rejected(self):
+        helper = package.load_module("_fresh_22_helper", package.HELPER)
+        for name in ("RELEASE_SHA", "SOURCE_PROOF_SHA", "ABSENCE_SHA", "PLAN_RELEASE_SHA"):
+            with self.subTest(name=name), patch.object(helper, name, "0" * 64):
+                with self.assertRaises(ValueError):
+                    helper.verify()
+
+    def test_cpu_authority_or_old_admission_cannot_be_inserted(self):
+        helper = package.load_module("_fresh_22_helper_plan", package.HELPER)
+        base_read = helper.read
+        plan = json.loads(base_read(helper.PLAN))
+        for key, value in (
+            ("execution_permitted", True),
+            ("approval_record", "invented"),
+            ("successful_readonly_preflight", {}),
+            ("required_control_proofs", ["old"]),
+        ):
+            changed = dict(plan, **{key: value})
+
+            def read(name, *args, changed=changed):
+                return helper.encode(changed) if name == helper.PLAN else base_read(name, *args)
+
+            with self.subTest(key=key), patch.object(helper, "read", side_effect=read):
+                with self.assertRaises(ValueError):
+                    helper.build()
+
+    def test_caps_and_sequence_remain_bounded(self):
+        plan = package.build_plan()
+        self.assertEqual(
+            plan["deployment_sequence"], ["unarmed_watchdog", "dedicated_private_cleanup_bucket"]
+        )
+        self.assertTrue(plan["stop_on_either_failure"])
+        self.assertEqual(plan["maximum_control_calls_combined"], 65)
+        self.assertEqual(plan["maximum_control_runtime_seconds_combined"], 900)
+        w, b = watch.expected_proposal(), bucket.expected_proposal()
+        self.assertEqual((w["maximum_seconds"], w["maximum_control_calls"]), (600, 45))
+        self.assertEqual((b["maximum_seconds"], b["maximum_calls"]), (300, 20))
+        self.assertFalse(w["invocation"] or w["schedule_creation"] or w["instance_action"])
+        self.assertFalse(b["object_access"] or b["shared_bucket_mutation"] or b["iam_mutation"])
+        self.assertFalse(w["execution_permitted"] or b["execution_permitted"])
+        self.assertFalse(w["retry"] or b["retry"])
+
+    def test_historical_native_evidence_is_not_fresh_qualification(self):
+        plan = package.build_plan()
+        self.assertTrue(plan["setup_transfer_native_qualification"]["historical_only"])
+        self.assertFalse(
+            plan["setup_transfer_native_qualification"]["fresh_identity_native_transfer_qualified"]
+        )
+        self.assertIsNone(plan["cpu_scope_reference"]["execution_entry_sha256"])
+        self.assertFalse(plan["predecessor_state"]["cpu_instance_launched"])
+        self.assertNotEqual(plan["predecessor_state"]["retained_host_attempt"], package.OLD)
+
+    def test_qualified_deployers_still_pinned_and_public_builder_closed(self):
+        self.assertEqual(watch.sha(watch.read(Path(watch.qualified.__file__))), watch.QUALIFIED_SHA)
+        base = package.ROOT / "scripts/sft_vm_dedicated_cleanup_bucket_v8.py"
+        self.assertEqual(bucket.sha(base.read_bytes()), bucket.QUALIFIED_SHA)
+        with self.assertRaises(ValueError):
+            package.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,130 @@
+"""One bounded read-only control readback; no deployer or workload entry."""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+from scripts import verify_sft_vm_attempt021_controls_v1 as verification
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-021-readonly-control-verification-v0.1"
+PINS = {
+    "scripts/verify_sft_vm_attempt021_controls_v1.py": (
+        "a0723c9f143b13b0a69e54a9246a31925cf21915e7785068251909db6d1337e5"
+    ),
+    "scripts/verify_sft_vm_attempt019_controls_v1.py": (
+        "e936d055caefc830e27adf5f1d7acb09291958e0ef025a601b485a2aff9029cf"
+    ),
+    "scripts/inspect_sft_vm_attempt019_control_targets_v1.py": (
+        "393a72b5c74aedb4666df2afd95c5b5faf852e9d0de0cf160699d74bdd447970"
+    ),
+}
+
+
+class TrackedReads:
+    def __init__(self, clients, *, clock=time.monotonic, started=None):
+        self.clients, self.clock = clients, clock
+        self.start, self.calls = clock() if started is None else started, 0
+
+    def __getitem__(self, service):
+        owner = self
+
+        class Client:
+            def __getattr__(self, operation):
+                files.need(operation.startswith(("get_", "describe_", "head_")))
+                files.need(operation not in {"get_object", "head_object", "get_object_attributes"})
+
+                def call(**fields):
+                    files.need(owner.calls < 28 and owner.clock() - owner.start < 280)
+                    owner.calls += 1
+                    result = getattr(owner.clients[service], operation)(**fields)
+                    files.need(
+                        not any(result.get(k) for k in ("NextToken", "nextToken", "IsTruncated"))
+                    )
+                    return result
+
+                return call
+
+        return Client()
+
+
+def authenticate():
+    for name, digest in PINS.items():
+        files.need(files.sha(files.read(ROOT / name)) == digest)
+    return verification.local()
+
+
+def run():
+    authenticate()
+    files.need(
+        not OUTPUT.exists()
+        and not verification.WATCH_OUTPUT.exists()
+        and not verification.STORE_OUTPUT.exists()
+    )
+    OUTPUT.mkdir(mode=0o700)
+    files.save(
+        OUTPUT / "started.json",
+        dict(
+            entry_sha256=files.sha(files.read(Path(__file__))),
+            maximum_sdk_reads=28,
+            maximum_seconds=300,
+            cloud_mutations=0,
+            object_access=False,
+            verification_outputs=[
+                str(p.relative_to(ROOT))
+                for p in (verification.WATCH_OUTPUT, verification.STORE_OUTPUT)
+            ],
+        ),
+    )
+    clients, tracked = None, None
+    report = dict(
+        status="started",
+        reads=0,
+        cloud_mutations=0,
+        object_access=False,
+        instance_actions=0,
+        verification_outputs_created=False,
+        cpu_launch_authorized=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    started = time.monotonic()
+    try:
+        clients = verification.transport.clients()
+        for client in clients.values():
+            files.need(client.meta.config.retries.get("total_max_attempts") == 1)
+        tracked = TrackedReads(clients, started=started)
+        watch, store = verification.verify_live(tracked)
+        files.need(
+            watch["read_only_calls_total"] == store["read_only_calls_total"] == tracked.calls
+        )
+        files.need(time.monotonic() - started < 300)
+        files.save(verification.WATCH_OUTPUT, watch)
+        files.save(verification.STORE_OUTPUT, store)
+        report.update(
+            status="independent_live_control_readback_passed",
+            reads=tracked.calls,
+            verification_outputs_created=True,
+        )
+    except BaseException:
+        report.update(
+            status="stopped_no_retry",
+            failure_stage="credentials_or_control_readback",
+            reads=tracked.calls if tracked is not None else 0,
+        )
+    finally:
+        if clients is not None:
+            for client in clients.values():
+                client.close()
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        files.save(OUTPUT / "result.json", report)
+    print(json.dumps(report, sort_keys=True))
+    return report
+
+
+if __name__ == "__main__":
+    files.need(sys.argv[1:] == ["--inspect-once"])
+    run()

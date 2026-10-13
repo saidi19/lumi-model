@@ -1,0 +1,171 @@
+"""Compose a fresh source/control identity with the qualified existing builders.
+
+Only pinned local source/control archives are opened. No model, credentials,
+cloud deployment, execution approval, or installation is performed.
+"""
+
+import ast
+import json
+import os
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+NEW = "9b87f7f591a240ef8b10f46b8d008fa0"
+PREVIOUS = "242bd09f5fa84b1f9a4e46cb4592ad8b"
+OUTPUT = "artifacts/lumi-vm-attempt-010-source-v0.1"
+PINS = {
+    "identity": (
+        "prepare_sft_vm_recovery_identity_v1.py",
+        "ca57e55638d8a9d297a263139d45a56e780c1898afe4a227c6e20c1141ffab98",
+    ),
+    "release": (
+        "prepare_sft_vm_recovery_release_v1.py",
+        "bc6c5242ed31f2a7cd707887e364ca0d84aefbf76419229a8965aae43a506557",
+    ),
+    "outer": (
+        "prepare_sft_vm_recovery_outer_v1.py",
+        "02f854423f3809a1a620c36c0c1942eb7ce621883e6b4aada7895e94024806d8",
+    ),
+    "cidr": (
+        "prepare_sft_vm_cidr_successor_v1.py",
+        "ea25f19538327151808081a043bec461a435ec4770a9fedd743c77da65824afd",
+    ),
+    "endpoint": (
+        "prepare_sft_vm_endpoint_successor_v1.py",
+        "82beccc55cf278a939714d6b46863adc10ec568824bd388d6202668089d66c5a",
+    ),
+}
+
+
+def sha(raw):
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt010_source_rejected")
+
+
+def load(kind, *, fresh=False):
+    name, pin = PINS[kind]
+    path = ROOT / "scripts" / name
+    need(not path.is_symlink())
+    raw = path.read_bytes()
+    need(sha(raw) == pin)
+    if fresh:
+        need(kind in {"identity", "release", "outer"})
+        # Pure builders only, in isolated module globals. Do not rewrite donors.
+        raw = raw.replace(PREVIOUS.encode(), NEW.encode())
+        raw = raw.replace(b"attempt-008", b"attempt-010").replace(b"Attempt-008", b"Attempt-010")
+        raw = raw.replace(b"v0.8", b"v0.10")
+    ast.parse(raw)
+    module = types.ModuleType("_attempt010_builder_" + kind)
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def pins(files):
+    return {n: dict(bytes=len(raw), sha256=sha(raw)) for n, raw in sorted(files.items())}
+
+
+def build():
+    identity_base, release_base, outer_base = (load(k) for k in ("identity", "release", "outer"))
+    identity, release, outer = (load(k, fresh=True) for k in ("identity", "release", "outer"))
+    cidr, endpoint = load("cidr"), load("endpoint")
+    # Revalidate the completed failure/cleanup chain and tested endpoint candidate.
+    endpoint.inputs()
+    verification = ROOT / "evidence/lumi-vm-endpoint-successor-verification-v0.1.json"
+    need(
+        sha(verification.read_bytes())
+        == "be27d69e3843f28086b43e8e8392caf123c7ee0a2f7654ae8da0a7acc659e92f"
+    )
+    identity_files, identity_report = identity.build(identity_base.inputs())
+    release.IDENTITY_SHA = sha(encode(identity_report))
+    donor = release_base.inputs()
+    donor_pins = json.loads((ROOT / release_base.INPUTS).read_bytes())["files"]
+    guest, guest_report = release.build(donor, donor_pins)
+    outer.GUEST_SHA = sha(encode(guest_report))
+    _, extras, extra_pins = outer_base.inputs()
+    composed, composed_report = outer.build(guest, extras, extra_pins)
+    with_cidr, _ = cidr.build(composed, pins(composed))
+    final, _ = endpoint.build(with_cidr, pins(with_cidr))
+    need(len(final) == 145 and NEW != PREVIOUS)
+    need(
+        final["configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"]
+        == guest["configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"]
+    )
+    # All qualified guest bytes remain unchanged by network-only fixes.
+    need(all(final[n] == raw for n, raw in guest.items()))
+    for name, raw in final.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+    ancillary = {"identity/" + n: raw for n, raw in identity_files.items()}
+    ancillary.update(
+        {
+            "identity/manifest.json": encode(identity_report),
+            "guest-release.json": encode(guest_report),
+            "outer-composition.json": encode(composed_report),
+        }
+    )
+    report = dict(
+        schema="lumi.vm-attempt010-source.v0.1",
+        attempt=NEW,
+        attempt_label="attempt-010",
+        operational_predecessor=PREVIOUS,
+        qualified_source_ancestor=identity.OLD,
+        outputs=pins(final),
+        ancillary=pins(ancillary),
+        builder_bindings=PINS,
+        identity_manifest_sha256=release.IDENTITY_SHA,
+        guest_release_sha256=outer.GUEST_SHA,
+        source_identity_bound=True,
+        new_identity_live_absence_verified=False,
+        cidr_collision_gate_preserved=True,
+        vpc_endpoint_gate_preserved=True,
+        checkpoint_selection_unchanged=True,
+        qualified_native_control_flow_unchanged=True,
+        guest_files_preserved_after_network_fixes=len(guest),
+        fresh_watchdog_deployment_required=True,
+        old_watchdog_reused=False,
+        deployment_plan_bound=False,
+        execution_entry_bound=False,
+        execution_permitted=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        remaining=[
+            "Prepare deployment/entry bindings for this identity, keeping limits unchanged.",
+            "Explicit cloud approval, fresh identity/quota/rights checks and inert controls.",
+            "New one-shot CPU execution authority; no authority inherited from old attempts.",
+        ],
+    )
+    return final, ancillary, report
+
+
+def prepare():
+    files, ancillary, report = build()
+    files = files | ancillary | {"release.json": encode(report)}
+    need(sum(map(len, files.values())) < 32 * 1024**2)
+    target = ROOT / OUTPUT
+    need(not target.exists() and not any(p.is_symlink() for p in (target, *target.parents)))
+    target.mkdir(mode=0o700)
+    for name, raw in sorted(files.items()):
+        path = target / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("source_binding_is_not_execution_authority")

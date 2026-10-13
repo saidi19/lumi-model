@@ -1,0 +1,53 @@
+"""Synthetic raw-text-free diagnostic projection; no AWS or credential access."""
+
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/diagnose_sft_vm_v06_nat_readback_v1.py"
+spec = importlib.util.spec_from_file_location("nat_diagnostic_test", PATH)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def good(self):
+        return {"NatGateways": [{"NatGatewayId": m.NAT, "State": "deleted", "VpcId": m.VPC,
+                                 "SubnetId": m.SUBNET}]}
+
+    def test_exact_deleted_and_absent_pass(self):
+        for value in (self.good(), {"NatGateways": []}):
+            self.assertTrue(m.summarize(value)["existing_contract_passes_current_response"])
+
+    def test_pagination_token_never_retained(self):
+        value = self.good()
+        value["NextToken"] = "sensitive-opaque-token"
+        report = m.summarize(value)
+        self.assertEqual(report["first_failed_check"], "pagination")
+        self.assertNotIn("sensitive", json.dumps(report))
+
+    def test_separate_identity_state_and_presence_failures(self):
+        for field in ("NatGatewayId", "State", "VpcId", "SubnetId"):
+            for missing in (False, True):
+                value = self.good()
+                if missing:
+                    del value["NatGateways"][0][field]
+                else:
+                    value["NatGateways"][0][field] = "sensitive-wrong-value"
+                report = m.summarize(value)
+                self.assertEqual(report["first_failed_check"], "nat_" + field)
+                self.assertNotIn("sensitive", json.dumps(report))
+
+    def test_malformed_and_multiple_rows_never_pass(self):
+        for value in (None, [], {}, {"NatGateways": {}}, {"NatGateways": [None]},
+                      {"NatGateways": [{}, {}]}):
+            self.assertFalse(m.summarize(value).get("existing_contract_passes_current_response"))
+
+    def test_unrelated_raw_fields_not_retained(self):
+        value = self.good()
+        value["NatGateways"][0]["Tags"] = [{"Value": "sensitive-raw"}]
+        value["ResponseMetadata"] = {"RequestId": "sensitive-id"}
+        report = json.dumps(m.summarize(value))
+        for raw in ("sensitive", m.NAT, m.VPC, m.SUBNET):
+            self.assertNotIn(raw, report)

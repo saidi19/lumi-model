@@ -1,0 +1,147 @@
+"""One fresh read-only diagnosis; never runs or resets the consumed CPU entry."""
+
+import ast
+import hashlib
+import json
+import math
+import os
+import time
+from pathlib import Path
+
+from scripts import execute_sft_vm_private_outer_v16 as entry
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-015-readonly-diagnostic-v0.1"
+ENTRY_SHA = "01950e925df34f983008e68e82e48eb1c2a32ab67e853a10f5825fde615697f7"
+CLEANUP = ROOT / "evidence/lumi-vm-attempt-014-endpoint-cleanup-verification-v0.1.json"
+CLEANUP_SHA = "d54f2420839ef8d1636ba7b12dbd06c73e547ebfd325c4da1ba33bbb8637f558"
+ALLOWED = frozenset(
+    """GetCallerIdentity DescribeImages DescribeInstanceTypes
+DescribeInstanceTypeOfferings GetServiceQuota DescribeInstances GetProducts
+DescribeKeyPairs DescribeSecurityGroups GetUser GetRole GetFunctionConfiguration
+GetFunctionConcurrency GetScheduleGroup GetSchedule GetRolePolicy ListRolePolicies
+ListAttachedRolePolicies GetFunctionEventInvokeConfig DescribeInstanceConnectEndpoints
+DescribeVpcs DescribeSubnets DescribeRouteTables DescribeInternetGateways
+DescribeNatGateways DescribeAddresses GetBucketLocation GetPublicAccessBlock
+GetBucketOwnershipControls GetBucketEncryption GetBucketVersioning GetBucketPolicyStatus
+GetBucketPolicy GetBucketLifecycleConfiguration""".split()
+)
+
+
+class Trace:
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.start = clock, clock()
+        self.stage, self.last, self.calls = "credentials", "none", 0
+
+    def before(self, model, **_kwargs):
+        if (
+            model.name not in ALLOWED
+            or self.calls >= 80
+            or not 0 <= self.clock() - self.start < 1380
+        ):
+            raise ValueError("readonly_diagnostic_boundary")
+        self.calls += 1
+        self.last = model.name
+
+
+def inspector(trace):
+    raw = Path(entry.__file__).read_bytes()
+    entry.need(hashlib.sha256(raw).hexdigest() == ENTRY_SHA)
+    node = next(
+        n
+        for n in ast.parse(raw).body
+        if isinstance(n, ast.FunctionDef) and n.name == "inspect_before_marker"
+    )
+    stage_names = {
+        "cpu": "cpu",
+        "watchdog": "watchdog",
+        "network": "network",
+        "store": "cleanup_store",
+    }
+    body = []
+    for item in node.body:
+        if isinstance(item, ast.Assign) and isinstance(item.targets[0], ast.Name):
+            stage = stage_names.get(item.targets[0].id)
+            if stage:
+                body += ast.parse(f'trace.stage = "{stage}"').body
+        body.append(item)
+    node.body = body
+    namespace = dict(entry.__dict__, trace=trace)
+    exec(
+        compile(
+            ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])),
+            "<bound-readonly-inspector>",
+            "exec",
+        ),
+        namespace,
+    )
+    return namespace["inspect_before_marker"]
+
+
+def main():
+    entry.need(hashlib.sha256(CLEANUP.read_bytes()).hexdigest() == CLEANUP_SHA)
+    entry.need(json.loads(CLEANUP.read_bytes())["result"]["cleanup_verified"] is True)
+    entry.local_preconditions()
+    entry.need(not OUTPUT.exists() and not entry.OUTPUT.exists())
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+
+    def save(name, value):
+        raw = entry.encode(value)
+        entry.need(len(raw) <= 32768)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    save(
+        "started.json",
+        dict(
+            entry_sha256=ENTRY_SHA,
+            cleanup_sha256=CLEANUP_SHA,
+            maximum_reads=80,
+            maximum_seconds=1400,
+            execution=False,
+        ),
+    )
+    trace, bundle = Trace(), None
+    credentials = entry.outer.credentials
+    original_session = credentials.session
+
+    def readonly_session():
+        session = original_session()
+        session.register("before-call", trace.before)
+        return session
+
+    credentials.session = readonly_session
+    report = dict(
+        status="stopped_readonly",
+        execution_marker_created=False,
+        cloud_mutations=0,
+        gpu=False,
+        training=False,
+        gate_5_complete=False,
+    )
+    try:
+        reader = credentials.Reader(float(math.floor(time.monotonic())) + 1450)
+        bundle = credentials.Clients(reader)
+        report["admission"] = inspector(trace)(bundle)
+        report["status"] = "all_readonly_admission_passed"
+    except BaseException as error:
+        report["failure"] = entry.outer.failure.describe(error, "preflight")
+    finally:
+        if bundle is not None:
+            bundle.close()
+        credentials.session = original_session
+        report.update(
+            stage=trace.stage,
+            last_operation=trace.last,
+            reads=trace.calls,
+            elapsed_seconds=round(time.monotonic() - trace.start, 3),
+        )
+        save("result.json", report)
+    print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

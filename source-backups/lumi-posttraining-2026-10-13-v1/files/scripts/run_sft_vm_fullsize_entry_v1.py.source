@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+"""Cold full-size worker for a separately admitted, fixed systemd import unit.
+
+No acquisition or training. Source/control/runtime authentication and backing
+writer exclusion belong to the root parent. A success still requires independent
+package verification, parent supervision and durable retention. Never run locally
+on real data; tests substitute OS/runtime/coordinator boundaries only.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import importlib.util
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+RELEASE = Path("/work/release")
+SOURCE = RELEASE / "src/lumi"
+ENTRY = RELEASE / "scripts/run_sft_vm_fullsize_entry_v1.py"
+CONTROL_ROOT = RELEASE / "controls"
+OUTPUT = Path("/outputs")
+ATTEMPT = OUTPUT / "import/attempt-001"
+SUMMARY = OUTPUT / "summary.json"
+NAMES = ("base.json", "manifest.sha256", "state.json", "config.json", "handoff.json",
+         "plan.json", "envelope.json", "kernel-io.json")
+CONSUMED = False
+STAGE = "boundary"
+STAGES = {40: "boundary", 41: "cold_loader", 42: "runtime", 43: "mounts",
+          44: "controls", 45: "contract", 46: "output_parent", 47: "import",
+          48: "result", 49: "summary"}
+
+
+def need(value):
+    if not value:
+        raise ValueError("fullsize_entry_rejected") from None
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read_private(path, cap=131072):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1
+             and (before.st_uid, before.st_gid) == (os.geteuid(), os.getegid())
+             and stat.S_IMODE(before.st_mode) in {0o400, 0o600, 0o644}
+             and 0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+        need(len(raw) == before.st_size and before == after)
+        return raw
+
+
+def boundary(attempt):
+    need(sys.platform == "linux" and sys.flags.isolated and sys.dont_write_bytecode
+         and type(attempt) is str and re.fullmatch(r"[0-9a-f]{32}", attempt)
+         and Path(__file__) == ENTRY)
+    unit = f"lumi-vm-fullsize-v1-{attempt}-import.service"
+    # Kernel controls, not a report-supplied boolean. Source parent protects
+    # these pseudo-files; small fixed reads never inspect checkpoint payload.
+    with open("/proc/self/cgroup", "rb") as stream:
+        need(stream.read(4097).strip() == f"0::/system.slice/{unit}".encode())
+    group = Path("/sys/fs/cgroup/system.slice") / unit
+    for name, expected in (("memory.max", 64*1024**3), ("memory.swap.max", 0), ("pids.max", 64)):
+        with (group / name).open("rb") as stream:
+            need(stream.read(65).strip() == str(expected).encode())
+
+
+def load_runner():
+    spec = importlib.util.spec_from_file_location("_fullsize_cold_loader",
+        SOURCE / "posttraining_checkpoint_vm_loader_v1.py")
+    need(spec is not None and spec.loader is not None)
+    loader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader)
+    return loader.load_coordinator()
+
+
+def execute(attempt, pins):
+    global CONSUMED, STAGE
+    STAGE = "boundary"
+    need(not CONSUMED)
+    boundary(attempt)
+    need(type(pins) is dict and set(pins) ==
+         {"control_sha256", "entry_sha256", "source_manifest_sha256", "attempt_nonce_sha256"}
+         and all(type(p) is str and re.fullmatch(r"[0-9a-f]{64}", p) for p in pins.values()))
+    STAGE = "cold_loader"
+    runner = load_runner()
+    STAGE = "runtime"
+    runner._runtime()
+    STAGE = "mounts"
+    for path in (RELEASE, SOURCE, CONTROL_ROOT,
+                 Path("/inputs/checkpoint"), Path("/inputs/tokenizer")):
+        need(os.statvfs(path).f_flag & os.ST_RDONLY)
+    need(not os.statvfs(OUTPUT).f_flag & os.ST_RDONLY)
+    # /outputs has depth two: do not call the frozen minimum-depth-three
+    # validator here. It will validate /outputs/import after exclusive mkdir.
+    need(not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    output_info = OUTPUT.lstat()
+    need(stat.S_ISDIR(output_info.st_mode) and stat.S_IMODE(output_info.st_mode) == 0o700
+         and (output_info.st_uid, output_info.st_gid) == (os.geteuid(), os.getegid()))
+    STAGE = "controls"
+    need(digest(read_private(ENTRY)) == pins["entry_sha256"])
+    need(digest(read_private(RELEASE / "release-manifest.json")) == pins["source_manifest_sha256"])
+    raw = read_private(CONTROL_ROOT / "control.json")
+    bodies = {name: read_private(CONTROL_ROOT / name) for name in NAMES}
+    need(sum(map(len, bodies.values())) <= 524288)
+    sources = {name: read_private(SOURCE / name, 65536)
+               for name in ("configuration_lumi.py", "modeling_lumi.py")}
+    STAGE = "contract"
+    adapter = importlib.import_module("lumi.posttraining_checkpoint_vm_fullsize_entry_v1")
+    arguments = {"expected_" + name: pin for name, pin in pins.items()}
+    arguments["runtime_sources"] = sources
+    adapter.prepare_entry(raw, bodies, **arguments)
+    CONSUMED = True
+    STAGE = "output_parent"
+    os.mkdir(ATTEMPT.parent, 0o700)  # Fresh only; never reuse earlier partial output.
+    STAGE = "import"
+    result = adapter._run_admitted_once(raw, bodies, **arguments)
+    STAGE = "result"
+    # Bind the disk terminal to the returned coordinator result; a leftover
+    # terminal alone never substitutes for a returned/supervised success.
+    complete = runner.json_object(read_private(ATTEMPT / runner.COMPLETE))
+    need(digest(runner.canonical(complete)) == result["coordinator_result_sha256"])
+    manifest = complete["package"]["manifest_file_sha256"]
+    need(type(manifest) is str and re.fullmatch(r"[0-9a-f]{64}", manifest))
+    summary = {"schema": "lumi.vm-fullsize-worker-result.v0.1", "entry": result,
+        "package_manifest_sha256": manifest, "independent_checksum_consumer": False,
+        "durable_package_retention_verified": False, "real_4b_import": False,
+        "gate_5_complete": False, "training_authorized": False, "production_eligible": False}
+    STAGE = "summary"
+    report = runner.canonical(summary)
+    need(len(report) <= 8192)
+    fd = os.open(SUMMARY, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(report) == len(report))
+        stream.flush()
+        os.fsync(stream.fileno())
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--attempt", required=True)
+    for name in ("control-sha256", "entry-sha256", "source-manifest-sha256",
+                 "attempt-nonce-sha256"):
+        parser.add_argument("--" + name, required=True)
+    args = vars(parser.parse_args())
+    attempt = args.pop("attempt")
+    try:
+        execute(attempt, args)
+    except BaseException:
+        status = next((code for code, name in STAGES.items() if STAGE == name), 1)
+        parser.exit(status, "fullsize_entry_failed\n")
+
+
+if __name__ == "__main__":
+    main()

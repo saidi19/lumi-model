@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Stage an authenticated source/control archive, without installing or running it.
+
+No network, SDK, credentials, model data, mounts, units or instance actions.
+The caller supplies the independently approved archive hash and machine ID.
+This lays out the exact existing worker paths; runtime/storage/egress admission
+and credential provisioning still precede any acquisition/import dispatch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import stat
+import sys
+import tarfile
+from pathlib import Path
+
+ROOT = Path("/var/lib/lumi-vm-fullsize")
+WORKER_UID = WORKER_GID = 10001
+MAX_ARCHIVE = 4 * 1024**2
+LOCK_SHA = "26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965"
+SELECTION_SHA = "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42"
+CONTROL_NAMES = (
+    "base.json",
+    "manifest.sha256",
+    "state.json",
+    "config.json",
+    "handoff.json",
+    "plan.json",
+    "envelope.json",
+    "kernel-io.json",
+)
+IMPORT_ENTRY = "scripts/run_sft_vm_fullsize_entry_v1.py"
+ACQUIRE_ENTRY = "scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+REQUIRED = {
+    IMPORT_ENTRY,
+    ACQUIRE_ENTRY,
+    "scripts/verify_sft_vm_fullsize_package_v1.py",
+    "src/lumi/posttraining_vm_fullsize_acquisition_unit_v1.py",
+    "src/lumi/posttraining_checkpoint_vm_fullsize_entry_v1.py",
+    "src/lumi/posttraining_checkpoint_vm_loader_v1.py",
+    "src/lumi/posttraining_checkpoint_import_runner_v4.py",
+    "src/lumi/posttraining_vm_fullsize_staging_v1.py",
+    "src/lumi/posttraining_vm_fullsize_transport_v1.py",
+    "src/lumi/posttraining_vm_fullsize_handoff_v1.py",
+    "src/lumi/posttraining_vm_fullsize_completion_v1.py",
+    "src/lumi/posttraining_vm_fullsize_controls_v1.py",
+    "src/lumi/posttraining_import_vm_rehearsal_v3.py",
+    "src/lumi/posttraining_sft_runtime_v4.py",
+    "src/lumi/configuration_lumi.py",
+    "src/lumi/modeling_lumi.py",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("fullsize_staging_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def hex_id(value, length):
+    return (
+        type(value) is str
+        and re.fullmatch(rf"[a-f0-9]{{{length}}}", value)
+        and value != "0" * length
+    )
+
+
+def decode(raw):
+    def pairs(rows):
+        result = {}
+        for key, value in rows:
+            need(key not in result)
+            result[key] = value
+        return result
+
+    def constant(_value):
+        raise ValueError("nonfinite_json")
+
+    value = json.loads(raw, object_pairs_hook=pairs, parse_constant=constant)
+    need(type(value) is dict)
+    return value
+
+
+def validate(raw, expected_sha256, attempt):
+    need(
+        type(raw) is bytes
+        and 0 < len(raw) <= MAX_ARCHIVE
+        and hex_id(expected_sha256, 64)
+        and sha(raw) == expected_sha256
+        and hex_id(attempt, 32)
+    )
+    fixed = {
+        "release-manifest.json",
+        "runtime-lock.json",
+        "prepared-attempt.json",
+        "controls/control.json",
+        "controls/input-selection.json",
+    } | {"controls/" + name for name in CONTROL_NAMES}
+    members, total = {}, 0
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as tar:
+        for member in tar:
+            name = member.name
+            need(
+                len(members) < 256
+                and name not in members
+                and member.type == tarfile.REGTYPE
+                and not member.pax_headers
+                and not member.linkname
+                and 0 <= member.size <= 1024**2
+                and (
+                    name in fixed
+                    or re.fullmatch(r"(?:src/lumi|scripts|tests)/[A-Za-z0-9_]+\.py", name)
+                )
+            )
+            total += member.size
+            need(total <= 3 * 1024**2)
+            with tar.extractfile(member) as stream:
+                body = stream.read(member.size + 1)
+            need(len(body) == member.size)
+            members[name] = body
+    need(fixed <= set(members))
+    manifest = decode(members["release-manifest.json"])
+    need(REQUIRED <= set(manifest) and set(members) == set(manifest) | fixed)
+    need(
+        all(
+            type(name) is str
+            and re.fullmatch(r"(?:src/lumi|scripts|tests)/[A-Za-z0-9_]+\.py", name)
+            and hex_id(pin, 64)
+            and sha(members[name]) == pin
+            for name, pin in manifest.items()
+        )
+    )
+    need(
+        sha(members["runtime-lock.json"]) == LOCK_SHA
+        and sha(members["controls/input-selection.json"]) == SELECTION_SHA
+    )
+    descriptor = decode(members["prepared-attempt.json"])
+    source_pin = sha(members["release-manifest.json"])
+    pins = {
+        "entry_sha256": sha(members[IMPORT_ENTRY]),
+        "source_manifest_sha256": source_pin,
+        "control_sha256": sha(members["controls/control.json"]),
+        "attempt_nonce_sha256": sha(b"lumi.vm-fullsize-attempt.v0.1\0" + attempt.encode()),
+    }
+    expected = {
+        "schema": "lumi.vm-fullsize-prepared-attempt.v0.1",
+        "attempt": attempt,
+        "import_pins": pins,
+        "acquisition_pins": {
+            "entry_sha256": sha(members[ACQUIRE_ENTRY]),
+            "source_manifest_sha256": source_pin,
+        },
+        "selection_sha256": SELECTION_SHA,
+        "runtime_lock_sha256": LOCK_SHA,
+        "host_admitted": False,
+        "sdk_runtime_bound": False,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "training_authorized": False,
+    }
+    need(json.dumps(descriptor, sort_keys=True) == json.dumps(expected, sort_keys=True))
+    # Source-manifest excludes controls to avoid a circular control hash; the
+    # archive hash binds both. Validate every control-body binding independently.
+    control = decode(members["controls/control.json"])
+    expected_control = {
+        "schema": "lumi.checkpoint-vm-fullsize-entry-control.v0.1",
+        "scope": "bound_vm_checkpoint_import_only",
+        **{k: v for k, v in pins.items() if k != "control_sha256"},
+        "files": [
+            {
+                "path": n,
+                "bytes": len(members["controls/" + n]),
+                "sha256": sha(members["controls/" + n]),
+            }
+            for n in CONTROL_NAMES
+        ],
+    }
+    need(
+        json.dumps(control, sort_keys=True) == json.dumps(expected_control, sort_keys=True)
+        and all(len(members["controls/" + n]) <= 131072 for n in CONTROL_NAMES)
+        and sum(len(members["controls/" + n]) for n in CONTROL_NAMES) <= 524288
+    )
+    return members, descriptor
+
+
+def host(machine_id):
+    need(
+        sys.platform == "linux"
+        and os.geteuid() == os.getegid() == 0
+        and sys.version_info[:2] == (3, 12)
+        and hex_id(machine_id, 32)
+    )
+    with open("/etc/machine-id", "rb") as stream:
+        need(stream.read(65).strip() == machine_id.encode())
+
+
+def root_owned(path):
+    for item in (path, *path.parents):
+        info = item.lstat()
+        need(
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == 0
+            and not stat.S_IMODE(info.st_mode) & 0o022
+        )
+
+
+def sync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_new(path, body, *, worker=False):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            need(stream.write(body) == len(body))
+            stream.flush()
+        if worker:
+            os.fchown(fd, WORKER_UID, WORKER_GID)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def stage(raw, expected_sha256, attempt, machine_id):
+    host(machine_id)  # No writes before host and complete archive validation.
+    members, descriptor = validate(raw, expected_sha256, attempt)
+    root_owned(ROOT.parent)
+    ROOT.mkdir(mode=0o700, exist_ok=True)
+    root_owned(ROOT)
+    need(stat.S_IMODE(ROOT.stat().st_mode) == 0o700)
+    destination = ROOT / attempt
+    destination.mkdir(mode=0o700, exist_ok=False)  # Consumed on any partial failure.
+    sync_dir(ROOT)
+    stage_root = destination / "stage"
+    stage_root.mkdir(mode=0o700)
+    release = stage_root / "release"
+    release.mkdir(mode=0o700)
+    directories = {release}
+    for name, body in sorted(members.items()):
+        path = release / name
+        for parent in reversed(path.relative_to(release).parents):
+            directory = release / parent
+            if directory not in directories:
+                directory.mkdir(mode=0o700)
+                directories.add(directory)
+        write_new(path, body, worker=True)
+    # Read back exact staged bytes before making an aggregate staging receipt.
+    for name, body in members.items():
+        path = release / name
+        info = path.lstat()
+        need(
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and info.st_size == len(body)
+            and stat.S_IMODE(info.st_mode) == 0o400
+            and (info.st_uid, info.st_gid) == (WORKER_UID, WORKER_GID)
+        )
+        with path.open("rb") as stream:
+            need(sha(stream.read(len(body) + 1)) == sha(body))
+    for directory in sorted(directories, key=lambda p: len(p.parts), reverse=True):
+        os.chown(directory, WORKER_UID, WORKER_GID)
+        sync_dir(directory)
+    for name in ("acquisition", "outputs"):
+        path = stage_root / name
+        path.mkdir(mode=0o700)
+        os.chown(path, WORKER_UID, WORKER_GID)
+        sync_dir(path)
+    (destination / "credentials").mkdir(mode=0o700)  # Empty, root-only; no secret provided.
+    sync_dir(stage_root)
+    report = {
+        "schema": "lumi.vm-fullsize-source-staging.v0.1",
+        "attempt": attempt,
+        "archive_sha256": expected_sha256,
+        "source_files_and_controls": len(members),
+        "staged_bytes": sum(map(len, members.values())),
+        "staged_file_hashes_verified": True,
+        "source_manifest_sha256": descriptor["import_pins"]["source_manifest_sha256"],
+        "runtime_installed_or_verified": False,
+        "sdk_runtime_bound": False,
+        "storage_egress_admitted": False,
+        "credentials_installed": False,
+        "host_admitted": False,
+        "acquisition_started": False,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "training_authorized": False,
+    }
+    write_new(
+        destination / "source-staging.json", json.dumps(report, sort_keys=True).encode() + b"\n"
+    )
+    sync_dir(destination)
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--archive", type=Path, required=True)
+    for name in ("archive-sha256", "attempt", "machine-id"):
+        parser.add_argument("--" + name, required=True)
+    args = parser.parse_args()
+    try:
+        need(not any(p.is_symlink() for p in (args.archive, *args.archive.parents)))
+        fd = os.open(args.archive, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            need(
+                stat.S_ISREG(info.st_mode)
+                and info.st_nlink == 1
+                and 0 < info.st_size <= MAX_ARCHIVE
+            )
+            with os.fdopen(fd, "rb", closefd=False) as stream:
+                raw = stream.read(MAX_ARCHIVE + 1)
+            need(len(raw) == info.st_size and info == os.fstat(fd))
+        finally:
+            os.close(fd)
+        print(
+            json.dumps(
+                stage(raw, args.archive_sha256, args.attempt, args.machine_id), sort_keys=True
+            )
+        )
+    except BaseException:
+        parser.exit(1, "fullsize_source_staging_failed\n")
+
+
+if __name__ == "__main__":
+    main()

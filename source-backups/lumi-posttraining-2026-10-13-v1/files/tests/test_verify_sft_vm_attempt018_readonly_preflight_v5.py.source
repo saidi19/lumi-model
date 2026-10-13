@@ -1,0 +1,30 @@
+"""Offline tests for the attempt-018 v0.5 preflight verifier."""
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt018_readonly_preflight_v5 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_evidence(self):
+        result = m.verify()
+        self.assertEqual(result["status"], "readonly_preflight_passed")
+        self.assertTrue(result["network_admitted"])
+        self.assertTrue(result["cpu_admitted"])
+        self.assertFalse(result["execution_authority_created"])
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_hash_drift_rejected(self):
+        original = m.read
+
+        def changed(name, digest):
+            if name.endswith("result.json"):
+                digest = "0" * 64
+            return original(name, digest)
+
+        with patch.object(m, "read", changed), self.assertRaises(ValueError):
+            m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

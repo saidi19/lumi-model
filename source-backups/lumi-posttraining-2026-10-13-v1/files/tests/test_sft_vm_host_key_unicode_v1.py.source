@@ -1,0 +1,159 @@
+"""Synthetic-only parser regression and immutable-source boundary tests."""
+
+import base64
+import hashlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import diagnose_sft_vm_host_key_v1 as diagnostic
+from scripts import prepare_sft_vm_host_key_unicode_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.original = m.read(m.SOURCE, m.SOURCE_SHA)
+        cls.patched = m.build()
+        cls.old = staticmethod(diagnostic.frozen_parser(cls.original))
+        cls.new = staticmethod(diagnostic.frozen_parser(cls.patched))
+        cls.key = base64.b64encode(
+            b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + b"x" * 32
+        ).decode()
+        cls.console = (
+            "-----BEGIN SSH HOST KEY KEYS-----\nssh-ed25519 "
+            + cls.key
+            + " synthetic\n-----END SSH HOST KEY KEYS-----\n"
+        )
+        cls.expected = cls.old(dict(InstanceId="synthetic", Output=cls.console), "synthetic")
+
+    def parse(self, value, encoded=False, parser=None):
+        if encoded:
+            value = base64.b64encode(value.encode("utf-8")).decode()
+        return (parser or self.new)(dict(InstanceId="synthetic", Output=value), "synthetic")
+
+    def test_unicode_surroundings_plain_and_base64_same_key(self):
+        value = "বুট চলছে ☃ ──\r\n" + self.console + "\nশেষ ✅"
+        with self.assertRaises(UnicodeEncodeError):
+            self.parse(value, parser=self.old)
+        for encoded in (False, True):
+            self.assertEqual(self.parse(value, encoded), self.expected)
+
+    def test_ascii_plain_base64_and_fingerprint_unchanged(self):
+        for text in (
+            self.console,
+            "boot\n" + self.console + "done",
+            self.console.replace("\n", "\r\n"),
+        ):
+            for encoded in (False, True):
+                self.assertEqual(self.parse(text, encoded), self.parse(text, encoded, self.old))
+
+    def test_exact_utf8_byte_cap_then_one_byte_over(self):
+        remaining = diagnostic.MAX_CONSOLE - len(self.console.encode())
+        value = "é" * (remaining // 2) + "x" * (remaining % 2) + self.console
+        self.assertEqual(len(value.encode()), diagnostic.MAX_CONSOLE)
+        self.assertEqual(self.parse(value), self.expected)
+        with self.assertRaises(ValueError):
+            self.parse(value + "x")
+
+    def test_character_cap_before_encoding_and_base64_cap(self):
+        for value in (
+            "x" * (diagnostic.MAX_CONSOLE + 1),
+            "é" * diagnostic.MAX_CONSOLE,
+            "A" * (diagnostic.MAX_CONSOLE + 1),
+        ):
+            with self.assertRaises(ValueError):
+                self.parse(value)
+
+    def test_strict_identity_and_output_type(self):
+        for reply in (
+            dict(InstanceId="other", Output=self.console),
+            dict(InstanceId="synthetic", Output=None),
+            dict(InstanceId="synthetic", Output=self.console.encode()),
+        ):
+            with self.assertRaises(ValueError):
+                self.new(reply, "synthetic")
+
+    def test_missing_duplicate_markers(self):
+        start, end = diagnostic.START.decode(), diagnostic.END.decode()
+        for value in (
+            "",
+            self.console * 2,
+            self.console.replace(start, ""),
+            self.console.replace(end, ""),
+        ):
+            for encoded in (False, True):
+                with self.assertRaises(ValueError):
+                    self.parse(value, encoded)
+
+    def test_existing_marker_order_behavior_not_silently_changed(self):
+        # The predecessor checks cardinality, not order. Preserve that separate
+        # contract here; this encoding-only repair does not claim to fix it.
+        end = diagnostic.END.decode()
+        value = end + "\n" + self.console.replace(end, "")
+        for encoded in (False, True):
+            self.assertEqual(self.parse(value, encoded), self.parse(value, encoded, self.old))
+
+    def test_single_ed25519_still_required(self):
+        for value in (
+            self.console.replace("ssh-ed25519 ", "ssh-rsa "),
+            self.console.replace("ssh-ed25519 " + self.key, "ssh-ed25519 " + self.key + " a b"),
+            self.console.replace(
+                diagnostic.END.decode(), "ssh-ed25519 " + self.key + "\n" + diagnostic.END.decode()
+            ),
+        ):
+            for encoded in (False, True):
+                with self.assertRaises(ValueError):
+                    self.parse(value, encoded)
+
+    def test_invalid_key_base64_shape_and_unicode_rejected(self):
+        for key in (
+            "!",
+            "é",
+            base64.b64encode(b"x" * 51).decode(),
+            base64.b64encode(b"x" * 50).decode(),
+        ):
+            for encoded in (False, True):
+                with self.assertRaises(ValueError):
+                    self.parse(self.console.replace(self.key, key), encoded)
+
+    def test_invalid_outer_base64_or_surrogate_rejected(self):
+        for value in ("not base64 !", "é", "\ud800" + self.console):
+            with self.assertRaises(ValueError):
+                self.parse(value)
+
+    def test_only_representation_prefix_changed(self):
+        old = self.original.decode()
+        new = self.patched.decode()
+        tail = "    need(len(raw) <= MAX_CONSOLE)\n    # AWS CLI versions"
+        self.assertEqual(old.split(tail, 1)[1], new.split(tail, 1)[1])
+        self.assertEqual(
+            old.split('    raw = reply["Output"].encode("ascii")')[0], new.split("    # SDK/CLI")[0]
+        )
+
+    def test_evidence_and_source_hash_drift_rejected(self):
+        for name in ("PROOF_SHA", "SOURCE_SHA"):
+            with patch.object(m, name, "0" * 64), self.assertRaises(ValueError):
+                m.build()
+
+    def test_exclusive_fragment_no_live_authority(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(m, "OUTPUT", Path(tmp).resolve() / "fragment"),
+        ):
+            report = m.prepare()
+            self.assertFalse(report["execution_permitted"])
+            self.assertFalse(report["cpu_retry"])
+            body = (m.OUTPUT / m.NAME).read_bytes()
+            self.assertEqual(body, self.patched)
+            self.assertEqual(report["outputs"][m.NAME]["sha256"], hashlib.sha256(body).hexdigest())
+            self.assertEqual(json.loads((m.OUTPUT / "release.json").read_bytes()), report)
+            with self.assertRaises(ValueError):
+                m.prepare()
+        self.assertEqual(m.read(m.SOURCE, m.SOURCE_SHA), self.original)
+
+
+if __name__ == "__main__":
+    unittest.main()

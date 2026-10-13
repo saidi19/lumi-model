@@ -1,0 +1,104 @@
+# SFT execution status v0.72
+
+2026-09-10. **The no-retry coordinator and private-package wiring are implemented;
+the complete tiny CPU chain passes. Gate 5 and the real 4B import are not complete.**
+This is the next bounded software stage after v0.71, not a new data-policy gate.
+No real weights, trainer/tokenizer payloads or datasets were opened. No network,
+GPU, inference, training, instance action, dependency installation, GitHub push
+or CI run was initiated. All changes remain local.
+
+## What finished
+
+The new `posttraining_checkpoint_import_runner_v1.py` ties the already implemented
+planner, inventory verifier and CPU kernel to the new
+`posttraining_checkpoint_package_v1.py`. The executable entry is **tiny synthetic
+only**: it requires the explicit fixture flag, independent base-file pin and
+fixed scale caps. `run_import` rejects real execution before parsing or I/O;
+approval booleans cannot unlock it.
+
+The integrated order is:
+
+1. Validate the pinned metadata, strict limits, single-main-thread condition and
+   disjoint private paths, including physical aliases.
+2. Exclusively consume a fresh attempt directory; write the STARTED marker and
+   exact source config. An existing or partially created attempt cannot retry.
+3. Audit the complete checkpoint and original normalized tokenizer inventory.
+4. Execute the actual CPU DCP-to-HF kernel with logical write reservations and
+   cooperative budget callbacks.
+5. Copy the three tokenizer files byte-for-byte under their original `tokenizer/`
+   paths; create the private receipt and closed checksum manifest. Verify those
+   with the **unchanged frozen worker checksum consumer** through bounded reads.
+6. Repeat both complete input audits, compare observed identities, and return the
+   result only after the provisional completion write and final deadline check.
+
+Failed reservations are not refunded. Failure output contains only fixed stage
+and error codes; partial new outputs remain consumed. A COMPLETE file alone is
+not authority: its final fsync/close or a subsequent deadline check can fail, and
+even FAILED may be unwritable. Success requires the returned outcome and an
+independent successful parent supervisor. This exact late-failure case is tested.
+
+Packaging uses pinned no-symlink directory descriptors, closed inventories and
+at most 1 MiB content reads/writes. Read-only 0400 tokenizer sources are accepted;
+private output files must be 0600. Tokenizer values are not deserialized. Package
+read accounting includes the real worker consumer, including its two manifest
+reads. Successful finalization content reads are
+`3 * backend_bytes + 3 * tokenizer_bytes + 2 * receipt_bytes + 3 * manifest_bytes`;
+source audits and native kernel reads are separate.
+
+Review fixes include physical alias rejection, copied caller limits, strict
+integer/tied-alias checks, exact safetensors names, a bounded manifest parser that
+supports more than 128 rows, and descriptor cleanup on fchmod/parent-close failure.
+No previous parser, dataset, rights, worker, plan or kernel file was changed.
+
+## Verification completed
+
+**255 distinct tests pass in this stage's targeted suites**, with zero failures
+or skips. This is not a full-repository test claim or a replacement for v0.71's
+separate 282-test scope.
+
+- 195 stdlib tests on Python 3.11.15, 3.13.7 and 3.14.6: respectively 0.612s,
+  0.606s and 0.616s test time. These cover the planner, inventory stream, original
+  final-base metadata and v2 coordinator regressions plus the new modules.
+- 60 genuine tiny CPU tests: 0.565s test time / 2.609s supervised wall time under a
+  60s parent subprocess timeout. These include four new full-chain tests, 38 v3
+  kernel tests, one previous integration test and 17 unchanged v2 native tests.
+- There are 67 new tests: 17 coordinator, 46 package and four native integration.
+  They cover successful packaging, source mutation rejection, consumed-attempt
+  rejection and non-authority after a late completion-write failure.
+- Exact Ruff E,F,I,B,UP, py311, line length 100 passes on all five new code/test
+  files. Existing DCP/platform deprecation warnings remain visible.
+
+Evidence: `evidence/lumi-4b-sft-import-coordinator-v0.1.json`.
+Structural verification:
+`evidence/lumi-4b-sft-import-coordinator-verification-v0.1.json`.
+The verification binds all five new code/test files, four predecessor/worker
+files, and the predecessor report's 15 transitive bindings. It checks count
+arithmetic and false execution claims, not real model payloads.
+
+## What still blocks real import
+
+Logical byte reservations and cooperative callbacks are **not** OS-enforced
+native DCP/HF/mmap read, RAM, disk-write, network or blocked-syscall limits. The
+parent timeout bounds the trusted tiny test process, not hostile detached child
+processes. Main-thread admission is not a process/container isolation proof.
+Two audits detect observed mutations; they do not make an atomic snapshot.
+Packaging hashes model output but does not independently connect safetensors
+bytes to the kernel's tensor digest: a trusted, quiescent kernel-to-package
+handoff is still required. Receipts prove neither origin nor real-base import.
+
+The next existing dependency is **native host/resource admission**: integrate the
+native I/O and Linux RAM/write/runtime guards, bind the exact dedicated runtime
+and immutable input set, then qualify that path before an explicitly bounded
+real import. No suitable real execution target has been admitted; `run_import`
+therefore remains closed. No GPU is needed for this remaining importer software
+work. The base remains our step-76,294 / 80B-token S3-backed pretraining checkpoint;
+no base selection changed.
+
+The downstream GPU worker/profile mismatch (FSDP/4096 versus the current worker's
+DDP/4095 limit), actual data relocation and CUDA/smoke requirements remain as in
+v0.70. They have not been skipped or silently marked complete. Training and
+production eligibility remain false.
+
+HEAD remains `ecc545fc423650bf1089311915290523c10b3172`; tracked and staged diffs
+are unchanged. This stage created only the two new modules, three test files,
+the new report/structural verification and this status successor.

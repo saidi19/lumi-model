@@ -1,0 +1,191 @@
+"""Fresh local identity plus verified diagnostics. No cloud or execution authority."""
+
+import ast
+import json
+import os
+import re
+import types
+
+from scripts.prepare_sft_vm_cidr_successor_v1 import LIMIT, ROOT, encode, need, read, sha
+
+NEW = "ad7b734ba7894916b25d795ac3dab31c"
+PREVIOUS = "9b87f7f591a240ef8b10f46b8d008fa0"
+OUTPUT = "artifacts/lumi-vm-attempt-011-source-v0.1"
+CIDR = "172.31.96.64/27"
+BUILDERS = {
+    "scripts/prepare_sft_vm_attempt010_v1.py": (
+        "5b883aa2e38e130e0e287a7a235a49be96d4a4376a082dce660a69f631ca57d5"
+    ),
+    "scripts/prepare_sft_vm_diagnostics_candidate_v1.py": (
+        "a367f768cc703c2e89189033a6c337499b5c8b9428370f277b86b1e5d4ee7570"
+    ),
+}
+PROOFS = {
+    "evidence/lumi-vm-attempt-010-endpoint-cleanup-verification-v0.1.json": (
+        "83dd28e106431e27014c50fb6a63ea733e5eaf629c573bdcdc403e744d1bedff"
+    ),
+    "evidence/lumi-vm-attempt-010-retained-network-observation-v0.1.json": (
+        "144bc4dc8500da0042591ddcf1719ebe444c76896558f265a02f94cac485ca40"
+    ),
+    "evidence/lumi-vm-diagnostics-candidate-verification-v0.1.json": (
+        "2585db46bb33575cd79f08d87ea06affe2c5561399b84268cb0006e709d4723d"
+    ),
+}
+
+
+def load(name, replacements=()):
+    raw = read(ROOT / name, BUILDERS[name])
+    for old, new in replacements:
+        need(old.encode() in raw)
+        raw = raw.replace(old.encode(), new.encode())
+    ast.parse(raw)
+    module = types.ModuleType("_attempt011_" + name.split("/")[-1][:-3])
+    module.__file__ = str(ROOT / name)
+    exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def evidence():
+    proofs = {}
+    for name, digest in PROOFS.items():
+        value = json.loads(read(ROOT / name, digest))
+        proofs[name] = value
+        for source, pin in value["source_bindings"].items():
+            need(not source.startswith("/") and ".." not in source.split("/"))
+            if isinstance(pin, str):
+                read(ROOT / source, pin)
+            else:
+                read(ROOT / source, pin["sha256"], pin["bytes"])
+    cleanup = proofs[next(n for n in proofs if "endpoint-cleanup" in n)]
+    need(cleanup["result"]["cleanup_verified"] is True)
+    need(cleanup["result"]["total_delete_dispatches"] == 1)
+    observation = proofs[next(n for n in proofs if "retained-network" in n)]
+    need(
+        observation["retained_network"]["observed_first_nonoverlapping_27_within_172_31_96_0_24"]
+        == CIDR
+    )
+    return cleanup
+
+
+def rebind_cidr(original):
+    seeds = dict(original)
+    for name, count in (
+        ("configs/lumi-vm-private-network-plan-v0.1.json", 1),
+        ("scripts/run_sft_vm_private_network_v1.py", 2),
+        ("scripts/run_sft_vm_private_outer_v7.py", 1),
+    ):
+        # Outer gate may refer to plan rather than a literal; count verified below.
+        actual = seeds[name].count(b"172.31.96.32/27")
+        if name.endswith("outer_v7.py"):
+            need(actual == 0)
+            continue
+        need(actual == count)
+        seeds[name] = seeds[name].replace(b"172.31.96.32/27", CIDR.encode())
+    current = dict(seeds)
+    for _ in range(64):
+        mapping = {sha(raw): sha(current[n]) for n, raw in original.items()}
+        following = {}
+        for name, raw in seeds.items():
+            if name.endswith((".py", ".json")) and not name.startswith("evidence/"):
+                raw = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda m, mapping=mapping: mapping.get(m[0].decode(), m[0].decode()).encode(),
+                    raw,
+                )
+            following[name] = raw
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("attempt011_cidr_hash_cycle")
+    for name, raw in original.items():
+        if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+            need(current[name] == raw)
+    return current
+
+
+def build():
+    cleanup = evidence()
+    base = load(
+        "scripts/prepare_sft_vm_attempt010_v1.py",
+        (
+            (PREVIOUS, NEW),
+            ("attempt-010", "attempt-011"),
+            ("Attempt-010", "Attempt-011"),
+            ("attempt010", "attempt011"),
+            ("v0.10", "v0.11"),
+        ),
+    )
+    files, ancillary, identity_report = base.build()
+    baseline = rebind_cidr(files)
+    diagnostics = load("scripts/prepare_sft_vm_diagnostics_candidate_v1.py")
+    _, donors = diagnostics.inputs()  # Verify all frozen source, donor and proof pins.
+    diagnostics.inputs = lambda: (baseline, donors)
+    final, diag_report = diagnostics.build()
+    need(len(final) == 147 and NEW != PREVIOUS)
+    for name, raw in final.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name.startswith("scripts/"):
+            need(PREVIOUS.encode() not in raw)
+    report = identity_report | dict(
+        schema="lumi.vm-attempt011-source.v0.1",
+        attempt=NEW,
+        attempt_label="attempt-011",
+        operational_predecessor=PREVIOUS,
+        outputs=base.pins(final),
+        ancillary=base.pins(ancillary),
+        builder_bindings=BUILDERS,
+        evidence_bindings=PROOFS,
+        source_identity_consumed=False,
+        consumed_execution_renewed=False,
+        fresh_operational_identity_bound=True,
+        proposed_private_subnet_cidr=CIDR,
+        new_cidr_live_rechecked=False,
+        cidr_reserved=False,
+        diagnostics_integrated=True,
+        diagnostics_logical_changes=diag_report["logical_changes"],
+        preserved_predecessor=cleanup["preserved"],
+        ancestor_builder_bindings=identity_report["builder_bindings"],
+        composition_manifest_scope=(
+            "Identity-only composition before CIDR/diagnostic integration; "
+            "this release manifest binds final outputs."
+        ),
+        deployment_plan_bound=False,
+        execution_entry_bound=False,
+        execution_permitted=False,
+        gate_5_complete=False,
+        real_4b_import=False,
+        gpu=False,
+        training=False,
+        remaining=[
+            "Bind deployment/entry to this release without changing limits or assuming authority.",
+            "Fresh identity/CIDR/quota admission and explicitly authorized new inert controls.",
+            "Separately authorized one-shot CPU attempt. Existing attempt-010 remains consumed.",
+        ],
+    )
+    return final, ancillary, report, baseline
+
+
+def prepare():
+    files, ancillary, report, _ = build()
+    outputs = files | ancillary | {"release.json": encode(report)}
+    need(sum(map(len, outputs.values())) < LIMIT)
+    destination = ROOT / OUTPUT
+    need(
+        not destination.exists()
+        and not any(p.is_symlink() for p in (destination, *destination.parents))
+    )
+    destination.mkdir(mode=0o700)
+    for name, raw in sorted(outputs.items()):
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("fresh_local_source_is_not_execution_authority")

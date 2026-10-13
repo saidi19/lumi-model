@@ -1,0 +1,333 @@
+import ast
+import copy
+import datetime as dt
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import tempfile
+import time
+import types
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests.test_sft_vm_watchdog_report_channel_v1 import module
+
+with patch("socket.has_ipv6", False):
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import RefreshableCredentials
+
+auth = module("sft_vm_watchdog_login_refresh_v1")
+m = module("execute_sft_vm_watchdog_object_v2")
+old = module("execute_sft_vm_watchdog_object_v1")
+channel = module("sft_vm_watchdog_report_channel_v1")
+builder = module("prepare_sft_vm_watchdog_object_v2")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def metadata(seconds=900, key="AKIASYNTHETIC00000000"):
+    return dict(
+        access_key=key,
+        secret_key="SYNTHETIC_SECRET",
+        token="SYNTHETIC_TOKEN",
+        expiry_time=(dt.datetime.now(dt.UTC) + dt.timedelta(seconds=seconds)).isoformat(),
+    )
+
+
+def provider(seconds=900, callback=None):
+    return RefreshableCredentials.create_from_metadata(
+        metadata(seconds),
+        refresh_using=callback or Mock(side_effect=AssertionError("unexpected_refresh")),
+        method="synthetic",
+        advisory_timeout=180,
+        mandatory_timeout=180,
+    )
+
+
+def exported(value=None):
+    value = value or metadata()
+    raw = json.dumps(
+        dict(
+            Version=1,
+            AccessKeyId=value["access_key"],
+            SecretAccessKey=value["secret_key"],
+            SessionToken=value["token"],
+            Expiration=value["expiry_time"],
+        )
+    ).encode()
+    return types.SimpleNamespace(returncode=0, stdout=raw, stderr=b"")
+
+
+def identity(account=auth.ACCOUNT, arn="arn:aws:iam::573978149073:user/synthetic"):
+    return {"Account": account, "Arn": arn}
+
+
+class RefreshTests(unittest.TestCase):
+    def test_realistic_fifteen_minute_export_is_accepted_without_lifetime_fiction(self):
+        client = Mock()
+        client.get_caller_identity.return_value = identity()
+        with (
+            patch.object(auth.subprocess, "run", return_value=exported()) as run,
+            patch.object(auth, "static_client", return_value=client),
+        ):
+            reader = auth.Reader(time.monotonic() + 1800)
+            value = reader()
+        self.assertGreater(auth.expiry(value) - time.time(), 890)
+        self.assertLessEqual(auth.expiry(value) - time.time(), 900)
+        self.assertNotIn("SYNTHETIC_SECRET", repr(run.call_args))
+        self.assertEqual(reader.calls, 1)
+        client.close.assert_called_once()
+
+    def test_old_forty_minute_static_check_rejects_same_valid_fixture(self):
+        with (
+            patch.object(old.subprocess, "run", return_value=exported()),
+            self.assertRaises(ValueError),
+        ):
+            old.credentials()
+
+    def test_invalid_export_expired_or_wrong_type_is_rejected(self):
+        valid = json.loads(exported().stdout)
+        variants = [
+            dict(valid, Version=True),
+            dict(valid, SessionToken=""),
+            dict(valid, Expiration="bad-date"),
+            dict(valid, Expiration=dt.datetime.now(dt.UTC).isoformat()),
+        ]
+        for value in variants:
+            with (
+                self.subTest(value_type=type(value)),
+                patch.object(
+                    auth.subprocess,
+                    "run",
+                    return_value=types.SimpleNamespace(
+                        returncode=0, stdout=json.dumps(value).encode(), stderr=b""
+                    ),
+                ),
+                patch.object(auth, "static_client") as client,
+                self.assertRaises(ValueError),
+            ):
+                auth.Reader(time.monotonic() + 1800)()
+            client.assert_not_called()
+
+    def test_export_error_and_timeout_never_expose_exception_or_stderr(self):
+        for kwargs in (
+            {"side_effect": RuntimeError("PRIVATE_SENTINEL")},
+            {
+                "return_value": types.SimpleNamespace(
+                    returncode=255, stdout=b"", stderr=b"PRIVATE_SENTINEL"
+                )
+            },
+        ):
+            with (
+                patch.object(auth.subprocess, "run", **kwargs),
+                self.assertRaisesRegex(ValueError, "^login_refresh_failed$"),
+            ):
+                auth.Reader(time.monotonic() + 1800)()
+
+    def test_account_or_principal_switch_blocks_new_generation(self):
+        for second in (identity(account="000000000000"), identity(arn="changed-principal")):
+            client = Mock()
+            client.get_caller_identity.side_effect = [identity(), second]
+            reader = auth.Reader(time.monotonic() + 1800)
+            with (
+                patch.object(auth.subprocess, "run", return_value=exported()),
+                patch.object(auth, "static_client", return_value=client),
+            ):
+                reader()
+                with self.assertRaises(ValueError):
+                    reader()
+            self.assertEqual(client.close.call_count, 2)
+
+    def test_export_count_and_deadline_bound_refresh(self):
+        for reader in (auth.Reader(time.monotonic()), auth.Reader(time.monotonic() + 1800)):
+            if reader.deadline > time.monotonic():
+                reader.calls = 8
+            with patch.object(auth.subprocess, "run") as run, self.assertRaises(ValueError):
+                reader()
+            run.assert_not_called()
+
+    def test_cached_credential_waits_before_attempt_until_cli_refresh_window(self):
+        now, mono = time.time(), time.monotonic()
+        clock = [now, mono]
+        first = metadata(500)
+        second = metadata(1110)  # 900 seconds remaining after the ~210-second wait.
+        reader = Mock(side_effect=[first, second])
+
+        def sleep(seconds):
+            self.assertLessEqual(seconds, 15)
+            clock[0] += seconds
+            clock[1] += seconds
+
+        with (
+            patch.object(auth, "Reader", return_value=reader),
+            patch.object(auth.time, "time", side_effect=lambda: clock[0]),
+            patch.object(auth.time, "monotonic", side_effect=lambda: clock[1]),
+            patch.object(auth.time, "sleep", side_effect=sleep),
+            redirect_stdout(io.StringIO()),
+        ):
+            result = auth.credentials(deadline=mono + 1800)
+        self.assertEqual(reader.call_count, 2)
+        self.assertGreater(result._expiry_time.timestamp() - clock[0], 899)
+        self.assertLess(clock[1] - mono, 211)
+
+    def test_fresh_login_needs_no_wait_and_uses_same_refresh_provider_for_clients(self):
+        with (
+            patch.object(auth, "Reader", return_value=Mock(return_value=metadata())),
+            patch.object(auth.time, "sleep") as sleep,
+        ):
+            value = auth.credentials(deadline=time.monotonic() + 1800)
+        sleep.assert_not_called()
+        supplied = auth.clients(value)
+        try:
+            for service, client in supplied.items():
+                self.assertIs(client._request_signer._credentials, value)
+                self.assertEqual(
+                    client.meta.endpoint_url, f"https://{service}.us-east-1.amazonaws.com"
+                )
+                self.assertEqual(client.meta.config.retries["total_max_attempts"], 1)
+                self.assertEqual(client.meta.config.proxies, {})
+        finally:
+            for client in supplied.values():
+                client.close()
+
+    def test_sdk_refreshes_signing_key_before_expiry_without_replaying_operation(self):
+        callback = Mock(return_value=metadata(1700, "AKIASYNTHETIC11111111"))
+        value = provider(callback=callback)
+        supplied = auth.clients(value)
+        try:
+            value._time_fetcher = lambda: dt.datetime.now(dt.UTC) + dt.timedelta(seconds=800)
+            request = AWSRequest(
+                method="POST",
+                url="https://ec2.us-east-1.amazonaws.com/",
+                data=b"Action=DescribeInstances&Version=2016-11-15",
+            )
+            supplied["ec2"]._request_signer.sign("DescribeInstances", request)
+            self.assertIn("AKIASYNTHETIC11111111/", request.headers["Authorization"])
+            callback.assert_called_once()
+        finally:
+            for client in supplied.values():
+                client.close()
+
+    def test_failed_mandatory_refresh_blocks_signing_no_stale_fallback(self):
+        value = provider(callback=Mock(side_effect=ValueError("synthetic_refresh_failure")))
+        value._time_fetcher = lambda: dt.datetime.now(dt.UTC) + dt.timedelta(seconds=800)
+        with self.assertRaises(ValueError):
+            value.get_frozen_credentials()
+
+    def test_urls_keep_original_credential_expiry_after_controller_refresh(self):
+        callback = Mock(return_value=metadata(1700, "AKIASYNTHETIC11111111"))
+        value = provider(seconds=780, callback=callback)
+        supplied = auth.clients(value)
+        try:
+            expected = value._expiry_time.timestamp()
+            urls, deadline = auth.issue(
+                supplied["s3"], channel=channel, attempt="a" * 32, bindings=builder.BINDINGS
+            )
+            before = copy.deepcopy(urls)
+            self.assertEqual(deadline, expected)
+            value._time_fetcher = lambda: dt.datetime.now(dt.UTC) + dt.timedelta(seconds=700)
+            value.get_frozen_credentials()
+            self.assertGreater(value._expiry_time.timestamp(), deadline)
+            self.assertEqual(urls, before)
+            self.assertEqual(deadline, expected)
+            self.assertTrue(all("AKIASYNTHETIC00000000" in u for u in urls["puts"].values()))
+        finally:
+            for client in supplied.values():
+                client.close()
+
+    def test_signing_with_insufficient_report_window_rejected_before_package(self):
+        value = provider(seconds=650)
+        supplied = auth.clients(value)
+        try:
+            with self.assertRaises(ValueError), patch.object(channel, "issue") as issue:
+                auth.issue(
+                    supplied["s3"], channel=channel, attempt="a" * 32, bindings=builder.BINDINGS
+                )
+            issue.assert_not_called()
+        finally:
+            for client in supplied.values():
+                client.close()
+
+    def test_all_resource_bounds_and_noncredential_lifecycle_methods_are_unchanged(self):
+        self.assertEqual(old.BOUNDS, m.BOUNDS)
+
+        def methods(module):
+            tree = ast.parse(Path(module.__file__).read_text())
+            cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Attempt")
+            return {
+                f.name: ast.dump(f)
+                for f in cls.body
+                if isinstance(f, ast.FunctionDef) and f.name != "execute"
+            }
+
+        self.assertEqual(methods(old), methods(m))
+        self.assertEqual(old.load("prepare_sft_vm_watchdog_object_v1.py").PINS, builder.PINS)
+
+    def test_readiness_failure_does_not_claim_output_or_authorize_any_cloud_attempt(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(m, "OUT", Path(directory) / "unused"),
+            patch.object(m, "validate_approval", return_value="synthetic"),
+            patch.object(m, "credentials", side_effect=ValueError("synthetic")),
+            patch.object(m, "Evidence") as evidence,
+            patch.object(m.resource, "setrlimit"),
+            patch.object(m.os, "umask"),
+            patch.object(m.logging, "disable"),
+            patch.object(m.sys, "argv", ["controller", "--execute-approved-once"]),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(m.main(), 1)
+        evidence.assert_not_called()
+
+    def test_lossless_packing_preserves_all_guest_sources_and_configuration(self):
+        supplied = auth.clients(provider())
+        try:
+            config, _ = auth.issue(
+                supplied["s3"], channel=channel, attempt="a" * 32, bindings=builder.BINDINGS
+            )
+            original = old.load("prepare_sft_vm_watchdog_object_v1.py")
+            first, _ = original.build(config)
+            packed, summary = builder.build(config)
+            before = json.loads(gzip.decompress(first).split(b"\n", 1)[1])
+            after = json.loads(gzip.decompress(packed).split(b"\n", 1)[1])
+            old_files = {v["path"]: v for v in before.pop("write_files")}
+            new_files = {v["path"]: v for v in after.pop("write_files")}
+            self.assertEqual(before, after)
+            self.assertEqual(old_files, new_files)
+            self.assertLess(len(packed), len(first))
+            self.assertLessEqual(len(packed), 16384)
+            self.assertEqual(summary["compressed_sha256"], hashlib.sha256(packed).hexdigest())
+        finally:
+            for client in supplied.values():
+                client.close()
+
+
+# Re-run the previous 31 lifecycle cases against v2 without changing old tests.
+# This isolated module keeps its globals independent of the original test suite.
+spec = importlib.util.spec_from_file_location(
+    "_v2_lifecycle_fixtures", ROOT / "tests/test_sft_vm_watchdog_object_controller_v1.py"
+)
+fixtures = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixtures)
+fixtures.m = m
+fixtures.builder = builder
+
+
+class RefreshedControllerLifecycleTests(fixtures.ObjectControllerTests):
+    @classmethod
+    def setUpClass(cls):
+        cls.clients = auth.clients(provider())
+
+    def test_credentials_require_temporary_session_and_enough_lifetime(self):
+        # Supersedes only the incompatible 40-minute/one-hour synthetic fixture.
+        self.assertGreater(
+            self.clients["s3"]._request_signer._credentials._expiry_time.timestamp() - time.time(),
+            720,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

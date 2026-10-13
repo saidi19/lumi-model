@@ -1,0 +1,90 @@
+"""Kernel outcomes are synthetic; no AWS or processes are executed."""
+
+import ast
+import signal
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_cleanup_absence_repair_v1 as m
+
+
+class Failure(Exception):
+    pass
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = m.build()
+        fn = next(
+            n for n in ast.parse(cls.source).body if getattr(n, "name", None) == "pipe_exchange"
+        )
+        body = next(n.finalbody for n in fn.body if isinstance(n, ast.Try) and n.finalbody)
+        cls.code = compile(ast.Module(body=body, type_ignores=[]), "<cleanup>", "exec")
+
+    def execute(self, outcomes, *, exit_kind="zero", returncode=0, close_error=False):
+        process, kernel = Mock(), Mock()
+        process.pid = 12345
+        process.returncode = returncode
+        kernel.killpg.side_effect = outcomes
+        if close_error:
+            process.stdout.close.side_effect = OSError("synthetic")
+        ns = dict(process=process, os=kernel, signal=signal, exit_kind=exit_kind,
+                  remote_stage="none", ExchangeFailure=Failure)
+        try:
+            exec(self.code, ns)
+            error = None
+        except Failure as failure:
+            error = failure.args[0]
+        process.wait.assert_called_once_with(timeout=2)
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
+        return error, kernel.killpg.call_args_list
+
+    def test_successful_exit_then_kernel_absence(self):
+        error, calls = self.execute([PermissionError(1, "denied"), ProcessLookupError(3, "gone")])
+        self.assertIsNone(error)
+        self.assertEqual([c.args for c in calls], [(12345, signal.SIGKILL), (12345, 0)])
+
+    def test_live_or_ambiguous_group_stays_failed(self):
+        for result in (None, PermissionError(1, "denied"), OSError(5, "io"),
+                       ProcessLookupError(999, "unexpected")):
+            with self.subTest(result=type(result).__name__):
+                error, _ = self.execute([PermissionError(1, "denied"), result])
+                self.assertEqual(error, "cleanup_kill_permission")
+
+    def test_no_reconciliation_for_unsuccessful_or_unreaped_leader(self):
+        for kind, code in (("exit_255", 255), ("none", None), ("zero", None), ("zero", 1)):
+            error, calls = self.execute([PermissionError(1, "denied")],
+                                        exit_kind=kind, returncode=code)
+            self.assertEqual(error, "cleanup_kill_permission")
+            self.assertEqual(len(calls), 1)
+
+    def test_other_permission_errno_not_accepted(self):
+        error, calls = self.execute([PermissionError(13, "denied")])
+        self.assertEqual(error, "cleanup_kill_permission")
+        self.assertEqual(len(calls), 1)
+
+    def test_pipe_failure_still_rejects_after_verified_absence(self):
+        error, _ = self.execute([PermissionError(1, "denied"), ProcessLookupError(3, "gone")],
+                                close_error=True)
+        self.assertEqual(error, "cleanup_stdout")
+
+    def test_normal_cleanup_paths_unchanged(self):
+        for result in (None, ProcessLookupError(3, "gone")):
+            error, calls = self.execute([result])
+            self.assertIsNone(error)
+            self.assertEqual(len(calls), 1)
+
+    def test_only_permission_branch_changed(self):
+        self.assertEqual(self.source.replace(m.AFTER, m.BEFORE), m.SOURCE.read_text())
+
+    def test_no_live_authority_and_tamper_rejected(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "SOURCE_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.build()
+
+
+if __name__ == "__main__":
+    unittest.main()

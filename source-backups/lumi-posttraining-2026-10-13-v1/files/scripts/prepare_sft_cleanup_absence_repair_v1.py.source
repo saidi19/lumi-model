@@ -1,0 +1,52 @@
+"""Offline candidate: accept EPERM only after successful exit and kernel ESRCH."""
+
+import ast
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / (
+    "artifacts/lumi-vm-attempt-016-source-v0.1/scripts/run_sft_vm_detached_delivery_v1.py"
+)
+SOURCE_SHA = "bf696cf3463c96cd3418ab60231fd501424e57bb3bc87a65c97f9f67436cda03"
+PROOF = ROOT / "evidence/lumi-ssh-cleanup-permission-reproduction-v0.5.json"
+PROOF_SHA = "6181a53f8a0d92798aefa824dca0a4624ee9a3ea7dbd418dcdea4fa2b4f313b7"
+BEFORE = '''        except PermissionError:
+            cleanup_stage = "cleanup_kill_permission"'''
+AFTER = '''        except PermissionError as error:
+            cleanup_stage = "cleanup_kill_permission"
+            # A process-list snapshot is not proof. Probe the kernel once,
+            # without sending a signal; all ambiguous/live states stay failed.
+            if error.errno == 1 and exit_kind == "zero" and process.returncode == 0:
+                try:
+                    os.killpg(process.pid, 0)
+                except ProcessLookupError as absent:
+                    if absent.errno == 3:
+                        cleanup_stage = None
+                except BaseException:
+                    pass'''
+
+
+def build():
+    raw = SOURCE.read_bytes()
+    proof_raw = PROOF.read_bytes()
+    if (hashlib.sha256(raw).hexdigest() != SOURCE_SHA
+            or hashlib.sha256(proof_raw).hexdigest() != PROOF_SHA):
+        raise ValueError("source_or_evidence_changed")
+    proof = json.loads(proof_raw)
+    for name, digest in proof["source_sha256"].items():
+        if hashlib.sha256((ROOT / name).read_bytes()).hexdigest() != digest:
+            raise ValueError("evidence_binding_changed")
+    if not proof["reconciliation"]["disposable_resources_removed"]:
+        raise ValueError("cleanup_not_verified")
+    source = raw.decode()
+    if source.count(BEFORE) != 1:
+        raise ValueError("unexpected_source")
+    result = source.replace(BEFORE, AFTER)
+    ast.parse(result)
+    return result
+
+
+def run(**_kwargs):
+    raise ValueError("offline_candidate_not_execution_authority")

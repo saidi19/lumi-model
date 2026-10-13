@@ -1,0 +1,48 @@
+"""Fresh deployment metadata remains inert, bounded, and source-pinned."""
+
+import copy
+import json
+import unittest
+
+from scripts import prepare_sft_vm_deployment_bindings_v2 as m
+
+
+class Tests(unittest.TestCase):
+    def test_new_scope_and_prior_limits(self):
+        plan, _ = m.build()
+        self.assertEqual(plan["attempt"], m.ATTEMPT)
+        self.assertNotIn(m.PREVIOUS, json.dumps(plan))
+        scope = plan["cpu_scope_reference"]
+        self.assertEqual(scope["instance_type"], "r6i.4xlarge")
+        self.assertEqual(scope["maximum_instance_seconds"], 14400)
+        self.assertEqual(scope["shared_controller_seconds"], 18000)
+        self.assertIn(m.ATTEMPT, scope["retention"]["prefix"])
+        self.assertTrue(scope["output"].endswith("v0.10/attempt-010"))
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_watchdog_inert_and_approval_pending(self):
+        p, a = m.build()
+        w = p["watchdog"]
+        self.assertEqual(w["function"], "lumi-stop-" + m.ATTEMPT)
+        self.assertEqual(w["reserved_concurrency"], 0)
+        self.assertFalse(w["invocation_allowed"] or w["schedule_creation_allowed"])
+        self.assertEqual(a["approved_execution_count"], 0)
+        self.assertIsNone(a["human_message"])
+        self.assertFalse(a["cleanup_policy_write_approved"] or a["cpu_execution_approved"])
+
+    def test_changed_plan_rejected(self):
+        p, _ = m.build()
+        p = copy.deepcopy(p)
+        p["cpu_scope_reference"]["maximum_instance_seconds"] += 1
+        with self.assertRaises(ValueError):
+            m.bound_builder().validate_plan(p)
+
+    def test_policy_fragments_only_deny_no_live_write(self):
+        p, _ = m.build()
+        c = p["cleanup_store"]
+        self.assertEqual(len(c["deny_statements"]), 4)
+        self.assertTrue(all(x["Effect"] == "Deny" for x in c["deny_statements"]))
+        self.assertFalse(c["live_policy_write"] or c["standalone_policy_document"])
+        self.assertEqual(c["new_allows"], 0)
+        with self.assertRaises(ValueError):
+            m.run()

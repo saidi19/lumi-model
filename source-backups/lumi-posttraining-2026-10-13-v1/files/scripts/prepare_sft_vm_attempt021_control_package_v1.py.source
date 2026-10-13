@@ -1,0 +1,320 @@
+"""Offline fresh control package after verified source transfer and endpoint cleanup.
+
+Only new binding constants, evidence gates and proposals are generated. The
+qualified watchdog/bucket deployment mechanics and their budgets are unchanged.
+No approvals, SDK clients, resource deployments or CPU execution are created.
+"""
+
+import ast
+import importlib.util
+import json
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt021_controls_v1 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "fa693cab783af2384f1f4a633ff6911c87efb0a5c2c0956d254b7193a4cd0015"
+BASE_PLAN = "artifacts/lumi-vm-attempt-021-control-plan-v0.1/plan.json"
+BASE_PLAN_SHA = "dde30fcd32f58e16e2c1ef8f3ce814474204830380bcacc17dff23b4123fc6d8"
+ABSENCE = previous.ABSENCE
+ABSENCE_SHA = "fec629a24fd057924d1ae03e45eb36bd07235c12238891f3c09e9fe59bee2770"
+CLEANUP = "evidence/lumi-vm-attempt-020-endpoint-cleanup-verification-v0.1.json"
+CLEANUP_SHA = "f31909ef2432bf2d9e73dc2567341e7b450450b52f85a82a1d9cb03f03ba5300"
+PLAN_DIR = "artifacts/lumi-vm-attempt-021-control-plan-v0.2"
+HELPER = "scripts/prepare_sft_vm_attempt021_deployment_bindings_v1.py"
+WATCH = "scripts/execute_sft_vm_inert_watchdog_v14.py"
+BUCKET = "scripts/sft_vm_dedicated_cleanup_bucket_v12.py"
+WATCH_TEST = "tests/test_sft_vm_inert_watchdog_v14.py"
+BUCKET_TEST = "tests/test_sft_vm_dedicated_cleanup_bucket_v12.py"
+WATCH_PROPOSAL = "configs/lumi-vm-attempt-021-watchdog-execution-proposal-v0.1.json"
+BUCKET_PROPOSAL = "configs/lumi-vm-attempt-021-cleanup-bucket-proposal-v0.1.json"
+OUTPUT = "artifacts/lumi-vm-attempt-021-control-package-v0.1/release.json"
+PINS = {
+    "scripts/prepare_sft_vm_deployment_bindings_v21.py": (
+        "2edc65d2a7e476fd206758aa9afbb3c3c6608fb8970c53fa7a8e057481be14f5"
+    ),
+    "scripts/execute_sft_vm_inert_watchdog_v13.py": (
+        "927329abb83f7b59f39d486d81f77b3ca8d9473fc413a2f10a7b4f2051e61d3c"
+    ),
+    "scripts/sft_vm_dedicated_cleanup_bucket_v11.py": (
+        "43352490e179943e258b43c124194e37b37045a78fada130f937cb5e084690ca"
+    ),
+    "tests/test_sft_vm_inert_watchdog_v13.py": (
+        "23a9db38a7f7b00c860aaa74fa8b81dfb0ae6c49cf5933a012064504ecf9e6ef"
+    ),
+    "tests/test_sft_vm_dedicated_cleanup_bucket_v11.py": (
+        "e813505c82015febfe3565321397a8a57dd0bc59f3c15d11e8dd561814899f10"
+    ),
+}
+need, sha, encode, read, write_new = (
+    previous.need,
+    previous.sha,
+    previous.encode,
+    previous.read,
+    previous.write_new,
+)
+
+
+def build_plan():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    need(encode(previous.fresh_plan()) == read(BASE_PLAN, BASE_PLAN_SHA))
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    absence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    cleanup = json.loads(read(CLEANUP, CLEANUP_SHA))
+    for name, digest in absence["source_bindings"].items():
+        read(name, digest)
+    for name, digest in cleanup["source_bindings"].items():
+        read(name, digest)
+    observations = absence["observations"]
+    counts = {
+        "selected_cidr_subnets",
+        "attempt_instance_connect_endpoints",
+        "attempt_tagged_instances",
+        "attempt_key_pairs",
+        "attempt_security_groups",
+    }
+    need(absence["attempt"] == previous.ATTEMPT and observations["selected_cidr"] == previous.CIDR)
+    need(all(type(observations[k]) is int and observations[k] == 0 for k in counts))
+    need(all(v is False for k, v in observations.items() if k.endswith("_exists")))
+    need(absence["collision_free_for_control_preparation"] is True)
+    need(absence["cloud_mutations"] == absence["object_access"] == absence["instance_actions"] == 0)
+    need(absence["frozen_vpc_endpoint_gate_passed"] is False)  # Preserve that old failed gate.
+    need(cleanup["status"] == "endpoint_removed_preserved_resources_verified")
+    need(cleanup["attempt"] == previous.OLD and cleanup["endpoint_interface_absent"] is True)
+    need(cleanup["delete_dispatches"] == 1 and cleanup["retry"] is False)
+    need(cleanup["preserved"]["pre_and_post_checks_passed"] is True)
+    need(cleanup["preserved"]["buckets_and_watchdogs_not_mutated"] is True)
+    need([row["endpoint"] for row in absence["blocking_vpc_endpoints"]] == [cleanup["endpoint"]])
+    plan.update(
+        schema="lumi.vm-attempt-021-control-plan.v0.2",
+        status="control_package_prepared_separate_deployment_approval_required",
+        network_candidate_live_availability_verified=True,
+        control_target_absence_evidence=dict(path=ABSENCE, sha256=ABSENCE_SHA),
+        predecessor_endpoint_cleanup=dict(path=CLEANUP, sha256=CLEANUP_SHA),
+        network_candidate_verification_scope="Historical exact-CIDR absence only; fresh full "
+        "network selection, quota and admission are required.",
+        frozen_endpoint_gate_clearance=dict(
+            observed_by_cleanup=True,
+            historical_blocked_scan_preserved=True,
+            fresh_full_network_admission_passed=False,
+        ),
+    )
+    plan["readiness_review"].update(
+        decision="fresh_watchdog_and_cleanup_bucket_deployment_approval_required",
+        risk="Native setup transfer and predecessor endpoint removal are proved. Fresh inert "
+        "controls, full CPU/network admission, acquisition and real import remain unproved.",
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Deploy and verify fresh unarmed watchdog under exact bounded approval.",
+        "Create and verify fresh dedicated private cleanup bucket under exact bounded approval.",
+        "Prepare and pass fresh read-only CPU, network, store and watchdog admission.",
+        "Bind and approve the final one-shot CPU import/private-retention proposal.",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    need(plan["required_control_proofs"] == [] and plan["successful_readonly_preflight"] is None)
+    return plan
+
+
+def helper_source(plan_sha, release_sha):
+    raw = read(
+        "scripts/prepare_sft_vm_deployment_bindings_v21.py",
+        PINS["scripts/prepare_sft_vm_deployment_bindings_v21.py"],
+    )
+    raw = previous.rewrite(raw)
+    values = {
+        "OLD": previous.OLD,
+        "RELEASE_SHA": previous.RELEASE_SHA,
+        "SOURCE_PROOF": previous.SOURCE_PROOF,
+        "SOURCE_PROOF_SHA": previous.SOURCE_PROOF_SHA,
+        "ABSENCE": ABSENCE,
+        "ABSENCE_SHA": ABSENCE_SHA,
+        "PLAN_SHA": plan_sha,
+        "PLAN_RELEASE_SHA": release_sha,
+    }
+    for name, value in values.items():
+        tree = ast.parse(raw)
+        row = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        lines = raw.splitlines(keepends=True)
+        lines[row.lineno - 1 : row.end_lineno] = [f"{name} = {value!r}\n".encode()]
+        raw = b"".join(lines)
+    # Existing build(), safe read and closed public entry are reused verbatim.
+    start, end = raw.index(b"def verify():"), raw.index(b"\ndef build():")
+    verification = f"""def verify():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    absence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    cleanup = json.loads(read(
+        {CLEANUP!r},
+        {CLEANUP_SHA!r}))
+    transfer = json.loads(read(
+        {previous.TRANSFER!r},
+        {previous.TRANSFER_SHA!r}))
+    need(manifest["attempt"] == ATTEMPT and manifest["operational_predecessor"] == OLD)
+    need(manifest["receipt_file_count"] == 19 and len(manifest["outputs"]) == 156)
+    need(manifest["execution_permitted"] is False)
+    need(proof["attempt"] == ATTEMPT and proof["source_release_sha256"] == RELEASE_SHA)
+    need(proof["receipt_contract"]["sender_and_receiver_full_receipts_equal"] is True)
+    need(proof["new_execution_authorized"] is False)
+    need(absence["attempt"] == ATTEMPT and absence["collision_free_for_control_preparation"])
+    need(absence["cloud_mutations"] == 0)
+    need(absence["predecessor_retention"]["instance_state"] == "stopped")
+    need(cleanup["status"] == "endpoint_removed_preserved_resources_verified")
+    need(cleanup["attempt"] == OLD and cleanup["endpoint_interface_absent"] is True)
+    need(cleanup["preserved"]["pre_and_post_checks_passed"] is True)
+    need(transfer["status"] == "source_only_native_transfer_passed")
+    need(transfer["full_receipt_matches"] and transfer["native_19_files_readback_verified"])
+    need(plan_release["attempt"] == ATTEMPT and plan_release["plan_sha256"] == PLAN_SHA)
+    need(plan_release["source_release_sha256"] == RELEASE_SHA)
+    need(plan_release["control_target_absence_sha256"] == ABSENCE_SHA)
+    need(plan_release["endpoint_cleanup_sha256"] ==
+         {CLEANUP_SHA!r})
+    need(plan_release["fresh_control_deployment_required"] is True)
+    need(plan_release["execution_permitted"] is False)
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    return manifest
+
+""".encode()
+    return raw[:start] + verification + raw[end:]
+
+
+def replacement(raw, before, after):
+    need(before.encode() in raw)
+    return raw.replace(before.encode(), after.encode())
+
+
+def control_source(name, helper_sha, plan_sha):
+    raw = previous.rewrite(read(name, PINS[name]))
+    raw = replacement(raw, "prepare_sft_vm_deployment_bindings_v21.py", Path(HELPER).name)
+    raw = replacement(raw, PINS["scripts/prepare_sft_vm_deployment_bindings_v21.py"], helper_sha)
+    raw = replacement(
+        raw, "6e3a355033b684f11900bf189d17b06e6cb5fe3c43dccfa021015d47f4439ee4", plan_sha
+    )
+    return raw
+
+
+def load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def prepare():
+    outputs = [
+        PLAN_DIR + "/plan.json",
+        PLAN_DIR + "/release.json",
+        HELPER,
+        WATCH,
+        BUCKET,
+        WATCH_TEST,
+        BUCKET_TEST,
+        WATCH_PROPOSAL,
+        BUCKET_PROPOSAL,
+        OUTPUT,
+    ]
+    need(all(not (ROOT / name).exists() for name in outputs))
+    plan = build_plan()
+    raw = encode(plan)
+    plan_sha = sha(raw)
+    release = dict(
+        schema="lumi.vm-attempt-021-control-plan-release.v0.2",
+        attempt=previous.ATTEMPT,
+        plan_sha256=plan_sha,
+        plan_bytes=len(raw),
+        source_release_sha256=previous.RELEASE_SHA,
+        control_target_absence_sha256=ABSENCE_SHA,
+        endpoint_cleanup_sha256=CLEANUP_SHA,
+        native_transfer_verification_sha256=previous.TRANSFER_SHA,
+        fresh_control_deployment_required=True,
+        execution_permitted=False,
+    )
+    release_raw = encode(release)
+    helper = helper_source(plan_sha, sha(release_raw))
+    watch = control_source("scripts/execute_sft_vm_inert_watchdog_v13.py", sha(helper), plan_sha)
+    bucket = control_source("scripts/sft_vm_dedicated_cleanup_bucket_v11.py", sha(helper), plan_sha)
+    tests = []
+    for origin, destination in (
+        ("tests/test_sft_vm_inert_watchdog_v13.py", WATCH_TEST),
+        ("tests/test_sft_vm_dedicated_cleanup_bucket_v11.py", BUCKET_TEST),
+    ):
+        body = previous.rewrite(read(origin, PINS[origin]))
+        body = body.replace(
+            b"execute_sft_vm_inert_watchdog_v13", b"execute_sft_vm_inert_watchdog_v14"
+        )
+        body = body.replace(
+            b"sft_vm_dedicated_cleanup_bucket_v11", b"sft_vm_dedicated_cleanup_bucket_v12"
+        )
+        # Check the actual predecessor identity, not the older fixture identity.
+        body = body.replace(b"c7124d8fb1a244798d7e41b7b5dfad61", previous.OLD.encode())
+        tests.append((destination, body))
+    bodies = [
+        (PLAN_DIR + "/plan.json", raw),
+        (PLAN_DIR + "/release.json", release_raw),
+        (HELPER, helper),
+        (WATCH, watch),
+        (BUCKET, bucket),
+        *tests,
+    ]
+    for name, body in bodies:
+        if name.endswith(".py"):
+            compile(body, name, "exec")
+    (ROOT / PLAN_DIR).mkdir(mode=0o700)
+    for name, body in bodies:
+        write_new(name, body)
+    watch_module = load_module("_prepared_watchdog21", WATCH)
+    bucket_module = load_module("_prepared_cleanup21", BUCKET)
+    watch_module.sources()
+    bucket_module.sources()
+    for path, module in ((WATCH_PROPOSAL, watch_module), (BUCKET_PROPOSAL, bucket_module)):
+        proposal = module.encode(module.expected_proposal())
+        write_new(path, proposal)
+        bodies.append((path, proposal))
+    directory = (ROOT / OUTPUT).parent
+    directory.mkdir(mode=0o700)
+    record = dict(
+        schema="lumi.vm-attempt021-control-package-release.v0.1",
+        attempt=previous.ATTEMPT,
+        status="prepared_not_authorized",
+        plan_sha256=plan_sha,
+        helper_sha256=sha(helper),
+        endpoint_cleanup_sha256=CLEANUP_SHA,
+        native_setup_transfer_sha256=previous.TRANSFER_SHA,
+        outputs={name: dict(sha256=sha(body), bytes=len(body)) for name, body in bodies},
+        qualified_deployment_mechanics_unchanged=True,
+        prior_evidence_preserved=True,
+        aws_calls=0,
+        cloud_mutations=0,
+        approvals_created=False,
+        control_deployments_created=False,
+        cpu_launch_authorized=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    write_new(OUTPUT, encode(record))
+    return record
+
+
+def run(**_arguments):
+    raise ValueError("local_preparation_not_deployment_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--prepare-once"])
+    result = prepare()
+    print(
+        json.dumps(
+            {k: result[k] for k in ("status", "plan_sha256", "helper_sha256", "aws_calls")},
+            sort_keys=True,
+        )
+    )

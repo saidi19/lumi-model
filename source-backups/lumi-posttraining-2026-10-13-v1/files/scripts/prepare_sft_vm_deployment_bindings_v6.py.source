@@ -1,0 +1,130 @@
+"""Attempt-013 local plan and future control-evidence checks. Never deploys."""
+
+import ast
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "d8664931c4984fe4a3121d2632af88a8"
+OLD = "58907eb20ec649a7bc340a144541ee32"
+BUCKET = "lumi-cleanup-" + ATTEMPT
+RELEASE = "artifacts/lumi-vm-attempt-013-source-v0.1"
+RELEASE_SHA = "b8c4a274eaabe214eb677a8469ef53dabf9d419da9a666e55f20d431d78c6158"
+OLD_PLAN = "configs/lumi-vm-attempt-012-deployment-plan-v0.1.json"
+OLD_PLAN_SHA = "26977427e36f9ab09237954160e6c796722b6376e0561fac78afc5cbc784c196"
+INSPECTION = "evidence/lumi-vm-attempt-012-endpoint-cleanup-verification-v0.1.json"
+INSPECTION_SHA = "43f7eb150fe7308ec5afd331cd616f50af96d2891412ced6cb12f0db7d74c1dd"
+WATCH = "evidence/lumi-vm-attempt-013-inert-watchdog-deployment-verification-v0.1.json"
+STORE = "evidence/lumi-vm-attempt-013-cleanup-bucket-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt013_binding_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verify():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    need(manifest["attempt"] == ATTEMPT and manifest["operational_predecessor"] == OLD)
+    need(manifest["execution_permitted"] is False and manifest["old_timer_reused"] is False)
+    need(len(manifest["outputs"]) == 156)
+    total = 0
+    for name, pin in manifest["outputs"].items():
+        total += len(read(RELEASE + "/" + name, pin["sha256"], pin["bytes"]))
+    need(total < 32 * 1024**2)
+    proof = json.loads(read(INSPECTION, INSPECTION_SHA))
+    need(proof["result"]["cleanup_verified"] is True)
+    need(proof["result"]["delete_dispatches"] == 1)
+    for name, pin in proof["source_bindings"].items():
+        read(name, pin["sha256"], pin["bytes"])
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(OLD_PLAN, OLD_PLAN_SHA).replace(OLD.encode(), ATTEMPT.encode()))
+    plan.update(
+        schema="lumi.vm-attempt-013-deployment-plan.v0.1",
+        release_manifest_sha256=RELEASE_SHA,
+        integration_report_sha256=INSPECTION_SHA,
+    )
+    plan["source_bindings"] = {
+        RELEASE + "/" + name.removeprefix("artifacts/lumi-vm-attempt-012-source-v0.1/"): manifest[
+            "outputs"
+        ][name.removeprefix("artifacts/lumi-vm-attempt-012-source-v0.1/")]
+        for name in plan["source_bindings"]
+    }
+    plan["cpu_scope_reference"]["output"] = (
+        "artifacts/lumi-vm-private-outer-execution-v0.14/attempt-013"
+    )
+    watch = plan["watchdog"]
+    watch["deployment_output"] = "artifacts/lumi-vm-attempt-013-watchdog-deployment-v0.1"
+    tree = ast.parse(read(RELEASE + "/scripts/arm_sft_vm_external_watchdog_v2.py"))
+    watch["expected_code_sha256_base64"] = next(
+        n.value.value
+        for n in tree.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == "CODE"
+    )
+    plan["required_control_proofs"] = [WATCH, STORE]
+    plan["host_key_repair"] = dict(
+        unicode_and_marker_order_corrected=True, current_stopped_host_console_verified=True
+    )
+    plan["network_candidate_cidr"] = "172.31.96.96/27"
+    plan["network_candidate_live_availability_verified"] = False
+    return plan
+
+
+def controls():
+    """Called only when assembling/checking a future explicit CPU approval."""
+    plan = build()
+    results, pins = [], {}
+    for name in (WATCH, STORE):
+        raw = read(name)
+        value = json.loads(raw)
+        need(value["attempt"] == ATTEMPT)
+        bindings = value["source_bindings"]
+        need(bindings[RELEASE + "/release.json"]["sha256"] == RELEASE_SHA)
+        for source, pin in bindings.items():
+            read(source, pin["sha256"], pin["bytes"])
+        pins[name] = sha(raw)
+        results.append(value)
+    watch, store = results
+    need(watch["status"] == "verified_deployed_unarmed_invocation_disabled")
+    deployment = watch["result"]["deployment"]
+    need(
+        deployment["unarmed_verified"] is True
+        and deployment["invocation_disabled_verified"] is True
+    )
+    need(deployment["code_sha256"] == plan["watchdog"]["expected_code_sha256_base64"])
+    need(store["status"] == "verified_private_cleanup_bucket_created")
+    need(store["storage"]["bucket"] == BUCKET)
+    need(store["storage"]["prefix"] == plan["cleanup_store"]["prefix"])
+    need(store["result"]["privacy_readback_verified"] is True)
+    return pins
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

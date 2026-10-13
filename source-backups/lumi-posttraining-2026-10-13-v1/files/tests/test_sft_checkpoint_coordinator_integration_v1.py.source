@@ -1,0 +1,212 @@
+"""Generated tiny DCP through the entire coordinator, without kernel doubles.
+
+Only the Linux host-runtime gate is replaced on this local test host. Planning,
+envelope validation, source checks, conversion, packaging, both input audits,
+accounting and completion records execute normally. No real payload is used.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_runner_v4 as runner
+from lumi.posttraining_checkpoint_io_contract_v1 import build_kernel_io_contract
+from lumi.posttraining_final_base_metadata_v1 import canonical, json_object, sha
+from tests import test_sft_checkpoint_import_runner_v3 as control_fixtures
+from tests import test_sft_checkpoint_import_torch_v3 as fixtures
+from tests.test_sft_checkpoint_import_runner_v2 import fixture_kernel_contract, seal_fixture
+from tests.test_sft_checkpoint_vm_loader_v1 import COLD_SETUP, ROOT
+
+
+class CoordinatorIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.CheckpointImportTorchTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.CheckpointImportTorchTests.tearDownClass()
+
+    def setUp(self):
+        self.f = fixtures.CheckpointImportTorchTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        for owner, name in ((self.f.model_class, "forward"),
+                            (self.f.torch.optim.AdamW, "step"),
+                            (socket.socket, "connect"), (socket.socket, "connect_ex"),
+                            (socket, "getaddrinfo")):
+            self.enterContext(patch.object(owner, name, side_effect=AssertionError("forbidden")))
+        from lumi.posttraining_checkpoint_import_torch_v5 import MODEL_FIELDS
+
+        config = self.f.config_class(**self.f.payload)
+        self.f.payload = {name: getattr(config, name) for name in MODEL_FIELDS}
+        self.f.payload["model_type"] = "lumi"
+        self.f.config_path.write_bytes(canonical(self.f.payload))
+        self.f._checkpoint()
+        self.f.checkpoint_path.chmod(0o700)
+        self.tokens = self.f.root / "coordinator-tokens"
+        self.tokens.mkdir(mode=0o700)
+        self.metadata = seal_fixture(self.f.checkpoint_path, self.tokens,
+                                     config_raw=self.f.config_path.read_bytes())
+        self.plan = runner.frozen.build_import_plan(
+            *self.metadata, expected_base_sha256=sha(self.metadata[0]), dtype="bfloat16")
+        rows = []
+        for name in ("configuration_lumi.py", "modeling_lumi.py"):
+            raw = Path(runner.__file__).with_name(name).read_bytes()
+            rows.append({"path": name, "bytes": len(raw), "sha256": sha(raw)})
+        builder = types.SimpleNamespace(plan=self.plan, metadata=self.metadata,
+                                        source_rows=rows,
+                                        source_bytes=sum(row["bytes"] for row in rows))
+        self.envelope, self.contract = control_fixtures.RunnerTests.bound_resource_inputs(builder)
+        # The control-only fixture uses the analytical minimum, not a measured
+        # serializer cap. Reuse the existing genuine-tiny fixture's 8-MiB cap:
+        # DCP's repeated/seek reads are additional to the on-disk inventory.
+        dcp = fixture_kernel_contract(self.metadata)["checkpoint_read_contract"]
+        delta = dcp["maximum_read_bytes"] - self.envelope["dcp_read_cap_bytes"]
+        self.envelope["dcp_read_cap_bytes"] += delta
+        self.envelope["dcp_payload_read_cap_bytes"] += delta
+        self.envelope["coordinator_read_cap_bytes"] += delta
+        self.contract = build_kernel_io_contract(self.plan, checkpoint_read_contract=dcp,
+                                                hf_io_contract=self.contract["hf_io_contract"])
+        self.attempt = self.f.root / "coordinator-attempt"
+        self.arguments = {
+            "metadata": self.metadata, "expected_base_sha256": sha(self.metadata[0]),
+            "plan_raw": canonical(self.plan),
+            "expected_plan_file_sha256": sha(canonical(self.plan)),
+            "envelope_raw": canonical(self.envelope),
+            "expected_envelope_file_sha256": sha(canonical(self.envelope)),
+            "checkpoint_root": self.f.checkpoint_path, "tokenizer_root": self.tokens,
+            "attempt": self.attempt, "kernel_io_contract": self.contract,
+            "expected_kernel_io_contract_sha256": self.contract["contract_sha256"],
+        }
+        self.before = self.input_hashes()
+
+    def input_hashes(self):
+        return {
+            (label, path.relative_to(root).as_posix()): sha(path.read_bytes())
+            for label, root in (("checkpoint", self.f.checkpoint_path), ("tokens", self.tokens))
+            for path in root.rglob("*") if path.is_file()
+        }
+
+    def run_core(self):
+        with patch.object(runner, "_runtime"):
+            return runner._coordinate_admitted_import(**self.arguments)
+
+    def test_actual_kernel_package_audits_accounting_and_completion(self):
+        result = self.run_core()
+        self.assertEqual(result["status"], "PASS_import_coordinator_requires_parent_verification")
+        self.assertEqual(result["full_input_audits_completed"], 2)
+        self.assertTrue(result["observed_input_identities_unchanged"])
+        self.assertTrue(result["package"]["real_worker_checksum_verifier_passed"])
+        self.assertEqual(result["coordinator_read_bytes_reserved"],
+                         self.envelope["coordinator_read_cap_bytes"])
+        self.assertLessEqual(result["private_write_bytes_reserved"],
+                             self.envelope["private_write_cap_bytes"])
+        account = result["content_accounting"]
+        self.assertLessEqual(account["successful_content_read_bytes_requested"],
+                             result["coordinator_read_bytes_reserved"])
+        self.assertEqual(json_object((self.attempt / runner.COMPLETE).read_bytes()), result)
+        self.assertFalse((self.attempt / runner.FAILED).exists())
+        self.assertEqual(self.input_hashes(), self.before)
+        for flag in ("real_4b_import", "training_authorized", "production_eligible",
+                     "os_memory_write_limits_enforced", "hard_timeout_enforced_here"):
+            self.assertIs(result[flag], False)
+
+    def test_multiple_shards_with_real_package_and_independent_checksum_consumer(self):
+        contract = build_kernel_io_contract(
+            self.plan, checkpoint_read_contract=self.contract["checkpoint_read_contract"],
+            hf_io_contract=self.contract["hf_io_contract"] | {"target_shard_bytes": 512})
+        self.arguments.update(kernel_io_contract=contract,
+                              expected_kernel_io_contract_sha256=contract["contract_sha256"])
+        result = self.run_core()
+        output = self.attempt / "checkpoint"
+        self.assertGreater(len(list(output.glob("*.safetensors"))), 1)
+        from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+
+        manifest = result["package"]["manifest_file_sha256"]
+        self.assertEqual(_verify_checksum_manifest(output, expected_manifest_sha256=manifest,
+            require_exact_inventory=True, require_private=True), manifest)
+        self.assertEqual(self.input_hashes(), self.before)
+
+    def test_generated_input_corruption_fails_and_attempt_cannot_be_reused(self):
+        source = self.f.checkpoint_path / "model/__0_0.distcp"
+        raw = source.read_bytes()
+        source.write_bytes(raw[:-1] + bytes([raw[-1] ^ 1]))
+        with self.assertRaisesRegex(runner.ImportRunnerError, "^kernel_failed$"):
+            self.run_core()
+        self.assertFalse((self.attempt / runner.COMPLETE).exists())
+        failed = (self.attempt / runner.FAILED).read_bytes()
+        self.assertEqual(json_object(failed)["code"], "kernel_failed")
+        marker = (self.attempt / runner.STARTED).read_bytes()
+        with self.assertRaisesRegex(runner.ImportRunnerError, "^attempt_exists_no_retry$"):
+            self.run_core()
+        self.assertEqual((self.attempt / runner.FAILED).read_bytes(), failed)
+        self.assertEqual((self.attempt / runner.STARTED).read_bytes(), marker)
+
+    def test_cold_loader_then_genuine_coordinator_without_eager_ml_registration(self):
+        encoded = dict(self.arguments)
+        encoded["metadata"] = [raw.hex() for raw in self.metadata]
+        for key in ("plan_raw", "envelope_raw"):
+            encoded[key] = encoded[key].hex()
+        for key in ("checkpoint_root", "tokenizer_root", "attempt"):
+            encoded[key] = str(encoded[key])
+        body = r'''
+import socket
+from unittest.mock import patch
+args = json.loads(sys.stdin.buffer.read(131073))
+args['metadata'] = tuple(bytes.fromhex(raw) for raw in args['metadata'])
+for key in ('plan_raw','envelope_raw'):
+    args[key] = bytes.fromhex(args[key])
+for key in ('checkpoint_root','tokenizer_root','attempt'):
+    args[key] = Path(args[key])
+coordinator = loader.load_coordinator()
+assert not any(n.split('.')[0] in loader.ML_ROOTS for n in sys.modules)
+assert not hasattr(sys.modules['lumi'], 'register_lumi')
+def forbidden(*args, **kwargs):
+    raise AssertionError('forbidden generated-test operation')
+for owner, name in ((socket.socket,'connect'),(socket.socket,'connect_ex'),
+                    (socket,'getaddrinfo'),(subprocess,'Popen')):
+    setattr(owner,name,forbidden)
+def no_training(frame, event, arg):
+    if event == 'call':
+        code = frame.f_code
+        assert not (code.co_name == 'forward' and code.co_filename.endswith('modeling_lumi.py'))
+        assert not (code.co_name == 'step' and '/torch/optim/' in code.co_filename)
+sys.setprofile(no_training)
+# This local generated-only test is not native host admission. No conversion,
+# packaging, parser, source/audit or accounting component is substituted.
+with patch.object(coordinator, '_runtime') as host_gate:
+    result = coordinator._coordinate_admitted_import(**args)
+    host_gate.assert_called_once_with()
+sys.setprofile(None)
+assert 'torch' in sys.modules
+assert result['package']['real_worker_checksum_verifier_passed']
+assert result['full_input_audits_completed'] == 2
+assert not result['real_4b_import'] and not result['training_authorized']
+print(json.dumps({'cold_chain_passed':True, 'full_input_audits':2}))
+'''
+        # stdlib subprocess is loaded before it is disabled in the fresh child.
+        code = COLD_SETUP + "\nimport subprocess\n" + body
+        raw = canonical(encoded)
+        self.assertLessEqual(len(raw), 131072)
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT)],
+            input=raw, capture_output=True, timeout=30, check=False,
+            env=os.environ | {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+                "HF_HUB_DISABLE_TELEMETRY": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+                "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(json.loads(result.stdout),
+                         {"cold_chain_passed": True, "full_input_audits": 2})
+        self.assertEqual(self.input_hashes(), self.before)
+
+
+if __name__ == "__main__":
+    unittest.main()

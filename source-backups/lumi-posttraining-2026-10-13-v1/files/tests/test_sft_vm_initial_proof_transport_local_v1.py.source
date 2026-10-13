@@ -1,0 +1,100 @@
+"""Real local pipes/process cleanup, synthetic bytes only; never SSH or AWS."""
+
+import ast
+import hashlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-initial-proof-integration-v0.1"
+RELEASE_SHA = "e0c8263fbe69dd1608166065b210d471c1c088e8531c2459562ca8d99dc18463"
+CASES = {
+    "success": 'import sys;sys.stdout.buffer.write(b"synthetic-proof")',
+    "body": "import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())",
+    "remote": (
+        'import sys;sys.stdout.write(\'{"schema":"lumi.initial-proof-failure.v1",'
+        '"code":"guard_proof"}\');sys.exit(2)'
+    ),
+    "transport": "import sys;sys.exit(255)",
+    "oversize": 'import sys;sys.stdout.buffer.write(b"x"*4097)',
+    "timeout": "import time;time.sleep(2)",
+}
+
+
+def guard(event, args):
+    if event.startswith("socket."):
+        raise RuntimeError("network_forbidden")
+    if event == "subprocess.Popen":
+        executable, argv = args[:2]
+        if not (
+            executable == sys.executable
+            and len(argv) == 5
+            and argv[:4] == [sys.executable, "-I", "-B", "-c"]
+            and argv[4] in CASES.values()
+        ):
+            raise RuntimeError("non_synthetic_process_forbidden")
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        raw = (RELEASE / "release.json").read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == RELEASE_SHA
+        manifest = json.loads(raw)
+        name = "scripts/run_sft_vm_detached_delivery_v1.py"
+        body = (RELEASE / name).read_bytes()
+        assert hashlib.sha256(body).hexdigest() == manifest["outputs"][name]["sha256"]
+        names = {
+            "MAX_REPLY",
+            "EXCHANGE_STAGES",
+            "EXIT_KINDS",
+            "REMOTE_STAGES",
+            "ExchangeFailure",
+            "exchange_diagnostic",
+            "remote_failure_stage",
+            "pipe_exchange",
+        }
+        nodes = []
+        for node in ast.parse(body).body:
+            if getattr(node, "name", None) in names or (
+                isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id in names for t in node.targets)
+            ):
+                nodes.append(node)
+        cls.module = types.ModuleType("synthetic_transport")
+        for name in ("json", "os", "selectors", "signal", "subprocess", "time"):
+            cls.module.__dict__[name] = __import__(name)
+        exec(
+            compile(ast.Module(body=nodes, type_ignores=[]), "<bound-transport>", "exec"),
+            cls.module.__dict__,
+        )
+
+    def test_real_local_process_matrix(self):
+        for case, source in CASES.items():
+            with self.subTest(case=case):
+                argv = [sys.executable, "-I", "-B", "-c", source]
+                payload = b"synthetic-input" if case == "body" else b""
+                if case in {"success", "body"}:
+                    result = self.module.pipe_exchange(argv, payload, 3)
+                    self.assertEqual(result, payload if case == "body" else b"synthetic-proof")
+                else:
+                    with self.assertRaises(self.module.ExchangeFailure) as caught:
+                        self.module.pipe_exchange(argv, payload, 0.1 if case == "timeout" else 3)
+                    value = self.module.exchange_diagnostic(caught.exception)
+                    expected = {"remote": "exit", "transport": "exit", "oversize": "reply_limit"}
+                    if case == "timeout":
+                        self.assertIn(value["exchange_stage"], {"deadline", "select"})
+                    else:
+                        self.assertEqual(value["exchange_stage"], expected[case])
+                    if case == "remote":
+                        self.assertEqual(value["remote_stage"], "guard_proof")
+                    if case == "transport":
+                        self.assertEqual(value["exit_kind"], "exit_255")
+
+
+if __name__ == "__main__":
+    sys.addaudithook(guard)
+    unittest.main()

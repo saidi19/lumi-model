@@ -1,0 +1,227 @@
+"""Prepare fresh attempt-021 controls locally; never deploy or launch.
+
+Reuse qualified control implementations. Change only fresh identity, source/
+evidence bindings and the proven receipt repair. Keep all old evidence intact.
+"""
+
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt020_controls_v1 as old
+from scripts import verify_sft_vm_attempt021_source_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "07be75c955dc43fe8818192e8a9e3fc1"
+OLD = "3179537f150b45548946f8114e8b73ca"
+RELEASE = "artifacts/lumi-vm-attempt-021-source-v0.1"
+RELEASE_SHA = "5cc27a9dc616baff2138aa81bd0d85a3089a33863fdc20270c71f7b7b0319409"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-021-source-verification-v0.1.json"
+SOURCE_PROOF_SHA = "e229517116e979636fa818ac20c921f52151bb644a9c24ebc28262e25a4fef87"
+TRANSFER = "evidence/lumi-setup-transfer-result-verification-v0.1.json"
+TRANSFER_SHA = "8973f6c2b3b72211862563cbeaeb81a6bcf5524cd92c271fcd02c16cf580c6f2"
+FAILURE = "evidence/lumi-vm-attempt-020-v025-execution-verification-v0.1.json"
+FAILURE_SHA = "f18eae3048a52d319e6cf8c4d57e151be798f43a9505ce15af9ff3b4f92c42e1"
+CIDR = "172.31.97.64/27"
+BASE_PLAN = "artifacts/lumi-vm-attempt-020-control-plan-v0.1/plan.json"
+BASE_PLAN_SHA = "222b929849b9d1bb286d3935aaa3c1abb4354e4246d685abfb3fabd979c6bb12"
+PLAN_DIR = "artifacts/lumi-vm-attempt-021-control-plan-v0.1"
+ABSENCE = "evidence/lumi-vm-attempt-021-control-target-absence-v0.1.json"
+need, sha, encode, read = old.need, old.sha, old.encode, old.read
+
+
+def rewrite(raw):
+    for before, after in (
+        (OLD, ATTEMPT),
+        ("attempt-020", "attempt-021"),
+        ("attempt020", "attempt021"),
+        ("Attempt-020", "Attempt-021"),
+        ("172.31.97.32/27", CIDR),
+        ("lumi-vm-private-outer-execution-v0.25", "lumi-vm-private-outer-execution-v0.26"),
+    ):
+        raw = raw.replace(before.encode(), after.encode())
+    return raw
+
+
+def fresh_plan():
+    need(
+        sha(Path(source.__file__).read_bytes())
+        == "63d115f157bf9fcaee07744d0a23015d5420d5c8d7eb6fe08a1b529a5dcb8012"
+    )
+    source.verify()
+    base = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    transfer = json.loads(read(TRANSFER, TRANSFER_SHA))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    need(transfer["status"] == "source_only_native_transfer_passed")
+    need(transfer["full_receipt_matches"] is True and transfer["native_19_files_readback_verified"])
+    need(
+        all(
+            transfer["live_reconciliation"][key] is True
+            for key in (
+                "disposable_instance_terminated_live_verified",
+                "disposable_tagged_volumes_deleted_live_verified",
+                "retained_host_stopped_live_verified",
+                "both_retained_encrypted_volumes_preserved_live_verified",
+            )
+        )
+    )
+    need(failure["execution"]["instance_launches"] == 1 and failure["execution"]["retry"] is False)
+    plan = json.loads(rewrite(encode(base)))
+    historical = (
+        "host_key_repair",
+        "initial_proof_diagnostics",
+        "network_selector_correction_evidence",
+        "v021_launch_denial_evidence",
+        "v03_authentication_failure_evidence",
+    )
+    for name in historical:
+        plan[name] = base[name]
+    plan.update(
+        schema="lumi.vm-attempt-021-control-plan.v0.1",
+        attempt=ATTEMPT,
+        release_manifest_sha256=RELEASE_SHA,
+        source_preparation_evidence={"path": SOURCE_PROOF, "sha256": SOURCE_PROOF_SHA},
+        source_bindings={RELEASE + "/" + name: manifest["outputs"][name] for name in old.BINDINGS},
+    )
+    plan["watchdog"]["expected_code_sha256_base64"] = manifest["watchdog_code_sha256_base64"]
+    plan["predecessor_state"].update(
+        operational_predecessor_attempt=OLD,
+        execution_evidence=FAILURE,
+        execution_evidence_sha256=FAILURE_SHA,
+    )
+    plan["setup_transfer_native_qualification"] = {
+        "path": TRANSFER,
+        "sha256": TRANSFER_SHA,
+        "source_release_sha256": RELEASE_SHA,
+        "source_only": True,
+        "full_receipt_matches": True,
+        "files_readback_verified": 19,
+        "payload_bytes": 17061196,
+        "native_linux_and_ssh": True,
+        "fullsize_host_admitted": False,
+        "real_4b_import": False,
+    }
+    plan["source_repair"].update(
+        receipt_file_count_derived_from_manifest=True,
+        full_receipt_guard_before_remote_seed=True,
+        full_receipt_guard_before_paid_allocation=True,
+        native_parser_transport_and_caps_unchanged=True,
+    )
+    plan["readiness_review"].update(
+        confirmed_defect="Receiver produced 19 files; consumed sender hardcoded 18. "
+        "Fresh sender derives the count and checks the entire producer receipt.",
+        historical_uncertainty=[
+            "The exact predecessor remote failure cause is not proved.",
+            "Native setup transfer is proved, not fullsize import or admission.",
+        ],
+        risk="Fresh control targets, network/CPU admission, checkpoint acquisition and real import "
+        "remain unproved. The source-only Linux/SSH transfer qualification passed.",
+    )
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Read-only absence checks pass for the fresh attempt-021 identity, CIDR and controls.",
+        "Fresh inert watchdog and private cleanup bucket receive separate bounded approval.",
+        "Fresh read-only admission binds source and successful control evidence.",
+        "The final one-shot CPU proposal receives exact separate approval.",
+        "Immediate read-only admission includes all credential identity SDK reads.",
+    ]
+    plan["unresolved_before_live_execution"] = plan["readiness_review"][
+        "required_before_paid_execution"
+    ]
+    need(plan["required_control_proofs"] == [] and plan["successful_readonly_preflight"] is None)
+    need(plan["approval_record"] is None and plan["execution_permitted"] is False)
+    return plan
+
+
+def write_new(name, raw):
+    path = ROOT / name
+    need(not path.exists() and not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+
+
+def prepare():
+    plan = fresh_plan()
+    raw = encode(plan)
+    directory = ROOT / PLAN_DIR
+    need(not directory.exists())
+    directory.mkdir(mode=0o700)
+    write_new(PLAN_DIR + "/plan.json", raw)
+    release = dict(
+        schema="lumi.vm-attempt-021-control-plan-release.v0.1",
+        attempt=ATTEMPT,
+        plan_sha256=sha(raw),
+        plan_bytes=len(raw),
+        source_release_sha256=RELEASE_SHA,
+        native_transfer_verification_sha256=TRANSFER_SHA,
+        fresh_control_deployment_required=True,
+        execution_permitted=False,
+        cloud_mutations=0,
+        gate_5_complete=False,
+    )
+    write_new(PLAN_DIR + "/release.json", encode(release))
+    return release
+
+
+def make_inspector():
+    raw = read(
+        "scripts/inspect_sft_vm_attempt020_control_targets_v1.py",
+        "f119deab431bfad41cd265d2be4d05c53f3e917213b886882b737aeee354ecb2",
+    )
+    # Preserve all read dispatches, absence error handling and read budgets.
+    # Replace only the initial source/evidence gate for the successor schemas.
+    start = raw.index(b"    need(\n", raw.index(b"def inspect(cloud):"))
+    end = raw.index(b"    reads = Reads(cloud)", start)
+    gate = b"""    need(
+        plan["attempt"] == ATTEMPT
+        and plan["network_candidate_cidr"] == CIDR
+        and plan["network_candidate_live_availability_verified"] is False
+        and plan["control_target_absence_evidence"] is None
+        and plan["execution_permitted"] is False
+        and proof["attempt"] == ATTEMPT
+        and proof["receipt_contract"]["file_count"] == 19
+        and proof["new_execution_authorized"] is False
+        and predecessor["attempt"] == binding["attempt"]
+        and predecessor["execution"]["retry"] is False
+        and predecessor["live_verification"]["instance_state"] == "stopped"
+        and set(predecessor["live_verification"]["encrypted_retained_volumes"])
+        == {binding["root_volume"], binding["work_volume"]}
+    )
+"""
+    raw = rewrite(raw[:start] + gate + raw[end:])
+    changes = {
+        "222b929849b9d1bb286d3935aaa3c1abb4354e4246d685abfb3fabd979c6bb12": sha(
+            read(PLAN_DIR + "/plan.json")
+        ),
+        "evidence/lumi-vm-attempt-021-source-v0.1-verification-v0.1.json": SOURCE_PROOF,
+        "3ab64b48f419499a5cbf5d76edf0445c855577e8253bf98b22f2652a4c9f72e4": SOURCE_PROOF_SHA,
+        "evidence/lumi-vm-attempt-019-v024-execution-failure-verification-v0.1.json": FAILURE,
+        "50b72551632cefd5c1f2af9382def5bef025002bf58ef66cb6f805ab252e50fc": FAILURE_SHA,
+        (
+            "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019/"
+            "host/execution/host/binding.json"
+        ): (
+            "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/"
+            "host/execution/host/binding.json"
+        ),
+        "a4b7e7924c7a4e77acfb4b5b6ca645b66d25a61c8dcd175498062935cac3990f": (
+            "643d962d424b073536d2f871a835aeaf5e6a4ca2477598949c769b0a23302663"
+        ),
+    }
+    for before, after in changes.items():
+        need(before.encode() in raw)
+        raw = raw.replace(before.encode(), after.encode())
+    compile(raw, "inspect_sft_vm_attempt021_control_targets_v1.py", "exec")
+    write_new("scripts/inspect_sft_vm_attempt021_control_targets_v1.py", raw)
+    return sha(raw)
+
+
+def run(**_arguments):
+    raise ValueError("local_control_preparation_not_cloud_authority") from None
+
+
+if __name__ == "__main__":
+    result = prepare()
+    result["inspector_sha256"] = make_inspector()
+    print(json.dumps(result, sort_keys=True))

@@ -1,0 +1,53 @@
+"""CIDR-corrected bindings; real controls preserved, no CPU authority."""
+
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_cidr_bindings_v1 as builder
+
+ROOT = builder.ROOT
+need, sha, encode = builder.need, builder.sha, builder.encode
+ATTEMPT = 'afae7b4618174ce084fd3b6a902d74e1'
+OLD = '07be75c955dc43fe8818192e8a9e3fc1'
+BUCKET = 'lumi-cleanup-afae7b4618174ce084fd3b6a902d74e1'
+RELEASE = 'artifacts/lumi-vm-attempt-022-source-v0.2'
+RELEASE_SHA = '90596ec5852b0853b0240b0e2fa3fae8a779cb31ad0b5b8fb40612631cbaa2d9'
+PLAN = 'artifacts/lumi-vm-attempt-022-control-plan-v0.3/plan.json'
+PLAN_SHA = '56023384f73c0d6209c96ef088eabab725e6ea893208d3a5fc617f30667aa67a'
+PLAN_RELEASE = 'artifacts/lumi-vm-attempt-022-control-plan-v0.3/release.json'
+PLAN_RELEASE_SHA = '74f784d78036a58ec4eed27774b9b42ab3e6099a0f756b80171f7d6d2fc387e9'
+WATCH = 'evidence/lumi-vm-attempt-022-inert-watchdog-deployment-verification-v0.1.json'
+WATCH_SHA = '90db6968b6a0de3f7d0c600d837a84a288489c639b6cb24c07b8cc4ed65869b7'
+STORE = 'evidence/lumi-vm-attempt-022-cleanup-bucket-verification-v0.1.json'
+STORE_SHA = '60e1686affe753f2d94ce9f614d5c796f6288fff5ece48fd2ca5495d9ffdd496'
+BUILDER_SHA = 'df7df8da11925949fbc8d074b3f8e6041001a5a437c1391a2b9a2196429181b8'
+
+def read(name, digest=None, size=None):
+    path = ROOT / name
+    need(not Path(name).is_absolute() and ".." not in Path(name).parts)
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    raw = path.read_bytes()
+    need(0 < len(raw) <= 32 * 1024**2)
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+def verify():
+    need(sha(Path(builder.__file__).read_bytes()) == BUILDER_SHA)
+    manifest, expected = builder.build()
+    need(read(PLAN, PLAN_SHA) == encode(expected))
+    release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(release["source_release_sha256"] == RELEASE_SHA)
+    need(release["plan_sha256"] == PLAN_SHA and release["execution_permitted"] is False)
+    return manifest
+
+def build():
+    verify()
+    return json.loads(read(PLAN, PLAN_SHA))
+
+def controls():
+    build()
+    return {WATCH: WATCH_SHA, STORE: STORE_SHA}
+
+def run(**_fields):
+    raise ValueError("cidr_bindings_not_cpu_authority") from None

@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Fetch only five fixed public pure-Python SDK wheels; never contact AWS.
+
+No installation, credential reads or runtime admission. One fresh directory,
+one GET per artifact, no redirect/retry; partial evidence is retained on failure.
+Bounds are HTTP body bytes, not TLS/header/device-write accounting.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+LOCK = ROOT / "configs/lumi-vm-acquisition-sdk-v0.1.lock.json"
+PRIOR = ROOT / "containers/emr-serverless-7.13-python312/requirements-staging-linux-x86_64.lock"
+PRIOR_SHA = "4e8a29b3e8669cb8d8ca677efea3b87ee8c3710e06fbe21f590fe282c24b92d6"
+NAMES = {"botocore", "jmespath", "python-dateutil", "six", "urllib3"}
+TOTAL = 15_791_700
+
+
+def need(value):
+    if not value:
+        raise ValueError("sdk_preparation_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def validate(lock_raw, prior_raw):
+    need(len(lock_raw) <= 32768 and sha(prior_raw) == PRIOR_SHA)
+    lock = json.loads(lock_raw)
+    rows = lock["requirements"]
+    need(
+        lock["schema"] == "lumi.vm-acquisition-sdk-lock.v0.1"
+        and lock["target"]
+        == {
+            "os": "linux",
+            "architecture": "x86_64",
+            "python": "3.12",
+            "runtime_path": "/opt/lumi-sft-acquisition/venv",
+        }
+        and len(rows) == 5
+        and {r["name"] for r in rows} == NAMES
+        and lock["extras"] == []
+        and lock["artifact_bytes"] == TOTAL
+        and sum(r["bytes"] for r in rows) == TOTAL
+    )
+    prior = prior_raw.decode("ascii").splitlines()
+    for row in rows:
+        need(
+            type(row["bytes"]) is int
+            and 0 < row["bytes"] <= TOTAL
+            and re.fullmatch(r"[a-f0-9]{64}", row["sha256"])
+            and re.fullmatch(r"[A-Za-z0-9_.-]+-(?:py3|py2\.py3)-none-any\.whl", row["filename"])
+            and f"{row['name']}=={row['version']} --hash=sha256:{row['sha256']}" in prior
+            and row["yanked_at_metadata_check"] is False
+        )
+        url = urllib.parse.urlsplit(row["url"])
+        need(
+            url.scheme == "https"
+            and url.netloc == "files.pythonhosted.org"
+            and not url.query
+            and not url.fragment
+            and re.fullmatch(
+                r"/packages/[a-f0-9]{2}/[a-f0-9]{2}/[a-f0-9]{60}/" + re.escape(row["filename"]),
+                url.path,
+            )
+        )
+    return lock
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_args, **_kwargs):
+        raise ValueError("sdk_redirect_rejected")
+
+
+def write_new(path, raw):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def copy_wheel(response, output, row, deadline):
+    need(
+        response.status == 200
+        and response.headers.get("Content-Length") == str(row["bytes"])
+        and response.headers.get("Content-Encoding", "identity") == "identity"
+        and response.headers.get("Transfer-Encoding") is None
+    )
+    remaining, digest = row["bytes"], hashlib.sha256()
+    while remaining:
+        need(time.monotonic() < deadline)
+        block = response.read(min(1024**2, remaining))
+        need(type(block) is bytes and 0 < len(block) <= remaining)
+        need(output.write(block) == len(block))
+        digest.update(block)
+        remaining -= len(block)
+    need(
+        time.monotonic() < deadline
+        and response.read(1) == b""
+        and digest.hexdigest() == row["sha256"]
+    )
+    output.flush()
+    os.fsync(output.fileno())
+    os.fchmod(output.fileno(), 0o400)
+
+
+def fetch(destination, lock_raw, prior_raw):
+    lock = validate(lock_raw, prior_raw)
+    need(not any(p.is_symlink() for p in (destination, *destination.parents)))
+    destination.mkdir(mode=0o700, parents=False, exist_ok=False)
+    write_new(
+        destination / "started.json",
+        canonical(
+            {
+                "lock_sha256": sha(lock_raw),
+                "retry_allowed": False,
+                "maximum_requests": 5,
+                "maximum_body_bytes": TOTAL + 5,
+            }
+        ),
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+    deadline, requests, completed = time.monotonic() + 300, 0, 0
+    try:
+        for row in lock["requirements"]:
+            need(time.monotonic() < deadline)
+            requests += 1
+            request = urllib.request.Request(row["url"], headers={"Accept-Encoding": "identity"})
+            fd = os.open(
+                destination / row["filename"],
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            with os.fdopen(fd, "wb") as output, opener.open(request, timeout=30) as response:
+                copy_wheel(response, output, row, deadline)
+            completed += 1
+        requirements = "".join(
+            f"{r['name']}=={r['version']} --hash=sha256:{r['sha256']}\n"
+            for r in lock["requirements"]
+        )
+        write_new(destination / "offline-requirements.txt", requirements.encode("ascii"))
+        write_new(destination / "sdk-lock.json", lock_raw)
+        report = {
+            "schema": "lumi.vm-acquisition-sdk-artifacts.v0.1",
+            "status": "verified_wheels",
+            "lock_sha256": sha(lock_raw),
+            "requests_started": requests,
+            "wheels_verified": completed,
+            "artifact_bytes": TOTAL,
+            "installed": False,
+            "linux_sdk_qualified": False,
+            "aws_requests": 0,
+        }
+        write_new(destination / "result.json", canonical(report))
+        return report
+    except BaseException:
+        write_new(
+            destination / "failed.json",
+            canonical(
+                {
+                    "stage": "wheel_acquisition",
+                    "requests_started": requests,
+                    "wheels_verified": completed,
+                    "retry_allowed": False,
+                    "aws_requests": 0,
+                    "exception_text_retained": False,
+                }
+            ),
+        )
+        raise ValueError("sdk_acquisition_failed") from None
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    try:
+        print(
+            json.dumps(
+                fetch(args.output.absolute(), LOCK.read_bytes(), PRIOR.read_bytes()), sort_keys=True
+            )
+        )
+    except BaseException:
+        parser.exit(1, "sdk_preparation_failed\n")
+
+
+if __name__ == "__main__":
+    main()

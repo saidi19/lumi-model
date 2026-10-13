@@ -1,0 +1,46 @@
+"""Exercise the real botocore event emitter without a network transport."""
+
+import types
+import unittest
+
+from botocore.config import Config
+from botocore.hooks import HierarchicalEmitter
+
+from scripts import sft_vm_admission_budget_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_botocore_hierarchical_event_matches_parent_budget_hook(self):
+        emitter = HierarchicalEmitter()
+        client = types.SimpleNamespace(
+            meta=types.SimpleNamespace(
+                config=Config(retries={"total_max_attempts": 1}, proxies={}),
+                events=emitter,
+            )
+        )
+        credentials = types.SimpleNamespace(static_identity_client=lambda _: client)
+        original = credentials.static_identity_client
+        with m.AdmissionBudget(credentials) as meter:
+            credentials.static_identity_client({})
+            emitter.emit(
+                "before-call.sts.GetCallerIdentity",
+                model=types.SimpleNamespace(name="GetCallerIdentity"),
+            )
+            self.assertEqual(meter.calls, 1)
+            self.assertEqual(meter.credential_calls, 1)
+            with self.assertRaises(ValueError):
+                emitter.emit(
+                    "before-call.sts.PutObject", model=types.SimpleNamespace(name="PutObject")
+                )
+        self.assertIs(credentials.static_identity_client, original)
+        # Cleanup unregisters the parent hook before normal workload traffic.
+        self.assertEqual(
+            emitter.emit(
+                "before-call.sts.PutObject", model=types.SimpleNamespace(name="PutObject")
+            ),
+            [],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

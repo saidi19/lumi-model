@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""Fixed root entry for the detached parent; no cloud provisioning or admission.
+
+An independently admitting root bootstrap must install parent.py, binding.json,
+binding.sha256, prepared-attempt.json and the exact source closure in controller/.
+The root-only binding is consumed authority, NOT proof of storage/runtime/egress
+or independent expiry. No such live binding is created by this implementation.
+Never install it from an untrusted SSH caller or an approval boolean.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import os
+import re
+import resource
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+ROOT = Path("/var/lib/lumi-vm-fullsize")
+PACKAGE = "_lumi_bound_root_parent"
+CONSUMED = False
+SOURCE_PINS = {
+    "posttraining_import_vm_rehearsal_v3.py": (
+        "ac97b64072ccd1f3db702bbf32bf0ff3de410e566ae1dc708533cb147ea15d4c"
+    ),
+    "posttraining_vm_fullsize_controls_v1.py": (
+        "937e44cdc598247bddf2fd9e1762b8ad79f79361fb707fcd2dfdaac045267a93"
+    ),
+    "posttraining_vm_fullsize_staging_v1.py": (
+        "0dd28e571a9b01ef7a2270fc9df81545d5f903acfb1133ba2771ebce1c479c68"
+    ),
+    "posttraining_vm_fullsize_handoff_v1.py": (
+        "c5cd7106ea4c8b6ba48e5d10fe2f18e42349dc581a0a3cb2a0a26dd6ce9f6fcc"
+    ),
+    "posttraining_vm_fullsize_completion_v1.py": (
+        "259bc102563dcf48ac55e818505082f5c0703efbfa1698055a03144c60ab98a7"
+    ),
+    "posttraining_vm_fullsize_acquisition_unit_v1.py": (
+        "9f2225c7a43417bddfa8ebabd4e1cae0a19bd8b45be8b1fc3870d2049de08662"
+    ),
+    "posttraining_vm_fullsize_credential_handoff_v1.py": (
+        "6a23d90686c87f4efc8133ce51fbc1282c40e4067b39e4abedf315b4bb963705"
+    ),
+    "posttraining_vm_fullsize_credential_setup_v1.py": (
+        "4477dd42957befcc1872285525f9698a16d464c84b7cfc4085a1fb266f0a33ab"
+    ),
+    "posttraining_vm_detached_parent_v1.py": (
+        "0239d512b345af3f23ce604707058beeb2f829e40440a512bdc94b7195339d9b"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("root_entry_rejected") from None
+
+
+def hex_id(value, size):
+    return type(value) is str and re.fullmatch(rf"[0-9a-f]{{{size}}}", value) is not None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def root_file(path, maximum=131072):
+    for parent in path.parents:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(stat.S_IMODE(info.st_mode) == 0o400 and info.st_nlink == 1)
+        raw = stream.read(maximum + 1)
+        need(0 < len(raw) <= maximum and info == os.fstat(stream.fileno()))
+    return raw
+
+
+def decode(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            need(key not in result)
+            result[key] = value
+        return result
+
+    value = json.loads(raw, object_pairs_hook=pairs)
+    need(type(value) is dict)
+    return value
+
+
+def validate_binding(value, attempt, operation, machine, boot, now):
+    need(
+        set(value)
+        == {
+            "schema",
+            "attempt",
+            "machine_id",
+            "boot_id",
+            "host_started_boottime",
+            "host_deadline_boottime",
+            "prepared_sha256",
+        }
+    )
+    need(value["schema"] == "lumi.vm-root-host-binding.v0.1" and value["attempt"] == attempt)
+    need(hex_id(value["machine_id"], 32) and value["machine_id"] == machine)
+    need(
+        type(value["boot_id"]) is str
+        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", value["boot_id"])
+    )
+    need(value["boot_id"] == boot and hex_id(value["prepared_sha256"], 64))
+    start, end = value["host_started_boottime"], value["host_deadline_boottime"]
+    need(all(type(n) in {int, float} and math.isfinite(n) for n in (start, end, now)))
+    need(0 <= start <= now and 0 < end - start <= 14400)
+    # Expired hosts must still permit status and cleanup, never new work.
+    if operation in {"dispatch", "submit", "serve"}:
+        need(end - now >= 8435 + (180 if operation == "dispatch" else 60))
+    return value
+
+
+def descriptor(raw, binding, attempt):
+    need(sha(raw) == binding["prepared_sha256"])
+    value = decode(raw)
+    need(value.get("schema") == "lumi.vm-fullsize-prepared-attempt.v0.1")
+    need(value.get("attempt") == attempt)
+    for flag in (
+        "host_admitted",
+        "sdk_runtime_bound",
+        "execution_permitted",
+        "real_4b_import",
+        "gate_5_complete",
+        "training_authorized",
+    ):
+        need(value.get(flag) is False)  # Preserve the preparation record unchanged.
+    acq, imp = value["acquisition_pins"], value["import_pins"]
+    need(type(acq) is dict and set(acq) == {"entry_sha256", "source_manifest_sha256"})
+    need(
+        type(imp) is dict
+        and set(imp)
+        == {"entry_sha256", "source_manifest_sha256", "control_sha256", "attempt_nonce_sha256"}
+    )
+    need(all(hex_id(pin, 64) for pin in (*acq.values(), *imp.values())))
+    need(acq["source_manifest_sha256"] == imp["source_manifest_sha256"])
+    need(imp["attempt_nonce_sha256"] == sha(b"lumi.vm-fullsize-attempt.v0.1\0" + attempt.encode()))
+    return acq, imp
+
+
+def load_parent(source):
+    global CONSUMED
+    need(not CONSUMED)
+    need(
+        not any(
+            name == "lumi"
+            or name.startswith("lumi.")
+            or name == PACKAGE
+            or name.startswith(PACKAGE + ".")
+            or name.split(".")[0] in {"torch", "numpy", "transformers", "safetensors", "tokenizers"}
+            for name in sys.modules
+        )
+    )
+    need({p.name for p in source.iterdir()} == set(SOURCE_PINS))
+    bodies = {}
+    for name, pin in SOURCE_PINS.items():
+        bodies[name] = root_file(source / name)
+        need(sha(bodies[name]) == pin)
+    # Verify the entire closure BEFORE executing even the first module. No
+    # lumi.__init__, path search or unverified parent-module import is needed.
+    CONSUMED = True
+    package = types.ModuleType(PACKAGE)
+    package.__path__ = []
+    sys.modules[PACKAGE] = package
+    for name, raw in bodies.items():
+        fullname = PACKAGE + "." + name[:-3]
+        module = types.ModuleType(fullname)
+        module.__file__ = str(source / name)
+        module.__package__ = PACKAGE
+        sys.modules[fullname] = module
+        setattr(package, name[:-3], module)
+        exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    return sys.modules[PACKAGE + ".posttraining_vm_detached_parent_v1"]
+
+
+def native_boundary(attempt):
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    controller = ROOT / attempt / "controller"
+    need(Path(__file__) == controller / "parent.py")
+    return controller
+
+
+def execute(arguments):
+    need(len(arguments) in {2, 3})
+    operation, attempt = arguments[:2]
+    need(operation in {"dispatch", "submit", "status", "serve", "stop"} and hex_id(attempt, 32))
+    need(len(arguments) == (3 if operation == "dispatch" else 2))
+    controller = native_boundary(attempt)
+    entry_pin = sha(root_file(controller / "parent.py"))
+    if operation == "dispatch":
+        need(hex_id(arguments[2], 64) and arguments[2] == entry_pin)
+    expected = root_file(controller / "binding.sha256", 65).decode("ascii").strip()
+    need(hex_id(expected, 64))
+    raw = root_file(controller / "binding.json", 16384)
+    need(sha(raw) == expected)
+    # proc boot-id is not a regular private file; bounded read, not root_file.
+    with open("/etc/machine-id", "rb") as stream:
+        machine = stream.read(65).strip().decode("ascii")
+    with open("/proc/sys/kernel/random/boot_id", "rb") as stream:
+        boot = stream.read(65).strip().decode("ascii")
+    binding = validate_binding(
+        decode(raw), attempt, operation, machine, boot, time.clock_gettime(time.CLOCK_BOOTTIME)
+    )
+    acq, imp = descriptor(root_file(controller / "prepared-attempt.json", 16384), binding, attempt)
+    parent = load_parent(controller / "src/lumi")
+    parent.handoff.frozen.host_check(machine)
+    if operation in {"dispatch", "serve", "submit"}:
+        parent.setup.workflow._no_swap()
+    return invoke(parent, operation, attempt, machine, entry_pin, acq, imp)
+
+
+def invoke(parent, operation, attempt, machine, entry_pin, acq, imp):
+    if operation == "dispatch":
+        return parent._dispatch_admitted_once(attempt, entry_pin, machine_id=machine)
+    if operation == "submit":
+        raw = parent.setup._read_pipe(0, time.monotonic() + 5)
+        try:
+            return parent._submit_admitted_once(attempt, raw, machine_id=machine)
+        finally:
+            raw[:] = b"\0" * len(raw)  # No claim of erasing other Python/OS copies.
+    if operation == "serve":
+        parent._serve_admitted_once(attempt, acq, imp, machine_id=machine)
+    elif operation == "stop":
+        parent._stop_children_admitted(attempt)
+    else:
+        return parent._status_admitted(attempt)
+    return None
+
+
+def main():
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        os.umask(0o077)
+        result = execute(sys.argv[1:])
+        if result is not None:
+            raw = json.dumps(result, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+            need(len(raw) <= 4096)
+            sys.stdout.buffer.write(raw)
+            sys.stdout.buffer.flush()
+    except BaseException:
+        # No raw exception, credential or arbitrary path in CLI output.
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

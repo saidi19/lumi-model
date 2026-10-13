@@ -1,0 +1,151 @@
+import ast
+import hashlib
+import importlib
+import json
+import sys
+import unittest
+from unittest.mock import Mock
+
+from tests.test_sft_vm_work_disk_v1 import ROOT, load_fixture
+
+sys.path.insert(0, str(ROOT / "scripts"))
+driver = importlib.import_module("run_sft_vm_setup_delivery_v3")
+native = importlib.import_module("run_sft_vm_setup_detached_v3")
+network = importlib.import_module("run_sft_vm_network_bootstrap_v4")
+sender, inputs = driver.seed.sender, driver.seed.INPUTS
+old_inputs = importlib.import_module("stage_sft_vm_setup_inputs_v4")
+
+native_fixture = load_fixture("_disk_native_fixture", "tests/test_sft_vm_setup_detached_v1.py")
+native_fixture.m, native_fixture.b = native, network
+delivery_fixture = load_fixture("_disk_sender_fixture", "tests/test_sft_vm_setup_delivery_v3.py")
+delivery_fixture.m = sender
+join_fixture = load_fixture("_disk_join_fixture", "tests/test_sft_vm_setup_delivery_join_v1.py")
+join_fixture.m, join_fixture.native, join_fixture.prior = driver, native, delivery_fixture
+input_fixture = load_fixture("_disk_input_fixture", "tests/test_sft_vm_setup_inputs_v3.py")
+input_fixture.m = inputs
+
+
+class NativeTests(native_fixture.NativeSetupTests):
+    def setUp(self):
+        super().setUp()
+        # This fixture doubles readonly disk discovery, never actual formatting.
+        self.wheel.load_storage = Mock()
+
+    def test_preparation_reserve_required_before_detached_dispatch(self):
+        self.boot.return_value = 1350
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.command.assert_not_called()
+        self.assertFalse(self.out.exists())
+
+
+class DeliveryTests(join_fixture.SetupDeliveryJoinTests):
+    def setUp(self):
+        super().setUp()
+        self.receiver = ROOT / "scripts/stage_sft_vm_setup_inputs_v5.py"
+        self.archive = ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar"
+
+
+class ReleaseTests(input_fixture.SetupInputsTests):
+    def test_original_setup_and_storage_pins_fully_covered(self):
+        setup = importlib.import_module("run_sft_vm_setup_sequence_v1")
+        storage = importlib.import_module("check_sft_vm_storage_v1")
+        for name, pin in setup.PINS.items():
+            self.assertEqual(inputs.FILES["lumi-bootstrap-input/" + name][1], pin)
+        for name, (pin, cap) in setup.EXTERNAL.items():
+            self.assertEqual(inputs.FILES[name.removeprefix("/opt/")][1:], (pin, cap))
+        self.assertEqual(
+            inputs.FILES[str(storage.SETUP).removeprefix("/opt/")][1], storage.SETUP_SHA
+        )
+        self.assertEqual(len(inputs.FILES), 19)
+
+    def test_actual_existing_controls_assemble_and_roundtrip_without_execution(self):
+        raw = inputs.assemble()
+        members = inputs.unpack(raw, sender.ARCHIVE_SHA)
+        self.assertEqual(len(members), 19)
+        self.assertEqual(raw, inputs.pack(members))
+        self.assertLess(len(raw), inputs.CAP)
+
+    def test_only_policy_and_bootstrap_members_replaced(self):
+        self.assertEqual(
+            set(old_inputs.FILES) - set(inputs.FILES),
+            {"lumi-bootstrap-input/run_sft_vm_network_bootstrap_v3.py"},
+        )
+        self.assertEqual(
+            set(inputs.FILES) - set(old_inputs.FILES),
+            {
+                "lumi-bootstrap-input/run_sft_vm_network_bootstrap_v4.py",
+                "lumi-bootstrap-input/prepare_sft_vm_work_disk_v1.py",
+            },
+        )
+        common = set(inputs.FILES) & set(old_inputs.FILES)
+        self.assertEqual(len(common), 17)
+        for name in common:
+            self.assertEqual(inputs.FILES[name], old_inputs.FILES[name])
+        for name, pin in network.PINS.items():
+            self.assertEqual(inputs.FILES["lumi-bootstrap-input/" + name][1], pin)
+
+    def test_stage_parser_and_boundary_algorithms_unchanged(self):
+        def functions(version):
+            return {
+                node.name: ast.dump(node)
+                for node in ast.parse(
+                    (ROOT / f"scripts/stage_sft_vm_setup_inputs_{version}.py").read_text()
+                ).body
+                if isinstance(node, ast.FunctionDef) and node.name != "receipt"
+            }
+
+        self.assertEqual(functions("v4"), functions("v5"))
+
+    def test_actual_built_release_exactly_matches_manifest(self):
+        root = ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.5"
+        raw = inputs.read(root / "setup-inputs.tar", inputs.CAP)
+        self.assertEqual(len(raw), sender.ARCHIVE_BYTES)
+        self.assertEqual(inputs.sha(raw), sender.ARCHIVE_SHA)
+        self.assertEqual(raw, inputs.assemble())
+        self.assertEqual(
+            json.loads(inputs.read(root / "build.json", 4096)),
+            inputs.receipt(raw) | {"native_staged": False, "uploaded": False},
+        )
+
+    def test_real_control_archive_stages_with_native_boundary_mocked(self):
+        def check(opt, attempt, raw):
+            result = inputs._stage_admitted_once(raw, inputs.sha(raw), "a" * 32)
+            for name, body in inputs.unpack(raw, inputs.sha(raw)).items():
+                self.assertEqual(inputs.read(opt / name, inputs.FILES[name][2]), body)
+            self.assertEqual(result["files"], 19)
+            self.assertFalse(result["host_admitted"])
+
+        self.staged_fixture(check, actual=True)
+
+    def test_preserved_common_member_bytes_and_new_pins(self):
+        old = old_inputs.unpack(
+            old_inputs.read(
+                ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.4/setup-inputs.tar", inputs.CAP
+            ),
+            "e086086b0de30c64633463804d1add486381d9f53ed00c27816a77af4542cdad",
+        )
+        new = inputs.unpack(
+            inputs.read(
+                ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar", inputs.CAP
+            ),
+            sender.ARCHIVE_SHA,
+        )
+        for name in old.keys() & new.keys():
+            self.assertEqual(old[name], new[name])
+        pins = {
+            "run_sft_vm_network_bootstrap_v4.py": native.BOOTSTRAP_SHA,
+            "run_sft_vm_setup_detached_v3.py": driver.SOURCE_SHA,
+            "send_sft_vm_setup_inputs_v5.py": driver.seed.SENDER_SHA,
+            "stage_sft_vm_setup_inputs_v5.py": sender.RECEIVER_SHA,
+        }
+        for name, pin in pins.items():
+            self.assertEqual(
+                hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest(), pin
+            )
+        self.assertEqual(driver.BOOTSTRAP_SHA, native.BOOTSTRAP_SHA)
+        self.assertEqual(len(driver.source_bytes()), driver.SOURCE_BYTES)
+
+
+if __name__ == "__main__":
+    unittest.main()

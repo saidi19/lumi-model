@@ -1,0 +1,94 @@
+"""Offline structural proof of fresh network diagnostic; no further AWS reads."""
+
+import ipaddress
+import json
+import sys
+from pathlib import Path
+
+from scripts import diagnose_sft_vm_attempt022_network_v1 as diagnostic
+
+ROOT = diagnostic.ROOT
+PLAN = ROOT / "configs/lumi-vm-attempt-022-network-diagnostic-plan-v0.1.json"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-network-diagnostic-verification-v0.1.json"
+need, read, sha = diagnostic.need, diagnostic.entry.files.read, diagnostic.entry.sha
+
+
+def load(path):
+    return json.loads(read(path))
+
+
+def verify():
+    plan = load(PLAN)
+    for name, digest in plan["source_bindings"].items():
+        need(sha(read(ROOT / name)) == digest)
+    diagnostic.local()
+    started = load(diagnostic.OUTPUT / "started.json")
+    result = load(diagnostic.OUTPUT / "result.json")
+    need(started["entry_sha256"] == sha(read(Path(diagnostic.__file__))))
+    need(started["prior_failure_proof_sha256"] == diagnostic.PROOF_SHA)
+    need(started["maximum_sdk_reads_including_identity"] == 20)
+    need(started["maximum_seconds"] == 300)
+    need(started["retry"] is False and started["cloud_mutations"] == 0)
+    need(result["attempt"] == diagnostic.entry.ATTEMPT)
+    need(result["status"] == "fresh_network_diagnostic_rejected")
+    need(result["historical_failure_proof_sha256"] == diagnostic.PROOF_SHA)
+    need(result["last_check"] == "network_selection_targets_match")
+    need(result["last_operation"] == "pricing.GetProducts")
+    need(result["failure_diagnostic"] == {
+        "check": "none", "kind": "validation", "stage": "network_admission",
+    })
+    need(result["selection_contract_mismatch_confirmed"] is True)
+    selection = result["selection_comparison"]
+    need(set(selection) == {
+        "pinned_cidr", "computed_first_free_cidr", "target_field_difference_count",
+        "only_cidr_differs", "targets_match",
+    })
+    need(selection["only_cidr_differs"] is True and selection["targets_match"] is False)
+    need(selection["target_field_difference_count"] == 1)
+    pinned = ipaddress.IPv4Network(selection["pinned_cidr"], strict=True)
+    computed = ipaddress.IPv4Network(selection["computed_first_free_cidr"], strict=True)
+    need(pinned.prefixlen == computed.prefixlen == 27 and pinned != computed)
+    need(pinned.subnet_of(ipaddress.IPv4Network("172.31.0.0/16")))
+    need(computed.subnet_of(ipaddress.IPv4Network("172.31.0.0/16")))
+    need(0 < result["sdk_read_dispatches"] <= 20)
+    need(result["credential_identity_dispatches"] == 1)
+    need(0 <= result["elapsed_seconds"] < 300)
+    need(result["cloud_mutations"] == result["object_access"] == result["instance_actions"] == 0)
+    for key in ("cpu_launch_authorized", "gate_5_complete", "gpu", "training", "retry",
+                "original_failure_cause_captured"):
+        need(result[key] is False)
+    bindings = dict(plan["source_bindings"])
+    for path in (PLAN, Path(__file__), diagnostic.OUTPUT / "started.json",
+                 diagnostic.OUTPUT / "result.json"):
+        bindings[str(path.relative_to(ROOT))] = sha(read(path))
+    return dict(
+        schema="lumi.vm-attempt022-network-diagnostic-verification.v0.1",
+        attempt=result["attempt"], status="fresh_selection_contract_mismatch_verified",
+        source_bindings=bindings, selection_comparison=selection,
+        sdk_read_dispatches=result["sdk_read_dispatches"],
+        credential_identity_dispatches=1, elapsed_seconds=result["elapsed_seconds"],
+        last_check=result["last_check"], prior_evidence_preserved=True,
+        fresh_diagnostic_reproduced_mismatch=True, original_failure_cause_captured=False,
+        additional_aws_verification_calls=0, cloud_mutations=0, object_access=0,
+        instance_actions=0, retry=False, cpu_launch_authorized=False,
+        real_4b_import=False, gate_5_complete=False, gpu=False, training=False,
+        proposed_narrow_recovery={
+            "update": "Rebind only network-plan CIDR and directly consequent source hashes "
+                      "to the frozen selector's observed first-free CIDR in a fresh release.",
+            "frozen_selector_change": False,
+            "resource_or_quota_rule_change": False,
+            "recreate_watchdog_or_cleanup_bucket": False,
+            "fresh_readonly_admission_required": True,
+            "old_consumed_pass_rerun": False,
+            "recovery_applied": False,
+            "cpu_execution_authorized": False,
+        },
+    )
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--write-once"] and not OUTPUT.exists())
+    value = verify()
+    diagnostic.entry.files.save(OUTPUT, value)
+    print(json.dumps({"status": value["status"], "sdk_read_dispatches":
+                      value["sdk_read_dispatches"], "additional_aws_calls": 0}, sort_keys=True))

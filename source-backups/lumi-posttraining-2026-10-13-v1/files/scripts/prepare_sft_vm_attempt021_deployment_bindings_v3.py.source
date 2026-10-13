@@ -1,0 +1,53 @@
+"""Final attempt-021 bindings; no execution grant."""
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt021_deployment_bindings_v2 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = '711a668f8ed4273fc495e5aa5170f30951cbf8a9cca1549e30ccad5e1c76dc08'
+ATTEMPT, OLD, BUCKET = source.ATTEMPT, source.OLD, source.BUCKET
+RELEASE, RELEASE_SHA = source.RELEASE, source.RELEASE_SHA
+WATCH, WATCH_SHA, STORE, STORE_SHA = source.WATCH, source.WATCH_SHA, source.STORE, source.STORE_SHA
+PLAN = 'artifacts/lumi-vm-attempt-021-control-plan-v0.4/plan.json'
+PLAN_SHA = '92cb9f21bac045335ceddea01512a7f9e1f27bc664d4b45d41baf016c1b53ca6'
+PLAN_RELEASE = 'artifacts/lumi-vm-attempt-021-control-plan-v0.4/release.json'
+PLAN_RELEASE_SHA = '9460e07c35957944da194f12a8a26ac820d3ab2bcae3be895c91ca3c8cf09be2'
+PREFLIGHT = 'evidence/lumi-vm-attempt-021-readonly-preflight-verification-v0.1.json'
+PREFLIGHT_SHA = '471fb7b010c332b7b2fd7afb53ae9df9ed5c09b794de8e22681dedb540024d66'
+BUDGET = 'scripts/sft_vm_admission_budget_v1.py'
+BUDGET_SHA = '93b389a15ea8911ca9afb4d8124542b09470311065ccccd552806162ad7f781f'
+need, sha, encode, read = source.need, source.sha, source.encode, source.read
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    proof = json.loads(read(PREFLIGHT, PREFLIGHT_SHA))
+    release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    read(BUDGET, BUDGET_SHA)
+    for name, digest in proof["run_bindings"].items():
+        read(name, digest)
+    need(proof["attempt"] == ATTEMPT and proof["status"] == "readonly_preflight_passed")
+    need(proof["control_evidence"] == source.controls())
+    need(proof["cpu_admitted"] and proof["network_admitted"])
+    need(proof["execution_authority_created"] is False and proof["cpu_instance_launched"] is False)
+    need(release["attempt"] == ATTEMPT and release["plan_sha256"] == PLAN_SHA)
+    need(release["successful_readonly_preflight_sha256"] == PREFLIGHT_SHA)
+    need(release["execution_permitted"] is False)
+    return manifest
+
+def build():
+    verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(plan["attempt"] == ATTEMPT and plan["release_manifest_sha256"] == RELEASE_SHA)
+    need(plan["required_control_proofs"] == [WATCH, STORE])
+    need(plan["successful_readonly_preflight"] == dict(path=PREFLIGHT, sha256=PREFLIGHT_SHA))
+    need(plan["approval_record"] is None and plan["execution_permitted"] is False)
+    return plan
+
+def controls():
+    build()
+    return source.controls()
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

@@ -1,0 +1,320 @@
+import hashlib
+import importlib
+import io
+import json
+import os
+import shlex
+import sys
+import tempfile
+import threading
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+m = importlib.import_module("send_sft_vm_setup_inputs_v2")
+BOOT = "11111111-2222-3333-4444-555555555555"
+MACHINE = "a" * 32
+
+
+class SetupDeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.output = self.root / "delivery"
+        self.key = self.root / "key"
+        m.inputs.write(self.key, b"synthetic-private-key-never-read")
+        self.binding = dict(
+            attempt=m.inputs.ATTEMPT,
+            instance="i-" + "1" * 17,
+            endpoint="eice-" + "2" * 17,
+            root_volume="vol-" + "3" * 17,
+            work_volume="vol-" + "4" * 17,
+            vm_group="sg-" + "5" * 17,
+            endpoint_group="sg-" + "6" * 17,
+            key_name="lumi-synthetic",
+        )
+        config = m.delivery.connection.ssh_config(
+            self.binding, self.key, self.root / "known_hosts"
+        ).encode()
+        hosts = b"synthetic-public-key-not-a-real-host"
+        for name, raw in (("ssh_config", config), ("known_hosts", hosts)):
+            m.inputs.write(self.root / name, raw)
+        self.config_sha, self.hosts_sha = m.inputs.sha(config), m.inputs.sha(hosts)
+        self.receiver = ROOT / "scripts/stage_sft_vm_setup_inputs_v2.py"
+        self.archive = ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.2/setup-inputs.tar"
+        self.deadline = 1800
+        self.budget = m.inputs.CAP
+
+    def send(self, **kwargs):
+        return m._send_admitted_once(
+            self.binding,
+            self.key,
+            self.root,
+            self.config_sha,
+            self.hosts_sha,
+            self.receiver,
+            self.archive,
+            MACHINE,
+            BOOT,
+            1500,
+            self.output,
+            deadline=self.deadline,
+            remaining_control_bytes=self.budget,
+            clock=kwargs.pop("clock", lambda: 0),
+            **kwargs,
+        )
+
+    def reply(self):
+        return m.inputs.canonical(m.expected_receipt())
+
+    def test_fixed_pins_frame_command_and_success_not_host_admission(self):
+        with patch.object(m, "pipe_exchange", return_value=self.reply()) as exchange:
+            result = self.send()
+        argv, body, timeout = exchange.call_args.args
+        self.assertEqual(timeout, 100)
+        self.assertEqual(len(body), m.MAX_BODY)
+        self.assertEqual(hashlib.sha256(body[: m.RECEIVER_BYTES]).hexdigest(), m.RECEIVER_SHA)
+        self.assertEqual(hashlib.sha256(body[m.RECEIVER_BYTES :]).hexdigest(), m.ARCHIVE_SHA)
+        self.assertEqual(
+            shlex.split(argv[-1])[:6], ["sudo", "-n", "/usr/bin/python3", "-I", "-B", "-c"]
+        )
+        self.assertNotIn("synthetic-private-key", " ".join(argv))
+        self.assertTrue(result["remote_staging_confirmed"])
+        self.assertFalse(result["host_admitted"])
+        self.assertFalse(result["wire_byte_accounting_proven"])
+        self.assertGreater(result["control_content_bytes_charged"], len(body))
+        with patch.object(m, "pipe_exchange") as again, self.assertRaises(FileExistsError):
+            self.send()
+        again.assert_not_called()
+
+    def test_deadline_and_budget_rejected_before_dispatch(self):
+        with patch.object(m, "pipe_exchange") as exchange:
+            for deadline in (0, 110, 1801, float("nan"), float("inf"), True):
+                self.deadline = deadline
+                with self.assertRaises(ValueError):
+                    self.send()
+            self.deadline = 1800
+            for budget in (m.MAX_BODY, m.inputs.CAP + 1, True):
+                self.budget = budget
+                with self.assertRaises(ValueError):
+                    self.send()
+            exchange.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_time_consumed_by_preflight_does_not_refresh_deadline(self):
+        with patch.object(m, "pipe_exchange") as exchange, self.assertRaises(ValueError):
+            self.send(clock=iter([0, 1700]).__next__)
+        exchange.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_modified_receiver_rejected_before_dispatch(self):
+        changed = self.root / "receiver.py"
+        m.inputs.write(changed, b"wrong")
+        self.receiver = changed
+        with patch.object(m, "pipe_exchange") as exchange, self.assertRaises(ValueError):
+            self.send()
+        exchange.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_deadline_exhausted_during_marker_write_never_sends(self):
+        with patch.object(m, "pipe_exchange") as exchange, self.assertRaises(ValueError):
+            self.send(clock=iter([0, 0, 1790]).__next__)
+        exchange.assert_not_called()
+        value = json.loads((self.output / "result.json").read_text())
+        self.assertFalse(value["ssh_dispatch_attempted"])
+        self.assertFalse(value["remote_completion_unknown"])
+        self.assertFalse(value["retry_allowed"])
+
+    def test_modified_config_and_wrong_attempt_rejected(self):
+        with patch.object(m, "pipe_exchange") as exchange:
+            self.config_sha = "0" * 64
+            with self.assertRaises(ValueError):
+                self.send()
+            self.binding["attempt"] = "f" * 32
+            with self.assertRaises(ValueError):
+                self.send()
+            exchange.assert_not_called()
+
+    def test_ambiguous_exchange_is_not_resent_and_evidence_contains_no_exception(self):
+        with patch.object(
+            m, "pipe_exchange", side_effect=TimeoutError("private exception")
+        ) as exchange:
+            with self.assertRaisesRegex(ValueError, "^setup_delivery_failed$"):
+                self.send()
+            self.assertEqual(exchange.call_count, 1)
+        raw = (self.output / "result.json").read_bytes()
+        self.assertNotIn(b"private exception", raw)
+        value = json.loads(raw)
+        self.assertTrue(value["remote_completion_unknown"])
+        self.assertFalse(value["remote_staging_confirmed"])
+        self.assertFalse(value["retry_allowed"])
+        with patch.object(m, "pipe_exchange") as exchange, self.assertRaises(FileExistsError):
+            self.send()
+        exchange.assert_not_called()
+
+    def test_extra_fields_numeric_booleans_and_false_success_rejected(self):
+        cases = [
+            m.expected_receipt() | {"host_admitted": True},
+            m.expected_receipt() | {"staged_files_readback_match": 1},
+            m.expected_receipt() | {"unexpected": "text"},
+        ]
+        for index, value in enumerate(cases):
+            self.output = self.root / f"case-{index}"
+            with patch.object(m, "pipe_exchange", return_value=m.inputs.canonical(value)):
+                with self.assertRaises(ValueError):
+                    self.send()
+
+    def test_public_entry_and_invalid_native_identity_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)
+        for machine, boot, deadline in [
+            ("x;cmd", BOOT, 1),
+            (MACHINE, "bad", 1),
+            (MACHINE, BOOT, float("nan")),
+            (MACHINE, BOOT, True),
+        ]:
+            with self.assertRaises(ValueError):
+                m.native_launcher(machine, boot, deadline)
+
+
+class NativeLauncherTests(unittest.TestCase):
+    def execute(self, *, bad_source=False, trailing=False, now=10, boot=BOOT):
+        source = (
+            b"def _stage_admitted_once(raw, expected, machine):\n"
+            b" assert raw == b'archive'\n"
+            b" return {'staged': True}\n"
+        )
+        archive = b"archive"
+        frame = (b"x" * len(source) if bad_source else source) + archive
+        if trailing:
+            frame += b"extra"
+        output = io.BytesIO()
+        with (
+            patch.object(m, "RECEIVER_BYTES", len(source)),
+            patch.object(m, "RECEIVER_SHA", m.inputs.sha(source)),
+            patch.object(m, "ARCHIVE_BYTES", len(archive)),
+            patch.object(m, "ARCHIVE_SHA", m.inputs.sha(archive)),
+        ):
+            code = compile(m.native_launcher(MACHINE, BOOT, 100), "<synthetic-launcher>", "exec")
+        stdout = types.SimpleNamespace(
+            buffer=output, write=lambda text: output.write(text.encode())
+        )
+        with (
+            patch.object(sys, "stdin", types.SimpleNamespace(buffer=io.BytesIO(frame))),
+            patch.object(sys, "stdout", stdout),
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "flags", types.SimpleNamespace(isolated=True)),
+            patch.object(sys, "version_info", (3, 12)),
+            patch.object(sys, "dont_write_bytecode", True),
+            patch.object(os, "geteuid", return_value=0),
+            patch.object(os, "getegid", return_value=0),
+            patch("builtins.open", return_value=io.BytesIO(boot.encode())),
+            patch.object(m.time, "CLOCK_BOOTTIME", 7, create=True),
+            patch.object(m.time, "clock_gettime", return_value=now),
+            patch.object(m.signal, "alarm") as alarm,
+            patch.object(m.signal, "setitimer") as timer,
+        ):
+            try:
+                exec(code, {})
+                status = 0
+            except SystemExit as exc:
+                status = exc.code
+            alarm.assert_called_once_with(85)
+            return status, json.loads(output.getvalue()), timer.call_args
+
+    def test_fixed_frame_native_alarm_and_original_boot_deadline(self):
+        status, result, timer = self.execute()
+        self.assertEqual(status, 0)
+        self.assertEqual(result, {"staged": True})
+        self.assertEqual(timer.args, (m.signal.ITIMER_REAL, 85))
+        self.assertEqual(self.execute(now=90)[2].args, (m.signal.ITIMER_REAL, 10))
+
+    def test_bad_source_extra_bytes_expired_deadline_and_boot_rejected(self):
+        for kwargs in [
+            dict(bad_source=True),
+            dict(trailing=True),
+            dict(now=100),
+            dict(now=-2000),
+            dict(boot="wrong"),
+        ]:
+            status, result, _ = self.execute(**kwargs)
+            self.assertEqual(status, 2)
+            self.assertEqual(
+                result, {"status": "setup_delivery_failed", "execution_permitted": False}
+            )
+
+
+class BulkPipeTests(unittest.TestCase):
+    def exchange(self, reply, returncode=0, expect_sent=True):
+        input_read, input_write = os.pipe()
+        output_read, output_write = os.pipe()
+        body = b"synthetic-control" * 16384  # Deliberately larger than credential pipe cap.
+        received = []
+
+        def worker():
+            with os.fdopen(input_read, "rb") as stream:
+                received.append(stream.read())
+            try:
+                os.write(output_write, reply)
+            except BrokenPipeError:
+                pass
+            finally:
+                os.close(output_write)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        process = types.SimpleNamespace(
+            pid=424242,
+            stdin=os.fdopen(input_write, "wb", buffering=0),
+            stdout=os.fdopen(output_read, "rb", buffering=0),
+            wait=lambda **kw: returncode,
+        )
+        thread.start()
+        try:
+            with (
+                patch.object(m.subprocess, "Popen", return_value=process) as launch,
+                patch.object(m.os, "killpg") as kill,
+            ):
+                try:
+                    return m.pipe_exchange(["synthetic-only"], body, 1)
+                finally:
+                    self.assertEqual(launch.call_count, 1)
+                    self.assertEqual(launch.call_args.kwargs["stderr"], m.subprocess.DEVNULL)
+                    self.assertTrue(launch.call_args.kwargs["start_new_session"])
+                    kill.assert_called_once_with(424242, m.signal.SIGKILL)
+        finally:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(received, [body if expect_sent else b""])
+
+    def test_real_bounded_pipes_without_process_or_network(self):
+        self.assertEqual(self.exchange(b'{"ok":true}'), b'{"ok":true}')
+
+    def test_reply_overflow_and_nonzero_exit_fail(self):
+        with self.assertRaises(ValueError):
+            self.exchange(b"x" * 4097)
+        with self.assertRaises(ValueError):
+            self.exchange(b"", returncode=1)
+
+    def test_empty_selector_wakeup_fails_and_closes_pipes(self):
+        # A no-progress timeout cannot leave a local SSH/tunnel group running.
+        # No actual process is created; cleanup is asserted by exchange().
+        with m.selectors.DefaultSelector() as selector:
+            selector_type = type(selector)
+        with patch.object(selector_type, "select", return_value=[]):
+            with self.assertRaises(ValueError):
+                self.exchange(b"", expect_sent=False)
+
+    def test_oversize_body_or_timeout_never_launches(self):
+        with patch.object(m.subprocess, "Popen") as launch:
+            for body, timeout in [(b"x" * (m.MAX_BODY + 1), 1), (b"x", 101), (b"", 1)]:
+                with self.assertRaises(ValueError):
+                    m.pipe_exchange(["synthetic-only"], body, timeout)
+            launch.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

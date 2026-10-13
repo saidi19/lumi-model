@@ -1,0 +1,390 @@
+import importlib.util
+import json
+import stat
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests.test_sft_vm_setup_return_contract_v1 import wrapped
+from tests.test_sft_vm_watchdog_report_channel_v1 import module
+
+m = module("prepare_sft_vm_work_disk_v1")
+storage = module("check_sft_vm_storage_v1")
+network = module("run_sft_vm_network_bootstrap_v4")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load_fixture(name, path):
+    spec = importlib.util.spec_from_file_location(name, ROOT / path)
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+def binding():
+    return dict(root_volume="vol-" + "1" * 17, work_volume="vol-" + "2" * 17)
+
+
+def disks():
+    return (
+        dict(volume=binding()["root_volume"], bytes=32 * m.GIB, disk="nvme0n1"),
+        dict(
+            volume=binding()["work_volume"],
+            bytes=128 * m.GIB,
+            disk="nvme1n1",
+            device="259:2",
+            partitions=False,
+            slaves=False,
+        ),
+    )
+
+
+RAW = b"1 0 259:1 / / rw,relatime shared:1 - ext4 /dev/nvme0n1p1 rw\n"
+
+
+class ValidationTests(unittest.TestCase):
+    def test_exact_work_whole_disk_only(self):
+        root, target = disks()
+        self.assertEqual(m.validate(storage.mounts(RAW), root, [target], binding()), target)
+
+    def test_root_wrong_size_identity_partition_slave_or_ambiguity_rejected(self):
+        root, target = disks()
+        for change in (
+            {"disk": root["disk"]},
+            {"volume": root["volume"]},
+            {"bytes": 32 * m.GIB},
+            {"partitions": True},
+            {"slaves": True},
+            {"disk": "../nvme1n1"},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                m.validate(storage.mounts(RAW), root, [target | change], binding())
+        with self.assertRaises(ValueError):
+            m.validate(storage.mounts(RAW), root, [target, target], binding())
+
+    def test_mounted_device_alias_or_existing_mountpoint_rejected(self):
+        root, target = disks()
+        for suffix in (
+            b"2 1 259:2 / /elsewhere rw - ext4 /dev/nvme1n1 rw\n",
+            b"2 1 0:20 / /var/lib/lumi-vm-fullsize rw - tmpfs tmpfs rw\n",
+            b"2 1 0:20 / /var/lib/lumi-vm-fullsize/sub rw - tmpfs tmpfs rw\n",
+        ):
+            with self.assertRaises(ValueError):
+                m.validate(storage.mounts(RAW + suffix), root, [target], binding())
+
+    def test_no_signature_probe_ambiguity_or_erase_permission(self):
+        m.blank_signatures(b'{"signatures": []}')
+        for raw in (
+            b"",
+            b"{}",
+            b'{"signatures":null}',
+            b'{"signatures":[],"signatures":[]}',
+            b'{"signatures":[{"type":"ext4"}]}',
+            b"x" * 32769,
+        ):
+            with self.subTest(raw=raw[:60]), self.assertRaises(ValueError):
+                m.blank_signatures(raw)
+
+    def test_closed_public_entry_and_mac_rejection_precede_native_reads(self):
+        with self.assertRaisesRegex(ValueError, "fullsize_host_admission_not_bound"):
+            m.run(approved=True)
+        with patch.object(m.sys, "platform", "darwin"), patch.object(storage, "small") as read:
+            with self.assertRaises(ValueError):
+                m.preflight(storage, binding())
+            read.assert_not_called()
+
+    def native_fixture(
+        self, *, signatures=False, device_mode=stat.S_IFBLK | 0o660, gid=6, drift=False
+    ):
+        root, target = disks()
+        directory = types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+        block = types.SimpleNamespace(
+            st_mode=device_mode, st_uid=0, st_gid=gid, st_rdev=259 * 256 + 2
+        )
+        reads = []
+
+        def small(path, *args):
+            if str(path) == "/proc/swaps":
+                return b"Filename Type Size Used Priority\n"
+            if str(path) == "/proc/self/mountinfo":
+                reads.append(path)
+                return RAW + (b"\n" if drift and len(reads) > 1 else b"")
+            return b"259:1" if path.parent.name == "nvme0n1" else b"259:2"
+
+        with (
+            patch.object(m.sys, "platform", "linux"),
+            patch.object(m.os, "geteuid", return_value=0),
+            patch.object(m.os, "getegid", return_value=0),
+            patch.object(m.os, "stat", return_value=types.SimpleNamespace(st_ino=1)),
+            patch.object(m.os.path, "lexists", return_value=False),
+            patch.object(m.os, "major", return_value=259),
+            patch.object(m.os, "minor", return_value=2),
+            patch.object(m.grp, "getgrnam", return_value=types.SimpleNamespace(gr_gid=6)),
+            patch.object(
+                Path,
+                "lstat",
+                side_effect=lambda p: block if str(p).startswith("/dev/") else directory,
+                autospec=True,
+            ),
+            patch.object(
+                Path,
+                "iterdir",
+                side_effect=lambda p: (
+                    iter(
+                        [m.SYS_BLOCK / "nvme0n1", m.SYS_BLOCK / "nvme1n1"]
+                        + ([m.SYS_BLOCK / "nvme1n1p1"] if signatures else [])
+                    )
+                    if p == m.SYS_BLOCK
+                    else iter([])
+                ),
+                autospec=True,
+            ),
+            patch.object(storage, "small", side_effect=small),
+            patch.object(
+                storage,
+                "disk_identity",
+                side_effect=lambda d: (
+                    root if d == "259:1" else {k: target[k] for k in ("volume", "bytes", "disk")}
+                ),
+            ),
+            patch.object(storage, "device_number", return_value="259:1"),
+        ):
+            return m.preflight(storage, binding())
+
+    def test_actual_native_discovery_uses_sysfs_and_accepts_standard_root_disk_permissions(self):
+        self.assertEqual(self.native_fixture(), disks()[1])
+        for kwargs in (
+            {"signatures": True},
+            {"device_mode": stat.S_IFLNK | 0o777},
+            {"gid": 1000},
+            {"drift": True},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                self.native_fixture(**kwargs)
+
+
+class PreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.work, self.out = self.root / "work-disk", self.root / "disk-preparation"
+        self.enterContext(patch.object(m, "WORK", self.work))
+        self.target = disks()[1]
+        self.preflight = self.enterContext(patch.object(m, "preflight", return_value=self.target))
+        self.guard = Mock()
+        self.commands = []
+        self.failure = None
+        self.probe = b'{"signatures":[]}'
+        self.native_storage = types.SimpleNamespace(
+            inspect=Mock(return_value={"work_volume_matches": True, "host_admitted": False})
+        )
+        self.enterContext(patch.object(network, "owned"))
+        self.enterContext(
+            patch.object(network, "read", side_effect=lambda p, cap=131072, **k: p.read_bytes())
+        )
+        self.runtime = types.SimpleNamespace(
+            boot_time=Mock(return_value=100.0),
+            command=self.command,
+            write=network.write,
+            sync=network.sync,
+            encode=network.encode,
+        )
+
+    def command(self, argv, seconds):
+        self.commands.append(argv)
+        self.assertGreater(seconds, 0)
+        self.assertLessEqual(seconds, 90)
+        if self.failure == len(self.commands):
+            raise TimeoutError("private exception must not be saved")
+        return self.probe if argv[0].endswith("wipefs") else b""
+
+    def call(self):
+        return m._prepare_admitted_once(
+            self.native_storage, binding(), self.runtime, self.guard, self.out
+        )
+
+    def test_exact_commands_post_mount_permissions_and_existing_checker_readback(self):
+        value = self.call()
+        self.assertTrue(value["work_disk_prepared"])
+        self.assertFalse(value["host_admitted"] or value["binding_created"])
+        self.assertEqual(
+            [a[0] for a in self.commands],
+            ["/usr/sbin/wipefs", "/usr/sbin/mkfs.ext4", "/usr/bin/mount", "/usr/bin/mount"],
+        )
+        self.assertNotIn("-F", self.commands[1])
+        self.assertNotIn("-a", self.commands[0])
+        self.assertEqual(self.commands[1][-1], "/dev/nvme1n1")
+        self.assertIn("lazy_itable_init=0,lazy_journal_init=0,nodiscard", self.commands[1])
+        self.assertEqual(self.work.stat().st_mode & 0o777, 0o700)
+        self.native_storage.inspect.assert_called_once_with(binding())
+        self.assertEqual(self.preflight.call_count, 2)
+        self.assertGreaterEqual(self.guard.call_count, 6)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.commands), 4)
+
+    def test_nonblank_and_failed_probe_never_format(self):
+        self.probe = b'{"signatures":[{"type":"ext4"}]}'
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.commands), 1)
+        self.assertFalse((self.out / "format-started.json").exists())
+        self.native_storage.inspect.assert_not_called()
+
+    def test_each_command_failure_preserves_marker_and_never_retries_or_unmounts(self):
+        for failed in range(1, 5):
+            with self.subTest(command=failed), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory) / "attempt"
+                work = Path(directory) / "disk"
+                self.commands, self.failure = [], failed
+                with patch.object(m, "WORK", work), self.assertRaises(ValueError):
+                    m._prepare_admitted_once(
+                        self.native_storage, binding(), self.runtime, self.guard, out
+                    )
+                self.assertEqual(len(self.commands), failed)
+                report = (out / "failed.json").read_bytes()
+                self.assertNotIn(b"private exception", report)
+                self.assertTrue(json.loads(report)["partial_preserved"])
+                self.assertFalse((out / "result.json").exists())
+                self.assertFalse(any("umount" in a[0] for a in self.commands))
+
+    def test_unarmed_guard_deadline_or_device_drift_prevents_format(self):
+        self.guard.side_effect = ValueError("not armed")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(self.out.exists())
+        self.guard.side_effect = None
+        self.runtime.boot_time.return_value = 1350
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(self.commands)
+        self.runtime.boot_time.return_value = 100
+        self.preflight.side_effect = [self.target, self.target | {"device": "259:3"}]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(len(self.commands), 1)
+
+    def test_post_mount_inspection_failure_is_not_success(self):
+        self.native_storage.inspect.side_effect = ValueError("bad mount")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertTrue(self.work.exists())
+        self.assertFalse((self.out / "result.json").exists())
+        self.assertEqual(json.loads((self.out / "failed.json").read_bytes())["stage"], "readback")
+
+
+fixture = load_fixture("_disk_network_fixture", "tests/test_sft_vm_network_bootstrap_v2.py")
+fixture.m = network
+
+
+class NetworkJoinTests(fixture.NetworkBootstrapTests):
+    def setUp(self):
+        super().setUp()
+        self.preparation = types.SimpleNamespace(
+            preflight=Mock(), _prepare_admitted_once=Mock(side_effect=self.prepare)
+        )
+        self.wheel.load_storage = Mock()
+        self.wheel.preflight.side_effect = lambda *a: self.events.append("storage-preflight")
+        self.enterContext(
+            patch.object(
+                network,
+                "load",
+                side_effect=lambda n: (
+                    fixture.policy
+                    if n.startswith("build_")
+                    else self.preparation
+                    if n.startswith("prepare_")
+                    else self.wheel
+                ),
+            )
+        )
+
+    def prepare(self, *args):
+        self.assertTrue((self.out / "watch-ready").is_dir())
+        args[3]()
+        self.events.append("disk-prepare")
+        if self.failure == "disk":
+            raise ValueError("disk failed")
+
+    def setup(self, *args):
+        return wrapped() | {"setup": super().setup(*args)}
+
+    def test_guard_before_setup_then_single_transition(self):
+        value = self.call()
+        self.assertEqual(
+            self.events,
+            [
+                "verify",
+                "check",
+                "timer",
+                "install",
+                "watch",
+                "disk-prepare",
+                "storage-preflight",
+                "setup",
+                "transition",
+            ],
+        )
+        self.assertTrue(value["watchdog_left_running"])
+        self.assertFalse(value["host_admitted"])
+
+    def test_disk_failure_blocks_wheel_download_and_preserves_phase(self):
+        self.failure = "disk"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.wheel._run_network_admitted_once.assert_not_called()
+        self.wheel.preflight.assert_not_called()
+        self.shutdown.assert_called_once()
+        self.assertEqual(
+            json.loads((self.out / "failed.json").read_bytes())["failed_phase"],
+            "work_disk_preparation",
+        )
+
+
+joined = load_fixture("_disk_actual_return_chain", "tests/test_sft_vm_setup_return_contract_v1.py")
+joined.m = network
+joined.fixture.m = network
+
+
+class ActualReturnChainTests(joined.JoinedTests):
+    def setUp(self):
+        super().setUp()
+        self.enterContext(patch.object(m, "WORK", self.root / "fresh-work-disk"))
+        self.enterContext(patch.object(m, "preflight", return_value=disks()[1]))
+        self.wheel.load_storage = Mock(return_value=joined.storage)
+        self.enterContext(
+            patch.object(
+                network,
+                "load",
+                side_effect=lambda n: (
+                    joined.fixture.policy
+                    if n.startswith("build_")
+                    else m
+                    if n.startswith("prepare_")
+                    else self.wheel
+                ),
+            )
+        )
+        self.native_commands = []
+        self.enterContext(patch.object(network, "command", side_effect=self.disk_command))
+
+    def disk_command(self, argv, *args, **kwargs):
+        self.native_commands.append(argv)
+        if argv[0].endswith("wipefs"):
+            return b'{"signatures":[]}'
+        return self.command(argv, *args, **kwargs)
+
+    def test_actual_disk_and_frozen_return_chain_persist_receipts(self):
+        self.joined_setup()
+        value = self.call()
+        self.assertTrue(value["wheel_and_offline_setup_verified"])
+        receipt = json.loads((self.out / "disk-preparation/result.json").read_bytes())
+        self.assertTrue(receipt["work_disk_prepared"])
+        self.assertEqual(receipt["storage_snapshot"], wrapped()["storage_snapshot"])
+        self.assertEqual(sum(a[0].endswith("mkfs.ext4") for a in self.native_commands), 1)
+        self.assertEqual(self.units_seen, [joined.wheel.UNIT, *joined.sequence.UNITS.values()])
+
+
+if __name__ == "__main__":
+    unittest.main()

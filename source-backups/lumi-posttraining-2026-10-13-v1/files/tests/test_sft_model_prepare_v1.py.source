@@ -1,0 +1,289 @@
+"""Metadata-only model preparation regressions; no ML/CUDA or model file reads."""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+PACKAGE = "_synthetic_model_prepare_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(Path(__file__).resolve().parents[1] / "src/lumi")]
+sys.modules[PACKAGE] = package
+prep = importlib.import_module(PACKAGE + ".posttraining_sft_model_prepare_v1")
+
+
+class Parameter:
+    def __init__(self, shape, trainable=True):
+        self.shape, self.requires_grad = shape, trainable
+
+
+class Model:
+    def __init__(self):
+        self.items = [Parameter((8, 8)), Parameter((8,)), Parameter((), False)]
+        self.config = types.SimpleNamespace(max_position_embeddings=4096, pad_token_id=0)
+
+    def parameters(self):
+        return iter(self.items)
+
+
+class Wrapped:
+    def __init__(self, model, world, strategy):
+        self.items = list(model.items)
+        self.process_group, self.sharding_strategy = world, strategy
+        self._use_orig_params = True
+        self.training = False
+
+    def parameters(self):
+        return iter(self.items)
+
+    def train(self):
+        self.training = True
+        return self
+
+
+class PreparationTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.model = Model()
+        self.context = object()
+        self.world, self.strategy = object(), object()
+        events = self.events
+
+        class AdamW:
+            def __init__(self, groups, **options):
+                events.append("optimizer")
+                self.param_groups, self.options, self.state = groups, options, {}
+
+        def wrap(model, **options):
+            self.assertIs(options["context"], self.context)
+            self.assertEqual(options["strategy"], "fsdp_full_shard")
+            self.assertEqual(options["precision"], "bf16")
+            self.events.append("wrap")
+            # Mimic metadata changes only, not native FSDP success.
+            for index, parameter in enumerate(model.items):
+                parameter.shape = (0 if index == 0 else 3,)
+            return Wrapped(model, self.world, self.strategy)
+
+        self.torch = types.SimpleNamespace(
+            optim=types.SimpleNamespace(AdamW=AdamW),
+            manual_seed=lambda seed: self.events.append(("seed", seed)),
+            cuda=types.SimpleNamespace(
+                manual_seed_all=lambda seed: self.events.append(("cuda_seed", seed))),
+            distributed=types.SimpleNamespace(group=types.SimpleNamespace(WORLD=self.world)))
+        self.distributed = types.SimpleNamespace(_wrap_model=wrap)
+        self.fsdp = types.SimpleNamespace(FullyShardedDataParallel=Wrapped,
+                                         ShardingStrategy=types.SimpleNamespace(
+                                             FULL_SHARD=self.strategy))
+
+    def options(self, **changes):
+        def load():
+            self.events.append("load")
+            return self.model
+
+        return {"context": self.context, "rank": 0, "pad_token_id": 0,
+                "encoded_root": object(), "output_parent_fd": 99,
+                "admit": lambda: self.events.append("admit"), "load_model": load,
+                "release": lambda: self.events.append("release"), **changes}
+
+    def native_double(self, preparation):
+        return patch.object(preparation, "_runtime", return_value=(
+            self.torch, self.distributed, types.SimpleNamespace(LumiForCausalLM=Model), self.fsdp))
+
+    def error(self, code, callback, *args, **kwargs):
+        with self.assertRaises(prep.PreparationError) as caught:
+            callback(*args, **kwargs)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn("PRIVATE", repr(caught.exception))
+
+    def test_constructor_inert_and_invalid_arguments_rejected(self):
+        prep.ModelPreparation(**self.options())
+        self.assertEqual(self.events, [])
+        for changes in ({"rank": True}, {"rank": 8}, {"pad_token_id": -1},
+                        {"output_parent_fd": True}, {"admit": None}, {"load_model": None},
+                        {"release": None}):
+            self.error("invalid_arguments", prep.ModelPreparation, **self.options(**changes))
+
+    def test_decay_membership_survives_empty_and_one_dimensional_local_shards(self):
+        matrix, vector, frozen = self.model.items
+        wrapped, optimizer = prep._wrap_and_optimize(
+            self.model, self.context, self.torch, self.distributed)
+        self.assertEqual(matrix.shape, (0,))
+        self.assertEqual(vector.shape, (3,))
+        self.assertEqual(optimizer.param_groups[0], {"params": [matrix], "weight_decay": 0.01})
+        self.assertEqual(optimizer.param_groups[1], {"params": [vector], "weight_decay": 0.0})
+        self.assertNotIn(frozen, sum([group["params"] for group in optimizer.param_groups], []))
+        self.assertEqual(optimizer.options, {"lr": 1e-5, "betas": (0.9, 0.95), "fused": True})
+        self.assertEqual(self.events, ["wrap", "optimizer"])
+        self.assertTrue(wrapped.training)
+
+    def test_legacy_helper_reproduces_post_wrap_grouping_bug_without_ml(self):
+        # Execute only the original helper's AST with metadata doubles. This does
+        # not import the training module or invoke a native optimizer.
+        source = Path(package.__path__[0]) / "pilot_training.py"
+        tree = ast.parse(source.read_text())
+        function = next(item for item in tree.body
+                        if isinstance(item, ast.FunctionDef) and item.name == "_create_optimizer")
+        function.returns = None
+        for argument in function.args.args + function.args.kwonlyargs:
+            argument.annotation = None
+        module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+        namespace = {"torch": self.torch,
+                     "OPTIMIZER_PROFILES": {"legacy", "grouped_adamw_beta2_0.95_v0.1"}}
+        exec(compile(module, str(source), "exec"), namespace)
+        for parameter in self.model.items:
+            parameter.ndim = 1  # Shape after FSDP, not the original matrix shape.
+        self.model.named_parameters = lambda: (
+            (f"parameter_{index}", parameter)
+            for index, parameter in enumerate(self.model.items))
+        optimizer = namespace["_create_optimizer"](
+            self.model, device=types.SimpleNamespace(type="cuda"), learning_rate=1e-5,
+            weight_decay=0.01, optimizer_profile="grouped_adamw_beta2_0.95_v0.1")
+        self.assertEqual(optimizer.param_groups[0]["params"], [])
+        self.assertIn(self.model.items[0], optimizer.param_groups[1]["params"])
+
+    def test_pre_wrap_empty_dimension_rejected(self):
+        self.model.items[0].shape = (0,)
+        self.error("grouping_rejected", prep._wrap_and_optimize,
+                   self.model, self.context, self.torch, self.distributed)
+        self.assertEqual(self.events, [])
+
+    def test_duplicate_or_missing_trainable_parameters_rejected(self):
+        for items in ([self.model.items[0]] * 2, [Parameter((2,), False)], []):
+            self.model.items = items
+            self.error("grouping_rejected", prep._original_groups, self.model)
+
+    def test_bad_shape_or_trainability_rejected_before_wrap(self):
+        for shape, flag in (([2, 3], True), ((True,), True), ((2**31,), True),
+                            ((-1,), True), ((1,) * 9, True), ((1,), 1)):
+            self.model.items = [Parameter(shape, flag)]
+            self.error("grouping_rejected", prep._original_groups, self.model)
+
+    def test_wrap_cannot_replace_drop_add_or_freeze_parameter_objects(self):
+        for mutation in ("replace", "drop", "add", "freeze", "duplicate"):
+            model = Model()
+
+            def bad_wrap(source, mutation=mutation, **_):
+                wrapped = Wrapped(source, self.world, self.strategy)
+                if mutation == "replace":
+                    wrapped.items[0] = Parameter((8,))
+                elif mutation == "drop":
+                    wrapped.items.pop()
+                elif mutation == "add":
+                    wrapped.items.append(Parameter((8,)))
+                elif mutation == "freeze":
+                    wrapped.items[0].requires_grad = False
+                else:
+                    wrapped.items.append(wrapped.items[0])
+                return wrapped
+
+            with self.subTest(mutation=mutation):
+                self.error("grouping_rejected", prep._wrap_and_optimize, model, self.context,
+                           self.torch, types.SimpleNamespace(_wrap_model=bad_wrap))
+        self.assertNotIn("optimizer", self.events)
+
+    def test_admission_denial_precedes_runtime_loader_and_seeding(self):
+        loader = Mock()
+        preparation = prep.ModelPreparation(**self.options(admit=lambda: False, load_model=loader))
+        with patch.object(preparation, "_runtime") as runtime:
+            self.error("admission_rejected", preparation)
+            self.error("admission_rejected", preparation)
+        runtime.assert_not_called()
+        loader.assert_not_called()
+        self.assertEqual(self.events, [])
+
+    def test_mac_or_missing_native_runtime_rejected_before_model_load(self):
+        loader = Mock()
+        preparation = prep.ModelPreparation(**self.options(load_model=loader))
+        with patch.object(prep.sys, "platform", "darwin"):
+            self.error("runtime_rejected", preparation)
+        loader.assert_not_called()
+        self.assertEqual(self.events, ["admit", "release"])
+
+    def test_linux_without_admitted_ml_modules_does_not_import_them(self):
+        preparation = prep.ModelPreparation(**self.options())
+        before = set(sys.modules)
+        with patch.object(prep.sys, "platform", "linux"):
+            self.error("runtime_rejected", preparation)
+        self.assertEqual(set(sys.modules), before)
+        self.assertNotIn("load", self.events)
+
+    def test_preparation_returns_bridge_type_and_close_is_once(self):
+        preparation = prep.ModelPreparation(**self.options())
+        with self.native_double(preparation):
+            prepared = preparation()
+        self.assertIs(type(prepared), prep.PreparedRank)
+        self.assertEqual(self.events, ["admit", ("seed", 2027), ("cuda_seed", 2027),
+                                      "load", "wrap", "optimizer"])
+        self.assertEqual(self.model.config._attn_implementation, "eager")
+        prepared.close()
+        prepared.close()
+        self.error("already_consumed", preparation)
+        self.assertEqual(self.events.count("release"), 1)
+        self.assertFalse(preparation.summary()["real_execution_authorized"])
+
+    def test_invalid_config_never_wraps_and_releases_once(self):
+        for context, pad in ((4095, 0), (True, 0), (4096, 1), (4096, False)):
+            self.model = Model()
+            self.model.config.max_position_embeddings = context
+            self.model.config.pad_token_id = pad
+            preparation = prep.ModelPreparation(**self.options())
+            with self.native_double(preparation):
+                self.error("model_rejected", preparation)
+        self.assertNotIn("wrap", self.events)
+        self.assertEqual(self.events.count("release"), 4)
+
+    def test_loader_failure_cleanup_and_first_failure_retained(self):
+        preparation = prep.ModelPreparation(**self.options(
+            load_model=Mock(side_effect=ValueError("PRIVATE")),
+            release=Mock(side_effect=OSError("PRIVATE-CLEANUP"))))
+        with self.native_double(preparation):
+            self.error("model_rejected", preparation)
+        self.assertTrue(preparation.summary()["release_failed"])
+        self.assertEqual(preparation.summary()["failure_code"], "model_rejected")
+
+    def test_swallowed_loader_reentry_prevents_wrapping(self):
+        preparation = prep.ModelPreparation(**self.options())
+
+        def load():
+            self.error("already_consumed", preparation)
+            return self.model
+
+        preparation._load = load
+        with self.native_double(preparation):
+            self.error("already_consumed", preparation)
+        self.assertNotIn("wrap", self.events)
+        self.assertEqual(self.events.count("release"), 1)
+
+    def test_wrong_wrapper_rejected_and_released(self):
+        preparation = prep.ModelPreparation(**self.options())
+        other = Wrapped(self.model, object(), self.strategy)
+        with self.native_double(preparation), patch.object(
+                prep, "_wrap_and_optimize", return_value=(other, object())):
+            self.error("wrap_failed", preparation)
+        self.assertEqual(self.events.count("release"), 1)
+
+    def test_failed_optimizer_is_cleaned_and_not_retried(self):
+        preparation = prep.ModelPreparation(**self.options())
+        with self.native_double(preparation), patch.object(
+                self.torch.optim, "AdamW", side_effect=ValueError("PRIVATE")) as optimizer:
+            self.error("optimizer_failed", preparation)
+            self.error("optimizer_failed", preparation)
+        optimizer.assert_called_once()
+        self.assertEqual(self.events.count("release"), 1)
+
+    def test_reinitialization_and_wrong_owner_rejected(self):
+        preparation = prep.ModelPreparation(**self.options())
+        self.error("already_consumed", preparation.__init__, **self.options())
+        with patch.object(prep.os, "getpid", return_value=-1):
+            self.error("owner_mismatch", preparation)
+        self.assertEqual(self.events, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

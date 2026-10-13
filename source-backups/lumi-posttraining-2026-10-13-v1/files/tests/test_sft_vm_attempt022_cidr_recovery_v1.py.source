@@ -1,0 +1,92 @@
+"""Offline CIDR-only recovery, source closure and admission boundary."""
+
+import ast
+import json
+import socket
+import subprocess
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import preflight_sft_vm_attempt022_v2 as entry
+from scripts import prepare_sft_vm_attempt022_cidr_bindings_v1 as bindings
+from scripts import prepare_sft_vm_attempt022_v2 as source
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        for module, name in ((socket, "socket"), (socket, "create_connection"),
+                             (subprocess, "run"), (subprocess, "Popen")):
+            guard = patch.object(module, name, side_effect=AssertionError("offline_only"))
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def test_saved_source_closure_and_selector_identical(self):
+        report = source.verify()
+        self.assertEqual(len(report["outputs"]), 156)
+        self.assertTrue(report["selector_byte_identical"])
+        self.assertTrue(report["watchdog_code_unchanged"])
+        self.assertEqual(report["receipt_file_count"], 19)
+
+    def test_only_two_cidr_seeds_changed(self):
+        before, _ = source.prerequisites()
+        changed = {name for name, raw in before.items() if name.endswith((".json", ".py"))
+                   and source.OLD_CIDR.encode() in raw and not name.startswith("evidence/")}
+        self.assertEqual(changed, {"scripts/run_sft_vm_private_network_v1.py",
+                                   "configs/lumi-vm-private-network-plan-v0.1.json"})
+
+    def test_saved_plan_and_helper_reproduce(self):
+        _, expected = bindings.build()
+        raw = (source.ROOT / bindings.PLAN_DIR / "plan.json").read_bytes()
+        release = (source.ROOT / bindings.PLAN_DIR / "release.json").read_bytes()
+        self.assertEqual(bindings.encode(expected), raw)
+        self.assertEqual(bindings.helper_source(raw, release),
+                         (source.ROOT / bindings.HELPER).read_bytes())
+        self.assertFalse(expected["watchdog_and_cleanup_bucket_redeployment_required"])
+        self.assertFalse(expected["execution_permitted"])
+
+    def test_actual_saved_outer_graph_and_readonly_callback(self):
+        outer, manifest, controls = entry.local()
+        self.assertEqual(manifest["attempt"], source.ATTEMPT)
+        self.assertEqual(len(controls), 2)
+        callback = entry.admission(outer)
+        self.assertNotIn("run", callback.__globals__)
+        self.assertNotIn("authorized", callback.__globals__)
+        self.assertFalse(entry.OUTPUT.exists())
+        self.assertEqual(entry.MAX_CALLS, 79)
+
+    def test_preflight_semantics_only_bindings_and_output_changed(self):
+        old = (source.ROOT / "scripts/preflight_sft_vm_attempt022_v1.py").read_text()
+        new = Path(entry.__file__).read_text().replace(
+            "prepare_sft_vm_attempt022_deployment_bindings_v3",
+            "prepare_sft_vm_attempt022_deployment_bindings_v2").replace(
+                "readonly-preflight-v0.2", "readonly-preflight-v0.1").replace(
+                    entry.BINDINGS_SHA,
+                    "f2a6c1ddc2ac8c89d018049ea152196d6e89a4048ac9f88be177a5e8dd504e03")
+        self.assertEqual(ast.dump(ast.parse(old)), ast.dump(ast.parse(new)))
+
+    def test_new_plan_keeps_no_execution_authority(self):
+        plan = entry.bindings.build()
+        self.assertEqual(plan["network_candidate_cidr"], "172.31.97.64/27")
+        self.assertIsNone(plan["approval_record"])
+        self.assertIsNone(plan["successful_readonly_preflight"])
+        with self.assertRaises(ValueError):
+            entry.bindings.run(approved=True)
+
+    def test_runtime_hash_drift_rejected(self):
+        for name in ("BINDINGS_SHA", "BUDGET_SHA", "SOURCE_SHA", "BOTOCORE_INIT_SHA"):
+            with self.subTest(name=name), patch.object(entry, name, "0" * 64):
+                with self.assertRaises(ValueError):
+                    entry.runtime()
+
+    def test_versioned_checkpoint_selection_identical(self):
+        selected = source.previous.SELECTION
+        self.assertEqual((source.BASE / selected).read_bytes(),
+                         (source.OUTPUT / selected).read_bytes())
+        value = json.loads((source.OUTPUT / selected).read_bytes())
+        self.assertTrue(value["object_versions_bound"])
+        self.assertEqual(value["versioned_object_count"], 22)
+
+
+if __name__ == "__main__":
+    unittest.main()

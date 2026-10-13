@@ -1,0 +1,122 @@
+"""Synthetic console and cloud; no actual network or model data."""
+
+import base64
+import contextlib
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import diagnose_sft_vm_attempt013_boot_markers_v1 as m
+from scripts import execute_sft_vm_private_outer_v14 as entry
+
+
+class Tests(unittest.TestCase):
+    def test_plain_unicode_and_base64_only_retain_allowlisted_counts(self):
+        raw = "বুট PRIVATE_SENTINEL\nLUMI_BOOT_V2:ready\nLUMI_BOOT_V2:rejected\n"
+        for body in (raw, base64.b64encode(raw.encode()).decode()):
+            report = m.analyze(dict(InstanceId="test", Output=body), "test")
+            self.assertEqual(report["marker_counts"]["ready"], 1)
+            self.assertEqual(report["marker_counts"]["rejected"], 1)
+            self.assertNotIn("PRIVATE_SENTINEL", json.dumps(report))
+
+    def test_marker_prefixes_and_unknown_names_not_counted(self):
+        result = m.analyze(
+            dict(InstanceId="test", Output="LUMI_BOOT_V2:ready_bad\nLUMI_BOOT_V2:unknown\n"), "test"
+        )
+        self.assertEqual(sum(result["marker_counts"].values()), 0)
+
+    def test_bad_instance_type_and_oversize_rejected(self):
+        for reply in (
+            {"InstanceId": "wrong", "Output": "x"},
+            {"InstanceId": "test", "Output": None},
+            {"InstanceId": "test", "Output": "x" * (m.CAP + 1)},
+            {"InstanceId": "test", "Output": "ব" * m.CAP},
+        ):
+            with self.assertRaises(ValueError):
+                m.analyze(reply, "test")
+
+    def fixture(self):
+        proof = json.loads(m.PROOF.read_bytes())
+        row = dict(
+            InstanceId=proof["outcome"]["instance"],
+            State={"Name": "stopped"},
+            InstanceType="r6i.4xlarge",
+            Tags=[dict(Key="LumiAttempt", Value=proof["attempt"])],
+            BlockDeviceMappings=[
+                {"Ebs": {"VolumeId": x}} for x in proof["outcome"]["two_retained_ebs_ids"]
+            ],
+        )
+        client = Mock(spec=["describe_instances", "get_console_output", "close"])
+        client.describe_instances.return_value = {
+            "Reservations": [{"OwnerId": "573978149073", "Instances": [row]}]
+        }
+        client.get_console_output.return_value = dict(
+            InstanceId=row["InstanceId"], Output="PRIVATE_SENTINEL\nLUMI_BOOT_V2:ready\n"
+        )
+
+        class Reader:
+            calls = 0
+            closed = False
+
+            def __init__(self, deadline):
+                self.deadline = deadline
+
+            def __call__(self):
+                self.calls += 1
+                return dict(access_key="synthetic", secret_key="synthetic", token="synthetic")
+
+            def active(self):
+                pass
+
+        sdk = types.SimpleNamespace(create_client=Mock(return_value=client))
+        credentials = types.SimpleNamespace(
+            Reader=Reader,
+            session=lambda: sdk,
+            endpoint=lambda _: "https://ec2.us-east-1.amazonaws.com",
+            ca_path=lambda: "synthetic",
+            legacy=types.SimpleNamespace(config=lambda _: {}),
+        )
+        outer = types.SimpleNamespace(
+            credentials=credentials,
+            network=types.SimpleNamespace(
+                host=types.SimpleNamespace(timeout=lambda _: contextlib.nullcontext())
+            ),
+        )
+        return client, row, outer
+
+    def test_one_console_read_no_retry_no_raw_storage(self):
+        client, _, outer = self.fixture()
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(m, "OUTPUT", Path(tmp).resolve() / "out"),
+            patch.object(entry, "local_preconditions"),
+            patch.object(entry, "outer", outer),
+        ):
+            result = m.run()
+            self.assertEqual(result["console_reads"], 1)
+            self.assertEqual(result["ec2_calls"], 2)
+            self.assertEqual(result["credential_generations"], 1)
+            self.assertNotIn("PRIVATE_SENTINEL", (m.OUTPUT / "result.json").read_text())
+            with self.assertRaises(ValueError):
+                m.run()
+        client.get_console_output.assert_called_once()
+        client.close.assert_called_once()
+
+    def test_running_or_wrong_owner_stops_before_console(self):
+        for change in ("running", "wrong_tag"):
+            client, row, outer = self.fixture()
+            if change == "running":
+                row["State"]["Name"] = "running"
+            else:
+                row["Tags"][0]["Value"] = "wrong"
+            with (
+                tempfile.TemporaryDirectory() as tmp,
+                patch.object(m, "OUTPUT", Path(tmp).resolve() / "out"),
+                patch.object(entry, "local_preconditions"),
+                patch.object(entry, "outer", outer),
+            ):
+                self.assertEqual(m.run()["status"], "failed_closed")
+            client.get_console_output.assert_not_called()

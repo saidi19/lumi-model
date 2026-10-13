@@ -1,0 +1,56 @@
+import base64
+import gzip
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "native_probe_controller", ROOT / "scripts/execute_sft_vm_network_native_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class NativeProbePreflightTests(unittest.TestCase):
+    def test_cloud_config_exact_two_authenticated_sources(self):
+        raw, digest = m.cloud_config()
+        self.assertLessEqual(len(raw), 16384)
+        config = json.loads(raw.decode().split("\n", 1)[1])
+        self.assertEqual(len(config["write_files"]), 2)
+        self.assertEqual(
+            config["runcmd"],
+            [["/usr/bin/python3", "-I", "-B", "/opt/lumi-network-probe/probe.py", "--outer"]],
+        )
+        sources = ("probe_sft_vm_network_native_v1.py", "build_sft_vm_network_expiry_v1.py")
+        for member, name in zip(config["write_files"], sources, strict=True):
+            data = gzip.decompress(base64.b64decode(member["content"], validate=True))
+            self.assertEqual(data, (ROOT / "scripts" / name).read_bytes())
+            self.assertEqual(member["permissions"], "0400")
+            compile(data, name, "exec")
+        self.assertEqual(len(digest), 64)
+
+    def test_prepare_config_has_no_network_or_cloud_side_effects(self):
+        with patch.object(m.subprocess, "run") as run:
+            m.cloud_config()
+        run.assert_not_called()
+
+    def test_evidence_is_exclusive(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(m, "OUT", Path(temp)):
+            m.save("example.json", {"x": 1})
+            with self.assertRaises(FileExistsError):
+                m.save("example.json", {"x": 2})
+            self.assertEqual(json.loads((Path(temp) / "example.json").read_text()), {"x": 1})
+
+    def test_existing_attempt_rejects_before_any_resource_creation(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(m, "OUT", Path(temp)),
+            patch.object(m, "aws", return_value={"Account": m.ACCOUNT}) as cloud,
+        ):
+            with self.assertRaises(FileExistsError):
+                m.main()
+            cloud.assert_called_once_with("sts", "get-caller-identity")

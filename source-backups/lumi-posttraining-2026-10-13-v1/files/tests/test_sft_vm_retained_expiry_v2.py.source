@@ -1,0 +1,49 @@
+"""Run the original safety suite against the narrowly changed timeout successor."""
+
+import ast
+from unittest.mock import patch
+
+from scripts import inspect_sft_vm_retained_expiry_v2 as m
+from tests import test_sft_vm_retained_expiry_v1 as baseline
+
+
+class RecoveryTests(baseline.InspectionTests):
+    @classmethod
+    def setUpClass(cls):
+        cls.enterClassContext(patch.object(baseline, "m", m))
+        super().setUpClass()
+
+    def reply(self, argv, env):
+        self.assertEqual(argv[argv.index("--cli-read-timeout") + 1], "15")
+        self.assertEqual(argv[argv.index("--cli-connect-timeout") + 1], "3")
+        return super().reply(argv, env)
+
+    def test_only_reviewed_timeouts_change_operational_functions(self):
+        old = ast.parse(m.read(m.ROOT / "scripts/inspect_sft_vm_retained_expiry_v1.py"))
+        new = ast.parse(m.read(m.ROOT / "scripts/inspect_sft_vm_retained_expiry_v2.py"))
+
+        def functions(tree):
+            return {
+                n.name: ast.dump(n, include_attributes=False)
+                for n in tree.body
+                if isinstance(n, ast.FunctionDef)
+            }
+
+        before, after = functions(old), functions(new)
+        self.assertEqual(set(before), set(after))
+        for name in before.keys() - {"inputs", "plan", "expected_approval", "command"}:
+            self.assertEqual(before[name], after[name], name)
+        self.assertEqual(
+            (m.MAX_CALLS, m.MAX_SECONDS, m.MAX_RESPONSE_BYTES, m.MAX_WRITE_BYTES),
+            (18, 400, 1048576, 16384),
+        )
+        self.assertEqual(
+            (m.READ_TIMEOUT_SECONDS, m.COMMAND_SECONDS, m.CLEANUP_RESERVE_SECONDS), (15, 30, 2)
+        )
+
+    def test_command_reserve_enforced_before_dispatch(self):
+        self.fake.t = self.cloud.start + 369
+        with patch.object(m, "command") as command:
+            with self.assertRaises(ValueError):
+                self.cloud.cli("sts", "get-caller-identity")
+            command.assert_not_called()

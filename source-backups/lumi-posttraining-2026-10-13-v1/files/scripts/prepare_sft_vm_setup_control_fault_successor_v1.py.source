@@ -1,0 +1,134 @@
+"""Local-only strict ownership fault localization and empty-visibility successor."""
+
+import ast
+import hashlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "scripts/qualify_sft_vm_setup_production_v2.py"
+BASE_SHA = "2bc3fb77f95f59eae9579a13687ae227aab4baa16f56fa9918e371e6081577f9"
+OUTPUT = ROOT / "scripts/qualify_sft_vm_setup_production_v3.py"
+
+OWNED = """class OwnershipFailure(ValueError):
+    def __init__(self, code):
+        super().__init__("owned_instance_rejected")
+        self.code = code
+
+
+def owned(response, instance, *, terminal=False):
+    stage = "instance_id_shape"
+    try:
+        need(type(instance) is str and re.fullmatch(r"i-[0-9a-f]{17}", instance))
+        stage = "pagination"
+        need(not response.get("NextToken"))
+        stage = "reservation_shape"
+        reservation = one(response["Reservations"])
+        stage = "account"
+        need(reservation["OwnerId"] == ACCOUNT)
+        stage = "instance_shape"
+        vm = one(reservation["Instances"])
+        stage = "identity_token"
+        need(vm["InstanceId"] == instance and vm["ClientToken"] == TOKEN)
+        stage = "image_type"
+        need(vm["ImageId"] == AMI and vm["InstanceType"] == "t3.micro")
+        stage = "diagnostic_tag"
+        tag(vm, "LumiDiagnostic", TOKEN)
+        if terminal:
+            stage = "terminal_state"
+            need(vm["State"]["Name"] == "terminated")
+        else:
+            stage = "network_key"
+            need(vm["VpcId"] == VPC and vm["SubnetId"] == SUBNET and vm["KeyName"] == KEY_NAME)
+            stage = "security_groups"
+            need({g["GroupId"] for g in vm["SecurityGroups"]} == {GROUP})
+            stage = "public_ip_profile"
+            need(not vm.get("PublicIpAddress") and not vm.get("IamInstanceProfile"))
+            stage = "imds_tokens"
+            need(vm["MetadataOptions"]["HttpTokens"] == "required")
+            stage = "ipv6"
+            need(not any(i.get("Ipv6Addresses") for i in vm.get("NetworkInterfaces", [])))
+        return vm
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise OwnershipFailure(stage) from None
+
+
+def cleanup_owned(response, instance):
+    try:
+        terminal = one(one(response["Reservations"])["Instances"])["State"]["Name"] == "terminated"
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise OwnershipFailure("state_shape") from None
+    return owned(response, instance, terminal=terminal)
+"""
+
+
+def build():
+    raw = BASE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("control_fault_base_rejected") from None
+    text = raw.decode()
+    node = next(n for n in ast.parse(text).body if getattr(n, "name", None) == "owned")
+    lines = text.splitlines(keepends=True)
+    lines[node.lineno - 1 : node.end_lineno] = [OWNED + "\n"]
+    text = "".join(lines)
+
+    def replace(old, new):
+        nonlocal text
+        if text.count(old) != 1:
+            raise ValueError("control_fault_anchor_rejected") from None
+        text = text.replace(old, new, 1)
+
+    replace(
+        '        return cloud.call("describe_instances", cleanup=cleanup, InstanceIds=[instance])',
+        '        response = cloud.call("describe_instances", cleanup=cleanup, '
+        'InstanceIds=[instance])\n'
+        '        if (type(response.get("Reservations")) is list\n'
+        '                and not response["Reservations"] and not response.get("NextToken")):\n'
+        "            return None\n"
+        "        return response",
+    )
+    replace(
+        "    except BaseException as error:\n"
+        '        if getattr(cloud, "last_cloud_failure", None) is not None:',
+        "    except BaseException as error:\n"
+        "        if type(error) is OwnershipFailure:\n"
+        '            report["ownership_failure_code"] = error.code\n'
+        '        if getattr(cloud, "last_cloud_failure", None) is not None:',
+    )
+    replace(
+        "                terminal = (\n"
+        '                    one(one(response["Reservations"])["Instances"])["State"]["Name"] '
+        '== "terminated"\n'
+        "                )\n"
+        "                vm = owned(response, instance, terminal=terminal)",
+        "                vm = cleanup_owned(response, instance)\n"
+        '                terminal = vm["State"]["Name"] == "terminated"',
+    )
+    replace(
+        "                    terminal = (\n"
+        '                        one(one(response["Reservations"])["Instances"])["State"]["Name"]\n'
+        '                        == "terminated"\n'
+        "                    )\n"
+        "                    owned(response, instance, terminal=terminal)",
+        "                    vm = cleanup_owned(response, instance)\n"
+        '                    terminal = vm["State"]["Name"] == "terminated"',
+    )
+    replace(
+        "            except BaseException:\n"
+        '                if getattr(cloud, "last_cloud_failure", None) is not None:',
+        "            except BaseException as error:\n"
+        "                if type(error) is OwnershipFailure:\n"
+        '                    report["cleanup_ownership_failure_code"] = error.code\n'
+        '                if getattr(cloud, "last_cloud_failure", None) is not None:',
+    )
+    for old, new in (
+        ("lumi-setup-production-20261013-f8275a9c", "lumi-setup-production-20261013-c93f481a"),
+        ("lumi-setup-production-qualification-v0.2", "lumi-setup-production-qualification-v0.3"),
+        (
+            "lumi-setup-production-qualification-approval-v0.2",
+            "lumi-setup-production-qualification-approval-v0.3",
+        ),
+        ("lumi-setup-production-readiness-v0.2", "lumi-setup-production-readiness-v0.3"),
+    ):
+        text = text.replace(old, new)
+    compile(text, str(OUTPUT), "exec")
+    return text.encode()

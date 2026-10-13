@@ -1,0 +1,241 @@
+"""One bounded read-only outcome/cleanup verification; no workload or mutation."""
+
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+from scripts import execute_sft_vm_private_outer_v26 as entry
+from scripts import sft_vm_admission_budget_v1 as budget
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "artifacts/lumi-vm-private-outer-execution-v0.26/attempt-021"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-021-v026-outcome-verification-v0.1"
+EVIDENCE = ROOT / "evidence/lumi-vm-attempt-021-v026-execution-verification-v0.1.json"
+PINS = {
+    "configs/lumi-vm-private-outer-execution-approval-v0.26.json":
+        "d69ee39056f176f29deb833cfe8dc45be821d2bb414154e00f92a82427f13e52",
+    "artifacts/lumi-vm-private-outer-preflight-v0.26/admission.json":
+        "b709965200cfea4757ea7f2c38e1896db2038d4bb0d90f5eb277aa4f53ee856b",
+    "artifacts/lumi-vm-private-outer-execution-v0.26/entry-result.json":
+        "509cea6e796f761f1af8a147fb996abef417bff27062d6a6751188024f2f7754",
+    BASE + "/network/0018-result.json":
+        "de5947d9761fcc57e1dc827e8d25b22fb0ee938dbb4af1183ae6feb9309f6d01",
+    BASE + "/host-preparation/watchdog/result.json":
+        "51623123770205f64b6c16c1c829a7503d72d457a017127cde9c951780e95ff4",
+}
+MAX_CALLS, MAX_SECONDS = 12, 180
+need, read, sha, encode = entry.need, entry.bindings.read, entry.sha, entry.encode
+
+
+def local():
+    for name, digest in PINS.items():
+        read(name, digest)
+    need(
+        sha(Path(entry.__file__).read_bytes())
+        == "dd9846ed307fc902dd763b215728cd1195c6b31ea2fdc87ba28f111b931f7b2b"
+    )
+    approved = json.loads(read(str(entry.APPROVAL.relative_to(ROOT))))
+    need(encode(approved) == encode(entry.expected_approval(approved["human_message"])))
+    outer, _, _ = entry.local()
+    result = json.loads(read("artifacts/lumi-vm-private-outer-execution-v0.26/entry-result.json"))
+    network = json.loads(read(BASE + "/network/0018-result.json"))
+    watchdog = json.loads(read(BASE + "/host-preparation/watchdog/result.json"))
+    need(result["execution_marker_created"] and result["outer_invoked"])
+    need(result["status"] == "failed_preserve_component_evidence_no_retry")
+    need(network["cost_resources_released"] and network["empty_network_removed"])
+    need(not network["cleanup_unresolved"] and not network["workload_completed"])
+    need(watchdog["code_update_attempts"] == 1 and not watchdog["host_launch_authorized"])
+    need(watchdog["stage"] == "successor_inert" and watchdog["failed_check"] is None)
+    need(not (ROOT / BASE / "host").exists())
+    names = [
+        BASE + "/network/" + name
+        for name in (
+            "0003-created-subnet.json",
+            "0005-created-table.json",
+            "0008-created-address.json",
+            "0010-created-nat.json",
+        )
+    ]
+    ids = [json.loads(read(name))["identifier"] for name in names]
+    target = json.loads(read(BASE + "/host-preparation/watchdog/started.json"))["code_sha256"]
+    return outer, ids, target, names
+
+
+class Meter(budget.AdmissionBudget):
+    def consume(self, service, **fields):
+        need(self.calls < MAX_CALLS and 0 <= self.clock() - self.start < MAX_SECONDS - 20)
+        return super().consume(service, **fields)
+
+
+def run():
+    outer, ids, target, names = local()
+    need(not OUTPUT.exists() and not EVIDENCE.exists())
+    need(not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents, EVIDENCE)))
+    OUTPUT.mkdir(mode=0o700)
+    outer.loading.save(
+        OUTPUT / "started.json",
+        encode(
+            dict(
+                max_sdk_reads=MAX_CALLS,
+                max_seconds=MAX_SECONDS,
+                mutations=0,
+                retry=False,
+                verifier_sha256=sha(Path(__file__).read_bytes()),
+            )
+        ),
+    )
+    report = dict(
+        schema="lumi.vm-attempt021-v026-execution-verification.v0.1",
+        status="started",
+        attempt=entry.bindings.ATTEMPT,
+        consumed_execution_preserved=True,
+        retry=False,
+        cloud_mutations=0,
+        object_access=0,
+        instance_actions=0,
+        cpu_instance_launched=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        production_eligible=False,
+        gpu=False,
+        training=False,
+        observations={},
+        failed_stage="successor_inert",
+        exact_original_failure_cause_proven=False,
+    )
+    bundle = None
+    with Meter(outer.credentials) as meter:
+        try:
+            start = float(math.floor(time.monotonic()))
+            first = True
+
+            def clock():
+                nonlocal first
+                if first:
+                    first = False
+                    return start
+                return time.monotonic()
+
+            reader = outer.credentials.Reader(start + 18000, clock=clock)
+            bundle = meter.clients(reader)
+            clients = bundle.clients
+
+            def call(service, operation, **fields):
+                value = getattr(clients[service], operation)(**fields)
+                need(type(value) is dict and len(json.dumps(value, default=str)) <= 262144)
+                need(not any(value.get(k) for k in ("NextToken", "Marker", "IsTruncated")))
+                return value
+
+            def absent(label, service, operation, key, allowed_codes, **fields):
+                try:
+                    value = call(service, operation, **fields)
+                    empty = not value[key]
+                except Exception as error:
+                    code = getattr(error, "response", {}).get("Error", {}).get("Code")
+                    need(code in allowed_codes)
+                    empty = True
+                report["observations"][label] = empty
+                need(empty)
+
+            subnet, table, address, nat = ids
+            absent(
+                "nat_deleted",
+                "ec2",
+                "describe_nat_gateways",
+                "NatGateways",
+                set(),
+                Filter=[
+                    dict(Name="nat-gateway-id", Values=[nat]),
+                    dict(Name="state", Values=["pending", "available", "deleting"]),
+                ],
+            )
+            absent(
+                "eip_released",
+                "ec2",
+                "describe_addresses",
+                "Addresses",
+                {"InvalidAllocationID.NotFound"},
+                AllocationIds=[address],
+            )
+            absent(
+                "subnet_deleted",
+                "ec2",
+                "describe_subnets",
+                "Subnets",
+                {"InvalidSubnetID.NotFound"},
+                SubnetIds=[subnet],
+            )
+            absent(
+                "route_table_deleted",
+                "ec2",
+                "describe_route_tables",
+                "RouteTables",
+                {"InvalidRouteTableID.NotFound"},
+                RouteTableIds=[table],
+            )
+            instances = call(
+                "ec2",
+                "describe_instances",
+                MaxResults=100,
+                Filters=[dict(Name="tag:LumiAttempt", Values=[entry.bindings.ATTEMPT])],
+            )
+            need(not any(row["Instances"] for row in instances["Reservations"]))
+            report["observations"]["no_attempt_instances"] = True
+            function = "lumi-stop-" + entry.bindings.ATTEMPT
+            config = call("lambda", "get_function_configuration", FunctionName=function)
+            guard = outer.loading.original_guard
+            guard.configuration({**config, "CodeSha256": guard.CODE}, guard.inert.UNARMED)
+            need(config["CodeSha256"] == target)
+            need(
+                call("lambda", "get_function_concurrency", FunctionName=function)[
+                    "ReservedConcurrentExecutions"
+                ]
+                == 0
+            )
+            event = call("lambda", "get_function_event_invoke_config", FunctionName=function)
+            need(event["MaximumRetryAttempts"] == 0 and event["MaximumEventAgeInSeconds"] == 60)
+            need(not any(event.get("DestinationConfig", {}).values()))
+            report["observations"]["watchdog_unarmed_invocation_disabled"] = True
+            absent(
+                "watchdog_schedule_group_absent",
+                "scheduler",
+                "get_schedule_group",
+                "Arn",
+                {"ResourceNotFoundException"},
+                Name=function,
+            )
+            absent(
+                "watchdog_stop_schedule_absent",
+                "scheduler",
+                "get_schedule",
+                "Arn",
+                {"ResourceNotFoundException"},
+                GroupName=function,
+                Name="stop",
+            )
+            report["status"] = "failed_attempt_cleanup_verified_no_cpu_launch_no_retry"
+        except BaseException:
+            report["status"] = "outcome_readback_stopped_preserve_no_retry"
+        finally:
+            if bundle is not None:
+                bundle.close()
+            report["read_budget"] = meter.report()
+            report["elapsed_seconds"] = round(time.monotonic() - meter.start, 3)
+            report["readback_maximum_calls"] = MAX_CALLS
+            report["readback_maximum_seconds"] = MAX_SECONDS
+    report["pins"] = PINS | {name: sha(read(name)) for name in names}
+    outer.loading.save(OUTPUT / "result.json", encode(report))
+    outer.loading.save(EVIDENCE, encode(report))
+    print(
+        json.dumps(
+            {key: report[key] for key in ("status", "observations", "read_budget")}, sort_keys=True
+        )
+    )
+    return report
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--verify-once"])
+    run()

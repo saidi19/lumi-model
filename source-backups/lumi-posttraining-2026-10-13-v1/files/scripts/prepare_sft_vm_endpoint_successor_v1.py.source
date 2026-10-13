@@ -1,0 +1,158 @@
+"""Source-only endpoint-admission successor. No execution/identity renewal."""
+
+import ast
+import json
+import os
+import re
+
+from scripts.prepare_sft_vm_cidr_successor_v1 import LIMIT, ROOT, encode, need, read, sha
+
+BASE = "artifacts/lumi-vm-network-cidr-successor-v0.1"
+BASE_SHA = "ed9b60096fa4a77bb215df9892320877516d6b07f8998f903dba8829c52ca107"
+OUTPUT = "artifacts/lumi-vm-endpoint-successor-v0.1"
+OUTER = "scripts/run_sft_vm_private_outer_v7.py"
+EVIDENCE = {
+    "evidence/lumi-vm-attempt-009-cpu-execution-verification-v0.1.json": (
+        "d1b40f40dc5fda79f033003b5b837022ef4da9f955a11d55c18886e7772d7deb"
+    ),
+    "evidence/lumi-vm-endpoint-dependency-audit-completion-v0.1.json": (
+        "2d524805b53798f62c3278907a9b1f213535d22cf8741cf79d8309c837a5ff18"
+    ),
+    "evidence/lumi-vm-endpoint-conflict-cleanup-verification-v0.1.json": (
+        "ff1b43fae667a1e2b229c2d934cf65a3f3e37778be4fa893679d99743da9883d"
+    ),
+}
+
+
+def inputs():
+    proofs = {n: json.loads(read(ROOT / n, pin)) for n, pin in EVIDENCE.items()}
+    cleanup = proofs[next(n for n in EVIDENCE if "cleanup-verification" in n)]
+    need(cleanup["result"]["cleanup_verified"] is True)
+    need(cleanup["result"]["mutations"] == 6)
+    for proof in proofs.values():
+        for name, pin in proof.get("source_bindings", {}).items():
+            need(not name.startswith("/") and ".." not in name.split("/"))
+            read(ROOT / name, pin["sha256"], pin["bytes"])
+    manifest = json.loads(read(ROOT / BASE / "release.json", BASE_SHA))
+    pins = manifest["outputs"]
+    need(len(pins) == 145)
+    files = {n: read(ROOT / BASE / n, p["sha256"], p["bytes"]) for n, p in pins.items()}
+    return files, pins
+
+
+def build(blobs, pins):
+    need(set(blobs) == set(pins))
+    need(
+        all(
+            sha(raw) == pins[n]["sha256"] and len(raw) == pins[n]["bytes"]
+            for n, raw in blobs.items()
+        )
+    )
+    seeds = dict(blobs)
+    source = seeds[OUTER].decode()
+    old = "        need(operation in readiness.base.OPS[service])\n"
+    new = """        if operation == "describe-instance-connect-endpoints":
+            need(service == "ec2" and fields == dict(
+                Filters=[dict(Name="vpc-id", Values=[network.selection.VPC])],
+                MaxResults=20))
+        else:
+            need(operation in readiness.base.OPS[service])
+"""
+    need(source.count(old) == 1)
+    source = source.replace(old, new)
+    anchor = '        vf = [dict(Name="vpc-id", Values=[selection.VPC])]\n'
+    guard = """        # VPC-wide check, not attempt-tagged: retained endpoints consume quota.
+        endpoint_rows = cloud.cli("ec2", "describe-instance-connect-endpoints",
+            Filters=[dict(Name="vpc-id", Values=[selection.VPC])],
+            MaxResults=20)["InstanceConnectEndpoints"]
+        need(type(endpoint_rows) is list and len(endpoint_rows) <= 20)
+        for endpoint in endpoint_rows:
+            need(endpoint["OwnerId"] == selection.ACCOUNT and endpoint["VpcId"] == selection.VPC)
+            if endpoint["State"] != "delete-complete":
+                self.report = dict(status="vpc_endpoint_slot_occupied",
+                    calls=cloud.calls, cloud_mutations=0)
+                raise ValueError("vpc_endpoint_slot_occupied") from None
+"""
+    need(source.count(anchor) == 1)
+    seeds[OUTER] = source.replace(anchor, guard + anchor).encode()
+    current = dict(seeds)
+    for _iteration in range(64):
+        mapping = {sha(raw): sha(current[name]) for name, raw in blobs.items()}
+        following = {}
+        for name, raw in seeds.items():
+            if name.endswith((".py", ".json")) and not name.startswith("evidence/"):
+                raw = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda m, mapping=mapping: mapping.get(m[0].decode(), m[0].decode()).encode(),
+                    raw,
+                )
+            following[name] = raw
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("endpoint_successor_hash_cycle")
+    changed = [n for n in current if current[n] != blobs[n]]
+    for name, raw in current.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name != OUTER:
+            need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", blobs[name])
+            )
+        if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+            need(raw == blobs[name])
+    need(sum(map(len, current.values())) < LIMIT)
+    return current, dict(
+        schema="lumi.vm-endpoint-successor.v0.1",
+        status="local_source_candidate_not_execution_ready",
+        proposed_execution_label="attempt-010",
+        source_release_sha256=BASE_SHA,
+        evidence_bindings=EVIDENCE,
+        logical_changes=[OUTER],
+        changed_files=sorted(changed),
+        unchanged_files=len(blobs) - len(changed),
+        iterations=_iteration + 1,
+        outputs={n: dict(bytes=len(raw), sha256=sha(raw)) for n, raw in sorted(current.items())},
+        source_identity="242bd09f5fa84b1f9a4e46cb4592ad8b",
+        source_identity_consumed=True,
+        fresh_operational_identity_bound=False,
+        consumed_execution_renewed=False,
+        endpoint_gate_before_network_allocation=True,
+        entry_uses_same_network_admission_before_execution_marker=True,
+        current_cloud_state_verified=False,
+        execution_permitted=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        remaining=[
+            "Fresh operational identity and its directly consequent guest/control bindings.",
+            "Fresh entry and explicit approvals; old approvals remain consumed.",
+            "Fresh live admission; cleanup evidence is historical, not a reservation.",
+        ],
+    )
+
+
+def prepare():
+    files, report = build(*inputs())
+    destination = ROOT / OUTPUT
+    need(
+        not destination.exists()
+        and not any(p.is_symlink() for p in (destination, *destination.parents))
+    )
+    files = files | {"release.json": encode(report)}
+    need(sum(map(len, files.values())) < LIMIT)
+    destination.mkdir(mode=0o700)
+    for name, raw in sorted(files.items()):
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("endpoint_candidate_is_not_execution_authority")

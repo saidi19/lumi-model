@@ -1,0 +1,192 @@
+"""Whole controller replay with synthetic SDK, credentials, clock and SSH."""
+
+import base64
+import contextlib
+import copy
+import io
+import json
+import socket
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import diagnose_sft_vm_transport_live_v4 as m
+
+
+class Tests(unittest.TestCase):
+    def replay(self, *, marker=True, terminal=True, already_terminal=False):
+        import botocore.session
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        output = Path(temporary.name).resolve() / "attempt"
+        now = [100.0]
+        calls = []
+        terminated = [already_terminal]
+        instance = "i-00000000000000001"
+        row = dict(
+            InstanceId=instance,
+            ClientToken=m.TOKEN,
+            ImageId=m.AMI,
+            InstanceType="t3.micro",
+            SubnetId=m.SUBNET,
+            VpcId=m.VPC,
+            KeyName=m.KEY_NAME,
+            Tags=[dict(Key="LumiDiagnostic", Value=m.TOKEN)],
+            State=dict(Name="running"),
+        )
+
+        def invoke(op, **fields):
+            calls.append((op, fields))
+            if op == "get_caller_identity":
+                return dict(Account=m.ACCOUNT)
+            if op == "describe_instance_connect_endpoints":
+                return dict(
+                    InstanceConnectEndpoints=[
+                        dict(State="create-complete", SubnetId=m.SUBNET, VpcId=m.VPC)
+                    ]
+                )
+            if op == "describe_security_groups":
+                return dict(SecurityGroups=[dict(OwnerId=m.ACCOUNT, VpcId=m.VPC)])
+            if op == "describe_images":
+                return dict(
+                    Images=[dict(State="available", OwnerId="099720109477", Architecture="x86_64")]
+                )
+            if op == "describe_instances":
+                if "Filters" in fields:
+                    return dict(Reservations=[])
+                current = copy.deepcopy(row)
+                if terminated[0]:
+                    current["State"]["Name"] = "terminated" if terminal else "shutting-down"
+                    if terminal:
+                        for key in ("SubnetId", "VpcId", "KeyName"):
+                            current.pop(key)
+                return dict(Reservations=[dict(OwnerId=m.ACCOUNT, Instances=[current])])
+            if op == "run_instances":
+                return dict(Instances=[dict(InstanceId=instance)])
+            if op == "get_console_output":
+                key = base64.b64encode(b"x" * 51).decode()
+                return dict(Output="LUMI_DIAG_HOSTKEY ssh-ed25519 " + key if marker else "")
+            if op == "terminate_instances":
+                terminated[0] = True
+                return {}
+            raise AssertionError(op)
+
+        class Client:
+            def __getattr__(self, op):
+                return lambda **fields: invoke(op, **fields)
+
+        session = Mock()
+        session.create_client.side_effect = lambda *a, **k: Client()
+        transport = types.SimpleNamespace(os=m.os, pipe_exchange=Mock(return_value=b"LUMI_DIAG_OK"))
+        transport.ExchangeFailure = type("SyntheticExchangeFailure", (Exception,), {})
+        joined = types.SimpleNamespace(
+            authenticate=Mock(),
+            lifecycle=types.SimpleNamespace(
+                guard=types.SimpleNamespace(
+                    provision=types.SimpleNamespace(
+                        setup=types.SimpleNamespace(
+                            delivery=types.SimpleNamespace(
+                                seed=types.SimpleNamespace(
+                                    sender=types.SimpleNamespace(delivery=transport)
+                                )
+                            )
+                        )
+                    )
+                )
+            ),
+        )
+        credentials = types.SimpleNamespace(
+            stdout=json.dumps(
+                dict(AccessKeyId="synthetic", SecretAccessKey="synthetic", SessionToken="synthetic")
+            ).encode()
+        )
+        saved_path = list(sys.path)
+        try:
+            with (
+                patch.object(m, "OUT", output),
+                patch.object(m.importlib, "import_module", return_value=joined),
+                patch.object(m.subprocess, "run", return_value=credentials),
+                patch.object(botocore.session, "get_session", return_value=session),
+                patch.object(m.time, "monotonic", side_effect=lambda: now[0]),
+                patch.object(m.time, "sleep", side_effect=lambda s: now.__setitem__(0, now[0] + s)),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                m._offline_flow()
+        finally:
+            sys.path[:] = saved_path
+        return json.loads((output / "result.json").read_bytes()), calls, transport
+
+    def test_success_terminal_missing_network_fields(self):
+        report, calls, transport = self.replay()
+        self.assertTrue(report["terminated_verified"])
+        self.assertTrue(report["probe_reply_matches"])
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+        transport.pipe_exchange.assert_called_once()
+
+    def test_marker_absence_stops_before_ssh_and_cleans_up(self):
+        report, calls, transport = self.replay(marker=False)
+        self.assertEqual(report["failed_stage"], "console_host_key")
+        self.assertTrue(report["terminated_verified"])
+        self.assertEqual(sum(op == "get_console_output" for op, _ in calls), 23)
+        transport.pipe_exchange.assert_not_called()
+
+    def test_full_poll_plan_and_cleanup_stay_bounded(self):
+        report, calls, _ = self.replay(marker=False, terminal=False)
+        self.assertEqual(len(calls), 78)
+        self.assertTrue(report["cleanup_unresolved"])
+        self.assertLess(report["elapsed_seconds"], 850)
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_already_terminated_does_not_dispatch_terminate(self):
+        report, calls, _ = self.replay(already_terminal=True)
+        self.assertTrue(report["terminated_verified"])
+        self.assertFalse(any(op == "terminate_instances" for op, _ in calls))
+
+    def test_launch_receives_early_boot_safe_userdata(self):
+        _, calls, _ = self.replay()
+        launches = [fields for op, fields in calls if op == "run_instances"]
+        self.assertEqual(len(launches), 1)
+        payload = launches[0]["UserData"]
+        self.assertEqual(payload, m.bootstrap.user_data())
+        config = json.loads(payload.split("\n", 1)[1])
+        boot = config["bootcmd"][0][2]
+        final = config["runcmd"][0][2]
+        for expected in (
+            "systemd-run --no-block",
+            "--timer-property=DefaultDependencies=no",
+            "--property=DefaultDependencies=no",
+            "--on-boot=600s",
+            "LUMI_DIAG_STAGE:expiry_rejected",
+        ):
+            self.assertIn(expected, boot)
+        self.assertLess(final.index("is-active --quiet"), final.index("LUMI_DIAG_HOSTKEY"))
+        self.assertNotIn("--on-active=", boot)
+
+    def test_bootstrap_drift_rejected_before_sdk_or_credentials(self):
+        with (
+            patch.object(m.bootstrap, "user_data", return_value="changed"),
+            patch.object(m.subprocess, "run") as credentials,
+        ):
+            with self.assertRaisesRegex(ValueError, "diagnostic_rejected"):
+                m._offline_flow()
+            credentials.assert_not_called()
+
+    def test_live_entry_closed(self):
+        with patch.object(m.sys, "argv", ["runner"]):
+            with self.assertRaisesRegex(ValueError, "diagnostic_rejected"):
+                m.main()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

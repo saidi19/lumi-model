@@ -1,0 +1,187 @@
+import base64
+import gzip
+import hashlib
+import importlib.util
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "native_probe_controller_v5", ROOT / "scripts/execute_sft_vm_network_native_v5.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class NativeProbePreflightTests(unittest.TestCase):
+    def test_missing_approval_rejects_before_any_cloud_call(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(m, "APPROVAL", Path(temp) / "absent.json"),
+            patch.object(m, "aws") as cloud,
+            self.assertRaisesRegex(RuntimeError, "fresh_native_approval_required"),
+        ):
+            m.main()
+        cloud.assert_not_called()
+
+    def test_approval_exact_bounds_hashes_and_types(self):
+        approval = {
+            "schema": "lumi.native-successor-approval.v0.5",
+            "approved": True,
+            "instance_count": 1,
+            "instance_type": "t3.small",
+            "max_instance_seconds": 1800,
+            "synthetic_only": True,
+            "retry_allowed": False,
+            "existing_instance_access": False,
+            "s3_model_dataset_access": False,
+            "gpu_inference_training": False,
+            "cleanup_new_resources_only": True,
+            "controller_sha256": hashlib.sha256(Path(m.__file__).read_bytes()).hexdigest(),
+            "probe_sha256": m.PROBE_SHA,
+            "policy_sha256": m.POLICY_SHA,
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "synthetic.json"
+            with patch.object(m, "APPROVAL", path):
+                raw = json.dumps(approval).encode()
+                path.write_bytes(raw)
+                self.assertEqual(m.validate_approval(), hashlib.sha256(raw).hexdigest())
+                for key in approval:
+                    bad = dict(approval)
+                    bad[key] = None
+                    path.write_text(json.dumps(bad))
+                    with self.subTest(key=key), self.assertRaises(RuntimeError):
+                        m.validate_approval()
+                for bad in (
+                    {**approval, "approved": 1},
+                    {**approval, "instance_count": True},
+                    {**approval, "max_instance_seconds": 1801},
+                    {**approval, "retry_allowed": True},
+                    {**approval, "probe_sha256": "0" * 64},
+                    {**approval, "extra": False},
+                ):
+                    path.write_text(json.dumps(bad))
+                    with self.assertRaises(RuntimeError):
+                        m.validate_approval()
+                for raw in (
+                    b"x" * 4097,
+                    b"[]",
+                    b"null",
+                    b"\xff",
+                    b'{"approved":true,"approved":true}',
+                ):
+                    path.write_bytes(raw)
+                    with self.assertRaises(RuntimeError):
+                        m.validate_approval()
+
+    def test_cloud_config_exact_two_authenticated_sources(self):
+        raw, digest = m.cloud_config()
+        self.assertLessEqual(len(raw), 16384)
+        config = json.loads(raw.decode().split("\n", 1)[1])
+        self.assertEqual(len(config["write_files"]), 2)
+        self.assertEqual(
+            config["runcmd"],
+            [["/usr/bin/python3", "-I", "-B", "/opt/lumi-network-probe/probe.py", "--outer"]],
+        )
+        sources = ("probe_sft_vm_network_native_v4.py", "build_sft_vm_network_expiry_v3.py")
+        for member, name in zip(config["write_files"], sources, strict=True):
+            data = gzip.decompress(base64.b64decode(member["content"], validate=True))
+            self.assertEqual(data, (ROOT / "scripts" / name).read_bytes())
+            self.assertEqual(member["permissions"], "0400")
+            compile(data, name, "exec")
+        self.assertEqual(len(digest), 64)
+
+    def test_prepare_config_has_no_network_or_cloud_side_effects(self):
+        with patch.object(m.subprocess, "run") as run:
+            m.cloud_config()
+        run.assert_not_called()
+
+    def test_evidence_is_exclusive(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(m, "OUT", Path(temp)):
+            m.save("example.json", {"x": 1})
+            with self.assertRaises(FileExistsError):
+                m.save("example.json", {"x": 2})
+            self.assertEqual(json.loads((Path(temp) / "example.json").read_text()), {"x": 1})
+
+    def test_existing_attempt_rejects_before_any_resource_creation(self):
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(m, "OUT", Path(temp)),
+            patch.object(m, "validate_approval", return_value="synthetic"),
+            patch.object(m, "aws", return_value={"Account": m.ACCOUNT}) as cloud,
+        ):
+            with self.assertRaises(FileExistsError):
+                m.main()
+            cloud.assert_called_once_with("sts", "get-caller-identity")
+
+
+class VisibilityPollingTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 0.0
+        self.delays = []
+        self.enterContext(patch.object(m.time, "monotonic", side_effect=lambda: self.now))
+
+        def sleep(seconds):
+            self.now += seconds
+            self.delays.append(seconds)
+
+        self.enterContext(patch.object(m.time, "sleep", side_effect=sleep))
+
+    def test_notfound_and_empty_then_visible_without_mutation(self):
+        ready = {"Reservations": [{"Instances": [{"InstanceId": "i-synthetic"}]}]}
+        with patch.object(
+            m,
+            "aws",
+            side_effect=[RuntimeError("InvalidInstanceID.NotFound"), {"Reservations": []}, ready],
+        ) as call:
+            result = m.visible("describe-instances", deadline=120, InstanceIds=["i-synthetic"])
+        self.assertEqual(result, {"InstanceId": "i-synthetic"})
+        self.assertEqual(self.delays, [2, 4])
+        for row in call.call_args_list:
+            self.assertEqual(row.args, ("ec2", "describe-instances"))
+            self.assertEqual(row.kwargs, {"InstanceIds": ["i-synthetic"]})
+
+    def test_security_group_visibility(self):
+        with patch.object(
+            m,
+            "aws",
+            side_effect=[
+                RuntimeError("InvalidGroup.NotFound"),
+                {"SecurityGroups": [{"GroupId": "sg-synthetic"}]},
+            ],
+        ):
+            result = m.visible("describe-security-groups", deadline=120, GroupIds=["sg-synthetic"])
+        self.assertEqual(result["GroupId"], "sg-synthetic")
+        self.assertEqual(self.delays, [2])
+
+    def test_permission_error_not_retried(self):
+        with patch.object(m, "aws", side_effect=RuntimeError("UnauthorizedOperation")) as call:
+            with self.assertRaisesRegex(RuntimeError, "UnauthorizedOperation"):
+                m.visible("describe-instances", deadline=120, InstanceIds=["i-synthetic"])
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(self.delays, [])
+
+    def test_exhausted_visibility_is_not_success_or_termination(self):
+        with patch.object(m, "aws", side_effect=RuntimeError("InvalidInstanceID.NotFound")) as call:
+            with self.assertRaisesRegex(RuntimeError, "visibility_deadline"):
+                m.visible("describe-instances", deadline=120, InstanceIds=["i-synthetic"])
+        self.assertLessEqual(self.now, 95)
+        self.assertLessEqual(call.call_count, 9)
+        self.assertTrue(all(c.args == ("ec2", "describe-instances") for c in call.call_args_list))
+
+    def test_insufficient_deadline_does_not_start_request(self):
+        with (
+            patch.object(m, "aws") as call,
+            self.assertRaisesRegex(RuntimeError, "visibility_deadline"),
+        ):
+            m.visible("describe-instances", deadline=25, InstanceIds=["i-synthetic"])
+        call.assert_not_called()
+
+    def test_mutations_are_never_admitted_to_polling(self):
+        with patch.object(m, "aws") as call, self.assertRaises(AssertionError):
+            m.visible("run-instances", deadline=120, ClientToken="synthetic")
+        call.assert_not_called()

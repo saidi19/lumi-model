@@ -1,0 +1,109 @@
+"""Source/byte-header checks only; no ML, real payloads or native host changes."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_hf_bytes_v1 as hf
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class HFSourceTests(unittest.TestCase):
+    def test_frozen_v4_unchanged(self):
+        raw = (ROOT / "src/lumi/posttraining_checkpoint_import_torch_v4.py").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(),
+                         "2493e46441b47720eb58201322a3117e26346a085ab51eb2667acbfb38636187")
+
+    def test_existing_tensor_and_configuration_helpers_unchanged(self):
+        def definitions(version):
+            path = ROOT / f"src/lumi/posttraining_checkpoint_import_torch_{version}.py"
+            return {node.name: node for node in ast.parse(path.read_bytes()).body
+                    if isinstance(node, (ast.FunctionDef, ast.ClassDef))}
+        old, new = definitions("v4"), definitions("v5")
+        replaced = {"_convert", "convert_and_verify", "_read_small_file", "_read_config",
+                    "_output_inventory"}
+        for name in old.keys() - replaced:
+            with self.subTest(name=name):
+                self.assertEqual(ast.dump(old[name]), ast.dump(new[name]))
+
+    def test_original_validation_codes_remain_in_conversion(self):
+        def codes(version):
+            tree = ast.parse((ROOT / f"src/lumi/posttraining_checkpoint_import_torch_{version}.py")
+                             .read_bytes())
+            convert = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                           and node.name == "_convert")
+            return {node.args[-1].value for node in ast.walk(convert)
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in {"_need", "_finite"} and node.args
+                    and isinstance(node.args[-1], ast.Constant)}
+        self.assertLessEqual(codes("v4"), codes("v5"))
+
+    def test_invalid_hf_contract_precedes_content_io(self):
+        from lumi import posttraining_checkpoint_import_torch_v5 as m
+
+        with patch.object(m, "ContentIO") as content:
+            with self.assertRaisesRegex(m.ImportKernelError, "hf_io_contract_rejected"):
+                m.convert_and_verify(None, None, None, None, maximum_parameters=1,
+                    maximum_tensor_bytes=1, maximum_output_bytes=1, check_budget=None,
+                    checkpoint_read_contract={}, hf_io_contract={})
+            content.assert_not_called()
+
+    def test_contract_rejects_boolean_excessive_and_unknown_bounds(self):
+        from lumi import posttraining_checkpoint_import_torch_v5 as m
+
+        good = dict(maximum_read_bytes=1000, maximum_write_bytes=1000, maximum_file_bytes=1000,
+                    maximum_control_bytes=1000, target_shard_bytes=100)
+        for delta in ({"maximum_read_bytes": True}, {"extra": 1},
+                      {"maximum_file_bytes": 2**31 + 1}, {"maximum_control_bytes": 65537},
+                      {"target_shard_bytes": m.SHARD_BYTES + 1}):
+            with self.subTest(delta=delta), self.assertRaises(m.ImportKernelError):
+                m._hf_contract(good | delta)
+        result = m._hf_contract(good)
+        good["maximum_read_bytes"] = 1
+        self.assertEqual(result["maximum_read_bytes"], 1000)
+
+    def blob(self, header=None, suffix=b"12345678"):
+        header = header or {"x": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+                            "__metadata__": {"format": "pt"}}
+        raw = json.dumps(header).encode()
+        raw += b" " * (-len(raw) % 8)
+        return len(raw).to_bytes(8, "little") + raw + suffix
+
+    def validate(self, raw):
+        hf.validate_blob(raw, {"serialized_bound": 4096, "header_bound": 2048,
+                              "payload_bytes": 8, "names": ("x",)},
+                         {"x": {"dtype": "F32", "shape": [2], "bytes": 8}})
+
+    def test_valid_bounded_header(self):
+        self.validate(self.blob())
+
+    def test_header_size_and_trailing_data_rejected(self):
+        for raw in (b"", b"1" * 8, self.blob() + b"x", self.blob()[:-1]):
+            with self.subTest(size=len(raw)), self.assertRaisesRegex(hf.HFBytesError,
+                                                                    "header_rejected"):
+                self.validate(raw)
+
+    def test_header_shape_dtype_alias_offsets_and_unknown_keys_rejected(self):
+        for row in ({"dtype": "BF16", "shape": [2], "data_offsets": [0, 8]},
+                    {"dtype": "F32", "shape": [1, 2], "data_offsets": [0, 8]},
+                    {"dtype": "F32", "shape": [2], "data_offsets": [1, 9]},
+                    {"dtype": "F32", "shape": [2], "data_offsets": [False, 8]},
+                    {"dtype": "F32", "shape": [2], "data_offsets": [0, 8], "extra": 1}):
+            with self.subTest(row=row), self.assertRaises(hf.HFBytesError):
+                self.validate(self.blob({"x": row, "__metadata__": {"format": "pt"}}))
+
+    def test_nonfinite_duplicate_and_wrong_format_headers_rejected(self):
+        for header in (b'{"x":1,"x":2}', b'{"x":NaN}', b'{"__metadata__":{"format":"np"}}'):
+            padded = header + b" " * (-len(header) % 8)
+            with self.assertRaises(hf.HFBytesError):
+                self.validate(len(padded).to_bytes(8, "little") + padded + b"12345678")
+
+
+if __name__ == "__main__":
+    unittest.main()

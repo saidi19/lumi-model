@@ -1,0 +1,119 @@
+# SFT execution status v0.53
+
+Local-only result receipt, 2026-09-09. The user reported credits refilled;
+read-only inspection resumed on the same existing run IDs. No republish,
+workflow dispatch, rerun, recovery or acceptance run was started. Preserve
+v0.50/v0.51/v0.52 and all earlier evidence unchanged.
+
+## Verified remote outcomes
+
+Commit `15127b62e702244923a6f56c1a936fb667ea4486`, parent
+`edaa86e238223cf3a1ecfb6292640d8bc43e72de`, has exactly three completed,
+successful run-attempt-1 workflows:
+
+- [SFT CPU origin diagnostic 34340467851](https://github.com/saidi19/lumi-model/actions/runs/34340467851),
+  job `102429797992`: diagnostic completed, **underlying observer failed**.
+- [Source checks 34340468803](https://github.com/saidi19/lumi-model/actions/runs/34340468803):
+  all four jobs passed. Test job `102429801187` reports **4,991 passed,
+  58 skipped, 329 deselected, 36 warnings, 9,943 subtests passed in 430.78s**.
+  Source accounting: 5,049 selected, 327 private NOT_EXECUTED, 2 history tests
+  routed separately; full CI/private integration remain false. Lint job
+  `102429801014`, validators `102429801098`, isolated controls `102429801133`
+  also passed.
+- [Spark source checks 34340467660](https://github.com/saidi19/lumi-model/actions/runs/34340467660),
+  job `102429796918`: **3 passed, no skips, 107.52s**.
+
+The old OCI acceptance did not run for this commit. Diagnostic workflow success
+means the bounded diagnostic captured a qualifying rejection and validated its
+report, not that the release passed or Gate 5 closed.
+
+## Exact localization and evidence limits
+
+The fixed diagnostic fields are:
+
+| Field | Value |
+| --- | --- |
+| captured_check | module_origins_check_12 |
+| captured_function | module_origins |
+| exception_class | ProbeError |
+| probe_error_code | distribution_rejected |
+| module_family | transformers |
+| phase | inputs |
+| origin_category | source |
+
+The hash-frozen observer's lines 322–323 compare the direct module dictionary:
+`str(vars(sys.modules[name]).get("__version__")) == _STATE["versions"][name]`.
+The current name was `transformers`; its lock requires `5.15.1`. This equality
+returned false. Torch's preceding equality and the preceding complete scanned
+module-root/core checks had passed in this observed witness.
+
+**Do not interpret `origin_category=source` as Transformers loading from source.**
+The diagnostic's context reader saw the lingering `resolved` local from the
+previous module scan while `name` had advanced to the separate version loop.
+The field is stale context for this particular predicate, not a path-origin
+failure. The report contains no actual version value, field-presence flag or
+type, so it cannot distinguish an absent direct-dictionary value, lazy attribute
+exposure, an unusual value, or a genuine version mismatch. A lazy-module issue
+is only a hypothesis. No OverlayFS, inode or native-mapping cause is established.
+
+`distribution_versions()` and `native_origins()` follow `module_origins()` in
+the witness; this failed witness did not complete those checks. Aggregate
+retained telemetry: 55,418 observed need checks; 1 witness started, 0 completed;
+2 failure messages, 1 retained deduplicated packet; 0 completed invocations,
+rank workers or origin observations. These are bounded observations, not proof
+of all unseen child work. Frozen stage/code: worker `inputs/synchronize_failed`,
+probe `worker_run`, fixture `ledger`, child `run`.
+
+## Software binding and private evidence
+
+Builder runtime was **54 seconds**, one diagnostic-container start, 34 pinned
+wheels / 248,715,637 downloaded software bytes. The exact owned diagnostic
+container was retired. Image ID was recorded before diagnostic start:
+`sha256:001e3982dcf1981f1a6031d2e8e5a8713b98890c3e80916c458ad471ff53f353`.
+No image archive or registry publication occurred. The frozen builder's separate
+base-inventory container is not miscounted as a second diagnostic pass.
+
+Control hashes:
+
+- Base inventory: `e30ec2e16ab8360be394b890e9f06e8819ae9f12c2414b975148beb76d93f8e8`.
+- Source inventory: `78ff610da225291d93cb0c7b82e75e8b77ad1029df2257af356811ab633c95e6`.
+- Software lock: `26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965`.
+
+Private artifact `10099534920` was read in memory once: 147,310 compressed bytes,
+ZIP SHA-256 `512dfb850e93dfaa16091c40aa2dfb5261071d46c6792e9186f8e375c41d0283`.
+Seven members, total 456,236 uncompressed bytes. Only four tiny fixed-label JSON
+members were read and saved locally; no archive extraction, software binaries,
+source inventory bodies, checkpoint, candidate rows or dataset were saved.
+
+Exact local copies are under
+`artifacts/lumi-sft-cpu-origin-diagnostic-v0.1-result-34340467851/`:
+
+- `diagnostic-build-report.json`: 1,799 bytes,
+  `9ac7876f3d868988e2be5096da27695bfd04c23511ff7bb3d4b49ea08dfff9d7`.
+- `software-binding-before-diagnostic.json`: 1,215 bytes,
+  `e4219029b032f08b87935ecdcfdcefb2fcb478128381d7a5e9c5ea4ec2fc2a32`.
+- `diagnostic-start-marker.json`: 904 bytes,
+  `de37fe5a6ebd5dd07661d2eed9bd3c798e86958ceba8dcf534040953ccf5ef0e`.
+- `origin-diagnostic.json`: 2,010 bytes,
+  `552f2b82aa53905c0b5e7ce16bb562c1c95a5763e458adae3913aa1b5ec6bc03`.
+
+Local copies total 5,928 bytes and match the remote member hashes exactly. The
+committed pure validator plus hash-bound AST-derived specification validated
+the original report and matching build/binding/start controls. No native source
+was imported or executed on the Mac. An independent read-only code review
+confirmed the predicate mapping and the stale-context limitation above.
+
+## Completion boundary and next authorization
+
+The approved one-run diagnostic is complete. Gate 5 remains partial; acceptance,
+recovery, production eligibility, real-host admission, complete dynamic closure
+and real SFT permission are all false. No GPU/H100/instance, S3/SSH, real
+checkpoint/data, real inference/training, seal or promotion action occurred.
+
+The next proposed scope is narrowly verifying the exact pinned Transformers
+version-access contract; only if a lookup defect is established, prepare a
+versioned correction to that lookup with synthetic ordinary/lazy/missing/wrong
+version cases. Keep exact locked equality, distribution checks, path roots,
+native identities, workers, policies and all prior evidence unchanged. This
+receipt does not authorize that successor or another remote run. Do not fix by
+deleting the equality, changing the lock, or accepting a missing version.

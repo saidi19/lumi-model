@@ -1,0 +1,319 @@
+"""Fixed controller event loop, integrated with the actual parent ledger.
+
+All worker writes, including READY and CONSUMED, require a parent reservation.
+Ledger offers are therefore serviced in every phase, including before READY.
+The parent records bytes before attempting ACK. Frames on different sockets
+can arrive in either order; terminal success requires their combined evidence.
+
+This local candidate borrows no caller callbacks and accepts no private data.
+Its four channels are taken from a finalized topology through authority v2.
+The process launcher and role producers are not yet bound to this loop; the
+public entry is closed. Native I/O must be separately qualified on Linux.
+"""
+
+from __future__ import annotations
+
+import os
+import select
+import struct
+import threading
+import time
+
+from . import posttraining_checkpoint_write_authority_v2 as authority
+from . import posttraining_checkpoint_write_ledger_v1 as ledger
+from . import posttraining_checkpoint_write_topology_v1 as topology
+from . import posttraining_checkpoint_write_transport_v1 as transport
+
+SCHEMA = "lumi.checkpoint-write-controller.v0.1"
+NAMES = {
+    "control": "control_controller", "ledger": "ledger_controller",
+    "broker": "broker_report_controller", "worker": "worker_report_controller",
+}
+ARM = b"A"
+ARMED = b"G"
+BROKER_READY = b"B"
+READY = b"R"
+CONSUMED = b"C"
+FAILURE = b"E"
+# Digest only: the entry result still needs independent parent verification.
+WORKER_DONE = struct.Struct("<c32s")
+# Worker status zero, worker reaped, broker stopped+reaped, leaf empty+removed.
+GUARDIAN_DONE = b"D\x01\x01\x01\x01"
+MAXIMUM_PACKET = WORKER_DONE.size
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "channel_rejected", "deadline_exhausted", "owner_mismatch", "reentry",
+    "already_attempted", "packet_rejected", "sequence_rejected",
+    "ledger_rejected", "peer_failed", "io_failed", "cleanup_unconfirmed",
+})
+
+
+class ControllerError(ValueError):
+    def __init__(self, code="io_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "io_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code):
+    if not value:
+        raise ControllerError(code) from None
+
+
+def run_write_controller(**_arguments):
+    raise ControllerError("host_guard_not_bound") from None
+
+
+def _runtime():
+    try:
+        transport._runtime()
+    except BaseException:
+        raise ControllerError("runtime_rejected") from None
+
+
+def _poll_many(fds, timeout_ms):
+    poller = select.poll()
+    for fd in fds:
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    return poller.poll(timeout_ms)
+
+
+def _receive_frame(fd, *, peer_hup=False):
+    raw, control, flags, bounded = transport._recvmsg(fd, MAXIMUM_PACKET + 1)
+    if control:
+        rights, _valid = transport._rights(control)
+        transport._close_rights(rights)
+    _need(type(raw) is bytes and len(raw) <= MAXIMUM_PACKET
+          and control == b"" and bounded is True
+          and type(flags) is int and flags in (0, transport.MSG_CMSG_CLOEXEC),
+          "packet_rejected")
+    if raw == b"":
+        _need(peer_hup is True, "packet_rejected")
+        return None
+    return raw
+
+
+class _Channels:
+    """Own exactly four detached controller descriptors until one close."""
+
+    def __init__(self, value, *, deadline_ns):
+        _need(type(value) is topology._Topology
+              and value.snapshot()["stage"] == "controller",
+              "arguments_rejected")
+        self._fds = {}
+        self._identities = {}
+        self._closed = False
+        self._ended = set()
+        self._hup = set()
+        self._deadline_ns = deadline_ns
+        self._owner = os.getpid(), threading.get_ident()
+        owned = None
+        try:
+            for key, name in NAMES.items():
+                owned = authority._detach_admitted_once(value, name)
+                fd = owned.take_admitted_once()
+                self._fds[key] = fd
+                self._identities[key] = owned._identity
+                owned = None
+            _need(len(set(self._fds.values())) == 4, "channel_rejected")
+        except BaseException:
+            # An identity-ambiguous authority must not be garbage-collected or
+            # closed through a possibly reused integer descriptor.
+            if owned is not None:
+                value._ambiguous.append(owned)
+            self.close_once()
+            _need(owned is None and not value._ambiguous, "cleanup_unconfirmed")
+            raise ControllerError("channel_rejected") from None
+
+    def _check(self, key=None):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        _need(not self._closed, "already_attempted")
+        _need(time.monotonic_ns() < self._deadline_ns, "deadline_exhausted")
+        for name in (self._fds if key is None else (key,)):
+            _need(authority._fd_identity(self._fds[name]) == self._identities[name],
+                  "channel_rejected")
+
+    def ready(self):
+        self._check()
+        remaining = self._deadline_ns - time.monotonic_ns()
+        _need(remaining > 0, "deadline_exhausted")
+        active = {name: fd for name, fd in self._fds.items()
+                  if name not in self._ended}
+        _need(bool(active), "peer_failed")
+        events = _poll_many(tuple(active.values()), (remaining + 999999) // 1000000)
+        self._check()
+        _need(type(events) is list and 0 < len(events) <= 4, "deadline_exhausted")
+        reverse = {fd: name for name, fd in active.items()}
+        names = set()
+        for event in events:
+            _need(type(event) is tuple and len(event) == 2
+                  and type(event[0]) is int and event[0] in reverse
+                  and type(event[1]) is int, "channel_rejected")
+            fd, mask = event
+            name = reverse[fd]
+            _need(name not in names, "channel_rejected")
+            # Read a queued final packet even if the writer has already closed.
+            _need(mask & (select.POLLIN | select.POLLHUP) and not mask & ~(
+                select.POLLIN | select.POLLHUP), "peer_failed")
+            if mask & select.POLLHUP:
+                self._hup.add(name)
+            names.add(name)
+        # ACK service must be available even while the worker is writing READY.
+        return [name for name in ("ledger", "broker", "worker", "control")
+                if name in names]
+
+    def receive(self, name):
+        self._check(name)
+        raw = _receive_frame(self._fds[name], peer_hup=name in self._hup)
+        self._check(name)
+        if raw is None:
+            self._ended.add(name)
+        return raw
+
+    def send(self, name, raw):
+        self._check(name)
+        count = transport._sendmsg(self._fds[name], raw, None)
+        _need(type(count) is int and count == len(raw), "io_failed")
+        self._check(name)
+
+    def close_once(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        _need(not self._closed, "already_attempted")
+        self._closed = True
+        failures = 0
+        while self._fds:
+            name, fd = self._fds.popitem()
+            try:
+                _need(authority._fd_identity(fd) == self._identities[name],
+                      "channel_rejected")
+                os.close(fd)
+            except BaseException:
+                failures += 1
+        _need(failures == 0, "cleanup_unconfirmed")
+
+
+class _Controller:
+    """Use one ledger and one event stream for the whole attempt."""
+
+    def __init__(self, budget, *, deadline_ns):
+        self._ledger = ledger._ParentLedger(budget, deadline_ns=deadline_ns)
+        self._deadline_ns = deadline_ns
+        self._owner = os.getpid(), threading.get_ident()
+        self._lock = threading.Lock()
+        self._started = self._failed = False
+        self._broker_ready = self._ready = self._arm_sent = False
+        self._armed = self._consumed = self._guardian_done = False
+        self._digest = None
+        self._frames = 0
+        self._maximum_frames = self._ledger._budget["maximum_notifications"] + 6
+
+    def _handle(self, channels, name, raw):
+        if raw is None:
+            # EOF is never completion proof. Cross-channel report delivery can
+            # lag peer termination, so ledger EOF waits for guardian evidence.
+            allowed = {"broker": self._broker_ready, "ledger": True,
+                       "worker": self._digest is not None,
+                       "control": self._guardian_done}
+            _need(allowed.get(name) is True, "peer_failed")
+            return
+        _need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_PACKET,
+              "packet_rejected")
+        _need(raw != FAILURE, "peer_failed")
+        self._frames += 1
+        _need(self._frames <= self._maximum_frames, "packet_rejected")
+        if name == "ledger":
+            _need(not self._guardian_done, "sequence_rejected")
+            try:
+                self._ledger._accept_admitted_once(
+                    raw, send_ack=lambda ack: channels.send("ledger", ack),
+                )
+            except BaseException:
+                raise ControllerError("ledger_rejected") from None
+        elif name == "broker":
+            _need(raw == BROKER_READY and not self._broker_ready,
+                  "sequence_rejected")
+            self._broker_ready = True
+        elif name == "worker":
+            if raw == READY:
+                _need(not self._ready and self._broker_ready
+                      and self._ledger.snapshot()["offers_accepted"] > 0,
+                      "sequence_rejected")
+                self._ready = True
+                self._arm_sent = True  # Any ambiguous ARM send consumes it.
+                channels.send("control", ARM)
+            elif raw == CONSUMED:
+                _need(self._ready and self._arm_sent and not self._consumed,
+                      "sequence_rejected")
+                self._consumed = True
+            else:
+                _need(len(raw) == WORKER_DONE.size and raw[:1] == b"W"
+                      and self._consumed and self._digest is None,
+                      "sequence_rejected")
+                _, digest = WORKER_DONE.unpack(raw)
+                _need(digest != bytes(32), "packet_rejected")
+                self._digest = digest.hex()
+        elif name == "control":
+            if raw == ARMED:
+                _need(self._arm_sent and not self._armed, "sequence_rejected")
+                self._armed = True
+            else:
+                _need(raw == GUARDIAN_DONE and self._armed
+                      and not self._guardian_done, "sequence_rejected")
+                self._guardian_done = True
+        else:
+            raise ControllerError("channel_rejected") from None
+
+    def _complete(self):
+        return (self._broker_ready and self._ready and self._arm_sent
+                and self._armed and self._consumed and self._guardian_done
+                and self._digest is not None)
+
+    def run_admitted_once(self, channels):
+        _need(type(channels) is _Channels, "arguments_rejected")
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        acquired = self._lock.acquire(blocking=False)
+        _need(acquired, "reentry")
+        try:
+            _need(not self._started, "already_attempted")
+            self._started = True
+            while not self._complete():
+                _need(time.monotonic_ns() < self._deadline_ns, "deadline_exhausted")
+                for name in channels.ready():
+                    self._handle(channels, name, channels.receive(name))
+            return self.snapshot()
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ControllerError else "io_failed"
+            raise ControllerError(code) from None
+        finally:
+            self._lock.release()
+
+    def snapshot(self):
+        counters = self._ledger.snapshot()
+        return {
+            "schema": SCHEMA, "frames_seen": self._frames,
+            "offers_accepted": counters["offers_accepted"],
+            "reserved_bytes": counters["reserved_bytes"],
+            "ack_attempts": counters["ack_attempts"],
+            "broker_ready": self._broker_ready, "worker_ready": self._ready,
+            "arm_send_attempted": self._arm_sent, "guardian_armed": self._armed,
+            "worker_consumed": self._consumed,
+            "guardian_cleanup_report_received": self._guardian_done,
+            "worker_result_sha256": self._digest,
+            "protocol_complete": bool(self._complete() and not self._failed),
+            "terminal_failed": self._failed,
+            "entry_result_verified": False, "native_processes_reaped": False,
+            "role_producers_bound": False, "native_qualification_verified": False,
+            "execution_permitted": False, "gate_5_complete": False,
+            "training_authorized": False, "production_eligible": False,
+        }
+
+
+def _run_admitted_once(value, budget, *, deadline_ns):
+    """Take controller endpoints once; process cleanup remains with the caller."""
+    _runtime()
+    controller = _Controller(budget, deadline_ns=deadline_ns)
+    channels = _Channels(value, deadline_ns=deadline_ns)
+    try:
+        return controller.run_admitted_once(channels)
+    finally:
+        channels.close_once()

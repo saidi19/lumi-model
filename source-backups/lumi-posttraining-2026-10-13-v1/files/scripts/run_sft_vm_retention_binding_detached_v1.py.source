@@ -1,0 +1,404 @@
+"""Private detached retention admission; no bucket authority or credentials.
+
+Reuse the frozen native context and retention admission. Same original clock,
+exclusive attempts, and outer host STOP remain mandatory after ambiguity.
+"""
+
+import hashlib
+import math
+import os
+import signal
+import stat
+import sys
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ROOT = Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "retention-binding"
+FULLSIZE = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+UNIT = "lumi-retention-binding-v1.service"
+PINS = {
+    "core.py": "8f652198e5a87d31f546cd83fc45eb6a316536dcd180068bd4d0cad58531230a",
+    "binder.py": "8c649038548fd16d6fce88cc92e1730f3cdce117c82e9e36954f6a1c175dbe88",
+    "admission.py": "f8a99dce334c7ce6fe5d8b5d6097157cc5a41fc1ad65fbad0555c9cb04114a64",
+    "entry.py": "1e78705b8779a6011ee236267b0db87039fa45537b225b786d99cfe9043a4493",
+}
+FALSE = (
+    "bucket_admitted",
+    "credentials_issued",
+    "host_admitted",
+    "offhost_retention_verified",
+    "real_4b_import",
+    "gate_5_complete",
+    "training_authorized",
+    "production_eligible",
+    "retry_allowed",
+    "adversarial_privileged_writer_exclusion_claimed",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_retention_binding_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def pin(value):
+    return type(value) is str and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def number(value):
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def sources(bodies):
+    need(type(bodies) is dict and set(bodies) == set(PINS))
+    need(
+        all(
+            type(v) is bytes and 0 < len(v) <= 32768 and sha(v) == PINS[k]
+            for k, v in bodies.items()
+        )
+    )
+    modules = {}
+    for name in ("core.py", "admission.py"):
+        module = types.ModuleType("_retention_binding_" + name[:-3])
+        module.__file__ = str(ROOT / name)
+        exec(compile(bodies[name], module.__file__, "exec"), module.__dict__)
+        modules[name] = module
+    return modules
+
+
+def context(request, prior_pin, end, bodies):
+    need(pin(prior_pin) and number(end))
+    loaded = sources(bodies)
+    expected = {k: request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")}
+    binder, bootstrap, helper, original = loaded["core.py"].context(expected, bodies["binder.py"])
+    need(request == original and end <= request["host_deadline_boottime"] - 700)
+    return loaded, binder, bootstrap, helper
+
+
+def envelope(request, prior_pin, end):
+    return dict(request=request, prior_binding_sha256=prior_pin, deadline_boottime=end)
+
+
+def result(state, observation=None):
+    return dict(
+        state=state,
+        observation=observation,
+        binding_may_exist=True,
+        host_admitted=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+
+
+def validate_report(value, prior_pin, end):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "schema",
+            "attempt",
+            "trust_scope",
+            "retention_binding_created",
+            "retention_binding_sha256",
+            "prior_binding_sha256",
+            "deadline_boottime",
+            "release_files_verified",
+            "sdk_package_versions_matched",
+            "metadata_and_package_files_observed",
+            "post_import_work_free_floor_bytes",
+            "aggregates",
+            "census_before",
+            "census_after",
+            "outer_stop_required_on_failure",
+            *FALSE,
+        }
+    )
+    need(value["schema"] == "lumi.vm-native-retention-admission.v0.1")
+    need(
+        value["attempt"] == ATTEMPT
+        and value["trust_scope"] == "dedicated-vm-trusted-admin-root-os-v1"
+    )
+    need(pin(value["retention_binding_sha256"]) and value["prior_binding_sha256"] == prior_pin)
+    need(number(value["deadline_boottime"]) and value["deadline_boottime"] == end)
+    need(
+        value["retention_binding_created"] is True
+        and value["outer_stop_required_on_failure"] is True
+    )
+    need(all(value[k] is False for k in FALSE))
+    for key, exact in (
+        ("release_files_verified", 21),
+        ("sdk_package_versions_matched", 5),
+        ("post_import_work_free_floor_bytes", 50111017472),
+    ):
+        need(type(value[key]) is int and value[key] == exact)
+    count = value["metadata_and_package_files_observed"]
+    need(type(count) is int and 0 < count <= 527)
+    totals = value["aggregates"]
+    need(
+        type(totals) is dict
+        and set(totals)
+        == {
+            "package_bytes",
+            "metadata_bytes",
+            "initial_manifest_read_bytes",
+            "package_manifest_sha256",
+            "source_manifest_sha256",
+        }
+    )
+    for key, cap in (
+        ("package_bytes", 8415205181),
+        ("metadata_bytes", 3670016),
+        ("initial_manifest_read_bytes", 131072),
+    ):
+        need(type(totals[key]) is int and 0 < totals[key] <= cap)
+    need(pin(totals["package_manifest_sha256"]) and pin(totals["source_manifest_sha256"]))
+    for key in ("census_before", "census_after"):
+        counts = value[key]
+        need(
+            type(counts) is dict
+            and set(counts) == {"processes", "threads", "vanished", "bytes_read"}
+        )
+        need(all(type(n) is int for n in counts.values()))
+        need(0 < counts["processes"] <= 4096 and 0 < counts["threads"] <= 8192)
+        need(
+            0 <= counts["vanished"] < counts["threads"] and 0 < counts["bytes_read"] <= 16 * 1024**2
+        )
+    need(sum(value[k]["bytes_read"] for k in ("census_before", "census_after")) <= 16 * 1024**2)
+    return value
+
+
+def command(receiver_sha):
+    need(pin(receiver_sha))
+    code = (
+        "import hashlib,runpy;from pathlib import Path;"
+        f"p=Path({str(ROOT / 'receiver.py')!r});raw=p.read_bytes();"
+        f"assert hashlib.sha256(raw).hexdigest()=={receiver_sha!r};"
+        "runpy.run_path(str(p),run_name='__retention_binding__')['_serve_once']()"
+    )
+    properties = dict(
+        User="root",
+        Group="root",
+        UMask="0077",
+        Restart="no",
+        RemainAfterExit="yes",
+        RuntimeMaxSec="240",
+        TimeoutStopSec="10",
+        KillMode="control-group",
+        SendSIGKILL="yes",
+        FailureAction="poweroff",
+        MemoryMax="256M",
+        MemorySwapMax="0",
+        TasksMax="64",
+        LimitCORE="0",
+        NoNewPrivileges="yes",
+        StandardInput="null",
+        StandardOutput="null",
+        StandardError="null",
+    )
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + UNIT,
+        ]
+        + [f"--property={k}={v}" for k, v in properties.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", "-c", code]
+    )
+
+
+def dispatch(request, prior_pin, end, bodies, receiver):
+    _, binder, bootstrap, helper = context(request, prior_pin, end, bodies)
+    need(type(receiver) is bytes and 0 < len(receiver) <= 32768)
+    need(440 < end - bootstrap.boot_time() <= 1800)
+    for path in (ROOT, FULLSIZE / "retention-admission", FULLSIZE / "retention-controller"):
+        need(not os.path.lexists(path))
+    need(bootstrap.show(UNIT, "LoadState") == b"not-found" and helper.cgroup_empty(UNIT))
+    binder.private_directory(FULLSIZE / "retention-release")
+    bootstrap.owned(ROOT.parent)
+    ROOT.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(ROOT.parent)
+    for name, raw in {
+        **bodies,
+        "receiver.py": receiver,
+        "request.json": bootstrap.encode(envelope(request, prior_pin, end)),
+    }.items():
+        bootstrap.write(ROOT / name, raw)
+        need(binder.root_read(ROOT / name) == raw)
+    bootstrap.write(ROOT / "dispatch.json", bootstrap.encode(result("dispatch_requested")))
+    bootstrap.command(command(sha(receiver)), seconds=15)
+    return result("dispatch_requested")
+
+
+def read_root(path, cap=32768):
+    # Authenticate the frozen reader's source before it can be loaded.
+    for parent in path.parents:
+        info = parent.lstat()
+        need(
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == info.st_gid == 0
+            and not info.st_mode & 0o022
+        )
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(before.st_uid == before.st_gid == 0 and stat.S_IMODE(before.st_mode) == 0o400)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, k) == getattr(after, k)
+            for k in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        )
+    )
+    return raw
+
+
+def _serve_once():
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    need(Path(__file__) == ROOT / "receiver.py")
+    bodies = {name: read_root(ROOT / name) for name in PINS}
+    loaded = sources(bodies)
+    binder = loaded["core.py"].binder(bodies["binder.py"])
+    saved = binder.decode(read_root(ROOT / "request.json"))
+    need(
+        type(saved) is dict
+        and set(saved) == {"request", "prior_binding_sha256", "deadline_boottime"}
+    )
+    request, prior_pin, end = (
+        saved["request"],
+        saved["prior_binding_sha256"],
+        saved["deadline_boottime"],
+    )
+    _, _, bootstrap, _ = context(request, prior_pin, end, bodies)
+    need(bootstrap.show(UNIT, "ActiveState") == b"active")
+    need(420 < end - bootstrap.boot_time() <= 1800)
+    bootstrap.write(ROOT / "started.json", bootstrap.encode(result("running")))
+
+    def expired(*_):
+        raise TimeoutError("retention_binding_deadline")
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.alarm(220)
+    try:
+        value = loaded["admission.py"]._admit_same_host(
+            request, prior_pin, end, bodies["binder.py"], bodies["entry.py"]
+        )
+        validate_report(value, prior_pin, end)
+        bootstrap.write(ROOT / "result.json", bootstrap.encode(value))
+    except BaseException:
+        bootstrap.write(ROOT / "failed.json", bootstrap.encode(result("failed")))
+        raise ValueError("retention_binding_service_failed") from None
+    finally:
+        signal.alarm(0)
+
+
+def binding_report(binder, bootstrap, request, prior_pin, end):
+    value = validate_report(binder.decode(binder.root_read(ROOT / "result.json")), prior_pin, end)
+    need(binder.decode(binder.root_read(FULLSIZE / "retention-admission/result.json")) == value)
+    raw = binder.root_read(FULLSIZE / "retention-controller/binding.json")
+    binding = binder.decode(raw)
+    need(
+        type(binding) is dict
+        and set(binding)
+        == {
+            "schema",
+            "scope",
+            "attempt",
+            "machine_id",
+            "boot_id",
+            "prior_binding_sha256",
+            "entry_sha256",
+            "release_manifest_sha256",
+            "started_boottime",
+            "deadline_boottime",
+        }
+    )
+    need(
+        binding
+        == dict(
+            schema="lumi.vm-retention-host-binding.v0.1",
+            scope="conditional-private-retention-once",
+            attempt=ATTEMPT,
+            machine_id=request["machine_id"],
+            boot_id=request["boot_id"],
+            prior_binding_sha256=prior_pin,
+            entry_sha256=PINS["entry.py"],
+            release_manifest_sha256="ad03a7c26f8c4a68a741ad3bcf2e7d0f1771e07441e3f91062a7321b158a05e0",
+            started_boottime=binding["started_boottime"],
+            deadline_boottime=end,
+        )
+    )
+    start = binding["started_boottime"]
+    need(number(start) and 0 <= start <= bootstrap.boot_time() and 180 < end - start <= 1800)
+    need(bootstrap.boot_time() < end - 180)
+    need(raw == bootstrap.encode(binding) and sha(raw) == value["retention_binding_sha256"])
+    need(
+        binder.root_read(FULLSIZE / "retention-controller/binding.sha256")
+        == (sha(raw) + "\n").encode()
+    )
+    need(sha(binder.root_read(FULLSIZE / "controller/binding.json")) == prior_pin)
+    return value
+
+
+def status(request, prior_pin, end, bodies):
+    _, binder, bootstrap, helper = context(request, prior_pin, end, bodies)
+    need(
+        binder.decode(binder.root_read(ROOT / "request.json")) == envelope(request, prior_pin, end)
+    )
+    need(not os.path.lexists(ROOT / "failed.json") and not os.path.lexists(ROOT / "cancel.started"))
+    need(bootstrap.boot_time() < end - 180)
+    observed = helper.observe(UNIT)
+    if (observed["ActiveState"], observed["SubState"]) in {
+        ("active", "running"),
+        ("activating", "start"),
+    }:
+        return result("running")
+    helper.validate_terminal("chain", observed)
+    need(helper.cgroup_empty(UNIT))
+    return result("returned", binding_report(binder, bootstrap, request, prior_pin, end))
+
+
+def finish(request, prior_pin, end, bodies):
+    answer = status(request, prior_pin, end, bodies)
+    need(answer["state"] == "returned")
+    _, binder, bootstrap, helper = context(request, prior_pin, end, bodies)
+    bootstrap.write(ROOT / "finish.started", b"consumed\n")
+    bootstrap.command(["/usr/bin/systemctl", "stop", UNIT], seconds=10)
+    need(helper.cgroup_empty(UNIT) and bootstrap.show(UNIT, "ActiveState") == b"inactive")
+    need(binding_report(binder, bootstrap, request, prior_pin, end) == answer["observation"])
+    bootstrap.write(ROOT / "reaped.json", bootstrap.encode(result("completed")))
+    return result("completed", answer["observation"])
+
+
+def cancel(request, prior_pin, end, bodies):
+    _, _, bootstrap, helper = context(request, prior_pin, end, bodies)
+    bootstrap.write(ROOT / "cancel.started", b"consumed\n")
+    bootstrap.command(["/usr/bin/systemctl", "stop", UNIT], seconds=10)
+    need(helper.cgroup_empty(UNIT) and bootstrap.show(UNIT, "ActiveState") == b"inactive")
+    return result("cancelled")  # Does not revoke a possibly committed binding.
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_admission_controller_required") from None

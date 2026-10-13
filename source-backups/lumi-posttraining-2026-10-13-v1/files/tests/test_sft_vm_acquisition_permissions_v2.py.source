@@ -1,0 +1,64 @@
+import importlib.util
+from unittest.mock import patch
+
+from tests import test_sft_vm_acquisition_permissions_v1 as old
+
+SPEC = importlib.util.spec_from_file_location(
+    "permissions_v2", old.ROOT / "scripts/prepare_sft_vm_acquisition_permissions_v2.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class SuccessorTests(old.PolicyTests):
+    def setUp(self):
+        self.original = old.m
+        self.replacement = patch.object(old, "m", m)
+        self.replacement.start()
+        self.addCleanup(self.replacement.stop)
+
+    def test_policy_unchanged_from_failed_matrix(self):
+        self.assertEqual(
+            m.policy_for_keys(old.KEYS, old.NOW), self.original.policy_for_keys(old.KEYS, old.NOW)
+        )
+
+    def test_service_appropriate_denial_resources(self):
+        policy, arns = m.policy_for_keys(old.KEYS, old.NOW + old.dt.timedelta(hours=2))
+        calls = []
+
+        class Cloud:
+            def cli(self, service, operation, **args):
+                calls.append(args)
+                context = {
+                    v["ContextKeyName"]: v["ContextKeyValues"][0] for v in args["ContextEntries"]
+                }
+                when = old.dt.datetime.fromisoformat(context["aws:CurrentTime"])
+                rows = []
+                for action in args["ActionNames"]:
+                    for arn in args["ResourceArns"]:
+                        allow = (
+                            action == "s3:GetObject"
+                            and arn in arns
+                            and context["aws:SecureTransport"] == "true"
+                            and when < old.NOW + old.dt.timedelta(hours=2)
+                        )
+                        rows.append(
+                            {
+                                "EvalActionName": action,
+                                "EvalResourceName": arn,
+                                "EvalDecision": "allowed" if allow else "explicitDeny",
+                            }
+                        )
+                return {"EvaluationResults": rows}
+
+        result = m.check_matrix(Cloud(), policy, arns, old.NOW, old.NOW + old.dt.timedelta(hours=2))
+        self.assertEqual(result["calls"], 9)
+        for request in calls:
+            for action in request["ActionNames"]:
+                for arn in request["ResourceArns"]:
+                    if action.startswith("iam:") or action.startswith("sts:"):
+                        self.assertTrue(arn.startswith("arn:aws:iam:"))
+                    elif action.startswith("kms:"):
+                        self.assertTrue(arn.startswith("arn:aws:kms:"))
+                    elif action == "s3:ListBucket":
+                        self.assertEqual(arn, f"arn:aws:s3:::{m.BUCKET}")

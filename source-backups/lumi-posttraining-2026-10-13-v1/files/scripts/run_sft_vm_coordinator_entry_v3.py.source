@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Cold fixed generated-only entry; never an admission for real checkpoint data."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+
+SOURCE = Path("/work/release/src/lumi")
+CONTROL = Path("/inputs/controls.json")
+CHECKPOINT = Path("/inputs/checkpoint")
+TOKENIZER = Path("/inputs/tokenizer")
+ATTEMPT = Path("/work/imports/attempt")
+SUMMARY = Path("/results/summary.json")
+CAP = 131072
+CONSUMED = False
+ENTRY_STAGES = {
+    40: "entry_once",
+    41: "cold_loader",
+    42: "runtime_gate",
+    43: "readonly_inputs",
+    44: "writable_output",
+    45: "control_read",
+    46: "control_contract",
+    47: "coordinate_import",
+    48: "result_contract",
+    49: "checksum_consumer",
+    50: "summary_write",
+}
+STAGE = "entry_once"
+
+
+def need(value):
+    if not value:
+        raise ValueError("generated_entry_rejected") from None
+
+
+def read_control(expected):
+    need(type(expected) is str and re.fullmatch(r"[a-f0-9]{64}", expected) is not None)
+    need(not any(path.is_symlink() for path in (CONTROL, *CONTROL.parents)))
+    fd = os.open(CONTROL, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(
+            stat.S_ISREG(info.st_mode)
+            and info.st_nlink == 1
+            and (info.st_uid, info.st_gid) == (os.geteuid(), os.getegid())
+            and stat.S_IMODE(info.st_mode) == 0o600
+            and 0 < info.st_size <= CAP
+        )
+        raw = stream.read(CAP + 1)
+        need(len(raw) == info.st_size and hashlib.sha256(raw).hexdigest() == expected)
+    return raw
+
+
+def arguments(raw, runner):
+    """Closed generated scope before any input path or conversion is accessed."""
+    value = runner.json_object(raw)
+    need(
+        set(value) == {"schema", "metadata", "plan", "envelope", "kernel_io"}
+        and value["schema"] == "lumi.vm-coordinator-generated-control.v0.1"
+        and runner.canonical(value) == raw
+    )
+    need(type(value["metadata"]) is list and len(value["metadata"]) == 5)
+    encoded = value["metadata"] + [value["plan"], value["envelope"]]
+    need(
+        all(
+            type(item) is str
+            and len(item) <= CAP
+            and len(item) % 2 == 0
+            and re.fullmatch("[0-9a-f]+", item) is not None
+            for item in encoded
+        )
+    )
+    metadata = tuple(bytes.fromhex(item) for item in value["metadata"])
+    plan_raw, envelope_raw = bytes.fromhex(value["plan"]), bytes.fromhex(value["envelope"])
+    base, config = runner.json_object(metadata[0]), runner.json_object(metadata[3])
+    need(base.get("synthetic_fixture_only") is True)
+    geometry = {
+        "vocab_size": 17,
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 4,
+        "max_position_embeddings": 16,
+        "tie_word_embeddings": True,
+    }
+    need(
+        all(
+            type(config.get(key)) is type(want) and config[key] == want
+            for key, want in geometry.items()
+        )
+    )
+    contract = value["kernel_io"]
+    need(type(contract) is dict)
+    args = {
+        "metadata": metadata,
+        "expected_base_sha256": runner.sha(metadata[0]),
+        "plan_raw": plan_raw,
+        "expected_plan_file_sha256": runner.sha(plan_raw),
+        "envelope_raw": envelope_raw,
+        "expected_envelope_file_sha256": runner.sha(envelope_raw),
+        "kernel_io_contract": contract,
+        "expected_kernel_io_contract_sha256": contract.get("contract_sha256"),
+    }
+    plan, envelope, limits, _ = runner._resource_inputs(**args)
+    need(
+        plan["model_parameters"] < 10000
+        and plan["resource_bounds"]["checkpoint_inventory_bytes"] < 1024**2
+        and plan["resource_bounds"]["tokenizer_inventory_bytes"] < 1024
+        and limits["maximum_seconds"] == 60
+        and limits["maximum_coordinator_read_bytes"] <= 32 * 1024**2
+        and limits["maximum_private_write_bytes"] <= 4 * 1024**2
+        and envelope["dcp_read_cap_bytes"] == 8 * 1024**2
+    )
+    # The planner's 16-GiB minimum is a general full-size planning floor, not
+    # an admission for this tiny fixture. Its explicit OS rehearsal bound is
+    # separately 2 GiB. No real input can pass the generated scope above.
+    return args | {"checkpoint_root": CHECKPOINT, "tokenizer_root": TOKENIZER, "attempt": ATTEMPT}
+
+
+def load_runner():
+    spec = importlib.util.spec_from_file_location(
+        "fixed_vm_loader", SOURCE / "posttraining_checkpoint_vm_loader_v1.py"
+    )
+    need(spec is not None and spec.loader is not None)
+    loader = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loader)
+    return loader.load_coordinator()
+
+
+def execute(expected):
+    global CONSUMED, STAGE
+    STAGE = "entry_once"
+    need(not CONSUMED)
+    STAGE = "cold_loader"
+    runner = load_runner()
+    STAGE = "runtime_gate"
+    runner._runtime()  # Actual Linux/uid/ABI/cold gate; no test bypass in the entry.
+    STAGE = "readonly_inputs"
+    for path in (SOURCE, CHECKPOINT, TOKENIZER, CONTROL):
+        need(os.statvfs(path).f_flag & os.ST_RDONLY)
+    STAGE = "writable_output"
+    need(not os.statvfs(ATTEMPT.parent.parent).f_flag & os.ST_RDONLY)
+    STAGE = "control_read"
+    raw = read_control(expected)
+    STAGE = "control_contract"
+    args = arguments(raw, runner)
+    CONSUMED = True
+    STAGE = "coordinate_import"
+    # The frozen coordinator validates attempt.parent with minimum depth 3.
+    # /work alone has depth 2. Create a private, exclusive nested parent;
+    # never relax the coordinator path gate or reuse a previous directory.
+    os.mkdir(ATTEMPT.parent, 0o700)
+    result = runner._coordinate_admitted_import(**args)
+    STAGE = "result_contract"
+    need(
+        result["full_input_audits_completed"] == 2
+        and result["package"]["real_worker_checksum_verifier_passed"] is True
+        and result["real_4b_import"] is False
+        and result["training_authorized"] is False
+    )
+    STAGE = "checksum_consumer"
+    from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+
+    manifest = result["package"]["manifest_file_sha256"]
+    need(
+        _verify_checksum_manifest(
+            ATTEMPT / "checkpoint",
+            expected_manifest_sha256=manifest,
+            require_exact_inventory=True,
+            require_private=True,
+        )
+        == manifest
+    )
+    STAGE = "summary_write"
+    summary = {
+        "schema": "lumi.vm-coordinator-generated-result.v0.1",
+        "status": "passed",
+        "control_sha256": expected,
+        "full_input_audits": 2,
+        "independent_checksum_consumer": True,
+        "coordinator_read_bytes_reserved": result["coordinator_read_bytes_reserved"],
+        "private_write_bytes_reserved": result["private_write_bytes_reserved"],
+        "package_manifest_sha256": manifest,
+        "real_4b_import": False,
+        "training_authorized": False,
+        "production_eligible": False,
+        "fullsize_resource_admission": False,
+    }
+    raw = runner.canonical(summary)
+    need(len(raw) <= 4096)
+    fd = os.open(SUMMARY, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as output:
+        need(output.write(raw) == len(raw))
+        output.flush()
+        os.fsync(output.fileno())
+    return summary
+
+
+def failure_exit_status():
+    # Never inspect, stringify or retain the exception or child output.
+    return next((code for code, stage in ENTRY_STAGES.items() if stage == STAGE), 1)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--control-sha256", required=True)
+    args = parser.parse_args()
+    if sys.platform != "linux" or Path(__file__) != Path(
+        "/work/release/scripts/run_sft_vm_coordinator_entry_v3.py"
+    ):
+        parser.exit(2, "fixed_linux_entry_required\n")
+    try:
+        execute(args.control_sha256)
+    except BaseException:
+        parser.exit(failure_exit_status(), "generated_entry_failed\n")
+
+
+if __name__ == "__main__":
+    main()

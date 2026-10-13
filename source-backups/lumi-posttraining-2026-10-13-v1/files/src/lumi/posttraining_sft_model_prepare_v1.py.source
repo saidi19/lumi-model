@@ -1,0 +1,194 @@
+"""Admitted FSDP model preparation for the frozen eight-rank smoke profile.
+
+This callable plugs into AdmittedRank.prepare. It does not bootstrap a target,
+import ML, initialize CUDA/NCCL, authenticate receipts or enable a public CLI.
+The caller supplies an already admitted runtime/group and a metered local model
+loader under verified source/host controls. No arbitrary from_pretrained path,
+download fallback or unmetered checkpoint reader is introduced here.
+
+Group membership is captured from ORIGINAL shapes before FULL_SHARD wrapping.
+AdamW is constructed AFTER wrapping, using preserved original Parameter objects,
+including empty local shards. Group membership must not be inferred from sharded
+1-D shapes. The existing legacy optimizer helper and all evidence stay frozen.
+Only fixed diagnostics/counts are public; prepared objects and roots are private.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+import threading
+from types import ModuleType
+
+from .posttraining_sft_smoke_bridge_v1 import PreparedRank
+
+ERROR_CODES = frozenset({
+    "invalid_arguments", "already_consumed", "owner_mismatch", "admission_rejected",
+    "runtime_rejected", "model_rejected", "grouping_rejected", "wrap_failed",
+    "optimizer_failed", "cleanup_failed", "prepare_failed",
+})
+
+
+class PreparationError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERROR_CODES else "prepare_failed"
+        super().__init__(self.code)
+
+
+def _require(condition, code):
+    if not condition:
+        raise PreparationError(code) from None
+
+
+def _original_groups(model):
+    """Bounded metadata/reference capture; never tensor contents or copies."""
+    groups, seen, trainability = [[], []], set(), {}
+    for index, parameter in enumerate(model.parameters()):
+        _require(index < 16384 and id(parameter) not in seen, "grouping_rejected")
+        shape = parameter.shape
+        _require(isinstance(shape, tuple) and len(shape) <= 8
+                 and all(type(size) is int and 0 < size < 2**31 for size in shape)
+                 and type(parameter.requires_grad) is bool, "grouping_rejected")
+        seen.add(id(parameter))
+        trainability[id(parameter)] = parameter.requires_grad
+        if parameter.requires_grad:
+            groups[0 if len(shape) >= 2 else 1].append(parameter)
+    _require(bool(groups[0] or groups[1]), "grouping_rejected")
+    return groups, trainability
+
+
+def _wrap_and_optimize(model, context, torch, distributed):
+    """Native operations, factored for metadata-only sequencing regression tests."""
+    groups, trainability = _original_groups(model)
+    wrapped = distributed._wrap_model(
+        model, context=context, strategy="fsdp_full_shard", precision="bf16")
+    observed = {}
+    for index, parameter in enumerate(wrapped.parameters()):
+        _require(index < 16384 and id(parameter) not in observed, "grouping_rejected")
+        _require(type(parameter.requires_grad) is bool, "grouping_rejected")
+        observed[id(parameter)] = parameter.requires_grad
+    _require(observed == trainability, "grouping_rejected")
+    wrapped.train()
+    try:
+        optimizer = torch.optim.AdamW(
+            [{"params": groups[0], "weight_decay": 0.01},
+             {"params": groups[1], "weight_decay": 0.0}],
+            lr=1e-5, betas=(0.9, 0.95), fused=True)
+    except BaseException:
+        raise PreparationError("optimizer_failed") from None
+    _require(type(optimizer) is torch.optim.AdamW and not optimizer.state, "optimizer_failed")
+    return wrapped, optimizer
+
+
+class ModelPreparation:
+    """One-shot trusted local-loader adapter; no runtime work in construction.
+
+    load_model must be an admitted metered loader, not an arbitrary HF loader.
+    release owns the prepared rank's resources and partial-failure cleanup.
+    Admission and release must return None or raise. The context is borrowed,
+    so this adapter never destroys a possibly unrelated process group.
+    """
+
+    def __init__(self, *, context, rank, pad_token_id, encoded_root, output_parent_fd,
+                 admit, load_model, release):
+        if hasattr(self, "_owner"):
+            raise PreparationError("already_consumed") from None
+        _require(type(rank) is int and 0 <= rank < 8
+                 and type(pad_token_id) is int and 0 <= pad_token_id < 2**32
+                 and type(output_parent_fd) is int and 0 <= output_parent_fd < 2**31
+                 and all(callable(fn) for fn in (admit, load_model, release)), "invalid_arguments")
+        self._context, self._rank, self._pad = context, rank, pad_token_id
+        self._root, self._fd = encoded_root, output_parent_fd
+        self._admit, self._load, self._release = admit, load_model, release
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._stage, self._failure = "idle", "idle", None
+        self._released = self._release_failed = False
+
+    def _runtime(self):
+        _require(sys.platform == "linux" and sys.flags.no_site == 1
+                 and sys.dont_write_bytecode, "runtime_rejected")
+        names = ("torch", "lumi.distributed_training", "lumi.modeling_lumi",
+                 "lumi.posttraining_sft_runtime_v4", "lumi.pilot_training",
+                 "torch.distributed.fsdp")
+        modules = [sys.modules.get(name) for name in names]
+        _require(all(type(module) is ModuleType for module in modules), "runtime_rejected")
+        torch, distributed, modeling, _, _, fsdp = modules
+        _require(re.match(r"2\.(10|14)\.", getattr(torch, "__version__", "")) is not None
+                 and type(self._context) is distributed.DistributedContext, "runtime_rejected")
+        context = self._context
+        _require(context.rank == self._rank and context.world_size == 8
+                 and context.backend == "nccl" and context.device.type == "cuda"
+                 and torch.distributed.is_initialized()
+                 and torch.distributed.get_world_size() == 8
+                 and torch.distributed.get_rank() == self._rank
+                 and torch.distributed.get_backend() == "nccl"
+                 and torch.cuda.current_device() == context.local_rank
+                 and context.device.index == context.local_rank, "runtime_rejected")
+        return torch, distributed, modeling, fsdp
+
+    def _close_once(self):
+        if self._released:
+            return
+        self._released = True
+        try:
+            _require(self._release() is None, "cleanup_failed")
+        except BaseException:
+            self._release_failed = True
+            raise PreparationError("cleanup_failed") from None
+
+    def __call__(self):
+        _require(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        if self._state != "idle":
+            # A callback may catch this exception; the outer operation must still fail.
+            if self._state == "running" and self._failure is None:
+                self._failure = "already_consumed"
+            raise PreparationError(self._failure or "already_consumed") from None
+        self._state, self._stage = "running", "admission"
+        admitted = False
+        try:
+            _require(self._admit() is None and self._failure is None, "admission_rejected")
+            admitted = True
+            self._stage = "runtime"
+            torch, distributed, modeling, fsdp = self._runtime()
+            self._stage = "model"
+            torch.manual_seed(2027)
+            torch.cuda.manual_seed_all(2027)
+            model = self._load()
+            _require(self._failure is None and type(model) is modeling.LumiForCausalLM,
+                     "model_rejected")
+            config = model.config
+            _require(type(config.max_position_embeddings) is int
+                     and config.max_position_embeddings >= 4096
+                     and type(config.pad_token_id) is int and config.pad_token_id == self._pad,
+                     "model_rejected")
+            config._attn_implementation = "eager"
+            self._stage = "wrap"
+            wrapped, optimizer = _wrap_and_optimize(model, self._context, torch, distributed)
+            _require(isinstance(wrapped, fsdp.FullyShardedDataParallel)
+                     and wrapped.process_group is torch.distributed.group.WORLD
+                     and wrapped.sharding_strategy is fsdp.ShardingStrategy.FULL_SHARD
+                     and getattr(wrapped, "_use_orig_params", None) is True, "wrap_failed")
+            _require(self._failure is None, "prepare_failed")
+            self._state, self._stage = "complete", "complete"
+            return PreparedRank(wrapped, optimizer, self._root, self._fd, self._close_once)
+        except BaseException as error:
+            if self._failure is None:
+                self._failure = error.code if type(error) is PreparationError else {
+                    "admission": "admission_rejected", "runtime": "runtime_rejected",
+                    "model": "model_rejected", "wrap": "wrap_failed",
+                }.get(self._stage, "prepare_failed")
+            self._state = "failed"
+            if admitted:
+                try:
+                    self._close_once()
+                except PreparationError:
+                    pass  # Preserve the first failure; the outer guardian handles cleanup failure.
+            raise PreparationError(self._failure) from None
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-model-preparation-summary.v0.1",
+                "state": self._state, "stage": self._stage, "failure_code": self._failure,
+                "release_attempted": self._released, "real_execution_authorized": False,
+                "release_failed": self._release_failed,
+                "production_eligible": False}

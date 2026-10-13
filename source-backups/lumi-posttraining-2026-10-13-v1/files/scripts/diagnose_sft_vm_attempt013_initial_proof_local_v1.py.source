@@ -1,0 +1,165 @@
+"""Read-only reconstruction; never executes SSH, guest code, or cloud calls."""
+
+import copy
+import hashlib
+import importlib
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROOF = "evidence/lumi-vm-attempt-013-cpu-execution-verification-v0.1.json"
+PROOF_SHA = "b4db8f71f727bb02980530410e716d4e7b182b8826db7cacf7af6716ae590067"
+ENTRY_SHA = "e5f5667065392ed07ab74f4adcb43b43743f85933c433a8eec94fed99af9b2a0"
+RUN = ROOT / "artifacts/lumi-vm-private-outer-execution-v0.14/attempt-013"
+
+
+def need(value):
+    if not value:
+        raise ValueError("local_initial_proof_diagnostic_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(0 < path.stat().st_size <= 131072)
+    return path.read_bytes()
+
+
+def guard(event, args):
+    if event.startswith(("socket.", "subprocess.")):
+        raise ValueError("external_action_forbidden") from None
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        if os.fsdecode(args[0]).endswith("connection-key"):
+            raise ValueError("private_key_read_forbidden") from None
+
+
+def validator_probe(initial):
+    """Synthetic only; never infer historical guest state from these results."""
+    value = dict(
+        attempt=initial.ATTEMPT,
+        source_sha256=initial.EARLY_SHA,
+        machine_id="a" * 32,
+        boot_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        early_timers_armed=True,
+        setup_deadline_boottime=1800,
+        host_deadline_boottime=14400,
+        observed_boottime=300.0,
+        **initial.BASE,
+    )
+    need(initial.validate_proof(json.dumps(value).encode()) == value)
+    changes = [
+        {"attempt": "wrong"},
+        {"source_sha256": "0" * 64},
+        {"early_timers_armed": False},
+        {"host_admitted": True},
+        {"setup_deadline_boottime": 1801},
+        {"host_deadline_boottime": 14401},
+        {"observed_boottime": 1350},
+        {"observed_boottime": True},
+        {"machine_id": "wrong"},
+        {"extra": "PRIVATE_SENTINEL"},
+    ]
+    rejected = 0
+    for change in changes:
+        candidate = copy.deepcopy(value)
+        candidate.update(change)
+        try:
+            initial.validate_proof(json.dumps(candidate).encode())
+        except (ValueError, TypeError, KeyError):
+            rejected += 1
+    need(rejected == len(changes))
+    return dict(valid_synthetic_proof_accepted=True, invalid_synthetic_proofs_rejected=rejected)
+
+
+def command_probe(module, binding, key, directory, prepared):
+    stage = "known_hosts_read"
+    try:
+        digest = sha(module.delivery.seed.INPUTS.read(directory / "known_hosts", 4096))
+        stage = "launcher_build"
+        launcher = module.initial.proof_launcher()
+        stage = "command_build"
+        argv = module.delivery.seed.sender.command(
+            binding, key, directory, prepared["ssh_config_sha256"], digest, launcher
+        )
+        stage = "launcher_compile"
+        compile(launcher, "<pinned-proof-launcher-not-executed>", "exec")
+        return dict(
+            status="constructed_not_executed",
+            argv_count=len(argv),
+            command_bytes=len(argv[-1].encode()),
+            launcher_compiles=True,
+        )
+    except Exception:
+        return dict(status="local_rejection", stage=stage)
+
+
+def run():
+    raw = read(ROOT / PROOF)
+    need(sha(raw) == PROOF_SHA)
+    proof = json.loads(raw)
+    need(proof["failure"]["deepest_saved_stage"] == "initial_boot_proof")
+    need(proof["outcome"]["instance_stopped_live_verified"] is True)
+    for name, pin in proof["source_bindings"].items():
+        p = Path(name)
+        need(not p.is_absolute() and ".." not in p.parts)
+        body = read(ROOT / p)
+        need(len(body) == pin["bytes"] and sha(body) == pin["sha256"])
+    need(sha(read(ROOT / "scripts/execute_sft_vm_private_outer_v14.py")) == ENTRY_SHA)
+    from scripts import execute_sft_vm_private_outer_v14 as entry
+
+    entry.local_preconditions()  # Inert authentication only, never run/authorize.
+    staged = RUN / "host-preparation/staged"
+    manifest = json.loads(read(staged / "manifest.json"))
+    proposal = RUN / "host-preparation/binding/host-proposal-v0.2.json"
+    need(manifest["proposal_path"] == str(proposal))
+    files, rebuilt = entry.outer.loading.sources.build(read(proposal), str(proposal))
+    need(manifest == rebuilt)
+    for name, body in files.items():
+        need(read(staged / name) == body)
+    for row in manifest["modules"].values():
+        body = read(entry.RELEASE / "scripts" / row["filename"])
+        need(len(body) == row["bytes"] and sha(body) == row["sha256"])
+    name = manifest["modules"]["run_sft_vm_host_setup_v3"]["filename"][:-3]
+    module = importlib.import_module(name)
+    host = RUN / "host/execution/host"
+    directory = host / "host-setup/connection"
+    binding = json.loads(read(host / "binding.json"))
+    prepared = json.loads(read(directory / "result.json"))
+    command = command_probe(module, binding, host / "connection-key", directory, prepared)
+    return dict(
+        status="local_reconstruction_complete_historical_remote_cause_unresolved",
+        source_manifest_reconstructed=True,
+        modules_verified=len(manifest["modules"]),
+        prior_evidence_bindings_verified=len(proof["source_bindings"]),
+        command=command,
+        proof_validator=validator_probe(module.initial),
+        unresolved=[
+            "historical_pre_exchange_deadline_or_budget",
+            "ssh_exchange",
+            "remote_early_guard_proof",
+            "historical_reply_or_boottime_validation",
+        ],
+        boundaries=dict(
+            network_calls=0,
+            subprocess_calls=0,
+            ssh_executed=False,
+            private_key_read=False,
+            guest_code_executed=False,
+            model_reads=0,
+            source_mutation=False,
+            cpu_retry=False,
+            gate_5_complete=False,
+        ),
+    )
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+    sys.addaudithook(guard)
+    print(json.dumps(run(), sort_keys=True, indent=2))

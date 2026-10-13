@@ -1,0 +1,322 @@
+"""Exact v0.3 leftover recovery; no host, download, training, or execution retry."""
+
+import hashlib
+import json
+import os
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-v03-network-cleanup-recovery-v0.1"
+ACCOUNT = "573978149073"
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+NONCE = "8966cb9c72bd4cc885699e42097afae3"
+VPC = "vpc-0905fbf9490a2dead"
+IDS = dict(
+    nat="nat-053a4c949a2fcbd62",
+    address="eipalloc-032881c823b542213",
+    subnet="subnet-0463c40319d6507f8",
+    table="rtb-0337a10bd6b2e3162",
+)
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+PREFIX = f"lumi-corpus/v0.1/control/sft-import-research/{ATTEMPT}/network-cleanup/{NONCE}/"
+APPROVAL = (
+    "শুধু v0.3-এর leftover EIP ও empty subnet/route table-এর bounded cleanup recovery অনুমোদন করছি। "
+    "Ownership ও cleanup-claim যাচাই করে করবে; নতুন instance, download বা training নয়।"
+)
+READS = {
+    "describe_nat_gateways",
+    "describe_addresses",
+    "describe_subnets",
+    "describe_route_tables",
+    "describe_network_interfaces",
+    "get_object",
+}
+WRITES = {
+    "put_object",
+    "release_address",
+    "disassociate_route_table",
+    "delete_route_table",
+    "delete_subnet",
+}
+ABSENT = {
+    "InvalidAllocationID.NotFound",
+    "InvalidSubnetID.NotFound",
+    "InvalidRouteTableID.NotFound",
+    "NatGatewayNotFound",
+    "NoSuchKey",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("cleanup_recovery_rejected")
+
+
+def owned(row, kind):
+    tags = row.get("Tags", [])
+    for key, value in (("LumiAttempt", ATTEMPT), ("LumiNetworkNonce", NONCE)):
+        need([t.get("Value") for t in tags if t.get("Key") == key] == [value])
+    field = dict(
+        nat="NatGatewayId", address="AllocationId", subnet="SubnetId", table="RouteTableId"
+    )[kind]
+    need(row.get(field) == IDS[kind])
+    if kind in {"subnet", "table", "nat"}:
+        need(row.get("VpcId") == VPC)
+    if kind in {"subnet", "table"}:
+        need(row.get("OwnerId") == ACCOUNT)
+    if kind == "subnet":
+        need(row.get("CidrBlock") == "172.31.96.0/27")
+        need(row.get("AvailabilityZone") == "us-east-1a")
+    if kind == "address":
+        need(row.get("Domain") == "vpc" and row.get("NetworkBorderGroup") == "us-east-1")
+
+
+def empty_table(row):
+    owned(row, "table")
+    need(not row.get("PropagatingVgws"))
+    need(all(r.get("GatewayId") == "local" for r in row.get("Routes", [])))
+    assoc = row.get("Associations", [])
+    need(len(assoc) <= 1)
+    if assoc:
+        a = assoc[0]
+        need(a.get("Main") is False and a.get("SubnetId") == IDS["subnet"])
+        need(a.get("RouteTableId") == IDS["table"])
+        need(a.get("AssociationState", {}).get("State") == "associated")
+        need(a.get("RouteTableAssociationId", "").startswith("rtbassoc-"))
+        return a["RouteTableAssociationId"]
+    return None
+
+
+class Recovery:
+    def __init__(self, clients, save, timeout, *, clock=time.monotonic, wait=time.sleep):
+        self.clients, self.save, self.timeout = clients, save, timeout
+        self.clock, self.wait, self.start = clock, wait, clock()
+        self.calls, self.content_bytes, self.writes = 0, 0, set()
+        self.stage = "initial_readback"
+
+    def call(self, service, operation, **fields):
+        need(operation in READS | WRITES and self.calls < 64)
+        need(self.clock() - self.start < 560)
+        self.stage = operation
+        if operation in WRITES:
+            need(operation not in self.writes)
+            self.writes.add(operation)
+            self.save("write-" + operation, dict(operation=operation, retry_allowed=False))
+        self.calls += 1
+        try:
+            with self.timeout(20):
+                response = getattr(self.clients[service], operation)(**fields)
+        except Exception as error:
+            code = getattr(error, "response", {}).get("Error", {}).get("Code")
+            if operation in READS and code in ABSENT:
+                return None
+            raise ValueError("cleanup_recovery_cloud_call_failed") from None
+        need(not any(response.get(k) for k in ("NextToken", "IsTruncated")))
+        size = len(
+            json.dumps({k: v for k, v in response.items() if k != "Body"}, default=str).encode()
+        )
+        self.content_bytes += size
+        need(size <= 262144 and self.content_bytes <= 1048576)
+        return response
+
+    def row(self, kind):
+        operation, arg, key = {
+            "nat": ("describe_nat_gateways", "NatGatewayIds", "NatGateways"),
+            "address": ("describe_addresses", "AllocationIds", "Addresses"),
+            "subnet": ("describe_subnets", "SubnetIds", "Subnets"),
+            "table": ("describe_route_tables", "RouteTableIds", "RouteTables"),
+        }[kind]
+        response = self.call("ec2", operation, **{arg: [IDS[kind]]})
+        if response is None:
+            return None
+        rows = response[key]
+        need(len(rows) <= 1)
+        if not rows:
+            return None
+        owned(rows[0], kind)
+        return rows[0]
+
+    def claim(self, operation, kind):
+        response = self.call(
+            "s3",
+            "get_object",
+            Bucket=BUCKET,
+            Key=PREFIX + operation + ".json",
+            ExpectedBucketOwner=ACCOUNT,
+        )
+        if response is None:
+            return False
+        body = response["Body"]
+        try:
+            need(0 < response["ContentLength"] <= 512)
+            with self.timeout(20):
+                raw = body.read(513)
+            need(len(raw) == response["ContentLength"])
+            need(
+                json.loads(raw)
+                == dict(attempt=ATTEMPT, nonce=NONCE, operation=operation, resource=IDS[kind])
+            )
+        finally:
+            body.close()
+        self.content_bytes += len(raw)
+        return True
+
+    def gone(self, kind):
+        for _ in range(6):
+            if self.row(kind) is None:
+                return
+            self.wait(2)
+        need(False)
+
+    def run(self):
+        nat = self.row("nat")
+        need(nat is None or nat.get("State") == "deleted")
+        address, subnet, table = self.row("address"), self.row("subnet"), self.row("table")
+        if table is not None:
+            empty_table(table)
+        nat_claim = self.claim("delete-nat-gateway", "nat")
+        eip_claim = self.claim("release-address", "address")
+        self.save(
+            "preflight",
+            dict(
+                nat_deleted_or_absent=True,
+                eip_present=address is not None,
+                nat_claim_present=nat_claim,
+                eip_claim_present=eip_claim,
+            ),
+        )
+        if address is not None:
+            need(not eip_claim)  # Never bypass the expiry worker's shared claim.
+            need(not address.get("AssociationId") and not address.get("NetworkInterfaceId"))
+            raw = json.dumps(
+                dict(
+                    attempt=ATTEMPT,
+                    nonce=NONCE,
+                    operation="release-address",
+                    resource=IDS["address"],
+                ),
+                sort_keys=True,
+            ).encode()
+            answer = self.call(
+                "s3",
+                "put_object",
+                Bucket=BUCKET,
+                Key=PREFIX + "release-address.json",
+                ExpectedBucketOwner=ACCOUNT,
+                Body=raw,
+                ContentLength=len(raw),
+                ContentType="application/json",
+                IfNoneMatch="*",
+                ServerSideEncryption="AES256",
+            )
+            need(answer.get("ResponseMetadata", {}).get("HTTPStatusCode") == 200)
+            address = self.row("address")
+            need(address is not None)
+            need(not address.get("AssociationId") and not address.get("NetworkInterfaceId"))
+            self.call("ec2", "release_address", AllocationId=IDS["address"])
+            self.gone("address")
+        self.save("eip-absent", dict(verified=True))
+        # No private-subnet deletion if a dependency has appeared.
+        enis = self.call(
+            "ec2",
+            "describe_network_interfaces",
+            Filters=[dict(Name="subnet-id", Values=[IDS["subnet"]])],
+            MaxResults=100,
+        )
+        need(not enis["NetworkInterfaces"])
+        table = self.row("table")
+        if table is not None:
+            association = empty_table(table)
+            if association:
+                self.call("ec2", "disassociate_route_table", AssociationId=association)
+                for _ in range(6):
+                    table = self.row("table")
+                    need(table is not None)
+                    if not table.get("Associations"):
+                        break
+                    self.wait(2)
+                need(empty_table(table) is None)
+            self.call("ec2", "delete_route_table", RouteTableId=IDS["table"])
+            self.gone("table")
+        subnet = self.row("subnet")
+        if subnet is not None:
+            self.call("ec2", "delete_subnet", SubnetId=IDS["subnet"])
+            self.gone("subnet")
+        return dict(
+            status="exact_leftovers_absent_verified",
+            eip_absent=True,
+            route_table_absent=True,
+            subnet_absent=True,
+        )
+
+
+def main():
+    import sft_vm_controller_credentials_v2 as credentials
+
+    need(
+        hashlib.sha256(Path(credentials.__file__).read_bytes()).hexdigest()
+        == "8de7a85755d79aebd2f27b98482a51cf0b65af4356cd8bd3e583e00e8211aadb"
+    )
+    prior = ROOT / "artifacts/lumi-vm-private-outer-execution-v0.3/entry-result.json"
+    need(
+        hashlib.sha256(prior.read_bytes()).hexdigest()
+        == "8837ba38c38853015dc7cbbe5035573a166a29236f3dadef6d8a7cd8a8e95d13"
+    )
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = (json.dumps(value, ensure_ascii=False, sort_keys=True) + "\n").encode()
+        need(written + len(raw) <= 65536)
+        fd = os.open(OUTPUT / (name + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    save(
+        "started",
+        dict(
+            human_authorization=APPROVAL,
+            exact_targets=IDS,
+            runtime_seconds=600,
+            maximum_calls=64,
+            maximum_private_write_bytes=65536,
+            maximum_response_content_bytes=1048576,
+            model_data_access=False,
+            gpu=False,
+            training=False,
+            retry_allowed=False,
+        ),
+    )
+    bundle, recovery = None, None
+    result = dict(status="stopped_preserve_no_retry", real_4b_import=False, gate_5_complete=False)
+    start = time.monotonic()
+    try:
+        bundle = credentials.Clients(credentials.Reader(start + 600))
+        recovery = Recovery(
+            bundle.clients, save, credentials.joined.lifecycle.guard.provision.timeout
+        )
+        recovery.start = start
+        result.update(recovery.run())
+    except Exception:
+        result["failed_stage"] = recovery.stage if recovery else "credentials"
+    finally:
+        if recovery:
+            result.update(
+                calls=recovery.calls,
+                attempted_write_operations=sorted(recovery.writes),
+                response_content_bytes=recovery.content_bytes,
+            )
+        if bundle:
+            bundle.close()
+        result["elapsed_seconds"] = round(time.monotonic() - start, 3)
+        save("result", result)
+        print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

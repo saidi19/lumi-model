@@ -1,0 +1,202 @@
+"""Local cleanup-only destination split; immutable attempt-011 stays untouched.
+
+Preserves all payload archives, checkpoint selection and retention destination.
+The generated candidate has no CPU execution entry or authority.
+"""
+
+import ast
+import hashlib
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import sft_vm_dedicated_cleanup_bucket_v1 as control
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-011-source-v0.1"
+BASE_SHA = "044fcf953518a1d85a72f067d7cae8be8d3357b6fde4c6e9011b968cf3bc92dc"
+CHECKER = "scripts/check_sft_vm_cleanup_bucket_v1.py"
+STORE = "scripts/check_sft_vm_cleanup_store_v1.py"
+WORKER = "scripts/sft_vm_network_cleanup_v1.py"
+OLD_BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+OUTPUT = ROOT / "artifacts/lumi-vm-dedicated-cleanup-source-v0.1"
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def need(value):
+    if not value:
+        raise ValueError("cleanup_source_split_rejected") from None
+
+
+def replace(raw, old, new):
+    need(raw.count(old.encode()) == 1)
+    return raw.replace(old.encode(), new.encode())
+
+
+def inputs():
+    raw = (BASE / "release.json").read_bytes()
+    need(sha(raw) == BASE_SHA)
+    manifest = json.loads(raw)
+    files = {}
+    for name, pin in (manifest["outputs"] | manifest["ancillary"]).items():
+        path = BASE / name
+        need(not Path(name).is_absolute() and ".." not in Path(name).parts)
+        need(not any(p.is_symlink() for p in (path, *path.parents)))
+        raw = path.read_bytes()
+        need(len(raw) == pin["bytes"] and sha(raw) == pin["sha256"])
+        files[name] = raw
+    need(len(manifest["outputs"]) == 147 and len(manifest["ancillary"]) == 8)
+    return files, manifest
+
+
+def build():
+    original, manifest = inputs()
+    seeds = dict(original)
+    seeds[WORKER] = replace(
+        original[WORKER], f'BUCKET = "{OLD_BUCKET}"', f'BUCKET = "{control.BUCKET}"'
+    )
+    checker = original["scripts/check_sft_vm_retention_bucket_v1.py"]
+    checker = replace(checker, f'BUCKET = "{OLD_BUCKET}"', f'BUCKET = "{control.BUCKET}"')
+    checker = replace(checker, ' + ATTEMPT + "/"', ' + ATTEMPT + "/network-cleanup/"')
+    # The original host proposal remains an immutable input. Validate its
+    # unchanged retention target, not a counterfeit rewritten proposal.
+    checker = replace(
+        checker,
+        'need((target["bucket"], target["region"], target["prefix"]) == '
+        '(BUCKET, "us-east-1", PREFIX))',
+        f'need((target["bucket"], target["region"], target["prefix"]) == '
+        f'("{OLD_BUCKET}", "us-east-1", '
+        '"lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/"))',
+    )
+    checker = checker.replace(
+        b"lumi.vm-retention-bucket-check.v0.1", b"lumi.vm-cleanup-bucket-check.v0.1"
+    )
+    seeds[CHECKER] = checker
+    store = replace(
+        original[STORE],
+        "import check_sft_vm_retention_bucket_v1 as bucket",
+        "import check_sft_vm_cleanup_bucket_v1 as bucket",
+    )
+    store = replace(
+        store,
+        "PINS = {\n",
+        'PINS = {\n    "check_sft_vm_cleanup_bucket_v1.py": "' + sha(checker) + '",\n',
+    )
+    # Preserve endpoint/SDK checks in the parent's constructor. Do not inherit
+    # its fixed retention-bucket request target for cleanup-only reads.
+    store = replace(
+        store,
+        '        if operation != "get-bucket-lifecycle-configuration":\n'
+        "            return super().cli(service, operation, **fields)\n"
+        "        need(\n"
+        '            service == "s3api"\n'
+        "            and fields == dict(Bucket=worker.BUCKET, ExpectedBucketOwner=worker.ACCOUNT)\n"
+        "        )",
+        "        need(operation in self.OPS.get(service, set()))\n"
+        '        need(fields == ({} if service == "sts" else\n'
+        "             dict(Bucket=worker.BUCKET, ExpectedBucketOwner=worker.ACCOUNT)))",
+    )
+    store = replace(
+        store,
+        '                return self.clients["s3api"].get_bucket_lifecycle_configuration(**fields)',
+        "                return getattr(self.clients[service], "
+        'operation.replace("-", "_"))(**fields)',
+    )
+    store = replace(
+        store,
+        '                getattr(error, "response", {}).get("Error", {}).get("Code")',
+        '                operation == "get-bucket-lifecycle-configuration"\n'
+        '                and getattr(error, "response", {}).get("Error", {}).get("Code")',
+    )
+    seeds[STORE] = store
+    current = dict(seeds)
+    for _ in range(64):
+        mapping = {}
+        for name in manifest["outputs"]:
+            raw = original[name]
+            before, after = sha(raw), sha(current[name])
+            need(before not in mapping or mapping[before] == after)
+            mapping[before] = after
+        following = {}
+        for name, raw in seeds.items():
+            if (
+                name not in manifest["ancillary"]
+                and name.endswith((".py", ".json"))
+                and not name.startswith("evidence/")
+            ):
+                raw = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda m, mapping=mapping: mapping.get(m[0].decode(), m[0].decode()).encode(),
+                    raw,
+                )
+            following[name] = raw
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("cleanup_source_hash_cycle")
+    changed = []
+    for name, raw in current.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name not in original:
+            continue
+        if raw != original[name]:
+            changed.append(name)
+        if name not in {STORE, WORKER}:
+            need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+            need(raw == original[name])
+    for name in (
+        "scripts/check_sft_vm_retention_bucket_v1.py",
+        "scripts/issue_sft_vm_retention_credentials_v1.py",
+        "scripts/prepare_sft_vm_external_watchdog_v1.py",
+    ):
+        need(current[name] == original[name])
+    need(sum(map(len, current.values())) < 32 * 1024**2)
+    report = dict(
+        schema="lumi.vm-dedicated-cleanup-source.v0.1",
+        status="local_candidate_not_cpu_authorized",
+        base_release_sha256=BASE_SHA,
+        attempt=control.ATTEMPT,
+        cleanup_bucket=control.BUCKET,
+        checkpoint_and_retention_bucket=OLD_BUCKET,
+        logical_changes=[STORE, WORKER, CHECKER],
+        consequent_hash_changes=sorted(changed),
+        outputs={n: dict(bytes=len(r), sha256=sha(r)) for n, r in current.items()},
+        original_outputs=len(manifest["outputs"]),
+        original_ancillary=len(manifest["ancillary"]),
+        ancillary_scope="Preserved ancestor composition evidence; outputs binds current candidate",
+        execution_permitted=False,
+        cpu_entry_bound=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+    return current, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    files = files | {"release.json": (json.dumps(report, sort_keys=True, indent=2) + "\n").encode()}
+    for name, raw in sorted(files.items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+        need(path.read_bytes() == raw)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("candidate_is_not_execution_authority")

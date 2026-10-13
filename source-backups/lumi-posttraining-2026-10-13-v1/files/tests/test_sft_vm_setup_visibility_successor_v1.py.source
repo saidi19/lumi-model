@@ -1,0 +1,88 @@
+"""Offline visibility regressions plus the existing production replay contracts."""
+
+from unittest.mock import patch
+
+from botocore.exceptions import ClientError
+
+from scripts import prepare_sft_vm_setup_visibility_successor_v1 as builder
+from scripts import qualify_sft_vm_setup_production_v2 as m
+from tests import test_sft_vm_setup_production_probe_v1 as base
+
+
+class Tests(base.Tests):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed, cls.receiver, cls.archive = m.authenticate()
+
+    def setUp(self):
+        self.enterContext(patch.object(base, "m", m))
+        super().setUp()
+        self.visibility_mode = None
+
+    def cloud(self, **options):
+        cloud, now, calls = super().cloud(**options)
+        client = cloud.clients["ec2"]
+        original = client.describe_instances
+        new_reads = [0]
+
+        def describe_instances(**fields):
+            response = original(**fields)
+            if cloud.launch_sent and fields.get("InstanceIds") != [m.RETAINED]:
+                new_reads[0] += 1
+                mode, count = self.visibility_mode, new_reads[0]
+                if (mode == "boot" and count <= 2) or (mode == "cleanup" and count == 2):
+                    raise ClientError(
+                        dict(
+                            Error=dict(
+                                Code="InvalidInstanceID.NotFound", Message="PRIVATE_SENTINEL"
+                            )
+                        ),
+                        "DescribeInstances",
+                    )
+                if mode == "denied" and count == 1:
+                    raise ClientError(
+                        dict(Error=dict(Code="UnauthorizedOperation", Message="PRIVATE_SENTINEL")),
+                        "DescribeInstances",
+                    )
+            return response
+
+        client.describe_instances = describe_instances
+        return cloud, now, calls
+
+    def test_reproducible_entry(self):
+        self.assertEqual(m.read(builder.OUTPUT), builder.build())
+
+    def test_initial_not_found_is_bounded_read_poll_not_launch_retry(self):
+        self.visibility_mode = "boot"
+        result, calls, _, transfer, _ = self.replay()
+        self.assertEqual(result["status"], "source_only_native_transfer_passed")
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(transfer.call_count, 1)
+        self.assertEqual(sum(op == "run_instances" for op, _ in calls), 1)
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+        self.assertLessEqual(len(calls), 100)
+
+    def test_cleanup_visibility_delay_does_not_abandon_owned_instance(self):
+        self.visibility_mode = "cleanup"
+        result, calls, _, _, _ = self.replay()
+        self.assertTrue(result["terminated_verified"])
+        self.assertTrue(result["disposable_volumes_absent_verified"])
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_permission_failure_is_not_treated_as_visibility(self):
+        self.visibility_mode = "denied"
+        result, _, control, transfer, files = self.replay()
+        self.assertEqual(result["status"], "failed_no_retry")
+        self.assertEqual(result["cloud_failure_code"], "UnauthorizedOperation")
+        self.assertEqual(result["cloud_failure_operation"], "describe_instances")
+        self.assertTrue(result["terminated_verified"])
+        self.assertNotIn(b"PRIVATE_SENTINEL", b"".join(files.values()))
+        control.assert_not_called()
+        transfer.assert_not_called()
+
+    def test_unallowlisted_cloud_message_never_retained(self):
+        error = ClientError(
+            dict(Error=dict(Code="PRIVATE_SENTINEL", Message="PRIVATE_SENTINEL")),
+            "DescribeInstances",
+        )
+        self.assertEqual(m.cloud_failure_code(error), "other")

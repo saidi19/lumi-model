@@ -1,0 +1,175 @@
+"""One bounded read-only native inspection over the existing pinned SSH channel.
+
+No launch or admission callback implementation; never turn readiness into a
+binding. No credentials/data input. The caller supplies the original setup
+request and authenticated connection. Ambiguous exchange consumes this output.
+"""
+
+import hashlib
+import math
+import re
+import time
+from pathlib import Path
+
+import send_sft_vm_setup_inputs_v5 as sender
+
+ATTEMPT = sender.inputs.ATTEMPT
+SOURCE_SHA = "c6d65a5e1dc90c46855f76be9ccf241193cf2ac0fedb20c6b8ad1d95bbefdfda"
+SOURCE = Path(__file__).with_name("inspect_sft_vm_native_readiness_v1.py")
+TRUE = (
+    "same_boot_setup_and_guards_observed",
+    "storage_snapshot_matches",
+    "expected_worker_units_absent",
+)
+FALSE = (
+    "binding_created",
+    "host_admitted",
+    "native_ml_runtime_qualified",
+    "privileged_writer_exclusion_proven",
+    "cloud_volume_encryption_proven",
+    "execution_permitted",
+    "real_4b_import",
+    "gate_5_complete",
+    "retry_allowed",
+)
+COUNTS = dict(
+    staged_source_files_verified=62,
+    parent_source_files_verified=9,
+    cpu_package_versions_matched=34,
+    sdk_package_versions_matched=5,
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("native_readiness_delivery_rejected") from None
+
+
+def validate_request(request, binding):
+    need(
+        type(request) is dict
+        and set(request)
+        == {
+            "schema",
+            "attempt",
+            "machine_id",
+            "boot_id",
+            "volumes",
+            "setup_deadline_boottime",
+            "host_deadline_boottime",
+        }
+    )
+    need(request["schema"] == "lumi.vm-detached-setup-request.v0.1")
+    need(request["attempt"] == binding["attempt"] == ATTEMPT)
+    need(
+        type(request["machine_id"]) is str and re.fullmatch(r"[0-9a-f]{32}", request["machine_id"])
+    )
+    need(
+        type(request["boot_id"]) is str
+        and re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request["boot_id"])
+    )
+    need(request["volumes"] == {k: binding[k] for k in ("root_volume", "work_volume")})
+    need(
+        type(request["setup_deadline_boottime"]) is int
+        and request["setup_deadline_boottime"] == 1800
+    )
+    need(
+        type(request["host_deadline_boottime"]) is int
+        and 1800 < request["host_deadline_boottime"] <= 14400
+    )
+
+
+def validate_reply(value):
+    need(type(value) is dict and set(value) == {"schema", "attempt", *TRUE, *FALSE, *COUNTS})
+    need(value["schema"] == "lumi.vm-native-readiness.v0.1" and value["attempt"] == ATTEMPT)
+    need(all(value[k] is True for k in TRUE) and all(value[k] is False for k in FALSE))
+    need(all(type(value[k]) is int and value[k] == expected for k, expected in COUNTS.items()))
+    return value
+
+
+def launcher(request, length):
+    return f"""import hashlib,json,os,signal,sys,types
+try:
+ signal.alarm(90)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ raw=sys.stdin.buffer.read({length + 1})
+ assert len(raw)=={length} and hashlib.sha256(raw).hexdigest()=={SOURCE_SHA!r}
+ m=types.ModuleType('_authenticated_native_readiness')
+ m.__file__='/opt/lumi-bootstrap-input/inspect_sft_vm_native_readiness_v1.py'
+ exec(compile(raw,m.__file__,'exec'),m.__dict__)
+ result=m._inspect_same_host({request!r})
+ body=json.dumps(result,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+ assert len(body)<=4096
+ sys.stdout.buffer.write(body)
+except BaseException:
+ sys.exit(1)
+"""
+
+
+def _inspect_channel_once(
+    output,
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    request,
+    *,
+    deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+):
+    validate_request(request, binding)
+    need(type(deadline) in {int, float} and math.isfinite(deadline))
+    need(100 < deadline - clock() <= 14400)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= 32 * 1024**2)
+    raw = SOURCE.read_bytes()
+    need(0 < len(raw) <= 32768 and hashlib.sha256(raw).hexdigest() == SOURCE_SHA)
+    argv = sender.command(
+        binding, key, directory, config_sha, hosts_sha, launcher(request, len(raw))
+    )
+    charge = len(argv[-1].encode()) + len(raw)
+    need(charge <= remaining_control_bytes)
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = sender.delivery.connection.issuer.base.save
+    save(
+        output / "started.json",
+        dict(
+            attempt=ATTEMPT,
+            source_sha256=SOURCE_SHA,
+            control_content_bytes_charged=charge,
+            retry_allowed=False,
+        ),
+    )
+    try:
+        need(deadline - clock() > 100)
+        value = validate_reply(
+            sender.delivery.decode(sender.delivery.pipe_exchange(argv, raw, 100))
+        )
+        report = dict(
+            status="readiness_observed_not_admission",
+            observation=value,
+            control_content_bytes_charged=charge,
+            host_admitted=False,
+            binding_created=False,
+            gate_5_complete=False,
+            retry_allowed=False,
+        )
+    except BaseException:
+        report = dict(
+            status="inspection_failed_preserve_no_retry",
+            host_admitted=False,
+            binding_created=False,
+            gate_5_complete=False,
+            retry_allowed=False,
+        )
+        save(output / "result.json", report)
+        raise ValueError("native_inspection_failed") from None
+    save(output / "result.json", report)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_native_channel_not_bound") from None

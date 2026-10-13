@@ -1,0 +1,30 @@
+"""Offline tests for the fresh attempt-020 preflight preparation."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt020_readonly_preflight_v2 as m
+
+
+class Tests(unittest.TestCase):
+    def test_fresh_successor_is_prepared_but_not_authorized(self):
+        plan = m.build()
+        self.assertEqual(plan["status"], "fresh_successor_prepared_not_executed")
+        self.assertEqual(plan["fresh_output"], m.RUN_OUTPUT)
+        self.assertEqual(plan["consumed_output_preserved"], m.CONSUMED_OUTPUT)
+        self.assertFalse(plan["retry_of_consumed_pass"])
+        self.assertFalse(plan["read_only_preflight_execution_permitted"])
+        self.assertFalse(plan["cpu_launch_authorized"])
+        self.assertFalse(plan["gate_5_complete"])
+
+    def test_cleanup_drift_rejected(self):
+        with patch.object(m, "CLEANUP_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.build()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

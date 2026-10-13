@@ -1,0 +1,59 @@
+"""Prepare fresh immutable control readback bindings; zero cloud calls."""
+
+import ast
+import json
+
+from scripts import prepare_sft_vm_attempt022_control_package_v1 as source
+
+ROOT = source.ROOT
+BASE = "scripts/verify_sft_vm_attempt021_controls_v1.py"
+BASE_SHA = "a0723c9f143b13b0a69e54a9246a31925cf21915e7785068251909db6d1337e5"
+PROOF = "evidence/lumi-vm-attempt-022-control-execution-verification-v0.1.json"
+PROOF_SHA = "5965f8e420c00fae2f04fdaaed9cb4b92dfa2742dca8bbc83e75afb89faad382"
+OUTPUT = "scripts/verify_sft_vm_attempt022_controls_v1.py"
+need, sha, read = source.need, source.sha, source.read
+
+
+def candidate():
+    proof = json.loads(read(PROOF, PROOF_SHA))
+    need(proof["status"] == "both_control_deployments_succeeded_receipts_verified")
+    need(proof["attempt"] == source.ATTEMPT)
+    need(proof["total_deployment_control_calls"] == 41)
+    pins = dict(proof["source_bindings"])
+    pins[PROOF] = PROOF_SHA
+    pins[source.RELEASE + "/release.json"] = source.RELEASE_SHA
+    bindings = {path: (len(read(path, digest)), digest) for path, digest in pins.items()}
+    raw = source.rewrite(read(BASE, BASE_SHA))
+    raw = raw.replace(b"cleanup_bucket_v12", b"cleanup_bucket_v13")
+    raw = raw.replace(b"attempt-022-control-plan-v0.2", b"attempt-022-control-plan-v0.1")
+    assignments = {
+        "PLAN_SHA": "0b072f68938e74484501c72e60a57965c5e205e4572af06dcc60ceb00d17fc35",
+        "SOURCE_RELEASE_SHA": source.RELEASE_SHA,
+        "SOURCE_BINDINGS": bindings,
+    }
+    for name, value in assignments.items():
+        row = next(
+            node for node in ast.parse(raw).body
+            if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        if name == "SOURCE_BINDINGS":
+            body = "SOURCE_BINDINGS = {\n"
+            for path, (size, digest) in bindings.items():
+                body += f"    {path!r}: (\n        {size},\n        {digest!r},\n    ),\n"
+            body += "}\n"
+        else:
+            body = f"{name} = {value!r}\n"
+        lines = raw.splitlines(keepends=True)
+        lines[row.lineno - 1:row.end_lineno] = [body.encode()]
+        raw = b"".join(lines)
+    raw = raw.replace(b"READ_DELAYS=transport.READ_DELAYS", b"READ_DELAYS=()")
+    raw = raw.replace(b"MAX_READ_RETRIES=transport.MAX_READ_RETRIES", b"MAX_READ_RETRIES=0")
+    compile(raw, OUTPUT, "exec")
+    return raw
+
+
+if __name__ == "__main__":
+    content = candidate()
+    source.write_new(OUTPUT, content)
+    print(json.dumps(dict(output=OUTPUT, sha256=sha(content), aws_calls=0), sort_keys=True))

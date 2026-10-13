@@ -1,0 +1,329 @@
+"""Owned eight-process backend for SocketTransport; no CLI or launch authority.
+
+acquire/check_health/retire implement the transport's process callbacks. A fresh
+stdlib guardian owns a new POSIX session, arms its deadline before releasing
+workers, and monitors a parent-lifetime pipe independently of the socket pump.
+Worker source is supplied as pinned PUBLIC code bytes, never secrets/data. Each
+exec inherits only its ledger/control sockets and a temporary release gate.
+Workers receive rank, socket FDs and deadline in argv; private bootstrap must
+use the inherited channels, not source/argv/environment. No ML is imported here.
+
+Trusted worker code MUST NOT escape the session, alter the guardian or create
+unmanaged descendants. Process groups are not a sandbox: setsid escape, native
+uninterruptible calls, hostile same-UID interference, guardian death, RAM/disk/
+network/GPU limits and instance shutdown require separate admitted host controls.
+This is NOT target admission, a cgroup guardian or a complete GPU launcher.
+The caller must bind interpreter/source/receipts, preserve consumed attempts,
+provide authority before acquire and include cleanup reserve in total budgets.
+Only fixed aggregate summaries are public; never log suppressed exceptions.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import select
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+CHILD_GATE = """import os,signal,sys
+gate=int(sys.argv.pop(1)); source=bytes.fromhex(sys.argv.pop(1))
+if os.read(gate,1)!=b'G': os._exit(125)
+os.close(gate)
+for sig in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT): signal.signal(sig,signal.SIG_DFL)
+for fd in map(int,sys.argv[2:4]): os.set_inheritable(fd,False)
+exec(compile(source,'<pinned-lumi-worker>','exec'))
+"""
+
+# This process, not the transport event loop, owns the deadline and group kill.
+# It never signals a caller-supplied PID/PGID. Worker handles belong to Popen.
+GUARDIAN = r'''import os,select,signal,subprocess,sys,time
+children=[]; closing=False; status=None; cleanup_ns=0
+def emit(kind,rank=255,result=0):
+ try: os.write(status,bytes((kind,rank,result)))
+ except BaseException: pass
+def stop(*ignored):
+ global closing
+ if closing: os.killpg(os.getpgrp(),signal.SIGKILL)
+ closing=True
+ signal.setitimer(signal.ITIMER_REAL,0)
+ end=time.monotonic_ns()+cleanup_ns
+ os.killpg(os.getpgrp(),signal.SIGTERM)
+ for child in children:
+  if child.poll() is None: child.kill()
+ complete=True
+ for child in children:
+  try: child.wait(timeout=max(.001,(end-time.monotonic_ns())/1e9))
+  except BaseException: complete=False
+ if complete: emit(67)
+ os.killpg(os.getpgrp(),signal.SIGKILL)
+try:
+ life,status,deadline,cleanup_ns=map(int,sys.argv[1:5])
+ source,gate_source=sys.argv[5:7]
+ endpoints=list(map(int,sys.argv[7:]))
+ if len(endpoints)!=16: raise ValueError()
+ for sig in (signal.SIGTERM,signal.SIGHUP,signal.SIGINT):
+  signal.signal(sig,signal.SIG_IGN)
+ signal.signal(signal.SIGALRM,stop)
+ remaining=(deadline-time.monotonic_ns())/1e9
+ if remaining<=0: stop()
+ signal.setitimer(signal.ITIMER_REAL,remaining)
+ gate_read,gate_write=os.pipe()
+ for rank in range(8):
+  if time.monotonic_ns()>=deadline: stop()
+  ledger,control=endpoints[rank*2:rank*2+2]
+  child=subprocess.Popen([sys.executable,'-I','-S','-B','-c',gate_source,
+      str(gate_read),source,str(rank),str(ledger),str(control),str(deadline)],
+      stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+      close_fds=True,pass_fds=(gate_read,ledger,control),env=dict(os.environ))
+  children.append(child)
+ os.close(gate_read)
+ for fd in endpoints: os.close(fd)
+ if select.select([life],[],[],0)[0]: stop()
+ emit(82)
+ if os.write(gate_write,b'G'*8)!=8: raise ValueError()
+ os.close(gate_write)
+ reported=set()
+ while True:
+  if time.monotonic_ns()>=deadline: stop()
+  for rank,child in enumerate(children):
+   result=child.poll()
+   if result is not None and rank not in reported:
+    emit(69,rank,int(result!=0)); reported.add(rank)
+  if select.select([life],[],[],.01)[0]:
+   if not os.read(life,1): stop()
+   raise ValueError()
+except BaseException:
+ emit(70,255,1)
+ stop()
+'''
+
+ERRORS = frozenset({"invalid_arguments", "runtime_rejected", "source_rejected",
+                    "already_consumed", "owner_mismatch", "admission_rejected",
+                    "spawn_failed", "deadline_exhausted", "status_rejected",
+                    "worker_failed", "guardian_failed", "cleanup_failed"})
+
+
+class ProcessPeersError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "spawn_failed"
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise ProcessPeersError(code) from None
+
+
+class ProcessPeers:
+    """Single-use, main-thread owner; successful acquire transfers parent sockets.
+
+    Worker sys.argv[1:] is rank, ledger_fd, control_fd, monotonic_deadline_ns.
+    The release gate restores TERM/HUP/INT defaults and socket CLOEXEC flags.
+    Worker entry must perform cold target admission before any ML/data work.
+    stdout/stderr are discarded to /dev/null, not captured or byte-metered.
+    No inherited environment overrides, shell, network setup or automatic retry.
+    """
+
+    def __init__(self, *, worker_source, source_sha256, python_executable,
+                 deadline_ns, cleanup_milliseconds, admit):
+        need(not hasattr(self, "_owner"), "already_consumed")
+        need(type(worker_source) is bytes and 0 < len(worker_source) <= 16384
+             and type(source_sha256) is str
+             and hashlib.sha256(worker_source).hexdigest() == source_sha256, "source_rejected")
+        need(type(python_executable) is str and Path(python_executable).is_absolute()
+             and type(deadline_ns) is int and 0 < deadline_ns < 2**63
+             and type(cleanup_milliseconds) is int and 100 <= cleanup_milliseconds <= 5000
+             and callable(admit), "invalid_arguments")
+        self._source, self._python = worker_source, python_executable
+        self._deadline, self._cleanup = deadline_ns, cleanup_milliseconds * 1_000_000
+        self._admit = admit
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._failure = "idle", None
+        self._process = None
+        self._life = self._status = None
+        self._ready = self._cleanup_ack = self._retired = False
+        self._retirement_ok = False
+        self._exits, self._raw = {}, bytearray()
+        self._status_bytes = 0
+
+    def _owned(self):
+        need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+
+    def _remaining(self, deadline):
+        remaining = deadline - time.monotonic_ns()
+        need(remaining > 0, "deadline_exhausted")
+        return remaining / 1e9
+
+    def _status_read(self, timeout):
+        if self._status is None or not select.select([self._status], [], [], timeout)[0]:
+            return
+        raw = os.read(self._status, 34 - self._status_bytes)
+        if not raw:
+            need(self._retired or self._cleanup_ack, "guardian_failed")
+            need(not self._raw, "status_rejected")
+            return
+        self._status_bytes += len(raw)
+        need(self._status_bytes <= 33, "status_rejected")
+        self._raw.extend(raw)
+        while len(self._raw) >= 3:
+            kind, rank, result = self._raw[:3]
+            del self._raw[:3]
+            if kind == 82:
+                need(not self._ready and rank == 255 and result == 0, "status_rejected")
+                self._ready = True
+            elif kind == 69:
+                need(self._ready and rank in range(8) and rank not in self._exits
+                     and result in (0, 1), "status_rejected")
+                self._exits[rank] = result
+            elif kind == 67:
+                need(not self._cleanup_ack and rank == 255 and result == 0, "status_rejected")
+                self._cleanup_ack = True
+            else:
+                raise ProcessPeersError("guardian_failed") from None
+
+    def acquire(self):
+        self._owned()
+        need(self._state == "idle", "already_consumed")
+        self._state = "starting"
+        parents, children, loose = [], [], []
+        stage = "runtime_rejected"
+        try:
+            need(os.name == "posix" and threading.current_thread() is threading.main_thread()
+                 and threading.active_count() == 1
+                 and signal.getsignal(signal.SIGCHLD) == signal.SIG_DFL
+                 and hasattr(signal, "setitimer")
+                 and not any(name.split('.')[0] in {"torch", "transformers", "numpy"}
+                             for name in sys.modules), "runtime_rejected")
+            need(str(Path(self._python).resolve()) == self._python
+                 and os.access(self._python, os.X_OK), "runtime_rejected")
+            self._remaining(self._deadline)
+            stage = "admission_rejected"
+            need(self._admit() is None, "admission_rejected")
+            stage = "spawn_failed"
+            self._remaining(self._deadline)
+            for _ in range(8):
+                pair = []
+                for _ in range(2):
+                    left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                    pair.append(left)
+                    children.append(right)
+                    loose.append(left)
+                parents.append(tuple(pair))
+            life_read, self._life = os.pipe()
+            loose.append(life_read)
+            self._status, status_write = os.pipe()
+            loose.append(status_write)
+            child_fds = tuple(sock.fileno() for sock in children)
+            self._process = subprocess.Popen(
+                [self._python, "-I", "-S", "-B", "-c", GUARDIAN,
+                 str(life_read), str(status_write), str(self._deadline), str(self._cleanup),
+                 self._source.hex(), CHILD_GATE, *map(str, child_fds)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                cwd="/", close_fds=True, pass_fds=(life_read, status_write, *child_fds),
+                start_new_session=True, env={"PATH": "/usr/bin:/bin", "LANG": "C",
+                    "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+                    "TOKENIZERS_PARALLELISM": "false", "OMP_NUM_THREADS": "1"})
+            for item in (life_read, status_write):
+                loose.remove(item)
+                os.close(item)
+            while not self._ready:
+                self._status_read(min(.05, self._remaining(self._deadline)))
+            self._state = "active"
+            loose.clear()  # Parent socket ownership transfers only on success.
+            return tuple(parents)
+        except BaseException as error:
+            self._failure = error.code if type(error) is ProcessPeersError else stage
+            self._state = "failed"
+            try:
+                self.retire(False)
+            except BaseException:
+                pass
+            raise ProcessPeersError(self._failure) from None
+        finally:
+            for item in children + loose:
+                try:
+                    item.close() if type(item) is socket.socket else os.close(item)
+                except OSError:
+                    pass
+
+    def check_health(self, retiring):
+        self._owned()
+        need(type(retiring) is bool and self._state == "active", "already_consumed")
+        try:
+            self._remaining(self._deadline)
+            self._status_read(0)
+            need(not self._cleanup_ack and self._process.poll() is None, "guardian_failed")
+            need(not any(self._exits.values()) and (retiring or not self._exits), "worker_failed")
+        except BaseException as error:
+            self._failure = error.code if type(error) is ProcessPeersError else "guardian_failed"
+            self._state = "failed"
+            raise ProcessPeersError(self._failure) from None
+
+    def retire(self, success):
+        self._owned()
+        need(type(success) is bool, "invalid_arguments")
+        if self._retired:
+            need(self._retirement_ok, "cleanup_failed")
+            return
+        self._retired = True
+        end = time.monotonic_ns() + self._cleanup
+        valid = True
+        try:
+            if success:
+                need(self._state == "active", "worker_failed")
+                self._remaining(self._deadline)
+                while len(self._exits) < 8:
+                    self._status_read(min(.01, self._remaining(min(end, self._deadline))))
+                need(not any(self._exits.values()) and not self._cleanup_ack, "worker_failed")
+                self._remaining(self._deadline)
+        except BaseException:
+            valid = False
+        finally:
+            if self._life is not None:
+                fd, self._life = self._life, None
+                try:
+                    os.close(fd)  # EOF wakes the guardian; no numeric PID signal.
+                except OSError:
+                    valid = False
+            if self._process is not None:
+                try:
+                    self._process.wait(timeout=self._remaining(end))
+                    while select.select([self._status], [], [], 0)[0]:
+                        before = self._status_bytes
+                        self._status_read(0)
+                        if before == self._status_bytes:
+                            break
+                    valid &= self._process.returncode == -signal.SIGKILL and self._cleanup_ack
+                except BaseException:
+                    valid = False
+            if self._status is not None:
+                fd, self._status = self._status, None
+                try:
+                    os.close(fd)
+                except OSError:
+                    valid = False
+            self._raw.clear()
+        if not valid:
+            self._state = "failed"
+            self._failure = self._failure or "cleanup_failed"
+            raise ProcessPeersError("cleanup_failed") from None
+        self._state = "retired" if self._failure is None else "failed"
+        self._retirement_ok = True
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-process-peers-summary.v0.1",
+                "state": self._state, "failure_code": self._failure,
+                "worker_exit_reports": len(self._exits),
+                "worker_failures": sum(self._exits.values()),
+                "guardian_ready": self._ready, "guardian_cleanup_ack": self._cleanup_ack,
+                "guardian_reaped": (self._process is not None
+                                    and self._process.returncode is not None),
+                "retained_child_text_bytes": 0, "target_admission_verified": False,
+                "setsid_escape_containment": False, "os_resource_enforcement": False,
+                "real_execution_authorized": False, "production_eligible": False}

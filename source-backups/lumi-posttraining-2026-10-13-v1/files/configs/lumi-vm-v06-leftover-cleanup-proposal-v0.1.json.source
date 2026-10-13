@@ -1,0 +1,97 @@
+{
+  "schema": "lumi.vm-v06-leftover-cleanup-proposal.v0.1",
+  "date": "2026-10-07",
+  "status": "requires_explicit_scoped_authorization",
+  "execution_permitted": false,
+  "approval_record": null,
+  "executor_implemented": false,
+  "scope": "One fresh cleanup of exact attempt-006 leftovers; not a CPU attempt, not a retry of failed provisioning.",
+  "account": "573978149073",
+  "region": "us-east-1",
+  "vpc": "vpc-0905fbf9490a2dead",
+  "attempt": "606d788073f1f0b66a39eabeb4b32c2c",
+  "network_nonce": "d753b0b8cbda4fde8ae8c64425696aa1",
+  "bindings": {
+    "evidence/lumi-vm-private-outer-execution-outcome-v0.6.json": "0245332a8b2d5a2049383efee037ca9221c68e62bc2206705845edf634427d01",
+    "artifacts/lumi-vm-private-outer-execution-v0.6/attempt-006/host/execution/host/connection-key.pub": "b1cf03fa41d61cd50b5d056af6139d405d2e89848631208980559990e888a6c5"
+  },
+  "targets": {
+    "endpoint": "eice-07aff6ac7f4bd5491",
+    "vm_security_group": "sg-0498da19671ca347e",
+    "endpoint_security_group": "sg-085e0ea72babd44d1",
+    "key_name": "lumi-fullsize-606d788073f1f0b66a39eabeb4b32c2c",
+    "key_pair_id": null,
+    "subnet": "subnet-0d234a4f92365457b",
+    "route_table": "rtb-09df0bb62501bb995",
+    "route_table_association_id": null
+  },
+  "caps": {
+    "resource_api_calls": 128,
+    "mutation_api_calls": 9,
+    "credential_provider_invocations": 1,
+    "wall_seconds": 900,
+    "observation_polls_per_wait": 30,
+    "association_pages_per_query": 8,
+    "single_response_bytes": 262144,
+    "aggregate_response_bytes": 4194304,
+    "private_write_bytes": 262144,
+    "sdk_total_max_attempts": 1,
+    "mutation_retries": 0
+  },
+  "read_admission": [
+    "Authenticate outcome and every bound receipt; require recorded no launch and verified NAT/EIP release. Exact account and region required.",
+    "Verify endpoint exact VPC/subnet/security group, PreserveClientIp=false, LumiAttempt ownership and create-complete state. Record only IDs and allowlisted state/validation booleans.",
+    "Verify both SG IDs/names/VPC/owner/tags and original exact rule sets. Only original VM inbound SSH/22 from endpoint group, endpoint outbound SSH/22 to VM group, VM outbound HTTPS/443 and no endpoint inbound rules allowed.",
+    "Resolve exact current key by name, verify ed25519, LumiAttempt tag and canonical algorithm/blob equality with hash-bound local public key; journal KeyPairId and use ID for deletion. Never read private key.",
+    "Require no nonterminated instances in separate attempt-tag and key-name queries and no instances using either group or target subnet.",
+    "Before endpoint deletion, subnet/group ENIs may be only the exact network-interface IDs returned for that endpoint; reject unrelated interfaces. After endpoint disappearance require those ENIs and all subnet/group ENIs absent before downstream deletions.",
+    "Require exact subnet/table VPC, owner and both LumiAttempt/LumiNetworkNonce tags. Subnet CIDR 172.31.96.0/27 in us-east-1a. Table has only frozen local route, no propagating gateways, no main association and at most one exact subnet association; resolve its ID freshly.",
+    "Check same-VPC inbound/outbound group references separately; only expected mutual references allowed. Require empty peer/transit references and complete empty SG VPC-association results; up to 8 pages with cycle detection per query, no partial-empty success.",
+    "Verify prior exact NAT nat-0ade5f222f766898b absent/deleted and allocation eipalloc-02bfac6c312f37b2a absent; never repeat their mutations.",
+    "Read only the two exact retained S3 cleanup claims under the bound nonce; match attempt, nonce, operation and NAT/allocation IDs. No S3 mutation or model/dataset read.",
+    "Reject unexpected pagination on other operations, malformed/partial data, resource drift, missing ownership, unlisted dependencies or cap exhaustion."
+  ],
+  "claim_reads": {
+    "bucket": "lumi-corpus-prod-27777c02b29b76efcac3",
+    "prefix": "lumi-corpus/v0.1/control/sft-import-research/606d788073f1f0b66a39eabeb4b32c2c/network-cleanup/d753b0b8cbda4fde8ae8c64425696aa1/",
+    "keys": [
+      "delete-nat-gateway.json",
+      "release-address.json"
+    ],
+    "maximum_body_bytes_each": 512,
+    "put_or_delete_allowed": false
+  },
+  "ordered_mutations": [
+    "DeleteInstanceConnectEndpoint for eice-07aff6ac7f4bd5491 once; bounded readback until absent/delete-complete and endpoint ENIs gone.",
+    "RevokeSecurityGroupIngress on sg-0498da19671ca347e only exact SSH/22 reference from sg-085e0ea72babd44d1.",
+    "RevokeSecurityGroupEgress on sg-085e0ea72babd44d1 only exact SSH/22 reference to sg-0498da19671ca347e.",
+    "DeleteSecurityGroup sg-085e0ea72babd44d1 after fresh no-dependency readback.",
+    "DeleteSecurityGroup sg-0498da19671ca347e after fresh no-dependency readback.",
+    "DeleteKeyPair using freshly verified/journaled exact KeyPairId after no-instance and both-group-absence checks.",
+    "If exactly one non-main target subnet/table association exists, disassociate only its freshly verified ID once; skip if already absent at initial admission.",
+    "DeleteRouteTable rtb-09df0bb62501bb995 after no associations, no propagated/nonlocal routes and fresh ownership check.",
+    "DeleteSubnet subnet-0d234a4f92365457b after no endpoints/ENIs/instances/NAT/explicit route associations and fresh ownership check."
+  ],
+  "write_rules": "Exclusive local started journal, record target/operation before every write, fresh relevant ownership/dependency checks immediately before each mutation and bounded readback after it. Uncertain mutation consumes the operation: readback only, stop without retry. Do not broaden targets or delete dependencies to force progress. Already absent unexpected targets at initial admission stop for review.",
+  "preserve": [
+    "All previous evidence and both local key files",
+    "EBS/S3 retained content",
+    "IAM/Lambda/Scheduler support resources",
+    "Remote cleanup claims",
+    "All unrelated resources"
+  ],
+  "forbidden": [
+    "New instance, network, endpoint or key creation",
+    "Checkpoint/model/dataset access",
+    "CPU import, GPU, inference or training",
+    "Instance stop/terminate",
+    "Disassociation of SG VPC associations",
+    "Bucket-wide, registry or policy changes",
+    "Private-key access/deletion",
+    "Automatic retry or replay of any consumed attempt"
+  ],
+  "consequences": "Deletes only listed leftover resources and exact associated rules. Deleted AWS IDs cannot be restored; equivalent resources would require separately authorized recreation. Local evidence/keys remain.",
+  "verification": "Every exact endpoint/group/key/table/subnet absent or endpoint delete-complete with ENIs absent, or report partial/unresolved; do not call partial cleanup complete.",
+  "training_authorized": false,
+  "new_cpu_execution_authorized": false
+}

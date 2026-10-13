@@ -1,0 +1,777 @@
+"""Tiny stdlib guard/callback tests; no ML, data, or successful training emulation.
+
+Clients use owned local socketpairs without external network access. Private
+running/retired states below isolate callback guards, not successful run paths.
+Only the isolated synthetic package's client methods are patched where needed.
+"""
+
+from __future__ import annotations
+
+import importlib
+import json
+import socket
+import sys
+import types
+import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_sft_worker_run_v2"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+runs = importlib.import_module(PACKAGE + ".posttraining_sft_worker_run_v2")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+
+
+def profile(**changes):
+    return {
+        "per_rank_batch_size": 1, "gradient_accumulation_steps": 2, "context_window": 8,
+        "pad_to_multiple_of": 2, "pad_token_id": 0, "seed": 17, "learning_rate": 0.01,
+        "lr_schedule": "cosine", "warmup_steps": 0, "min_learning_rate_ratio": 0.1,
+        "max_grad_norm": 1.0, "strategy": "ddp", "gradient_sync_mode": "last_microbatch",
+        "precision": "fp32", **changes,
+    }
+
+
+def fsdp_profile(**changes):
+    return profile(**{"strategy": "fsdp_full_shard", "precision": "bf16",
+                      "context_window": 4096, "pad_to_multiple_of": 8,
+                      "gradient_accumulation_steps": 1, **changes})
+
+
+class MetadataParameter:
+    """Original-parameter metadata only. No tensor contents or ML operations."""
+
+    def __init__(self, shape):
+        self.shape, self.dtype, self.requires_grad = shape, "torch.float32", True
+
+
+class MetadataModel:
+    def __init__(self, shape):
+        self.parameters = [("weight", MetadataParameter(shape)), ("bias", MetadataParameter((0,)))]
+
+    def named_parameters(self):
+        return iter(self.parameters)
+
+
+class MetadataAdamW:
+    def __init__(self, model):
+        self.state = {}
+        self.param_groups = [{"params": [item[1] for item in model.parameters],
+                             "lr": 1e-5, "betas": (0.9, 0.95), "weight_decay": 0.01}]
+
+
+class DigestTensor:
+    def __init__(self, values):
+        self.values = list(values)
+
+    def tolist(self):
+        return list(self.values)
+
+
+class DigestTransport:
+    """Stdlib collective double for 32-byte metadata only, NOT CUDA evidence."""
+
+    uint8 = "uint8"
+    optim = types.SimpleNamespace(AdamW=MetadataAdamW)
+
+    def __init__(self, rounds):
+        self.rounds, self.calls = list(rounds), []
+        self.distributed = types.SimpleNamespace(all_gather=self.all_gather)
+
+    def tensor(self, values, *, dtype, device):
+        assert dtype == self.uint8 and device == "cuda:synthetic"
+        assert len(values) == 32
+        assert all(type(value) is int and 0 <= value <= 255 for value in values)
+        return DigestTensor(values)
+
+    def empty_like(self, tensor):
+        return DigestTensor([0] * len(tensor.values))
+
+    def equal(self, left, right):
+        return left.values == right.values
+
+    def all_gather(self, outputs, local):
+        assert len(outputs) == 8 and len(local.values) == 32
+        self.calls.append(bytes(local.values).hex())
+        peers = self.rounds.pop(0)
+        if peers is None:
+            peers = [bytes(local.values).hex()] * 8
+        assert len(peers) == 8
+        for output, digest in zip(outputs, peers, strict=True):
+            output.values = list(bytes.fromhex(digest))
+
+
+class WorkerRunGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.clients, self.sockets, self.events = [], [], []
+
+    def tearDown(self):
+        for client in self.clients:
+            client.close()
+        for sock in self.sockets:
+            sock.close()
+
+    def client(self, rank=0):
+        left, right = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sockets.extend((left, right))
+        client = runs.WorkerLedgerClient(
+            left, epoch="a" * 64, rank=rank, token="b" * 64,
+            interrupt=lambda: self.events.append("client_interrupt"), maximum_wire_bytes=65_536,
+            deadline_ns=10_000, maximum_exchange_ns=1000, clock_ns=lambda: 1,
+        )
+        self.clients.append(client)
+        return client
+
+    def options(self, **changes):
+        options = {
+            "client": self.client(), "rank": 0, "world_size": 2, "from_step": 0,
+            "stop_step": 2, "profile": profile(), "record_limit": 4,
+            "loader_bindings": dict.fromkeys(runs.PIN_FIELDS, "c" * 64),
+            "source_identity_sha256": "d" * 64,
+            "checkpoint_limits": dict.fromkeys(runs.LIMIT_KEYS, 1024),
+            "admit": lambda: self.events.append("admit"),
+            "synchronize": lambda phase, step: self.events.append((phase, step)),
+            "interrupt": lambda: self.events.append("interrupt"), "device_type": "cpu",
+        }
+        options.update(changes)
+        return options
+
+    def worker(self, **changes):
+        return runs.WorkerRun(**self.options(**changes))
+
+    def error(self, code, operation, *args, **kwargs):
+        with self.assertRaises(runs.WorkerRunError) as caught:
+            operation(*args, **kwargs)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn("SYNTHETIC-PRIVATE", repr(caught.exception))
+
+    def run_sentinel(self, worker, **changes):
+        return worker.run(object(), object(), encoded_root=object(), output_parent_fd=object(),
+                          **changes)
+
+    def block_after_admission(self):
+        """Fail loudly if a denied guard reaches FD, helper, runtime or input work."""
+        stack = ExitStack()
+        targets = (
+            (runs, "_directory_info"), (runs.WorkerRun, "_helpers"),
+            (runs.WorkerRun, "_runtime"), (runs.WorkerInput, "load"),
+            (runs.CheckpointWorker, "restore_checkpoint"),
+            (runs.CheckpointWorker, "save_checkpoint"), (runs, "read_training_state"),
+        )
+        mocks = [stack.enter_context(patch.object(
+            owner, name, side_effect=AssertionError("SYNTHETIC-PRIVATE-UNREACHABLE"),
+        )) for owner, name in targets]
+        return stack, mocks
+
+    def test_imports_are_stdlib_only(self):
+        forbidden = {"torch", "numpy", "transformers", "tokenizers", "safetensors"}
+        self.assertFalse(any(name.split(".")[0] in forbidden for name in IMPORT_ADDITIONS))
+
+    def test_constructor_is_inert_and_safe_summary_omits_private_values(self):
+        worker = self.worker()
+        self.assertEqual(self.events, [])
+        self.assertEqual(worker._client.summary()["requests_sent"], 0)
+        self.assertEqual(worker._client.summary()["wire_bytes_sent"], 0)
+        summary = worker.summary()
+        self.assertEqual(summary["state"], "idle")
+        self.assertEqual(summary["completed_steps"], 0)
+        self.assertIs(summary["real_sft_execution_permitted"], False)
+        self.assertIs(summary["production_eligible"], False)
+        self.assertNotIn(worker._identity, json.dumps(summary))
+        self.assertNotIn("c" * 64, json.dumps(summary))
+        self.assertEqual(repr(worker), "<WorkerRun admitted objects only>")
+
+    def test_client_requires_exact_v2_type_and_matching_rank(self):
+        self.error("invalid_arguments", runs.WorkerRun, **self.options(client=object()))
+        self.error("invalid_arguments", runs.WorkerRun, **self.options(rank=1))
+
+        class ClientSubclass(runs.WorkerLedgerClient):
+            pass
+
+        sentinel = object.__new__(ClientSubclass)
+        self.error("invalid_arguments", runs.WorkerRun, **self.options(client=sentinel))
+
+    def test_integer_constructor_bounds_are_exact(self):
+        invalid = {
+            "rank": (True, -1, 2, 0.0), "world_size": (True, 1, 13, 2.0),
+            "from_step": (True, -1, 2, 0.0), "stop_step": (True, 0, 3, 2.0),
+            "record_limit": (True, 1, 13, 4.0),
+        }
+        base = self.options()
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, kind=type(value).__name__):
+                    self.error("invalid_arguments", runs.WorkerRun, **{**base, field: value})
+        self.error("invalid_arguments", runs.WorkerRun, **{**base, "from_step": 1, "stop_step": 1})
+        self.assertEqual(self.events, [])
+
+    def test_constructor_requires_callable_capabilities_and_device_enum(self):
+        base = self.options()
+        for field in ("admit", "synchronize", "interrupt"):
+            self.error("invalid_arguments", runs.WorkerRun, **{**base, field: None})
+        for value in (None, True, "mps", "CPU"):
+            self.error("invalid_arguments", runs.WorkerRun, **{**base, "device_type": value})
+
+    def test_profile_has_exact_fields_and_builtin_mapping_type(self):
+        base = self.options()
+        for field in profile():
+            changed = profile()
+            del changed[field]
+            self.error("invalid_arguments", runs.WorkerRun, **{**base, "profile": changed})
+        self.error("invalid_arguments", runs.WorkerRun,
+                   **{**base, "profile": profile(private_text="SYNTHETIC-PRIVATE")})
+
+        class Hostile(dict):
+            def __iter__(self):
+                raise AssertionError("SYNTHETIC-PRIVATE")
+
+        self.error("invalid_arguments", runs.WorkerRun, **{**base, "profile": Hostile(profile())})
+        self.error("invalid_arguments", runs.WorkerRun, **{**base, "profile": {**profile(), 1: 2}})
+
+    def test_profile_integer_boundaries_and_geometry(self):
+        base = self.options()
+        invalid = {
+            "per_rank_batch_size": (0, 13, True, 1.0, 3),
+            "gradient_accumulation_steps": (0, 13, False, 1.0),
+            "context_window": (1, 4097, True, 8.0),
+            "pad_to_multiple_of": (0, 4097, 3, 16, True),
+            "pad_token_id": (-1, 2**32, True), "seed": (-1, 2**31, True),
+            "warmup_steps": (-1, 2, True),
+        }
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.error("invalid_arguments", runs.WorkerRun,
+                               **{**base, "profile": profile(**{field: value})})
+
+    def test_profile_rejects_nonfinite_negative_boolean_and_huge_numbers(self):
+        base = self.options()
+        for field in ("learning_rate", "max_grad_norm", "min_learning_rate_ratio"):
+            for value in (float("nan"), float("inf"), -1, True, "1", 10 ** 1000):
+                self.error("invalid_arguments", runs.WorkerRun,
+                           **{**base, "profile": profile(**{field: value})})
+        for field in ("learning_rate", "max_grad_norm"):
+            self.error("invalid_arguments", runs.WorkerRun,
+                       **{**base, "profile": profile(**{field: 0})})
+        self.error("invalid_arguments", runs.WorkerRun,
+                   **{**base, "profile": profile(min_learning_rate_ratio=0)})
+
+    def test_profile_enums_and_no_implicit_device_strategy_fallback(self):
+        base = self.options()
+        for field in ("lr_schedule", "strategy", "gradient_sync_mode", "precision"):
+            for value in (None, True, "SYNTHETIC-PRIVATE"):
+                self.error("invalid_arguments", runs.WorkerRun,
+                           **{**base, "profile": profile(**{field: value})})
+        self.error("invalid_arguments", runs.WorkerRun,
+                   **{**base, "profile": profile(strategy="fsdp_full_shard")})
+        self.error("invalid_arguments", runs.WorkerRun, **{
+            **base, "device_type": "cuda",
+            "profile": profile(precision="bf16", strategy="fsdp_full_shard"),
+        })
+        self.error("invalid_arguments", runs.WorkerRun, **{**base, "device_type": "cuda"})
+
+    def test_hash_pins_are_exact_and_all_five_are_required(self):
+        base = self.options()
+        for field in runs.PIN_FIELDS:
+            pins = dict(base["loader_bindings"])
+            del pins[field]
+            self.error("invalid_arguments", runs.WorkerRun, **{**base, "loader_bindings": pins})
+            for value in ("A" * 64, "g" * 64, "c" * 63, True, None):
+                self.error("invalid_arguments", runs.WorkerRun,
+                           **{**base, "loader_bindings": {**base["loader_bindings"], field: value}})
+        for value in (None, True, "D" * 64, "d" * 63):
+            self.error("invalid_arguments", runs.WorkerRun,
+                       **{**base, "source_identity_sha256": value})
+
+    def test_checkpoint_limits_are_exact_positive_bounded_integers(self):
+        base = self.options()
+        for field in runs.LIMIT_KEYS:
+            limits = dict(base["checkpoint_limits"])
+            del limits[field]
+            self.error("invalid_arguments", runs.WorkerRun,
+                       **{**base, "checkpoint_limits": limits})
+            for value in (0, -1, True, 1.0, runs.MAX_FILE_BYTES + 1):
+                self.error("invalid_arguments", runs.WorkerRun, **{
+                    **base, "checkpoint_limits": {**base["checkpoint_limits"], field: value},
+                })
+
+    def test_identity_is_shared_across_rank_and_fresh_invocation_boundaries(self):
+        base = self.options()
+        uninterrupted = runs.WorkerRun(**base)
+        rank_one = runs.WorkerRun(**{**base, "client": self.client(1), "rank": 1})
+        initial = runs.WorkerRun(**{**base, "stop_step": 1})
+        resume = runs.WorkerRun(**{**base, "from_step": 1, "stop_step": 2})
+        self.assertEqual({worker._identity for worker in
+                          (uninterrupted, rank_one, initial, resume)}, {uninterrupted._identity})
+
+    def test_identity_binds_source_every_profile_field_and_every_pin(self):
+        base = self.options()
+        original = runs.WorkerRun(**base)._identity
+        changes = {
+            "per_rank_batch_size": 2, "gradient_accumulation_steps": 1, "context_window": 16,
+            "pad_to_multiple_of": 1, "pad_token_id": 1, "seed": 18, "learning_rate": 0.02,
+            "lr_schedule": "constant", "warmup_steps": 1, "min_learning_rate_ratio": 0.2,
+            "max_grad_norm": 2.0, "gradient_sync_mode": "every_microbatch", "precision": "bf16",
+        }
+        for field, value in changes.items():
+            worker = runs.WorkerRun(**{**base, "profile": profile(**{field: value})})
+            self.assertNotEqual(worker._identity, original)
+        for field in runs.PIN_FIELDS:
+            worker = runs.WorkerRun(**{
+                **base, "loader_bindings": {**base["loader_bindings"], field: "e" * 64},
+            })
+            self.assertNotEqual(worker._identity, original)
+        changed_source = runs.WorkerRun(**{**base, "source_identity_sha256": "e" * 64})
+        self.assertNotEqual(changed_source._identity, original)
+        cuda = {**base, "device_type": "cuda", "profile": profile(precision="bf16")}
+        self.assertNotEqual(runs.WorkerRun(**cuda)._identity, original)
+
+    def test_identity_binds_global_geometry_but_not_resource_caps(self):
+        base = self.options()
+        original = runs.WorkerRun(**base)._identity
+        self.assertNotEqual(runs.WorkerRun(**{**base, "world_size": 3})._identity, original)
+        self.assertNotEqual(runs.WorkerRun(**{**base, "record_limit": 6})._identity, original)
+        limited = {**base, "checkpoint_limits": dict.fromkeys(runs.LIMIT_KEYS, 2048)}
+        self.assertEqual(runs.WorkerRun(**limited)._identity, original)
+
+    def test_profile_numbers_canonicalize_and_inputs_are_defensively_copied(self):
+        base = self.options(profile=profile(learning_rate=1, max_grad_norm=2))
+        worker = runs.WorkerRun(**base)
+        identity = worker._identity
+        for field in ("learning_rate", "max_grad_norm", "min_learning_rate_ratio"):
+            self.assertIs(type(worker._profile[field]), float)
+        base["profile"]["seed"] = 999
+        base["loader_bindings"][runs.PIN_FIELDS[0]] = "f" * 64
+        base["checkpoint_limits"]["maximum_file_bytes"] = 5
+        self.assertEqual(worker._profile["seed"], 17)
+        self.assertEqual(worker._pins[runs.PIN_FIELDS[0]], "c" * 64)
+        self.assertEqual(worker._limits["maximum_file_bytes"], 1024)
+        self.assertEqual(worker._identity, identity)
+        for mapping in (worker._profile, worker._pins, worker._limits):
+            with self.assertRaises(TypeError):
+                mapping[next(iter(mapping))] = None
+
+    def test_admission_denial_precedes_fd_helpers_runtime_and_inputs(self):
+        def deny():
+            self.events.append("deny")
+            raise RuntimeError("SYNTHETIC-PRIVATE")
+
+        worker = self.worker(admit=deny)
+        stack, mocks = self.block_after_admission()
+        with stack:
+            self.error("admission_rejected", self.run_sentinel, worker)
+        for operation in mocks:
+            operation.assert_not_called()
+        self.assertEqual(self.events, ["deny", "interrupt"])
+        self.assertEqual(worker._failure_stage, "admission")
+        self.assertFalse(worker._client.closed)
+
+    def test_non_none_admission_return_is_a_denial(self):
+        for value in (True, False, 0, "SYNTHETIC-PRIVATE"):
+            worker = self.worker(admit=lambda result=value: result)
+            stack, mocks = self.block_after_admission()
+            with stack:
+                self.error("admission_rejected", self.run_sentinel, worker)
+            for operation in mocks:
+                operation.assert_not_called()
+
+    def test_resume_arguments_are_validated_before_admission(self):
+        cases = (
+            ({}, {"resume_checkpoint_name": "checkpoint-00000001"}),
+            ({}, {"resume_manifest_sha256": "e" * 64}),
+            ({"from_step": 1}, {}),
+            ({"from_step": 1}, {"resume_checkpoint_name": "checkpoint-00000002",
+                                "resume_manifest_sha256": "e" * 64}),
+            ({"from_step": 1}, {"resume_checkpoint_name": "../checkpoint-00000001",
+                                "resume_manifest_sha256": "e" * 64}),
+            ({"from_step": 1}, {"resume_checkpoint_name": "checkpoint-00000001",
+                                "resume_manifest_sha256": "E" * 64}),
+        )
+        for options, resume in cases:
+            worker = self.worker(**options)
+            stack, mocks = self.block_after_admission()
+            with stack:
+                self.error("invalid_arguments", self.run_sentinel, worker, **resume)
+            for operation in mocks:
+                operation.assert_not_called()
+        self.assertNotIn("admit", self.events)
+
+    def test_exact_resume_pin_reaches_admission_but_no_later_work_when_denied(self):
+        worker = self.worker(from_step=1, admit=lambda: False)
+        stack, mocks = self.block_after_admission()
+        with stack:
+            self.error("admission_rejected", self.run_sentinel, worker,
+                       resume_checkpoint_name="checkpoint-00000001",
+                       resume_manifest_sha256="e" * 64)
+        for operation in mocks:
+            operation.assert_not_called()
+
+    def test_denial_is_sticky_and_interrupt_is_once(self):
+        worker = self.worker(admit=lambda: False)
+        for _ in range(2):
+            self.error("admission_rejected", self.run_sentinel, worker)
+        self.assertEqual(self.events, ["interrupt"])
+        self.assertEqual(worker._state, "failed")
+
+    def test_failed_summary_preserves_fixed_first_failure_without_reinterrupting(self):
+        worker = self.worker(admit=lambda: False)
+        self.error("admission_rejected", self.run_sentinel, worker)
+        summary = worker.summary()
+        self.assertEqual(summary["state"], "failed")
+        self.assertEqual(summary["failure_code"], "admission_rejected")
+        self.assertEqual(summary["failure_stage"], "admission")
+        self.assertEqual(summary["completed_steps"], 0)
+        self.assertEqual(self.events, ["interrupt"])
+        self.assertNotIn(worker._identity, json.dumps(summary))
+
+    def test_reentrant_run_cannot_be_swallowed_by_admission(self):
+        worker = self.worker()
+
+        def reenter():
+            self.error("reentry", self.run_sentinel, worker)
+
+        worker._admit = reenter
+        stack, mocks = self.block_after_admission()
+        with stack:
+            self.error("reentry", self.run_sentinel, worker)
+        for operation in mocks:
+            operation.assert_not_called()
+        self.assertEqual(self.events, ["interrupt"])
+
+    def test_owner_mismatch_precedes_admission(self):
+        for owner, name in ((runs.os, "getpid"), (runs.threading, "get_ident")):
+            worker = self.worker()
+            with patch.object(owner, name, return_value=-1):
+                self.error("owner_mismatch", self.run_sentinel, worker)
+        self.assertNotIn("admit", self.events)
+
+    def test_reinitialization_is_terminal_without_transport_or_data_work(self):
+        options = self.options()
+        worker = runs.WorkerRun(**options)
+        self.error("already_consumed", worker.__init__, **options)
+        self.error("already_consumed", self.run_sentinel, worker)
+        self.assertEqual(self.events, ["interrupt"])
+        self.assertEqual(worker._client.summary()["requests_sent"], 0)
+
+    def test_completed_callback_waits_for_parent_fence_before_synchronize(self):
+        worker = self.worker()
+        worker._state = "running"  # Callback-only guard setup; no run/model execution.
+        with patch.object(runs.WorkerLedgerClient, "wait_step_commit",
+                          lambda client, step: self.events.append(("fence", step))):
+            worker._sync("completed", 1)
+        self.assertEqual(self.events, [("fence", 1), ("completed", 1)])
+
+    def test_failed_fence_never_releases_synchronize(self):
+        worker = self.worker()
+        worker._state = "running"
+        with patch.object(runs.WorkerLedgerClient, "wait_step_commit",
+                          side_effect=RuntimeError("SYNTHETIC-PRIVATE")):
+            self.error("synchronize_failed", worker._sync, "completed", 1)
+        self.assertEqual(self.events, ["interrupt"])
+
+    def test_non_completion_phases_do_not_claim_parent_step_fence(self):
+        worker = self.worker()
+        worker._state = "running"
+        with patch.object(runs.WorkerLedgerClient, "wait_step_commit") as fence:
+            for phase in sorted(runs.PHASES - {"completed"}):
+                worker._sync(phase, 1)
+        fence.assert_not_called()
+        self.assertEqual(len(self.events), len(runs.PHASES) - 1)
+
+    def test_invalid_sync_and_rank_guards_precede_callbacks(self):
+        for phase, step in (("private", 1), (True, 1), ("inputs", True), ("inputs", 3)):
+            worker = self.worker()
+            worker._state = "running"
+            self.error("synchronize_failed", worker._sync, phase, step)
+        for rank in (1, True, -1):
+            worker = self.worker()
+            worker._state = "running"
+            with patch.object(runs.WorkerLedgerClient, "reserve") as reserve:
+                self.error("reserve_failed", worker._reserve, rank, private_write_bytes=1)
+            reserve.assert_not_called()
+        self.assertTrue(all(event == "interrupt" for event in self.events))
+
+    def test_swallowed_callback_reentry_remains_terminal(self):
+        worker = self.worker()
+        worker._state = "running"
+
+        def callback():
+            self.error("reentry", worker._call, lambda: None, "synchronize_failed")
+
+        self.error("reentry", worker._call, callback, "synchronize_failed")
+        self.assertEqual(self.events, ["interrupt"])
+
+    def test_retired_callbacks_cannot_interrupt_a_later_shared_epoch(self):
+        worker = self.worker()
+        worker._state, worker._stage = "complete", "complete"  # Retired-guard unit setup only.
+        worker._interrupt_once()
+        self.error("already_consumed", self.run_sentinel, worker)
+        self.error("already_consumed", worker._sync, "completed", 1)
+        self.error("already_consumed", worker._reserve, 0, private_write_bytes=1)
+        self.error("already_consumed", worker._fail, "run_failed")
+        self.assertEqual(self.events, [])
+        self.assertEqual(worker._state, "complete")
+        self.assertIsNone(worker._failure)
+        self.assertFalse(worker._client.closed)
+
+    def test_unknown_error_text_is_not_retained(self):
+        for value in ("SYNTHETIC-PRIVATE", None, True, {}):
+            error = runs.WorkerRunError(value)
+            self.assertEqual(error.args, ("run_failed",))
+            self.assertNotIn("PRIVATE", repr(error))
+
+    def fsdp_worker(self, **changes):
+        return self.worker(**{"world_size": 8, "record_limit": 8, "device_type": "cuda",
+                              "profile": fsdp_profile(), **changes})
+
+    def synthetic_runtime(self, worker, transport):
+        stack = ExitStack()
+        modules = {}
+        for name, helpers in {
+            "lumi.posttraining_sft_runtime_v4": ("collate_sft_tensors",),
+            "lumi.distributed_training": ("EpochPermutationPlanner", "_runtime_rng_state",
+                                          "_restore_runtime_rng_state"),
+            "lumi.pilot_training": ("scheduled_learning_rate",),
+        }.items():
+            module = types.ModuleType(name)
+            for helper in helpers:
+                setattr(module, helper, lambda: None)
+            modules[name] = module
+        stack.enter_context(patch.dict(sys.modules, modules))
+        worker._step = types.SimpleNamespace(
+            _runtime=lambda *_: (transport, "cuda:synthetic"))
+        return stack
+
+    def test_eight_rank_fsdp_constructor_accepts_4096_without_execution(self):
+        worker = self.fsdp_worker()
+        self.assertEqual(worker._profile["context_window"], 4096)
+        self.assertEqual(worker._profile["strategy"], "fsdp_full_shard")
+        self.assertEqual(worker._global_records, 8)
+        self.assertEqual(self.events, [])
+        self.assertEqual(worker._client.summary()["requests_sent"], 0)
+        self.assertEqual(worker.summary()["schema_version"], "lumi.sft-worker-run-summary.v0.2")
+        self.assertIs(worker.summary()["real_sft_execution_permitted"], False)
+
+    def test_fsdp_rejects_other_world_device_precision_and_unbounded_steps(self):
+        for changes in ({"world_size": 2}, {"world_size": 7}, {"world_size": 9, "record_limit": 9},
+                        {"device_type": "cpu"}, {"profile": fsdp_profile(precision="fp32")},
+                        {"stop_step": 3}, {"record_limit": 13}):
+            # Build profile overrides separately to avoid duplicate keyword arguments.
+            self.error("invalid_arguments", self.fsdp_worker, **changes)
+
+    def test_4096_padding_boundary_is_accepted_but_larger_or_bad_geometry_rejected(self):
+        for padding in (8, 4096):
+            worker = self.fsdp_worker(profile={**fsdp_profile(), "pad_to_multiple_of": padding})
+            self.assertEqual(worker._profile["context_window"], 4096)
+        for changes in ({"context_window": 4097}, {"pad_to_multiple_of": 4097},
+                        {"context_window": 4095}, {"pad_to_multiple_of": 3}):
+            self.error("invalid_arguments", self.fsdp_worker,
+                       profile={**fsdp_profile(), **changes})
+
+    def test_fsdp_admission_denial_still_precedes_every_resource(self):
+        worker = self.fsdp_worker(admit=lambda: False)
+        stack, mocks = self.block_after_admission()
+        with stack:
+            self.error("admission_rejected", self.run_sentinel, worker)
+        for operation in mocks:
+            operation.assert_not_called()
+        self.assertEqual(self.events, ["interrupt"])
+        self.assertEqual(worker.summary()["completed_steps"], 0)
+
+    def test_local_shapes_can_differ_but_common_configuration_must_match(self):
+        bindings = []
+        for shape in ((0,), (1,), (7,), (16,)):
+            model = MetadataModel(shape)
+            bindings.append(runs._optimizer_bindings(model, MetadataAdamW(model)))
+        self.assertEqual(len({local for local, _ in bindings}), 4)
+        self.assertEqual(len({shared for _, shared in bindings}), 1)
+
+    def test_shared_configuration_binds_order_dtype_trainability_and_group_settings(self):
+        model = MetadataModel((2,))
+        original = runs._optimizer_bindings(model, MetadataAdamW(model))[1]
+        for mutation in ("order", "name", "dtype", "requires_grad", "lr", "betas", "groups"):
+            model = MetadataModel((2,))
+            optimizer = MetadataAdamW(model)
+            if mutation == "order":
+                optimizer.param_groups[0]["params"].reverse()
+            elif mutation == "name":
+                model.parameters[0] = ("different", model.parameters[0][1])
+            elif mutation == "dtype":
+                model.parameters[0][1].dtype = "torch.bfloat16"
+            elif mutation == "requires_grad":
+                model.parameters[0][1].requires_grad = False
+            elif mutation == "groups":
+                parameter = optimizer.param_groups[0]["params"].pop()
+                optimizer.param_groups.append({"params": [parameter], "lr": 1e-5})
+            else:
+                optimizer.param_groups[0][mutation] = 0.01 if mutation == "lr" else (0.9, 0.99)
+            with self.subTest(mutation=mutation):
+                self.assertNotEqual(runs._optimizer_bindings(model, optimizer)[1], original)
+
+    def test_optimizer_metadata_rejects_unbound_empty_parameter_and_invalid_settings(self):
+        model = MetadataModel((7,))
+        optimizer = MetadataAdamW(model)
+        optimizer.param_groups[0]["params"].pop()  # Even empty original parameters are bound.
+        self.error("runtime_rejected", runs._optimizer_bindings, model, optimizer)
+        for field, value in (("lr", float("nan")), ("betas", (0.9, 1.0)), ("fused", "yes")):
+            optimizer = MetadataAdamW(model)
+            optimizer.param_groups[0][field] = value
+            self.error("runtime_rejected", runs._optimizer_bindings, model, optimizer)
+
+    def test_ranked_digest_binds_every_rank_and_order(self):
+        digests = [str(rank) * 64 for rank in range(8)]
+        original = runs._ranked_optimizer_binding(digests)
+        self.assertEqual(original, runs._ranked_optimizer_binding(list(digests)))
+        self.assertNotEqual(original, runs._ranked_optimizer_binding(list(reversed(digests))))
+        for rank in range(8):
+            changed = list(digests)
+            changed[rank] = "e" * 64
+            self.assertNotEqual(original, runs._ranked_optimizer_binding(changed))
+        # Fully replicated or identically empty local shapes need not yield distinct hashes.
+        self.assertTrue(runs._hash(runs._ranked_optimizer_binding(["a" * 64] * 8)))
+
+    def test_ranked_digest_rejects_wrong_count_type_and_noncanonical_hashes(self):
+        valid = ["a" * 64] * 8
+        for value in (None, tuple(valid), valid[:7], valid + ["a" * 64]):
+            self.error("runtime_rejected", runs._ranked_optimizer_binding, value)
+        for value in (True, None, "A" * 64, "g" * 64, "a" * 63):
+            self.error("runtime_rejected", runs._ranked_optimizer_binding, valid[:7] + [value])
+
+    def test_ranked_transport_produces_same_binding_for_all_eight_distinct_layouts(self):
+        digests = [str(rank) * 64 for rank in range(8)]
+        for rank in range(8):
+            worker = self.fsdp_worker(rank=rank, client=self.client(rank))
+            transport = DigestTransport([digests])
+            result = worker._shared_optimizer_binding(transport, "cuda:synthetic", digests[rank])
+            self.assertEqual(result, runs._ranked_optimizer_binding(digests))
+            self.assertEqual(transport.calls, [digests[rank]])
+            self.assertEqual(transport.rounds, [])
+
+    def test_ranked_transport_rejects_own_slot_mismatch(self):
+        worker = self.fsdp_worker()
+        self.error("runtime_rejected", worker._shared_optimizer_binding,
+                   DigestTransport([["b" * 64] * 8]), "cuda:synthetic", "a" * 64)
+        self.assertEqual(self.events, ["interrupt"])
+
+    def test_ddp_retains_local_binding_without_collective(self):
+        worker = self.worker()
+        self.assertEqual(worker._shared_optimizer_binding(object(), object(), "a" * 64), "a" * 64)
+        self.error("runtime_rejected", worker._shared_optimizer_binding, object(), object(), True)
+
+    def test_runtime_binds_same_eight_rank_layout_across_fresh_resume(self):
+        models = [MetadataModel((rank,)) for rank in range(8)]
+        optimizers = [MetadataAdamW(model) for model in models]
+        digests = [runs._optimizer_bindings(model, optimizer)[0]
+                   for model, optimizer in zip(models, optimizers, strict=True)]
+        identities = set()
+        for rank in range(8):
+            for start, stop in ((0, 2), (0, 1), (1, 2)):
+                worker = self.fsdp_worker(rank=rank, client=self.client(rank),
+                                          from_step=start, stop_step=stop)
+                transport = DigestTransport([None, digests])
+                with self.synthetic_runtime(worker, transport):
+                    worker._runtime(models[rank], optimizers[rank])
+                identities.add(worker._identity)
+                self.assertEqual(len(transport.calls), 2)
+                self.assertEqual(transport.rounds, [])
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(self.events, [])
+
+    def test_runtime_rejects_common_config_disagreement_before_layout_collective(self):
+        worker = self.fsdp_worker()
+        model = MetadataModel((0,))
+        transport = DigestTransport([["a" * 64] * 8])
+        with self.synthetic_runtime(worker, transport):
+            self.error("state_rejected", worker._runtime, model, MetadataAdamW(model))
+        self.assertEqual(len(transport.calls), 1)
+        self.assertEqual(self.events, ["interrupt"])
+
+    def test_runtime_rejects_nonfresh_or_wrong_optimizer_before_collectives(self):
+        for nonfresh in (False, True):
+            worker = self.fsdp_worker()
+            model = MetadataModel((0,))
+            optimizer = MetadataAdamW(model)
+            optimizer.state = {0: {}} if nonfresh else {}
+            transport = DigestTransport([])
+            with self.synthetic_runtime(worker, transport):
+                self.error("runtime_rejected", worker._runtime, model,
+                           optimizer if nonfresh else object())
+            self.assertEqual(transport.calls, [])
+
+    def test_v2_schema_does_not_accept_v1_resume_identity(self):
+        from . import test_sft_worker_run_v1 as old
+
+        old_worker_test = old.WorkerRunGuardTests()
+        old_worker_test.setUp()
+        try:
+            old_identity = old_worker_test.worker()._identity
+            self.assertNotEqual(self.worker()._identity, old_identity)
+        finally:
+            old_worker_test.tearDown()
+
+    def test_ddp_metadata_fingerprint_is_unchanged_from_v1(self):
+        from . import test_sft_worker_run_v1 as old
+
+        model = MetadataModel((7,))
+        optimizer = MetadataAdamW(model)
+        self.assertEqual(runs._optimizer_binding(model, optimizer),
+                         old.runs._optimizer_binding(model, optimizer))
+
+    def test_changed_rank_layout_rejects_saved_state_before_checkpoint_restore(self):
+        states = importlib.import_module(PACKAGE + ".posttraining_sft_training_state_v1")
+        digests = [str(rank) * 64 for rank in range(8)]
+        original = runs._ranked_optimizer_binding(digests)
+        saved = runs.advance_state(runs.make_state(original), global_records_per_step=8,
+                                   metrics={"to_step": 1, "loss": 1.0, "gradient_norm": 0.5,
+                                            "tokens": 32, "supervised_tokens": 16})
+        self.assertEqual(runs.validate_state(saved, run_identity_sha256=original, from_step=1,
+                                             global_records_per_step=8)["step"], 1)
+        digests[7] = "e" * 64
+        with self.assertRaises(states.TrainingStateError) as caught:
+            runs.validate_state(saved, run_identity_sha256=runs._ranked_optimizer_binding(digests),
+                                from_step=1, global_records_per_step=8)
+        self.assertEqual(caught.exception.code, "identity_mismatch")
+
+    def test_one_rank_changed_lr_is_rejected_by_shared_runtime_agreement(self):
+        worker = self.fsdp_worker()
+        models = [MetadataModel((rank,)) for rank in range(8)]
+        optimizers = [MetadataAdamW(model) for model in models]
+        optimizers[7].param_groups[0]["lr"] = 0.1
+        shared_hashes = [runs._digest({
+            "plan_sha256": worker._identity,
+            "optimizer_shared_config_sha256": runs._optimizer_bindings(model, optimizer)[1],
+        }) for model, optimizer in zip(models, optimizers, strict=True)]
+        transport = DigestTransport([shared_hashes])
+        with self.synthetic_runtime(worker, transport):
+            self.error("state_rejected", worker._runtime, models[0], optimizers[0])
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_collective_failure_is_sanitized_and_stops_before_inputs_without_retry(self):
+        worker = self.fsdp_worker()
+        model = MetadataModel((0,))
+        transport = DigestTransport([])
+        with self.synthetic_runtime(worker, transport), ExitStack() as stack:
+            stack.enter_context(patch.object(runs, "_directory_info"))
+            stack.enter_context(patch.object(worker, "_helpers"))
+            collective = stack.enter_context(patch.object(
+                transport.distributed, "all_gather",
+                side_effect=RuntimeError("SYNTHETIC-PRIVATE-COLLECTIVE")))
+            load = stack.enter_context(patch.object(runs.WorkerInput, "load"))
+            for _ in range(2):
+                self.error("run_failed", worker.run, model, MetadataAdamW(model),
+                           encoded_root=object(), output_parent_fd=object())
+            collective.assert_called_once()
+            load.assert_not_called()
+        self.assertEqual(worker.summary()["failure_stage"], "runtime")
+        self.assertEqual(self.events, ["admit", "interrupt"])
+
+
+if __name__ == "__main__":
+    unittest.main()

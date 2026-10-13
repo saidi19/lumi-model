@@ -1,0 +1,92 @@
+"""Finite diagnostic codes only: never serialize exceptions, requests or credentials."""
+
+STAGES = frozenset(
+    {
+        "unknown",
+        "credential_active",
+        "credential_budget",
+        "credential_export",
+        "credential_decode",
+        "credential_expiry",
+        "credential_identity",
+        "credential_principal",
+        "credential_complete",
+        "client_setup",
+        "cloud_call",
+        "preflight",
+        "resources",
+        "launch",
+        "setup",
+        "stop_observation",
+        "stop_dispatch",
+    }
+)
+CHECKS = frozenset({"none", "closed", "deadline", "clock_drift"})
+KINDS = frozenset(
+    {
+        "unknown",
+        "timeout",
+        "connect_timeout",
+        "read_timeout",
+        "tls",
+        "connection",
+        "aws_service",
+        "validation",
+        "interrupted",
+        "io",
+    }
+)
+
+
+class Failure(ValueError):
+    def __init__(self, message, diagnostic):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+def describe(error, stage="unknown", check="none"):
+    """Only exact known scalar codes cross exception boundaries, never arbitrary names."""
+    if type(error) is Failure and type(error.diagnostic) is dict:
+        value = error.diagnostic
+        if (
+            set(value) == {"stage", "kind", "check"}
+            and type(value["stage"]) is str
+            and value["stage"] in STAGES
+            and type(value["kind"]) is str
+            and value["kind"] in KINDS
+            and type(value["check"]) is str
+            and value["check"] in CHECKS
+        ):
+            return dict(value)
+    name = type(error).__name__
+    module = type(error).__module__
+    kind = "unknown"
+    if module == "botocore.exceptions":
+        kind = {
+            "ConnectTimeoutError": "connect_timeout",
+            "ReadTimeoutError": "read_timeout",
+            "SSLError": "tls",
+            "EndpointConnectionError": "connection",
+            "ConnectionClosedError": "connection",
+            "ClientError": "aws_service",
+        }.get(name, kind)
+    elif isinstance(error, TimeoutError):
+        kind = "timeout"
+    elif isinstance(error, (ValueError, AssertionError, KeyError, TypeError)):
+        kind = "validation"
+    elif isinstance(error, (KeyboardInterrupt, SystemExit)):
+        kind = "interrupted"
+    elif isinstance(error, OSError):
+        kind = "io"
+    return {
+        "stage": stage if type(stage) is str and stage in STAGES else "unknown",
+        "kind": kind,
+        "check": check if type(check) is str and check in CHECKS else "none",
+    }
+
+
+def reject(value, check):
+    if not value:
+        raise Failure(
+            "controller_credentials_rejected", describe(ValueError(), "credential_active", check)
+        ) from None

@@ -1,0 +1,53 @@
+"""Synthetic tests for attempt-019 read-only control-target inspection."""
+import time
+import unittest
+from unittest.mock import Mock
+
+from scripts import inspect_sft_vm_attempt019_control_targets_v1 as m
+
+
+class CodedError(Exception):
+    def __init__(self, code, status=400):
+        self.response = {
+            "Error": {"Code": code},
+            "ResponseMetadata": {"HTTPStatusCode": status},
+        }
+
+
+class Tests(unittest.TestCase):
+    def test_only_read_operations_are_reachable(self):
+        wrapper = m.Reads({"ec2": Mock()}, clock=time.monotonic, sleep=lambda _: None)
+        with self.assertRaises(ValueError):
+            wrapper.call("ec2", "run_instances")
+        self.assertEqual(wrapper.calls, 0)
+
+    def test_exact_absence_codes_are_accepted(self):
+        client = Mock()
+        client.get_role.side_effect = CodedError("NoSuchEntity")
+        wrapper = m.Reads({"iam": client}, sleep=lambda _: None)
+        self.assertTrue(wrapper.absent("iam", "get_role", RoleName="synthetic"))
+        self.assertEqual(wrapper.calls, 1)
+        self.assertEqual(wrapper.retries, 0)
+
+    def test_nonabsence_error_is_fail_closed(self):
+        client = Mock()
+        client.get_role.side_effect = CodedError("AccessDenied")
+        wrapper = m.Reads({"iam": client}, sleep=lambda _: None)
+        with self.assertRaises(CodedError):
+            wrapper.absent("iam", "get_role", RoleName="synthetic")
+        self.assertEqual(wrapper.calls, 1)
+
+    def test_transient_reads_have_a_bounded_retry(self):
+        client = Mock()
+        client.describe_instances.side_effect = [
+            CodedError("ServiceUnavailable", 503),
+            {"Reservations": []},
+        ]
+        wrapper = m.Reads({"ec2": client}, sleep=lambda _: None)
+        self.assertEqual(wrapper.call("ec2", "describe_instances"), {"Reservations": []})
+        self.assertEqual(wrapper.calls, 2)
+        self.assertEqual(wrapper.retries, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

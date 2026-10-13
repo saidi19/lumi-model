@@ -1,0 +1,49 @@
+import importlib
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("observe_sft_vm_network_readiness_v2")
+
+
+class QuotaCorrectionTests(unittest.TestCase):
+    def test_authoritative_nat_code_not_vpc_count(self):
+        service, code, name = m.NAT_QUOTA
+        q = dict(
+            ServiceCode="vpc",
+            QuotaCode="L-FE5A380F",
+            QuotaName="NAT gateways per Availability Zone",
+            GlobalQuota=False,
+            Value=5,
+        )
+        self.assertEqual(m.base.headroom(q, service, code, name, 0)["quota"], 5)
+        with self.assertRaises(ValueError):
+            m.base.headroom(
+                q | dict(QuotaCode="L-F678F1CE", QuotaName="VPCs per Region"),
+                service,
+                code,
+                name,
+                0,
+            )
+
+    def test_successor_only_changes_nat_code_output_and_bindings(self):
+        before = m.base.QUOTAS.copy()
+        old_output = m.base.OUTPUT
+
+        def check():
+            self.assertEqual(m.base.QUOTAS, before | {"nat": m.NAT_QUOTA})
+            self.assertEqual(m.base.OUTPUT, m.OUTPUT)
+            self.assertEqual(
+                m.base.PINS["scripts/observe_sft_vm_network_readiness_v1.py"], m.BASE_SHA
+            )
+
+        with patch.object(m.base, "run", side_effect=check):
+            m.run()
+        self.assertEqual(m.base.QUOTAS, before)
+        self.assertEqual(m.base.OUTPUT, old_output)
+
+
+if __name__ == "__main__":
+    unittest.main()

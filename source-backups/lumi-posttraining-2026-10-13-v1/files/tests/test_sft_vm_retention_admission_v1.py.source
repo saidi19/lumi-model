@@ -1,0 +1,579 @@
+"""Pinned release, real metadata inventory and binding validators; host/cloud doubled."""
+
+import copy
+import importlib
+import json
+import os
+import stat
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("admit_sft_vm_retention_native_v1")
+b = importlib.import_module("check_sft_vm_retention_bucket_v1")
+builder = importlib.import_module("prepare_sft_vm_retention_release_v2")
+entry = importlib.import_module("run_sft_vm_parent_entry_v2")
+previous = importlib.import_module("tests.test_sft_vm_retention_v1")
+storage_fixture = importlib.import_module("tests.test_sft_vm_storage_v1")
+ready_fixture = importlib.import_module("tests.test_sft_vm_native_readiness_v1")
+REPO = Path(__file__).resolve().parents[1]
+PROPOSAL = (REPO / "configs/lumi-vm-fullsize-host-proposal-v0.1.json").read_bytes()
+BINDER = (REPO / "scripts/bind_sft_vm_native_admission_v1.py").read_bytes()
+ENTRY = (REPO / "scripts/run_sft_vm_retention_parent_v1.py").read_bytes()
+
+
+class BucketTests(unittest.TestCase):
+    def setUp(self):
+        policy = dict(
+            Statement=[
+                dict(
+                    Effect="Deny",
+                    Principal="*",
+                    Action="s3:*",
+                    Resource=[f"arn:aws:s3:::{b.BUCKET}", f"arn:aws:s3:::{b.BUCKET}/*"],
+                    Condition={"Bool": {"aws:SecureTransport": "false"}},
+                )
+            ]
+        )
+        self.values = {
+            "get-caller-identity": dict(Account=b.ACCOUNT),
+            "get-bucket-location": dict(LocationConstraint=None),
+            "get-public-access-block": dict(
+                PublicAccessBlockConfiguration={k: True for k in b.BLOCK}
+            ),
+            "get-bucket-ownership-controls": dict(
+                OwnershipControls={"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+            ),
+            "get-bucket-encryption": dict(
+                ServerSideEncryptionConfiguration={
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]
+                }
+            ),
+            "get-bucket-versioning": dict(Status="Enabled"),
+            "get-bucket-policy-status": dict(PolicyStatus={"IsPublic": False}),
+            "get-bucket-policy": dict(Policy=json.dumps(policy)),
+        }
+        self.cloud = types.SimpleNamespace(
+            cli=Mock(side_effect=lambda s, op, **kw: self.values[op])
+        )
+
+    def call(self, **kw):
+        return b.inspect(self.cloud, PROPOSAL, **(dict(deadline=180, clock=lambda: 0) | kw))
+
+    def test_exact_read_only_calls_owner_target_and_no_object_operations(self):
+        result = self.call()
+        self.assertEqual(result["observation_calls"], 8)
+        self.assertFalse(result["host_admitted"] or result["credentials_issued"])
+        for call in self.cloud.cli.call_args_list[1:]:
+            self.assertEqual(call.args[0], "s3api")
+            self.assertEqual(call.kwargs, dict(Bucket=b.BUCKET, ExpectedBucketOwner=b.ACCOUNT))
+            self.assertNotIn(
+                call.args[1], {"get-object", "head-object", "list-objects", "put-object"}
+            )
+
+    def test_wrong_account_region_public_acl_owner_encryption_versioning_rejected(self):
+        wrong = {
+            "get-caller-identity": dict(Account="000000000000"),
+            "get-bucket-location": dict(LocationConstraint="eu-west-1"),
+            "get-public-access-block": dict(PublicAccessBlockConfiguration={k: 1 for k in b.BLOCK}),
+            "get-bucket-ownership-controls": dict(
+                OwnershipControls={"Rules": [{"ObjectOwnership": "ObjectWriter"}]}
+            ),
+            "get-bucket-encryption": dict(
+                ServerSideEncryptionConfiguration={
+                    "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms"}}]
+                }
+            ),
+            "get-bucket-versioning": dict(Status="Suspended"),
+            "get-bucket-policy-status": dict(PolicyStatus={"IsPublic": True}),
+            "get-bucket-policy": dict(Policy=json.dumps({"Statement": []})),
+        }
+        for key, value in wrong.items():
+            with (
+                self.subTest(operation=key),
+                patch.dict(self.values, {key: value}),
+                self.assertRaises(ValueError),
+            ):
+                self.call()
+
+    def test_transport_failure_is_not_retried_or_raw_retained(self):
+        self.cloud.cli.side_effect = TimeoutError("secret error")
+        with self.assertRaisesRegex(ValueError, "^retention_bucket_admission_failed_no_mutation$"):
+            self.call()
+        self.cloud.cli.assert_called_once()
+
+    def test_expired_and_oversized_response_rejected(self):
+        for deadline in (True, 160, 181, float("nan")):
+            with self.assertRaises(ValueError):
+                self.call(deadline=deadline)
+        self.cloud.cli.assert_not_called()
+        self.values["get-caller-identity"]["large"] = "x" * 32769
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_late_response_and_missing_owner_data_rejected(self):
+        with self.assertRaises(ValueError):
+            self.call(clock=Mock(side_effect=[0, 0, 181]))
+        self.values["get-caller-identity"] = {}
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_missing_region_is_not_treated_as_explicit_us_east_null(self):
+        self.values["get-bucket-location"] = {}
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_wrong_proposal_or_public_approval_closed(self):
+        with self.assertRaises(ValueError):
+            b.inspect(self.cloud, PROPOSAL + b" ", deadline=180, clock=lambda: 0)
+        with self.assertRaises(ValueError):
+            b.run(approved=True)
+        self.cloud.cli.assert_not_called()
+
+
+class StorageTests(unittest.TestCase):
+    def setUp(self):
+        self.f = storage_fixture.StorageTests()
+        self.f.setUp()
+        self.s = storage_fixture.m
+        self.free = 107374182400 - 57258970624 - 4194304
+        self.mounts = self.f.raw
+        self.enterContext(patch.object(self.s, "small", side_effect=lambda *a: self.mounts))
+        self.enterContext(
+            patch.object(
+                self.s,
+                "disk_identity",
+                side_effect=lambda device: self.f.disks["root" if device == "259:1" else "work"],
+            )
+        )
+        self.enterContext(
+            patch.object(
+                self.s,
+                "device_number",
+                side_effect=lambda path: "259:2" if path == self.s.WORK else "259:1",
+            )
+        )
+        self.enterContext(
+            patch.object(
+                Path,
+                "lstat",
+                return_value=types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=0),
+            )
+        )
+        self.enterContext(
+            patch.object(
+                Path, "stat", return_value=types.SimpleNamespace(st_mode=stat.S_IFDIR | 0o700)
+            )
+        )
+        self.enterContext(patch.object(m.os, "stat", return_value=types.SimpleNamespace(st_ino=12)))
+        self.enterContext(
+            patch.object(
+                m.os,
+                "statvfs",
+                side_effect=lambda path: types.SimpleNamespace(
+                    f_flag=0, f_bavail=self.free if path == self.s.WORK else 4 * 1024**3, f_frsize=1
+                ),
+            )
+        )
+
+    def call(self):
+        return m.post_import_storage(self.s, self.f.binding, json.loads(PROPOSAL))
+
+    def test_phase_floor_derived_from_actual_frozen_proposal(self):
+        self.assertEqual(self.call(), 50111017472)
+        self.assertLess(self.free, 100 * 1024**3)
+        with self.assertRaises(ValueError):
+            self.f.validate(work_free=self.free)  # Initial 100 GiB check stays unchanged.
+
+    def test_low_space_wrong_disk_alias_and_submount_rejected(self):
+        self.free -= 1
+        with self.assertRaises(ValueError):
+            self.call()
+        self.free += 1
+        self.mounts += b"3 2 0:10 / /var/lib/lumi-vm-fullsize/credentials rw - tmpfs tmpfs rw\n"
+        with self.assertRaises(ValueError):
+            self.call()
+        self.mounts = self.f.raw
+        self.f.disks["work"]["volume"] = self.f.binding["root_volume"]
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_namespace_mismatch_and_mount_change_rejected(self):
+        with patch.object(
+            m.os,
+            "stat",
+            side_effect=[types.SimpleNamespace(st_ino=1), types.SimpleNamespace(st_ino=2)],
+        ):
+            with self.assertRaises(ValueError):
+                self.call()
+        with patch.object(self.s, "small", side_effect=[self.f.raw, self.f.raw + b"changed"]):
+            with self.assertRaises(ValueError):
+                self.call()
+
+
+class GuardTests(unittest.TestCase):
+    def setUp(self):
+        self.f = ready_fixture.Tests()
+        self.f.setUp()
+        self.f.b.boot_time = lambda: 11000
+        self.request = copy.deepcopy(ready_fixture.REQUEST)
+        self.policy = self.f.policy
+        self.f.b.read = lambda path, *a: (
+            json.dumps(self.f.context).encode()
+            if path.name == "context.json"
+            else b"watch"
+            if path.name == "watch.service"
+            else b"timer"
+        )
+
+    def test_post_import_clock_uses_retention_end_not_fresh_import_reserve(self):
+        self.assertEqual(m.guards(self.f.b, self.policy, self.request, 12800), {"used": 1})
+        self.policy.inspect.assert_called_once()
+
+    def test_renewed_deadline_wrong_boot_and_missing_reserve_rejected(self):
+        with self.assertRaises(ValueError):
+            m.guards(self.f.b, self.policy, self.request, 14200)
+        with self.assertRaises(ValueError):
+            m.guards(self.f.b, self.policy, self.request, 11180)
+        self.f.context["boot_id"] = "foreign"
+        with self.assertRaises(ValueError):
+            m.guards(self.f.b, self.policy, self.request, 12800)
+
+
+class IdleTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.credentials = self.root / "credentials"
+        self.credentials.mkdir(mode=0o700)
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        actual = Path.lstat
+
+        def owned(path):
+            info = actual(path)
+            return types.SimpleNamespace(st_uid=0, st_gid=0, st_mode=info.st_mode)
+
+        self.enterContext(patch.object(Path, "lstat", owned))
+        self.bootstrap = types.SimpleNamespace(
+            show=Mock(
+                side_effect=lambda unit, field: (
+                    b"inactive" if field == "ActiveState" else b"not-found"
+                )
+            )
+        )
+        self.helper = types.SimpleNamespace(cgroup_empty=Mock(return_value=True))
+        self.sequence = types.SimpleNamespace(UNITS={"sdk": "sdk.service"})
+
+    def call(self):
+        m.idle(self.bootstrap, self.helper, self.sequence)
+
+    def test_old_units_inactive_new_units_absent(self):
+        self.call()
+        calls = self.bootstrap.show.call_args_list
+        self.assertEqual(sum(call.args[1] == "ActiveState" for call in calls), 5)
+        self.assertEqual(sum(call.args[1] == "LoadState" for call in calls), 2)
+
+    def test_running_old_unit_or_existing_retention_unit_rejected(self):
+        self.bootstrap.show.side_effect = lambda unit, field: (
+            b"active" if field == "ActiveState" else b"not-found"
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        self.bootstrap.show.side_effect = lambda unit, field: (
+            b"inactive" if field == "ActiveState" else b"loaded"
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_nonempty_cgroup_and_remaining_credentials_rejected(self):
+        self.helper.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            self.call()
+        self.helper.cgroup_empty.return_value = True
+        (self.credentials / "source").write_bytes(b"synthetic")
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_failure_marker_or_previous_retention_attempt_rejected(self):
+        (self.root / "detached-parent.failed.json").write_bytes(b"{}")
+        with self.assertRaises(ValueError):
+            self.call()
+
+
+class AdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.f = previous.RetentionTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.root = self.f.destination
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.binder, self.entry = m.modules(BINDER, ENTRY)
+        self.entry.ROOT = self.root
+        self.entry.RELEASE = self.root / "retention-release"
+        self.entry.ENTRY = self.entry.RELEASE / "scripts/run_sft_vm_retention_parent_v1.py"
+        _, _, bodies = builder.assemble()
+        for name, raw in bodies.items():
+            path = self.entry.RELEASE / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+            path.chmod(0o400)
+        self.entry.root_file = lambda path, *a: path.read_bytes()
+        controller = self.root / "controller"
+        controller.mkdir()
+        self.request = dict(
+            attempt=m.ATTEMPT,
+            machine_id="a" * 32,
+            boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            host_deadline_boottime=14300,
+            volumes=dict(root_volume="vol-" + "1" * 17, work_volume="vol-" + "2" * 17),
+        )
+        self.prior = dict(
+            schema="lumi.vm-root-host-binding.v0.1",
+            attempt=m.ATTEMPT,
+            machine_id=self.request["machine_id"],
+            boot_id=self.request["boot_id"],
+            host_started_boottime=0,
+            host_deadline_boottime=14300,
+            prepared_sha256="d" * 64,
+        )
+        raw = json.dumps(self.prior).encode()
+        self.prior_pin = m.sha(raw)
+        (controller / "binding.json").write_bytes(raw)
+        (controller / "binding.sha256").write_bytes((self.prior_pin + "\n").encode())
+        (controller / "prepared-attempt.json").write_bytes(b"{}")
+        self.writes = []
+
+        def write(path, raw):
+            with path.open("xb") as stream:
+                stream.write(raw)
+            path.chmod(0o400)
+            self.writes.append(path.name)
+
+        self.policy = types.SimpleNamespace(inspect=Mock())
+        self.bootstrap = types.SimpleNamespace(
+            boot_time=lambda: 11000,
+            sync=Mock(),
+            write=write,
+            encode=previous.m.canonical,
+            load=lambda name: self.policy,
+            snapshot=lambda policy: b"quota",
+        )
+        self.sequence = types.SimpleNamespace(
+            SDK=self.root / "sdk", LOCK_SHA=m.sha(b'{"requirements":[]}'), receipt=Mock()
+        )
+        self.ready = types.SimpleNamespace(
+            SDK_LOCK_SHA=m.sha(b"{}"),
+            read=lambda path: b'{"requirements":[]}' if path.name == "runtime-lock.json" else b"{}",
+            decode=json.loads,
+            versions=Mock(return_value=5),
+        )
+        self.prior_entry = types.SimpleNamespace(
+            validate_binding=entry.validate_binding,
+            decode=entry.decode,
+            root_file=lambda path, *a: path.read_bytes(),
+            descriptor=Mock(return_value=({}, dict(source_manifest_sha256="b" * 64))),
+        )
+        self.ready.modules = lambda: {
+            "parent.py": self.prior_entry,
+            "run_sft_vm_setup_sequence_v1.py": self.sequence,
+            "check_sft_vm_storage_v1.py": object(),
+        }
+        detached = types.SimpleNamespace(
+            context=Mock(return_value=(self.bootstrap, object(), self.request))
+        )
+        self.binder.boundary = Mock()
+        self.binder.helpers = lambda: (detached, self.ready)
+        self.binder.private_directory = Mock()
+        self.binder.root_read = lambda path, *a: path.read_bytes()
+        self.binder.census = Mock(
+            return_value=dict(processes=1, threads=1, vanished=0, bytes_read=50)
+        )
+        self.continuation = types.SimpleNamespace(
+            worker=types.SimpleNamespace(retention=previous.m),
+            _completed_parent=Mock(return_value=(self.f.completed, 12800)),
+        )
+        self.entry.load_parent = Mock(
+            return_value=types.SimpleNamespace(continuation=self.continuation)
+        )
+        self.enterContext(patch.object(previous.m, "policy"))
+        self.enterContext(patch.object(m, "modules", return_value=(self.binder, self.entry)))
+        self.guard = self.enterContext(patch.object(m, "guards", return_value={"used": 1}))
+        self.storage = self.enterContext(
+            patch.object(m, "post_import_storage", return_value=50111017472)
+        )
+        self.idle = self.enterContext(patch.object(m, "idle"))
+
+    def call(self, **kw):
+        return m._admit_same_host(
+            self.request, kw.get("pin", self.prior_pin), kw.get("end", 12800), BINDER, ENTRY
+        )
+
+    def test_real_release_inventory_binding_contract_and_original_deadline(self):
+        before = {p: p.read_bytes() for p in self.f.package.iterdir()}
+        result = self.call()
+        self.assertTrue(result["retention_binding_created"])
+        self.assertEqual(result["release_files_verified"], 21)
+        self.assertEqual(result["deadline_boottime"], 12800)
+        self.assertEqual(result["aggregates"]["package_bytes"], self.f.package_bytes)
+        raw = (self.root / "retention-controller/binding.json").read_bytes()
+        binding = json.loads(raw)
+        self.assertEqual(binding["prior_binding_sha256"], self.prior_pin)
+        self.assertEqual(binding["scope"], "conditional-private-retention-once")
+        self.assertEqual(result["retention_binding_sha256"], m.sha(raw))
+        self.assertEqual(
+            self.writes, ["started.json", "binding.json", "binding.sha256", "result.json"]
+        )
+        self.assertEqual(self.binder.census.call_count, 2)
+        self.assertEqual(self.continuation._completed_parent.call_count, 2)
+        self.assertEqual(before, {p: p.read_bytes() for p in before})
+        self.assertFalse(
+            result["bucket_admitted"] or result["credentials_issued"] or result["gate_5_complete"]
+        )
+
+    def test_wrong_prior_hash_time_or_too_late_rejected(self):
+        for kw in ({"pin": "f" * 64}, {"end": 12801}, {"end": 11180}, {"end": float("nan")}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                self.call(**kw)
+        self.assertFalse((self.root / "retention-admission").exists())
+
+    def test_repeat_preserves_binding(self):
+        self.call()
+        raw = (self.root / "retention-controller/binding.json").read_bytes()
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual((self.root / "retention-controller/binding.json").read_bytes(), raw)
+
+    def test_package_payloads_never_opened_by_admission_inventory(self):
+        actual = os.open
+        forbidden = {self.f.package / name for name in ("model.safetensors", "config.json")}
+
+        def no_payload(path, *args, **kwargs):
+            if Path(path) in forbidden:
+                raise AssertionError("admission_must_not_open_package_payload")
+            return actual(path, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=no_payload):
+            self.assertTrue(self.call()["retention_binding_created"])
+
+    def test_corrupt_release_rejected_before_closure_loading(self):
+        path = self.entry.RELEASE / "src/lumi/posttraining_vm_retention_parent_v1.py"
+        path.chmod(0o600)
+        path.write_bytes(b"corrupted")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.entry.load_parent.assert_not_called()
+
+    def test_completion_verification_mismatch_consumes_admission(self):
+        path = self.root / "stage/verification/verification.json"
+        path.write_bytes(b"{}")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertTrue((self.root / "retention-admission/started.json").exists())
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_mismatched_source_lineage_rejected(self):
+        self.prior_entry.descriptor.return_value = ({}, dict(source_manifest_sha256="c" * 64))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_active_worker_or_census_blocks_binding(self):
+        self.idle.side_effect = ValueError("active worker")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_snapshot_change_before_commit_rejected(self):
+        def change(_):
+            path = self.f.package / "model.safetensors"
+            path.write_bytes(b"changed synthetic")
+            return dict(processes=1, threads=1, vanished=0, bytes_read=50)
+
+        calls = 0
+
+        def census(budget):
+            nonlocal calls
+            calls += 1
+            return (
+                change(budget)
+                if calls == 2
+                else dict(processes=1, threads=1, vanished=0, bytes_read=50)
+            )
+
+        self.binder.census.side_effect = census
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_sdk_lock_drift_and_final_guard_failure_prevent_binding(self):
+        self.ready.SDK_LOCK_SHA = "0" * 64
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_final_guard_failure_and_second_census_failure_prevent_binding(self):
+        self.guard.side_effect = [{"used": 1}, ValueError("synthetic expiry")]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_second_census_rejects_new_worker_without_writing_binding(self):
+        self.binder.census.side_effect = [dict(processes=1), ValueError("synthetic worker")]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "retention-controller").exists())
+
+    def test_failure_after_hash_commit_keeps_possible_binding_and_no_retry(self):
+        writer = self.bootstrap.write
+
+        def fail(path, raw):
+            if path.name == "result.json":
+                raise OSError("synthetic lost ack")
+            writer(path, raw)
+
+        self.bootstrap.write = fail
+        with self.assertRaises(OSError):
+            self.call()
+        self.assertTrue((self.root / "retention-controller/binding.sha256").exists())
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_hash_write_failure_preserves_partial_without_retry(self):
+        writer = self.bootstrap.write
+
+        def fail(path, raw):
+            if path.name == "binding.sha256":
+                raise OSError("synthetic disk failure")
+            writer(path, raw)
+
+        self.bootstrap.write = fail
+        with self.assertRaises(OSError):
+            self.call()
+        self.assertTrue((self.root / "retention-controller/binding.json").exists())
+        self.assertFalse((self.root / "retention-controller/binding.sha256").exists())
+        with self.assertRaises(ValueError):
+            self.call()
+
+
+class BoundaryTests(unittest.TestCase):
+    def test_all_helpers_authenticate_before_load(self):
+        for a, c in ((BINDER + b" ", ENTRY), (BINDER, ENTRY + b" ")):
+            with self.assertRaises(ValueError):
+                m.modules(a, c)
+        binder, entry = m.modules(BINDER, ENTRY)
+        self.assertEqual(binder.TRUST, m.TRUST)
+        self.assertEqual(len(entry.SOURCES), 15)
+
+    def test_mac_boundary_and_public_launch_closed(self):
+        with patch.object(sys, "platform", "darwin"):
+            with self.assertRaises(ValueError):
+                m._admit_same_host({}, "a" * 64, 12000, BINDER, ENTRY)
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

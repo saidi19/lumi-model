@@ -1,0 +1,100 @@
+"""Attempt-018 v0.5 source/v0.6 plan bindings; never execution authority."""
+import hashlib
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v16 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = "1a65f26d11a8cc2b7897de19865ece36904b95e2336db2bf978bb54732404bec"
+ATTEMPT = source.ATTEMPT
+OLD = source.OLD
+BUCKET = source.BUCKET
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.5"
+RELEASE_SHA = "8b66eff48b193009d4fc51761488deeb4c70488ead72e3e099838f9333cf5a5f"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-018-source-v0.5-verification-v0.1.json"
+SOURCE_PROOF_SHA = "8e22ba2569d0595c01c01afa1c870bfd0fa72e8f313ac458cf95691a574f24ab"
+PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.6/plan.json"
+PLAN_SHA = "c49ee31418df6ad3b414feb68904dc9f01a31c22d1d174e303f4eac81cfd8afa"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-018-control-plan-v0.6/release.json"
+PLAN_RELEASE_SHA = "5d21f0156a7d8289d617230593a8c0dcadb0fbe102c9bd5f71425d025ee63907"
+WATCH = source.WATCH
+STORE = source.STORE
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_binding_v17_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    return source.read(name, digest, size)
+
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(
+        manifest["schema"] == "lumi.vm-attempt018-source.v0.5"
+        and manifest["application_read_attempts_per_call_maximum"] == 3
+        and manifest["application_read_retries_total_maximum"] == 8
+        and manifest["write_attempts_per_operation"] == 1
+        and proof["source_release_sha256"] == RELEASE_SHA
+        and proof["bounded_transient_reads_verified"] is True
+        and proof["write_retry_prohibited_verified"] is True
+        and proof["execution_authority_created"] is False
+        and plan_release["plan_sha256"] == PLAN_SHA
+        and plan_release["source_release_sha256"] == RELEASE_SHA
+        and plan_release["source_verification_sha256"] == SOURCE_PROOF_SHA
+        and plan_release["fresh_readonly_preflight_required"] is True
+        and plan_release["execution_permitted"] is False
+    )
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    scope = plan["cpu_scope_reference"]
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["successful_readonly_preflight"] is None
+        and plan["source_repair"]["bounded_transient_read_recovery"] is True
+        and plan["source_repair"]["read_attempts_per_call_maximum"] == 3
+        and plan["source_repair"]["read_retries_total_maximum"] == 8
+        and plan["source_repair"]["write_attempts_per_operation"] == 1
+        and scope["source"]["source_versions_bound"] is True
+        and scope["source"]["wire_or_billing_byte_cap_claimed"] is False
+        and scope["watchdog_launch_interlock_bound"] is True
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    build()
+    pins = source.controls()
+    need(set(pins) == {WATCH, STORE})
+    return pins
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

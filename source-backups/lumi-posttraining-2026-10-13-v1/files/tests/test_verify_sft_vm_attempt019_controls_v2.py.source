@@ -1,0 +1,35 @@
+"""Checks for the exact lifecycle-absence verifier correction."""
+import unittest
+
+from scripts import verify_sft_vm_attempt019_controls_v2 as m
+
+
+class CodedError(Exception):
+    def __init__(self, code):
+        self.response = {
+            "Error": {"Code": code},
+            "ResponseMetadata": {"HTTPStatusCode": 404},
+        }
+
+
+class Fake:
+    def get_bucket_lifecycle_configuration(self, **_fields):
+        raise CodedError("NoSuchLifecycleConfiguration")
+
+    def head_bucket(self, **_fields):
+        raise CodedError("NoSuchLifecycleConfiguration")
+
+
+class Tests(unittest.TestCase):
+    def test_exact_lifecycle_absence_is_accepted(self):
+        reads = m.Reads({"s3": Fake()}, sleep=lambda _: None)
+        self.assertTrue(reads.absent("s3", "get_bucket_lifecycle_configuration"))
+
+    def test_same_code_is_not_global_s3_absence(self):
+        reads = m.Reads({"s3": Fake()}, sleep=lambda _: None)
+        with self.assertRaises(CodedError):
+            reads.absent("s3", "head_bucket")
+
+
+if __name__ == "__main__":
+    unittest.main()

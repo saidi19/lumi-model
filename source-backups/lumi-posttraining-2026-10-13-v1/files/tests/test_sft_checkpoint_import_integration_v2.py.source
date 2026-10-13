@@ -1,0 +1,202 @@
+"""Real tiny DCP -> v5 import -> v2 package -> SFT checksum/HF consumers.
+
+All payloads are generated in a temporary directory. Tokenizer files are
+opaque synthetic fixtures: this checks exact copying, not tokenization.
+No component, checksum consumer, or tensor conversion is replaced by a mock.
+Forward passes, optimizer steps, and network connects are forbidden.
+"""
+
+from __future__ import annotations
+
+import socket
+import time
+import unittest
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_torch_v5 as kernel
+from lumi import posttraining_checkpoint_package_v2 as package
+from lumi.posttraining_checkpoint_import_plan_v1 import build_import_plan
+from lumi.posttraining_checkpoint_io_contract_v1 import build_kernel_io_contract
+from lumi.posttraining_checkpoint_stream_v1 import verify_inventory
+from lumi.posttraining_final_base_metadata_v1 import canonical, sha
+from tests import test_sft_checkpoint_import_torch_v3 as fixtures
+from tests.test_sft_checkpoint_import_runner_v2 import (
+    fixture_kernel_contract,
+    seal_fixture,
+)
+
+
+class PackagedImportIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.CheckpointImportTorchTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.CheckpointImportTorchTests.tearDownClass()
+
+    def setUp(self):
+        self.deadline = time.monotonic() + 30
+        self.f = fixtures.CheckpointImportTorchTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        for owner, name in (
+            (self.f.model_class, "forward"),
+            (self.f.torch.optim.AdamW, "step"),
+            (socket.socket, "connect"),
+            (socket.socket, "connect_ex"),
+            (socket, "getaddrinfo"),
+        ):
+            self.enterContext(patch.object(
+                owner, name, side_effect=AssertionError("forbidden_integration_action")
+            ))
+        config = self.f.config_class(**self.f.payload)
+        self.f.payload = {name: getattr(config, name) for name in kernel.MODEL_FIELDS}
+        self.f.payload["model_type"] = "lumi"
+        config_raw = canonical(self.f.payload)
+        self.f.config_path.write_bytes(config_raw)
+        self.f._checkpoint()
+        self.f.checkpoint_path.chmod(0o700)
+        self.tokens = self.f.root / "tokenizer-input"
+        self.tokens.mkdir(mode=0o700)
+        metadata = seal_fixture(
+            self.f.checkpoint_path, self.tokens, config_raw=config_raw
+        )
+        self.plan = build_import_plan(
+            *metadata, expected_base_sha256=sha(metadata[0]), dtype="bfloat16"
+        )
+        self.contract = fixture_kernel_contract(metadata)
+        self.before = self.audit_inputs()
+
+    def check_budget(self):
+        if time.monotonic() >= self.deadline:
+            raise TimeoutError("synthetic_integration_deadline")
+
+    def audit_inputs(self):
+        bounds = self.plan["resource_bounds"]
+        checkpoint = verify_inventory(
+            self.f.checkpoint_path, self.plan["checkpoint_inventory"],
+            maximum_read_bytes=bounds["checkpoint_inventory_bytes"],
+            maximum_files=bounds["checkpoint_inventory_files"], maximum_seconds=10,
+        )
+        tokens = self.plan["tokenizer_inventory"]
+        tokenizer = verify_inventory(
+            self.tokens, tokens, maximum_read_bytes=sum(row["bytes"] for row in tokens),
+            maximum_files=len(tokens), maximum_seconds=10,
+        )
+        return checkpoint, tokenizer
+
+    def convert(self, *, sharded=False):
+        if sharded:
+            self.contract = build_kernel_io_contract(
+                self.plan,
+                checkpoint_read_contract=self.contract["checkpoint_read_contract"],
+                hf_io_contract=self.contract["hf_io_contract"]
+                | {"target_shard_bytes": 512},
+            )
+        bounds = self.plan["resource_bounds"]
+        self.evidence = kernel.convert_and_verify(
+            self.f.config_path, self.f.checkpoint_path, self.f.output_path, "bfloat16",
+            maximum_parameters=self.plan["model_parameters"],
+            maximum_tensor_bytes=bounds["maximum_projected_live_tensor_bytes"],
+            maximum_output_bytes=bounds["maximum_backend_output_bytes"],
+            check_budget=self.check_budget,
+            checkpoint_read_contract=self.contract["checkpoint_read_contract"],
+            hf_io_contract=self.contract["hf_io_contract"],
+        )
+
+    def package_arguments(self):
+        return dict(
+            output=self.f.output_path, plan=self.plan,
+            expected_plan_sha256=self.plan["plan_sha256"],
+            kernel_evidence=self.evidence, kernel_io_contract=self.contract,
+            expected_kernel_io_contract_sha256=self.contract["contract_sha256"],
+            maximum_read_bytes=32 * 1024**2, maximum_control_bytes=131072,
+            check_budget=self.check_budget,
+        )
+
+    def finalize(self):
+        return package.finalize_package(
+            **self.package_arguments(), tokenizer_root=self.tokens,
+            maximum_write_bytes=4 * 1024**2,
+        )
+
+    def assert_roundtrip(self, *, sharded):
+        self.convert(sharded=sharded)
+        result = self.finalize()
+        manifest = result["manifest_file_sha256"]
+        verified = package.verify_package(
+            **self.package_arguments(), expected_manifest_sha256=manifest
+        )
+        self.assertEqual(verified["receipt_internal_sha256"],
+                         result["receipt_internal_sha256"])
+        self.assertEqual(verified["package_content_write_bytes"], 0)
+        self.assertTrue(result["real_worker_checksum_verifier_passed"])
+        # Independent actual Path consumer, not just the package's path adapter.
+        from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+
+        self.assertEqual(_verify_checksum_manifest(
+            self.f.output_path, expected_manifest_sha256=manifest,
+            require_exact_inventory=True, require_private=True,
+        ), manifest)
+        with self.f.torch.device("cpu"):
+            loaded = self.f.model_class.from_pretrained(
+                self.f.output_path, local_files_only=True, dtype=self.f.torch.bfloat16,
+                attn_implementation="eager", device_map=None,
+                use_safetensors=True, trust_remote_code=False,
+            )
+        self.assertEqual(kernel._tensor_digest(loaded.state_dict(), lambda: None),
+                         self.evidence["reload_tensor_sha256"])
+        self.assertEqual(self.evidence["cast_tensor_sha256"],
+                         self.evidence["reload_tensor_sha256"])
+        for name in self.f.buffer_names:
+            actual = loaded.state_dict()[name]
+            self.assertEqual(actual.dtype, self.f.torch.float32)
+            self.assertTrue(self.f.torch.equal(actual, self.f.fixture_state[name]))
+        for row in self.plan["tokenizer_inventory"]:
+            self.assertEqual((self.f.output_path / row["path"]).read_bytes(),
+                             (self.tokens / row["path"]).read_bytes())
+        for flag in package.FALSE_FLAGS:
+            self.assertIs(result[flag], False)
+        self.assertEqual(self.audit_inputs(), self.before)
+        self.assertEqual(self.evidence["safetensor_file_count"] > 1, sharded)
+
+    def test_single_shard_full_chain(self):
+        self.assert_roundtrip(sharded=False)
+
+    def test_multiple_shards_full_chain(self):
+        self.assert_roundtrip(sharded=True)
+
+    def test_packaged_weight_corruption_rejected_by_both_consumers(self):
+        self.convert()
+        result = self.finalize()
+        path = next(self.f.output_path.glob("*.safetensors"))
+        original = path.read_bytes()
+        path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+        with self.assertRaises(package.CheckpointPackageError):
+            package.verify_package(
+                **self.package_arguments(),
+                expected_manifest_sha256=result["manifest_file_sha256"],
+            )
+        from lumi.posttraining_sft_runtime_v4 import _verify_checksum_manifest
+
+        with self.assertRaisesRegex(ValueError, "checkpoint file hash changed"):
+            _verify_checksum_manifest(
+                self.f.output_path,
+                expected_manifest_sha256=result["manifest_file_sha256"],
+                require_exact_inventory=True, require_private=True,
+            )
+        self.assertEqual(self.audit_inputs(), self.before)
+
+    def test_mismatched_tokenizer_never_produces_completed_package(self):
+        self.convert()
+        token = self.tokens / "tokenizer/tokenizer.json"
+        token.write_bytes(b'{"synthetic":null}')
+        with self.assertRaisesRegex(package.CheckpointPackageError, "content_changed"):
+            self.finalize()
+        self.assertFalse((self.f.output_path / package.MANIFEST).exists())
+        self.assertFalse((self.f.output_path / package.RECEIPT).exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

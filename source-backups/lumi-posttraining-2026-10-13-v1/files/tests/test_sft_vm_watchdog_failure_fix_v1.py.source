@@ -1,0 +1,198 @@
+"""Exercise actual frozen/fixed SDK wrappers without network or cloud credentials."""
+
+import base64
+import hashlib
+import importlib.util
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from botocore.exceptions import ClientError, ReadTimeoutError
+
+from scripts import preflight_sft_vm_attempt021_v1 as preflight
+from scripts import prepare_sft_vm_watchdog_failure_fix_v1 as builder
+from scripts import verify_sft_vm_watchdog_failure_fix_v1 as verification
+
+outer, _, _ = preflight.local()
+frozen = outer.loading
+spec = importlib.util.spec_from_file_location(
+    "_local_watchdog_failure_fix", builder.ROOT / builder.OUTPUT
+)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class Client:
+    def __init__(self, service, error=None):
+        self.error, self.calls = error, []
+        self.meta = types.SimpleNamespace(
+            endpoint_url="https://iam.amazonaws.com"
+            if service == "iam"
+            else f"https://{service}.us-east-1.amazonaws.com",
+            region_name="us-east-1",
+            config=types.SimpleNamespace(
+                retries={"total_max_attempts": 1}, connect_timeout=3, read_timeout=5, proxies={}
+            ),
+        )
+
+    def __getattr__(self, name):
+        def call(**fields):
+            self.calls.append(name)
+            if self.error:
+                raise self.error
+            return {}
+
+        return call
+
+
+def aws_error(code):
+    return ClientError({"Error": {"Code": code, "Message": "PRIVATE_RAW_TEXT"}}, "GetScheduleGroup")
+
+
+class Tests(unittest.TestCase):
+    def test_entire_inert_validator_and_frozen_limits_unchanged(self):
+        _, candidate, _ = verification.local()
+        self.assertEqual(candidate.SOURCE_SHA, frozen.SOURCE_SHA)
+        self.assertEqual(candidate.BASE_CODE, frozen.BASE_CODE)
+
+    def test_full_readback_limit_is_sixteen_without_mutations(self):
+        credentials = types.SimpleNamespace(static_identity_client=None)
+        meter = verification.Meter(credentials, clock=lambda: 1)
+        for _ in range(16):
+            meter.consume("lambda", model=types.SimpleNamespace(name="GetFunctionConfiguration"))
+        with self.assertRaises(ValueError):
+            meter.consume("lambda", model=types.SimpleNamespace(name="GetFunctionConfiguration"))
+        fresh = verification.Meter(credentials, clock=lambda: 1)
+        with self.assertRaises(ValueError):
+            fresh.consume("lambda", model=types.SimpleNamespace(name="UpdateFunctionCode"))
+        self.assertEqual(fresh.calls, 0)
+
+    def cloud(self, error, cls=m.WatchdogCloud):
+        clients = {service: Client(service) for service in m.original_guard.OPS}
+        clients["scheduler"].error = error
+        return cls(clients), clients
+
+    def test_exact_source_reproduction_and_private_entry(self):
+        self.assertEqual((builder.ROOT / builder.OUTPUT).read_bytes(), builder.build())
+        with self.assertRaises(ValueError):
+            m.run()
+        with self.assertRaises(ValueError):
+            builder.run()
+
+    def test_frozen_wrapper_proves_aws_code_loss(self):
+        cloud, clients = self.cloud(aws_error("AccessDeniedException"), frozen.WatchdogCloud)
+        with self.assertRaises(RuntimeError) as caught:
+            cloud.cli("scheduler", "get-schedule-group", Name=m.original_guard.inert.GROUP)
+        self.assertFalse(hasattr(caught.exception, "response"))
+        self.assertFalse(hasattr(caught.exception, "diagnostic"))
+        self.assertEqual(len(clients["scheduler"].calls), 1)
+
+    def test_fixed_wrapper_preserves_only_allowlisted_aws_code(self):
+        cloud, clients = self.cloud(aws_error("AccessDeniedException"))
+        with self.assertRaises(m.WatchdogCloudFailure) as caught:
+            cloud.cli("scheduler", "get-schedule-group", Name=m.original_guard.inert.GROUP)
+        self.assertEqual(
+            caught.exception.diagnostic, dict(kind="aws_service", code="AccessDeniedException")
+        )
+        self.assertNotIn("PRIVATE_RAW_TEXT", json.dumps(caught.exception.diagnostic))
+        self.assertNotIn("PRIVATE_RAW_TEXT", str(caught.exception))
+        self.assertEqual(len(clients["scheduler"].calls), 1)
+
+    def test_expected_absence_still_lookup_error(self):
+        for operation in ("get-schedule-group", "get-schedule"):
+            cloud, clients = self.cloud(aws_error("ResourceNotFoundException"))
+            with self.subTest(operation=operation), self.assertRaises(LookupError):
+                cloud.cli("scheduler", operation, Name="synthetic")
+            self.assertEqual(cloud.failure_record, {})
+            self.assertEqual(len(clients["scheduler"].calls), 1)
+
+    def test_unknown_error_code_is_not_retained(self):
+        cloud, _ = self.cloud(aws_error("PRIVATE_UNKNOWN_CODE"))
+        with self.assertRaises(m.WatchdogCloudFailure) as caught:
+            cloud.cli("scheduler", "get-schedule-group", Name="synthetic")
+        self.assertEqual(caught.exception.diagnostic, dict(kind="aws_service", code="other"))
+
+    def test_read_timeout_classification_before_redaction(self):
+        cloud, _ = self.cloud(ReadTimeoutError(endpoint_url="https://PRIVATE_RAW_TEXT"))
+        with self.assertRaises(m.WatchdogCloudFailure) as caught:
+            cloud.cli("scheduler", "get-schedule-group", Name="synthetic")
+        self.assertEqual(caught.exception.diagnostic, dict(kind="read_timeout", code="none"))
+
+    def test_malformed_error_payload_cannot_break_or_leak_diagnostics(self):
+        for response in (None, {"Error": None}, {"Error": {"Code": ["PRIVATE_RAW_TEXT"]}}):
+            error = RuntimeError("PRIVATE_RAW_TEXT")
+            error.response = response
+            value = m.safe_cloud_error(error)
+            self.assertNotIn("PRIVATE_RAW_TEXT", json.dumps(value))
+            self.assertEqual(set(value), {"kind", "code"})
+
+    def test_update_validation_and_other_mutations_remain_closed(self):
+        cloud, clients = self.cloud(None)
+        for operation in ("create-schedule-group", "create-schedule", "delete-schedule"):
+            with self.subTest(operation=operation), self.assertRaises(m.WatchdogCloudFailure):
+                cloud.cli("scheduler", operation, Name="synthetic")
+        with self.assertRaises(m.WatchdogCloudFailure):
+            cloud.cli("lambda", "update-function-code", FunctionName="foreign")
+        self.assertTrue(all(not client.calls for client in clients.values()))
+
+    def test_foreign_endpoints_and_retry_settings_still_rejected(self):
+        for change in ("endpoint", "retry"):
+            clients = {service: Client(service) for service in m.original_guard.OPS}
+            if change == "endpoint":
+                clients["scheduler"].meta.endpoint_url = "https://foreign.invalid"
+            else:
+                clients["scheduler"].meta.config.retries = {"total_max_attempts": 2}
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                m.WatchdogCloud(clients)
+
+    def test_updater_saves_failure_without_second_write_or_raw_text(self):
+        body = b"synthetic_worker"
+        code = base64.b64encode(hashlib.sha256(body).digest()).decode()
+        guard = types.SimpleNamespace(
+            inert=types.SimpleNamespace(package=lambda: body, UNARMED={}),
+            CODE=code,
+            worker=types.SimpleNamespace(FUNCTION="synthetic"),
+            configuration=lambda *_: None,
+        )
+        loaded = m.Loaded.__new__(m.Loaded)
+        loaded.update_used, loaded.deadline = False, 100000
+        loaded.verify, loaded.active = Mock(), Mock()
+        loaded.joined = types.SimpleNamespace(lifecycle=types.SimpleNamespace(guard=guard))
+        cloud = Mock()
+        cloud.cli.side_effect = [
+            dict(CodeSha256=code, RevisionId="new"),
+            dict(CodeSha256=code, RevisionId="new", LastUpdateStatus="Successful"),
+        ]
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            patch.object(m, "fresh_identity"),
+            patch.object(
+                m,
+                "_inert_checks",
+                side_effect=[
+                    dict(RevisionId="base"),
+                    m.WatchdogCloudFailure(dict(kind="aws_service", code="AccessDeniedException")),
+                ],
+            ),
+        ):
+            output = Path(temp).resolve() / "failure"
+            with self.assertRaises(ValueError):
+                m._update_inert_watchdog_once(loaded, output, cloud=cloud, clock=lambda: 100)
+            result = json.loads((output / "result.json").read_bytes())
+            self.assertEqual(result["stage"], "successor_inert")
+            self.assertEqual(result["code_update_attempts"], 1)
+            self.assertEqual(
+                result["failure_diagnostic"], dict(kind="aws_service", code="AccessDeniedException")
+            )
+            self.assertFalse(result["host_launch_authorized"])
+            self.assertNotIn("PRIVATE_RAW_TEXT", json.dumps(result))
+            with self.assertRaises(ValueError):
+                m._update_inert_watchdog_once(loaded, output, cloud=cloud, clock=lambda: 100)
+            self.assertEqual(cloud.cli.call_count, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

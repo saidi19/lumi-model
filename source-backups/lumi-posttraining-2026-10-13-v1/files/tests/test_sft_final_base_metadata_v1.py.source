@@ -1,0 +1,638 @@
+"""Pure synthetic metadata and source-AST tests; no payload or native execution."""
+
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import importlib.util
+import itertools
+import json
+import re
+import unittest
+from collections.abc import Mapping
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "src/lumi/posttraining_final_base_metadata_v1.py"
+OLD_SOURCE = ROOT / "src/lumi/posttraining_checkpoint_import_v2.py"
+READINESS_SOURCE = ROOT / "src/lumi/posttraining_readiness.py"
+spec = importlib.util.spec_from_file_location("_pure_final_base_metadata_v1", SOURCE)
+assert spec is not None and spec.loader is not None
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def canonical(value):
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    ).encode("utf-8")
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def manifest(entries):
+    return "".join(f"{sha}  {name}\n" for name, sha in sorted(entries.items())).encode()
+
+
+class SyntheticMetadataTests(unittest.TestCase):
+    def setUp(self):
+        self.config = {
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "max_position_embeddings": 16,
+            "rope_theta": 10000.0,
+            "rms_norm_eps": 0.00001,
+            "attention_bias": False,
+            "tie_word_embeddings": True,
+            "pad_token_id": 0,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "doc_token_id": 3,
+            "model_type": "lumi",
+        }
+        self.state = {
+            "checkpoint_schema_version": 1,
+            "step": 4,
+            "sequence_cursor": 8,
+            "tokens_seen": 256,
+            "run_fingerprint": "a" * 64,
+            "run_specification": {"source_commit": "b" * 40, "distributed": {"world_size": 2}},
+        }
+        files = [
+            {"relative_path": role, "bytes": index + 1, "sha256": str(index + 1) * 64}
+            for index, role in enumerate(m.TOKENIZER_ROLES)
+        ]
+        self.base = {
+            "schema_version": "lumi.posttraining-base-binding.v0.1",
+            "checkpoint_stage": "base",
+            "model_id": "lumi-4b-base",
+            "run_fingerprint": "a" * 64,
+            "source_commit": "b" * 40,
+            "checkpoint": {
+                "step": 4,
+                "sequence_cursor": 8,
+                "training_tokens": 256,
+                "world_size": 2,
+            },
+            "tokenizer": {"files": files, "manifest_sha256": digest(canonical(files))},
+        }
+        self.entries = {
+            "model/.metadata": "c" * 64,
+            "model/__0_0.distcp": "d" * 64,
+            "trainer-rank-00000.pt": "e" * 64,
+            "trainer-rank-00001.pt": "f" * 64,
+        }
+
+    def documents(self, *, config_raw=None, state_raw=None, manifest_raw=None, base_raw=None):
+        config_raw = canonical(self.config) if config_raw is None else config_raw
+        state = copy.deepcopy(self.state)
+        if type(state.get("run_specification")) is dict:
+            state["run_specification"].setdefault("config_sha256", digest(config_raw))
+        state_raw = canonical(state) if state_raw is None else state_raw
+        entries = {**self.entries, m.STATE: digest(state_raw)}
+        manifest_raw = manifest(entries) if manifest_raw is None else manifest_raw
+        base = copy.deepcopy(self.base)
+        if type(base.get("checkpoint")) is dict:
+            base["checkpoint"].setdefault("manifest_sha256", digest(manifest_raw))
+        base_raw = canonical(base) if base_raw is None else base_raw
+        return base_raw, manifest_raw, state_raw, config_raw
+
+    def verify(self, **raw_overrides):
+        documents = self.documents(**raw_overrides)
+        return m.verify_final_base_metadata(*documents, expected_base_sha256=digest(documents[0]))
+
+    def reject(self, code=None, **raw_overrides):
+        with self.assertRaises(m.FinalBaseMetadataError) as caught:
+            self.verify(**raw_overrides)
+        error = caught.exception
+        self.assertIn(error.code, m.ERROR_CODES)
+        self.assertEqual(error.args, (error.code,))
+        if code is not None:
+            self.assertEqual(error.code, code)
+
+    def test_complete_synthetic_lineage_returns_closed_metadata_receipt(self):
+        result = self.verify()
+        self.assertEqual(set(result), set(m.REPORT_KEYS))
+        self.assertEqual(result["status"], "PASS_metadata_lineage_only")
+        self.assertEqual(result["checkpoint_manifest_entries"], 5)
+        self.assertEqual(result["model_entries_declared"], 2)
+        self.assertEqual(result["trainer_ranks_declared"], 2)
+        self.assertEqual(result["tokenizer_files_declared"], 3)
+        self.assertEqual(result["tokenizer_bytes_declared"], 6)
+        self.assertEqual(
+            result["model_geometry"], {key: self.config[key] for key in m.MODEL_FIELDS}
+        )
+        for flag in m.FALSE_FLAGS:
+            self.assertIs(result[flag], False)
+        self.assertLessEqual(len(canonical(result)), m.MAXIMUM_REPORT_BYTES)
+
+    def test_required_independent_pin_has_no_default_and_is_checked_before_json(self):
+        documents = self.documents()
+        with self.assertRaises(TypeError):
+            m.verify_final_base_metadata(*documents)
+        for pin in (None, "", "A" * 64, "a" * 63, "a" * 64 + "\n", True, b"a" * 64):
+            with self.subTest(pin=pin), patch.object(m, "json_object") as parser:
+                with self.assertRaisesRegex(m.FinalBaseMetadataError, "base_pin_required"):
+                    m.verify_final_base_metadata(*documents, expected_base_sha256=pin)
+                parser.assert_not_called()
+        with patch.object(m, "json_object") as parser:
+            with self.assertRaisesRegex(m.FinalBaseMetadataError, "base_binding_mismatch"):
+                m.verify_final_base_metadata(*documents, expected_base_sha256="0" * 64)
+            parser.assert_not_called()
+
+    def test_raw_base_whitespace_change_requires_new_independent_pin(self):
+        documents = self.documents()
+        with self.assertRaisesRegex(m.FinalBaseMetadataError, "base_binding_mismatch"):
+            m.verify_final_base_metadata(
+                documents[0] + b" ", *documents[1:], expected_base_sha256=digest(documents[0])
+            )
+
+    def test_only_bytes_inputs_and_each_exact_cap_before_json(self):
+        baseline = self.documents()
+        for index, name in enumerate(m.MAXIMUM_INPUT_BYTES):
+            for invalid in ("text", bytearray(b"{}"), memoryview(b"{}"), None):
+                docs = list(baseline)
+                docs[index] = invalid
+                with self.subTest(index=index), patch.object(m, "json_object") as parser:
+                    with self.assertRaisesRegex(m.FinalBaseMetadataError, "input_bytes_required"):
+                        m.verify_final_base_metadata(
+                            *docs, expected_base_sha256=digest(baseline[0])
+                        )
+                    parser.assert_not_called()
+            for invalid in (b"", b"x" * (m.MAXIMUM_INPUT_BYTES[name] + 1)):
+                docs = list(baseline)
+                docs[index] = invalid
+                with self.assertRaisesRegex(m.FinalBaseMetadataError, "input_size_cap"):
+                    m.verify_final_base_metadata(*docs, expected_base_sha256=digest(baseline[0]))
+
+    def test_combined_cap_independent_of_per_object_caps(self):
+        raw = [b"x" * size for size in m.MAXIMUM_INPUT_BYTES.values()]
+        with self.assertRaisesRegex(m.FinalBaseMetadataError, "input_size_cap"):
+            m.verify_final_base_metadata(*raw, expected_base_sha256=digest(raw[0]))
+
+    def test_duplicate_json_keys_rejected_in_every_json_object(self):
+        for name in ("base_raw", "state_raw", "config_raw"):
+            self.reject("duplicate_json_key", **{name: b'{"x":1,"x":2}'})
+            self.reject("duplicate_json_key", **{name: b'{"x":{"nested":1,"nested":2}}'})
+
+    def test_nonfinite_json_and_overflow_rejected(self):
+        for name in ("base_raw", "state_raw", "config_raw"):
+            for value in (b"NaN", b"Infinity", b"-Infinity"):
+                self.reject("nonfinite_json_number", **{name: b'{"x":' + value + b"}"})
+            self.reject("invalid_json", **{name: b'{"x":1e999}'})
+
+    def test_invalid_encoding_surrogate_shapes_and_nesting_are_fixed_errors(self):
+        for raw in (b"\xff", b'{"x":"\\ud800"}', b"{"):
+            self.reject("invalid_json", base_raw=raw)
+        for raw in (b"[]", b"1", b"null", b'"text"'):
+            self.reject("json_object_required", base_raw=raw)
+        with patch.object(m.json, "loads", side_effect=RecursionError("unretained")):
+            self.reject("invalid_json")
+
+    def test_wrong_base_schema_stage_and_model_rejected(self):
+        for key, bad, code in (
+            ("schema_version", "other", "base_schema"),
+            ("checkpoint_stage", "sft", "base_stage"),
+            ("model_id", "tiny-model", "model_id_mismatch"),
+        ):
+            original = self.base[key]
+            self.base[key] = bad
+            self.reject(code)
+            self.base[key] = original
+
+    def test_fingerprint_and_commit_require_exact_lowercase_hex(self):
+        for key, width, code in (
+            ("run_fingerprint", 64, "run_fingerprint_format"),
+            ("source_commit", 40, "source_commit_format"),
+        ):
+            original = self.base[key]
+            for bad in (None, True, "A" * width, "a" * (width - 1), "a" * width + "\n"):
+                self.base[key] = bad
+                self.reject(code)
+            self.base[key] = original
+
+    def test_checkpoint_closed_shape_and_manifest_pin(self):
+        original = copy.deepcopy(self.base["checkpoint"])
+        for changed in (None, {}, [], {**original, "extra": True}):
+            self.base["checkpoint"] = changed
+            self.reject("checkpoint_binding_shape")
+        self.base["checkpoint"] = {**original, "manifest_sha256": "a" * 64}
+        self.reject("source_manifest_binding")
+
+    def test_state_digest_must_appear_in_dcp_manifest(self):
+        entries = {**self.entries, m.STATE: "0" * 64}
+        self.reject("checkpoint_state_not_bound", manifest_raw=manifest(entries))
+        self.reject("checkpoint_state_not_bound", manifest_raw=manifest(self.entries))
+
+    def test_model_entry_must_be_declared(self):
+        self.entries = {
+            name: value for name, value in self.entries.items() if not name.startswith("model/")
+        }
+        self.reject("model_state_not_declared")
+
+    def test_checkpoint_schema_exact_integer_one(self):
+        for value in (True, 1.0, "1", 0, 2, None):
+            self.state["checkpoint_schema_version"] = value
+            self.reject("checkpoint_schema")
+
+    def test_cursor_values_both_sides_reject_boolean_float_nonpositive_and_mismatch(self):
+        for bound, actual in (
+            ("step", "step"),
+            ("sequence_cursor", "sequence_cursor"),
+            ("training_tokens", "tokens_seen"),
+        ):
+            for obj, key in ((self.base["checkpoint"], bound), (self.state, actual)):
+                original = obj[key]
+                for bad in (True, float(original), str(original), -1, 0, original + 1, 2**63):
+                    obj[key] = bad
+                    self.reject("checkpoint_cursor_mismatch")
+                obj[key] = original
+
+    def test_world_requires_equal_two_to_eight_integer_ranks(self):
+        for obj in (self.base["checkpoint"], self.state["run_specification"]["distributed"]):
+            for bad in (True, 2.0, "2", 1, 3, 9, None):
+                obj["world_size"] = bad
+                self.reject("world_size_mismatch")
+            obj["world_size"] = 2
+
+    def test_each_expected_trainer_rank_required(self):
+        for name in ("trainer-rank-00000.pt", "trainer-rank-00001.pt"):
+            value = self.entries.pop(name)
+            self.reject("trainer_rank_not_declared")
+            self.entries[name] = value
+
+    def test_eight_rank_metadata_supported_without_reading_trainer_payloads(self):
+        self.base["checkpoint"]["world_size"] = 8
+        self.state["run_specification"]["distributed"]["world_size"] = 8
+        for rank in range(2, 8):
+            self.entries[f"trainer-rank-{rank:05d}.pt"] = "f" * 64
+        self.assertEqual(self.verify()["trainer_ranks_declared"], 8)
+
+    def test_state_run_and_source_commit_must_match_base(self):
+        self.state["run_fingerprint"] = "e" * 64
+        self.reject("run_fingerprint_mismatch")
+        self.state["run_fingerprint"] = "a" * 64
+        self.state["run_specification"]["source_commit"] = "e" * 40
+        self.reject("source_commit_mismatch")
+
+    def test_source_config_raw_digest_not_shape_equivalence(self):
+        self.state["run_specification"]["config_sha256"] = digest(canonical(self.config))
+        self.reject("source_config_binding", config_raw=canonical(self.config) + b" ")
+
+    def test_malformed_run_specification_is_fixed_shape_error(self):
+        for bad in (None, [], "private-path", True):
+            self.state["run_specification"] = bad
+            self.reject("metadata_shape_rejected")
+        self.state["run_specification"] = {"distributed": None}
+        self.reject("metadata_shape_rejected")
+
+    def test_config_type_and_each_explicit_field_required(self):
+        self.config["model_type"] = "other"
+        self.reject("model_type_mismatch")
+        self.config["model_type"] = "lumi"
+        for key in m.MODEL_FIELDS:
+            value = self.config.pop(key)
+            self.reject("incomplete_explicit_model_config")
+            self.config[key] = value
+
+    def test_dimensional_integer_config_fields_are_positive_not_bool_or_float(self):
+        for key in m.MODEL_FIELDS[:8]:
+            original = self.config[key]
+            for bad in (True, 0, -1, float(original), "8", None, 2**63):
+                self.config[key] = bad
+                self.reject("model_geometry_type")
+            self.config[key] = original
+
+    def test_numeric_boolean_and_token_id_model_fields_are_typed(self):
+        for key, values in (
+            ("rope_theta", (True, 0, -1, "10000", None)),
+            ("rms_norm_eps", (False, 0, -1, "0.01", None)),
+            ("attention_bias", (0, 1, "false", None)),
+            ("tie_word_embeddings", (0, 1, "true", None)),
+            ("pad_token_id", (True, -1, 32, 0.0, None)),
+            ("bos_token_id", (True, -1, 32, 1.0, None)),
+            ("eos_token_id", (True, -1, 32, 2.0, None)),
+            ("doc_token_id", (True, -1, 32, 3.0, None)),
+        ):
+            original = self.config[key]
+            for bad in values:
+                self.config[key] = bad
+                self.reject("model_geometry_type")
+            self.config[key] = original
+
+    def test_tokenizer_inventory_is_json_digest_not_checksum_lines(self):
+        files = self.base["tokenizer"]["files"]
+        line_manifest = "".join(
+            f"{item['sha256']}  {item['relative_path']}\n" for item in files
+        ).encode()
+        self.base["tokenizer"]["manifest_sha256"] = digest(line_manifest)
+        self.reject("tokenizer_manifest_binding")
+        self.base["tokenizer"]["manifest_sha256"] = digest(canonical(files) + b"\n")
+        self.reject("tokenizer_manifest_binding")
+
+    def test_all_inventory_permutations_sort_before_canonical_digest(self):
+        files = self.base["tokenizer"]["files"]
+        expected = self.base["tokenizer"]["manifest_sha256"]
+        for permutation in itertools.permutations(files):
+            self.base["tokenizer"]["files"] = list(permutation)
+            result = self.verify()
+            self.assertEqual(result["tokenizer_inventory_sha256"], expected)
+            self.assertEqual(result["tokenizer_inventory_canonical_bytes"], len(canonical(files)))
+
+    def test_auxiliary_inventory_fields_normalized_out_like_readiness(self):
+        self.base["tokenizer"]["files"][0]["synthetic_auxiliary"] = "NOT_FOR_REPORT"
+        result = self.verify()
+        self.assertNotIn(b"NOT_FOR_REPORT", canonical(result))
+
+    def test_tokenizer_count_mapping_hash_and_role_fields_rejected(self):
+        original = copy.deepcopy(self.base["tokenizer"])
+        for bad in (
+            None,
+            [],
+            {"files": []},
+            {"files": original["files"], "manifest_sha256": "BAD"},
+        ):
+            self.base["tokenizer"] = bad
+            self.reject("tokenizer_binding_shape")
+        self.base["tokenizer"] = copy.deepcopy(original)
+        for bad in (None, {}, [], original["files"][:2], original["files"] * 2):
+            self.base["tokenizer"]["files"] = bad
+            self.reject("tokenizer_file_count")
+        self.base["tokenizer"] = copy.deepcopy(original)
+        self.base["tokenizer"]["files"][0] = None
+        self.reject("tokenizer_binding_shape")
+
+    def test_each_tokenizer_role_exact_no_path_or_duplicate_substitution(self):
+        files = self.base["tokenizer"]["files"]
+        original = files[0]["relative_path"]
+        for bad in (
+            None,
+            True,
+            [],
+            "tokenizer.json",
+            "/tokenizer/tokenizer.json",
+            "tokenizer/../tokenizer.json",
+            "tokenizer/nested/tokenizer.json",
+            "tokenizer/tokenizer.json\n",
+            "tokenizer\\tokenizer.json",
+        ):
+            files[0]["relative_path"] = bad
+            self.reject("tokenizer_path_contract")
+        files[0]["relative_path"] = files[1]["relative_path"]
+        self.reject("tokenizer_role_contract")
+        files[0]["relative_path"] = original
+
+    def test_tokenizer_positive_integer_sizes_and_hex_hashes(self):
+        row = self.base["tokenizer"]["files"][0]
+        original = dict(row)
+        for bad in (True, 0, -1, 1.0, "1", None, 2**63):
+            row["bytes"] = bad
+            self.reject("tokenizer_size_contract")
+        row.update(original)
+        for bad in (None, True, "A" * 64, "a" * 63, "a" * 64 + "\n"):
+            row["sha256"] = bad
+            self.reject("tokenizer_hash_contract")
+
+    def test_returned_receipt_does_not_alias_caller_metadata(self):
+        before = copy.deepcopy((self.base, self.state, self.config))
+        result = self.verify()
+        result["model_geometry"]["hidden_size"] = 999
+        self.assertEqual((self.base, self.state, self.config), before)
+
+    def test_no_raw_unallowlisted_metadata_values_or_paths_in_receipt_or_error(self):
+        private = "RAW_PRIVATE_SENTINEL_ABC"
+        self.config["extra"] = private
+        self.state["extra"] = {"untrusted": private}
+        self.base["extra"] = private
+        self.entries["other/" + private] = "f" * 64
+        self.assertNotIn(private.encode(), canonical(self.verify()))
+        self.config["model_type"] = private
+        with self.assertRaises(m.FinalBaseMetadataError) as caught:
+            self.verify()
+        self.assertNotIn(private, str(caught.exception))
+
+
+class ManifestTests(unittest.TestCase):
+    def test_original_dcp_checksum_lines_remain_supported(self):
+        raw = manifest({"model/.metadata": "a" * 64, m.STATE: "b" * 64})
+        self.assertEqual(m.parse_manifest(raw), {"model/.metadata": "a" * 64, m.STATE: "b" * 64})
+
+    def test_manifest_shape_errors_fixed(self):
+        for raw in (b"", b"a", b"\r\n", b"no-newline"):
+            with self.assertRaisesRegex(m.FinalBaseMetadataError, "manifest_line_endings"):
+                m.parse_manifest(raw)
+        for raw in (b"\xff\n", b"bad\n", b"a  name\n", b"a b\n", b"\n"):
+            with self.assertRaises(m.FinalBaseMetadataError):
+                m.parse_manifest(raw)
+
+    def test_manifest_paths_duplicate_self_and_hash_format(self):
+        for path in (
+            "../file",
+            "/file",
+            "a//b",
+            "a/./b",
+            "a\\b",
+            "a b",
+            "a\t",
+            "a\x7f",
+            "a" * 513,
+            "manifest.sha256",
+        ):
+            with self.assertRaises(m.FinalBaseMetadataError):
+                m.parse_manifest(f"{'a' * 64}  {path}\n".encode())
+        for value in ("A" * 64, "a" * 63, "x" * 64):
+            with self.assertRaisesRegex(m.FinalBaseMetadataError, "manifest_line_invalid"):
+                m.parse_manifest(f"{value}  file\n".encode())
+        with self.assertRaisesRegex(m.FinalBaseMetadataError, "manifest_duplicate_or_self"):
+            m.parse_manifest((f"{'a' * 64}  file\n" * 2).encode())
+
+    def test_manifest_entry_count_bounded(self):
+        raw = manifest({f"part-{i}": "a" * 64 for i in range(m.MAXIMUM_MANIFEST_ENTRIES + 1)})
+        with self.assertRaisesRegex(m.FinalBaseMetadataError, "manifest_entry_cap"):
+            m.parse_manifest(raw)
+
+
+class SourcePreservationTests(unittest.TestCase):
+    def test_original_sources_byte_pins_preserved(self):
+        self.assertEqual(
+            digest(OLD_SOURCE.read_bytes()),
+            "8a395f26c9b16d29a39d4fbf9877dd6836d8e7eb1640fa0c9d24ec42f46972d6",
+        )
+        self.assertEqual(
+            digest(READINESS_SOURCE.read_bytes()),
+            "4d2b88e053f16d9e84671548dbe92066948da7478f87ac6f988dab2e78f183f4",
+        )
+
+    def test_original_model_fields_exactly_preserved(self):
+        tree = ast.parse(OLD_SOURCE.read_text())
+        node = next(
+            item
+            for item in tree.body
+            if isinstance(item, ast.Assign)
+            and isinstance(item.targets[0], ast.Name)
+            and item.targets[0].id == "MODEL_FIELDS"
+        )
+        self.assertEqual(ast.literal_eval(node.value), m.MODEL_FIELDS)
+
+    def test_all_original_lineage_requirement_codes_remain_covered(self):
+        tree = ast.parse(OLD_SOURCE.read_text())
+        old = next(
+            item
+            for item in tree.body
+            if isinstance(item, ast.FunctionDef) and item.name == "validate_lineage"
+        )
+        codes = {
+            call.args[1].value
+            for call in ast.walk(old)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "require"
+            and len(call.args) == 2
+            and isinstance(call.args[1], ast.Constant)
+        }
+        replaced = {"tokenizer_manifest_inventory": "tokenizer_manifest_binding"}
+        actual = {
+            call.args[1].value
+            for call in ast.walk(ast.parse(SOURCE.read_text()))
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id == "require"
+            and len(call.args) == 2
+            and isinstance(call.args[1], ast.Constant)
+        }
+        self.assertEqual(codes - actual, set(replaced))
+        self.assertTrue(set(replaced.values()) <= actual)
+
+    def test_core_original_manifest_state_and_lineage_predicates_ast_identical(self):
+        codes = {
+            "base_schema",
+            "base_stage",
+            "checkpoint_state_not_bound",
+            "model_state_not_declared",
+            "checkpoint_schema",
+            "world_size_mismatch",
+            "trainer_rank_not_declared",
+            "run_fingerprint_mismatch",
+            "source_commit_mismatch",
+            "source_config_binding",
+            "model_type_mismatch",
+            "incomplete_explicit_model_config",
+        }
+
+        def predicates(path):
+            return {
+                node.args[1].value: ast.dump(node.args[0], include_attributes=False)
+                for node in ast.walk(ast.parse(path.read_text()))
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "require"
+                and len(node.args) == 2
+                and isinstance(node.args[1], ast.Constant)
+                and node.args[1].value in codes
+            }
+
+        old, new = predicates(OLD_SOURCE), predicates(SOURCE)
+        self.assertEqual(set(old), codes)
+        self.assertEqual(new, old)
+
+    def test_inventory_digest_matches_exact_source_selected_readiness_helpers(self):
+        tree = ast.parse(READINESS_SOURCE.read_text())
+        names = {"_canonical_json", "_sha256", "_valid_sha256", "tokenizer_manifest_sha256"}
+        selected = [
+            node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        namespace = {
+            "__builtins__": __builtins__,
+            "json": json,
+            "hashlib": hashlib,
+            "Mapping": Mapping,
+            "Any": object,
+            "_SHA256": re.compile(r"^[0-9a-f]{64}$"),
+            "EXPECTED_TOKENIZER_FILES": set(m.TOKENIZER_ROLES),
+        }
+        self.assertEqual({node.name for node in selected}, names)
+        exec(
+            compile(ast.Module(body=selected, type_ignores=[]), "<pure-readiness-helpers>", "exec"),
+            namespace,
+        )
+        files = [
+            {
+                "relative_path": role,
+                "bytes": 10 + index,
+                "sha256": "a" * 64,
+                "ignored_extra": "synthetic",
+            }
+            for index, role in enumerate(m.TOKENIZER_ROLES)
+        ]
+        expected = namespace["tokenizer_manifest_sha256"](files)
+        for permutation in itertools.permutations(files):
+            actual = m.tokenizer_inventory(
+                {"files": list(permutation), "manifest_sha256": expected}
+            )
+            self.assertEqual(actual[0], expected)
+
+    def test_pure_module_import_and_call_surface_has_no_io_or_execution(self):
+        tree = ast.parse(SOURCE.read_text())
+        imports = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        self.assertEqual(imports, {"hashlib", "json", "math", "re"})
+        self.assertFalse(
+            any(
+                isinstance(node, ast.ImportFrom) and node.module != "__future__"
+                for node in ast.walk(tree)
+            )
+        )
+        forbidden = {
+            "open",
+            "exec",
+            "eval",
+            "compile",
+            "__import__",
+            "getattr",
+            "setattr",
+            "read_bytes",
+            "read_text",
+            "write_bytes",
+            "write_text",
+            "Popen",
+            "load",
+            "loads_torch",
+            "system",
+            "urlopen",
+            "run_synthetic_import",
+        }
+        calls = {
+            node.func.id if isinstance(node.func, ast.Name) else node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, (ast.Name, ast.Attribute))
+        }
+        self.assertFalse(calls & forbidden)
+        public = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "verify_final_base_metadata"
+        )
+        self.assertEqual(
+            [arg.arg for arg in public.args.args],
+            ["base_raw", "manifest_raw", "state_raw", "config_raw"],
+        )
+        self.assertEqual([arg.arg for arg in public.args.kwonlyargs], ["expected_base_sha256"])
+        self.assertEqual(public.args.kw_defaults, [None])
+        self.assertNotIn("tokenizer_manifest", [arg.arg for arg in public.args.args])
+
+
+if __name__ == "__main__":
+    unittest.main()

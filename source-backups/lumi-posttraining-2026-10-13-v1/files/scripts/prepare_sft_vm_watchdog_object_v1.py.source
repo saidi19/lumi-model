@@ -1,0 +1,99 @@
+"""Assemble a secret-bearing gzip cloud-config in memory; never launch or save it.
+
+Only public hashes/lengths may be retained. The future controller must send the
+compressed bytes as binary EC2 user-data, not through the old text-file launcher.
+"""
+
+import gzip
+import hashlib
+import importlib.util
+import json
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PINS = {
+    "probe_sft_vm_watchdog_object_v1.py": (
+        "41ebd3097943852ab2a6a16cf089636a79c48d4501ace0e10eb2c69e4c9f28bd"
+    ),
+    "sft_vm_watchdog_report_channel_v1.py": (
+        "7ea5adf3bc5209421daba9dd3d943a968defd369fe8443c328dbcc8e0bb66f35"
+    ),
+    "probe_sft_vm_watchdog_native_v3.py": (
+        "597b602874e731520baeee3f4784e533d3c6fc40c097b286963066ba59b7f42f"
+    ),
+    "run_sft_vm_network_bootstrap_v2.py": (
+        "3034eca29487b089729aafb29748da2333a54f6ac4cc630d24a7cb3867c07202"
+    ),
+    "build_sft_vm_network_expiry_v3.py": (
+        "caa0d6b551e9ee81599e3ed78f936e26705b2555e5e5b5716817160de6ea0833"
+    ),
+}
+BINDINGS = {
+    "probe": PINS["probe_sft_vm_watchdog_object_v1.py"],
+    "bootstrap": PINS["run_sft_vm_network_bootstrap_v2.py"],
+    "policy": PINS["build_sft_vm_network_expiry_v3.py"],
+}
+
+
+def build(config):
+    sources = {}
+    for name, digest in PINS.items():
+        raw = (ROOT / "scripts" / name).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise ValueError("object_release_source_changed")
+        sources[name] = raw.decode()
+    spec = importlib.util.spec_from_file_location(
+        "_bounded_report_channel", ROOT / "scripts/sft_vm_watchdog_report_channel_v1.py"
+    )
+    channel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(channel)
+    channel.need(type(config) is dict and set(config) == {"attempt", "bindings", "puts"})
+    channel.identity(config["attempt"], config["bindings"])
+    channel.need(config["bindings"] == BINDINGS)
+    channel.need(type(config["puts"]) is dict and set(config["puts"]) == set(channel.SLOTS))
+    for slot, url in config["puts"].items():
+        channel.validate_url(url, attempt=config["attempt"], slot=slot, now=time.time())
+    sources["report-channel.json"] = channel.canonical(config).decode()
+    cloud = {
+        "package_update": False,
+        "package_upgrade": False,
+        "write_files": [
+            {
+                "path": "/opt/lumi-bootstrap-input/" + name,
+                "permissions": "0400",
+                "owner": "root:root",
+                "content": source,
+            }
+            for name, source in sources.items()
+        ],
+        "runcmd": [
+            [
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                "/opt/lumi-bootstrap-input/probe_sft_vm_watchdog_object_v1.py",
+                "--native-once",
+            ]
+        ],
+    }
+    raw = ("#cloud-config\n" + json.dumps(cloud, separators=(",", ":"))).encode()
+    compressed = gzip.compress(raw, mtime=0)
+    channel.need(len(raw) <= 100000 and len(compressed) <= 16384)
+    summary = {
+        "source_sha256": dict(PINS),
+        "uncompressed_bytes": len(raw),
+        "compressed_bytes": len(compressed),
+        "compressed_sha256": hashlib.sha256(compressed).hexdigest(),
+        "contains_upload_capabilities": True,
+        "requires_binary_user_data": True,
+        "secret_payload_persisted": False,
+        "cloud_mutations": 0,
+        "native_execution_started": False,
+        "gate_5_complete": False,
+    }
+    return compressed, summary
+
+
+def run(**_arguments):
+    raise ValueError("object_report_provisioner_not_bound")

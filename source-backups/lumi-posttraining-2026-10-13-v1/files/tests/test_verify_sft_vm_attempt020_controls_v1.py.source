@@ -1,0 +1,53 @@
+"""Offline tests for attempt-020 control deployment verification."""
+
+import time
+import unittest
+from unittest.mock import Mock
+
+from scripts import verify_sft_vm_attempt020_controls_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_local_deployment_receipts_are_closed(self):
+        plan, watch, store = m.local()
+        self.assertEqual(plan["attempt"], m.ATTEMPT)
+        self.assertEqual(watch["status"], "deployed_unarmed_invocation_disabled")
+        self.assertFalse(watch["invocation"])
+        self.assertFalse(watch["schedule_creation"])
+        self.assertEqual(store["status"], "created_private_cleanup_store_verified")
+        self.assertFalse(store["object_access"])
+        self.assertFalse(store["shared_bucket_mutation"])
+
+    def test_read_wrapper_rejects_mutations_and_objects(self):
+        m.bind()
+        wrapper = m.Reads({"ec2": Mock()}, clock=time.monotonic, sleep=lambda _: None)
+        for operation in ("run_instances", "get_object", "list_objects_v2"):
+            with self.assertRaises(ValueError):
+                wrapper.call("ec2", operation)
+        self.assertEqual(wrapper.calls, 0)
+
+    def test_exact_missing_lifecycle_code_is_absence(self):
+        class MissingLifecycle(Exception):
+            response = {
+                "Error": {"Code": "NoSuchLifecycleConfiguration"},
+                "ResponseMetadata": {"HTTPStatusCode": 404},
+            }
+
+        m.bind()
+        client = Mock()
+        client.get_bucket_lifecycle_configuration.side_effect = MissingLifecycle()
+        wrapper = m.Reads({"s3": client}, clock=time.monotonic, sleep=lambda _: None)
+        self.assertTrue(
+            wrapper.absent("s3", "get_bucket_lifecycle_configuration", Bucket="synthetic")
+        )
+        self.assertEqual(wrapper.calls, 1)
+
+    def test_aws_aes256_readback_shape_is_explicit(self):
+        rule = m.READBACK_ENCRYPTION["Rules"][0]
+        self.assertEqual(rule["ApplyServerSideEncryptionByDefault"], {"SSEAlgorithm": "AES256"})
+        self.assertIs(rule["BucketKeyEnabled"], False)
+        self.assertEqual(rule["BlockedEncryptionTypes"], {"EncryptionType": ["SSE-C"]})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,263 @@
+"""Exact-prefix one-send S3 PUT/GET transport for private retention.
+
+Clients are explicitly constructed by an admitted credential-bearing worker;
+importing this module creates none. Reaping that worker, bucket privacy, scoped
+credentials, authenticated SDK/TLS and host network limits remain parent duties.
+Raw error bodies, exception strings, credentials and payloads never enter logs.
+"""
+
+from __future__ import annotations
+
+import base64
+import math
+import time
+from urllib.parse import quote
+
+from . import posttraining_vm_fullsize_retention_v1 as retention
+from . import posttraining_vm_fullsize_transport_v1 as acquisition
+
+ENDPOINT = "https://s3.us-east-1.amazonaws.com"
+OBJECT_ENDPOINT = "https://" + retention.BUCKET + ".s3.us-east-1.amazonaws.com/"
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_transport_rejected") from None
+
+
+def client_options(credentials, config_type):
+    options = acquisition.client_options(credentials, config_type)
+    options["config"] = config_type(
+        signature_version="s3v4",
+        connect_timeout=5,
+        read_timeout=30,
+        max_pool_connections=1,
+        proxies={},
+        ignore_configured_endpoint_urls=True,
+        retries={"total_max_attempts": 1, "mode": "standard"},
+        request_checksum_calculation="when_required",
+        response_checksum_validation="when_required",
+        s3={
+            "addressing_style": "virtual",
+            "use_accelerate_endpoint": False,
+            "payload_signing_enabled": False,
+        },
+        use_dualstack_endpoint=False,
+        use_fips_endpoint=False,
+    )
+    return options
+
+
+def row_contract(row):
+    need(type(row) is dict and {"key", "bytes", "sha256"} <= set(row))
+    key = row["key"]
+    need(type(key) is str and key.startswith(retention.PREFIX))
+    relative = key[len(retention.PREFIX) :]
+    role, separator, name = relative.partition("/")
+    need(separator and role in {"package", "metadata"} and 0 < len(name) <= 256)
+    need(retention.re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", name))
+    need(all(p not in {".", ".."} for p in name.split("/")))
+    need(type(row["bytes"]) is int and 0 < row["bytes"] <= 2**31 and retention.pin(row["sha256"]))
+
+
+def headers_of(headers):
+    result = {}
+    for key, value in headers.items():
+        name = key.decode("ascii") if isinstance(key, bytes) else key
+        value = value.decode("ascii") if isinstance(value, bytes) else value
+        need(type(name) is str and type(value) is str and name.lower() not in result)
+        result[name.lower()] = value
+    return result
+
+
+class _Channel:
+    def __init__(self, client, operation, deadline, clock=time.monotonic):
+        need(operation in {"PUT", "GET"})
+        need(
+            type(deadline) in {int, float}
+            and math.isfinite(deadline)
+            and 0 < deadline - clock() <= 1800
+        )
+        config = client.meta.config
+        need(client.meta.endpoint_url == ENDPOINT and client.meta.region_name == "us-east-1")
+        need(config.signature_version == "s3v4" and config.proxies == {})
+        need(config.retries.get("total_max_attempts") == 1)
+        need(
+            config.s3.get("addressing_style") == "virtual"
+            and config.s3.get("payload_signing_enabled") is False
+        )
+        need(
+            config.request_checksum_calculation
+            == config.response_checksum_validation
+            == "when_required"
+        )
+        need(0 < config.connect_timeout <= 5 and 0 < config.read_timeout <= 30)
+        self.client, self.operation, self.deadline, self.clock = client, operation, deadline, clock
+        self.used, self.active, self.body = set(), None, None
+        self.sent, self.http_sends, self.bytes_reserved = False, 0, 0
+        client.meta.events.register_first(
+            "before-send.s3", self.before_send, unique_id="lumi-retention-one-send"
+        )
+        self.underlying = client._endpoint.http_session
+        client._endpoint.http_session = _RawGate(self.underlying, self)
+
+    def tick(self):
+        need(self.clock() < self.deadline)
+
+    def claim(self, row, body=None):
+        self.tick()
+        row_contract(row)
+        need(self.active is None and row["key"] not in self.used and len(self.used) < 528)
+        need(self.bytes_reserved + row["bytes"] <= retention.PACKAGE_CAP + retention.META_CAP)
+        self.used.add(row["key"])
+        self.bytes_reserved += row["bytes"]
+        self.active = {k: row[k] for k in ("key", "bytes", "sha256")}
+        self.body, self.sent = body, False
+
+    def before_send(self, request, **_kwargs):
+        self.tick()
+        need(self.active is not None and not self.sent and request.method == self.operation)
+        need(request.url == OBJECT_ENDPOINT + quote(self.active["key"], safe="/"))
+        h = headers_of(request.headers)
+        need(h.get("x-amz-expected-bucket-owner") == retention.ACCOUNT)
+        need("range" not in h and "transfer-encoding" not in h and "content-encoding" not in h)
+        if self.operation == "PUT":
+            need(request.body is self.body)
+            need(h.get("content-length") == str(self.active["bytes"]))
+            need(
+                h.get("if-none-match") == "*" and h.get("x-amz-server-side-encryption") == "AES256"
+            )
+            expected = base64.b64encode(bytes.fromhex(self.active["sha256"])).decode()
+            need(h.get("x-amz-checksum-sha256") == expected)
+            need(h.get("x-amz-content-sha256") == "UNSIGNED-PAYLOAD")
+            need(not any(k.startswith("x-amz-grant-") or k == "x-amz-acl" for k in h))
+        self.sent = True
+        self.http_sends += 1
+        need(self.http_sends <= 528)
+
+    def close(self):
+        self.underlying.close()
+
+
+class Writer(_Channel):
+    def __init__(self, client, deadline, clock=time.monotonic):
+        super().__init__(client, "PUT", deadline, clock)
+
+    def put(self, row, body):
+        self.claim(row, body)
+        try:
+            response = self.client.put_object(
+                Bucket=retention.BUCKET,
+                Key=row["key"],
+                Body=body,
+                ContentLength=row["bytes"],
+                ContentType="application/octet-stream",
+                IfNoneMatch="*",
+                ExpectedBucketOwner=retention.ACCOUNT,
+                ServerSideEncryption="AES256",
+                ChecksumSHA256=base64.b64encode(bytes.fromhex(row["sha256"])).decode(),
+            )
+            meta = response["ResponseMetadata"]
+            need(self.sent and meta["HTTPStatusCode"] == 200 and meta["RetryAttempts"] == 0)
+            need(response["ServerSideEncryption"] == "AES256")
+            # The streamed GET, not an ETag or PUT acknowledgement, decides acceptance.
+        except BaseException:
+            raise ValueError("retention_put_failed") from None
+        finally:
+            self.active, self.body = None, None
+
+
+class Reader(_Channel):
+    def __init__(self, client, deadline, clock=time.monotonic):
+        super().__init__(client, "GET", deadline, clock)
+
+    def open(self, row):
+        self.claim(row)
+        response, accepted = None, False
+        try:
+            response = self.client.get_object(
+                Bucket=retention.BUCKET, Key=row["key"], ExpectedBucketOwner=retention.ACCOUNT
+            )
+            meta = response["ResponseMetadata"]
+            need(self.sent and meta["HTTPStatusCode"] == 200 and meta["RetryAttempts"] == 0)
+            need(
+                type(response["ContentLength"]) is int and response["ContentLength"] == row["bytes"]
+            )
+            need(response["ServerSideEncryption"] == "AES256" and "ContentRange" not in response)
+            need(response.get("ContentEncoding", "identity") == "identity")
+            body = response["Body"]
+            need(callable(getattr(body, "read", None)) and callable(getattr(body, "close", None)))
+            accepted = True
+            return body
+        except BaseException:
+            raise ValueError("retention_get_failed") from None
+        finally:
+            self.active = None
+            if not accepted and type(response) is dict and "Body" in response:
+                response["Body"].close()
+
+
+class _RawGate:
+    """Reject status/size/encoding before the SDK parses any error response body."""
+
+    def __init__(self, underlying, owner):
+        self.underlying, self.owner = underlying, owner
+
+    def send(self, request):
+        owner = self.owner
+        owner.tick()
+        need(owner.active is not None and owner.sent)
+        response = self.underlying.send(request)
+        accepted = False
+        try:
+            owner.tick()
+            need(response.status_code == 200)
+            h = headers_of(response.headers)
+            expected = 0 if owner.operation == "PUT" else owner.active["bytes"]
+            need(h.get("content-length") == str(expected))
+            need(h.get("content-encoding", "identity") == "identity")
+            need("transfer-encoding" not in h and "content-range" not in h)
+            need(h.get("x-amz-server-side-encryption") == "AES256")
+            accepted = True
+            return response
+        finally:
+            if not accepted:
+                response.raw.close()
+
+    def close(self):
+        self.underlying.close()
+
+
+def _retain_admitted_once(
+    attempt, completed, *, session, config_type, retention_credentials, deadline
+):
+    """Two distinct signed clients; independent GET bytes, not separate OS units.
+
+    Clients/credentials live ONLY in the separately admitted retention process.
+    No acquisition credential is obtained or inherited by this function.
+    """
+    options = client_options(retention_credentials, config_type)
+    clients = []
+    try:
+        for _ in range(2):
+            clients.append(session.create_client("s3", **options))
+        need(clients[0] is not clients[1])
+        writer, reader = Writer(clients[0], deadline), Reader(clients[1], deadline)
+        return retention._retain_completed_admitted_once(
+            attempt, completed, writer=writer, reader=reader, deadline=deadline
+        )
+    except BaseException:
+        raise ValueError("retention_transport_failed") from None
+    finally:
+        failed = False
+        for client in clients:
+            try:
+                client.close()
+            except BaseException:
+                failed = True
+        if failed:
+            raise ValueError("retention_transport_close_failed") from None
+
+
+def retain_package(**_arguments):
+    raise ValueError("host_guard_not_bound") from None

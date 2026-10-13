@@ -1,0 +1,312 @@
+"""Private post-import retention binding; no worker, credential or network call.
+
+Requires the original authenticated host request and already staged frozen
+retention release. The trusted controller must separately validate the bucket,
+cloud preservation and exact-prefix credential channel before invoking this.
+This primitive does not establish those cloud permissions or wire the lifecycle.
+Root/admin/OS remain trusted; census means observed worker absence, not hostile
+root exclusion. All failures consume local evidence; never retry or delete it.
+"""
+
+import hashlib
+import json
+import math
+import os
+import stat
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ROOT = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+BINDER_SHA = "8c649038548fd16d6fce88cc92e1730f3cdce117c82e9e36954f6a1c175dbe88"
+ENTRY_SHA = "1e78705b8779a6011ee236267b0db87039fa45537b225b786d99cfe9043a4493"
+MANIFEST_SHA = "ad03a7c26f8c4a68a741ad3bcf2e7d0f1771e07441e3f91062a7321b158a05e0"
+TRUST = "dedicated-vm-trusted-admin-root-os-v1"
+
+
+def need(value):
+    if not value:
+        raise ValueError("native_retention_admission_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def modules(binder_source, entry_source):
+    bodies = (
+        (binder_source, BINDER_SHA, "binder.py"),
+        (entry_source, ENTRY_SHA, "retention-release/scripts/run_sft_vm_retention_parent_v1.py"),
+    )
+    need(
+        all(
+            type(raw) is bytes and 0 < len(raw) <= 32768 and sha(raw) == pin
+            for raw, pin, _ in bodies
+        )
+    )
+    loaded = []
+    for raw, _, name in bodies:
+        module = types.ModuleType("_retention_admission_" + Path(name).stem)
+        module.__file__ = str(ROOT / name)
+        exec(compile(raw, module.__file__, "exec"), module.__dict__)
+        loaded.append(module)
+    return loaded
+
+
+def guards(bootstrap, policy, request, end):
+    """Original guard checks, using the already fixed retention phase deadline."""
+    bootstrap.native_identity(request["machine_id"], request["boot_id"])
+    context = json.loads(bootstrap.read(bootstrap.OUTPUT / "context.json", 4096))
+    need(
+        context
+        == dict(
+            machine_id=request["machine_id"],
+            boot_id=request["boot_id"],
+            original_deadline_boot_seconds=request["host_deadline_boottime"],
+            host_net_inode=bootstrap.host_network_inode(),
+        )
+    )
+    observed = bootstrap.boot_time()
+    need(math.isfinite(observed) and 0 <= observed < end - 180)
+    need(end <= request["host_deadline_boottime"] - 700)
+    need(bootstrap.setup_finished(policy))
+    quotas = policy.inspect(bootstrap.snapshot(policy), setup=False)
+    bootstrap.active(policy)
+    units = policy.expiry_units(
+        original_deadline_boot_seconds=request["host_deadline_boottime"],
+        observed_boot_seconds=math.floor(observed),
+    )
+    units[bootstrap.WATCH] = bootstrap.watch_unit(
+        "804c5121c7aaab818c9d6f3e70fe7463b8963619617e1117cab5387997fb37b8"
+    )
+    for name, body in units.items():
+        path = bootstrap.SYSTEMD / name
+        need(bootstrap.read(path, 32768) == body.encode())
+        need(bootstrap.show(name, "FragmentPath") == str(path).encode())
+        need(bootstrap.show(name, "DropInPaths") == b"")
+    for action in ("FailureAction", "SuccessAction"):
+        need(bootstrap.show(bootstrap.WATCH, action) == b"poweroff")
+    return quotas
+
+
+def post_import_storage(storage, volumes, proposal):
+    """Same EBS/mount constraints; initial acquisition free space is phase-specific.
+
+    Reserve the original 100 GiB less only the pinned maximum source+package and
+    metadata allocations. Do not require an empty import output or reallocate a
+    fresh 100 GiB after successful import. No original pre-acquisition check is
+    edited. No package content or block-device data is read.
+    """
+    need(os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino)
+    for path in (storage.WORK, *storage.WORK.parents):
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    need(stat.S_IMODE(storage.WORK.stat().st_mode) == 0o700)
+    before = storage.small(Path("/proc/self/mountinfo"), 1024**2)
+    selected = storage.selected_mounts(storage.mounts(before))
+    disks = {key: storage.disk_identity(row["device"]) for key, row in selected.items()}
+    devices = {
+        "root": storage.device_number(Path("/")),
+        "work": storage.device_number(storage.WORK),
+    }
+    need(storage.device_number(Path("/opt")) == devices["root"])
+    for key, size in (("root", 32 * 1024**3), ("work", 128 * 1024**3)):
+        need(disks[key]["volume"] == volumes[key + "_volume"] and disks[key]["bytes"] == size)
+        need(devices[key] == selected[key]["device"])
+    need(disks["root"]["disk"] != disks["work"]["disk"])
+    work, root = os.statvfs(storage.WORK), os.statvfs("/opt")
+    need(not (work.f_flag | root.f_flag) & os.ST_RDONLY)
+    space = proposal["storage"]
+    minimum = (
+        space["minimum_work_free_bytes_before_acquisition"]
+        - space["source_plus_max_package_bytes"]
+        - proposal["resources"]["aggregate_retained_metadata_bytes"]
+    )
+    need(minimum > 0 and work.f_bavail * work.f_frsize >= minimum)
+    need(root.f_bavail * root.f_frsize >= 4 * 1024**3)
+    need(storage.small(Path("/proc/self/mountinfo"), 1024**2) == before)
+    need(
+        {"root": storage.device_number(Path("/")), "work": storage.device_number(storage.WORK)}
+        == devices
+    )
+    return minimum
+
+
+def idle(bootstrap, helper, sequence):
+    # Old import units must be reaped, while retention units must never have run.
+    for unit in list(sequence.UNITS.values()) + [
+        f"lumi-vm-fullsize-v1-{ATTEMPT}-{phase}.service"
+        for phase in ("parent", "acquire", "import", "verify")
+    ]:
+        need(helper.cgroup_empty(unit) and bootstrap.show(unit, "ActiveState") == b"inactive")
+    for phase in ("retain", "retention-parent"):
+        unit = f"lumi-vm-fullsize-v1-{ATTEMPT}-{phase}.service"
+        need(helper.cgroup_empty(unit) and bootstrap.show(unit, "LoadState") == b"not-found")
+    for name in (
+        "retention-worker",
+        "retention-parent",
+        "retention-credentials",
+        "retention-continuation.started.json",
+        "credential-delivery.fifo",
+        "completion-failed.json",
+        "detached-parent.failed.json",
+    ):
+        need(not os.path.lexists(ROOT / name))
+    credentials = ROOT / "credentials"
+    info = credentials.lstat()
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0)
+    need(stat.S_IMODE(info.st_mode) == 0o700 and not list(credentials.iterdir()))
+
+
+def _admit_same_host(request, prior_pin, deadline_boottime, binder_source, entry_source):
+    binder, entry = modules(binder_source, entry_source)
+    binder.boundary()  # Mac must reject before any native path access.
+    need(entry.pin(prior_pin))
+    need(type(deadline_boottime) in {int, float} and math.isfinite(deadline_boottime))
+    detached, ready = binder.helpers()
+    expected = {k: request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")}
+    bootstrap, helper, original = detached.context(expected)
+    need(request == original)
+    loaded = ready.modules()
+    prior_entry = loaded["parent.py"]
+    sequence, storage = (
+        loaded["run_sft_vm_setup_sequence_v1.py"],
+        loaded["check_sft_vm_storage_v1.py"],
+    )
+    binder.private_directory(ROOT)
+    binder.private_directory(ROOT / "retained")
+    binder.private_directory(ROOT / "controller")
+    now = bootstrap.boot_time()
+    need(180 < deadline_boottime - now <= 1800)
+    need(deadline_boottime <= request["host_deadline_boottime"] - 700)
+    raw_prior = binder.root_read(ROOT / "controller/binding.json")
+    need(sha(raw_prior) == prior_pin)
+    need(binder.root_read(ROOT / "controller/binding.sha256") == (prior_pin + "\n").encode())
+    prior = prior_entry.validate_binding(
+        prior_entry.decode(raw_prior),
+        ATTEMPT,
+        "status",
+        request["machine_id"],
+        request["boot_id"],
+        now,
+    )
+    need(prior["host_deadline_boottime"] == request["host_deadline_boottime"])
+    binding = dict(
+        schema="lumi.vm-retention-host-binding.v0.1",
+        scope="conditional-private-retention-once",
+        attempt=ATTEMPT,
+        machine_id=request["machine_id"],
+        boot_id=request["boot_id"],
+        prior_binding_sha256=prior_pin,
+        entry_sha256=ENTRY_SHA,
+        release_manifest_sha256=MANIFEST_SHA,
+        started_boottime=now,
+        deadline_boottime=deadline_boottime,
+    )
+    need(entry.root_file(entry.ENTRY) == entry_source)
+    bodies = entry.authenticated_release(binding)
+    # All 21 source/proposal files authenticate before loading the cold closure.
+    parent = entry.load_parent(bodies)
+    retention = parent.continuation.worker.retention
+    retention.policy()
+    proposal = retention.decode(bodies["configs/lumi-vm-fullsize-host-proposal-v0.1.json"])
+    for name in ("retention-controller", "retention-admission"):
+        need(not os.path.lexists(ROOT / name))
+    evidence = ROOT / "retention-admission"
+    evidence.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(ROOT)
+    bootstrap.write(
+        evidence / "started.json",
+        bootstrap.encode(
+            dict(
+                attempt=ATTEMPT,
+                trust_scope=TRUST,
+                deadline_boottime=deadline_boottime,
+                retry_allowed=False,
+            )
+        ),
+    )
+    budget = dict(bytes=0, seconds=0.0)
+    before = binder.census(budget)
+    policy = bootstrap.load("build_sft_vm_network_expiry_v3.py")
+    quotas = guards(bootstrap, policy, request, deadline_boottime)
+    floor = post_import_storage(storage, request["volumes"], proposal)
+    idle(bootstrap, helper, sequence)
+    completed, _ = parent.continuation._completed_parent(
+        ATTEMPT, request["machine_id"], prior_pin, minimum_seconds=180
+    )
+    rows, aggregates = retention.inventory(ROOT, completed)  # Metadata/stat only, not payloads.
+    need(
+        completed["source_manifest_sha256"]
+        == prior_entry.descriptor(
+            prior_entry.root_file(ROOT / "controller/prepared-attempt.json"), prior, ATTEMPT
+        )[1]["source_manifest_sha256"]
+    )
+    sdk_raw = ready.read(
+        sequence.SDK / "qualification/configs/lumi-vm-acquisition-sdk-v0.1.lock.json"
+    )
+    need(sha(sdk_raw) == ready.SDK_LOCK_SHA)
+    lock_raw = ready.read(Path("/opt/lumi-cpu-input/runtime-lock.json"))
+    # Hash authenticate the CPU lock before using its wheel totals for the original receipt.
+    need(sha(lock_raw) == sequence.LOCK_SHA)
+    lock = ready.decode(lock_raw)
+    sequence.receipt("sdk", sum(row["bytes"] for row in lock["requirements"]))
+    sdk_count = ready.versions(bootstrap, sequence.SDK, ready.decode(sdk_raw))
+    after = binder.census(budget)
+    idle(bootstrap, helper, sequence)
+    need(entry.authenticated_release(binding) == bodies)
+    for row in rows:
+        need(retention.snapshot(row["path"].lstat()) == row["identity"])
+    need(
+        parent.continuation._completed_parent(
+            ATTEMPT, request["machine_id"], prior_pin, minimum_seconds=180
+        )[0]
+        == completed
+    )
+    policy.inspect(bootstrap.snapshot(policy), setup=False, previous=quotas)
+    guards(bootstrap, policy, request, deadline_boottime)
+    post_import_storage(storage, request["volumes"], proposal)
+    entry.validate_binding(
+        binding, "dispatch", request["machine_id"], request["boot_id"], bootstrap.boot_time(), prior
+    )
+    controller = ROOT / "retention-controller"
+    controller.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(ROOT)
+    raw = bootstrap.encode(binding)
+    bootstrap.write(controller / "binding.json", raw)
+    need(entry.root_file(controller / "binding.json") == raw)
+    bootstrap.write(controller / "binding.sha256", (sha(raw) + "\n").encode())
+    need(entry.root_file(controller / "binding.sha256") == (sha(raw) + "\n").encode())
+    result = dict(
+        schema="lumi.vm-native-retention-admission.v0.1",
+        attempt=ATTEMPT,
+        trust_scope=TRUST,
+        retention_binding_created=True,
+        retention_binding_sha256=sha(raw),
+        prior_binding_sha256=prior_pin,
+        deadline_boottime=deadline_boottime,
+        release_files_verified=len(bodies),
+        sdk_package_versions_matched=sdk_count,
+        metadata_and_package_files_observed=len(rows),
+        post_import_work_free_floor_bytes=floor,
+        aggregates=aggregates,
+        census_before=before,
+        census_after=after,
+        bucket_admitted=False,
+        credentials_issued=False,
+        host_admitted=False,
+        offhost_retention_verified=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        training_authorized=False,
+        production_eligible=False,
+        retry_allowed=False,
+        outer_stop_required_on_failure=True,
+        adversarial_privileged_writer_exclusion_claimed=False,
+    )
+    bootstrap.write(evidence / "result.json", bootstrap.encode(result))
+    return result
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_admission_controller_required") from None

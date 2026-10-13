@@ -1,0 +1,65 @@
+"""Authenticate actual offline source graph in a fresh interpreter; no execution."""
+
+import importlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_initial_proof_integration_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.root = Path(tmp.name).resolve() / "candidate"
+        with patch.object(m, "OUTPUT", cls.root):
+            cls.report = m.prepare()
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.addClassCleanup(sys.path.remove, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+
+    def test_actual_outer_and_34_source_role_authentication(self):
+        self.outer.authenticate()
+        self.outer.loading.fresh_identity()
+        self.assertEqual(len(self.outer.loading.sources.inputs()), 34)
+        self.assertIn(str(self.root), self.outer.__file__)
+
+    def test_all_156_outputs_and_no_execution_authority(self):
+        self.assertEqual(len(self.report["outputs"]), 156)
+        for name, pin in self.report["outputs"].items():
+            raw = (self.root / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(m.repair.sha(raw), pin["sha256"])
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertFalse(self.report["historical_failure_cause_resolved"])
+        self.assertTrue(self.report["consumed_identity_retained"])
+        self.assertTrue(self.report["fresh_identity_required_before_execution"])
+
+    def test_scope_and_existing_evidence_unchanged(self):
+        names = [name for name in self.report["outputs"] if name.startswith("evidence/")]
+        names += [
+            "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json",
+            "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+            "configs/lumi-vm-private-network-plan-v0.1.json",
+        ]
+        for name in names:
+            self.assertEqual((self.root / name).read_bytes(), (m.BASE / name).read_bytes())
+        for role, pin in json.loads((self.root / m.INPUTS).read_bytes())["sources"].items():
+            raw = (self.root / "scripts" / (role + ".py")).read_bytes()
+            self.assertEqual(pin["sha256"], m.repair.sha(raw))
+            self.assertEqual(pin["bytes"], len(raw))
+
+    def test_rejects_overwrite_and_direct_execution(self):
+        with patch.object(m, "OUTPUT", self.root), self.assertRaises(ValueError):
+            m.prepare()
+        with self.assertRaisesRegex(ValueError, "integration_not_execution_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

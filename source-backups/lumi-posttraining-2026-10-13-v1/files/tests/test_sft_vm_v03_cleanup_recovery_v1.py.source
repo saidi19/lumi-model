@@ -1,0 +1,179 @@
+import contextlib
+import copy
+import importlib.util
+import io
+import json
+import unittest
+from pathlib import Path
+
+path = Path(__file__).resolve().parents[1] / "scripts/recover_sft_vm_v03_network_cleanup_v1.py"
+spec = importlib.util.spec_from_file_location("recovery", path)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class CloudError(Exception):
+    def __init__(self, code):
+        self.response = {"Error": {"Code": code}}
+
+
+class Cloud:
+    def __init__(self):
+        self.calls, self.block_claim, self.dependency = [], False, False
+        self.rows = {}
+        fields = dict(
+            nat="NatGatewayId", address="AllocationId", subnet="SubnetId", table="RouteTableId"
+        )
+        for kind, field in fields.items():
+            self.rows[kind] = {
+                field: m.IDS[kind],
+                "VpcId": m.VPC,
+                "OwnerId": m.ACCOUNT,
+                "Tags": [
+                    dict(Key="LumiAttempt", Value=m.ATTEMPT),
+                    dict(Key="LumiNetworkNonce", Value=m.NONCE),
+                ],
+            }
+        self.rows["nat"]["State"] = "deleted"
+        self.rows["address"].update(Domain="vpc", NetworkBorderGroup="us-east-1")
+        self.rows["subnet"].update(CidrBlock="172.31.96.0/27", AvailabilityZone="us-east-1a")
+        self.rows["table"].update(
+            Routes=[dict(GatewayId="local")],
+            Associations=[
+                dict(
+                    Main=False,
+                    SubnetId=m.IDS["subnet"],
+                    RouteTableId=m.IDS["table"],
+                    RouteTableAssociationId="rtbassoc-0123456789abcdef0",
+                    AssociationState=dict(State="associated"),
+                )
+            ],
+        )
+        self.claims = {"delete-nat-gateway": self.body("delete-nat-gateway", "nat")}
+
+    def body(self, op, kind):
+        return json.dumps(
+            dict(attempt=m.ATTEMPT, nonce=m.NONCE, operation=op, resource=m.IDS[kind])
+        ).encode()
+
+    def __getattr__(self, op):
+        def call(**fields):
+            self.calls.append((op, fields))
+            mapping = {
+                "describe_nat_gateways": ("nat", "NatGateways"),
+                "describe_addresses": ("address", "Addresses"),
+                "describe_subnets": ("subnet", "Subnets"),
+                "describe_route_tables": ("table", "RouteTables"),
+            }
+            if op in mapping:
+                kind, key = mapping[op]
+                return {key: [copy.deepcopy(self.rows[kind])] if self.rows[kind] else []}
+            if op == "describe_network_interfaces":
+                return {"NetworkInterfaces": [{}] if self.dependency else []}
+            if op == "get_object":
+                name = fields["Key"].rsplit("/", 1)[1][:-5]
+                if name not in self.claims:
+                    raise CloudError("NoSuchKey")
+                raw = self.claims[name]
+                return dict(ContentLength=len(raw), Body=io.BytesIO(raw))
+            if op == "put_object":
+                assert fields["IfNoneMatch"] == "*"
+                if self.block_claim:
+                    raise CloudError("PreconditionFailed")
+                return {"ResponseMetadata": {"HTTPStatusCode": 200}}
+            if op == "release_address":
+                self.rows["address"] = None
+            elif op == "disassociate_route_table":
+                self.rows["table"]["Associations"] = []
+            elif op == "delete_route_table":
+                self.rows["table"] = None
+            elif op == "delete_subnet":
+                self.rows["subnet"] = None
+            else:
+                raise AssertionError(op)
+            return {}
+
+        return call
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.cloud = Cloud()
+        self.recovery = m.Recovery(
+            {"ec2": self.cloud, "s3": self.cloud},
+            lambda *a: None,
+            lambda _: contextlib.nullcontext(),
+            clock=lambda: 0,
+            wait=lambda _: None,
+        )
+
+    def writes(self):
+        return [op for op, _ in self.cloud.calls if op in m.WRITES]
+
+    def test_exact_success_claim_precedes_release_and_network_deletion(self):
+        result = self.recovery.run()
+        self.assertEqual(result["status"], "exact_leftovers_absent_verified")
+        self.assertEqual(
+            self.writes(),
+            [
+                "put_object",
+                "release_address",
+                "disassociate_route_table",
+                "delete_route_table",
+                "delete_subnet",
+            ],
+        )
+
+    def test_already_absent_needs_no_writes(self):
+        self.cloud.rows = dict.fromkeys(self.cloud.rows)
+        self.recovery.run()
+        self.assertEqual(self.writes(), [])
+
+    def test_wrong_owner_tag_rejects_before_writes(self):
+        self.cloud.rows["address"]["Tags"][0]["Value"] = "other"
+        with self.assertRaises(ValueError):
+            self.recovery.run()
+        self.assertEqual(self.writes(), [])
+
+    def test_existing_eip_claim_never_replayed(self):
+        self.cloud.claims["release-address"] = self.cloud.body("release-address", "address")
+        with self.assertRaises(ValueError):
+            self.recovery.run()
+        self.assertEqual(self.writes(), [])
+
+    def test_concurrent_claim_win_stops_release(self):
+        self.cloud.block_claim = True
+        with self.assertRaises(ValueError):
+            self.recovery.run()
+        self.assertEqual(self.writes(), ["put_object"])
+
+    def test_dependency_preserves_network(self):
+        self.cloud.dependency = True
+        with self.assertRaises(ValueError):
+            self.recovery.run()
+        self.assertEqual(self.writes(), ["put_object", "release_address"])
+
+    def test_main_table_or_wrong_subnet_rejected(self):
+        self.cloud.rows["table"]["Associations"][0]["Main"] = True
+        with self.assertRaises(ValueError):
+            self.recovery.run()
+        self.assertEqual(self.writes(), [])
+
+    def test_live_nat_rejected(self):
+        self.cloud.rows["nat"]["State"] = "available"
+        with self.assertRaises(ValueError):
+            self.recovery.run()
+        self.assertEqual(self.writes(), [])
+
+    def test_response_read_budget_and_repeated_write_rejected(self):
+        self.recovery.calls = 64
+        with self.assertRaises(ValueError):
+            self.recovery.row("address")
+        self.recovery.calls = 0
+        self.recovery.writes.add("put_object")
+        with self.assertRaises(ValueError):
+            self.recovery.call("s3", "put_object")
+
+
+if __name__ == "__main__":
+    unittest.main()

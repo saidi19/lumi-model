@@ -1,0 +1,192 @@
+"""Synthetic byte streams only. No network, pytest collection, or model inputs."""
+
+import gzip
+import importlib.util
+import io
+import json
+import unittest
+import zipfile
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/parse_sft_source_stage_diagnostic_v1.py"
+SPEC = importlib.util.spec_from_file_location("source_stage_diagnostic_v1", PATH)
+P = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(P)
+
+
+class StageDiagnosticTests(unittest.TestCase):
+    def fixture(self, body, command=None):
+        return (
+            "##[group]Run "
+            + (command or P.SOURCE_COMMAND)
+            + "\n"
+            + "SYNTHETIC_PRIVATE_HEADER\n##[endgroup]\n"
+            + body
+            + "\n"
+        ).encode()
+
+    def test_exact_startup_guard(self):
+        result = P.parse_diagnostic(
+            self.fixture(
+                "ERROR: source partition: scope_arguments\n"
+                "##[error]Process completed with exit code 4."
+            )
+        )
+        self.assertEqual(result["process_exit_code"], 4)
+        self.assertEqual(result["allowlisted_guard_codes"], ["scope_arguments"])
+        self.assertEqual(result["code_scope"], "source_step")
+        self.assertFalse(result["summary_present"])
+
+    def test_no_free_text_retention(self):
+        result = P.parse_diagnostic(
+            self.fixture(
+                "ERROR: source partition: PRIVATE_VALUE\n"
+                "Traceback PRIVATE_VALUE\nFAILED tests/test_private.py::test_private[PRIVATE_VALUE]"
+            )
+        )
+        self.assertNotIn("PRIVATE", json.dumps(result))
+        self.assertNotIn("test_private", json.dumps(result))
+        self.assertEqual(result["allowlisted_guard_codes"], [])
+
+    def test_timestamp_ansi_and_crlf(self):
+        raw = self.fixture("\x1b[31mERROR: source partition: missing_collected_node\x1b[0m")
+        raw = b"\r\n".join(b"2026-09-14T01:02:03.1234567Z " + row for row in raw.splitlines())
+        self.assertEqual(
+            P.parse_diagnostic(raw)["allowlisted_guard_codes"], ["missing_collected_node"]
+        )
+
+    def test_annotation_prefix(self):
+        result = P.parse_diagnostic(self.fixture("##[error]ERROR: source partition: manifest_hash"))
+        self.assertEqual(result["allowlisted_guard_codes"], ["manifest_hash"])
+
+    def test_all_static_codes(self):
+        for code in P.GUARD_CODES:
+            result = P.parse_diagnostic(self.fixture("ERROR: source partition: " + code))
+            self.assertEqual(result["allowlisted_guard_codes"], [code])
+
+    def test_unreachable_and_unknown_codes_omitted(self):
+        for code in ("arguments", "duplicate_json_key", "private_value", "scope_arguments PRIVATE"):
+            result = P.parse_diagnostic(self.fixture("ERROR: source partition: " + code))
+            self.assertEqual(result["allowlisted_guard_codes"], [])
+
+    def test_embedded_and_trailing_fake_codes_omitted(self):
+        for body in (
+            "print('ERROR: source partition: scope_arguments')",
+            "prefix ERROR: source partition: scope_arguments",
+            "ERROR: source partition: scope_arguments: PRIVATE",
+            "##[error]Process completed with exit code 4. PRIVATE",
+        ):
+            result = P.parse_diagnostic(self.fixture(body))
+            self.assertEqual(result["allowlisted_guard_codes"], [])
+            self.assertIsNone(result["process_exit_code"])
+
+    def test_other_steps_excluded(self):
+        raw = self.fixture(
+            "ERROR: source partition: manifest_hash\n##[error]Process completed with exit code 3.",
+            command="echo PRIVATE",
+        )
+        raw += self.fixture(
+            "ERROR: source partition: collection_failed\n"
+            "##[error]Process completed with exit code 4."
+        )
+        raw += self.fixture(
+            "ERROR: source partition: scope_arguments\n"
+            "##[error]Process completed with exit code 2.",
+            command="echo OTHER",
+        )
+        result = P.parse_diagnostic(raw)
+        self.assertEqual(result["allowlisted_guard_codes"], ["collection_failed"])
+        self.assertEqual(result["process_exit_code"], 4)
+
+    def test_header_echo_excluded(self):
+        raw = (
+            P.SOURCE_GROUP + "\nERROR: source partition: scope_arguments\n"
+            "##[endgroup]\n##[error]Process completed with exit code 4.\n"
+        ).encode()
+        self.assertEqual(P.parse_diagnostic(raw)["allowlisted_guard_codes"], [])
+
+    def test_duplicate_source_groups_unresolved(self):
+        raw = self.fixture("ERROR: source partition: scope_arguments") * 2
+        result = P.parse_diagnostic(raw)
+        self.assertEqual(result["source_step_scope"], "ambiguous")
+        self.assertEqual(result["allowlisted_guard_codes"], [])
+
+    def test_conflicting_exits_no_inference(self):
+        result = P.parse_diagnostic(
+            self.fixture(
+                "##[error]Process completed with exit code 1.\n"
+                "##[error]Process completed with exit code 4."
+            )
+        )
+        self.assertTrue(result["process_exit_conflict"])
+        self.assertIsNone(result["process_exit_code"])
+
+    def test_no_source_group_explicitly_unattributed(self):
+        result = P.parse_diagnostic(b"ERROR: source partition: scope_arguments\n")
+        self.assertEqual(result["code_scope"], "unattributed_log")
+        self.assertEqual(result["source_step_scope"], "absent")
+
+    def test_summary_structural_only(self):
+        result = P.parse_diagnostic(self.fixture("=== short test summary info ===\nPRIVATE"))
+        self.assertTrue(result["summary_present"])
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_exit_zero_and_bounds(self):
+        for code, expected in ((0, 0), (255, 255), (256, None), (-1, None), (1000, None)):
+            result = P.parse_diagnostic(
+                self.fixture(f"##[error]Process completed with exit code {code}.")
+            )
+            self.assertEqual(result["process_exit_code"], expected)
+
+    def test_invalid_bytes_and_cap(self):
+        for raw in (b"", b"X" * (P.MAXIMUM_LOG_BYTES + 1), "not bytes", b"\xff\xfe"):
+            result = P.parse_diagnostic(raw)
+            self.assertIsNone(result["process_exit_code"])
+            self.assertEqual(result["allowlisted_guard_codes"], [])
+
+    def test_gzip_in_memory(self):
+        raw = self.fixture("ERROR: source partition: manifest_json")
+        result = P.parse_diagnostic(gzip.compress(raw))
+        self.assertEqual(result["input_format"], "gzip_utf8")
+        self.assertEqual(result["allowlisted_guard_codes"], ["manifest_json"])
+
+    def test_gzip_expansion_bound(self):
+        result = P.parse_diagnostic(gzip.compress(b"X" * (P.MAXIMUM_LOG_BYTES + 1)))
+        self.assertEqual(result["input_format"], "gzip_expansion_rejected")
+
+    def test_gzip_exact_limit_and_extra_member(self):
+        result = P.parse_diagnostic(gzip.compress(b"X" * P.MAXIMUM_LOG_BYTES))
+        self.assertEqual(result["input_format"], "gzip_utf8")
+        result = P.parse_diagnostic(gzip.compress(b"X") + gzip.compress(b"Y"))
+        self.assertEqual(result["input_format"], "gzip_expansion_rejected")
+
+    def zipped(self, values):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for index, value in enumerate(values):
+                archive.writestr("PRIVATE_MEMBER_" + str(index), value)
+        return buffer.getvalue()
+
+    def test_zip_members_not_retained(self):
+        raw = self.zipped([b"PRIVATE", self.fixture("ERROR: source partition: collection_changed")])
+        result = P.parse_diagnostic(raw)
+        self.assertEqual(result["allowlisted_guard_codes"], ["collection_changed"])
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
+    def test_zip_expansion_bound(self):
+        result = P.parse_diagnostic(self.zipped([b"X" * 70_000, b"X" * 70_000]))
+        self.assertEqual(result["input_format"], "zip_expansion_rejected")
+
+    def test_corrupt_compression_no_exception_text(self):
+        for raw in (
+            b"\x1f\x8bPRIVATE",
+            b"PK\x03\x04PRIVATE",
+            b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03\x07PRIVATE",
+        ):
+            result = P.parse_diagnostic(raw)
+            self.assertEqual(result["input_format"], "invalid_or_unsupported_encoding")
+            self.assertNotIn("PRIVATE", json.dumps(result))
+
+
+if __name__ == "__main__":
+    unittest.main()

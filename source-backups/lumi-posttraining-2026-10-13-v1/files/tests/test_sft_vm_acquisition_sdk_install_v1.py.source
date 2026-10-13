@@ -1,0 +1,282 @@
+"""Offline packaging and installer sequencing; native admission/commands doubled."""
+
+import copy
+import importlib.util
+import io
+import json
+import os
+import tarfile
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "sdk_install", ROOT / "scripts/install_sft_vm_acquisition_sdk_v1.py"
+)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+def archive(members):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as out:
+        for name, body in members.items():
+            item = tarfile.TarInfo(name)
+            item.size = len(body)
+            out.addfile(item, io.BytesIO(body))
+    return buffer.getvalue()
+
+
+class InstallerTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.dest = self.root / "runtime"
+        self.enterContext(patch.object(m, "DEST", self.dest))
+        self.rows = [
+            {
+                "name": f"package{i}",
+                "version": "1",
+                "filename": f"p{i}.whl",
+                "bytes": 3,
+                "sha256": m.sha(b"abc"),
+            }
+            for i in range(5)
+        ]
+        self.members = {name: b"# synthetic" for name in m.PINS}
+        self.members[m.LOCK] = json.dumps({"requirements": self.rows}).encode()
+        pins = {name: m.sha(body) for name, body in self.members.items()}
+        self.members.update({"wheels/" + r["filename"]: b"abc" for r in self.rows})
+        self.enterContext(patch.object(m, "PINS", pins))
+        self.raw = archive(self.members)
+        self.source = self.root / "sdk.tar"
+        self.source.write_bytes(self.raw)
+        self.report = {
+            "schema": "lumi.vm-acquisition-sdk-wire-check.v0.2",
+            "versions": {r["name"]: "1" for r in self.rows},
+            "platform": "linux",
+            "python": "3.12.3",
+            "passed": True,
+            "tests": 4,
+            "failures": 0,
+            "errors": 0,
+            "skips": 0,
+            "guard_violations": {"network": 0, "payload_or_credentials": 0},
+            "production_sdk_factory_used": True,
+            "existing_four_wire_tests_reused": True,
+            "http_send_doubled": True,
+            "dummy_credentials_only": True,
+            "linux_host_qualified": False,
+            "real_4b_import": False,
+            "gate_5_complete": False,
+        }
+
+    def test_archive_exact_source_and_wheel_hashes(self):
+        self.assertEqual(m.unpack(self.raw, m.sha(self.raw)), self.members)
+
+    def test_changed_archive_or_wheel_rejected(self):
+        with self.assertRaises(ValueError):
+            m.unpack(self.raw, "0" * 64)
+        self.members["wheels/p0.whl"] = b"bad"
+        raw = archive(self.members)
+        with self.assertRaises(ValueError):
+            m.unpack(raw, m.sha(raw))
+
+    def test_unknown_member_traversal_missing_and_duplicate_rejected(self):
+        for name in ("../escape", "/escape", "extra"):
+            changed = dict(self.members)
+            changed[name] = changed.pop("wheels/p0.whl")
+            raw = archive(changed)
+            with self.assertRaises((ValueError, KeyError)):
+                m.unpack(raw, m.sha(raw))
+        raw = archive(dict(list(self.members.items())[:-1]))
+        with self.assertRaises(ValueError):
+            m.unpack(raw, m.sha(raw))
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w") as tf:
+            for _ in range(11):
+                item = tarfile.TarInfo("duplicate")
+                item.size = 1
+                tf.addfile(item, io.BytesIO(b"x"))
+        with self.assertRaises(ValueError):
+            m.unpack(out.getvalue(), m.sha(out.getvalue()))
+
+    def test_links_and_hardlinks_rejected(self):
+        alias = self.root / "alias"
+        alias.symlink_to(self.source)
+        with self.assertRaises(ValueError):
+            m.read(alias, m.CAP)
+        alias.unlink()
+        os.link(self.source, alias)
+        with self.assertRaises(ValueError):
+            m.read(self.source, m.CAP)
+
+    def test_read_allows_atime_update_but_rejects_content_metadata_change(self):
+        actual = os.stat(self.source)
+        attrs = {name: getattr(actual, name) for name in dir(actual) if name.startswith("st_")}
+        before = types.SimpleNamespace(**attrs)
+        for key in ("st_atime_ns", "st_mtime_ns", "st_ctime_ns", "st_ino"):
+            after = types.SimpleNamespace(**(attrs | {key: attrs[key] + 1}))
+            with patch.object(m.os, "fstat", side_effect=[before, after]):
+                if key == "st_atime_ns":
+                    self.assertEqual(m.read(self.source, m.CAP), self.raw)
+                else:
+                    with self.assertRaises(ValueError):
+                        m.read(self.source, m.CAP)
+
+    def test_actual_platform_rejected_before_write_or_commands(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "run_command") as run:
+            with self.assertRaises(ValueError):
+                m.install(self.source, m.sha(self.raw))
+        self.assertFalse(self.dest.exists())
+        run.assert_not_called()
+
+    def test_failed_native_admission_does_not_consume_attempt(self):
+        with patch.object(m, "boundary", side_effect=ValueError), self.assertRaises(ValueError):
+            m.install(self.source, m.sha(self.raw))
+        self.assertFalse(self.dest.exists())
+
+    def fake_run(self, args, timeout, output=None):
+        if output is not None:
+            output.write(json.dumps(self.report).encode())
+
+    def test_successful_sequence_reuses_exact_checker_and_does_not_claim_host(self):
+        with (
+            patch.object(m, "boundary"),
+            patch.object(m, "run_command", side_effect=self.fake_run) as run,
+        ):
+            result = m.install(self.source, m.sha(self.raw))
+            self.assertEqual(run.call_count, 4)
+            calls = [c.args[0] for c in run.call_args_list]
+            self.assertEqual(calls[0][:5], ["/usr/bin/python3", "-I", "-B", "-m", "venv"])
+            for flag in ("--no-index", "--require-hashes", "--no-deps", "--no-compile"):
+                self.assertIn(flag, calls[1])
+            self.assertEqual(calls[3][-1], str(self.dest / "qualification" / m.CHECK))
+            self.assertTrue(result["sdk_native_wire_qualified"])
+            self.assertFalse(result["host_admitted"])
+            self.assertFalse(result["real_4b_import"])
+            with self.assertRaises(FileExistsError):
+                m.install(self.source, m.sha(self.raw))
+            self.assertEqual(run.call_count, 4)
+
+    def test_each_command_failure_preserves_stage_and_prevents_retry(self):
+        for failed in range(4):
+            with self.subTest(failed=failed), patch.object(m, "DEST", self.root / f"run{failed}"):
+                calls = 0
+
+                def run(*_a, fail_at=failed + 1, **_kw):
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_at:
+                        raise RuntimeError("must never retain this exception text")
+
+                with patch.object(m, "boundary"), patch.object(m, "run_command", side_effect=run):
+                    with self.assertRaises(ValueError):
+                        m.install(self.source, m.sha(self.raw))
+                    failure = json.loads((m.DEST / "failed.json").read_bytes())
+                    self.assertEqual(set(failure), {"stage", "retry_allowed"})
+                    self.assertFalse(failure["retry_allowed"])
+                    self.assertFalse((m.DEST / "result.json").exists())
+                    with self.assertRaises(FileExistsError):
+                        m.install(self.source, m.sha(self.raw))
+                    self.assertEqual(calls, failed + 1)
+
+    def test_bad_wire_report_never_written_as_success(self):
+        self.report["passed"] = False
+        with patch.object(m, "boundary"), patch.object(m, "run_command", side_effect=self.fake_run):
+            with self.assertRaises(ValueError):
+                m.install(self.source, m.sha(self.raw))
+        failure = json.loads((self.dest / "failed.json").read_bytes())
+        self.assertEqual(failure["stage"], "wire_check")
+        self.assertFalse((self.dest / "result.json").exists())
+
+    def test_wrong_platform_version_counts_or_guard_rejected(self):
+        for key, value in (
+            ("platform", "darwin"),
+            ("python", "3.13.7"),
+            ("tests", 3),
+            ("skips", 1),
+            ("linux_host_qualified", True),
+            ("versions", {}),
+            ("guard_violations", {"network": 1, "payload_or_credentials": 0}),
+        ):
+            report = copy.deepcopy(self.report)
+            report[key] = value
+            with self.assertRaises(ValueError):
+                m.check_report(report, self.rows)
+
+    def test_commands_use_clean_environment_and_no_output_capture(self):
+        with patch.object(m.subprocess, "run") as run:
+            m.run_command(["synthetic"], 12)
+        kw = run.call_args.kwargs
+        self.assertEqual(kw["env"], m.ENV)
+        self.assertEqual(kw["timeout"], 12)
+        self.assertEqual(kw["stdout"], m.subprocess.DEVNULL)
+        self.assertFalse(any(k.startswith("AWS_") or "PROXY" in k for k in kw["env"]))
+        self.assertEqual(kw["env"]["PIP_CONFIG_FILE"], "/dev/null")
+
+    def test_supervisor_template_has_offline_limits_and_no_auto_start(self):
+        text = (ROOT / "configs/lumi-vm-acquisition-sdk-install-v0.1.service").read_text()
+        for line in (
+            "PrivateNetwork=yes",
+            "Restart=no",
+            "MemoryMax=1G",
+            "MemorySwapMax=0",
+            "TasksMax=64",
+            "TimeoutStartSec=600",
+            "KillMode=control-group",
+            "ProtectHome=yes",
+            "StandardOutput=null",
+            "RestrictAddressFamilies=AF_UNIX",
+        ):
+            self.assertIn(line, text.splitlines())
+        self.assertIn("ARCHIVE_SHA256", text)
+        self.assertNotIn("[Install]", text)
+
+    def test_native_boundary_reads_procfs_without_regular_file_size_assumption(self):
+        values = {
+            "cgroup": f"0::/system.slice/{m.UNIT}\n".encode(),
+            "memory.max": b"1073741824\n",
+            "memory.swap.max": b"0\n",
+            "pids.max": b"64\n",
+        }
+
+        def opened(path, *_a, **_kw):
+            return io.BytesIO(values[Path(path).name])
+
+        def observed(path, *_a, **_kw):
+            return types.SimpleNamespace(
+                st_ino=1 if str(path) == "/proc/1/ns/net" else 2,
+                st_uid=0,
+                st_mode=0o755,
+            )
+
+        with (
+            patch.object(m.sys, "platform", "linux"),
+            patch.object(m.platform, "machine", return_value="x86_64"),
+            patch.object(m.sys, "version_info", (3, 12, 3)),
+            patch.object(m.sys, "flags", types.SimpleNamespace(isolated=1)),
+            patch.object(m.sys, "dont_write_bytecode", True),
+            patch.object(m.os, "geteuid", return_value=0),
+            patch.object(m.os, "getegid", return_value=0),
+            patch("builtins.open", side_effect=opened),
+            patch.object(Path, "open", opened),
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(m.os, "stat", side_effect=observed),
+        ):
+            m.boundary()
+            for name in values:
+                prior = values[name]
+                values[name] = b"wrong\n"
+                with self.assertRaises(ValueError):
+                    m.boundary()
+                values[name] = prior
+            with patch.object(m.os, "stat", return_value=observed("/proc/1/ns/net")):
+                with self.assertRaises(ValueError):
+                    m.boundary()
+
+
+if __name__ == "__main__":
+    unittest.main()

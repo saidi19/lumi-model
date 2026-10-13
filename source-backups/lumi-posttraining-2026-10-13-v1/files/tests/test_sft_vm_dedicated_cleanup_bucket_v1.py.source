@@ -1,0 +1,192 @@
+"""Offline fixed-scope deployment and one-shot failure tests."""
+
+import copy
+import importlib
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("sft_vm_dedicated_cleanup_bucket_v1")
+
+
+class Fake:
+    def __init__(self):
+        self.calls, self.mutations = [], []
+        self.collision = False
+        self.fail = self.drift = None
+        self.account = m.ACCOUNT
+
+    def call(self, service, operation, **fields):
+        self.calls.append((service, operation, copy.deepcopy(fields)))
+        if operation.startswith(("create-", "put-")):
+            self.mutations.append(operation)
+        if operation == self.fail:
+            raise ValueError("PRIVATE_ERROR_SENTINEL")
+        if operation == "get-caller-identity":
+            return {"Account": self.account}
+        if operation == "head-bucket":
+            if self.collision:
+                return {}
+            raise LookupError("absent")
+        if operation == "get-bucket-lifecycle-configuration":
+            raise LookupError("absent")
+        values = {
+            "get-bucket-location": {"LocationConstraint": None},
+            "get-public-access-block": {"PublicAccessBlockConfiguration": m.BLOCK},
+            "get-bucket-ownership-controls": {
+                "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+            },
+            "get-bucket-encryption": {"ServerSideEncryptionConfiguration": m.ENCRYPTION},
+            "get-bucket-versioning": {"Status": "Enabled"},
+            "get-bucket-tagging": {"TagSet": list(reversed(m.TAGS))},
+            "get-bucket-policy": {"Policy": m.encode(m.policy()).decode()},
+            "get-bucket-policy-status": {"PolicyStatus": {"IsPublic": False}},
+        }
+        return {} if operation == self.drift else copy.deepcopy(values.get(operation, {}))
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "OUTPUT", self.root / "output"))
+        self.enterContext(patch.object(m, "APPROVAL", self.root / "approval.json"))
+        m.APPROVAL.write_bytes(m.encode(m.expected_approval("SYNTHETIC ONLY")))
+        self.cloud = Fake()
+
+    def test_success_exact_scope_and_receipt_budget(self):
+        result = m.run(cloud=self.cloud)
+        self.assertEqual(result["status"], "created_private_cleanup_store_verified")
+        self.assertEqual(result["calls"], 17)
+        self.assertEqual(result["mutation_dispatches"], 6)
+        self.assertFalse(result["cpu_entry_bound"])
+        self.assertFalse(result["gate_5_complete"])
+        for service, operation, fields in self.cloud.calls:
+            self.assertEqual(fields, m.requests()[service, operation])
+            if service == "s3api":
+                self.assertEqual(fields["Bucket"], m.BUCKET)
+        self.assertLess(sum(p.stat().st_size for p in m.OUTPUT.iterdir()), m.MAX_BYTES)
+
+    def test_collision_never_mutates(self):
+        self.cloud.collision = True
+        self.assertEqual(m.run(cloud=self.cloud)["failed_stage"], "fresh_name_absence")
+        self.assertEqual(self.cloud.mutations, [])
+
+    def test_wrong_identity_never_checks_bucket(self):
+        self.cloud.account = "wrong"
+        self.assertEqual(m.run(cloud=self.cloud)["calls"], 1)
+        self.assertEqual(self.cloud.mutations, [])
+
+    def test_each_mutation_failure_stops_no_retry_no_raw_error(self):
+        original = m.OUTPUT
+        for index, operation in enumerate(
+            op for _, op in m.requests() if op.startswith(("create-", "put-"))
+        ):
+            with (
+                self.subTest(operation=operation),
+                patch.object(m, "OUTPUT", original.parent / str(index)),
+            ):
+                cloud = Fake()
+                cloud.fail = operation
+                report = m.run(cloud=cloud)
+                self.assertEqual(report["status"], "stopped_no_retry_preserve_partial")
+                self.assertEqual(cloud.mutations.count(operation), 1)
+                self.assertEqual(cloud.calls[-1][1], operation)
+                self.assertNotIn(b"PRIVATE_ERROR_SENTINEL", (m.OUTPUT / "result.json").read_bytes())
+                count = len(cloud.calls)
+                with self.assertRaises(ValueError):
+                    m.run(cloud=cloud)
+                self.assertEqual(len(cloud.calls), count)
+
+    def test_each_readback_failure_is_not_success(self):
+        original = m.OUTPUT
+        for index, operation in enumerate(
+            op for service, op in m.requests() if service == "s3api" and op.startswith("get-")
+        ):
+            with (
+                self.subTest(operation=operation),
+                patch.object(m, "OUTPUT", original.parent / str(index)),
+            ):
+                cloud = Fake()
+                cloud.fail = operation
+                report = m.run(cloud=cloud)
+                self.assertFalse(report["privacy_readback_verified"])
+
+    def test_missing_or_broadened_approval_rejected(self):
+        value = m.expected_approval("SYNTHETIC ONLY")
+        for key, new in [
+            ("shared_bucket_mutation", True),
+            ("approved_execution_count", True),
+            ("entry_sha256", "0" * 64),
+            ("policy_sha256", "0" * 64),
+            ("human_message", ""),
+            ("maximum_calls", 21),
+        ]:
+            m.APPROVAL.write_bytes(m.encode(dict(value, **{key: new})))
+            with self.assertRaises(ValueError):
+                m.run(cloud=self.cloud)
+        m.APPROVAL.unlink()
+        with self.assertRaises(ValueError):
+            m.run(cloud=self.cloud)
+        self.assertFalse(m.OUTPUT.exists())
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_deadline_before_cloud(self):
+        ticks = iter((0, 300, 300))
+        result = m.run(cloud=self.cloud, clock=lambda: next(ticks))
+        self.assertEqual(result["calls"], 0)
+
+    def test_started_receipt_precedes_dispatch(self):
+        original = self.cloud.call
+
+        def observe(service, operation, **fields):
+            index = len(self.cloud.calls) + 1
+            self.assertTrue((m.OUTPUT / f"call-{index:02d}-started.json").exists())
+            return original(service, operation, **fields)
+
+        self.cloud.call = observe
+        self.assertTrue(m.run(cloud=self.cloud)["privacy_readback_verified"])
+
+    def test_sdk_shapes(self):
+        import botocore.session
+        import botocore.validate
+
+        sdk = botocore.session.Session()
+        for (service, operation), fields in m.requests().items():
+            model = sdk.get_service_model("s3" if service == "s3api" else service)
+            shape = model.operation_model(
+                "".join(s.capitalize() for s in operation.split("-"))
+            ).input_shape
+            botocore.validate.validate_parameters(fields, shape)
+
+    def test_transport_rejects_shared_bucket_objects_and_broader_policy(self):
+        with patch.object(m.subprocess, "run") as invoke:
+            for operation, fields in [
+                ("get-object", {"Bucket": m.BUCKET}),
+                ("put-bucket-policy", {"Bucket": "shared"}),
+                ("delete-bucket", {"Bucket": m.BUCKET}),
+            ]:
+                with self.assertRaises(ValueError):
+                    m.Cloud().call("s3api", operation, **fields)
+        invoke.assert_not_called()
+
+    def test_only_head_404_is_fresh_absence_not_access_denied(self):
+        for error, kind in [(b"(404)", LookupError), (b"(403)", ValueError)]:
+            response = types.SimpleNamespace(returncode=255, stdout=b"", stderr=error)
+            with patch.object(m.subprocess, "run", return_value=response) as invoke:
+                with self.assertRaises(kind):
+                    m.Cloud().call("s3api", "head-bucket", **m.requests()["s3api", "head-bucket"])
+                self.assertEqual(invoke.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+
+    def test_no_allows_and_claim_conditions_preserved(self):
+        rows = m.policy()["Statement"]
+        self.assertTrue(all(row["Effect"] == "Deny" for row in rows))
+        self.assertEqual(rows[2]["Condition"], {"StringNotEquals": {"s3:if-none-match": "*"}})
+        self.assertEqual(rows[-1]["NotResource"], f"arn:aws:s3:::{m.BUCKET}/{m.PREFIX}*")
+
+
+if __name__ == "__main__":
+    unittest.main()

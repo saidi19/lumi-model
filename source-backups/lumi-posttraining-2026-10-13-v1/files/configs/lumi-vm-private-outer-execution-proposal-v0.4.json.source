@@ -1,0 +1,95 @@
+{
+  "schema": "lumi.vm-private-outer-execution-proposal.v0.4",
+  "date": "2026-10-07",
+  "status": "proposed_watchdog_predecessor_recovery_not_authorized",
+  "execution_permitted": false,
+  "approval_record": null,
+  "account": "573978149073",
+  "region": "us-east-1",
+  "prepared_host_attempt": "606d788073f1f0b66a39eabeb4b32c2c",
+  "fresh_output": "artifacts/lumi-vm-private-outer-execution-v0.4/attempt-004",
+  "bindings": {
+    "configs/lumi-vm-private-outer-execution-proposal-v0.3.json": "b280942e7c04d705044836916e213c5ba99f64bcd3eb1faf9bfbe7b43abc2842",
+    "evidence/lumi-vm-private-outer-execution-outcome-v0.3.json": "d17ef78b4a261ca929828fcf5fe70a0cacedbaf1acf9695d1a5cc374ada9356c",
+    "evidence/lumi-vm-v03-network-cleanup-recovery-verification-v0.1.json": "401e92c338e703202536922392380349006c2e970eafa770aa336429a973791b",
+    "evidence/lumi-vm-watchdog-successor-local-verification-v0.1.json": "5d8944a7433631366d3d1742858c4b7abe304008897dea209624116d2d87e9c8",
+    "scripts/run_sft_vm_private_outer_v3.py": "4720020ece5efb7c8164c85de6528184c66131d235c91fba6efc3f1b0450691e",
+    "scripts/load_sft_vm_private_host_v2.py": "69a1498d8190c09b9551b859105f21285a1e333fd00d81842fec913a1dbf21eb",
+    "scripts/execute_sft_vm_private_outer_v3.py": "489de16ec7d1a8c4a20129e13b61447e8ce132029c74833610b48ada4b322a58",
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json": "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061",
+    "configs/lumi-vm-private-network-plan-v0.1.json": "50d6a1207dd89a8d018c21a67d3220b4b689931b872397bb4190578ced74174a",
+    "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json": "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42"
+  },
+  "proposed_scope": {
+    "execution_count": 1,
+    "host": "One fresh r6i.4xlarge CPU instance, 16 vCPU, 128 GiB RAM, in us-east-1a; no public IP; no existing instance reuse or mutation.",
+    "host_maximum_seconds": 14400,
+    "original_shared_controller_network_seconds": 18000,
+    "cleanup_reserve_seconds": 1800,
+    "storage": "New encrypted gp3 root 32 GiB and work 128 GiB. Preserve both volumes and STOP the instance; do not terminate or delete retained storage automatically.",
+    "network": "One nonce-owned private subnet, isolated route table, public NAT gateway and EIP, plus exact route/association. No existing public/main route changes. Cleanup deletes only new NAT and releases its EIP; preserve subnet/table if dependent ENIs remain.",
+    "host_connection": "Attempt-scoped security groups, temporary SSH key pair and Instance Connect Endpoint under the frozen host connection contract.",
+    "network_expiry": "One nonce-specific Lambda, two least-privilege IAM roles, one scheduler group and one schedule with two conditional private S3 mutation claims. Arm and independently verify before paid allocation.",
+    "host_watchdog": "One revision-conditional code update of the existing exact STOP-only watchdog for the new private subnet, while inert; readback first, then frozen launch-interlock arming and one-time schedule.",
+    "credentials": "Existing shared short-lived controller provider; exact-scope temporary acquisition and retention IAM users/roles/access keys with their frozen cleanup. Never print or persist credential text in reports.",
+    "source": "Only 22 preselected checkpoint objects, maximum 48,843,765,443 body bytes plus 22 EOF-probe bytes; validate frozen SHA-256 before CPU import. No model-source retry, listing, extra objects or dataset/evaluation access.",
+    "import": "Existing bounded CPU import and independent verification, unchanged frozen read/write/time caps. No GPU, inference or training.",
+    "retention": "Private exact attempt prefix in lumi-corpus-prod-27777c02b29b76efcac3. At most 528 non-overwriting PUTs and 528 independent streamed GET/SHA-256 readbacks; maximum package 8,415,205,181 bytes plus 4,194,304 metadata bytes. No multipart, list, overwrite or retry.",
+    "failure": "Preserve evidence and storage, consume uncertain writes without retry, retain existing exactly-once STOP ledger and claimed NAT/EIP cleanup. Unknown resource identity requires later explicit recovery, never guessing targets."
+  },
+  "cost_disclosure": {
+    "four_hour_compute_usd": "4.0320000000",
+    "network_planned_estimate_usd": "3.82556",
+    "network_planning_ceiling_usd": "5.00",
+    "existing_host_active_run_planning_ceiling_usd": 10,
+    "ceilings_are_separate_not_total_10_usd": true,
+    "aws_enforced_billing_cap": false,
+    "excluded_or_additional_costs": [
+      "Retained EBS and retained S3 storage after STOP",
+      "S3 requests, control-plane services and logs",
+      "Taxes and nonstandard transfer paths"
+    ],
+    "ebs_current_price_not_refreshed_this_step": true,
+    "credits_not_verified_or_assumed": true,
+    "resources_and_capacity_not_reserved": true,
+    "prices_are_historical_not_current": true,
+    "historical_compute_usd_per_hour": "1.0080000000"
+  },
+  "required_before_mutations": [
+    "Explicit human approval of this exact full scope, recorded separately without changing frozen predecessor proposals.",
+    "Bind the approved proposal and unused output path to the private entry; a boolean or this file alone cannot authorize execution.",
+    "Repeat fresh identity, CPU price/quota/image/offering checks immediately before execution and retain existing in-transaction network and cleanup-store admission; today's snapshots are not launch authority.",
+    "Verify source/tool hashes and absence of consumed exact-name host/issuer attempts. Retain original deadlines and do not reuse any failed pass or output."
+  ],
+  "excluded": [
+    "GPU, SFT training, inference, promotion, registry mutation or dataset seal",
+    "Model/data source mutation or test/evaluation-object access",
+    "Changes to existing unrelated resources or bucket-wide policy",
+    "Automatic retry after a started pass or ambiguous mutation",
+    "Automatic termination or deletion of retained EBS/S3 evidence"
+  ],
+  "gate_5_complete": false,
+  "production_eligible": false,
+  "recovery": {
+    "predecessor_result_sha256": "8837ba38c38853015dc7cbbe5035573a166a29236f3dadef6d8a7cd8a8e95d13",
+    "change": "Use loader v2 and outer v3, and the exact derived-predecessor validator in the CPU entry. Keep all other configuration/revision/status, import, retention and resource limits unchanged.",
+    "fresh_human_approval_required": true,
+    "predecessor_preserved": true,
+    "prepared_identity": "Retain the frozen prepared host identity 606d788073f1f0b66a39eabeb4b32c2c only because v0.3 failed before entering the host lifecycle. This choice must be included in the new explicit approval, not inferred from the old approval.",
+    "local_preconditions": "Authenticate v0.3 outcome and all its saved bindings; require its host subtree absent, new output absent (including dangling symlinks), and exact loader evidence intact before credentials.",
+    "live_preconditions": "Fresh bounded CPU/AMI/price/quota checks and absence of tagged instances, host keys/security groups and acquisition/retention IAM names; exact inert watchdog check in entry and full 14-read predecessor check in outer before network allocation. No read-only check is treated as reservation.",
+    "claim_separation": "A new random network nonce selects new cleanup claim keys and specialized-source names; exclusive creation and conditional writes remain mandatory. Never delete or reuse old network claims. Host/issuer output is beneath the fresh attempt-004 tree; the host STOP ledger is process-local and instance-bound.",
+    "retention_caveat": "No live S3 prefix-emptiness claim is made. Frozen non-overwriting retention writes remain mandatory and any collision fails closed without retry.",
+    "preallocation_caps": {
+      "entry_maximum_reads": 32,
+      "entry_maximum_seconds": 600,
+      "entry_maximum_response_bytes": 4194304,
+      "outer_predecessor_maximum_reads": 14,
+      "outer_predecessor_maximum_seconds": 300,
+      "outer_predecessor_maximum_response_bytes": 2097152,
+      "shared_controller_seconds": 18000,
+      "setup_window_not_reset": true
+    },
+    "historical_exact_failure_known": false
+  }
+}

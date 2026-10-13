@@ -1,0 +1,73 @@
+# SFT execution status v0.108
+
+2026-09-23. The private full-size controller/guardian/bootstrap lifecycle is
+implemented and tested with syscall doubles. **No native Linux execution or
+real import occurred, and Gate 5 remains incomplete.** No S3 payload access,
+remote action, GPU use, commit or push occurred.
+
+## Completed
+
+The new full-size composition binds environment/control pins, input inventories
+and worker receipts to the prepared entry. It derives memory/deadline limits
+from the validated envelope and preserves the caller's original absolute
+deadline through the controller and guardian. The frozen synthetic driver has a
+hidden 220-second worker cap; the new driver does not reuse that cap or edit it.
+
+The private bootstrap uses the frozen mount/isolation/privilege-drop helpers
+and a fixed future staged entry. Its public API and the public composition API
+are unconditionally closed with `host_guard_not_bound`; no approval flag opens
+them. The earlier entry/preparation APIs remain unchanged and closed.
+
+Review found two startup cleanup gaps before native execution. New start
+handshakes now prevent controller/guardian and bootstrap work before the parent
+owns the corresponding pidfd. A retained worker pidfd permits failure cleanup
+even if the bootstrap stalls before cgroup attachment. Only owned pidfds and
+the owned leaf cgroup are targeted; ambiguous signal/kill/close operations are
+not retried. Exact READY, release ordering, zero exit status, matching receipt,
+EOF and empty/removal checks remain necessary for a private success result.
+
+Fork followed by pidfd acquisition is not atomic containment. If a child is
+stopped before handle acquisition fails, cleanup may remain unconfirmed. This
+limitation is explicitly retained; the tests do not establish complete native
+containment, and no real execution path has been opened.
+
+## Verification
+
+**407 unique tests passed on CPython 3.11.15 and 3.13.7**, with zero failures,
+errors or skips: 19 new bootstrap tests, 44 new composition tests, 48 prior
+entry/guard tests and 296 unchanged regression tests. Native syscall boundaries
+were doubled; privileged Linux test wrappers were not executed locally.
+
+Ruff passed for all four new source/test files. A fresh isolated import loaded
+no ML modules and confirmed the new public APIs reject. Independent review
+rechecked the startup fixes and found no additional actionable defect.
+
+All 21 readiness bindings, nine prior entry-development bindings and 78
+qualified source hashes remain unchanged. Tracked and staged diffs are empty;
+the successor files are local and unpushed, not part of the frozen native
+qualification manifest.
+
+Development record:
+`configs/lumi-4b-sft-fullsize-lifecycle-development-v0.1.json`.
+
+SHA-256: `9a70eefbc08f11d7c09e3699d946f2ab47d34e673ee8b649a6c73cf0393e5270`.
+
+Verification:
+`evidence/lumi-4b-sft-fullsize-lifecycle-development-verification-v0.1.json`.
+
+## Next work, before native execution
+
+Finish the fixed staged entry/control loader and authenticated successor source
+staging, connecting the bootstrap's fixed path to the existing private entry
+adapter. Resolve cumulative native-write enforcement and its separately bounded
+setup, scratch, OS and report-write scopes. These are existing missing parts,
+not new policy gates.
+
+Then the new lifecycle needs bounded native qualification plus the already
+required host/runtime/source admission, source immutability or writer exclusion,
+mount/resource readback, combined budgets and exact real-import authorization.
+Local synthetic success cannot substitute for any of those observations.
+
+The S3-backed pretrained checkpoint remains the recorded base; no current S3
+availability claim is made. GPU and training remain off. The next local
+entry/staging implementation does not require turning on a GPU.

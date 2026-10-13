@@ -1,0 +1,232 @@
+"""Exercise real archive validators and launch-template sources offline only."""
+
+import ast
+import base64
+import copy
+import gzip
+import importlib
+import io
+import json
+import re
+import sys
+import tarfile
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("prepare_sft_vm_recovery_release_v1")
+
+
+class ReleaseTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.blobs = m.inputs()
+        cls.pins = json.loads((m.ROOT / m.INPUTS).read_bytes())["files"]
+        cls.files, cls.report = m.build(cls.blobs, cls.pins)
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-recovery-release-test-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.root = Path(cls.temp.name)
+        for name, raw in cls.files.items():
+            path = cls.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def module(self, name):
+        value = types.ModuleType("_fixture_" + name)
+        value.__file__ = str(self.root / "scripts" / (name + ".py"))
+        exec(compile(self.files["scripts/" + name + ".py"], value.__file__, "exec"), value.__dict__)
+        return value
+
+    def joined(self):
+        names = {Path(n).stem for n in self.files if n.startswith("scripts/")}
+        saved = {n: sys.modules.pop(n) for n in names if n in sys.modules}
+        directory = str(self.root / "scripts")
+        sys.path.insert(0, directory)
+        importlib.invalidate_caches()
+
+        def restore():
+            sys.path.remove(directory)
+            for n in names:
+                sys.modules.pop(n, None)
+            sys.modules.update(saved)
+
+        self.addCleanup(restore)
+        return importlib.import_module("run_sft_vm_joined_admission_v2")
+
+    def test_deterministic_build_and_complete_byte_pins(self):
+        files, report = m.build(self.blobs, self.pins)
+        self.assertEqual((files, report), (self.files, self.report))
+        self.assertEqual(len(files), 128)
+        self.assertEqual(report["source_control_archives"], 4)
+        self.assertLess(sum(map(len, files.values())), m.LIMIT)
+        for name, raw in files.items():
+            self.assertEqual(report["outputs"][name], dict(bytes=len(raw), sha256=m.sha(raw)))
+
+    def test_each_tampered_input_and_missing_extra_rejected(self):
+        for name in self.blobs:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.build(self.blobs | {name: self.blobs[name] + b"\n"}, self.pins)
+        with self.assertRaises(ValueError):
+            m.build(self.blobs | {"extra": b"x"}, self.pins)
+        fewer = dict(self.blobs)
+        fewer.pop(next(iter(fewer)))
+        with self.assertRaises(ValueError):
+            m.build(fewer, self.pins)
+
+    def test_real_fullsize_validator_and_old_attempt_rejection(self):
+        stage = self.module("stage_sft_vm_fullsize_release_v1")
+        raw = self.files[m.FULLSIZE]
+        members, descriptor = stage.validate(raw, m.sha(raw), m.NEW)
+        self.assertEqual(descriptor["attempt"], m.NEW)
+        with self.assertRaises(ValueError):
+            stage.validate(raw, m.sha(raw), m.OLD)
+        _, original = m.unpack(self.blobs[m.FULLSIZE])
+        for name in original:
+            if name not in {"prepared-attempt.json", "controls/control.json"}:
+                self.assertEqual(members[name], original[name], name)
+
+    def test_real_controller_assembly_matches_new_archive(self):
+        stage = self.module("stage_sft_vm_root_controller_v1")
+        self.assertEqual(stage.ATTEMPT, m.NEW)
+        raw = stage.assemble(self.root)
+        self.assertEqual(raw, self.files[m.CONTROLLER])
+        stage.unpack(raw, m.sha(raw))
+
+    def test_real_retention_validators_and_source_manifest(self):
+        old = self.module("prepare_sft_vm_retention_release_v1")
+        successor = self.module("prepare_sft_vm_retention_release_v2")
+        raw = self.files[m.RETENTION]
+        members = successor.unpack(raw, m.sha(raw), old)
+        stage = self.module("stage_sft_vm_retention_source_v1")
+        self.assertEqual(len(raw), stage.ARCHIVE_BYTES)
+        self.assertEqual(m.sha(raw), stage.ARCHIVE_SHA)
+        self.assertEqual(m.sha(members["release-manifest.json"]), stage.MANIFEST_SHA)
+        self.assertEqual(old.ATTEMPT, m.NEW)
+        self.assertNotIn(m.OLD.encode(), raw)
+
+    def test_real_setup_validator_nested_archives_and_opaque_sdk(self):
+        stage = self.module("stage_sft_vm_setup_inputs_v5")
+        raw = self.files[m.SETUP]
+        members = stage.unpack(raw, m.sha(raw))
+        self.assertEqual(
+            members["lumi-bootstrap-input/root-controller.tar"], self.files[m.CONTROLLER]
+        )
+        self.assertEqual(
+            members["lumi-bootstrap-input/source-controls.tar"], self.files[m.FULLSIZE]
+        )
+        _, original = m.unpack(self.blobs[m.SETUP])
+        self.assertEqual(
+            members["lumi-sdk-input/sdk-release.tar"], original["lumi-sdk-input/sdk-release.tar"]
+        )
+
+    def test_real_joined_launch_graph_authenticates(self):
+        joined = self.joined()
+        joined.authenticate()
+        initial = joined.prepare.initial
+        self.assertEqual(initial.ATTEMPT, m.NEW)
+        self.assertIs(initial, joined.lifecycle.guard.provision.initial)
+        self.assertIs(initial, joined.lifecycle.guard.provision.setup.initial)
+        self.assertEqual(
+            initial.EARLY_SHA, m.sha(self.files["scripts/run_sft_vm_early_stop_v2.py"])
+        )
+        self.assertEqual(initial.source_bytes(), self.files["scripts/run_sft_vm_early_stop_v2.py"])
+        body = gzip.decompress(initial.user_data())
+        self.assertNotIn(m.OLD.encode(), body)
+        self.assertIn(b"run_sft_vm_early_stop_v2.py", body)
+        self.assertIn(initial.EARLY_SHA, initial.proof_launcher())
+
+    def test_real_delivery_byte_and_hash_contracts(self):
+        joined = self.joined()
+        delivery = joined.prepare.initial.delivery
+        self.assertEqual(
+            delivery.source_bytes(), self.files["scripts/run_sft_vm_setup_detached_v3.py"]
+        )
+        sender = delivery.seed.sender
+        self.assertEqual(
+            sender.RECEIVER_BYTES, len(self.files["scripts/stage_sft_vm_setup_inputs_v5.py"])
+        )
+        self.assertEqual(
+            sender.RECEIVER_SHA, m.sha(self.files["scripts/stage_sft_vm_setup_inputs_v5.py"])
+        )
+        self.assertEqual(sender.ARCHIVE_BYTES, len(self.files[m.SETUP]))
+        self.assertEqual(sender.ARCHIVE_SHA, m.sha(self.files[m.SETUP]))
+        request = delivery.request_from
+        self.assertTrue(callable(request))
+
+    def test_real_watchdog_zip_role_names_and_new_identity(self):
+        joined = self.joined()
+        guard = joined.lifecycle.guard
+        raw = guard.inert.package()
+        self.assertEqual(
+            base64.b64encode(__import__("hashlib").sha256(raw).digest()).decode(), guard.CODE
+        )
+        self.assertEqual(guard.worker.ATTEMPT, m.NEW)
+        for value in (guard.inert.WORKER_ROLE, guard.inert.SCHEDULER_ROLE, guard.inert.GROUP):
+            self.assertIn(m.NEW, value)
+            self.assertNotIn(m.OLD, value)
+
+    def test_launch_limits_endpoint_fix_and_proposal_unchanged(self):
+        joined = self.joined()
+        provision = joined.lifecycle.guard.provision
+        self.assertEqual(provision.ENDPOINT_MAX_POLLS, 40)
+        self.assertEqual(provision.ENDPOINT_POLL_SECONDS, 15)
+        self.assertEqual(provision.ENDPOINT_RESOURCE_SECONDS, 550)
+        path = "configs/lumi-vm-fullsize-host-proposal-v0.1.json"
+        old = json.loads(self.blobs[path])
+        new = json.loads(self.files[path])
+        restored = copy.deepcopy(new)
+        restored["prepared_attempt"] = old["prepared_attempt"]
+        restored["retention_proposal"]["prefix"] = old["retention_proposal"]["prefix"]
+        self.assertEqual(restored, old)
+        self.assertFalse(new["execution_permitted"])
+
+    def test_all_python_outputs_parse_and_old_id_absent(self):
+        for name, raw in self.files.items():
+            if name.endswith(".py"):
+                ast.parse(raw)
+                self.assertNotIn(m.OLD.encode(), raw, name)
+
+    def test_every_source_ast_only_identity_or_hash_change(self):
+        originals = dict(self.blobs)
+        for name in (m.FULLSIZE, m.RETENTION):
+            _, members = m.unpack(self.blobs[name])
+            originals.update({n: raw for n, raw in members.items() if n.endswith(".py")})
+        originals["scripts/build_sft_vm_initial_boot_v1.py"] = self.blobs[
+            "scripts/build_sft_vm_initial_boot_v2.py"
+        ]
+        originals["scripts/provision_sft_vm_host_v2.py"] = self.blobs[
+            "scripts/provision_sft_vm_host_v4.py"
+        ]
+        worker = "scripts/sft_vm_external_watchdog_v1.py"
+        codes = [m.code_pin(source[worker]).decode() for source in (self.blobs, self.files)]
+
+        def normalized(raw):
+            text = raw.decode().replace(m.OLD, "ATTEMPT_ID").replace(m.NEW, "ATTEMPT_ID")
+            text = re.sub(r"\b[0-9a-f]{64}\b", "SHA256_BINDING", text)
+            for code in codes:
+                text = text.replace(code, "WATCHDOG_CODE_BINDING")
+            return ast.dump(ast.parse(text))
+
+        for name, raw in self.files.items():
+            if name.endswith(".py"):
+                self.assertEqual(normalized(raw), normalized(originals[name]), name)
+
+    def test_malformed_archive_rejected_without_extraction(self):
+        for name, kind in (("../escape", tarfile.REGTYPE), ("link", tarfile.SYMTYPE)):
+            out = io.BytesIO()
+            with tarfile.open(fileobj=out, mode="w") as archive:
+                row = tarfile.TarInfo(name)
+                row.type, row.mode, row.size = kind, 0o400, 1
+                archive.addfile(row, io.BytesIO(b"x"))
+            with self.assertRaises(ValueError):
+                m.unpack(out.getvalue())
+        with self.assertRaises(ValueError):
+            m.unpack(self.blobs[m.FULLSIZE] + b"extra")
+
+    def test_no_execution_authority_and_no_old_input_mutation(self):
+        self.assertFalse(self.report["execution_permitted"] or self.report["gate_5_complete"])
+        self.assertEqual(m.inputs(), self.blobs)
+        with self.assertRaises(ValueError):
+            m.run(approved=True)

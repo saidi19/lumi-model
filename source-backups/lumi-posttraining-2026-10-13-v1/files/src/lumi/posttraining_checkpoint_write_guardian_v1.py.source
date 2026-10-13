@@ -1,0 +1,407 @@
+"""Independent parent/deadline/broker watcher for one owned write-guard attempt.
+
+The blocking seccomp notification receive must run in a separate broker process,
+not in this watcher and not in a thread that shares its failure domain. This
+module never receives a notification, owns a listener, parses payload data or
+installs a filter. It monitors generation-bound pidfds while the unchanged owned
+cgroup lease supplies the workload kill boundary.
+
+An independently admitted caller first creates and attaches exactly one blocked
+workload and one dedicated broker process, obtains both pidfds, completes the
+listener handoff/final-seal/mediated READY protocol, then invokes this private
+watcher. Only after parent and broker liveness plus cgroup ownership are verified
+does the watcher send one fixed byte with per-call nonblocking/no-SIGPIPE flags
+to an owned local release socket once.
+Parent loss, deadline,
+broker loss or natural workload emptying all retire the workload and stop the
+dedicated broker. The borrowed broker pidfd is never closed here; its owner must
+reap the broker and validate its aggregate receipt separately.
+
+Lease/broker/parent descriptor admission errors are setup failures, not monitored
+terminal reasons. After those authorities are bound, every reason selection uses
+the fixed priority parent loss, deadline, broker loss, then natural workload empty.
+
+No numeric-PID signal, external process scan, retry, deadline reset, replacement
+broker or cleanup fallback is provided. A pidfd identity change is never used to
+signal a possibly unrelated object. Public use remains closed and local tests
+replace every process/cgroup/native operation.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import os
+import select
+import signal
+import stat
+import threading
+import time
+
+from . import posttraining_sft_cgroup_guardian_v1 as frozen
+from .posttraining_sft_cgroup_v1 import CgroupLease
+
+SCHEMA = "lumi.checkpoint-write-guardian.v0.1"
+RELEASE_TOKEN = b"G"
+MSG_DONTWAIT = 0x40
+MSG_NOSIGNAL = 0x4000
+RELEASE_SEND_FLAGS = MSG_DONTWAIT | MSG_NOSIGNAL
+SOL_SOCKET = 1
+SO_TYPE = 3
+SO_DOMAIN = 39
+AF_UNIX = 1
+SOCK_SEQPACKET = 5
+REASONS = frozenset({"workload_empty", "parent_lost", "deadline_exhausted", "broker_lost"})
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "invalid_arguments", "reentry",
+    "lease_rejected", "parent_binding_rejected", "broker_binding_rejected",
+    "release_rejected", "guardian_failed", "cleanup_unconfirmed",
+})
+FALSE_FLAGS = (
+    "broker_origin_verified", "broker_receipt_verified", "broker_reaped",
+    "listener_origin_verified", "release_reader_exclusive_verified",
+    "release_writer_exclusive_verified", "release_channel_origin_verified",
+    "release_consumed_verified", "release_atomic_with_liveness_verified",
+    "native_write_enforcement_verified", "worker_exit_success_verified",
+    "guardian_death_containment", "host_admission_verified", "execution_permitted",
+    "real_import_permitted", "gate_5_complete", "training_authorized",
+    "production_eligible", "retry_allowed",
+)
+_WATCH_LOCK = threading.Lock()
+
+
+class WriteGuardianError(ValueError):
+    def __init__(self, code="guardian_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "guardian_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code="guardian_failed"):
+    if not condition:
+        raise WriteGuardianError(code) from None
+
+
+def _runtime():
+    try:
+        frozen._runtime_check()
+        inert = {signal.SIG_DFL, signal.SIG_IGN}
+        catchable = signal.valid_signals() - {signal.SIGKILL, signal.SIGSTOP}
+        _need(type(catchable) is set and all(signal.getsignal(number) in inert
+                                             for number in catchable),
+              "runtime_rejected")
+        _need(signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN, "runtime_rejected")
+    except BaseException:
+        raise WriteGuardianError("runtime_rejected") from None
+
+
+def _pidfd_identity(fd, code):
+    try:
+        identity = frozen._pidfd_identity(fd)
+    except BaseException:
+        raise WriteGuardianError(code) from None
+    _need(type(identity) is tuple and len(identity) == 4
+          and all(type(value) is int for value in identity), code)
+    return identity
+
+
+def _alive(fd):
+    try:
+        signal.pidfd_send_signal(fd, 0, None, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _populated(lease):
+    value = lease.snapshot()
+    _need(type(value) is dict and type(value.get("populated")) is int
+          and value["populated"] in (0, 1), "lease_rejected")
+    return value["populated"]
+
+
+def _release_descriptor(fd):
+    try:
+        _need(type(fd) is int and fd >= 3, "release_rejected")
+        info = os.fstat(fd)
+        descriptor_flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        status_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        domain, kind = _socket_properties(fd)
+        _need(all(type(value) is int for value in (
+                  info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+                  descriptor_flags, status_flags, domain, kind))
+              and stat.S_ISSOCK(info.st_mode) and info.st_ino > 0
+              and info.st_uid == info.st_gid == 0 and domain == AF_UNIX
+              and kind == SOCK_SEQPACKET
+              and descriptor_flags & fcntl.FD_CLOEXEC
+              and status_flags & os.O_ACCMODE == os.O_RDWR, "release_rejected")
+        return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_uid,
+                info.st_gid, descriptor_flags, status_flags)
+    except WriteGuardianError:
+        raise
+    except BaseException:
+        raise WriteGuardianError("release_rejected") from None
+
+
+def _libc():
+    return ctypes.CDLL(None, use_errno=True)
+
+
+def _socket_properties(fd):
+    library = _libc()
+    call = library.getsockopt
+    call.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                     ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    call.restype = ctypes.c_int
+    result = []
+    for option in (SO_DOMAIN, SO_TYPE):
+        value = ctypes.c_int()
+        size = ctypes.c_uint32(ctypes.sizeof(value))
+        _need(call(fd, SOL_SOCKET, option, ctypes.byref(value), ctypes.byref(size)) == 0
+              and size.value == ctypes.sizeof(value), "release_rejected")
+        result.append(value.value)
+    return tuple(result)
+
+
+def _send_release(fd):
+    payload = ctypes.create_string_buffer(RELEASE_TOKEN, len(RELEASE_TOKEN))
+    call = _libc().send
+    call.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    call.restype = ctypes.c_ssize_t
+    return call(fd, ctypes.cast(payload, ctypes.c_void_p), len(RELEASE_TOKEN),
+                RELEASE_SEND_FLAGS)
+
+
+def _poll_ready(poller, parent_fd, broker_fd, mask, timeout_ms):
+    events = poller.poll(timeout_ms)
+    _need(type(events) is list and len(events) <= 2, "guardian_failed")
+    seen = set()
+    parent_event = broker_event = False
+    for event in events:
+        _need(type(event) is tuple and len(event) == 2
+              and all(type(value) is int for value in event), "guardian_failed")
+        fd, flags = event
+        _need(fd in {parent_fd, broker_fd} and fd not in seen
+              and flags & mask and not flags & (select.POLLNVAL | ~mask),
+              "guardian_failed")
+        seen.add(fd)
+        parent_event |= fd == parent_fd
+        broker_event |= fd == broker_fd
+    return parent_event, broker_event
+
+
+def watch_write_guardian(**_arguments):
+    """No supplied pidfd, lease, hash or approval opens the private watcher."""
+    raise WriteGuardianError("host_guard_not_bound") from None
+
+
+def _watch_admitted_once(lease, *, expected_parent_pid, broker_pidfd, release_fd,
+                         deadline_ns, cleanup_timeout_ms):
+    """Release once, watch two pidfds, retire once; never service the listener."""
+    _runtime()
+    _need(type(lease) is CgroupLease
+          and type(expected_parent_pid) is int and 1 < expected_parent_pid < 2**31
+          and type(broker_pidfd) is int and broker_pidfd >= 3
+          and type(release_fd) is int and release_fd >= 3 and release_fd != broker_pidfd
+          and type(deadline_ns) is int and 0 < deadline_ns < 2**63
+          and type(cleanup_timeout_ms) is int and 1 <= cleanup_timeout_ms <= 10_000,
+          "invalid_arguments")
+    _need(_WATCH_LOCK.acquire(blocking=False), "reentry")
+    parent_fd = broker_fd = None
+    parent_identity = broker_identity = release_identity = None
+    owns_lease = owns_broker_fd = broker_bound = owns_release = False
+    parent_bound = released = broker_stop_attempted = workload_retired = False
+    parent_closed = broker_closed = release_closed = False
+    cleanup_ok = True
+    reason = failure = None
+    try:
+        lease.verify_limits()
+        owns_lease = True
+        _need(_populated(lease) == 1, "lease_rejected")
+        release_identity = _release_descriptor(release_fd)
+        owns_release = True
+        _pidfd_identity(broker_pidfd, "broker_binding_rejected")
+        try:
+            broker_fd = fcntl.fcntl(broker_pidfd, fcntl.F_DUPFD_CLOEXEC, 3)
+        except BaseException:
+            raise WriteGuardianError("broker_binding_rejected") from None
+        _need(type(broker_fd) is int and broker_fd >= 3
+              and broker_fd not in {broker_pidfd, release_fd}, "broker_binding_rejected")
+        owns_broker_fd = True
+        broker_identity = _pidfd_identity(broker_fd, "broker_binding_rejected")
+        _need(_alive(broker_fd), "broker_binding_rejected")
+        _need(_pidfd_identity(broker_fd, "broker_binding_rejected")
+              == broker_identity, "broker_binding_rejected")
+        broker_bound = True
+        if os.getppid() != expected_parent_pid:
+            reason = "parent_lost"
+        elif time.monotonic_ns() >= deadline_ns:
+            reason = "deadline_exhausted"
+        else:
+            try:
+                parent_fd = os.pidfd_open(expected_parent_pid, 0)
+            except ProcessLookupError:
+                reason = "parent_lost"
+            if parent_fd is not None:
+                parent_identity = _pidfd_identity(parent_fd, "parent_binding_rejected")
+                poller = select.poll()
+                mask = select.POLLIN | select.POLLHUP | select.POLLERR
+                poller.register(parent_fd, mask)
+                poller.register(broker_fd, mask)
+                if os.getppid() != expected_parent_pid or not _alive(parent_fd):
+                    reason = "parent_lost"
+                else:
+                    parent_bound = True
+                    if time.monotonic_ns() >= deadline_ns:
+                        reason = "deadline_exhausted"
+                    elif not _alive(broker_fd):
+                        reason = "broker_lost"
+                    else:
+                        _need(_release_descriptor(release_fd) == release_identity,
+                              "release_rejected")
+                        parent_event, broker_event = _poll_ready(
+                            poller, parent_fd, broker_fd, mask, 0,
+                        )
+                        if (parent_event or os.getppid() != expected_parent_pid
+                                or not _alive(parent_fd)):
+                            reason = "parent_lost"
+                        elif time.monotonic_ns() >= deadline_ns:
+                            reason = "deadline_exhausted"
+                        elif broker_event or not _alive(broker_fd):
+                            reason = "broker_lost"
+                        else:
+                            released = True  # A partial/raised write is consumed.
+                            try:
+                                _need(signal.getsignal(signal.SIGPIPE) is signal.SIG_IGN,
+                                      "release_rejected")
+                                written = _send_release(release_fd)
+                            except BaseException:
+                                raise WriteGuardianError("release_rejected") from None
+                            _need(type(written) is int and written == len(RELEASE_TOKEN),
+                                  "release_rejected")
+                            closing, release_fd = release_fd, None
+                            owns_release = False  # Never retry an ambiguous close.
+                            try:
+                                _need(_release_descriptor(closing) == release_identity,
+                                      "release_rejected")
+                                os.close(closing)
+                                release_closed = True
+                            except BaseException:
+                                raise WriteGuardianError("cleanup_unconfirmed") from None
+                while reason is None:
+                    _need(_pidfd_identity(parent_fd, "parent_binding_rejected")
+                          == parent_identity, "parent_binding_rejected")
+                    _need(_pidfd_identity(broker_fd, "broker_binding_rejected")
+                          == broker_identity, "broker_binding_rejected")
+                    parent_event, broker_event = _poll_ready(
+                        poller, parent_fd, broker_fd, mask, 0,
+                    )
+                    # Loss/deadline precede a contemporaneous empty workload.
+                    if (parent_event or os.getppid() != expected_parent_pid
+                            or not _alive(parent_fd)):
+                        reason = "parent_lost"
+                    elif time.monotonic_ns() >= deadline_ns:
+                        reason = "deadline_exhausted"
+                    elif broker_event or not _alive(broker_fd):
+                        reason = "broker_lost"
+                    else:
+                        empty = _populated(lease) == 0
+                        # Snapshot I/O is not atomic with process/deadline state.
+                        # Re-check every higher-priority terminal condition before
+                        # committing a natural-empty reason.
+                        parent_event, broker_event = _poll_ready(
+                            poller, parent_fd, broker_fd, mask, 0,
+                        )
+                        if (parent_event or os.getppid() != expected_parent_pid
+                                or not _alive(parent_fd)):
+                            reason = "parent_lost"
+                        elif time.monotonic_ns() >= deadline_ns:
+                            reason = "deadline_exhausted"
+                        elif broker_event or not _alive(broker_fd):
+                            reason = "broker_lost"
+                        elif empty:
+                            reason = "workload_empty"
+                        else:
+                            remaining_ms = max(
+                                1, (deadline_ns - time.monotonic_ns()) // 1_000_000,
+                            )
+                            parent_event, broker_event = _poll_ready(
+                                poller, parent_fd, broker_fd, mask,
+                                min(50, remaining_ms),
+                            )
+                            # A pidfd readiness event is authoritative process
+                            # exit, including when signal zero still sees a zombie.
+                            if (parent_event or os.getppid() != expected_parent_pid
+                                    or not _alive(parent_fd)):
+                                reason = "parent_lost"
+                            elif time.monotonic_ns() >= deadline_ns:
+                                reason = "deadline_exhausted"
+                            elif broker_event or not _alive(broker_fd):
+                                reason = "broker_lost"
+        _need(reason in REASONS, "guardian_failed")
+    except WriteGuardianError as error:
+        failure = error.code
+    except BaseException:
+        failure = "guardian_failed"
+    finally:
+        if owns_lease:
+            try:
+                frozen._retire(lease, cleanup_timeout_ms=cleanup_timeout_ms)
+                workload_retired = True
+            except BaseException:
+                failure = "cleanup_unconfirmed"
+        if owns_release and release_fd is not None:
+            closing, release_fd = release_fd, None
+            owns_release = False
+            try:
+                _need(_release_descriptor(closing) == release_identity, "release_rejected")
+                os.close(closing)
+                release_closed = True
+            except BaseException:
+                cleanup_ok = False
+        if broker_bound:
+            broker_stop_attempted = True
+            try:
+                _need(_pidfd_identity(broker_fd, "broker_binding_rejected")
+                      == broker_identity, "broker_binding_rejected")
+                try:
+                    signal.pidfd_send_signal(broker_fd, signal.SIGKILL, None, 0)
+                except ProcessLookupError:
+                    pass
+            except BaseException:
+                cleanup_ok = False
+        if owns_broker_fd and broker_fd is not None:
+            closing, broker_fd = broker_fd, None
+            owns_broker_fd = False
+            try:
+                if broker_identity is not None:
+                    _need(_pidfd_identity(closing, "broker_binding_rejected")
+                          == broker_identity, "broker_binding_rejected")
+                os.close(closing)
+                broker_closed = True
+            except BaseException:
+                cleanup_ok = False
+        if parent_fd is not None:
+            closing, parent_fd = parent_fd, None
+            try:
+                if parent_identity is not None:
+                    _need(_pidfd_identity(closing, "parent_binding_rejected")
+                          == parent_identity, "parent_binding_rejected")
+                os.close(closing)
+                parent_closed = True
+            except BaseException:
+                cleanup_ok = False
+        _WATCH_LOCK.release()
+    if owns_lease and (not workload_retired or not cleanup_ok):
+        raise WriteGuardianError("cleanup_unconfirmed") from None
+    if failure is not None:
+        raise WriteGuardianError(failure) from None
+    return {"schema": SCHEMA, "reason": reason, "release_sent": released,
+            "release_fd_bound": release_identity is not None,
+            "release_fd_closed": release_closed,
+            "workload_retired": workload_retired, "broker_pidfd_bound": broker_bound,
+            "broker_stop_attempted": broker_stop_attempted,
+            "borrowed_broker_pidfd_closed": False,
+            "owned_broker_pidfd_closed": broker_closed,
+            "parent_pidfd_bound": parent_bound,
+            "parent_pidfd_closed": parent_closed,
+            **dict.fromkeys(FALSE_FLAGS, False)}

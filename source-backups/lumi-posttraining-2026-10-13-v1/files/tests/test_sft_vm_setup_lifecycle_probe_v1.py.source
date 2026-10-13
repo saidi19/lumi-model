@@ -1,0 +1,77 @@
+"""Offline production controller and real lifecycle-loader binding regressions."""
+
+import json
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_setup_lifecycle_probe_v1 as builder
+from scripts import qualify_sft_vm_setup_production_v4 as m
+from tests import test_sft_vm_setup_control_fault_successor_v1 as base
+
+
+class Tests(base.Tests):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed, cls.receiver, cls.archive = m.authenticate()
+
+    def setUp(self):
+        self.enterContext(patch.object(base, "m", m))
+        super().setUp()
+
+    def test_reproducible_entry(self):
+        self.assertEqual(m.read(builder.OUTPUT), builder.build())
+
+    def test_actual_loader_uses_the_lifecycle_sender(self):
+        self.assertEqual(self.seed.sender.__name__, "_production_sender_v7")
+        self.assertEqual(
+            Path(self.seed.sender.pipe_exchange.__code__.co_filename).resolve(),
+            builder.lifecycle.OUTPUT,
+        )
+        self.assertEqual(
+            m.sha(m.read(builder.lifecycle.OUTPUT)),
+            "3c344d353c793be953ff073435b6c66ef21ecbe5984d0b4cfe53976267cf44ca",
+        )
+
+    def test_actual_wrapper_fault_reaches_transfer_boundary_without_text(self):
+        machine, boot = "a" * 32, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        proof = dict(
+            self.seed.initial.BASE,
+            attempt=m.OWNER_ATTEMPT,
+            source_sha256=self.seed.initial.EARLY_SHA,
+            machine_id=machine,
+            boot_id=boot,
+            early_timers_armed=True,
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14400,
+            observed_boottime=90,
+        )
+        identity = dict(
+            schema="lumi.vm-setup-seed.v0.1",
+            attempt=m.OWNER_ATTEMPT,
+            machine_id=machine,
+            boot_id=boot,
+            observed_boottime=100,
+            setup_deadline_boottime=1800,
+            receipt_parents_created=True,
+            host_admitted=False,
+            expiry_enforced=False,
+            execution_permitted=False,
+            retry_allowed=False,
+        )
+        control = Mock(side_effect=[json.dumps(proof).encode(), json.dumps(identity).encode()])
+        report = {}
+        with (
+            patch.object(self.seed.sender.delivery, "pipe_exchange", control),
+            patch.object(
+                self.seed.sender,
+                "_pipe_exchange_v6",
+                side_effect=FileNotFoundError("PRIVATE_SENTINEL"),
+            ),
+        ):
+            with self.assertRaises(self.seed.sender.SetupExchangeFailure) as caught:
+                m.transfer(self.seed, self.receiver, self.archive, ["/usr/bin/ssh"], report)
+        self.assertEqual(caught.exception.diagnostic["phase"], "boundary")
+        self.assertEqual(caught.exception.diagnostic["kind"], "io")
+        self.assertIsNone(caught.exception.diagnostic["stdin_bytes_written"])
+        self.assertTrue(report["seed_confirmed"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(caught.exception.diagnostic))

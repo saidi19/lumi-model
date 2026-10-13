@@ -1,0 +1,246 @@
+"""Owned all-phase worker control socket for SocketTransport v2.
+
+All six WorkerRun phase kinds are parent-confirmed in frozen execution order.
+reserved waits for parent consumption of rank-zero reservation confirmation;
+updated requires trusted local CUDA completion before sending; completed follows
+the ledger client's all-rank step fence. RankPhases provides that worker wiring.
+No tensor, identifier, exception or source payload is permitted here.
+Exact canonical responses avoid general decoding.
+
+This client is not admission, a process launcher, CUDA synchronization or a hard
+watchdog. Caller authenticates/transfers the connected private socket, preserves
+fresh invocation ownership, and supplies bounded resource cleanup. It must close
+the separate ledger socket before acknowledging closed. External guardian owns
+failure cleanup and deadline enforcement even if a callback/kernel call hangs.
+"""
+
+from __future__ import annotations
+
+import os
+import socket
+import threading
+import time
+from contextlib import contextmanager
+
+from .posttraining_sft_peer_credentials_v1 import _close_received_rights
+from .posttraining_sft_phase_bridge_v1 import phases
+from .posttraining_sft_socket_transport_v2 import control_frame
+from .posttraining_sft_supervisor_v2 import SEQUENCE
+from .posttraining_sft_worker_client_v2 import ANCILLARY_BYTES, _socket_identity
+
+ERRORS = frozenset({"invalid_arguments", "owner_mismatch", "already_consumed", "reentry",
+                    "terminal_failure", "phase_rejected", "report_rejected", "wire_exhausted",
+                    "clock_rejected", "deadline_exhausted", "io_failed", "response_rejected",
+                    "descriptor_changed", "cleanup_failed"})
+
+
+class ControlError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "io_failed"
+        super().__init__(self.code)
+
+
+class WorkerControlClient:
+    def __init__(self, sock, *, invocation_index, deadline_ns, maximum_exchange_ns,
+                 maximum_wire_bytes, maximum_reads, interrupt, clock_ns=time.monotonic_ns):
+        if (hasattr(self, "_owner") or type(invocation_index) is not int
+                or not 0 <= invocation_index <= 2
+                or not all(type(n) is int and 0 < n < 2**63 for n in
+                           (deadline_ns, maximum_exchange_ns, maximum_wire_bytes, maximum_reads))
+                or not callable(interrupt) or not callable(clock_ns)):
+            raise ControlError("invalid_arguments") from None
+        identity = _socket_identity(sock, require_connected=True)
+        self._owner = os.getpid(), threading.get_ident()
+        self._interrupt, self._clock = interrupt, clock_ns
+        self._deadline, self._exchange = deadline_ns, maximum_exchange_ns
+        self._wire_cap, self._read_cap = maximum_wire_bytes, maximum_reads
+        _, start, stop, resumed = SEQUENCE[invocation_index]
+        self._phases = phases(invocation_index)
+        self._expected = {
+            "schema_version": "lumi.sft-worker-run-summary.v0.2", "state": "complete",
+            "stage": "complete", "failure_code": None, "failure_stage": None,
+            "completed_steps": stop-start, "saved_checkpoints": stop-start,
+            "restored_checkpoints": int(resumed), "os_admission_verified": False,
+            "os_resource_enforcement": False, "real_sft_execution_permitted": False,
+            "production_eligible": False,
+        }
+        self._state, self._failure = "ready", None
+        self._busy = self._interrupted = self._retired = False
+        self._wire = self._reads = self._sent = self._received = self._index = self._last = 0
+        self._now()  # Failed construction does not acquire the socket.
+        self._identity, self._sock = identity, sock
+
+    def _fail(self, code):
+        if not self._retired:
+            self._failure = self._failure or code
+            if not self._interrupted:
+                self._interrupted = True
+                try:
+                    self._interrupt()
+                except BaseException:
+                    pass
+        raise ControlError(code) from None
+
+    def _now(self):
+        try:
+            now = self._clock()
+        except BaseException:
+            self._fail("clock_rejected")
+        if type(now) is not int or not self._last <= now < 2**63:
+            self._fail("clock_rejected")
+        self._last = now
+        if now >= self._deadline:
+            self._fail("deadline_exhausted")
+        if self._failure is not None:
+            self._fail("terminal_failure")
+        return now
+
+    def _owned(self):
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+
+    def _charge(self, size):
+        if self._wire + size > self._wire_cap:
+            self._fail("wire_exhausted")
+        self._wire += size
+
+    def _timeout(self, end):
+        if _socket_identity(self._sock) != self._identity:
+            self._fail("descriptor_changed")
+        remaining = end - self._now()
+        if remaining <= 0:
+            self._fail("deadline_exhausted")
+        if _socket_identity(self._sock) != self._identity:
+            self._fail("descriptor_changed")
+        self._sock.settimeout(remaining / 1e9)
+
+    @contextmanager
+    def _operation(self, state):
+        self._owned()
+        if self._busy:
+            self._fail("reentry")
+        if self._failure:
+            self._fail("terminal_failure")
+        if self._state != state or self._sock is None:
+            self._fail("already_consumed")
+        self._busy = True
+        try:
+            end = min(self._deadline, self._now() + self._exchange)
+            yield end
+            if self._failure:
+                self._fail("terminal_failure")
+            if self._now() >= end:
+                self._fail("deadline_exhausted")
+        except ControlError:
+            raise
+        except TimeoutError:
+            self._fail("deadline_exhausted")
+        except BaseException:
+            self._fail("io_failed")
+        finally:
+            self._busy = False
+
+    def _send(self, raw, end):
+        offset = 0
+        while offset < len(raw):
+            self._timeout(end)
+            count = self._sock.send(raw[offset:])
+            if not 0 < count <= len(raw) - offset:
+                self._fail("io_failed")
+            offset += count
+            self._sent += count
+
+    def _receive(self, expected, end):
+        raw = bytearray()
+        while len(raw) < len(expected):
+            self._timeout(end)
+            if self._reads >= self._read_cap:
+                self._fail("wire_exhausted")
+            self._reads += 1
+            self._charge(ANCILLARY_BYTES)
+            cloexec = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+            block, ancillary, flags, _ = self._sock.recvmsg(
+                len(expected)-len(raw), ANCILLARY_BYTES, cloexec)
+            _, failed = _close_received_rights(ancillary)
+            if failed:
+                self._fail("cleanup_failed")
+            if ancillary or flags & ~cloexec or not block:
+                self._fail("response_rejected")
+            self._received += len(block)
+            raw.extend(block)
+            if raw != expected[:len(raw)]:
+                self._fail("response_rejected")
+
+    def _exchange_message(self, message, expected, end):
+        sent, reply = control_frame(message), control_frame(expected)
+        self._charge(len(sent) + len(reply))
+        self._send(sent, end)
+        self._receive(reply, end)
+
+    def phase(self, name, step):
+        with self._operation("ready") as end:
+            if (type(name) is not str or type(step) is not int
+                    or self._index >= len(self._phases)
+                    or (name, step) != self._phases[self._index]):
+                self._fail("phase_rejected")
+            self._exchange_message({"status": "phase", "phase": name, "step": step},
+                                   {"status": "phase_committed", "phase": name, "step": step}, end)
+            self._index += 1
+
+    def report_and_wait(self, summary, requests):
+        with self._operation("ready") as end:
+            if (self._index != len(self._phases) or type(summary) is not dict
+                    or set(summary) != set(self._expected)
+                    or any(type(summary[k]) is not type(v) or summary[k] != v
+                           for k, v in self._expected.items())
+                    or type(requests) is not int or not 0 < requests < 2**31):
+                self._fail("report_rejected")
+            self._exchange_message({"status": "report", "summary": summary, "requests": requests},
+                                   {"status": "release"}, end)
+            self._state = "released"
+
+    def retire(self, close_resources):
+        with self._operation("released") as end:
+            if not callable(close_resources):
+                self._fail("invalid_arguments")
+            try:
+                if close_resources() is not None:
+                    self._fail("cleanup_failed")
+            except BaseException:
+                self._fail("cleanup_failed")
+            raw = control_frame({"status": "closed"})
+            self._charge(len(raw))
+            self._send(raw, end)
+        self.close()
+
+    def close(self):
+        self._owned()
+        if self._busy:
+            self._fail("reentry")
+        if self._sock is None:
+            return
+        sock, self._sock = self._sock, None
+        try:
+            same = _socket_identity(sock) == self._identity
+        except BaseException:
+            same = False
+        if not same:
+            try:
+                sock.detach()
+            except BaseException:
+                pass
+            self._fail("descriptor_changed")
+        try:
+            sock.close()
+        except BaseException:
+            self._fail("cleanup_failed")
+        self._retired = True
+        self._state = "closed"
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-worker-control-summary.v0.2",
+                "state": self._state, "failure_code": self._failure,
+                "wire_capacity_reserved": self._wire, "read_calls": self._reads,
+                "bytes_sent": self._sent, "bytes_received": self._received,
+                "phases_completed": self._index, "execution_authorized": False,
+                "os_peer_identity_verified": False, "production_eligible": False}

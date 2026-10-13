@@ -1,0 +1,187 @@
+"""One stopped-host console read; fixed marker counts only, no SSH or mutation."""
+
+import base64
+import binascii
+import hashlib
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROOF = ROOT / "evidence/lumi-vm-attempt-013-cpu-execution-verification-v0.1.json"
+PROOF_SHA = "b4db8f71f727bb02980530410e716d4e7b182b8826db7cacf7af6716ae590067"
+ENTRY_SHA = "e5f5667065392ed07ab74f4adcb43b43743f85933c433a8eec94fed99af9b2a0"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-013-boot-marker-diagnostic-v0.1"
+CAP = 262144
+MARKERS = (
+    "wrapper_entry",
+    "wrapper_rejected",
+    "entry",
+    "identity",
+    "source",
+    "context",
+    "units",
+    "verify",
+    "reload",
+    "host_timer",
+    "setup_timer",
+    "proof",
+    "ready",
+    "setup_check",
+    "rejected",
+    "stop_failed",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("boot_marker_diagnostic_rejected") from None
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
+
+
+def analyze(reply, instance):
+    need(reply.get("InstanceId") == instance)
+    value = reply.get("Output")
+    need(type(value) is str and len(value) <= CAP)
+    raw = value.encode("utf-8")
+    need(len(raw) <= CAP)
+    encoded = False
+    try:
+        decoded = base64.b64decode(raw, validate=True)
+    except binascii.Error:
+        pass
+    else:
+        raw, encoded = decoded, True
+    need(len(raw) <= CAP)
+    counts = {
+        name: len(re.findall(b"LUMI_BOOT_V2:" + name.encode() + rb"(?=[\r\n]|$)", raw))
+        for name in MARKERS
+    }
+    return dict(console_bytes=len(raw), transport_base64=encoded, marker_counts=counts)
+
+
+def run():
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    need(hashlib.sha256(PROOF.read_bytes()).hexdigest() == PROOF_SHA)
+    proof = json.loads(PROOF.read_bytes())
+    need(proof["failure"]["deepest_saved_stage"] == "initial_boot_proof")
+    for name, pin in proof["source_bindings"].items():
+        p = Path(name)
+        need(not p.is_absolute() and ".." not in p.parts)
+        p = ROOT / p
+        need(not any(x.is_symlink() for x in (p, *p.parents)))
+        need(0 < p.stat().st_size <= 131072)
+        raw = p.read_bytes()
+        need(len(raw) == pin["bytes"] and hashlib.sha256(raw).hexdigest() == pin["sha256"])
+    need(
+        hashlib.sha256(
+            (ROOT / "scripts/execute_sft_vm_private_outer_v14.py").read_bytes()
+        ).hexdigest()
+        == ENTRY_SHA
+    )
+    from scripts import execute_sft_vm_private_outer_v14 as entry
+
+    entry.local_preconditions()
+    credentials = entry.outer.credentials
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+
+    def save(name, value):
+        raw = encode(value)
+        need(len(raw) <= 8192)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    save(
+        "started.json",
+        dict(
+            human_authorization="ok shuru kor; mama limit aiche kaj resume kor",
+            proof_sha256=PROOF_SHA,
+            maximum_seconds=180,
+            maximum_service_calls=3,
+            maximum_console_reads=1,
+            raw_text_retained=False,
+            mutation=False,
+            retry=False,
+        ),
+    )
+    start = time.monotonic()
+    reader = credentials.Reader(start + 180)
+    client = None
+    report = dict(
+        status="failed_closed",
+        stage="credentials",
+        ec2_calls=0,
+        console_reads=0,
+        cloud_mutations=0,
+        ssh_executed=False,
+        instance_action=False,
+        raw_console_retained=False,
+        model_reads=0,
+        retry=False,
+    )
+    try:
+        metadata = reader()
+        client = credentials.session().create_client(
+            "ec2",
+            region_name="us-east-1",
+            endpoint_url=credentials.endpoint("ec2"),
+            config=credentials.legacy.config("ec2"),
+            verify=credentials.ca_path(),
+            aws_access_key_id=metadata["access_key"],
+            aws_secret_access_key=metadata["secret_key"],
+            aws_session_token=metadata["token"],
+        )
+        instance = proof["outcome"]["instance"]
+        report["stage"] = "stopped_host_ownership"
+        reader.active()
+        report["ec2_calls"] += 1
+        with entry.outer.network.host.timeout(20):
+            response = client.describe_instances(InstanceIds=[instance])
+        need(not response.get("NextToken"))
+        rows = response["Reservations"]
+        need(len(rows) == 1 and rows[0]["OwnerId"] == "573978149073")
+        rows = rows[0]["Instances"]
+        need(len(rows) == 1)
+        row = rows[0]
+        need(row["InstanceId"] == instance and row["State"]["Name"] == "stopped")
+        need(row["InstanceType"] == "r6i.4xlarge")
+        need(sum(t.get("Key") == "LumiAttempt" for t in row["Tags"]) == 1)
+        need({t["Key"]: t["Value"] for t in row["Tags"]}["LumiAttempt"] == proof["attempt"])
+        need(
+            {v["Ebs"]["VolumeId"] for v in row["BlockDeviceMappings"]}
+            == set(proof["outcome"]["two_retained_ebs_ids"])
+        )
+        report["stopped_host_ownership_verified"] = True
+        reader.active()
+        report["stage"] = "one_console_read"
+        report["ec2_calls"] += 1
+        report["console_reads"] += 1
+        with entry.outer.network.host.timeout(20):
+            reply = client.get_console_output(InstanceId=instance, Latest=True)
+        report["stage"] = "aggregate_analysis"
+        report["aggregate"] = analyze(reply, instance)
+        reader.active()
+        report["status"] = "completed_current_console_marker_counts_only"
+    except Exception:
+        report["failure_code"] = "bounded_stage_failed"
+    finally:
+        if client is not None:
+            client.close()
+        reader.closed = True
+        report["credential_generations"] = reader.calls
+        report["elapsed_seconds"] = round(time.monotonic() - start, 3)
+        report["historical_proof_reply_reconstructed"] = False
+        save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    print(encode(run()).decode(), end="")

@@ -1,0 +1,334 @@
+"""Generated source/controls and object doubles; no actual installer or payload I/O."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_fullsize_addon_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_fullsize_sources_v1")
+IMPORTED = set(sys.modules) - before
+
+
+def bundle():
+    spec = importlib.util.spec_from_file_location("_lumi_fullsize_addon_control_fixture",
+        ROOT / "tests/test_sft_checkpoint_fullsize_entry_v1.py")
+    fixtures = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fixtures)
+    bodies, runtime = fixtures.fixture()
+    files = dict.fromkeys(m.REQUIRED_SOURCES, b"# generated inert source\n")
+    files.update({"lumi/" + name: raw for name, raw in runtime.items()})
+    manifest = m.sources.build_manifest(files)
+    entry = b"# generated fixed entry placeholder, not executable qualification\n"
+    # Only the exact frozen helper SOURCE is read; no model/input payload access.
+    helper = (ROOT / "scripts/run_checkpoint_guarded_import_v1.py").read_bytes()
+    mp, ep, nonce = m.worker.sha(manifest), m.worker.sha(entry), "9" * 64
+    control = m.worker.build_control(bodies, entry_sha256=ep, source_manifest_sha256=mp,
+                                    attempt_nonce_sha256=nonce)
+    return {"files": files, "manifest": manifest, "entry": entry, "helper": helper,
+        "control_raw": control, "control_bodies": bodies, "expected_manifest_sha256": mp,
+        "expected_entry_sha256": ep, "expected_control_sha256": m.worker.sha(control),
+        "expected_attempt_nonce_sha256": nonce}
+
+
+def rebind(arguments):
+    arguments["manifest"] = m.sources.build_manifest(arguments["files"])
+    arguments["expected_manifest_sha256"] = m.worker.sha(arguments["manifest"])
+    arguments["control_raw"] = m.worker.build_control(arguments["control_bodies"],
+        entry_sha256=arguments["expected_entry_sha256"],
+        source_manifest_sha256=arguments["expected_manifest_sha256"],
+        attempt_nonce_sha256=arguments["expected_attempt_nonce_sha256"])
+    arguments["expected_control_sha256"] = m.worker.sha(arguments["control_raw"])
+
+
+class OwnedDouble:
+    def __init__(self):
+        self.calls, self.writes = [], []
+        self.failure = None
+        self.owned = object.__new__(m.rootfs.OwnedRootfs)
+        owned = self.owned
+        owned._frozen = owned._tainted = False
+        owned._installed_files = owned._installed_bytes = owned._content_bytes = 0
+        owned._nodes = {(): ((), "directory", 0o755)}
+        owned._seen = set()
+        owned._limits = {"file": 262144, "total": 8 * 1024**2, "entries": 256}
+        owned._guard = self.guard
+        owned._verify_tree = self.verify
+        owned._write = self.write
+        owned.freeze = self.freeze
+
+    def guard(self):
+        self.calls.append("guard")
+        if self.owned._tainted or self.failure == "guard":
+            raise ValueError("PRIVATE GUARD FAILURE")
+
+    def verify(self):
+        self.calls.append("verify")
+        if self.failure == "verify":
+            raise ValueError("PRIVATE VERIFY FAILURE")
+
+    def write(self, parts, stream, size, mode):
+        self.calls.append("write")
+        raw = stream.read()
+        assert len(raw) == size and mode == 0o444
+        self.writes.append((parts, raw, mode))
+        for depth in range(1, len(parts)):
+            self.owned._nodes.setdefault(parts[:depth], ((), "directory", 0o755))
+        self.owned._nodes[parts] = ((), "file", mode)
+        self.owned._content_bytes += size
+        if self.failure == "write":
+            raise OSError("PRIVATE PARTIAL WRITE")
+
+    def freeze(self):
+        self.calls.append("freeze")
+        if self.failure == "freeze":
+            raise OSError("PRIVATE FREEZE FAILURE")
+        self.owned._frozen = True
+
+
+class FullsizeSourcesTests(unittest.TestCase):
+    def setUp(self):
+        self.arguments = bundle()
+        self.d = OwnedDouble()
+
+    def install(self, **overrides):
+        with patch.object(m, "_runtime"):
+            return m._install_admitted_once(self.d.owned, **(self.arguments | overrides))
+
+    def test_pure_validation_binds_sources_controls_and_four_pin_environment(self):
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            result = m.validate_bundle(**self.arguments)
+        self.assertEqual(result["addon_files"], len(self.arguments["files"]) + 12)
+        expected = (sum(map(len, self.arguments["files"].values()))
+            + len(self.arguments["manifest"]) + len(self.arguments["entry"])
+            + len(self.arguments["helper"]) + len(self.arguments["control_raw"])
+            + sum(map(len, self.arguments["control_bodies"].values())))
+        self.assertEqual(result["addon_bytes"], expected)
+        self.assertEqual(result["addon_content_write_bytes_reserved"], expected)
+        self.assertEqual(m.bootstrap.validate_environment(result["environment"]),
+                         result["environment"])
+        self.assertEqual(result["bindings"]["attempt_nonce_sha256"], "9" * 64)
+        self.assertEqual(result["helper_sha256"], m.HELPER_SHA256)
+        self.assertTrue(all(result[key] is False for key in m.FALSE_FLAGS))
+
+    def test_caps_and_destinations_are_exact_source_control_only(self):
+        self.assertEqual(m.MAXIMUM_ADDON_BYTES, 5191700)
+        self.assertEqual(m.MAXIMUM_ADDON_FILES, 140)
+        self.assertEqual(m.ENTRY_PATH, "opt/lumi-release/guardian/fullsize_entry.py")
+        self.assertEqual(m.CONTROL_PREFIX, "opt/lumi-release/fullsize-control/")
+        self.assertEqual(m.MANIFEST_PATH, m.sources.MANIFEST_PATH)
+        self.assertEqual(m.SOURCE_PREFIX, m.sources.SOURCE_PREFIX)
+
+    def test_every_required_module_is_required_even_with_rebound_manifest(self):
+        for name in m.REQUIRED_SOURCES:
+            arguments = copy.deepcopy(self.arguments)
+            del arguments["files"][name]
+            if name not in m.sources.REQUIRED:
+                rebind(arguments)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    m.FullsizeSourceError, "binding_rejected"):
+                m.validate_bundle(**arguments)
+
+    def test_helper_has_exact_frozen_bytes_not_caller_selected_hash(self):
+        original = self.arguments["helper"]
+        for helper in (original[:-1], original + b"x", b"x" * len(original), bytearray(original)):
+            with self.subTest(length=len(helper)), self.assertRaisesRegex(
+                    m.FullsizeSourceError, "binding_rejected"):
+                m.validate_bundle(**(self.arguments | {"helper": helper}))
+
+    def test_all_pins_and_body_mutations_reject(self):
+        for name in ("expected_manifest_sha256", "expected_entry_sha256",
+                     "expected_control_sha256", "expected_attempt_nonce_sha256"):
+            with self.subTest(pin=name), self.assertRaises(m.FullsizeSourceError):
+                m.validate_bundle(**(self.arguments | {name: "0" * 64}))
+        for name in ("manifest", "entry", "control_raw"):
+            with self.subTest(body=name), self.assertRaises(m.FullsizeSourceError):
+                m.validate_bundle(**(self.arguments | {name: self.arguments[name] + b"x"}))
+
+    def test_runtime_sources_are_cross_bound_to_control_resource_envelope(self):
+        for name in m.worker.RUNTIME_NAMES:
+            arguments = copy.deepcopy(self.arguments)
+            arguments["files"]["lumi/" + name] += b"# changed\n"
+            rebind(arguments)
+            with self.subTest(name=name), self.assertRaises(m.FullsizeSourceError):
+                m.validate_bundle(**arguments)
+
+    def test_valid_summary_is_detached_and_has_no_raw_control_or_source(self):
+        result = m.validate_bundle(**self.arguments)
+        self.assertNotIn("files", result)
+        self.assertNotIn("control_bodies", result)
+        self.assertNotIn("plan", result)
+        original = dict(result["environment"])
+        result["environment"].clear()
+        result["bindings"].clear()
+        self.assertEqual(m.validate_bundle(**self.arguments)["environment"], original)
+
+    def test_invalid_source_names_and_caps_reuse_frozen_validator(self):
+        for name, body in (("../escape.py", b"x"), ("lumi/extra.py", b"x" * 262145),
+                           ("lumi/extra.py", bytearray(b"x"))):
+            arguments = copy.deepcopy(self.arguments)
+            arguments["files"][name] = body
+            with self.subTest(name=name), self.assertRaises(m.FullsizeSourceError):
+                m.validate_bundle(**arguments)
+
+    def test_native_runtime_gate_precedes_bundle_or_owned_object_access(self):
+        with patch.object(m, "validate_bundle") as validate, \
+                patch("os.open", side_effect=AssertionError):
+            with self.assertRaisesRegex(m.FullsizeSourceError, "runtime_rejected"):
+                m._install_admitted_once(object(), **self.arguments)
+        validate.assert_not_called()
+        self.assertEqual(self.d.calls, [])
+
+    def test_public_installer_closed_even_with_arbitrary_authority_claims(self):
+        forbidden = Mock(side_effect=AssertionError)
+        with patch.object(m, "_runtime", forbidden), patch.object(m, "validate_bundle", forbidden):
+            for kwargs in ({}, {"approved": True}, {"owned": object(), **self.arguments}):
+                with self.assertRaisesRegex(m.FullsizeSourceError, "host_guard_not_bound"):
+                    m.install_fullsize_addon(**kwargs)
+        forbidden.assert_not_called()
+
+    def test_install_writes_only_absent_fixed_files_0444_accounts_and_freezes(self):
+        result = self.install()
+        expected = {m.ENTRY_PATH: self.arguments["entry"],
+            m.HELPER_PATH: self.arguments["helper"], m.MANIFEST_PATH: self.arguments["manifest"],
+            m.CONTROL_PREFIX + "control.json": self.arguments["control_raw"],
+            **{m.SOURCE_PREFIX + k: v for k, v in self.arguments["files"].items()},
+            **{m.CONTROL_PREFIX + k: v for k, v in self.arguments["control_bodies"].items()}}
+        self.assertEqual({"/".join(parts): raw for parts, raw, _mode in self.d.writes}, expected)
+        self.assertEqual(["/".join(row[0]) for row in self.d.writes], sorted(expected))
+        self.assertTrue(all(mode == 0o444 for _, _, mode in self.d.writes))
+        self.assertTrue(result["installation_frozen"])
+        self.assertTrue(all(result[key] is False for key in m.FALSE_FLAGS))
+        self.assertEqual(self.d.owned._installed_files, result["addon_files"])
+        self.assertEqual(self.d.owned._installed_bytes, result["addon_bytes"])
+        self.assertEqual(self.d.owned._content_bytes, result["addon_bytes"])
+        self.assertEqual(self.d.calls[-1], "freeze")
+        self.assertFalse(any(parts[0] in {"inputs", "outputs"} for parts in self.d.owned._nodes
+                             if parts))
+
+    def test_exact_rootfs_type_required_before_methods(self):
+        with patch.object(m, "_runtime"), self.assertRaisesRegex(
+                m.FullsizeSourceError, "installation_rejected"):
+            m._install_admitted_once(types.SimpleNamespace(**self.d.owned.__dict__),
+                                    **self.arguments)
+        self.assertEqual(self.d.calls, [])
+
+    def test_frozen_used_or_tainted_tree_cannot_install_or_retry(self):
+        for attr, value in (("_frozen", True), ("_installed_files", 1),
+                            ("_installed_bytes", 1), ("_tainted", True)):
+            self.d = OwnedDouble()
+            setattr(self.d.owned, attr, value)
+            with self.subTest(attr=attr), self.assertRaises(m.FullsizeSourceError):
+                self.install()
+            self.assertEqual(self.d.writes, [])
+        self.d = OwnedDouble()
+        self.install()
+        count = len(self.d.writes)
+        with self.assertRaises(m.FullsizeSourceError):
+            self.install()
+        self.assertEqual(len(self.d.writes), count)
+
+    def test_existing_control_importer_entry_helper_or_non_directory_parent_rejects(self):
+        for path in ("opt/lumi-release/importer", "opt/lumi-release/fullsize-control",
+                     m.ENTRY_PATH, m.HELPER_PATH, "opt/lumi-release"):
+            self.d = OwnedDouble()
+            parts = tuple(path.split("/"))
+            self.d.owned._nodes[parts] = ((), "file", 0o444)
+            with self.subTest(path=path), self.assertRaises(m.FullsizeSourceError):
+                self.install()
+            self.assertEqual(self.d.writes, [])
+            self.assertFalse(self.d.owned._tainted)
+
+    def test_seen_only_destinations_or_prefixes_cannot_be_reused(self):
+        for path in (m.ENTRY_PATH, "opt/lumi-release/fullsize-control/old.json",
+                     "opt/lumi-release/importer/old.py"):
+            self.d = OwnedDouble()
+            self.d.owned._seen.add(tuple(path.split("/")))
+            with self.subTest(path=path), self.assertRaises(m.FullsizeSourceError):
+                self.install()
+            self.assertEqual(self.d.writes, [])
+
+    def test_file_total_and_entry_caps_preflight_before_first_write(self):
+        for key in ("file", "total", "entries"):
+            self.d = OwnedDouble()
+            self.d.owned._limits[key] = 1
+            with self.subTest(key=key), self.assertRaises(m.FullsizeSourceError):
+                self.install()
+            self.assertEqual(self.d.writes, [])
+            self.assertFalse(self.d.owned._tainted)
+
+    def test_preflight_failure_does_not_taint_but_started_failure_always_does(self):
+        for failure in ("verify", "write", "freeze"):
+            self.d = OwnedDouble()
+            self.d.failure = failure
+            with self.subTest(failure=failure), self.assertRaisesRegex(
+                    m.FullsizeSourceError, "^installation_rejected$"):
+                self.install()
+            self.assertEqual(self.d.owned._tainted, failure != "verify")
+            count = len(self.d.writes)
+            with self.assertRaises(m.FullsizeSourceError):
+                self.install()
+            self.assertEqual(len(self.d.writes), count)
+
+    def test_post_write_accounting_mismatch_or_nonfreezing_freeze_taints(self):
+        for stage in ("accounting", "freeze"):
+            self.d = OwnedDouble()
+            if stage == "accounting":
+                original = self.d.write
+
+                def wrong_count(*args, write=original):
+                    write(*args)
+                    self.d.owned._content_bytes -= 1
+
+                self.d.owned._write = wrong_count
+            else:
+                self.d.owned.freeze = lambda: None
+            with self.subTest(stage=stage), self.assertRaises(m.FullsizeSourceError):
+                self.install()
+            self.assertTrue(self.d.owned._tainted)
+
+    def test_caller_mapping_mutation_after_validation_does_not_change_writes(self):
+        expected_files = dict(self.arguments["files"])
+        expected_controls = dict(self.arguments["control_bodies"])
+        original_guard = self.d.guard
+
+        def mutate():
+            self.arguments["files"].clear()
+            self.arguments["control_bodies"].clear()
+            original_guard()
+
+        self.d.owned._guard = mutate
+        self.install()
+        written = {"/".join(parts): raw for parts, raw, _mode in self.d.writes}
+        self.assertTrue(all(written[m.SOURCE_PREFIX + name] == raw
+                            for name, raw in expected_files.items()))
+        self.assertTrue(all(written[m.CONTROL_PREFIX + name] == raw
+                            for name, raw in expected_controls.items()))
+
+    def test_install_doubles_have_no_filesystem_network_or_native_actions(self):
+        with patch("builtins.open", side_effect=AssertionError), \
+                patch("os.open", side_effect=AssertionError), \
+                patch("os.fork", side_effect=AssertionError), \
+                patch("socket.socket", side_effect=AssertionError):
+            self.install()
+
+    def test_imports_no_ml_runtime_or_primary_package(self):
+        self.assertFalse({name.split(".")[0] for name in IMPORTED} & {
+            "lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers", "jax"})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,126 @@
+"""Same total budgets; bounded slow endpoint completion and fixed-code evidence."""
+
+import json
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_initial_provisioning_v3.py").read_text()
+source = source.replace("provision_sft_vm_host_v3", "provision_sft_vm_host_v4")
+inherited = types.ModuleType("endpoint_readiness_v4_inherited")
+inherited.__file__ = str(ROOT / "tests/test_sft_vm_initial_provisioning_v3.py")
+exec(compile(source, inherited.__file__, "exec"), inherited.__dict__)
+m = inherited.m
+
+
+class PublicKeyV4Tests(inherited.PublicKeyTests):
+    pass
+
+
+class InitialV4Tests(inherited.InitialV3Tests):
+    pass
+
+
+class EndpointV4Tests(inherited.ProvisionV3Tests):
+    def endpoint(self, action):
+        original = self.cloud.cli
+        def cli(service, operation, **fields):
+            value = original(service, operation, **fields)
+            if operation == "describe-instance-connect-endpoints":
+                action(value)
+            return value
+        self.cloud.cli = cli
+
+    def test_never_ready_endpoint_has_bounded_observations_and_no_launch_retry(self):
+        self.endpoint(lambda v: v["InstanceConnectEndpoints"][0].update(
+            State="create-in-progress"))
+        with self.assertRaises(ValueError):
+            self.call()
+        report = self.report()
+        self.assertEqual(report["endpoint_check"], "endpoint_deadline")
+        self.assertLessEqual(report["endpoint_polls"], 40)
+        self.assertLessEqual(self.now - 100, 550)
+        self.assertEqual(self.cloud.launch_count, 0)
+        self.assertEqual(report["endpoint_last_state"], "create-in-progress")
+
+    def test_slow_completion_after_old_cutoff_reaches_setup_once(self):
+        self.endpoint(lambda v: v["InstanceConnectEndpoints"][0].update(
+            State="create-in-progress" if self.now < 400 else "create-complete"))
+        result = self.call()
+        self.assertTrue(result["report"]["setup_completed"])
+        self.assertEqual(self.cloud.launch_count, 1)
+        self.assertEqual(result["report"]["endpoint_check"], "endpoint_ready")
+        self.assertLessEqual(result["report"]["endpoint_polls"], 40)
+        self.assertEqual(sum(op == "create-instance-connect-endpoint"
+                             for _, op, _ in self.cloud.calls), 1)
+
+    def test_terminal_state_and_unknown_text_are_sanitized(self):
+        self.endpoint(lambda v: v["InstanceConnectEndpoints"][0].update(
+            State="private-error-value", StateMessage="private-error-message"))
+        with self.assertRaises(ValueError):
+            self.call()
+        report = self.report()
+        self.assertEqual(report["endpoint_check"], "endpoint_state")
+        self.assertEqual(report["endpoint_last_state"], "unknown")
+        self.assertNotIn("private-error", json.dumps(report))
+        self.assertEqual(self.cloud.launch_count, 0)
+
+    def test_wrong_ownership_still_rejected(self):
+        self.endpoint(lambda v: v["InstanceConnectEndpoints"][0].update(Tags=[]))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.report()["endpoint_check"], "endpoint_ownership")
+        self.assertEqual(self.cloud.launch_count, 0)
+
+    def test_late_success_response_does_not_extend_deadline(self):
+        def slow(value):
+            self.now += 551
+        self.endpoint(slow)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.report()["endpoint_check"], "endpoint_deadline")
+        self.assertEqual(self.cloud.launch_count, 0)
+
+    def test_transport_failure_is_not_retried_or_printed(self):
+        def fail(value):
+            raise TimeoutError("private-transport")
+        self.endpoint(fail)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.report()["endpoint_polls"], 1)
+        self.assertEqual(self.report()["endpoint_check"], "endpoint_readback")
+        self.assertNotIn("private-transport", json.dumps(self.report()))
+
+    def test_pagination_is_rejected(self):
+        self.endpoint(lambda v: v.update(NextToken="opaque"))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.report()["endpoint_check"], "endpoint_pagination")
+        self.assertEqual(self.cloud.launch_count, 0)
+
+    def transaction(self):
+        self.output.mkdir(mode=0o700)
+        return m.Transaction(self.output, self.cloud, lambda: self.now,
+                             self.sleep, lambda: None)
+
+    def test_consumed_resource_window_does_not_reset_at_endpoint(self):
+        transaction = self.transaction()
+        self.now += 540
+        with self.assertRaises(ValueError):
+            transaction.wait_endpoint("unused", "unused")
+        self.assertEqual(transaction.endpoint_polls, 0)
+        self.assertEqual(transaction.check, "endpoint_deadline")
+
+    def test_original_setup_deadline_remains_1800_seconds(self):
+        transaction = self.transaction()
+        self.assertEqual(transaction.deadline - transaction.started, 1800)
+        self.assertEqual(m.MAX_CALLS, 160)
+
+    def test_backwards_clock_during_readback_is_rejected(self):
+        def backwards(value):
+            self.now -= 1
+        self.endpoint(backwards)
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.report()["endpoint_check"], "endpoint_deadline")
+        self.assertEqual(self.cloud.launch_count, 0)

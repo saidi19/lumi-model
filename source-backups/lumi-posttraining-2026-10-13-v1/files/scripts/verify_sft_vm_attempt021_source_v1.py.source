@@ -1,0 +1,149 @@
+"""Offline semantic verification of the repaired attempt-021 source release."""
+
+import ast
+import importlib
+import json
+import os
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt021_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-attempt-021-source-v0.1"
+RELEASE_SHA = "5cc27a9dc616baff2138aa81bd0d85a3089a33863fdc20270c71f7b7b0319409"
+BUILDER_SHA = "d7749baba6ded653d67de4ac6675e84085fb46412f47a041d3b28e0bc646e580"
+TEST = ROOT / "tests/test_sft_vm_attempt021_setup_contract_v1.py"
+TEST_SHA = "18ede141df5373c120961e64ac6bdf9e1a752a49c77bf54ba48605fddd8f0a1b"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-021-source-verification-v0.1.json"
+need, sha, read = source.need, source.sha, source.read
+
+
+def outer_check():
+    names = {Path(name).stem for name in RELEASE.joinpath("scripts").glob("*.py")}
+    previous = {name: sys.modules.pop(name) for name in names if name in sys.modules}
+    path = str(RELEASE / "scripts")
+    sys.path.insert(0, path)
+    try:
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        need(Path(outer.__file__).resolve() == RELEASE / "scripts/run_sft_vm_private_outer_v7.py")
+        outer.authenticate()  # Includes the actual pre-allocation receipt guard.
+        outer.loading.fresh_identity()
+        need(outer.network.selection.ATTEMPT == source.NEW)
+    finally:
+        sys.path.remove(path)
+        for name in names:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous)
+
+
+def verify():
+    read(Path(source.__file__), BUILDER_SHA)
+    read(Path(source.repair.__file__), source.REPAIR_SHA)
+    read(TEST, TEST_SHA)
+    release = json.loads(read(RELEASE / "release.json", RELEASE_SHA))
+    need(
+        release["attempt"] == source.NEW
+        and release["operational_predecessor"] == source.OLD
+        and release["base_release_sha256"] == source.BASE_SHA
+        and release["predecessor_failure_sha256"] == source.FAILURE_SHA
+        and release["repair_implementation_sha256"] == source.REPAIR_SHA
+        and release["sender_receiver_receipts_equal"] is True
+        and release["receipt_file_count"] == 19
+        and release["receipt_contract_guard_before_paid_allocation"] is True
+        and release["execution_permitted"] is False
+        and release["old_authorization_reused"] is False
+        and release["real_linux_or_remote_transfer_qualified"] is False
+        and len(release["outputs"]) == 156
+    )
+    bodies = {}
+    for name, pin in release["outputs"].items():
+        relative = Path(name)
+        need(not relative.is_absolute() and ".." not in relative.parts)
+        bodies[name] = read(RELEASE / relative, pin["sha256"], pin["bytes"])
+        if name.endswith(".py"):
+            ast.parse(bodies[name])
+    base = json.loads(read(source.BASE / "release.json", source.BASE_SHA))
+    # Verify the complete consumed predecessor, not just its summary flags.
+    for name, pin in base["outputs"].items():
+        read(source.BASE / name, pin["sha256"], pin["bytes"])
+    failure = json.loads(read(source.FAILURE, source.FAILURE_SHA))
+    for name, digest in failure["source_bindings"].items():
+        read(ROOT / name, digest)
+    sender = bodies[source.SETUP_SEND]
+    stage = bodies[source.SETUP_STAGE]
+    archive = bodies[source.SETUP_TAR]
+    receipt = source.repair.check(sender, stage, archive, RELEASE / source.SETUP_STAGE)
+    need(receipt["files"] == 19 and receipt["host_admitted"] is False)
+    pins = source.constants(sender)
+    need(pins["ARCHIVE_SHA"] == sha(archive) and pins["ARCHIVE_BYTES"] == len(archive))
+    need(pins["RECEIVER_SHA"] == sha(stage) and pins["RECEIVER_BYTES"] == len(stage))
+    bootstrap = bodies["scripts/start_sft_vm_setup_bootstrap_v5.py"]
+    need(b"sender.validate_receipt_contract(content)" in bootstrap)
+    need(
+        bootstrap.index(b"sender.validate_receipt_contract(content)")
+        < bootstrap.index(b"argv = sender.command")
+    )
+    outer_check()
+    return {
+        "schema": "lumi.vm-attempt021-source-verification.v0.1",
+        "attempt": source.NEW,
+        "status": "verified_local_receipt_contract_repair",
+        "source_release_sha256": RELEASE_SHA,
+        "builder_sha256": BUILDER_SHA,
+        "repair_sha256": source.REPAIR_SHA,
+        "test_sha256": TEST_SHA,
+        "predecessor_failure_sha256": source.FAILURE_SHA,
+        "source_bindings": release["outputs"],
+        "receipt_contract": {
+            "file_count": 19,
+            "sender_and_receiver_full_receipts_equal": True,
+            "file_count_derived_from_manifest": True,
+            "guard_before_remote_seed": True,
+            "guard_before_paid_allocation": True,
+            "native_parser_transport_and_caps_unchanged": True,
+            "fixed_failure_stages": [
+                "before_dispatch",
+                "exchange",
+                "receipt_decode",
+                "receipt_contract",
+            ],
+        },
+        "qualification": {
+            "actual_archive_staging_and_receipt_sender_join_tested": True,
+            "native_boundary_and_root_ownership_mocked": True,
+            "ssh_and_remote_seed_mocked": True,
+            "real_linux_or_remote_transfer_qualified": False,
+            "offline_contract_tests_passed": 13,
+            "socket_and_process_creation_blocked_during_tests": True,
+            "ruff": "passed",
+        },
+        "prior_evidence_byte_for_byte_preserved": True,
+        "aws_calls": 0,
+        "cloud_mutations": 0,
+        "new_execution_authorized": False,
+        "gate_5_complete": False,
+        "real_4b_import": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    report = write() if len(sys.argv) == 2 else verify()
+    print(
+        json.dumps(
+            {"status": report["status"], "source_release_sha256": RELEASE_SHA}, sort_keys=True
+        )
+    )

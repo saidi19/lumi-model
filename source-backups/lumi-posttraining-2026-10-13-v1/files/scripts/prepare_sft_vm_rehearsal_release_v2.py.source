@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Build a source-only rehearsal archive; no AWS, runtime install or model data."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import io
+import json
+import re
+import tarfile
+from pathlib import Path
+
+SEEDS = (
+    "scripts/run_sft_import_vm_rehearsal_v2.py",
+    "src/lumi/posttraining_import_vm_rehearsal_v2.py",
+    "tests/test_sft_checkpoint_import_integration_v2.py",
+)
+LOCK = "configs/lumi-sft-linux-cpu-release-v0.1.lock.json"
+LOCK_SHA256 = "26bde6a0163e5db9d8d4564117546482601f4d0beb09f8705be5fc9183594965"
+MAXIMUM_FILE = 1024 * 1024
+MAXIMUM_TOTAL = 64 * 1024 * 1024
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def module_file(root, name):
+    if not re.fullmatch(r"(?:lumi|tests)(?:\.[A-Za-z_][A-Za-z0-9_]*)*", name):
+        return None
+    relative = ("src/" if name.startswith("lumi") else "") + name.replace(".", "/")
+    relative += "/__init__.py" if name in {"lumi", "tests"} else ".py"
+    candidate = root / relative
+    return relative if candidate.is_file() else None
+
+
+def source_closure(root):
+    """Conservative local import closure; validate separately from this archive."""
+    pending = list(SEEDS)
+    sources = {}
+    while pending:
+        relative = pending.pop()
+        if relative in sources:
+            continue
+        if not re.fullmatch(r"(?:src/lumi|tests|scripts)/[A-Za-z0-9_]+\.py", relative):
+            raise ValueError("source_path_rejected")
+        path = root / relative
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > MAXIMUM_FILE:
+            raise ValueError("source_file_rejected")
+        raw = path.read_bytes()
+        sources[relative] = raw
+        if len(sources) > 4096 or sum(map(len, sources.values())) > MAXIMUM_TOTAL:
+            raise ValueError("source_budget_exceeded")
+        tree = ast.parse(raw, filename=relative)
+        package = "lumi" if relative.startswith("src/lumi/") else "tests"
+        names = {package} if not relative.startswith("scripts/") else set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level > 1:
+                    raise ValueError("unsupported_relative_import")
+                base = ((package + ".") if node.level else "") + (node.module or "")
+                base = base.rstrip(".")
+                names.add(base)
+                names.update(base + "." + alias.name for alias in node.names)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                # Includes literal importlib module names and fixed test selectors.
+                if node.value.startswith(("lumi.", "tests.")):
+                    names.add(node.value)
+        for name in names:
+            found = module_file(root, name)
+            if found:
+                pending.append(found)
+    return dict(sorted(sources.items()))
+
+
+def build(root, output):
+    sources = source_closure(root)
+    lock_raw = (root / LOCK).read_bytes()
+    if digest(lock_raw) != LOCK_SHA256:
+        raise ValueError("runtime_lock_changed")
+    manifest = canonical({name: digest(raw) for name, raw in sources.items()})
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    archive = output / "source-release.tar.gz"
+    members = sources | {"release-manifest.json": manifest, "runtime-lock.json": lock_raw}
+    with tarfile.open(archive, "w:gz") as bundle:
+        for name, raw in sorted(members.items()):
+            member = tarfile.TarInfo(name)
+            member.size = len(raw)
+            member.mode = 0o644
+            member.uid = member.gid = member.mtime = 0
+            bundle.addfile(member, io.BytesIO(raw))
+    archive.chmod(0o600)
+    report = {
+        "schema": "lumi.sft-vm-rehearsal-source-build.v0.2",
+        "source_files": len(sources), "source_bytes": sum(map(len, sources.values())),
+        "manifest_sha256": digest(manifest), "runtime_lock_sha256": LOCK_SHA256,
+        "archive_bytes": archive.stat().st_size,
+        "archive_sha256": digest(archive.read_bytes()),
+        "source_manifest": json.loads(manifest),
+        "runtime_installed": False, "uploaded": False, "native_execution": False,
+        "real_checkpoint_or_dataset_included": False,
+    }
+    (output / "build.json").write_bytes(canonical(report))
+    (output / "build.json").chmod(0o600)
+    return {key: value for key, value in report.items() if key != "source_manifest"}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    print(json.dumps(build(root, args.output.resolve()), sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
+

@@ -1,0 +1,371 @@
+"""Bounded attempt-010 inert deployment entry; no authority from a template.
+
+Uses the source-pinned deployment unchanged. Adds explicit approval, one-shot
+output, shared deadline/call budget, exact request allowlist and durable request
+receipts. No invocation, scheduler creation, instance action, retry or deletion.
+"""
+
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+HELPER = ROOT / "scripts/prepare_sft_vm_deployment_bindings_v2.py"
+HELPER_SHA = "12434944cb6ec8f8b13409f97beb3fe2fdad1c06dc0374821b385821f97d17e2"
+PLAN = ROOT / "configs/lumi-vm-attempt-010-deployment-plan-v0.1.json"
+PLAN_SHA = "f0e9c9ff91fa4fc5990f47e54e54f45c84660cfd1b111d766bd79fec09eab81a"
+PROPOSAL = ROOT / "configs/lumi-vm-attempt-010-watchdog-execution-proposal-v0.1.json"
+APPROVAL = ROOT / "configs/lumi-vm-attempt-010-watchdog-execution-approval-v0.1.json"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-010-watchdog-deployment-v0.1"
+SECONDS, CALLS = 600, 45
+
+
+def need(value):
+    if not value:
+        raise ValueError("inert_watchdog_entry_rejected") from None
+
+
+def encode(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+    ).encode()
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            need(key not in result)
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def read(path):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 131072)
+    raw = path.read_bytes()
+    need(len(raw) <= 131072)
+    return raw
+
+
+def sources():
+    need(sha(read(HELPER)) == HELPER_SHA and sha(read(PLAN)) == PLAN_SHA)
+    spec = importlib.util.spec_from_file_location("_inert_scope_helper", HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    helper = helper.bound_builder()
+    blobs, pins = helper.inputs()
+    plan = decode(read(PLAN))
+    need(helper.encode(plan) == helper.encode(helper.build(blobs, pins)))
+    worker = helper.module(blobs[helper.SOURCES[0]], "sft_vm_external_watchdog_v1")
+    deployer = helper.module(
+        blobs[helper.SOURCES[1]],
+        "prepare_sft_vm_external_watchdog_v1",
+        {"sft_vm_external_watchdog_v1": worker},
+    )
+    need(
+        base64.b64encode(hashlib.sha256(deployer.package()).digest()).decode()
+        == plan["watchdog"]["expected_code_sha256_base64"]
+    )
+    return plan, deployer
+
+
+def expected_proposal():
+    need(sha(read(PLAN)) == PLAN_SHA)
+    return dict(
+        schema="lumi.vm-attempt-010-watchdog-execution-proposal.v0.1",
+        status="prepared_not_authorized",
+        plan_sha256=PLAN_SHA,
+        helper_sha256=HELPER_SHA,
+        entry_sha256=sha(read(Path(__file__))),
+        output="artifacts/lumi-vm-attempt-010-watchdog-deployment-v0.1",
+        maximum_seconds=SECONDS,
+        maximum_control_calls=CALLS,
+        maximum_new_roles=2,
+        maximum_new_functions=1,
+        maximum_new_log_groups=1,
+        maximum_local_receipt_bytes=1048576,
+        invocation=False,
+        schedule_creation=False,
+        bucket_policy_mutation=False,
+        instance_action=False,
+        gpu=False,
+        training=False,
+        retry=False,
+        rollback=False,
+        execution_permitted=False,
+    )
+
+
+def authorize():
+    raw = read(PROPOSAL)
+    need(encode(decode(raw)) == encode(expected_proposal()))
+    approval = decode(read(APPROVAL))
+    message = approval.get("human_message")
+    need(type(message) is str and 0 < len(message.strip()) <= 4096)
+    expected = dict(
+        schema="lumi.vm-attempt-010-watchdog-execution-approval.v0.1",
+        status="explicit_human_approval_recorded",
+        human_message=message,
+        proposal_sha256=sha(raw),
+        entry_sha256=sha(read(Path(__file__))),
+        plan_sha256=PLAN_SHA,
+        scope="one_inert_watchdog_deployment_only",
+        approved_execution_count=1,
+        maximum_seconds=SECONDS,
+        maximum_control_calls=CALLS,
+        preserve_partial_resources_on_failure=True,
+        invocation=False,
+        schedule_creation=False,
+        bucket_policy_mutation=False,
+        instance_action=False,
+        gpu=False,
+        training=False,
+        retry=False,
+        rollback=False,
+    )
+    need(encode(approval) == encode(expected))
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    return approval
+
+
+def allowed_requests(d):
+    """Every request's exact fields, derived from the pinned deployer."""
+    allowed = {}
+
+    def add(service, operation, **fields):
+        allowed.setdefault((service, operation), set()).add(encode(fields))
+
+    add("sts", "get-caller-identity")
+    add("scheduler", "get-schedule-group", Name=d.GROUP)
+    for name, trust, policy in d.policies():
+        add("iam", "get-role", RoleName=name)
+        add(
+            "iam",
+            "create-role",
+            RoleName=name,
+            Path=d.PATH,
+            AssumeRolePolicyDocument=d.compact(trust),
+            MaxSessionDuration=3600,
+            Tags=[dict(Key="LumiAttempt", Value=d.ATTEMPT)],
+        )
+        add(
+            "iam",
+            "put-role-policy",
+            RoleName=name,
+            PolicyName=d.POLICY,
+            PolicyDocument=d.compact(policy),
+        )
+        add("iam", "get-role-policy", RoleName=name, PolicyName=d.POLICY)
+    add("logs", "describe-log-groups", logGroupNamePrefix=d.LOG_GROUP, limit=50)
+    add("logs", "create-log-group", logGroupName=d.LOG_GROUP, tags={"LumiAttempt": d.ATTEMPT})
+    add("logs", "put-retention-policy", logGroupName=d.LOG_GROUP, retentionInDays=7)
+    for op in (
+        "get-function-configuration",
+        "get-function-concurrency",
+        "get-function-event-invoke-config",
+    ):
+        add("lambda", op, FunctionName=d.FUNCTION)
+    add(
+        "lambda",
+        "create-function",
+        FunctionName=d.FUNCTION,
+        Runtime="python3.13",
+        Role=d.BASE + d.WORKER_ROLE,
+        Handler="watchdog.handler",
+        Code={"ZipFile": base64.b64encode(d.package()).decode()},
+        Description="Unarmed stop-only guard for one Lumi attempt; no model data access",
+        Timeout=180,
+        MemorySize=128,
+        Publish=False,
+        Environment=d.UNARMED,
+        Architectures=["arm64"],
+        EphemeralStorage={"Size": 512},
+        Tags={"LumiAttempt": d.ATTEMPT},
+    )
+    add(
+        "lambda",
+        "put-function-concurrency",
+        FunctionName=d.FUNCTION,
+        ReservedConcurrentExecutions=0,
+    )
+    add(
+        "lambda",
+        "put-function-event-invoke-config",
+        FunctionName=d.FUNCTION,
+        MaximumRetryAttempts=0,
+        MaximumEventAgeInSeconds=60,
+    )
+    return allowed
+
+
+class Transport:
+    def cli(self, service, operation, **fields):
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("AWS_")
+            and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                service,
+                operation,
+                "--cli-input-json",
+                encode(fields).decode(),
+                "--region",
+                "us-east-1",
+                "--cli-binary-format",
+                "base64",
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=40,
+            env=env,
+        )
+        need(len(result.stdout) <= 131072 and len(result.stderr) <= 8192)
+        if result.returncode:
+            absence = {
+                ("iam", "get-role"): b"(NoSuchEntity)",
+                ("lambda", "get-function-configuration"): b"(ResourceNotFoundException)",
+                ("scheduler", "get-schedule-group"): b"(ResourceNotFoundException)",
+            }
+            if absence.get((service, operation), b"__no_absence__") in result.stderr:
+                raise LookupError("absent") from None
+            raise ValueError("watchdog_control_call_failed") from None
+        return decode(result.stdout) if result.stdout.strip() else {}
+
+
+class BoundedCloud:
+    def __init__(self, deployer, transport, save, *, clock=time.monotonic, wait=time.sleep):
+        self.allowed = allowed_requests(deployer)
+        self.transport, self.save, self.clock, self.sleeper = transport, save, clock, wait
+        self.start, self.calls, self.response_bytes = clock(), 0, 0
+        self.mutations = set()
+
+    def cli(self, service, operation, **fields):
+        key = (service, operation)
+        raw = encode(fields)
+        need(raw in self.allowed.get(key, set()))
+        need(self.calls < CALLS and 0 <= self.clock() - self.start < SECONDS - 40)
+        mutation = operation.startswith(("create-", "put-"))
+        fingerprint = (key, raw)
+        if mutation:
+            need(fingerprint not in self.mutations)
+            self.mutations.add(fingerprint)
+        self.calls += 1
+        prefix = f"call-{self.calls:02d}"
+        receipt = dict(
+            service=service, operation=operation, request_sha256=sha(raw), mutation=mutation
+        )
+        self.save(prefix + "-started.json", receipt)
+        try:
+            answer = self.transport.cli(service, operation, **fields)
+        except LookupError:
+            self.save(prefix + "-result.json", dict(receipt, status="absent"))
+            raise
+        except Exception:
+            self.save(prefix + "-result.json", dict(receipt, status="unconfirmed_no_retry"))
+            raise
+        self.response_bytes += len(encode(answer))
+        need(self.response_bytes <= 1048576 and self.clock() - self.start < SECONDS)
+        self.save(prefix + "-result.json", dict(receipt, status="acknowledged"))
+        return answer
+
+    def wait(self, seconds):
+        need(seconds == 15 and 0 <= self.clock() - self.start < SECONDS - seconds - 40)
+        self.sleeper(seconds)
+        need(self.clock() - self.start < SECONDS)
+
+
+def run(*, transport=None, clock=time.monotonic, wait=time.sleep):
+    approval = authorize()
+    plan, deployer = sources()
+    OUTPUT.mkdir(mode=0o700, parents=False, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = encode(value)
+        need(len(raw) <= 8192 and written + len(raw) <= 1048576 - 32768)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    save(
+        "entry-started.json",
+        dict(
+            approval_sha256=sha(encode(approval)),
+            entry_sha256=sha(read(Path(__file__))),
+            plan_sha256=PLAN_SHA,
+            maximum_seconds=SECONDS,
+            maximum_control_calls=CALLS,
+            attempt=plan["attempt"],
+        ),
+    )
+    cloud = BoundedCloud(deployer, transport or Transport(), save, clock=clock, wait=wait)
+    stage, deployment = "identity", None
+    try:
+        need(cloud.cli("sts", "get-caller-identity")["Account"] == plan["account"])
+        stage = "schedule_group_absence"
+        try:
+            cloud.cli("scheduler", "get-schedule-group", Name=deployer.GROUP)
+        except LookupError:
+            pass
+        else:
+            need(False)
+        stage = "pinned_inert_deployment"
+        deployment = deployer.deploy(OUTPUT / "deployment", cloud, wait=cloud.wait)
+        need(deployment["status"] == "deployed_unarmed_invocation_disabled")
+        status = "deployed_unarmed_invocation_disabled"
+    except Exception:
+        status = "stopped_no_retry_preserve_partial"
+    result = dict(
+        status=status,
+        stage=stage,
+        total_control_calls=cloud.calls,
+        mutation_dispatches=len(cloud.mutations),
+        response_bytes=cloud.response_bytes,
+        elapsed_seconds=round(clock() - cloud.start, 3),
+        deployment=deployment,
+        gate_5_complete=False,
+        instance_actions=0,
+        invocation=False,
+        schedule_creation=False,
+        bucket_policy_mutation=False,
+        gpu=False,
+        training=False,
+        retry=False,
+        rollback=False,
+    )
+    save("entry-result.json", result)
+    return result
+
+
+if __name__ == "__main__":
+    print(encode(run()).decode(), end="")

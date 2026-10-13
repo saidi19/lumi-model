@@ -1,0 +1,257 @@
+"""Offline production-bootstrap controller replay; no cloud or SSH dispatch."""
+
+import base64
+import json
+import socket
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_setup_production_probe_v1 as builder
+from scripts import qualify_sft_vm_setup_production_v1 as m
+from tests import test_sft_vm_setup_transfer_qualification_v1 as previous
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.seed, cls.receiver, cls.archive = m.authenticate()
+
+    def setUp(self):
+        for target in ("run", "Popen"):
+            self.enterContext(
+                patch.object(m.subprocess, target, side_effect=AssertionError("live"))
+            )
+        self.enterContext(
+            patch.object(socket, "create_connection", side_effect=AssertionError("live"))
+        )
+        self.enterContext(patch.object(previous, "m", m))
+
+    def cloud(self, *, remaining_volumes=False, **options):
+        cloud, now, calls = previous.Tests().cloud(**options)
+        original = cloud.call
+
+        def call(operation, **fields):
+            value = original(operation, **fields)
+            if operation == "get_console_output" and value.get("Output"):
+                key = base64.b64encode(
+                    b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + b"x" * 32
+                ).decode()
+                value = dict(
+                    InstanceId=fields["InstanceId"],
+                    Output="-----BEGIN SSH HOST KEY KEYS-----\nssh-ed25519 "
+                    + key
+                    + "\n-----END SSH HOST KEY KEYS-----",
+                )
+            if operation == "describe_instances" and fields.get("InstanceIds") != [m.RETAINED]:
+                for reservation in value["Reservations"]:
+                    for vm in reservation["Instances"]:
+                        vm["PrivateIpAddress"] = "172.31.97.72"
+                        vm["BlockDeviceMappings"] = [
+                            dict(DeviceName=d, Ebs=dict(VolumeId=v))
+                            for d, v in (
+                                ("/dev/sda1", "vol-11111111111111111"),
+                                ("/dev/sdf", "vol-22222222222222222"),
+                            )
+                        ]
+            if operation == "describe_volumes" and "Filters" in fields:
+                value = dict(
+                    Volumes=[{"VolumeId": "vol-11111111111111111"}] if remaining_volumes else []
+                )
+            return value
+
+        cloud.call = call
+        return cloud, now, calls
+
+    def replay(self, *, bad_receipt=False, exchange_failure=False, bad_proof=False, **options):
+        cloud, now, calls = self.cloud(**options)
+        machine, boot = "a" * 32, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        proof = dict(
+            self.seed.initial.BASE,
+            attempt=m.OWNER_ATTEMPT,
+            source_sha256=self.seed.initial.EARLY_SHA,
+            machine_id=machine,
+            boot_id=boot,
+            early_timers_armed=True,
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14400,
+            observed_boottime=90,
+        )
+        if bad_proof:
+            proof["early_timers_armed"] = False
+        identity = dict(
+            schema="lumi.vm-setup-seed.v0.1",
+            attempt=m.OWNER_ATTEMPT,
+            machine_id=machine,
+            boot_id=boot,
+            observed_boottime=100,
+            setup_deadline_boottime=1800,
+            receipt_parents_created=True,
+            host_admitted=False,
+            expiry_enforced=False,
+            execution_permitted=False,
+            retry_allowed=False,
+        )
+        receipt = self.seed.sender.expected_receipt()
+        if bad_receipt:
+            receipt["files"] = 18
+        control = Mock(side_effect=[json.dumps(proof).encode(), json.dumps(identity).encode()])
+        transfer = Mock(return_value=json.dumps(receipt).encode())
+        if exchange_failure:
+            diagnostic = dict(
+                schema="lumi.vm-setup-exchange-diagnostic.v0.1",
+                phase="exit",
+                kind="validation",
+                exit_code=2,
+                stdin_bytes_written=4096,
+                stdout_bytes_seen=90,
+                remote_failure_code="receiver",
+            )
+            transfer.side_effect = self.seed.sender.SetupExchangeFailure(diagnostic)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory).resolve() / "attempt"
+            with (
+                patch.object(m, "OUT", out),
+                patch.object(self.seed.sender.delivery, "pipe_exchange", control),
+                patch.object(self.seed.sender, "pipe_exchange", transfer),
+            ):
+                result = m.execute(
+                    cloud,
+                    self.seed,
+                    self.receiver,
+                    self.archive,
+                    clock=lambda: now[0],
+                    sleep=lambda s: now.__setitem__(0, now[0] + s),
+                )
+                outputs = {p.name: p.read_bytes() for p in out.iterdir()}
+        return result, calls, control, transfer, outputs
+
+    def test_reproducible_entry(self):
+        self.assertEqual(m.read(Path(m.__file__)), builder.source())
+
+    def test_production_boot_and_disposable_disks(self):
+        fields = m.launch_fields()
+        self.assertEqual(fields["UserData"], self.seed.initial.user_data())
+        self.assertEqual(m.sha(fields["UserData"]), builder.BOOT_SHA)
+        self.assertEqual([d["Ebs"]["VolumeSize"] for d in fields["BlockDeviceMappings"]], [8, 1])
+        self.assertTrue(
+            all(
+                d["Ebs"]["Encrypted"] and d["Ebs"]["DeleteOnTermination"]
+                for d in fields["BlockDeviceMappings"]
+            )
+        )
+        self.assertNotIn("IamInstanceProfile", fields)
+
+    def test_success_exact_production_path(self):
+        result, calls, control, transfer, files = self.replay()
+        self.assertEqual(result["status"], "source_only_native_transfer_passed")
+        self.assertTrue(result["production_early_timers_verified"])
+        self.assertTrue(result["terminated_verified"])
+        self.assertTrue(result["disposable_volumes_absent_verified"])
+        self.assertFalse(result["gate_5_complete"])
+        self.assertEqual(control.call_count, 2)
+        self.assertEqual(transfer.call_count, 1)
+        argv, body, timeout = transfer.call_args.args
+        self.assertEqual(body, self.receiver + self.archive)
+        self.assertEqual(len(body), 17061196)
+        self.assertEqual(timeout, 100)
+        self.assertIn("signal.alarm(85)", argv[-1])
+        self.assertIn(b"--instance-id", files["ssh_config"])
+        self.assertNotIn(b"--private-ip-address", files["ssh_config"])
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_finite_diagnostic_no_retry(self):
+        result, _, _, transfer, _ = self.replay(exchange_failure=True)
+        self.assertEqual(result["exchange_diagnostic"]["remote_failure_code"], "receiver")
+        self.assertEqual(result["status"], "failed_no_retry")
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(transfer.call_count, 1)
+
+    def test_receipt_mismatch_cleanup(self):
+        result, _, _, transfer, _ = self.replay(bad_receipt=True)
+        self.assertEqual(result["failure_stage"], "receipt_contract")
+        self.assertTrue(result["remote_completion_unknown"])
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(transfer.call_count, 1)
+
+    def test_preflight_rejects_before_launch(self):
+        for invalid in ("account", "host", "volume", "ingress", "route"):
+            with self.subTest(invalid=invalid):
+                result, calls, control, transfer, _ = self.replay(invalid=invalid)
+                self.assertFalse(result["launch_dispatched"])
+                self.assertFalse(
+                    any(op in {"run_instances", "terminate_instances"} for op, _ in calls)
+                )
+                control.assert_not_called()
+                transfer.assert_not_called()
+
+    def test_worst_poll_preserves_cleanup_reserve(self):
+        result, calls, control, transfer, _ = self.replay(no_key=True, no_terminal=True)
+        self.assertLessEqual(len(calls), 100)
+        self.assertLess(result["elapsed_seconds"], 850)
+        self.assertTrue(result["cleanup_unresolved"])
+        control.assert_not_called()
+        transfer.assert_not_called()
+
+    def test_ambiguous_launch_reconciles_without_retry(self):
+        result, calls, _, _, _ = self.replay(lost_launch=True)
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(sum(op == "run_instances" for op, _ in calls), 1)
+        self.assertEqual(sum(op == "terminate_instances" for op, _ in calls), 1)
+
+    def test_evidence_drift_rejected_before_credentials(self):
+        with patch.object(m, "PROOF_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.authenticate()
+
+    def test_bad_early_proof_prevents_seed_and_transfer(self):
+        result, _, control, transfer, _ = self.replay(bad_proof=True)
+        self.assertEqual(result["failure_stage"], "production_early_proof")
+        self.assertTrue(result["terminated_verified"])
+        self.assertEqual(control.call_count, 1)
+        transfer.assert_not_called()
+
+    def test_retained_diagnostic_volume_is_not_falsely_declared_deleted(self):
+        result, calls, _, _, _ = self.replay(remaining_volumes=True)
+        self.assertTrue(result["terminated_verified"])
+        self.assertTrue(result["cleanup_unresolved"])
+        self.assertFalse(result.get("disposable_volumes_absent_verified", False))
+        self.assertFalse(any(op == "delete_volume" for op, _ in calls))
+
+    def test_approval_mismatch_rejected(self):
+        plan = dict(
+            entry_sha256=m.sha(m.read(Path(m.__file__))),
+            token=m.TOKEN,
+            source_release_sha256=m.RELEASE_SHA,
+        )
+        raw = json.dumps(plan).encode()
+        with tempfile.TemporaryDirectory() as directory:
+            approval = Path(directory).resolve() / "approval.json"
+            m.save(
+                approval,
+                dict(
+                    plan_sha256="0" * 64,
+                    entry_sha256=plan["entry_sha256"],
+                    human_authorization="synthetic",
+                    approved=True,
+                ),
+            )
+            with patch.object(m, "APPROVAL", approval), self.assertRaises(ValueError):
+                m.approve(raw)
+
+    def test_readonly_cannot_mutate(self):
+        cloud, _, calls = self.cloud()
+        cloud.execute = False
+        for op, fields in (
+            ("run_instances", m.launch_fields()),
+            ("terminate_instances", dict(InstanceIds=[m.RETAINED])),
+            ("start_instances", dict(InstanceIds=[m.RETAINED])),
+            ("put_bucket_policy", {}),
+        ):
+            with self.assertRaises(ValueError):
+                cloud.call(op, **fields)
+        self.assertFalse(calls)
+
+
+if __name__ == "__main__":
+    unittest.main()

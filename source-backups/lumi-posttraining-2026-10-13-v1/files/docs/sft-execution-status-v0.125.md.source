@@ -1,0 +1,110 @@
+# SFT execution status v0.125: fixed generated-only VM entry connected
+
+2026-09-27. **A concrete two-unit Linux supervisor, fixed cold coordinator
+entry, generated-fixture builder and authenticated source bundle are ready
+for native qualification.** The local run passed 229 tests with zero failures,
+errors or skips. This is not a native pass, a real checkpoint import, or Gate-5
+completion. No AWS resource or S3 object was accessed in this step.
+
+## What now connects
+
+`root supervisor -> isolated preparation unit -> stop + empty cgroup ->
+read-only source/input binds -> fresh cold import unit -> actual coordinator
+and package -> independent checksum consumer -> stop + empty cgroup ->
+input/source hash readback -> tmpfs cleanup -> bounded aggregate result`
+
+Preparation creates only the fixed 17-token-vocabulary, one-layer tiny model
+and opaque synthetic tokenizer fixtures. The import entry accepts no paths,
+model selector, approval flag, or real-data mode. It requires the exact generated
+scope/geometry, bound canonical controls and small content caps before input
+access. It calls the actual v4 runtime gate before control reads and again
+through the coordinator: the native script contains no runtime-check bypass.
+
+The cold import sees worker-owned source files and generated inputs through
+read-only mounts. Their writable host aliases sit beneath a root-owned 0700
+attempt directory, and the preparation unit must be stopped with an empty
+cgroup before import dispatch. The worker has no network, GPU devices or
+credentials. The parent checks the staged source against its release manifest
+and compares all generated-input/source hashes again after import.
+
+This uses the existing systemd control helpers without changing their code or
+globals. Mount composition was checked against the official
+[systemd 255 execution specification](https://raw.githubusercontent.com/systemd/systemd/v255/man/systemd.exec.xml).
+Its semantics still need observation on the target Linux host; local doubles
+are not proof of namespace behavior or external-writer exclusion.
+
+## Bounds and truth boundaries
+
+- Exactly one preparation unit followed by one import unit, never retry after
+  start. Each has 2-GiB memory, zero swap, 64 tasks and a 90-second independent
+  systemd deadline. The controller has a 240-second cooperative budget; a
+  native operator must additionally apply a 300-second outer timeout.
+- A new 64-MiB host tmpfs stages generated files. The import unit has another
+  64-MiB private work tmpfs; only a <=4-KiB aggregate crosses the result bind.
+  These are capacities, not cumulative native-write limits. Python/module
+  reads and the extra independent checksum verification are not added to the
+  coordinator's content counters.
+- The tiny fixture keeps the established 8-MiB DCP execution cap; total
+  coordinator reservations are capped at 32 MiB reads / 4 MiB private writes.
+  The unchanged general planner has a 16-GiB minimum planning floor even for
+  this geometry. The separate 2-GiB tiny rehearsal explicitly does **not**
+  establish that full-size resource envelope or host admission.
+- Failed cleanup prevents success, retains a fixed cleanup-failure record,
+  and requires operator action. No force/lazy unmount occurs while a cgroup
+  is nonempty. On successful cleanup generated tmpfs payloads disappear;
+  root-owned started/failure/result evidence remains for collection. Billing
+  expiry and instance termination belong to the separately admitted operator.
+
+## Verified locally
+
+The final 12-module suite ran in 5.229 seconds on the existing Mac CPython
+3.13.7 environment: **229 tests, zero failures/errors/skips**. Twenty-five
+tests are new; 204 are related prior regressions. Ruff passed for all eight
+new Python files. A parent audit guard recorded zero network and zero real
+artifact-access attempts during this suite. Fresh child tests load only the
+listed scripts/source; the audit hook is not an OS boundary and does not
+automatically propagate to child interpreters.
+
+The genuine local entry tests substitute host observations (runtime gate,
+read-only filesystem flags and loader location) only. Actual controls,
+source/config hashes, conversion, packaging, two input audits and independent
+checksum verification execute. Dispatch/mount/UID tests double every native
+operation. No Mac mount, privilege change or heavy checkpoint workload ran.
+
+Separate extracted-bundle verification checked every file hash, created tiny
+generated inputs and ran the complete entry under the same local host-only
+substitutions. This caught one concrete packaging defect: the source-closure
+builder could not discover v3's computed inert-namespace import. Added its
+explicit source seed and a regression. The incomplete v0.1 archive remains
+preserved; it was never uploaded or executed as a native attempt.
+
+Use only the corrected archive in `artifacts/lumi-vm-coordinator-source-v0.2/`:
+49 source files, 810,989 source bytes; 51 archive members, 180,619 archive bytes.
+Archive SHA-256:
+`f53163624e4c5d12b0d7251029302a1b4144a1067dfc9c8071c943600d217b0c`.
+Manifest SHA-256:
+`7372740f51f5c28d046b4f33e34dfcc5382f6eb16b7d723a8998502af844f69a`.
+The staging script pins this exact archive and the unchanged 34-wheel Linux
+CPU runtime lock. It has not been executed; no software installation occurred.
+
+All v0.124 bound sources/evidence remain unchanged. No commit, push, promotion,
+seal, inference, training, real model/tokenizer/dataset access or instance
+action occurred. Public systemd documentation was read; this turn is not
+represented as globally zero-network.
+
+## Next action, and what it does not authorize
+
+Run this exact bundle once on a freshly admitted CPU Linux VM under the bounded
+proposal in `docs/lumi-vm-coordinator-native-run-proposal-v0.1.md`. This is a
+new attempt requiring its own authorization, not a reuse of the consumed
+v0.123 approval. The new bootstrap/staging scripts are prepared but unexecuted.
+
+If it passes, complete the real-input host-bound entry/admission, then acquire
+and CPU-import the preserved S3 4B checkpoint and independently verify its
+package. The generated-only scope here must not be removed casually to run
+real inputs. The previous cumulative-native-write contract remains closed.
+Gate 6 (GPU smoke/save/resume and SFT), Gate 7 (evaluation) and Gate 8 (serving)
+remain later. GPU rental is not needed for this next CPU check.
+
+Evidence: `evidence/lumi-vm-coordinator-entry-preparation-v0.1.json` and its
+structural verification record. Predecessor: `docs/sft-execution-status-v0.124.md`.

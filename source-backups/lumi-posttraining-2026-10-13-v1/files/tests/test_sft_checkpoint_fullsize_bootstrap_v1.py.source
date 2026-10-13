@@ -1,0 +1,372 @@
+"""Doubled full-size child plumbing; no process, descriptor, ML or host action."""
+
+from __future__ import annotations
+
+import copy
+import importlib
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_lumi_fullsize_bootstrap_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_fullsize_bootstrap_v1")
+IMPORTED = set(sys.modules) - before
+
+
+def mount_arguments():
+    parent = "/tmp/lumi-fullsize-bootstrap"
+    identities = {}
+    for index, role in enumerate(m.frozen.mount.input_mount.ROLES, 1):
+        uid = 10001 if role in {"checkpoint", "tokenizer", "output"} else 0
+        mode = 0o755 if role in {"root", "inputs"} else 0o700
+        identities[role] = (1, index, stat.S_IFDIR | mode, uid, uid, 2, 0, 1, 1)
+    return {
+        "rootfs_path": parent + "/rootfs", "mountpoint_path": parent + "/mount",
+        "checkpoint_path": parent + "/checkpoint", "tokenizer_path": parent + "/tokenizer",
+        "output_path": parent + "/output", "expected_identities": identities,
+        "expected_mountpoint_identity": (1, 100, stat.S_IFDIR | 0o700, 0, 0, 2, 0, 1, 1),
+        "inventories": {"checkpoint": {"model/generated": 48 * 1024**3},
+                        "tokenizer": {"tokenizer/generated": 4000000}},
+        "scratch_bytes": 536870912, "shm_bytes": 67108864,
+    }
+
+
+class Exited(BaseException):
+    def __init__(self, code):
+        self.code = code
+
+
+class Channel:
+    def fileno(self):
+        return 8
+
+
+class Doubles:
+    def __init__(self):
+        self.calls, self.frames, self.fds = [], [], {0, 1, 2, 7, 8, 9}
+        self.uid, self.gid, self.groups = (0, 0, 0), (0, 0, 0), [0]
+        self.environment = dict(m.FIXED_ENV) | {key: "a" * 64 for key in m.HASH_ENV}
+        self.mounts = mount_arguments()
+        self.channel = Channel()
+        self.executed = None
+        self.failure = None
+        self.mounted = self.policy = None
+        self.os = types.SimpleNamespace(
+            close=self.close, getresuid=lambda: self.uid, getresgid=lambda: self.gid,
+            getgroups=lambda: self.groups, chdir=lambda path: self.event("chdir", path),
+            dup2=lambda source, target: self.event("dup2", (source, target)),
+            execve=self.execve, _exit=self.exit,
+        )
+
+    def event(self, name, value=None):
+        self.calls.append(name)
+        if self.failure == name:
+            raise RuntimeError("PRIVATE NATIVE FAILURE")
+        return value
+
+    def sanitize(self, group_fd, channel_fd):
+        self.event("sanitize")
+        assert (group_fd, channel_fd) == (7, 8)
+        self.fds = {0, 1, 2, 7, 8}
+
+    def close(self, fd):
+        self.calls.append("close:" + str(fd))
+        self.fds.remove(fd)
+        if self.failure == "close:" + str(fd):
+            raise OSError("PRIVATE AMBIGUOUS CLOSE")
+
+    def close_except(self, kept):
+        self.event("close_except")
+        self.fds = {fd for fd in self.fds if fd <= 2 or fd in kept}
+
+    def drop(self, uid, gid):
+        self.event("drop")
+        assert uid == gid == 10001
+        self.uid, self.gid, self.groups = (uid,) * 3, (gid,) * 3, []
+
+    def send(self, channel, frame):
+        assert channel is self.channel
+        self.frames.append(dict(frame))
+        self.event("send:" + frame["phase"])
+
+    def mount(self, **kwargs):
+        self.mounted = kwargs
+        return self.event("mount", {"old_root_detached": True, "readonly_software_root": True,
+                                     "input_output_mounts_survive_pivot": True})
+
+    def landlock(self, **kwargs):
+        self.policy = kwargs
+        return self.event("landlock", {"filesystem_content_policy_enforced": True,
+                                       "abi_version": 5})
+
+    def execve(self, runtime, argv, environment):
+        self.executed = runtime, argv, environment
+        self.event("exec")  # A returning native exec is always terminal failure.
+
+    def exit(self, code):
+        self.event("exit")
+        raise Exited(code)
+
+    def replacements(self):
+        return {
+            "_runtime": lambda: self.event("runtime"), "_ATTEMPTED": False,
+            "_arguments": lambda *_args: self.event("arguments"), "os": self.os,
+            "_sanitize": self.sanitize, "_close_except": self.close_except,
+            "_descriptors": lambda: set(self.fds), "_send": self.send,
+            "_release": lambda _channel: self.event("release"),
+            "cgroup": types.SimpleNamespace(
+                enter_current_process=lambda _fd: self.event("attach")),
+            "netns": types.SimpleNamespace(create_loopback_namespace=lambda: self.event(
+                "network", {"namespace_changed": True, "only_loopback_interface": True})),
+            "mount": types.SimpleNamespace(enter_import_rootfs=self.mount),
+            "landlock": types.SimpleNamespace(restrict_filesystem=self.landlock),
+            "ipc": types.SimpleNamespace(RECEIPT={"fixed": True},
+                install_ipc_filter=lambda: self.event("ipc", {"fixed": True})),
+            "resource": types.SimpleNamespace(RLIMIT_CORE=4, RLIMIT_NOFILE=7,
+                setrlimit=lambda key, value: self.event("limit:" + str(key), value)),
+            "guardian": types.SimpleNamespace(drop_worker_privileges=self.drop),
+        }
+
+    def call(self, **changes):
+        return m._bootstrap_admitted(7, self.channel, **{
+            "mount_arguments": self.mounts, "environment": self.environment, **changes})
+
+
+class FullsizeBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.d = Doubles()
+
+    def execute(self, replacements=None):
+        with patch.multiple(m, **(self.d.replacements() if replacements is None else replacements)):
+            with self.assertRaises(Exited) as caught:
+                self.d.call()
+            self.assertEqual(caught.exception.code, 2)
+            self.assertTrue(m._ATTEMPTED)
+
+    def test_fixed_fullsize_exec_after_all_isolation_and_release(self):
+        self.execute()
+        self.assertEqual(self.d.calls, [
+            "runtime", "arguments", "sanitize", "attach", "network", "mount", "landlock",
+            "ipc", "limit:4", "limit:7", "drop", "close:7", "close_except", "send:ready",
+            "release", "chdir", "dup2", "close_except", "exec", "exit",
+        ])
+        self.assertEqual(self.d.executed, (m.RUNTIME, [m.RUNTIME, "-I", "-B",
+            "/opt/lumi-release/guardian/fullsize_entry.py", "--bound-checkpoint-import"],
+            self.d.environment))
+        self.assertEqual(self.d.frames, [m.READY])
+        self.assertEqual(self.d.fds, {0, 1, 2})
+
+    def test_environment_exact_four_nonzero_pins_and_fixed_values(self):
+        self.assertEqual(m.HASH_ENV, {"LUMI_IMPORT_SOURCE_MANIFEST_SHA256",
+            "LUMI_FULLSIZE_ENTRY_SHA256", "LUMI_FULLSIZE_CONTROL_SHA256",
+            "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256"})
+        self.assertEqual(m.FIXED_ENV, m.frozen.FIXED_ENV)
+        self.assertIsNot(m.FIXED_ENV, m.frozen.FIXED_ENV)
+        original = dict(self.d.environment)
+        self.assertEqual(m.validate_environment(original), original)
+        for key in m.HASH_ENV:
+            for value in ("0" * 64, "A" * 64, "a" * 63, True, None, b"a" * 64):
+                with self.subTest(key=key, value=value), \
+                        self.assertRaisesRegex(m.FullsizeBootstrapError, "environment_rejected"):
+                    m.validate_environment(original | {key: value})
+        for key in m.FIXED_ENV:
+            with self.subTest(key=key), self.assertRaises(m.FullsizeBootstrapError):
+                m.validate_environment(original | {key: "wrong"})
+        for extra in ("PYTHONPATH", "LD_PRELOAD", "approved", "LUMI_PREPARED_FIXTURE_ENTRY_SHA256"):
+            with self.subTest(extra=extra), self.assertRaises(m.FullsizeBootstrapError):
+                m.validate_environment(original | {extra: "a" * 64})
+
+    def test_invalid_environment_precedes_descriptors_and_mutation(self):
+        with patch.multiple(m, **self.d.replacements()):
+            with self.assertRaisesRegex(m.FullsizeBootstrapError, "environment_rejected"):
+                self.d.call(environment={})
+            self.assertFalse(m._ATTEMPTED)
+        self.assertEqual(self.d.calls, ["runtime"])
+
+    def test_invalid_mount_metadata_precedes_mutation_and_preserves_attempt(self):
+        variants = [self.d.mounts | {"approved": True}, self.d.mounts | {"scratch_bytes": True},
+                    self.d.mounts | {"checkpoint_path": "/private/../checkpoint"}]
+        for mounts in variants:
+            self.d = Doubles()
+            with self.subTest(mounts=mounts), patch.multiple(m, **self.d.replacements()):
+                with self.assertRaisesRegex(m.FullsizeBootstrapError, "arguments_rejected"):
+                    self.d.call(mount_arguments=mounts)
+                self.assertFalse(m._ATTEMPTED)
+            self.assertEqual(self.d.calls, ["runtime", "arguments"])
+
+    def test_mount_validation_and_environment_are_detached(self):
+        copied = m.validate_mount_arguments(self.d.mounts)
+        env = m.validate_environment(self.d.environment)
+        copied["inventories"]["checkpoint"].clear()
+        copied["expected_identities"].clear()
+        env.clear()
+        self.assertEqual(len(self.d.mounts["expected_identities"]), 9)
+        self.assertTrue(self.d.mounts["inventories"]["checkpoint"])
+        self.assertTrue(self.d.environment)
+
+    def test_caller_mutation_during_isolation_cannot_change_exec_or_mount(self):
+        mounts, env = copy.deepcopy(self.d.mounts), dict(self.d.environment)
+        replacements = self.d.replacements()
+
+        def network():
+            self.d.mounts["inventories"]["checkpoint"].clear()
+            self.d.mounts["expected_identities"]["root"] = (0,) * 9
+            self.d.environment["PATH"] = "PRIVATE MUTATION"
+            return {"namespace_changed": True, "only_loopback_interface": True}
+
+        replacements["netns"] = types.SimpleNamespace(create_loopback_namespace=network)
+        self.execute(replacements)
+        self.assertEqual(self.d.mounted, mounts)
+        self.assertEqual(self.d.executed[2], env)
+        identity = mounts["expected_identities"]["root"]
+        self.assertEqual(self.d.policy["expected_root_identity"],
+                         (identity[0], identity[1], stat.S_IFDIR, 0, 0))
+
+    def test_each_started_stage_failure_consumes_attempt_and_has_fixed_frame(self):
+        stages = {"sanitize": "sanitize", "attach": "attach", "network": "network",
+                  "mount": "mount", "landlock": "landlock", "ipc": "ipc", "limit:4": "limits",
+                  "limit:7": "limits", "drop": "drop", "close:7": "drop",
+                  "send:ready": "ready", "release": "release", "chdir": "exec"}
+        for failure, stage in stages.items():
+            self.d = Doubles()
+            self.d.failure = failure
+            with self.subTest(stage=failure), patch.multiple(m, **self.d.replacements()):
+                with self.assertRaises(Exited):
+                    self.d.call()
+                self.assertTrue(m._ATTEMPTED)
+                before_calls = len(self.d.calls)
+                with self.assertRaisesRegex(m.FullsizeBootstrapError, "already_attempted"):
+                    self.d.call()
+                self.assertEqual(self.d.calls[before_calls:], ["runtime", "arguments"])
+            self.assertIsNone(self.d.executed)
+            self.assertEqual(self.d.frames[-1], {"phase": "bootstrap_failed", "stage": stage})
+            self.assertEqual(sum(frame["phase"] == "bootstrap_failed"
+                                 for frame in self.d.frames), 1)
+            self.assertNotIn("PRIVATE", str(self.d.frames))
+
+    def test_bad_mount_survival_receipt_never_reaches_release(self):
+        for value in (False, None, 1, "true"):
+            self.d = Doubles()
+            replacements = self.d.replacements()
+            replacements["mount"] = types.SimpleNamespace(
+                enter_import_rootfs=lambda v=value, **kw: {
+                    "old_root_detached": True, "readonly_software_root": True,
+                    "input_output_mounts_survive_pivot": v})
+            with self.subTest(value=value):
+                self.execute(replacements)
+            self.assertNotIn("release", self.d.calls)
+            self.assertEqual(self.d.frames, [{"phase": "bootstrap_failed", "stage": "mount"}])
+
+    def test_bad_isolation_receipts_prevent_ready(self):
+        for component, replacement, stage in (
+            ("netns", types.SimpleNamespace(create_loopback_namespace=lambda: {
+                "namespace_changed": 1, "only_loopback_interface": True}), "network"),
+            ("landlock", types.SimpleNamespace(restrict_filesystem=lambda **_kwargs: {
+                "filesystem_content_policy_enforced": True, "abi_version": True}), "landlock"),
+            ("ipc", types.SimpleNamespace(RECEIPT={"fixed": True},
+                install_ipc_filter=lambda: {"fixed": False}), "ipc"),
+        ):
+            self.d = Doubles()
+            replacements = self.d.replacements()
+            replacements[component] = replacement
+            with self.subTest(component=component):
+                self.execute(replacements)
+            self.assertNotIn("send:ready", self.d.calls)
+            self.assertEqual(self.d.frames[-1]["stage"], stage)
+
+    def test_missing_privilege_drop_or_extra_descriptors_prevent_ready(self):
+        for target in ("privileges", "descriptors"):
+            self.d = Doubles()
+            replacements = self.d.replacements()
+            if target == "privileges":
+                replacements["guardian"] = types.SimpleNamespace(
+                    drop_worker_privileges=lambda *_args: None)
+            else:
+                replacements["_descriptors"] = lambda: {0, 1, 2, 8, 11}
+            with self.subTest(target=target):
+                self.execute(replacements)
+            self.assertNotIn("send:ready", self.d.calls)
+            self.assertEqual(self.d.frames[-1]["stage"], "drop")
+
+    def test_ambiguous_authority_close_never_retries(self):
+        self.d.failure = "close:7"
+        self.execute()
+        self.assertEqual(self.d.calls.count("close:7"), 1)
+        self.assertNotIn("send:ready", self.d.calls)
+
+    def test_exec_failure_after_channel_revocation_does_not_send_on_closed_fd(self):
+        self.d.failure = "exec"
+        self.execute()
+        self.assertEqual(self.d.frames, [m.READY])
+        self.assertEqual(self.d.fds, {0, 1, 2})
+
+    def test_failure_frame_error_still_exits_without_retry(self):
+        self.d.failure = "mount"
+        replacements = self.d.replacements()
+        sent = Mock(side_effect=RuntimeError("PRIVATE SEND"))
+        replacements["_send"] = sent
+        self.execute(replacements)
+        sent.assert_called_once_with(self.d.channel,
+                                     {"phase": "bootstrap_failed", "stage": "mount"})
+        self.assertEqual(self.d.calls.count("exit"), 1)
+
+    def test_runtime_first_and_wrapper_uses_unchanged_frozen_runtime(self):
+        # This unsupported Darwin host must be rejected by the actual frozen
+        # runtime precheck, with no metadata or native process operations.
+        with patch.object(m, "validate_environment") as environment, \
+                patch.object(m, "_arguments") as arguments, \
+                patch("os.open", side_effect=AssertionError), \
+                patch("os.fork", side_effect=AssertionError):
+            with self.assertRaisesRegex(m.FullsizeBootstrapError, "runtime_rejected"):
+                self.d.call()
+        environment.assert_not_called()
+        arguments.assert_not_called()
+
+    def test_descriptor_preflight_rejects_invalid_fd_without_native_socket(self):
+        for group in (True, -1, 0, 1, 2, 1024, "7"):
+            with self.subTest(group=group), self.assertRaisesRegex(
+                    m.FullsizeBootstrapError, "arguments_rejected"):
+                m._arguments(group, object())
+
+    def test_frozen_helpers_shared_without_changing_frozen_globals(self):
+        for name in ("_sanitize", "_close_except", "_descriptors", "_send", "_release"):
+            self.assertIs(getattr(m, name), getattr(m.frozen, name))
+        state = dict(m.frozen.__dict__)
+        self.execute()
+        self.assertEqual(set(state), set(m.frozen.__dict__))
+        self.assertTrue(all(value is m.frozen.__dict__[key] for key, value in state.items()))
+        self.assertIsNot(m.READY, m.frozen.READY)
+
+    def test_landlock_paths_stay_fixed_and_do_not_claim_native_write_metering(self):
+        self.execute()
+        self.assertEqual(self.d.policy["read_only_paths"], m.frozen.READ_ONLY_PATHS)
+        self.assertEqual(self.d.policy["writable_paths"], ("/tmp", "/dev/shm", "/outputs"))
+        self.assertEqual(self.d.policy["device_paths"], m.frozen.DEVICE_PATHS)
+        self.assertEqual(m.READY, {"phase": "ready", "isolation_installed": True,
+                                  "uid_gid_dropped": True, "authority_fds_closed": True})
+
+    def test_public_bootstrap_is_closed_before_any_runtime_or_argument_inspection(self):
+        sentinel = Mock(side_effect=AssertionError("must not execute"))
+        with patch.object(m, "_runtime", sentinel), \
+                patch.object(m, "_bootstrap_admitted", sentinel), \
+                patch.object(m, "validate_environment", sentinel):
+            for kwargs in ({}, {"approved": True}, {"callback": sentinel, "environment": object()}):
+                with self.assertRaisesRegex(m.FullsizeBootstrapError, "host_guard_not_bound"):
+                    m.bootstrap(**kwargs)
+        sentinel.assert_not_called()
+
+    def test_imports_do_not_load_ml_or_primary_package(self):
+        self.assertFalse({name.split(".")[0] for name in IMPORTED} & {
+            "lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers", "jax"})
+
+
+if __name__ == "__main__":
+    unittest.main()

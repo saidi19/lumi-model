@@ -1,0 +1,189 @@
+"""Offline verification of the attempt-020 nested-archive repair release."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib
+import json
+import os
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt020_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-attempt-020-source-v0.1"
+RELEASE_SHA = "059fbed8faf317fdf778cba3e29af02c5271ce4f4d76e2961381b76010a5ce52"
+BUILDER_SHA = "6917338254084f21e1b4bd10675e4d62e8653ab95d14e67d999f7a14143cbcad"
+TEST_SHA = "0e3b01a30de1841cd24796b0dceb0180be6b0add2aa3dbf22a67012d61aa77b1"
+FAILURE_SHA = "50b72551632cefd5c1f2af9382def5bef025002bf58ef66cb6f805ab252e50fc"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-020-source-v0.1-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_v1_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, digest, size=None, maximum=64 * 1024**2):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= maximum)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def authenticate_outer():
+    scripts = str(RELEASE / "scripts")
+    before = set(sys.modules)
+    sys.path.insert(0, scripts)
+    try:
+        need("run_sft_vm_private_outer_v7" not in before)
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        need(Path(outer.__file__).resolve() == RELEASE / "scripts/run_sft_vm_private_outer_v7.py")
+        outer.authenticate()
+        need(outer.network.selection.ATTEMPT == source.NEW)
+    finally:
+        sys.path.remove(scripts)
+        for name in set(sys.modules) - before:
+            module = sys.modules.get(name)
+            path = getattr(module, "__file__", None)
+            if path is not None and Path(path).is_relative_to(RELEASE):
+                del sys.modules[name]
+
+
+def verify():
+    read(ROOT / "scripts/prepare_sft_vm_attempt020_v1.py", BUILDER_SHA)
+    read(ROOT / "tests/test_sft_vm_attempt020_v1.py", TEST_SHA)
+    failure = json.loads(
+        read(
+            ROOT / "evidence/lumi-vm-attempt-019-v024-execution-failure-verification-v0.1.json",
+            FAILURE_SHA,
+        )
+    )
+    need(
+        failure["attempt"] == source.OLD
+        and failure["status"] == "verified_fail_closed_before_remote_seed_or_checkpoint_access"
+        and failure["execution"]["failed_stage"] == "guarded_setup"
+        and failure["execution"]["remote_seed_dispatch_started"] is False
+        and failure["execution"]["checkpoint_download_started"] is False
+        and failure["execution"]["retry_allowed"] is False
+        and failure["execution"]["real_4b_import"] is False
+        and failure["live_verification"]["instance_state"] == "stopped"
+    )
+    release = json.loads(read(RELEASE / "release.json", RELEASE_SHA))
+    need(
+        release["schema"] == "lumi.vm-attempt020-source.v0.1"
+        and release["attempt"] == source.NEW
+        and release["operational_predecessor"] == source.OLD
+        and release["attempt_label"] == "attempt-020"
+        and release["predecessor_failure_sha256"] == FAILURE_SHA
+        and release["predecessor_failure_preserved"] is True
+        and release["selected_cidr"] == source.NEW_CIDR
+        and release["selected_cidr_live_absence_verified"] is False
+        and release["nested_setup_archive_rebuilt"] is True
+        and release["nested_setup_members_verified"] == 19
+        and release["nested_setup_loose_members_rebuilt"] == 16
+        and release["nested_setup_frozen_members_preserved"] == 3
+        and release["bounded_transient_read_recovery_preserved"] is True
+        and release["write_attempts_per_operation"] == 1
+        and release["source_versions_bound"] is True
+        and release["versioned_object_count"] == 22
+        and release["fresh_controls_required"] is True
+        and release["execution_permitted"] is False
+        and release["old_authorization_reused"] is False
+        and release["old_timer_reused"] is False
+        and release["consumed_attempt_retained"] is True
+        and len(release["outputs"]) == 156
+    )
+    bodies = {}
+    for name, pin in release["outputs"].items():
+        body = read(RELEASE / name, pin["sha256"], pin["bytes"])
+        bodies[name] = body
+        if name.endswith(".py"):
+            ast.parse(body)
+        if name.startswith("scripts/"):
+            need(source.OLD.encode() not in body and b"attempt-019" not in body)
+    base_members = source.setup_members((source.BASE / source.SETUP_TAR).read_bytes())
+    setup = source.setup_members(bodies[source.SETUP_TAR])
+    contract = source.stage_contract(bodies[source.SETUP_STAGE])
+    need(len(setup) == len(contract) == len(source.SETUP_MEMBERS) == 19)
+    for destination, origin in source.SETUP_MEMBERS.items():
+        expected = bodies.get(origin, base_members[destination])
+        need(
+            setup[destination] == expected
+            and sha(expected) == contract[destination][1]
+            and 0 < len(expected) <= contract[destination][2]
+        )
+    pins = source.constants(bodies[source.SETUP_SEND])
+    need(
+        pins["ARCHIVE_SHA"] == sha(bodies[source.SETUP_TAR])
+        and pins["ARCHIVE_BYTES"] == len(bodies[source.SETUP_TAR])
+        and pins["RECEIVER_SHA"] == sha(bodies[source.SETUP_STAGE])
+        and pins["RECEIVER_BYTES"] == len(bodies[source.SETUP_STAGE])
+    )
+    inputs = json.loads(bodies["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        body = bodies["scripts/" + role + ".py"]
+        need(pin == {"bytes": len(body), "sha256": sha(body)})
+    authenticate_outer()
+    selection = json.loads(bodies[source.SELECTION])
+    members = source.source.source.previous.previous.tar_members(bodies[source.TAR])
+    manifest = json.loads(members["release-manifest.json"])
+    need(
+        selection["object_versions_bound"] is True
+        and selection["versioned_object_count"] == 22
+        and members["controls/input-selection.json"] == bodies[source.SELECTION]
+        and all(sha(members[name]) == digest for name, digest in manifest.items())
+    )
+    return {
+        "schema": "lumi.vm-attempt020-source-v0.1-verification.v0.1",
+        "attempt": source.NEW,
+        "operational_predecessor": source.OLD,
+        "status": "fresh_nested_archive_repair_verified_offline",
+        "source_release_sha256": RELEASE_SHA,
+        "builder_sha256": BUILDER_SHA,
+        "test_sha256": TEST_SHA,
+        "predecessor_failure_sha256": FAILURE_SHA,
+        "outputs_verified": 156,
+        "outer_source_authentication_verified": True,
+        "sha256_and_byte_count_closure_verified": True,
+        "nested_setup_members_verified": 19,
+        "nested_setup_stage_contract_verified": True,
+        "nested_setup_sender_binding_verified": True,
+        "fresh_identity_verified": True,
+        "old_identity_absent_from_executable_scripts": True,
+        "predecessor_failure_preserved": True,
+        "write_retry_prohibited_verified": True,
+        "versioned_objects_verified": 22,
+        "cloud_calls": 0,
+        "cloud_mutations": 0,
+        "payload_reads": 0,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

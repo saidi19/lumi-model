@@ -1,0 +1,106 @@
+# SFT execution status v0.73
+
+2026-09-10. **DCP checkpoint reads are now budgeted in a new CPU-kernel successor,
+and tiny BF16/FP32 roundtrips pass.** This completes the DCP-read part of v0.72's
+native-I/O dependency, not the entire host guard, real import or Gate 5.
+
+No real weights, trainer/tokenizer payloads or datasets were read. No GPU,
+inference, training, network action, dependency installation, instance action,
+GitHub publication or CI run was initiated. Previous evidence remains unchanged.
+
+## Implemented and reused
+
+`posttraining_checkpoint_dcp_reader_v1.py` connects the existing frozen
+`CheckpointReadSession`, `CheckpointReadView` and worker's instance-local DCP
+adapter. It verifies the complete checkpoint manifest and all declared files
+before DCP metadata deserialization. The reader's Torch import is lazy, after
+that audit; the encompassing conversion kernel still imports ML and creates its
+meta-only architecture before entering the reader. Neither operation loads real
+inputs in this stage.
+
+Every subsequent DCP metadata/tensor read, including rereads, shares the same
+nonrefundable byte limit. The frozen reader reserves bytes before each `pread`,
+in chunks no larger than 1 MiB. File-like views enforce bounds and expose neither
+`fileno` nor a native pathname. No global Torch/Python file function is patched
+by the implementation. The original DCP transforms remain rejected.
+
+`posttraining_checkpoint_import_torch_v4.py` explicitly uses that reader instead
+of constructing an unmetered `FileSystemReader`. It accepts an independently
+chosen checkpoint-read contract and returns a new v0.4 receipt with aggregate
+audit/read counters. AST comparison verifies that the v3 conversion predicates
+and helpers remain unchanged apart from the explicit reader scope and receipt
+addition. Shape/dtype/chunk coverage, independent tied-alias validation,
+nonfinite rejection, parameter-only casts, FP32 buffer preservation and complete
+HF reload comparison remain in place. V3 was not edited.
+
+## Integration issue fixed
+
+The installed Torch `load_state_dict` calls `reset()` at the start of its first
+load. Denying every reset blocked that legitimate first call. The new adapter
+allows exactly one **argument-free, no-op initialization handshake** before
+restore; it does not reset the source binding, byte counters or deadline.
+A second reset, a reset with arguments, or a second `read_data` invocation fails
+terminally. Restore is consumed before entering native code, including failure.
+
+The reader also closes its session and checks the budget after close. A late
+deadline/cleanup failure cannot publish success. The kernel preserves only its
+own exact typed, allowlisted validation codes through context error scrubbing;
+cleanup/read errors take precedence. Raw exception text is never a receipt field.
+
+## Verification
+
+**485 distinct tests pass in the targeted suites, with zero failures or skips.**
+This is not a full-repository test claim.
+
+- 414 stdlib tests on Python 3.11.15, 3.13.7 and 3.14.6: 0.777s, 0.808s and
+  0.827s. This includes the existing reader/view/metered-I/O/worker tests and
+  v0.72's 195-test stdlib regression set.
+- 71 genuine tiny CPU tests on Python 3.13.7: 0.758s test time / 2.073s supervised
+  wall time under a 60-second parent timeout. The prior 60 native tests pass too.
+- 48 new tests: 30 reader, seven source/contract and 11 native integration.
+- Exact Ruff E,F,I,B,UP / py311 / line length 100 passes on all five new code/test
+  files. Existing Torch DCP/platform warnings remain visible.
+
+Native tests verify both BF16 and FP32 roundtrips, reject incorrect hashes before
+pickle, exhaust the shared read budget after the initial audit, preserve tied/
+nonfinite checks, and successfully load with the stock DCP path stream disabled.
+The reported byte count exactly matches intercepted `read`/`pread` request sizes
+for the tiny checkpoint. Tensor deserialization receives descriptor-free bounded
+views with CPU/weights-only loading. The old packager explicitly rejects the new
+kernel receipt rather than silently treating it as accepted v3 evidence.
+
+Evidence: `evidence/lumi-4b-sft-import-metered-dcp-v0.1.json`.
+Structural verification:
+`evidence/lumi-4b-sft-import-metered-dcp-verification-v0.1.json`.
+
+## Remaining work, without changing existing limits
+
+This is **logical content-byte accounting**, not physical device/page-cache
+measurement or an OS sandbox. DCP metadata still uses pickle: hash integrity is
+not safe unpickling or origin authentication. Inputs must be trusted and quiescent.
+The reused session requires existing 0600 files and 0700 directories; it refuses
+0400 files without changing their permissions. Real input compatibility has not
+been established or worked around with chmod.
+
+HF `save_pretrained`/`from_pretrained`, small config/runtime-code reads and hard
+RAM/write/network/runtime containment remain outside this new DCP ledger. The
+next software task is to mediate those HF/control I/O paths, then explicitly
+version coordinator/package integration and its aggregate read accounting.
+This reader performs a full audit of its own; plugging it into v0.72 unchanged
+would add an audit. That is **not** an approved increase to the existing two-audit
+plan: integration must account for/reuse the verified audit or obtain an explicit
+new bound, never silently raise limits. The old coordinator, package and real
+resource plan are unchanged and are not yet wired to this successor.
+
+Existing Linux cgroup/guardian components cover RAM/swap/processes and owned-group
+deadline/parent-loss teardown. Their actual integration and native qualification,
+plus filesystem/network/write constraints and exact host/runtime admission, are
+still required. Mac tests do not qualify those Linux controls. No GPU is needed
+for the remaining importer software work; the real `run_import` entry stays
+closed. Gate 5, real SFT and production eligibility remain false.
+
+The downstream GPU worker/profile, data relocation and CUDA/smoke dependencies
+remain as recorded in v0.70-v0.72. No base, dataset, rights or evaluation rule was
+changed. HEAD remains `ecc545fc423650bf1089311915290523c10b3172`, with unchanged
+tracked/staged diffs. This stage adds only two modules, three test files and the
+report, structural verification and status successor, all local/unpublished.

@@ -1,0 +1,152 @@
+"""Verify fresh source closure and narrow semantic delta, without cloud access."""
+
+import ast
+import importlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_v1 as source
+
+ROOT, RELEASE = source.ROOT, source.OUTPUT
+RELEASE_SHA = "5cd83aa6c3ce497e45170a5e3165ae28705bf08a92b191098b6b4f66c48f7a8a"
+BUILDER_SHA = "0f7b1a54c9206ceed0f241407872a6e6b7e70409e9a30c3a2f91c2b17b7a1a79"
+TEST = ROOT / "tests/test_sft_vm_attempt022_source_v1.py"
+TEST_SHA = "7122ef35ba3b9ba431b385fa4f0ee45b2d978eb36aa183849acac00cc4bcd593"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-source-verification-v0.1.json"
+need, sha, read, encode = source.need, source.sha, source.read, source.encode
+
+
+def normalize(raw, before_code, after_code):
+    for before, after in (
+        (source.NEW, source.OLD), ("attempt-022", "attempt-021"),
+        ("Attempt-022", "Attempt-021"), ("attempt022", "attempt021"),
+        (source.NEW_CIDR, source.OLD_CIDR),
+    ):
+        raw = raw.replace(before.encode(), after.encode())
+    raw = raw.replace(before_code.encode(), b"BOUND_CODE")
+    raw = raw.replace(after_code.encode(), b"BOUND_CODE")
+    return re.sub(rb"\b[0-9a-f]{64}\b", b"BOUND_HASH", raw)
+
+
+def config_shape(value):
+    if type(value) is dict:
+        result = {key: config_shape(child) for key, child in value.items()}
+        if type(value.get("bytes")) is int and value.get("sha256") == "BOUND_HASH":
+            result["bytes"] = "BOUND_BYTE_COUNT"
+        return result
+    if type(value) is list:
+        return [config_shape(child) for child in value]
+    return value
+
+
+def outer_check():
+    names = {Path(name).stem for name in RELEASE.joinpath("scripts").glob("*.py")}
+    previous = {name: sys.modules.pop(name) for name in names if name in sys.modules}
+    directory = str(RELEASE / "scripts")
+    sys.path.insert(0, directory)
+    try:
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        need(Path(outer.__file__).resolve() == RELEASE / "scripts/run_sft_vm_private_outer_v7.py")
+        outer.authenticate()
+        outer.loading.fresh_identity()
+        need(outer.network.selection.ATTEMPT == source.NEW)
+        need(outer.loading.__file__ == str(RELEASE / source.LOADER))
+        need(hasattr(outer.loading, "WatchdogCloudFailure"))
+        try:
+            outer.run(approved=True)
+        except ValueError:
+            pass
+        else:
+            need(False)
+    finally:
+        sys.path.remove(directory)
+        for name in names:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous)
+
+
+def verify():
+    read(Path(source.__file__), BUILDER_SHA)
+    read(TEST, TEST_SHA)
+    release_raw = read(RELEASE / "release.json", RELEASE_SHA)
+    release = json.loads(release_raw)
+    expected, expected_release = source.build()
+    need(release_raw == encode(expected_release))
+    need(release["attempt"] == source.NEW and release["execution_permitted"] is False)
+    base_release = json.loads(read(source.BASE / "release.json", source.BASE_SHA))
+    files = {}
+    for name, pin in release["outputs"].items():
+        relative = Path(name)
+        need(not relative.is_absolute() and ".." not in relative.parts)
+        files[name] = read(RELEASE / name, pin["sha256"], pin["bytes"])
+        need(files[name] == expected[name])
+    need(len(files) == 156 and set(files) == set(base_release["outputs"]))
+    base = {name: read(source.BASE / name, pin["sha256"], pin["bytes"])
+            for name, pin in base_release["outputs"].items()}
+    before, after = (base_release["watchdog_code_sha256_base64"],
+                     release["watchdog_code_sha256_base64"])
+    python_count = config_count = 0
+    for name, body in files.items():
+        if name.endswith(".py"):
+            ast.parse(body)
+            if name != source.LOADER:
+                need(ast.dump(ast.parse(normalize(body, before, after))) ==
+                     ast.dump(ast.parse(normalize(base[name], before, after))))
+                python_count += 1
+        if name.startswith("configs/") and name.endswith(".json"):
+            need(config_shape(json.loads(normalize(body, before, after))) ==
+                 config_shape(json.loads(normalize(base[name], before, after))))
+            config_count += 1
+    fixed = read(ROOT / source.fix.OUTPUT, source.FIX_SHA)
+    need(ast.dump(ast.parse(normalize(files[source.LOADER], before, after))) ==
+         ast.dump(ast.parse(normalize(fixed, before, after))))
+    outer_check()
+    return dict(
+        schema="lumi.vm-attempt022-source-verification.v0.1",
+        status="fresh_source_bound_and_semantically_verified_not_authorized",
+        attempt=source.NEW, source_release_sha256=RELEASE_SHA,
+        source_files=156, private_source_bytes=sum(map(len, files.values())),
+        builder_sha256=BUILDER_SHA, test_sha256=TEST_SHA,
+        qualified_loader_implementation_sha256=source.FIX_SHA,
+        source_bindings=release["outputs"],
+        predecessor_release_sha256=source.BASE_SHA,
+        predecessor_failure_sha256=source.FAILURE_SHA,
+        watchdog_fix_readonly_verification_sha256=source.PROOF_SHA,
+        unchanged_python_ast_except_identity_and_hash_bindings=python_count,
+        unchanged_config_semantics_except_identity_and_byte_hash_bindings=config_count,
+        qualified_fix_only_loader_ast_verified=True,
+        actual_saved_outer_graph_authenticated=True,
+        source_versions_and_resource_caps_unchanged=True,
+        nested_setup_receipt_file_count=19,
+        setup_receipt_guard_before_paid_allocation_preserved=True,
+        prior_evidence_preserved=True,
+        offline_tests_passed=25, socket_and_process_creation_blocked=True, ruff="passed",
+        new_identity_live_controls_verified=False, new_identity_live_admission_passed=False,
+        real_linux_or_remote_transfer_qualified=False,
+        new_execution_authorized=False, new_cpu_instance_launched=False,
+        aws_calls=0, cloud_mutations=0, object_access=0,
+        historical_failure_cause_proven=False,
+        real_4b_import=False, gate_5_complete=False, gpu=False, training=False,
+        production_eligible=False,
+    )
+
+
+def write():
+    report = verify()
+    raw = encode(report)
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return report
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    result = write() if len(sys.argv) == 2 else verify()
+    print(json.dumps({key: result[key] for key in
+                     ("status", "source_release_sha256", "source_files", "aws_calls")},
+                     sort_keys=True))

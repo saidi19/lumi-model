@@ -1,0 +1,155 @@
+"""Exact native path regression; real filesystem work uses tiny temporary fixtures."""
+
+import importlib.util
+import os
+import stat
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from tests import test_sft_vm_coordinator_entry_v1 as old
+
+
+class EntryTests(old.EntryTests):
+    def setUp(self):
+        original = old.load_script
+        self.enterContext(
+            patch.object(
+                old,
+                "load_script",
+                side_effect=lambda name: original(
+                    name.replace(
+                        "run_sft_vm_coordinator_entry_v1", "run_sft_vm_coordinator_entry_v3"
+                    )
+                ),
+            )
+        )
+        super().setUp()
+        self.entry.ATTEMPT = self.root / "imports" / "attempt"
+
+    def test_exact_old_native_parent_rejected_before_filesystem_io(self):
+        # This is the real frozen validator, not a substitute for its depth rule.
+        with patch.object(Path, "lstat") as inspect:
+            with self.assertRaisesRegex(self.runner.frozen.ImportRunnerError, "path_rejected"):
+                self.runner._path(Path("/work"))
+            inspect.assert_not_called()
+
+    def test_real_coordinator_reproduces_old_parent_rejection_before_attempt_write(self):
+        args = self.entry.arguments(self.raw, self.runner)
+        args["attempt"] = Path("/work/import-attempt")
+        original = self.runner._path
+
+        def paths(path, **kwargs):
+            if path == Path("/work"):
+                return original(path, **kwargs)
+            # Other namespace paths are synthetic here, never native filesystem IO.
+            return None
+
+        with (
+            patch.object(self.runner, "_runtime"),
+            patch.object(self.runner, "_path", paths),
+            patch.object(self.runner, "_physical_overlap"),
+            patch.object(self.runner.os, "mkdir") as create,
+        ):
+            with self.assertRaisesRegex(self.runner.ImportRunnerError, "path_rejected"):
+                self.runner._coordinate_admitted_import(**args)
+            create.assert_not_called()
+
+    def test_exact_new_native_parent_passes_frozen_depth_and_owner_mode_rules(self):
+        native = Path("/work/imports")
+        info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o700, st_uid=os.geteuid())
+        with (
+            patch.object(Path, "is_symlink", return_value=False),
+            patch.object(Path, "lstat", return_value=info),
+        ):
+            self.runner._path(native)
+            info.st_mode = stat.S_IFDIR | 0o755
+            with self.assertRaisesRegex(self.runner.frozen.ImportRunnerError, "path_rejected"):
+                self.runner._path(native)
+
+    def test_new_private_parent_created_and_full_chain_passes(self):
+        result = self.execute()
+        self.assertEqual(stat.S_IMODE(self.entry.ATTEMPT.parent.stat().st_mode), 0o700)
+        self.assertEqual(result["full_input_audits"], 2)
+        self.assertTrue(result["independent_checksum_consumer"])
+
+    def test_existing_parent_is_not_reused_and_consumes_entry(self):
+        self.entry.ATTEMPT.parent.mkdir(mode=0o700)
+        with patch.object(self.runner, "_coordinate_admitted_import") as coordinate:
+            with self.assertRaises(FileExistsError):
+                self.execute()
+            coordinate.assert_not_called()
+        self.assertTrue(self.entry.CONSUMED)
+        with self.assertRaises(ValueError):
+            self.execute()
+
+    def test_invalid_control_creates_no_parent(self):
+        self.pin = "0" * 64
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertFalse(self.entry.ATTEMPT.parent.exists())
+
+    def test_writable_probe_targets_existing_work_root(self):
+        calls = []
+
+        def space(path):
+            calls.append(path)
+            return SimpleNamespace(f_flag=0 if path == self.root else os.ST_RDONLY)
+
+        with (
+            patch.object(self.entry, "load_runner", return_value=self.runner),
+            patch.object(self.runner, "_runtime"),
+            patch.object(self.entry.os, "statvfs", space),
+        ):
+            self.entry.execute(self.pin)
+        self.assertIn(self.root, calls)
+        self.assertNotIn(self.entry.ATTEMPT.parent, calls)
+
+
+class StaticTests(unittest.TestCase):
+    def test_successor_supervisor_changes_only_versioned_bindings(self):
+        root = Path(__file__).resolve().parents[1]
+        for name in (
+            "scripts/run_sft_vm_coordinator_rehearsal",
+            "scripts/prepare_sft_vm_coordinator_release",
+            "src/lumi/posttraining_vm_coordinator_rehearsal",
+        ):
+            before = (root / (name + "_v2.py")).read_text()
+            expected = before.replace(
+                "run_sft_vm_coordinator_entry_v2", "run_sft_vm_coordinator_entry_v3"
+            )
+            for stem in (
+                "run_sft_vm_coordinator_rehearsal",
+                "posttraining_vm_coordinator_rehearsal",
+            ):
+                expected = expected.replace(stem + "_v2", stem + "_v3")
+            expected = expected.replace(
+                "/opt/lumi-vm-coordinator-v2", "/opt/lumi-vm-coordinator-v3"
+            )
+            expected = expected.replace("lumi-vm-coordinator-v2-", "lumi-vm-coordinator-v3-")
+            self.assertEqual(expected, (root / (name + "_v3.py")).read_text())
+
+    def test_only_output_parent_plumbing_changed(self):
+        import ast
+
+        root = Path(__file__).resolve().parents[1]
+        before = ast.parse((root / "scripts/run_sft_vm_coordinator_entry_v2.py").read_text())
+        after = ast.parse((root / "scripts/run_sft_vm_coordinator_entry_v3.py").read_text())
+
+        def functions(tree):
+            return {n.name: ast.dump(n) for n in tree.body if isinstance(n, ast.FunctionDef)}
+
+        a, b = functions(before), functions(after)
+        for name in a.keys() - {"execute", "main"}:
+            self.assertEqual(a[name], b[name])
+        spec = importlib.util.spec_from_file_location(
+            "new_entry", root / "scripts/run_sft_vm_coordinator_entry_v3.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.ATTEMPT, Path("/work/imports/attempt"))
+
+
+if __name__ == "__main__":
+    unittest.main()

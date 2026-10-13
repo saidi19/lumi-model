@@ -1,0 +1,100 @@
+"""Offline Unicode repair fragment; never a deployment or retry authority.
+
+Compose from the immutable attempt-012 source. Future execution must separately
+rebind its source hashes; the consumed attempt and all evidence stay unchanged.
+"""
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = "artifacts/lumi-vm-attempt-012-source-v0.1/scripts/prepare_sft_vm_host_connection_v3.py"
+SOURCE_SHA = "aba4bda87c940f471916e8eb87cf4dd39f76a415f7d32c7b523b95f1ac48ccb0"
+PROOF = "evidence/lumi-vm-attempt-012-host-key-diagnostic-verification-v0.1.json"
+PROOF_SHA = "8b8f6a31da7e74f55cbf0a1c786866753fc5c29883c6418b6c003ba693dbbb50"
+OUTPUT = ROOT / "artifacts/lumi-vm-host-key-unicode-source-v0.1"
+NAME = "prepare_sft_vm_host_connection_v3.py"
+
+
+def need(value):
+    if not value:
+        raise ValueError("host_key_unicode_patch_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 131072)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def build():
+    proof = json.loads(read(PROOF, PROOF_SHA))
+    need(proof["status"] == "current_console_non_ascii_rejection_reproduced")
+    for name, pin in proof["source_bindings"].items():
+        read(name, pin["sha256"], pin["bytes"])
+    original = read(SOURCE, SOURCE_SHA)
+    old = b'    raw = reply["Output"].encode("ascii")\n'
+    new = (
+        b"    # SDK/CLI can return decoded Unicode boot text around the ASCII key block.\n"
+        b"    # Bound characters before encoding, then enforce the original byte cap.\n"
+        b'    need(len(reply["Output"]) <= MAX_CONSOLE)\n'
+        b'    raw = reply["Output"].encode("utf-8")\n'
+    )
+    need(original.count(old) == 1)
+    patched = original.replace(old, new)
+    before, after = ast.parse(original), ast.parse(patched)
+
+    def keep(tree):
+        return [
+            ast.dump(n)
+            for n in tree.body
+            if not (isinstance(n, ast.FunctionDef) and n.name == "host_key")
+        ]
+
+    need(keep(before) == keep(after))
+    compile(patched, "<unicode-host-key-fragment>", "exec")
+    return patched
+
+
+def prepare():
+    patched = build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    manifest = dict(
+        schema="lumi.host-key-unicode-source.v0.1",
+        status="local_repair_fragment_not_execution_bound",
+        source_bindings={SOURCE: dict(sha256=SOURCE_SHA), PROOF: dict(sha256=PROOF_SHA)},
+        outputs={NAME: dict(bytes=len(patched), sha256=sha(patched))},
+        changed_function="host_key",
+        other_source_bytes_unchanged=True,
+        execution_permitted=False,
+        cpu_retry=False,
+        network_calls=0,
+        raw_console_retained=False,
+    )
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    for name, raw in (
+        (NAME, patched),
+        ("release.json", (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()),
+    ):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+            stream.flush()
+            os.fsync(stream.fileno())
+    return manifest
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

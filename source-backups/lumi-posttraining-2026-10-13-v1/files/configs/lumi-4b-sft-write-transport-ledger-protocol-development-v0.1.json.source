@@ -1,0 +1,157 @@
+{
+  "schema_version": "lumi.sft-write-transport-ledger-protocol-development.v0.1",
+  "date": "2026-09-26",
+  "status": "PASS_local_dropped_seal_transport_ledger_protocol_candidates_NOT_process_integration",
+  "scope": "Local, import-inert dropped-worker seal, listener-transfer, parent-reservation-ledger and sealed READY/release/CONSUMED protocol candidates with synthetic native-boundary tests only. No process spawn, listener transfer, filter installation, socket I/O, pidfd, cgroup, worker, payload, remote, GPU, inference or training execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_listener_v2.py",
+      "bytes": 8640,
+      "sha256": "27334dd75d0aff9efd7d2a85fa7bb62f5146e2d6874c7633e7efa67f6c9ca005"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_listener_v2.py",
+      "bytes": 24835,
+      "sha256": "23966391f32924867062aa17ccda65714069781b109be23809d6f69482af62e1"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_transport_v1.py",
+      "bytes": 16181,
+      "sha256": "195a8d42b4bab8e72db05d5577b2e0ac2d0b3294b4e9237b1bea99add074bab8"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_transport_v1.py",
+      "bytes": 19730,
+      "sha256": "da32ee4af7e8fca14e46d0bddc8fdc443f71c53554700075fe03153b83915892"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_ledger_v1.py",
+      "bytes": 10043,
+      "sha256": "a566ed583aa861d5b8a7e3d03edf53a4b6225b3efdb3740737150055fbeb0091"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_ledger_v1.py",
+      "bytes": 16290,
+      "sha256": "2c1da2f3b965394327a22ee1ed0916dbb7cbc2507ef70e45d25c1de22b600700"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_protocol_v1.py",
+      "bytes": 10569,
+      "sha256": "7c8f0c8509b396f11ee5500bc351e94127a1637e628ba3c1bda1f7a237481ed0"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_protocol_v1.py",
+      "bytes": 15142,
+      "sha256": "be6bee8f66259aaddd45f64597a88af9dc00645c0519ba4715f6f8fb208118d5"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_listener_v1.py",
+      "bytes": 20848,
+      "sha256": "46df3670f8921e06679b2978c7aecd70700dd71c67a44dcf84c7cd4bb034e64a"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_guardian_v1.py",
+      "bytes": 18831,
+      "sha256": "b8831ac5c43d4e1f58e5a56467b42d3ac2ef8b225210fbb9f472bf048e35896b"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_broker_v1.py",
+      "bytes": 9293,
+      "sha256": "cfad51b8870bab8cd58ae35252aa932d49248dc44d64d779a359fa91d58e1716"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_policy_v1.py",
+      "bytes": 12666,
+      "sha256": "0b415b6951d9b0a7886158851a90464536fd42bd8716ae740a6361fc3cbf7690"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-listener-guardian-development-v0.1.json",
+      "bytes": 8763,
+      "sha256": "091e3845f604004a72f13d28e8ae4cc69e668cb9b7a91596f6fdc8e1e0608d3f"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-listener-guardian-development-verification-v0.1.json",
+      "bytes": 8240,
+      "sha256": "9595c24be51385b2d19169a63e161a3b0b07a8005885562fefff66d49f9b668e"
+    }
+  ],
+  "completed": [
+    "A versioned listener successor preserves listener v1 byte-for-byte, delegates the root-only prepare and adoption phases unchanged, and permits the frozen final seal only after the same process and main thread has irreversibly reached exact uid/gid 10001, empty supplementary groups, no-new-privileges and an inherited listener filter.",
+    "The private transfer candidate validates one borrowed root-owned connected AF_UNIX SOCK_SEQPACKET channel, uses one nonblocking SCM_RIGHTS offer and one exact digest-bound acknowledgement, closes malformed delivered descriptors, rejects SCM_PIDFD, detects descriptor-number reuse and transfers received-listener ownership only through an explicit one-shot operation.",
+    "The broker-to-parent ledger sends only one fixed 24-byte ordinal, requested-byte and cumulative-byte offer. The parent validates and stores the conservative reservation before attempting its fixed 8-byte acknowledgement; the frozen broker performs ID_VALID and CONTINUE only after that acknowledgement.",
+    "The sealed worker protocol separates the report and release channels. It writes READY on the report channel, reads the guardian's release byte and an empty read with HUP on the release channel, closes that release descriptor and then writes CONSUMED on the still-open report channel.",
+    "Post-seal protocol I/O uses frozen-policy-compatible scalar read, write and poll syscalls with no implicit Python EINTR retry. An empty read plus HUP is recorded only as that observation, not as proof that the queue was drained.",
+    "Every public entry remains unconditionally closed. All retained snapshots contain fixed codes and aggregate state only; they retain explicit false claims for origin, exclusivity, native qualification, process integration, execution, import and training."
+  ],
+  "required_lifecycle_order": [
+    "Root bootstrap prepares the frozen listener and offers its descriptor over the precreated transfer channel.",
+    "A dedicated broker explicitly receives and takes the descriptor, adopts it through listener v1 and returns the exact digest-bound acknowledgement.",
+    "The worker irreversibly drops to uid/gid 10001 with no supplementary groups and installs the frozen final seal through listener v2.",
+    "The sealed worker writes READY on the report channel; the parent verifies the fixed message and only then arms the independent guardian.",
+    "The guardian writes the one-byte release token and closes its release endpoint; the worker reads the token, observes an empty read with HUP, closes its release endpoint and writes CONSUMED on the separate report channel.",
+    "For each write notification the broker sends an aggregate reservation offer; the parent validates and stores it before acknowledging, and only then may the frozen broker validate the notification ID and send CONTINUE.",
+    "Only after the controller has proved the full process topology, ownership transitions and terminal cleanup may it execute the frozen full-size worker entry."
+  ],
+  "ledger_bounds": {
+    "maximum_notifications": 262144,
+    "offer_bytes_each": 24,
+    "ack_bytes_each": 8,
+    "maximum_offer_bytes": 6291456,
+    "maximum_ack_bytes": 2097152,
+    "maximum_protocol_bytes": 8388608,
+    "reservation_is_conservative_requested_byte_upper_bound": true,
+    "final_successful_response_or_write_count_verified": false
+  },
+  "verification": {
+    "new_listener_v2_tests": 31,
+    "new_transport_tests": 33,
+    "new_ledger_tests": 36,
+    "new_protocol_tests": 24,
+    "new_tests": 124,
+    "prior_regressions": 697,
+    "unique_tests_per_runtime": 821,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ],
+    "all_native_boundaries_synthetic": true,
+    "native_operations_performed": false
+  },
+  "remaining_integration_work": [
+    "Version the guardian so cgroup-lease and release-descriptor ownership transfer is unambiguous on every early failure; the frozen v1 order can otherwise leave the caller unable to distinguish a leak from a double retirement.",
+    "Implement the controller-owned process topology: dedicated broker spawn, exact inherited-descriptor closure matrix, worker and guardian launch order, trusted single-writer release topology, report consumption, ledger callbacks, pidfd termination and parent-side broker and worker reap.",
+    "Bind the controller into the frozen full-size bootstrap, dispatcher and lifecycle closure without weakening host, input, source, cgroup, authority, core-dump, mapping or resource-envelope gates.",
+    "Authenticate the successor source closure and run a separately authorized bounded Linux native qualification before any real checkpoint payload read or import.",
+    "Only after native qualification, re-run the unchanged host, input, resource and real-import admission gates."
+  ],
+  "nonclaims": {
+    "public_execution_open": false,
+    "target_kernel_abi_qualified": false,
+    "native_filters_installed": false,
+    "native_listener_bound_or_transferred": false,
+    "listener_or_channel_origin_authenticated": false,
+    "transfer_channel_exclusivity_verified": false,
+    "broker_process_spawned_or_reaped": false,
+    "worker_process_spawned_or_reaped": false,
+    "guardian_process_spawned_or_reaped": false,
+    "release_channel_origin_or_peer_exclusivity_verified": false,
+    "release_queue_drained_verified": false,
+    "parent_received_ready_or_consumed": false,
+    "guardian_armed_after_ready": false,
+    "native_write_continuations_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "successful_write_count_verified": false,
+    "physical_or_metadata_write_accounting": false,
+    "guardian_death_containment_verified": false,
+    "bootstrap_or_lifecycle_integration_verified": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "retry_allowed": false,
+    "publication": false
+  }
+}

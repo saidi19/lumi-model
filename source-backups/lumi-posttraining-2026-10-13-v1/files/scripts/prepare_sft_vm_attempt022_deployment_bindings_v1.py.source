@@ -1,0 +1,111 @@
+"""Attempt-022 source and live-absence bindings before control deployment."""
+
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "afae7b4618174ce084fd3b6a902d74e1"
+OLD = '07be75c955dc43fe8818192e8a9e3fc1'
+BUCKET = "lumi-cleanup-" + ATTEMPT
+RELEASE = 'artifacts/lumi-vm-attempt-022-source-v0.1'
+RELEASE_SHA = '5cd83aa6c3ce497e45170a5e3165ae28705bf08a92b191098b6b4f66c48f7a8a'
+SOURCE_PROOF = 'evidence/lumi-vm-attempt-022-source-verification-v0.1.json'
+SOURCE_PROOF_SHA = '9a152480ad7a8b04866b47e7bf648f7ce7a8dae4aee9273e0d0e832c11be5f66'
+ABSENCE = 'evidence/lumi-vm-attempt-022-control-target-absence-v0.1.json'
+ABSENCE_SHA = '0fae9b018c0565050952bd3f277a94d1c2e544d2d5cb033f2f00165df6f2ca18'
+PLAN = 'artifacts/lumi-vm-attempt-022-control-plan-v0.1/plan.json'
+PLAN_SHA = '0b072f68938e74484501c72e60a57965c5e205e4572af06dcc60ceb00d17fc35'
+PLAN_RELEASE = 'artifacts/lumi-vm-attempt-022-control-plan-v0.1/release.json'
+PLAN_RELEASE_SHA = '87df9d8b8fb0722020277468d5e5071874c4cab89f6731fac0de3b5619cc9813'
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt022_binding_v21_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def verify():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    absence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    checked = json.loads(read(
+        'evidence/lumi-vm-attempt-022-control-target-absence-verification-v0.1.json',
+        '8258b2b924aabb1baa158f532e933e820e636c66b00343c6e2503ff0eca28860'))
+    need(manifest["attempt"] == ATTEMPT and manifest["operational_predecessor"] == OLD)
+    need(manifest["receipt_file_count"] == 19 and len(manifest["outputs"]) == 156)
+    need(manifest["execution_permitted"] is False)
+    need(proof["attempt"] == ATTEMPT and proof["source_release_sha256"] == RELEASE_SHA)
+    need(proof["qualified_fix_only_loader_ast_verified"]
+         and proof["new_execution_authorized"] is False)
+    need(absence["attempt"] == ATTEMPT and absence["target_names_absent"])
+    need(absence["status"] == "fresh_targets_absent_network_slot_free")
+    need(absence["frozen_vpc_endpoint_gate_passed"] and not absence["blocking_vpc_endpoints"])
+    need(absence["cloud_mutations"] == absence["object_access"] == absence["instance_actions"] == 0)
+    need(absence["predecessor_retention"]["instance_state"] == "stopped")
+    need(absence["predecessor_retention"]["encrypted_volume_count"] == 2)
+    need(checked["attempt"] == ATTEMPT and checked["source_release_sha256"] == RELEASE_SHA)
+    need(checked["control_deployment_authorized"] is False)
+    need(plan_release["attempt"] == ATTEMPT and plan_release["plan_sha256"] == PLAN_SHA)
+    need(plan_release["source_release_sha256"] == RELEASE_SHA)
+    need(plan_release["control_target_absence_sha256"] == ABSENCE_SHA)
+    need(
+        plan_release["target_verification_sha256"]
+        == '8258b2b924aabb1baa158f532e933e820e636c66b00343c6e2503ff0eca28860'
+    )
+    need(plan_release["fresh_control_deployment_required"] is True)
+    need(plan_release["execution_permitted"] is False)
+    for name, digest in checked["bindings"].items():
+        read(name, digest)
+    for name, pin in manifest["outputs"].items():
+        read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["network_candidate_live_availability_verified"] is True
+        and plan["control_target_absence_evidence"] == {"path": ABSENCE, "sha256": ABSENCE_SHA}
+        and plan["required_control_proofs"] == []
+        and plan["successful_readonly_preflight"] is None
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    raise ValueError("fresh_control_evidence_not_created") from None
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

@@ -1,0 +1,156 @@
+"""Bind independently verified attempt-020 live controls."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt020_controls_v2 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "66372c18d0cd36a916af83b9327e532679495fa857a69bfa600d9627f7f4ac26"
+BASE_PLAN = "artifacts/lumi-vm-attempt-020-control-plan-v0.2/plan.json"
+BASE_PLAN_SHA = "6e3a355033b684f11900bf189d17b06e6cb5fe3c43dccfa021015d47f4439ee4"
+WATCH = "evidence/lumi-vm-attempt-020-inert-watchdog-deployment-verification-v0.1.json"
+WATCH_SHA = "fed207778bbe56bc8209de6cfb457139302134a1212e8e68970db891dd3ff321"
+STORE = "evidence/lumi-vm-attempt-020-cleanup-bucket-verification-v0.1.json"
+STORE_SHA = "b91bc9d573fa48f38dc05cf83b08c062c13c7420031c95f2929831fae337526e"
+FAILURES = (
+    (
+        "evidence/lumi-vm-attempt-020-control-verification-failure-v0.1.json",
+        "d7a662739eeea15859d285d29b30f8fe7b4522b88b70db13a234bc2c6300ade3",
+    ),
+    (
+        "evidence/lumi-vm-attempt-020-control-verification-failure-v0.2.json",
+        "e82fe8fc919cca84a412f57e4f64b9a8b42ef6efc04752e7facac8709931134a",
+    ),
+    (
+        "evidence/lumi-vm-attempt-020-control-verification-failure-v0.3.json",
+        "787cb3a7159fa05699a34624f36daeeb83d6011ef21de5cd712fad92e6452e57",
+    ),
+)
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-020-control-plan-v0.3"
+ATTEMPT = previous.ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_control_plan_v3_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 256 * 1024)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    previous.build()
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    watch = json.loads(read(WATCH, WATCH_SHA))
+    store = json.loads(read(STORE, STORE_SHA))
+    failures = [json.loads(read(path, digest)) for path, digest in FAILURES]
+    need(
+        watch["attempt"] == ATTEMPT
+        and watch["status"] == "verified_deployed_unarmed_invocation_disabled"
+        and watch["independent_live_readback"]["reserved_concurrency"] == 0
+        and watch["independent_live_readback"]["schedule_group_absent"] is True
+        and watch["cloud_mutations"] == 0
+        and watch["object_access"] is False
+        and store["attempt"] == ATTEMPT
+        and store["status"] == "verified_private_cleanup_bucket_created"
+        and store["storage"]["public"] is False
+        and store["storage"]["object_access"] is False
+        and store["independent_readback"]["deny_only_policy_verified"] is True
+        and store["independent_readback"]["aes256_default_encryption"] is True
+        and store["cloud_mutations"] == 0
+        and all(item["verification_outputs_created"] is False for item in failures)
+        and all(item["control_deployments_retried"] is False for item in failures)
+        and all(item["cloud_mutations"] == item["object_access"] == 0 for item in failures)
+    )
+    plan["schema"] = "lumi.vm-attempt-020-control-plan.v0.3"
+    plan["status"] = "live_controls_verified_fresh_readonly_preflight_required"
+    plan["required_control_proofs"] = [WATCH, STORE]
+    plan["watchdog"]["status"] = "deployed_unarmed_invocation_disabled_verified"
+    plan["watchdog"]["redeployment_authorized"] = False
+    plan["cleanup_store"]["status"] = "private_cleanup_store_verified"
+    plan["control_verification_failures_preserved"] = [
+        {"path": path, "sha256": digest} for path, digest in FAILURES
+    ]
+    plan["successful_readonly_preflight"] = None
+    plan["readiness_review"]["decision"] = "fresh_full_readonly_preflight_required"
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Fresh full read-only CPU, network, watchdog and cleanup-store admission passes",
+        "A separate v0.25 one-shot CPU proposal and exact approval bind that admission",
+        "Immediate pre-launch read-only admission passes before the execution marker",
+    ]
+    plan["readiness_review"]["risk"] = (
+        "Live inert controls are verified, but CPU capacity, fresh network admission, "
+        "remote boot and import remain unproved."
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Pass the fresh full read-only CPU, network, store and watchdog admission.",
+        "Bind a separate one-shot CPU proposal and exact approval.",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-020-control-plan-release.v0.3",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": previous.previous.RELEASE_SHA,
+        "watchdog_verification_sha256": WATCH_SHA,
+        "cleanup_store_verification_sha256": STORE_SHA,
+        "failed_verification_evidence_preserved": True,
+        "failed_verification_count": len(FAILURES),
+        "live_controls_verified": True,
+        "fresh_readonly_preflight_required": True,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(
+            OUTPUT / name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+        )
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

@@ -1,0 +1,141 @@
+"""Fresh identity and diagnostics tested through real local binders, synthetic AWS only."""
+
+import ast
+import hashlib
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt011_v1 as builder
+from tests import test_sft_vm_diagnostics_candidate_v1 as diagnostic_tests
+
+retained_fixture = diagnostic_tests.prior.cidr.retained_fixture
+
+
+class Tests(diagnostic_tests.Tests):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.ancillary, cls.report, cls.base = builder.build()
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-attempt011-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.package = Path(cls.temp.name).resolve()
+        for name, raw in cls.files.items():
+            path = cls.package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def setUp(self):
+        # Both older /27s remain occupied; match the observed retained topology.
+        self.enterContext(
+            patch.object(
+                diagnostic_tests.prior.cidr,
+                "retained_fixture",
+                lambda: retained_fixture(extra=True),
+            )
+        )
+        super().setUp()
+
+    def test_archives_limits_and_history_unchanged_not_execution_authority(self):
+        for name, raw in self.base.items():
+            if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+                self.assertEqual(self.files[name], raw)
+        self.assertTrue(self.report["fresh_operational_identity_bound"])
+        self.assertFalse(self.report["execution_permitted"])
+        self.m.authenticate()
+
+    def test_new_target_collision_still_stops_before_allocation(self):
+        def occupied():
+            value = retained_fixture(extra=True)
+            value["subnets"].append(
+                dict(
+                    value["subnets"][0],
+                    id="subnet-" + "f" * 17,
+                    cidr=builder.CIDR,
+                    available_ipv4=25,
+                )
+            )
+            return value
+
+        with patch.object(diagnostic_tests.prior.cidr.recovery.outer_fake, "fixture", occupied):
+            result = self.case.run_once()
+        self.assertFalse(result["host_lifecycle_completed"])
+        self.assertFalse(self.case.net.rows or self.case.host_calls)
+
+    def test_no_new_authority_and_unchanged_function_bodies(self):
+        self.assertFalse(self.report["source_identity_consumed"])
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertFalse(self.report["new_identity_live_absence_verified"])
+        with self.assertRaises(ValueError):
+            builder.run()
+        allowed = {
+            "scripts/sft_vm_controller_credentials_v2.py": {
+                "Reader.active",
+                "Reader.__call__",
+                "Clients.__init__",
+            },
+            "scripts/provision_sft_vm_host_v5.py": {
+                "Transaction.cli",
+                "Transaction.stop_failed_launch",
+                "_provision_and_setup_admitted_once",
+            },
+        }
+        functions = diagnostic_tests.builder.functions
+        for name, changed in allowed.items():
+            base_name = name.replace("provision_sft_vm_host_v5", "provision_sft_vm_host_v4")
+            before, after = functions(self.base[base_name]), functions(self.files[name])
+            self.assertEqual(set(before), set(after))
+            for function in before.keys() - changed:
+                self.assertEqual(ast.dump(before[function]), ast.dump(after[function]))
+
+    def test_fresh_identity_and_cidr_bound_across_controllers(self):
+        self.m.authenticate()
+        self.m.loading.fresh_identity()
+        self.assertEqual(self.m.network.selection.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.loading.original_guard.worker.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.store.worker.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.loading.BASE_CODE, self.m.loading.original_guard.CODE)
+        self.assertNotIn(builder.PREVIOUS, self.m.store.worker.PREFIX)
+        plan = json.loads(self.files["configs/lumi-vm-private-network-plan-v0.1.json"])
+        self.assertEqual(plan["targets"]["new_private_subnet_cidr"], builder.CIDR)
+        proposal = json.loads(self.files["configs/lumi-vm-fullsize-host-proposal-v0.1.json"])
+        self.assertEqual(proposal["prepared_attempt"], builder.NEW)
+        self.assertIn(builder.NEW, proposal["retention_proposal"]["prefix"])
+        self.assertFalse(proposal["execution_permitted"])
+
+    def test_native_guard_is_only_identity_change_from_qualified_source(self):
+        proof = json.loads(self.files["evidence/lumi-vm-boot-smoke-closure-v0.5.json"])
+        name = "scripts/run_sft_vm_early_stop_v2.py"
+        raw = self.files[name]
+        self.assertEqual(raw.count(builder.NEW.encode()), 1)
+        restored = raw.replace(
+            builder.NEW.encode(), self.report["qualified_source_ancestor"].encode()
+        )
+        self.assertEqual(hashlib.sha256(restored).hexdigest(), proof["bindings"][name])
+
+    def test_identity_and_guest_manifests_and_preserved_ancestor(self):
+        identity_raw = self.ancillary["identity/manifest.json"]
+        identity = json.loads(identity_raw)
+        guest = json.loads(self.ancillary["guest-release.json"])
+        self.assertEqual(guest["identity_manifest_sha256"], builder.sha(identity_raw))
+        self.assertEqual(guest["attempt"], builder.NEW)
+        self.assertEqual(
+            identity["namespaces"]["private_output"],
+            "artifacts/lumi-vm-private-outer-execution-v0.11/attempt-011",
+        )
+        self.assertEqual(self.report["operational_predecessor"], builder.PREVIOUS)
+        self.assertEqual(
+            self.report["preserved_predecessor"]["stopped_instance"], "i-04afbb5dbed16b970"
+        )
+        self.assertFalse(
+            self.report["deployment_plan_bound"] or self.report["execution_entry_bound"]
+        )
+
+    def test_checkpoint_selection_unchanged_from_prior_release(self):
+        name = "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"
+        old = builder.ROOT / "artifacts/lumi-vm-attempt-010-source-v0.1" / name
+        self.assertEqual(self.files[name], old.read_bytes())
+        for name in self.files:
+            if name.endswith("sdk-release.tar"):
+                old = builder.ROOT / "artifacts/lumi-vm-attempt-010-source-v0.1" / name
+                self.assertEqual(self.files[name], old.read_bytes())

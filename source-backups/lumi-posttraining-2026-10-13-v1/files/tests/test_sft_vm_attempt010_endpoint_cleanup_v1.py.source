@@ -1,0 +1,208 @@
+"""Synthetic-only exact endpoint cleanup admission and one-dispatch checks."""
+
+import copy
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from scripts import cleanup_sft_vm_attempt010_endpoint_v1 as m
+
+
+def fixture():
+    tags = [dict(Key="LumiAttempt", Value=m.ATTEMPT), dict(Key="LumiNetworkNonce", Value=m.NONCE)]
+    return {
+        "get-caller-identity": dict(Account=m.ACCOUNT),
+        "describe-instances": dict(
+            Reservations=[
+                dict(
+                    OwnerId=m.ACCOUNT,
+                    Instances=[
+                        dict(
+                            InstanceId=m.VM,
+                            State=dict(Name="stopped"),
+                            VpcId=m.VPC,
+                            SubnetId=m.SUBNET,
+                            ClientToken=m.ATTEMPT,
+                            InstanceType="r6i.4xlarge",
+                            BlockDeviceMappings=[
+                                dict(Ebs=dict(VolumeId=v, DeleteOnTermination=False))
+                                for v in m.VOLUMES
+                            ],
+                        )
+                    ],
+                )
+            ]
+        ),
+        "describe-volumes": dict(
+            Volumes=[
+                dict(VolumeId=v, State="in-use", Attachments=[dict(InstanceId=m.VM)])
+                for v in m.VOLUMES
+            ]
+        ),
+        "describe-subnets": dict(
+            Subnets=[
+                dict(
+                    SubnetId=m.SUBNET,
+                    VpcId=m.VPC,
+                    OwnerId=m.ACCOUNT,
+                    CidrBlock="172.31.96.32/27",
+                    Tags=tags,
+                )
+            ]
+        ),
+        "describe-route-tables": dict(
+            RouteTables=[
+                dict(
+                    RouteTableId=m.TABLE,
+                    VpcId=m.VPC,
+                    OwnerId=m.ACCOUNT,
+                    Tags=tags,
+                    Associations=[dict(SubnetId=m.SUBNET, Main=False)],
+                    Routes=[],
+                )
+            ]
+        ),
+        "describe-instance-connect-endpoints": dict(
+            InstanceConnectEndpoints=[
+                dict(
+                    InstanceConnectEndpointId=m.ENDPOINT,
+                    State="create-complete",
+                    OwnerId=m.ACCOUNT,
+                    VpcId=m.VPC,
+                    SubnetId=m.SUBNET,
+                    Tags=tags,
+                    NetworkInterfaceIds=[m.ENI],
+                )
+            ]
+        ),
+        "describe-network-interfaces": dict(
+            NetworkInterfaces=[
+                dict(
+                    NetworkInterfaceId=m.ENI,
+                    OwnerId=m.ACCOUNT,
+                    SubnetId=m.SUBNET,
+                    VpcId=m.VPC,
+                    InterfaceType="ec2_instance_connect_endpoint",
+                ),
+                dict(
+                    NetworkInterfaceId=m.VM_ENI,
+                    OwnerId=m.ACCOUNT,
+                    SubnetId=m.SUBNET,
+                    VpcId=m.VPC,
+                    Attachment=dict(InstanceId=m.VM),
+                ),
+            ]
+        ),
+    }
+
+
+class Fake:
+    def __init__(self):
+        self.data, self.ops = fixture(), []
+        self.save = lambda *args: None
+
+    def call(self, op):
+        self.ops.append(op)
+        if op == m.DELETE:
+            self.data["describe-instance-connect-endpoints"]["InstanceConnectEndpoints"] = []
+            self.data["describe-network-interfaces"]["NetworkInterfaces"].pop(0)
+            return {}
+        return copy.deepcopy(self.data[op])
+
+
+class Tests(unittest.TestCase):
+    def test_success_one_delete_and_preservation_rechecked(self):
+        cloud = Fake()
+        self.assertTrue(m.Cleanup(cloud).run()["cleanup_verified"])
+        self.assertEqual(cloud.ops.count(m.DELETE), 1)
+        self.assertEqual(cloud.ops.count("describe-instances"), 2)
+        self.assertEqual(cloud.ops.count("describe-volumes"), 2)
+        self.assertEqual(cloud.ops.count("describe-subnets"), 2)
+        self.assertEqual(cloud.ops.count("describe-route-tables"), 2)
+
+    def test_wrong_identity_denies_before_resource_reads(self):
+        cloud = Fake()
+        cloud.data["get-caller-identity"]["Account"] = "wrong"
+        with self.assertRaises(ValueError):
+            m.Cleanup(cloud).run()
+        self.assertEqual(cloud.ops, ["get-caller-identity"])
+
+    def test_wrong_owner_running_vm_or_changed_disk_denied(self):
+        for variant in ("owner", "running", "disk"):
+            cloud = Fake()
+            if variant == "owner":
+                cloud.data["describe-instance-connect-endpoints"]["InstanceConnectEndpoints"][0][
+                    "OwnerId"
+                ] = "wrong"
+            else:
+                vm = cloud.data["describe-instances"]["Reservations"][0]["Instances"][0]
+                if variant == "running":
+                    vm["State"]["Name"] = "running"
+                else:
+                    vm["BlockDeviceMappings"][0]["Ebs"]["DeleteOnTermination"] = True
+            with self.assertRaises(ValueError):
+                m.Cleanup(cloud).run()
+            self.assertNotIn(m.DELETE, cloud.ops)
+
+    def test_unknown_interface_or_changed_endpoint_tag_denied(self):
+        for variant in ("interface", "tag"):
+            cloud = Fake()
+            if variant == "interface":
+                cloud.data["describe-network-interfaces"]["NetworkInterfaces"][0][
+                    "NetworkInterfaceId"
+                ] = "unknown"
+            else:
+                cloud.data["describe-instance-connect-endpoints"]["InstanceConnectEndpoints"][0][
+                    "Tags"
+                ] = []
+            with self.assertRaises(ValueError):
+                m.Cleanup(cloud).run()
+            self.assertNotIn(m.DELETE, cloud.ops)
+
+    def test_already_absent_no_mutation(self):
+        cloud = Fake()
+        cloud.call(m.DELETE)
+        cloud.ops.clear()
+        self.assertEqual(m.Cleanup(cloud).run()["status"], "already_absent_no_mutation")
+        self.assertNotIn(m.DELETE, cloud.ops)
+
+    def test_transport_timeout_consumes_dispatch_and_prevents_retry(self):
+        cloud = m.Cloud(lambda *a: None, clock=lambda: 0)
+        with patch.object(m.subprocess, "run", side_effect=TimeoutError("SECRET")) as call:
+            with self.assertRaises(TimeoutError):
+                cloud.call(m.DELETE)
+            with self.assertRaises(ValueError):
+                cloud.call(m.DELETE)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(cloud.writes, 1)
+
+    def test_transport_exact_endpoint_no_retry_and_unknown_operation_blocked(self):
+        cloud = m.Cloud(lambda *a: None, clock=lambda: 0)
+        with patch.object(
+            m.subprocess,
+            "run",
+            return_value=SimpleNamespace(stdout=b"{}", stderr=b"", returncode=0),
+        ) as call:
+            cloud.call(m.DELETE)
+            args = call.call_args.args[0]
+            self.assertEqual(
+                json.loads(args[args.index("--cli-input-json") + 1]),
+                dict(InstanceConnectEndpointId=m.ENDPOINT),
+            )
+            self.assertEqual(call.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+            for op in ("terminate-instances", "delete-subnet", "delete-route-table", m.DELETE):
+                with self.assertRaises(ValueError):
+                    cloud.call(op)
+            self.assertEqual(call.call_count, 1)
+
+    def test_read_and_deadline_budget_fail_closed(self):
+        now = [0]
+        cloud = m.Cloud(lambda *a: None, clock=lambda: now[0])
+        cloud.reads = 30
+        with self.assertRaises(ValueError):
+            cloud.call("get-caller-identity")
+        now[0] = 565
+        with self.assertRaises(ValueError):
+            cloud.call(m.DELETE)
+        self.assertEqual(cloud.writes, 0)

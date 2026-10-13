@@ -1,0 +1,71 @@
+"""Bounded read-only endpoint-disposition admission; never deletes or launches."""
+
+import hashlib
+import json
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = ROOT / "scripts/cleanup_sft_vm_attempt015_endpoint_v1.py"
+SOURCE_SHA = "a3bc4c981457a79e76235687107a32bfb4b7f8c18fe142af945cd870a9c34b01"
+
+
+def checker():
+    raw = SOURCE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != SOURCE_SHA:
+        raise ValueError("checker_drift")
+    replacements = {
+        "4cf0fb2a3ebe4d72af842c351a4cc4cd": "3f3cb73e00434101943c82601a3fb3bc",
+        "478a459cf4b94bebae30761059cce636": "33add86298624c64a12e5bcce0fc9329",
+        "subnet-0b018a98676575616": "subnet-0092d2454f0d114fd",
+        "rtb-0bf3ffc4bd2138a55": "rtb-0b63896597a91a4bf",
+        "i-0652575b4b0e8689d": "i-042f9583629d63b3b",
+        "eice-0eae6c018a9cae6e2": "eice-064320cd523dd05e8",
+        "sg-000b86a853ec89e83": "sg-09a18b061afc759e0",
+        "sg-02aecc343220cb654": "sg-0897b7057a4086434",
+        "vol-0e0194f7dd9872884": "vol-0effbd5fc3da2a6c4",
+        "vol-0b67ceeb75dde40c4": "vol-075ae20516947c6f0",
+        "172.31.96.160/27": "172.31.96.192/27",
+    }
+    for before, after in replacements.items():
+        if before.encode() not in raw:
+            raise ValueError("checker_shape_drift")
+        raw = raw.replace(before.encode(), after.encode())
+    module = types.ModuleType("_readonly_endpoint_checker")
+    module.__file__ = str(SOURCE)
+    exec(compile(raw, str(SOURCE), "exec"), module.__dict__)
+    # Even an accidental call of legacy Cleanup.run cannot dispatch a deletion.
+    module.REQUESTS.pop(module.DELETE)
+    return module
+
+
+def inspect(module, cloud):
+    module.need(cloud.call("get-caller-identity")["Account"] == module.ACCOUNT)
+    checks = module.Cleanup(cloud)
+    checks.preserved()
+    state = checks.endpoint()
+    module.need(state == "create-complete")
+    checks.interfaces(False)
+    return dict(status="owned_retained_endpoint_and_dependencies_verified",
+                endpoint=module.ENDPOINT, instance=module.VM, volumes=sorted(module.VOLUMES),
+                endpoint_disposition_resolved=False, deletion_authorized=False,
+                instance_actions=0, mutations=0, cpu_launch_authorized=False)
+
+
+def main():
+    module = checker()
+    receipts = []
+    cloud = module.Cloud(lambda name, value: receipts.append(dict(name=name, **value)))
+    report = dict(status="read_only_inspection_failed", mutations=0,
+                  endpoint_disposition_resolved=False, cpu_launch_authorized=False)
+    try:
+        report.update(inspect(module, cloud))
+    except Exception:
+        report["failed_stage"] = cloud.stage
+    report.update(reads=cloud.reads, writes=cloud.writes, receipts=receipts,
+                  elapsed_seconds=round(cloud.clock() - cloud.start, 3))
+    print(json.dumps(report, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

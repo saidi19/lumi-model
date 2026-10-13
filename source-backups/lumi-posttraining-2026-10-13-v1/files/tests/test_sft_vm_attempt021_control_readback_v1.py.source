@@ -1,0 +1,50 @@
+"""Offline control-readback gates before actual read-only execution."""
+
+import sys
+import unittest
+from unittest.mock import Mock
+
+from scripts import execute_sft_vm_attempt021_control_readback_v1 as entry
+from scripts import prepare_sft_vm_attempt021_control_readback_v1 as builder
+from tests import test_verify_sft_vm_attempt020_controls_v1 as previous
+
+
+class Tests(previous.Tests):
+    def setUp(self):
+        original = previous.m
+        previous.m = entry.verification
+        self.addCleanup(setattr, previous, "m", original)
+
+    def test_reproduced_candidate_is_exact(self):
+        self.assertEqual(builder.candidate(), entry.files.read(entry.ROOT / builder.OUTPUT))
+
+    def test_tracked_reads_reject_mutations_and_objects_before_dispatch(self):
+        client = Mock()
+        tracked = entry.TrackedReads({"ec2": client})
+        for operation in ("run_instances", "invoke", "get_object", "head_object"):
+            with self.assertRaises(ValueError):
+                getattr(tracked["ec2"], operation)()
+        self.assertEqual(tracked.calls, 0)
+        self.assertFalse(client.mock_calls)
+
+    def test_call_budget_counts_before_attempt_and_stops(self):
+        client = Mock()
+        client.describe_instances.side_effect = TimeoutError("synthetic")
+        tracked = entry.TrackedReads({"ec2": client})
+        with self.assertRaises(TimeoutError):
+            tracked["ec2"].describe_instances()
+        self.assertEqual(tracked.calls, 1)
+        tracked.calls = 28
+        with self.assertRaises(ValueError):
+            tracked["ec2"].describe_instances()
+        self.assertEqual(client.describe_instances.call_count, 1)
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

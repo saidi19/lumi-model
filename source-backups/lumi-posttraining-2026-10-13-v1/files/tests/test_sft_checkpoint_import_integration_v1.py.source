@@ -1,0 +1,94 @@
+"""One tiny synthetic metadata -> closed input audit -> CPU kernel -> audit chain."""
+
+from __future__ import annotations
+
+import unittest
+
+from lumi.posttraining_checkpoint_import_plan_v1 import build_import_plan
+from lumi.posttraining_checkpoint_stream_v1 import verify_inventory
+from lumi.posttraining_final_base_metadata_v1 import canonical, sha
+from tests import test_sft_checkpoint_import_torch_v3 as fixtures
+
+
+class TinyComponentIntegrationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.CheckpointImportTorchTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.CheckpointImportTorchTests.tearDownClass()
+
+    def test_metadata_plan_closed_audits_and_cpu_roundtrip(self):
+        fixture = fixtures.CheckpointImportTorchTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        config = fixture.config_class(**fixture.payload)
+        fixture.payload = {key: getattr(config, key) for key in fixtures.m.MODEL_FIELDS}
+        fixture.payload["model_type"] = "lumi"
+        config_raw = canonical(fixture.payload)
+        fixture.config_path.write_bytes(config_raw)
+        fixture._checkpoint()
+        root = fixture.checkpoint_path
+        state = {"checkpoint_schema_version": 1, "step": 1, "sequence_cursor": 2,
+                 "tokens_seen": 32, "run_fingerprint": "a" * 64,
+                 "run_specification": {"source_commit": "b" * 40,
+                                       "config_sha256": sha(config_raw),
+                                       "distributed": {"world_size": 2}}}
+        state_raw = canonical(state)
+        (root / "distributed-training-state.json").write_bytes(state_raw)
+        for rank in range(2):
+            (root / f"trainer-rank-{rank:05d}.pt").write_bytes(b"synthetic opaque")
+        files = []
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                raw = path.read_bytes()
+                files.append({"path": path.relative_to(root).as_posix(),
+                              "bytes": len(raw), "sha256": sha(raw)})
+        manifest_raw = "".join(f"{x['sha256']}  {x['path']}\n" for x in files).encode()
+        (root / "manifest.sha256").write_bytes(manifest_raw)
+        files.append({"path": "manifest.sha256", "bytes": len(manifest_raw),
+                      "sha256": sha(manifest_raw)})
+        for path in [root, *root.rglob("*")]:
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        handoff = {"schema_version": 1, "gate": "lumi_4b_checkpoint_handoff_v0.1",
+                   "status": "sealed", "source_commit": "b" * 40, "run_fingerprint": "a" * 64,
+                   "world_size": 2, "checkpoint": {"step": 1, "sequence_cursor": 2,
+                                                   "tokens_seen": 32}, "files": files}
+        handoff["handoff_sha256"] = sha(canonical(handoff))
+        handoff_raw = canonical(handoff)
+        tokens = [{"relative_path": f"tokenizer/{name}", "bytes": 1, "sha256": sha(b"x")}
+                  for name in ("lumi_tokenizer_metadata.json", "tokenizer.json",
+                               "tokenizer_config.json")]
+        base = {"schema_version": "lumi.posttraining-base-binding.v0.1",
+                "checkpoint_stage": "base", "model_id": "lumi-4b-base",
+                "run_fingerprint": "a" * 64, "source_commit": "b" * 40,
+                "checkpoint": {"step": 1, "sequence_cursor": 2, "training_tokens": 32,
+                               "world_size": 2, "manifest_sha256": sha(manifest_raw)},
+                "handoff": {"file_sha256": sha(handoff_raw), "sha256": handoff["handoff_sha256"]},
+                "tokenizer": {"files": tokens, "manifest_sha256": sha(canonical(tokens))}}
+        base_raw = canonical(base)
+        plan = build_import_plan(base_raw, manifest_raw, state_raw, config_raw, handoff_raw,
+                                 expected_base_sha256=sha(base_raw), dtype="bfloat16")
+        bounds = plan["resource_bounds"]
+
+        def audit():
+            return verify_inventory(root, plan["checkpoint_inventory"],
+                                    maximum_read_bytes=bounds["checkpoint_inventory_bytes"],
+                                    maximum_files=bounds["checkpoint_inventory_files"],
+                                    maximum_seconds=10)
+
+        before = audit()
+        result = fixture._run("bfloat16", maximum_parameters=plan["model_parameters"],
+                              maximum_tensor_bytes=bounds["maximum_projected_live_tensor_bytes"],
+                              maximum_output_bytes=bounds["maximum_backend_output_bytes"])
+        self.assertEqual(audit(), before)
+        self.assertEqual(before["bytes_hashed"], bounds["checkpoint_inventory_bytes"])
+        self.assertFalse(result["real_4b_import"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertEqual(result["model_tensor_count"], plan["model_tensor_count"])
+        self.assertEqual(result["cast_tensor_sha256"], result["reload_tensor_sha256"])
+
+
+if __name__ == "__main__":
+    unittest.main()

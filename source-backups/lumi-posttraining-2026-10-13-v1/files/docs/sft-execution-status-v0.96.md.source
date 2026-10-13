@@ -1,0 +1,43 @@
+# SFT execution status v0.96
+
+2026-09-16. The two-file synthetic thread-context fix is published and its new
+GitHub Source and Spark checks both passed. This supersedes the CI-pending state
+in v0.95; historical reports remain unchanged.
+
+Commit: `9ae708c73a327b7cac69c16d29d075450a500e9d`.
+Parent: `6585a1e073a6a5302630ed63a3c1a3d81adda429`.
+Branch: `codex/lumi-posttraining-product-v0.1`.
+
+## Verified result
+
+- [Source checks](https://github.com/saidi19/lumi-model/actions/runs/35090272645):
+  **success**, first attempt. All four jobs passed: frozen-lint-integrity,
+  isolated-sft-controls, source-only-validators and test. The BF16 history check
+  and the full selected Source suite also report success.
+- [Spark source checks](https://github.com/saidi19/lumi-model/actions/runs/35090272657):
+  **success**, including the synthetic-spark job.
+- Local CI-pinned Ruff 0.15.1 passed on both files before publication. The 46
+  affected/regression tests passed with and without an owned background thread;
+  63 scope/workflow guard tests passed again before commit.
+- The remote branch tip was rechecked after CI and matches the published commit.
+
+Only `tests/test_sft_checkpoint_generator_entry_v1.py` and
+`tests/test_sft_checkpoint_import_runner_v2.py` were committed: 84 insertions,
+no deletions. Unrelated local diagnostics and evidence were not published.
+Production runtime guards, workflows and private-integration routing were not
+changed. There were no workflow reruns or manual dispatches, and no raw CI logs
+were read during publication/verification.
+
+## Remaining work
+
+The Source CI failure addressed by these test-context fixes is now remotely
+verified as repaired. This is not full private-integration or native-importer
+qualification. The earlier native qualification failure remains open and its
+attempt remains consumed. Its historical plan/test hashes were not silently
+updated or reused; a new native successor must bind the changed tests explicitly.
+
+Gate 5 is therefore still incomplete. No native qualification workflow, GPU
+instance, real checkpoint import or real SFT training was started by this push.
+
+Evidence: `evidence/lumi-4b-sft-source-thread-context-ci-result-v0.1.json` and
+`evidence/lumi-4b-sft-source-thread-context-publication-v0.1.json`.

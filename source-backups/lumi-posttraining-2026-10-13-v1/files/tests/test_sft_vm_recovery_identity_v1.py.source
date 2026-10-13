@@ -1,0 +1,140 @@
+"""Pure identity/package tests; no cloud or model payloads."""
+
+import ast
+import copy
+import importlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("prepare_sft_vm_recovery_identity_v1")
+
+
+def module(name, raw):
+    value = types.ModuleType(name)
+    value.__file__ = "<synthetic-identity-source>"
+    exec(compile(raw, value.__file__, "exec"), value.__dict__)
+    return value
+
+
+class IdentityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.blobs = m.inputs()
+
+    def build(self):
+        return m.build(self.blobs)
+
+    def test_deterministic_complete_package_no_authority(self):
+        files, manifest = self.build()
+        self.assertEqual((files, manifest), self.build())
+        self.assertEqual(len(files), 5)
+        self.assertLessEqual(sum(map(len, files.values())) + len(m.encoded(manifest)), 131072)
+        for name, raw in files.items():
+            self.assertEqual(m.sha(raw), manifest["files"][name]["sha256"])
+        self.assertFalse(
+            manifest["installed"] or manifest["deployed"] or manifest["execution_permitted"]
+        )
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+    def test_exactly_two_host_proposal_identity_fields_changed(self):
+        files, manifest = self.build()
+        new = json.loads(files["host-proposal.json"])
+        old = json.loads(self.blobs["configs/lumi-vm-fullsize-host-proposal-v0.1.json"])
+        self.assertEqual(new["prepared_attempt"], m.NEW)
+        self.assertEqual(
+            new["retention_proposal"]["prefix"], manifest["namespaces"]["retention_prefix"]
+        )
+        new["prepared_attempt"] = old["prepared_attempt"]
+        new["retention_proposal"]["prefix"] = old["retention_proposal"]["prefix"]
+        self.assertEqual(new, old)
+
+    def test_worker_control_flow_unchanged_and_native_pin_rebound(self):
+        files, _ = self.build()
+        for name in (
+            "run_sft_vm_early_stop_v2.py",
+            "sft_vm_external_watchdog_v1.py",
+            "sft_vm_network_cleanup_v1.py",
+        ):
+            self.assertNotIn(m.OLD.encode(), files[name])
+            restored = files[name].replace(m.NEW.encode(), m.OLD.encode())
+            self.assertEqual(restored, self.blobs["scripts/" + name])
+            self.assertEqual(
+                ast.dump(ast.parse(restored)), ast.dump(ast.parse(self.blobs["scripts/" + name]))
+            )
+        builder = files["build_sft_vm_initial_boot_v2.py"]
+        self.assertIn(m.sha(files["run_sft_vm_early_stop_v2.py"]).encode(), builder)
+        self.assertNotIn(m.PINS["scripts/run_sft_vm_early_stop_v2.py"].encode(), builder)
+
+    def test_watchdog_rejects_retained_predecessor_accepts_new_only(self):
+        from tests.test_sft_vm_external_watchdog_v1 import BOUND, row
+
+        files, manifest = self.build()
+        worker = module("_fresh_watchdog", files["sft_vm_external_watchdog_v1.py"])
+        bound = dict(BOUND, attempt=m.NEW)
+        old = row()
+        old["InstanceId"] = manifest["protected_predecessor"]["instance"]
+
+        def response(value):
+            return dict(Reservations=[dict(OwnerId=worker.ACCOUNT, Instances=[value])])
+
+        with self.assertRaises(ValueError):
+            worker.binding(json.dumps(BOUND))
+        with self.assertRaises(ValueError):
+            worker.candidate(response(old), bound)
+        fresh = copy.deepcopy(old)
+        fresh.update(
+            InstanceId="i-" + "a" * 17,
+            ClientToken=m.NEW,
+            Tags=[dict(Key="LumiAttempt", Value=m.NEW)],
+            KeyName="lumi-fullsize-" + m.NEW,
+        )
+        self.assertEqual(worker.binding(json.dumps(bound)), bound)
+        self.assertEqual(worker.candidate(response(fresh), bound), fresh)
+
+    def test_network_cleanup_claims_disjoint_and_old_arm_rejected(self):
+        files, manifest = self.build()
+        cleanup = module("_fresh_cleanup", files["sft_vm_network_cleanup_v1.py"])
+        for operation in cleanup.OPERATIONS:
+            key = cleanup.claim_key("a" * 32, operation)
+            self.assertTrue(key.startswith(manifest["namespaces"]["cleanup_claim_prefix"]))
+            self.assertNotIn(m.OLD, key)
+        raw = dict(armed=True, attempt=m.OLD, nonce="a" * 32, not_before=100, expires_at=200)
+        with self.assertRaises(ValueError):
+            cleanup.binding(json.dumps(raw))
+        raw["attempt"] = m.NEW
+        self.assertEqual(cleanup.binding(json.dumps(raw)), raw)
+
+    def test_each_input_tamper_and_missing_extra_input_rejected(self):
+        for name in self.blobs:
+            altered = dict(self.blobs)
+            altered[name] += b"\n"
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                m.build(altered)
+        for altered in ({}, dict(self.blobs, extra=b"private")):
+            with self.assertRaises(ValueError):
+                m.build(altered)
+
+    def test_identity_reuse_malformed_and_path_injection_rejected(self):
+        for identity in (m.OLD, "../escape", "A" * 32, "a" * 31, ""):
+            with self.subTest(identity=identity), patch.object(m, "NEW", identity):
+                with self.assertRaises(ValueError):
+                    self.build()
+
+    def test_rekey_is_exact_assignment_only(self):
+        for raw in (b"", f"# {m.OLD}\n".encode(), f'ATTEMPT = "{m.OLD}"\n# {m.OLD}\n'.encode()):
+            with self.assertRaises(ValueError):
+                m.rekey(raw)
+
+    def test_no_shared_resource_namespace_or_predecessor_deletion(self):
+        _, manifest = self.build()
+        for value in manifest["namespaces"].values():
+            self.assertNotIn(m.OLD, value)
+        self.assertEqual(manifest["protected_predecessor"]["instance"], "i-045114b98ce9b3a48")
+        self.assertFalse(manifest["native_new_identity_executed"])
+        self.assertTrue(manifest["remaining_bindings"])

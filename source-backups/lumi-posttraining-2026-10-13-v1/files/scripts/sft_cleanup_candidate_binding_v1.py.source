@@ -1,0 +1,38 @@
+"""Bind only the reviewed function into a diagnostic-only copied namespace."""
+
+import ast
+import hashlib
+import json
+import types
+from pathlib import Path
+
+from scripts import prepare_sft_cleanup_absence_repair_v1 as repair
+
+
+def bind(transport):
+    proof = repair.ROOT / "evidence/lumi-cleanup-absence-repair-v0.1.json"
+    raw = proof.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != (
+        "aef350e77008b59e7e1fded6b63e964e104f62f8b636ec44fcbb19fa8dcecd13"
+    ):
+        raise ValueError("candidate_evidence_changed")
+    value = json.loads(raw)
+    for name, digest in value["source_sha256"].items():
+        if hashlib.sha256((repair.ROOT / name).read_bytes()).hexdigest() != digest:
+            raise ValueError("candidate_source_changed")
+    candidate = repair.build()
+    if hashlib.sha256(candidate.encode()).hexdigest() != value["candidate_sha256"]:
+        raise ValueError("candidate_hash_changed")
+
+    def function(source):
+        return next(
+            n for n in ast.parse(source).body if getattr(n, "name", None) == "pipe_exchange"
+        )
+
+    original = function(repair.SOURCE.read_bytes())
+    if ast.dump(function(Path(transport.__file__).read_bytes())) != ast.dump(original):
+        raise ValueError("private_transport_drift")
+    namespace = dict(vars(transport))
+    exec(compile(ast.Module(body=[function(candidate)], type_ignores=[]),
+                 "<diagnostic-only-cleanup-candidate>", "exec"), namespace)
+    return types.SimpleNamespace(**namespace)

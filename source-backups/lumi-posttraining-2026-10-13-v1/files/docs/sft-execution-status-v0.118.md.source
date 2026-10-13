@@ -1,0 +1,81 @@
+# SFT execution status v0.118
+
+2026-09-26. The private controller → guardian → broker/worker doubled-fork
+composition is implemented and locally verified with synthetic boundaries.
+**The process topology and cleanup wiring are now present, but the fixed role
+runtimes and controller event loop are still closed; Gate 5 remains
+incomplete.** No real process, socket, descriptor, pidfd, signal, waitid,
+cgroup, listener, payload, remote mutation, GPU operation, inference or
+training occurred.
+
+## Completed
+
+- Admission requires the frozen Linux/root contracts, one main thread, exact
+  cgroup limits/name and parent descriptor, one workload deadline and a bounded
+  cleanup suffix before consuming the one attempt.
+- Controller precreates the topology, forks guardian, immediately pidfd-binds
+  it, closes the controller's cgroup-parent copy and transitions to its exact
+  final endpoints plus the guardian pidfd.
+- Guardian adopts the inherited topology, reaches `guardian_prefork`, verifies
+  the inherited parent descriptor and creates the one cgroup lease before
+  nested forks.
+- Guardian forks and pidfd-binds broker before forking worker. The later worker
+  explicitly identity-checks and closes its inherited broker-pidfd copy before
+  transitioning or entering the cgroup.
+- Broker and worker adopt their copies, retain only their final topology
+  endpoints, close their cgroup-parent copy, join the lease through its leaf FD
+  and close that leaf copy.
+- Guardian reaches `guardian_watch` only after the parent/leaf descriptors and
+  both distinct child pidfds are proven non-aliased. It can create exactly one
+  independent CLOEXEC broker-pidfd duplicate for the later fixed watcher.
+- Controller, guardian and role wrappers transfer endpoints only through the
+  v0.117 one-shot authority adapter. They expose aggregate state without PIDs,
+  FDs, descriptor identities or exception text.
+- Partial failures continue every independently safe cleanup: lease kill,
+  pidfd termination, `waitid(P_PIDFD)` reap, owner close, lease removal,
+  inherited-parent close and topology close. Uncertain cleanup remains
+  terminal and is never retried.
+- Broker, worker and guardian role runtimes remain fixed closed stubs. A
+  premature private invocation exits failure after cleanup and cannot execute
+  a payload or accept a caller callback.
+
+## Verification
+
+**924 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 28 new process-composition tests plus the previous 896
+regressions. Every new fork, exit, pidfd, cgroup, descriptor, topology, clock,
+role and close boundary is synthetic.
+
+Syntax/AST checks pass for both new files on both runtimes; maximum line length
+is 88 and trailing whitespace is zero. Tests used `-B`, and no bytecode file
+for the new component is present. The five predecessor-plan bindings and all
+eight new-plan bindings match their recorded sizes and SHA-256 values.
+
+Development record:
+`configs/lumi-4b-sft-write-process-composition-development-v0.1.json`.
+
+SHA-256: `37a465ed5bccbf870532a2c8005f2e443fbe583f841c994e6e826b461a82c3b0`.
+
+Verification:
+`evidence/lumi-4b-sft-write-process-composition-development-verification-v0.1.json`.
+
+SHA-256: `2f5bb2ba123bb526f56156b3ab22850f4d7572c283868c9fee7df684ac31e26d`.
+
+## Exact next work and unchanged boundary
+
+The next successor is the fixed controller/role event composition. Controller
+must authenticate worker READY, then send ARM to guardian and retain guardian
+armed proof before release. Broker must exchange every aggregate reservation
+offer with controller and receive its exact ACK before issuing CONTINUE.
+Controller must verify worker CONSUMED, collect terminal aggregate reports and
+own absolute-deadline cleanup.
+
+That successor must consume each final endpoint through its v0.117 authority,
+bind listener handoff/adoption, worker privilege drop and final seal, and call
+the frozen guardian-v2, ledger and protocol components without caller
+callbacks. Full-size bootstrap/source-closure integration and separately
+authorized Linux native qualification still follow.
+
+GPU is still unnecessary. No S3 or other remote availability check was made.
+Real import, training and production remain disabled. The new source, test and
+three records are local and untracked; nothing was staged, committed or pushed.

@@ -1,0 +1,100 @@
+"""One read-only target/retention scan including the frozen VPC endpoint gate."""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+from scripts import inspect_sft_vm_attempt021_control_targets_v1 as targets
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-021-control-target-absence-v0.1.json"
+INSPECTOR_SHA = "16e23c3ba2ea8d6d33c0d22fde2f1365e3ea3f2c808cbae5aeeef417318a7675"
+MAX_CALLS, MAX_SECONDS = 20, 300
+
+
+class BoundedClients:
+    def __init__(self, clients, *, clock=time.monotonic):
+        self.clients, self.clock, self.start, self.calls = clients, clock, clock(), 0
+
+    def __getitem__(self, service):
+        owner = self
+
+        class Reader:
+            def __getattr__(self, operation):
+                def invoke(**fields):
+                    files.need(operation.startswith(("get_", "describe_", "head_")))
+                    files.need(operation not in {"get_object", "head_object"})
+                    files.need(owner.calls < MAX_CALLS)
+                    files.need(owner.clock() - owner.start < MAX_SECONDS)
+                    owner.calls += 1
+                    value = getattr(owner.clients[service], operation)(**fields)
+                    files.need(
+                        not any(value.get(k) for k in ("NextToken", "nextToken", "IsTruncated"))
+                    )
+                    return value
+
+                return invoke
+
+        return Reader()
+
+
+def inspect(clients):
+    files.need(files.sha(files.read(Path(targets.__file__))) == INSPECTOR_SHA)
+    bounded = BoundedClients(clients)
+    report = targets.inspect(bounded)
+    rows = bounded["ec2"].describe_instance_connect_endpoints(
+        Filters=[dict(Name="vpc-id", Values=[targets.VPC])], MaxResults=20
+    )["InstanceConnectEndpoints"]
+    files.need(type(rows) is list and len(rows) <= 20)
+    for row in rows:
+        files.need(row["OwnerId"] == targets.ACCOUNT and row["VpcId"] == targets.VPC)
+    blockers = [
+        dict(
+            endpoint=row["InstanceConnectEndpointId"],
+            state=row["State"],
+            subnet=row["SubnetId"],
+            owner=row["OwnerId"],
+        )
+        for row in rows
+        if row["State"] != "delete-complete"
+    ]
+    report.update(
+        status="fresh_targets_absent_network_slot_blocked"
+        if blockers
+        else "fresh_targets_absent_network_slot_free",
+        read_only_aws_calls=bounded.calls,
+        frozen_vpc_endpoint_gate_passed=not blockers,
+        blocking_vpc_endpoints=blockers,
+        cpu_network_admitted=False,
+        endpoint_deletion_authorized=False,
+    )
+    report["source_bindings"].update(
+        {
+            str(Path(__file__).relative_to(ROOT)): files.sha(files.read(Path(__file__))),
+            str(Path(targets.__file__).relative_to(ROOT)): INSPECTOR_SHA,
+        }
+    )
+    return report
+
+
+if __name__ == "__main__":
+    files.need(sys.argv[1:] == ["--inspect-once"] and not OUTPUT.exists())
+    result = inspect(targets.clients())
+    files.save(OUTPUT, result)
+    print(
+        json.dumps(
+            {
+                k: result[k]
+                for k in (
+                    "status",
+                    "read_only_aws_calls",
+                    "blocking_vpc_endpoints",
+                    "cloud_mutations",
+                    "execution_permitted",
+                )
+            },
+            sort_keys=True,
+        )
+    )

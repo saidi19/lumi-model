@@ -1,0 +1,482 @@
+"""Tiny stdlib-only synthetic tests for the HF content descriptor adapter."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from lumi import posttraining_checkpoint_hf_io_v1 as module
+
+
+class ContentIOTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.handles = []
+        self.addCleanup(self.cleanup_handles)
+
+    def cleanup_handles(self):
+        for handle in self.handles:
+            try:
+                handle.close()
+            except module.ContentIOError:
+                pass
+
+    def handle(self, **overrides):
+        values = dict(maximum_read_bytes=8 * module.CHUNK_BYTES,
+                      maximum_write_bytes=8 * module.CHUNK_BYTES,
+                      maximum_file_bytes=4 * module.CHUNK_BYTES,
+                      maximum_control_bytes=65536, check_budget=lambda: None)
+        values.update(overrides)
+        handle = module.ContentIO(**values)
+        self.handles.append(handle)
+        return handle
+
+    def source(self, name="source.json", data=b'{"synthetic":true}', mode=0o600):
+        result = self.root / name
+        result.write_bytes(data)
+        result.chmod(mode)
+        return result
+
+    def prepared(self, **limits):
+        handle = self.handle(**limits)
+        output = self.root / f"output-{len(self.handles)}"
+        handle.create_output(output)
+        return handle, output
+
+    def assert_code(self, code, operation, *args, **kwargs):
+        with self.assertRaises(module.ContentIOError) as raised:
+            operation(*args, **kwargs)
+        self.assertEqual(raised.exception.args, (code,))
+        self.assertEqual(raised.exception.code, code)
+
+    def test_complete_flat_content_roundtrip(self):
+        handle = self.handle()
+        source = self.source()
+        raw = handle.read_control(source)
+        output = self.root / "complete"
+        handle.create_output(output)
+        receipt = handle.write("config.json", raw)
+        self.assertEqual(receipt, {"path": "config.json", "bytes": len(raw),
+                                   "sha256": hashlib.sha256(raw).hexdigest()})
+        self.assertEqual(handle.read("config.json", expected_bytes=len(raw),
+                                     expected_sha256=receipt["sha256"]), raw)
+        self.assertEqual(handle.inventory(), [receipt])
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE((output / "config.json").stat().st_mode), 0o600)
+        summary = handle.summary()
+        self.assertEqual(summary["hf_content_read_bytes_reserved"], 2 * len(raw))
+        self.assertEqual(summary["hf_content_write_bytes_reserved"], len(raw))
+        self.assertFalse(summary["physical_io_bytes_measured"])
+        self.assertFalse(summary["memory_limits_enforced"])
+        self.assertFalse(summary["os_resource_limits_enforced"])
+        self.assertFalse(summary["hard_timeout_enforced"])
+
+    def test_control_source_modes_preserved(self):
+        for index, mode in enumerate((0o400, 0o600, 0o644)):
+            source = self.source(str(index), mode=mode)
+            self.assertTrue(self.handle().read_control(source))
+            self.assertEqual(stat.S_IMODE(source.stat().st_mode), mode)
+
+    def test_invalid_limits_no_io(self):
+        for key in ("maximum_read_bytes", "maximum_write_bytes", "maximum_file_bytes",
+                    "maximum_control_bytes"):
+            for value in (False, 0, -1, 0.5, 2**63):
+                with self.subTest(key=key, value=value), mock.patch.object(os, "open") as opened:
+                    self.assert_code("invalid_arguments", self.handle, **{key: value})
+                    opened.assert_not_called()
+        self.assert_code("invalid_arguments", self.handle, check_budget=None)
+        self.assert_code("invalid_arguments", self.handle,
+                         maximum_control_bytes=module.MAX_CONTROL_BYTES + 1)
+
+    def test_control_read_is_bounded_before_content(self):
+        source = self.source(data=b"a" * 9)
+        handle = self.handle(maximum_control_bytes=8)
+        with mock.patch.object(os, "pread") as read:
+            self.assert_code("control_limit_exceeded", handle.read_control, source)
+            read.assert_not_called()
+
+    def test_control_rejects_relative_parent_symlink_and_string(self):
+        link = self.root / "link"
+        link.symlink_to(self.root, target_is_directory=True)
+        source = self.source()
+        for path in (Path("relative"), self.root / ".." / "other", str(source),
+                     link / source.name):
+            with self.subTest(path=str(path)):
+                self.assert_code("path_rejected" if not isinstance(path, Path)
+                                 or path == Path("relative") or ".." in path.parts
+                                 else "io_failed", self.handle().read_control, path)
+
+    def test_control_rejects_symlink_hardlink_and_bad_mode(self):
+        source = self.source()
+        linked = self.root / "symbolic"
+        linked.symlink_to(source)
+        self.assert_code("io_failed", self.handle().read_control, linked)
+        hardlink = self.root / "hardlink"
+        os.link(source, hardlink)
+        self.assert_code("path_rejected", self.handle().read_control, source)
+        wrong = self.source("mode", mode=0o666)
+        self.assert_code("path_rejected", self.handle().read_control, wrong)
+
+    def test_control_rejects_fifo_without_blocking(self):
+        path = self.root / "fifo"
+        os.mkfifo(path, 0o600)
+        self.assert_code("path_rejected", self.handle().read_control, path)
+
+    def test_control_mutation_during_read_detected(self):
+        path = self.source()
+        real = os.pread
+
+        def read(fd, amount, start):
+            raw = real(fd, amount, start)
+            path.write_bytes(b"changed")
+            return raw
+
+        with mock.patch.object(os, "pread", side_effect=read):
+            self.assert_code("input_changed", self.handle().read_control, path)
+
+    def test_control_atomic_replacement_during_read_detected(self):
+        path = self.source()
+        replacement = self.source("replacement")
+        real = os.pread
+
+        def read(fd, amount, start):
+            raw = real(fd, amount, start)
+            replacement.replace(path)
+            return raw
+
+        with mock.patch.object(os, "pread", side_effect=read):
+            self.assert_code("input_changed", self.handle().read_control, path)
+
+    def test_repeat_control_read_counts_all_content(self):
+        handle = self.handle()
+        path = self.source()
+        raw = handle.read_control(path)
+        self.assertEqual(handle.read_control(path), raw)
+        self.assertEqual(handle.summary()["hf_content_read_bytes_reserved"], 2 * len(raw))
+
+    def test_control_after_output_rejected(self):
+        handle, _ = self.prepared()
+        self.assert_code("invalid_arguments", handle.read_control, self.source())
+
+    def test_create_output_existing_preserved(self):
+        output = self.root / "existing"
+        output.mkdir()
+        existing = output / "old"
+        existing.write_bytes(b"prior evidence")
+        handle = self.handle()
+        self.assert_code("output_exists", handle.create_output, output)
+        self.assertEqual(existing.read_bytes(), b"prior evidence")
+
+    def test_create_output_input_overlap_rejected(self):
+        source = self.source()
+        handle = self.handle()
+        handle.read_control(source)
+        self.assert_code("path_rejected", handle.create_output, source)
+
+    def test_second_output_creation_rejected(self):
+        handle, _ = self.prepared()
+        self.assert_code("output_exists", handle.create_output, self.root / "another")
+
+    def test_strict_output_names(self):
+        for name in ("../escape", "nested/config.json", "pytorch_model.bin", "manifest.sha256",
+                     "MODEL.safetensors", "model-00000-of-00001.safetensors",
+                     "model-00002-of-00001.safetensors", "model-00001-of-99999.safetensors", 1):
+            with self.subTest(name=name):
+                handle, _ = self.prepared()
+                self.assert_code("name_rejected", handle.write, name, b"a")
+
+    def test_all_allowed_output_names(self):
+        handle, _ = self.prepared()
+        names = module._CONTROL_NAMES | {"model.safetensors", "model-00001-of-00002.safetensors",
+                                         "model-00002-of-00002.safetensors"}
+        for name in names:
+            handle.write(name, b"a")
+        self.assertEqual({entry["path"] for entry in handle.inventory()}, names)
+
+    def test_write_requires_output(self):
+        self.assert_code("output_not_created", self.handle().write, "config.json", b"a")
+
+    def test_write_does_not_overwrite(self):
+        handle, output = self.prepared()
+        handle.write("config.json", b"original")
+        self.assert_code("output_exists", handle.write, "config.json", b"replacement")
+        self.assertEqual((output / "config.json").read_bytes(), b"original")
+
+    def test_write_refuses_mutable_empty_and_subclass_bytes(self):
+        class NotExactBytes(bytes):
+            pass
+
+        for raw in (b"", bytearray(b"a"), memoryview(b"a"), NotExactBytes(b"a")):
+            handle, _ = self.prepared()
+            self.assert_code("invalid_arguments", handle.write, "config.json", raw)
+
+    def test_file_and_control_caps_before_create(self):
+        handle, output = self.prepared(maximum_file_bytes=4)
+        self.assert_code("file_limit_exceeded", handle.write, "model.safetensors", b"a" * 5)
+        self.assertEqual(list(output.iterdir()), [])
+        handle, output = self.prepared(maximum_control_bytes=4)
+        self.assert_code("control_limit_exceeded", handle.write, "config.json", b"a" * 5)
+        self.assertEqual(list(output.iterdir()), [])
+
+    def test_total_write_cap_before_create(self):
+        handle, output = self.prepared(maximum_write_bytes=3)
+        self.assert_code("write_limit_exceeded", handle.write, "config.json", b"a" * 4)
+        self.assertEqual(list(output.iterdir()), [])
+
+    def test_read_cap_before_content(self):
+        handle, _ = self.prepared(maximum_read_bytes=3)
+        receipt = handle.write("config.json", b"a" * 4)
+        with mock.patch.object(os, "pread") as read:
+            self.assert_code("read_limit_exceeded", handle.read, "config.json",
+                             expected_sha256=receipt["sha256"], expected_bytes=4)
+            read.assert_not_called()
+
+    def test_write_and_read_debit_before_each_bounded_syscall(self):
+        handle, _ = self.prepared()
+        payload = b"s" * (2 * module.CHUNK_BYTES + 3)
+        write, read = os.pwrite, os.pread
+        written = consumed = 0
+
+        def checked_write(fd, data, offset):
+            nonlocal written
+            self.assertLessEqual(len(data), module.CHUNK_BYTES)
+            self.assertEqual(handle._writes, written + len(data))
+            written += len(data)
+            return write(fd, data, offset)
+
+        def checked_read(fd, amount, offset):
+            nonlocal consumed
+            self.assertLessEqual(amount, module.CHUNK_BYTES)
+            self.assertEqual(handle._reads, consumed + amount)
+            consumed += amount
+            return read(fd, amount, offset)
+
+        with mock.patch.object(os, "pwrite", side_effect=checked_write), \
+                mock.patch.object(os, "pread", side_effect=checked_read):
+            receipt = handle.write("model.safetensors", payload)
+            self.assertEqual(handle.read("model.safetensors", expected_bytes=len(payload),
+                                         expected_sha256=receipt["sha256"]), payload)
+        self.assertEqual(written, len(payload))
+        self.assertEqual(consumed, len(payload))
+
+    def test_short_write_poison_preserves_partial_and_reservation(self):
+        handle, output = self.prepared()
+        real = os.pwrite
+
+        def short(fd, data, start):
+            return real(fd, data[:1], start)
+
+        with mock.patch.object(os, "pwrite", side_effect=short):
+            self.assert_code("short_write", handle.write, "config.json", b"secret text")
+        self.assertEqual(handle._writes, len(b"secret text"))
+        self.assertEqual((output / "config.json").read_bytes(), b"s")
+        self.assert_code("terminal_failure", handle.inventory)
+
+    def test_failed_write_no_secret_error_or_refund(self):
+        handle, _ = self.prepared()
+        with mock.patch.object(os, "pwrite", side_effect=OSError("source secret")):
+            self.assert_code("write_failed", handle.write, "config.json", b"abcd")
+        self.assertEqual(handle._writes, 4)
+        self.assertNotIn("source", repr(handle))
+
+    def test_short_read_poison_no_refund(self):
+        handle, _ = self.prepared()
+        receipt = handle.write("config.json", b"abcd")
+        with mock.patch.object(os, "pread", return_value=b"a"):
+            self.assert_code("short_read", handle.read, "config.json",
+                             expected_bytes=4, expected_sha256=receipt["sha256"])
+        self.assertEqual(handle._reads, 4)
+        self.assert_code("terminal_failure", handle.summary)
+
+    def test_read_hash_checked_even_when_metadata_stable(self):
+        handle, _ = self.prepared()
+        receipt = handle.write("config.json", b"abcd")
+        with mock.patch.object(os, "pread", return_value=b"wxyz"):
+            self.assert_code("checksum_mismatch", handle.read, "config.json",
+                             expected_bytes=4, expected_sha256=receipt["sha256"])
+
+    def test_callback_after_write_debit_can_stop_before_syscall(self):
+        handle, output = self.prepared()
+
+        def callback():
+            if handle._writes:
+                raise RuntimeError("deadline")
+
+        handle._check_budget = callback
+        with mock.patch.object(os, "pwrite") as write:
+            self.assert_code("budget_check_failed", handle.write, "config.json", b"abcd")
+            write.assert_not_called()
+        self.assertEqual(handle._writes, 4)
+        self.assertEqual((output / "config.json").stat().st_size, 0)
+        handle._check_budget = lambda: None
+
+    def test_root_descriptor_flag_change_rejected(self):
+        handle, _ = self.prepared()
+        os.set_inheritable(handle._root_fd, True)
+        self.assert_code("output_changed", handle.inventory)
+
+    def test_read_descriptor_flag_change_rejected(self):
+        handle = self.handle()
+        source = self.source()
+        real_read = os.pread
+
+        def read(fd, amount, offset):
+            raw = real_read(fd, amount, offset)
+            os.set_inheritable(fd, True)
+            return raw
+
+        with mock.patch.object(os, "pread", side_effect=read):
+            self.assert_code("input_changed", handle.read_control, source)
+
+    def test_write_descriptor_flag_change_rejected(self):
+        handle, _ = self.prepared()
+        real_write = os.pwrite
+
+        def write(fd, raw, offset):
+            count = real_write(fd, raw, offset)
+            os.set_inheritable(fd, True)
+            return count
+
+        with mock.patch.object(os, "pwrite", side_effect=write):
+            self.assert_code("output_changed", handle.write, "config.json", b"abcd")
+
+    def test_unknown_read_and_bad_receipt_before_content(self):
+        handle, _ = self.prepared()
+        self.assert_code("unknown_file", handle.read, "config.json",
+                         expected_sha256="0" * 64, expected_bytes=1)
+        for override in ({"expected_sha256": "0" * 64}, {"expected_bytes": True}):
+            handle, _ = self.prepared()
+            receipt = handle.write("config.json", b"a")
+            args = dict(expected_sha256=receipt["sha256"], expected_bytes=1)
+            args.update(override)
+            with mock.patch.object(os, "pread") as read:
+                self.assert_code("receipt_mismatch", handle.read, "config.json", **args)
+                read.assert_not_called()
+
+    def test_inventory_detects_unknown_file_and_mutation(self):
+        handle, output = self.prepared()
+        (output / "unlisted").write_bytes(b"a")
+        self.assert_code("output_changed", handle.inventory)
+        handle, output = self.prepared()
+        handle.write("config.json", b"a")
+        (output / "config.json").write_bytes(b"b")
+        self.assert_code("output_changed", handle.inventory)
+
+    def test_output_replacement_detected(self):
+        handle, output = self.prepared()
+        old = self.root / "old-output"
+        output.rename(old)
+        output.mkdir(mode=0o700)
+        self.assert_code("output_changed", handle.write, "config.json", b"a")
+        self.assertEqual(list(old.iterdir()), [])
+
+    def test_budget_callback_exception_and_non_none(self):
+        def failed():
+            raise RuntimeError("private exception text")
+
+        for callback in (failed, lambda: True):
+            handle = self.handle(check_budget=callback)
+            self.assert_code("budget_check_failed", handle.summary)
+
+    def test_reentry_is_poisoned_even_if_callback_swallows(self):
+        handle = self.handle()
+
+        def callback():
+            try:
+                handle.summary()
+            except module.ContentIOError:
+                pass
+
+        handle._check_budget = callback
+        self.assert_code("budget_check_failed", handle.summary)
+        handle._check_budget = lambda: None
+        self.assert_code("terminal_failure", handle.summary)
+
+    def test_wrong_thread_is_poisoned(self):
+        handle = self.handle()
+        errors = []
+
+        def worker():
+            try:
+                handle.summary()
+            except module.ContentIOError as error:
+                errors.append(error.code)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, ["owner_mismatch"])
+        self.assert_code("terminal_failure", handle.summary)
+
+    def test_close_revokes_fd_before_callback_and_is_idempotent(self):
+        handle, _ = self.prepared()
+        fd = handle._root_fd
+
+        def callback():
+            self.assertIsNone(handle._root_fd)
+            with self.assertRaises(OSError):
+                os.fstat(fd)
+
+        handle._check_budget = callback
+        handle.close()
+        handle.close()
+        self.assert_code("closed", handle.summary)
+
+    def test_close_failure_never_retries_ambiguous_close(self):
+        handle, _ = self.prepared()
+        fd = handle._root_fd
+        real = os.close
+
+        def ambiguous(value):
+            real(value)
+            raise OSError("secret")
+
+        with mock.patch.object(os, "close", side_effect=ambiguous) as close:
+            self.assert_code("close_failed", handle.close)
+            handle.close()
+            close.assert_called_once_with(fd)
+
+    def test_close_callback_swallowed_reentry_is_failure(self):
+        handle, _ = self.prepared()
+
+        def callback():
+            try:
+                handle.close()
+            except module.ContentIOError:
+                pass
+
+        handle._check_budget = callback
+        self.assert_code("budget_check_failed", handle.close)
+        handle.close()
+
+    def test_fchmod_failure_releases_opened_file_fd(self):
+        handle, output = self.prepared()
+        real_open = os.open
+        fds = []
+
+        def opened(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            if args[1] & os.O_CREAT:
+                fds.append(fd)
+            return fd
+
+        with mock.patch.object(os, "open", side_effect=opened), \
+                mock.patch.object(os, "fchmod", side_effect=OSError("secret")):
+            self.assert_code("io_failed", handle.write, "config.json", b"a")
+        self.assertEqual(len(fds), 1)
+        with self.assertRaises(OSError):
+            os.fstat(fds[0])
+        self.assertTrue((output / "config.json").is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

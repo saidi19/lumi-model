@@ -1,0 +1,403 @@
+"""Real topology/authority/ledger/controller; only OS boundaries are doubled."""
+
+from __future__ import annotations
+
+import fcntl
+import importlib
+import os
+import select
+import socket
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_write_controller_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_controller_v1")
+old = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_authority_v1")
+ADDITIONS = set(sys.modules) - before
+PRIVATE = "SYNTHETIC-PRIVATE-MUST-NOT-ESCAPE"
+
+
+class Endpoint:
+    def __init__(self, fd, harness):
+        self.fd, self.harness, self.detached = fd, harness, False
+
+    def fileno(self):
+        return -1 if self.detached else self.fd
+
+    def getsockopt(self, level, option):
+        return int(socket.AF_UNIX if option == 39 else socket.SOCK_SEQPACKET)
+
+    def getpeername(self):
+        return ""
+
+    def detach(self):
+        if self.detached or self.fd not in self.harness.alive:
+            raise AssertionError(PRIVATE)
+        self.detached = True
+        self.harness.events.append(("detach", self.fd))
+        return self.fd
+
+    def close(self):
+        if self.detached:
+            raise AssertionError(PRIVATE)
+        self.harness.close_fd(self.fd)
+
+
+class ControllerTests(unittest.TestCase):
+    def setUp(self):
+        self.now, self.pid, self.deadline = 10, 100, 1000
+        self.events, self.schedule, self.incoming = [], [], {}
+        self.alive, self.inodes = set(), {}
+        self.mode = stat.S_IFSOCK | 0o777
+        self.sent, self.on_send = [], None
+        self.runtime = self.enterContext(patch.object(m, "_runtime"))
+        self.enterContext(patch.object(m.authority, "_runtime"))
+        self.enterContext(patch.object(old, "_runtime"))
+        self.enterContext(patch.object(m.time, "monotonic_ns", lambda: self.now))
+        self.enterContext(patch.object(m.os, "getpid", lambda: self.pid))
+        self.enterContext(patch.object(m.os, "fstat", self.fstat))
+        self.enterContext(patch.object(m.os, "close", self.close_fd))
+        self.enterContext(patch.object(fcntl, "fcntl", self.fcntl))
+        self.enterContext(patch.object(m.topology.socket, "socket", Endpoint))
+        self.enterContext(patch.object(m, "_poll_many", self.poll))
+        self.enterContext(patch.object(m.transport, "_recvmsg", self.recv))
+        self.enterContext(patch.object(m.transport, "_sendmsg", self.send))
+        self.budget = m.ledger.broker.make_budget(
+            maximum_bytes=100, maximum_notifications=8, maximum_call_bytes=64,
+            precharged_bytes=5,
+        )
+        self.value = self.topology()
+        self.channels = None
+
+    def fstat(self, fd):
+        if fd not in self.alive:
+            raise OSError(PRIVATE)
+        return types.SimpleNamespace(st_dev=1, st_ino=self.inodes[fd],
+                                     st_mode=self.mode, st_uid=0, st_gid=0)
+
+    def fcntl(self, fd, op):
+        self.fstat(fd)
+        if op == fcntl.F_GETFD:
+            return fcntl.FD_CLOEXEC
+        if op == fcntl.F_GETFL:
+            return os.O_RDWR | os.O_NONBLOCK
+        raise AssertionError(PRIVATE)
+
+    def close_fd(self, fd):
+        self.events.append(("close", fd))
+        if fd not in self.alive:
+            raise OSError(PRIVATE)
+        self.alive.remove(fd)
+
+    def topology(self):
+        endpoints = {}
+        names = (n for pair in m.topology.PAIR_ENDPOINTS for n in pair)
+        for fd, name in enumerate(names, 10):
+            self.alive.add(fd)
+            self.inodes[fd] = 1000 + fd
+            endpoints[name] = Endpoint(fd, self)
+        identities = {n: m.topology._endpoint_identity(e) for n, e in endpoints.items()}
+        value = m.topology._Topology(endpoints, identities, self.deadline,
+                                     m.topology._BUILD)
+        value.transition_admitted_once("controller")
+        return value
+
+    def setup_controller(self):
+        self.channels = m._Channels(self.value, deadline_ns=self.deadline)
+        self.controller = m._Controller(self.budget, deadline_ns=self.deadline)
+
+    def poll(self, fds, timeout_ms):
+        if not self.schedule:
+            self.now = self.deadline
+            return []
+        batch = self.schedule.pop(0)
+        result = []
+        for name, raw, mask in batch:
+            fd = self.channels._fds[name]
+            self.assertIn(fd, fds)
+            self.incoming[fd] = raw
+            result.append((fd, mask))
+        return result
+
+    def recv(self, fd, maximum):
+        self.assertEqual(maximum, m.MAXIMUM_PACKET + 1)
+        return self.incoming.pop(fd), b"", 0, True
+
+    def send(self, fd, raw, rights):
+        self.assertIsNone(rights)
+        if self.on_send is not None:
+            self.on_send(fd, raw)
+        self.sent.append((fd, raw))
+        return len(raw)
+
+    @staticmethod
+    def frame(name, raw, mask=select.POLLIN):
+        return (name, raw, mask)
+
+    def happy(self, *, consumed_first=False, done_first=False, eof=False):
+        f = self.frame
+        offer = m.ledger.encode_offer
+        self.schedule = [
+            [f("ledger", offer(1, 1, 6))],
+            [f("worker", m.READY), f("broker", m.BROKER_READY)],
+        ]
+        consumed = [[f("ledger", offer(2, 1, 7))], [f("worker", m.CONSUMED)]]
+        armed = [[f("control", m.ARMED)]]
+        self.schedule += consumed + armed if consumed_first else armed + consumed
+        self.schedule += [[f("ledger", offer(3, 33, 40))]]
+        worker = [f("worker", m.WORKER_DONE.pack(b"W", b"x" * 32))]
+        guardian = [f("control", m.GUARDIAN_DONE)]
+        if eof:
+            self.schedule += [[f("broker", b"", select.POLLHUP),
+                               f("ledger", b"", select.POLLIN | select.POLLHUP)]]
+        self.schedule += [guardian, worker] if done_first else [worker, guardian]
+
+    def run_controller(self):
+        return self.controller.run_admitted_once(self.channels)
+
+    def assert_failure(self, code):
+        with self.assertRaises(m.ControllerError) as caught:
+            self.run_controller()
+        self.assertEqual(caught.exception.code, code)
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.assertFalse(self.controller.snapshot()["protocol_complete"])
+        with self.assertRaisesRegex(m.ControllerError, "already_attempted"):
+            self.run_controller()
+
+    def test_old_identity_contract_reproduces_permission_bit_mismatch(self):
+        fd = self.value._live["control_controller"].fileno()
+        expected = self.value._identities["control_controller"]
+        self.assertNotEqual(old._fd_identity(fd), expected)
+        with self.assertRaisesRegex(old.EndpointAuthorityError, "transfer_failed"):
+            old._detach_admitted_once(self.value, "control_controller")
+        self.assertEqual(len(self.value._ambiguous), 1)
+
+    def test_corrected_identity_matches_real_topology_and_transfers_once(self):
+        owned = m.authority._detach_admitted_once(self.value, "control_controller")
+        fd = owned.take_admitted_once()
+        self.assertEqual(m.authority._fd_identity(fd), owned._identity)
+        self.assertEqual(owned._identity[3], stat.S_IFSOCK)
+        with self.assertRaises(m.authority.EndpointAuthorityError):
+            owned.take_admitted_once()
+
+    def test_permission_modes_match_without_weakening_other_identity_fields(self):
+        for permissions in (0o600, 0o660, 0o777):
+            self.mode = stat.S_IFSOCK | permissions
+            endpoint = self.value._live["control_controller"]
+            self.assertEqual(m.authority._fd_identity(endpoint.fd),
+                             m.topology._endpoint_identity(endpoint))
+        self.inodes[endpoint.fd] += 1
+        with self.assertRaises(m.authority.EndpointAuthorityError):
+            m.authority._detach_admitted_once(self.value, "control_controller")
+
+    def test_no_ml_import_and_public_path_closed(self):
+        self.assertFalse(any(n.split(".")[0] in {"torch", "numpy", "transformers"}
+                             for n in ADDITIONS))
+        with self.assertRaisesRegex(m.ControllerError, "host_guard_not_bound"):
+            m.run_write_controller(approved=True, payload=PRIVATE)
+        self.runtime.assert_not_called()
+
+    def test_integrated_ledger_before_ready_and_reservation_before_ack(self):
+        self.setup_controller()
+        self.happy()
+        observations = []
+        def observe(fd, raw):
+            if fd == self.channels._fds["ledger"]:
+                observations.append(self.controller._ledger._reserved)
+        self.on_send = observe
+        report = self.run_controller()
+        self.assertEqual(observations, [6, 7, 40])
+        self.assertTrue(report["protocol_complete"])
+        self.assertEqual(report["offers_accepted"], 3)
+        self.assertEqual(report["worker_result_sha256"], (b"x" * 32).hex())
+        self.assertEqual(self.sent[0][1], m.ledger.encode_ack(1))
+        self.assertEqual(self.sent[1][1], m.ARM)
+        for key in ("execution_permitted", "gate_5_complete", "entry_result_verified",
+                    "native_processes_reaped", "production_eligible"):
+            self.assertIs(report[key], False)
+
+    def test_cross_channel_consumed_can_arrive_before_armed(self):
+        self.setup_controller()
+        self.happy(consumed_first=True)
+        self.assertTrue(self.run_controller()["protocol_complete"])
+
+    def test_guardian_report_can_arrive_before_queued_worker_digest(self):
+        self.setup_controller()
+        self.happy(done_first=True)
+        self.assertTrue(self.run_controller()["protocol_complete"])
+
+    def test_broker_and_ledger_eof_wait_for_both_terminal_reports(self):
+        self.setup_controller()
+        self.happy(eof=True)
+        self.assertTrue(self.run_controller()["protocol_complete"])
+        self.assertEqual(self.channels._ended, {"broker", "ledger"})
+
+    def test_premature_worker_eof_is_failure(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("worker", b"", select.POLLHUP)]]
+        self.assert_failure("peer_failed")
+
+    def test_ledger_eof_alone_never_completes(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("ledger", b"", select.POLLHUP)]]
+        self.assert_failure("deadline_exhausted")
+
+    def test_ready_without_a_reservation_rejected(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("broker", m.BROKER_READY)],
+                         [self.frame("worker", m.READY)]]
+        self.assert_failure("sequence_rejected")
+        self.assertEqual(self.sent, [])
+
+    def test_consumed_before_ready_rejected(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("worker", m.CONSUMED)]]
+        self.assert_failure("sequence_rejected")
+
+    def test_guardian_cannot_arm_itself(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("control", m.ARMED)]]
+        self.assert_failure("sequence_rejected")
+
+    def test_duplicate_ready_consumes_stream(self):
+        self.setup_controller()
+        self.happy()
+        self.schedule.insert(2, [self.frame("worker", m.READY)])
+        self.assert_failure("sequence_rejected")
+        self.assertEqual(sum(raw == m.ARM for _, raw in self.sent), 1)
+
+    def test_duplicate_ledger_ordinal_is_not_acked(self):
+        self.setup_controller()
+        raw = m.ledger.encode_offer(1, 1, 6)
+        self.schedule = [[self.frame("ledger", raw)], [self.frame("ledger", raw)]]
+        self.assert_failure("ledger_rejected")
+        self.assertEqual(len(self.sent), 1)
+
+    def test_budget_overrun_rejected_without_ack(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("ledger", m.ledger.encode_offer(1, 96, 101))]]
+        self.assert_failure("ledger_rejected")
+        self.assertEqual(self.sent, [])
+
+    def test_short_ack_retains_charge_and_never_retries(self):
+        self.setup_controller()
+        self.happy()
+        with patch.object(m.transport, "_sendmsg", return_value=0) as sender:
+            self.assert_failure("ledger_rejected")
+        self.assertEqual(sender.call_count, 1)
+        self.assertEqual(self.controller.snapshot()["reserved_bytes"], 6)
+        self.assertEqual(self.controller.snapshot()["ack_attempts"], 1)
+
+    def test_ambiguous_arm_is_attempted_once(self):
+        self.setup_controller()
+        self.happy()
+        def observe(fd, raw):
+            if raw == m.ARM:
+                raise OSError(PRIVATE)
+        self.on_send = observe
+        self.assert_failure("io_failed")
+        self.assertTrue(self.controller.snapshot()["arm_send_attempted"])
+
+    def test_failure_code_never_retains_peer_payload(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("worker", PRIVATE.encode())]]
+        self.assert_failure("sequence_rejected")
+
+    def test_peer_failure_frame_rejected(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("broker", m.FAILURE)]]
+        self.assert_failure("peer_failed")
+
+    def test_descriptor_replacement_is_not_used_or_closed(self):
+        self.setup_controller()
+        fd = self.channels._fds["ledger"]
+        self.inodes[fd] += 1
+        self.assert_failure("channel_rejected")
+        with self.assertRaisesRegex(m.ControllerError, "cleanup_unconfirmed"):
+            self.channels.close_once()
+        self.assertIn(fd, self.alive)
+        self.assertEqual(len(self.alive), 1)
+
+    def test_channel_close_consumes_once_and_closes_all_four(self):
+        self.setup_controller()
+        self.channels.close_once()
+        self.assertFalse(self.alive)
+        with self.assertRaisesRegex(m.ControllerError, "already_attempted"):
+            self.channels.close_once()
+        self.assertEqual(sum(e[0] == "close" for e in self.events), 12)
+
+    def test_failed_take_retains_ambiguous_authority(self):
+        with patch.object(m.authority._EndpointAuthority, "take_admitted_once",
+                          side_effect=m.authority.EndpointAuthorityError()):
+            with self.assertRaisesRegex(m.ControllerError, "cleanup_unconfirmed"):
+                m._Channels(self.value, deadline_ns=self.deadline)
+        self.assertEqual(len(self.value._ambiguous), 1)
+        self.assertTrue(self.value._ambiguous[0].snapshot()["descriptor_owned"])
+
+    def test_owner_mismatch_prevents_io(self):
+        self.setup_controller()
+        self.pid += 1
+        with self.assertRaisesRegex(m.ControllerError, "owner_mismatch"):
+            self.run_controller()
+        self.assertEqual(self.sent, [])
+
+    def test_deadline_is_not_extended(self):
+        self.setup_controller()
+        self.now = self.deadline
+        self.assert_failure("deadline_exhausted")
+
+    def test_reentry_is_rejected(self):
+        self.setup_controller()
+        self.controller._lock.acquire()
+        try:
+            with self.assertRaisesRegex(m.ControllerError, "reentry"):
+                self.run_controller()
+        finally:
+            self.controller._lock.release()
+
+    def test_empty_packet_without_hup_is_not_eof(self):
+        with patch.object(m.transport, "_recvmsg", return_value=(b"", b"", 0, True)):
+            with self.assertRaisesRegex(m.ControllerError, "packet_rejected"):
+                m._receive_frame(10)
+
+    def test_unsolicited_rights_closed_then_rejected(self):
+        with patch.object(m.transport, "_recvmsg",
+                          return_value=(b"R", b"synthetic-control", 0, True)), \
+             patch.object(m.transport, "_rights", return_value=([90, 91], True)), \
+             patch.object(m.transport, "_close_rights") as close:
+            with self.assertRaisesRegex(m.ControllerError, "packet_rejected"):
+                m._receive_frame(10)
+        close.assert_called_once_with([90, 91])
+
+    def test_truncated_frame_rejected_and_cmsg_cloexec_flag_allowed(self):
+        with patch.object(m.transport, "_recvmsg",
+                          return_value=(b"R", b"", 0x20, True)):
+            with self.assertRaisesRegex(m.ControllerError, "packet_rejected"):
+                m._receive_frame(10)
+        with patch.object(m.transport, "_recvmsg", return_value=(
+                b"R", b"", m.transport.MSG_CMSG_CLOEXEC, True)):
+            self.assertEqual(m._receive_frame(10), b"R")
+
+    def test_poller_error_not_treated_as_data(self):
+        self.setup_controller()
+        self.schedule = [[self.frame("ledger", b"", select.POLLERR)]]
+        self.assert_failure("peer_failed")
+
+    def test_exact_terminal_digest_and_cleanup_proof_required(self):
+        self.setup_controller()
+        self.happy()
+        self.schedule[-2] = [self.frame("worker", m.WORKER_DONE.pack(b"W", bytes(32)))]
+        self.assert_failure("packet_rejected")
+
+
+if __name__ == "__main__":
+    unittest.main()

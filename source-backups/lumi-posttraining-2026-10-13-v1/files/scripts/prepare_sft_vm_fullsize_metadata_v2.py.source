@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Offline VersionId binding for the already-selected full-size VM inputs.
+
+Reads only the frozen local metadata selection and the completed local backup
+receipt.  It performs no AWS request and never opens checkpoint payload bytes.
+"""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import re
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+V1 = ROOT / "scripts/prepare_sft_vm_fullsize_metadata_v1.py"
+V1_SHA256 = "d06fe9d321c70bca68606b922d32af320ec938b5eef327b94f4351929f653cb9"
+RECEIPT = (
+    ROOT
+    / "../lumi-artifacts/4b-80b-production-v0.1/418a113021da/segment-3-s3-backup/"
+    "s3-backup-receipt-v0.1.json"
+)
+RECEIPT_SHA256 = "b826123e42ac71c3cb15f3a67d5e057507781286331f147fc0ab0fb584059ea5"
+VERSION = re.compile(r"[A-Za-z0-9._=-]{1,1024}")
+
+
+def need(value):
+    if not value:
+        raise ValueError("version_binding_rejected") from None
+
+
+def read_bound(path, pin, limit=131072):
+    need(path.is_file() and not path.is_symlink() and 0 < path.stat().st_size <= limit)
+    raw = path.read_bytes()
+    need(len(raw) <= limit and hashlib.sha256(raw).hexdigest() == pin)
+    return raw
+
+
+def bind(selected, receipt):
+    """Join exact selected key/size/digest rows to immutable S3 versions."""
+    need(type(selected) is dict and type(receipt) is dict)
+    storage, bindings = receipt["storage"], receipt["bindings"]
+    need(
+        receipt["schema_version"] == 1
+        and receipt["status"] == "pass"
+        and receipt["source_checkpoint_unchanged"] is True
+        and storage["account"] == selected["account"]
+        and storage["region"] == selected["region"]
+        and storage["bucket"] == selected["bucket"]
+        and storage["versioning"] == "Enabled"
+        and storage["server_side_encryption"] == "AES256"
+        and bindings["plan_sha256"] == selected["source_bindings"]["backup.json"][1]
+        and bindings["checkpoint_manifest_sha256"]
+        == selected["source_bindings"]["manifest.sha256"][1]
+        # The authoritative lineage checks were already performed by v1.  Pin
+        # that entire output and independently require exact object equality.
+        and selected["object_versions_bound"] is False
+        and selected["remote_availability_verified"] is False
+    )
+    by_key = {}
+    for row in receipt["objects"]:
+        need(type(row) is dict and type(row.get("key")) is str and row["key"] not in by_key)
+        by_key[row["key"]] = row
+    need(len(by_key) == receipt["total_objects"] == 52)
+    objects = []
+    for row in selected["objects"]:
+        saved = by_key.get(row["key"])
+        need(type(saved) is dict)
+        version = saved.get("version_id")
+        need(
+            row["key"].startswith(storage["archive_prefix"])
+            and saved["bytes"] == row["bytes"]
+            and saved["sha256"] == row["sha256"]
+            and type(version) is str
+            and VERSION.fullmatch(version) is not None
+        )
+        objects.append(row | {"version_id": version})
+    need(len(objects) == selected["object_count"] and 1 <= len(objects) <= 22)
+    result = dict(selected)
+    result.update(
+        schema="lumi.vm-fullsize-metadata-preparation.v0.2",
+        objects=objects,
+        object_versions_bound=True,
+        versioned_object_count=len(objects),
+        backup_receipt_sha256=RECEIPT_SHA256,
+        remote_availability_verified=False,
+        acquisition_authorized=False,
+        execution_permitted=False,
+    )
+    return result
+
+
+def prepare():
+    v1_raw = read_bound(V1, V1_SHA256)
+    receipt_raw = read_bound(RECEIPT, RECEIPT_SHA256)
+    spec = importlib.util.spec_from_file_location("_lumi_fullsize_metadata_v1_bound", V1)
+    module = importlib.util.module_from_spec(spec)
+    need(spec.loader is not None)
+    spec.loader.exec_module(module)
+    namespace = "_lumi_vm_fullsize_metadata_prepare_v1"
+    need(not any(name == namespace or name.startswith(namespace + ".") for name in sys.modules))
+    try:
+        selected = module.prepare()
+    finally:
+        for name in list(sys.modules):
+            if name == namespace or name.startswith(namespace + "."):
+                del sys.modules[name]
+    result = bind(selected, json.loads(receipt_raw))
+    need(result["object_count"] == result["versioned_object_count"] == 22)
+    result["metadata_v1_script_sha256"] = hashlib.sha256(v1_raw).hexdigest()
+    result["version_receipt_bytes_read"] = len(receipt_raw)
+    return result
+
+
+if __name__ == "__main__":
+    need(len(sys.argv) == 1)
+    try:
+        print(json.dumps(prepare(), sort_keys=True))
+    except BaseException:
+        raise SystemExit("version_binding_failed") from None

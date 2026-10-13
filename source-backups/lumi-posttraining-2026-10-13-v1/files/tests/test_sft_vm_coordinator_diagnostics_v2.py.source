@@ -1,0 +1,275 @@
+"""Generated-only diagnostics: fixed exit transport, unchanged gates, no native dispatch."""
+
+import contextlib
+import hashlib
+import importlib.util
+import io
+import subprocess
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from tests import test_sft_vm_coordinator_entry_v1 as entry_tests
+from tests import test_sft_vm_coordinator_rehearsal_v1 as supervisor_tests
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load(relative):
+    spec = importlib.util.spec_from_file_location("fixed_diagnostic_test", ROOT / relative)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+m = load("src/lumi/posttraining_vm_coordinator_rehearsal_v2.py")
+
+
+class EntryRegressions(entry_tests.EntryTests):
+    def setUp(self):
+        original = entry_tests.load_script
+        self.enterContext(
+            patch.object(
+                entry_tests,
+                "load_script",
+                side_effect=lambda name: original(
+                    name.replace(
+                        "run_sft_vm_coordinator_entry_v1", "run_sft_vm_coordinator_entry_v2"
+                    )
+                ),
+            )
+        )
+        super().setUp()
+
+    def test_runtime_failure_stage_and_no_control_read(self):
+        with (
+            patch.object(self.entry, "load_runner", return_value=self.runner),
+            patch.object(self.runner, "_runtime", side_effect=RuntimeError("PRIVATE")),
+            patch.object(self.entry, "read_control") as read,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.entry.execute(self.pin)
+            self.assertEqual(self.entry.failure_exit_status(), 42)
+            read.assert_not_called()
+
+    def test_corrupt_control_is_localized_before_import(self):
+        self.pin = "0" * 64
+        with patch.object(self.runner, "_coordinate_admitted_import") as coordinate:
+            with self.assertRaises(ValueError):
+                self.execute()
+            self.assertEqual(self.entry.failure_exit_status(), 45)
+            coordinate.assert_not_called()
+
+    def test_success_stage_and_single_consumption(self):
+        self.execute()
+        self.assertEqual(self.entry.STAGE, "summary_write")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(self.entry.failure_exit_status(), 40)
+
+
+class PhaseRegressions(supervisor_tests.PhaseTests):
+    def setUp(self):
+        self.enterContext(patch.object(supervisor_tests, "m", m))
+        super().setUp()
+
+    def test_all_diagnostic_statuses_fail_and_stop_once(self):
+        for status in m.DIAGNOSTIC_STAGES:
+            with self.subTest(status=status):
+                self.run.reset_mock()
+                self.observe.return_value = {
+                    "ActiveState": "failed",
+                    "SubState": "failed",
+                    "Result": "exit-code",
+                    "ExecMainCode": "1",
+                    "ExecMainStatus": str(status),
+                }
+                with self.assertRaises(m.StageError) as error:
+                    m.run_phase("a" * 32, "import", "b" * 64, float("inf"))
+                self.assertEqual(error.exception.exit_status, status)
+                self.assertEqual(len(self.stops()), 1)
+
+
+class LifecycleRegressions(supervisor_tests.LifecycleTests):
+    def setUp(self):
+        self.enterContext(patch.object(supervisor_tests, "m", m))
+        super().setUp()
+
+    def test_stage_failure_retained_cleanup_runs_and_no_retry(self):
+        self.phase.side_effect = m.StageError(42)
+        with self.assertRaises(m.StageError):
+            self.launch()
+        import json
+
+        report = json.loads((self.root / supervisor_tests.ATTEMPT / "failure.json").read_bytes())
+        self.assertEqual(
+            report, {"status": "failed", "code": "stage_runtime_gate", "retry_allowed": False}
+        )
+        self.assertFalse(self.mounted)
+        with self.assertRaisesRegex(m.Error, "attempt_used"):
+            self.launch()
+        self.assertEqual(self.phase.call_count, 1)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def setUp(self):
+        self.entry = load("scripts/run_sft_vm_coordinator_entry_v2.py")
+
+    def test_maps_match_and_only_fixed_unique_nonzero_codes(self):
+        self.assertEqual(
+            self.entry.ENTRY_STAGES, {k: v for k, v in m.DIAGNOSTIC_STAGES.items() if k < 60}
+        )
+        self.assertEqual(len(set(m.DIAGNOSTIC_STAGES.values())), len(m.DIAGNOSTIC_STAGES))
+        self.assertTrue(all(0 < k < 126 for k in m.DIAGNOSTIC_STAGES))
+        self.entry.STAGE = "PRIVATE arbitrary exception"
+        self.assertEqual(self.entry.failure_exit_status(), 1)
+        self.assertEqual(m.StageError("PRIVATE").code, "stage_child_unknown_failure")
+
+    def test_builder_has_every_fixed_new_entry_seed(self):
+        builder = load("scripts/prepare_sft_vm_coordinator_release_v2.py")
+        sources = builder.source_closure(ROOT)
+        self.assertTrue(m.REQUIRED <= set(sources))
+        self.assertIn("src/lumi/posttraining_checkpoint_import_runner_v3.py", sources)
+        self.assertIn("scripts/run_sft_vm_coordinator_entry_v2.py", sources)
+        self.assertIn("src/lumi/posttraining_vm_coordinator_rehearsal_v2.py", sources)
+
+    def test_entry_main_never_prints_exception_or_traceback(self):
+        class Poison(BaseException):
+            def __str__(self):
+                raise AssertionError("exception must never be formatted")
+
+        for status, stage in self.entry.ENTRY_STAGES.items():
+            with self.subTest(stage=stage):
+                self.entry.STAGE = stage
+                stderr, stdout = io.StringIO(), io.StringIO()
+                with (
+                    patch.object(self.entry, "execute", side_effect=Poison()),
+                    patch.object(self.entry.sys, "platform", "linux"),
+                    patch.object(
+                        self.entry,
+                        "__file__",
+                        "/work/release/scripts/run_sft_vm_coordinator_entry_v2.py",
+                    ),
+                    patch.object(sys, "argv", ["entry", "--control-sha256", "a" * 64]),
+                    contextlib.redirect_stderr(stderr),
+                    contextlib.redirect_stdout(stdout),
+                ):
+                    with self.assertRaises(SystemExit) as error:
+                        self.entry.main()
+                self.assertEqual(error.exception.code, status)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "generated_entry_failed\n")
+
+    def test_worker_propagates_only_import_stage_codes_without_output_capture(self):
+        for code in list(self.entry.ENTRY_STAGES) + [1, -9, 137, 255, 60, True]:
+            with (
+                self.subTest(code=code),
+                patch.object(m, "worker_check"),
+                patch.object(m.os, "statvfs", return_value=SimpleNamespace(f_flag=m.os.ST_RDONLY)),
+                patch.object(
+                    m.subprocess, "run", return_value=SimpleNamespace(returncode=code)
+                ) as run,
+            ):
+                with self.assertRaises(m.StageError) as error:
+                    m.worker("a" * 32, "import", "b" * 64)
+                self.assertEqual(
+                    error.exception.exit_status,
+                    code if type(code) is int and code in self.entry.ENTRY_STAGES else 65,
+                )
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_args.kwargs["stdout"], subprocess.DEVNULL)
+                self.assertEqual(run.call_args.kwargs["stderr"], subprocess.DEVNULL)
+                self.assertEqual(run.call_args.kwargs["timeout"], 80)
+
+    def test_prepare_cannot_claim_import_stage(self):
+        with (
+            patch.object(m, "worker_check"),
+            patch.object(m, "copy_sources"),
+            patch.object(m.subprocess, "run", return_value=SimpleNamespace(returncode=42)),
+        ):
+            with self.assertRaises(m.StageError) as error:
+                m.worker("a" * 32, "prepare", "b" * 64)
+            self.assertEqual(error.exception.exit_status, 65)
+
+    def test_worker_boundary_and_child_timeout_localized(self):
+        with (
+            patch.object(m, "worker_check", side_effect=ValueError("PRIVATE")),
+            patch.object(m.subprocess, "run") as run,
+        ):
+            with self.assertRaises(m.StageError) as error:
+                m.worker("a" * 32, "import", "b" * 64)
+            self.assertEqual(error.exception.exit_status, 60)
+            run.assert_not_called()
+        with (
+            patch.object(m, "worker_check"),
+            patch.object(m, "copy_sources"),
+            patch.object(m.subprocess, "run", side_effect=subprocess.TimeoutExpired("PRIVATE", 80)),
+        ):
+            with self.assertRaises(m.StageError) as error:
+                m.worker("a" * 32, "prepare", "b" * 64)
+            self.assertEqual(error.exception.exit_status, 64)
+
+    def test_terminal_classifier_rejects_signals_oom_timeout_and_unknown_status(self):
+        observed = {
+            "Result": "exit-code",
+            "ExecMainCode": "1",
+            "ActiveState": "failed",
+            "SubState": "failed",
+            "ExecMainStatus": "42",
+        }
+        self.assertEqual(m.diagnostic_status(observed, "import"), 42)
+        self.assertIsNone(m.diagnostic_status(observed, "prepare"))
+        for key, value in [
+            ("Result", "oom-kill"),
+            ("Result", "timeout"),
+            ("ExecMainCode", "2"),
+            ("ActiveState", "active"),
+            ("SubState", "exited"),
+            ("ExecMainStatus", "042"),
+            ("ExecMainStatus", "PRIVATE"),
+        ]:
+            self.assertIsNone(m.diagnostic_status(observed | {key: value}, "import"))
+
+    def test_os_properties_unchanged_and_new_paths_fixed(self):
+        for mode in m.MODES:
+            self.assertEqual(
+                m.properties("a" * 32, mode), supervisor_tests.m.properties("a" * 32, mode)
+            )
+        self.assertNotEqual(m.SCRIPT, supervisor_tests.m.SCRIPT)
+        self.assertIn("v2-", m.unit_name("a" * 32, "import"))
+
+    def test_launcher_transports_diagnostic_exit_only(self):
+        launcher = load("scripts/run_sft_vm_coordinator_rehearsal_v2.py")
+        for code in m.DIAGNOSTIC_STAGES:
+            with (
+                patch.object(launcher, "load_control", return_value=m),
+                patch.object(m, "worker", side_effect=m.StageError(code)),
+                patch.object(sys, "platform", "linux"),
+                patch.object(launcher, "__file__", str(m.SCRIPT)),
+                patch.object(sys, "argv", ["launch", "worker", "a" * 32, "import", "b" * 64]),
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                with self.assertRaises(SystemExit) as error:
+                    launcher.main()
+                self.assertEqual(error.exception.code, code)
+
+    def test_frozen_predecessors_and_failed_attempt_preserved(self):
+        pins = {
+            "scripts/run_sft_vm_coordinator_entry_v1.py": (
+                "be19fc1c21af418b89d276621eed719d0533273a3e860bdba40a2115084b5115"
+            ),
+            "scripts/run_sft_vm_coordinator_rehearsal_v1.py": (
+                "6a8937cfedaee1085f898949260544ecc07437cdd859b312959c9a5c629b5bd6"
+            ),
+            "src/lumi/posttraining_vm_coordinator_rehearsal_v1.py": (
+                "0a1a9e1f29827acb8972315ce7e9bbe3271f684ade6a5e3a8676ee0152cc0edf"
+            ),
+        }
+        for path, digest in pins.items():
+            self.assertEqual(hashlib.sha256((ROOT / path).read_bytes()).hexdigest(), digest)
+
+
+if __name__ == "__main__":
+    unittest.main()

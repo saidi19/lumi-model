@@ -1,0 +1,434 @@
+"""Verify the consumed v0.25 outcome and stopped retained AWS resources."""
+
+import ast
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+BASE = "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020"
+SOURCE = "artifacts/lumi-vm-attempt-020-source-v0.1"
+PRIOR = "scripts/verify_sft_vm_attempt019_v024_failure_v1.py"
+PRIOR_SHA = "a7b5c87251abff68ceea3c0a5d37aec09712852f1d9c4572435f279d1c7f5bb3"
+PINS = {
+    (
+        "configs/lumi-vm-private-outer-execution-approval-v0.25.json"
+    ): (
+        "5a5d59aab20c4010e3c6cccbd7b196a90231a38a354e70e1a0a2680850a94985"
+    ),
+    (
+        "scripts/execute_sft_vm_private_outer_v25.py"
+    ): (
+        "417febecc50c9068a7815646f4f9d1b3c52f36bd522f07e021af2c18240975c4"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-preflight-v0.25/started.json"
+    ): (
+        "d4698c13e2c5da10a5bae38f3964db18a130ea41672ed9d758e655855b757716"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-preflight-v0.25/admission.json"
+    ): (
+        "c62defed1f0cc0930e96b71ced6307e7d659aa206cca02d4971e33003583e9a1"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-preflight-v0.25/result.json"
+    ): (
+        "9c3fd03ec876bf7ab74b87b6ebb0f50dac1392349cddc70ef151d23455fbc2e6"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/entry-started.json"
+    ): (
+        "cb8e46d1bc03a675b3dd5e843a37b9d1962423771e57a5ec03ef73f27100eabf"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/entry-result.json"
+    ): (
+        "9c3fd03ec876bf7ab74b87b6ebb0f50dac1392349cddc70ef151d23455fbc2e6"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/network/0001-started"
+        ".json"
+    ): (
+        "c2c94880edfdce63872ddd104c1b64bfb892b0605982a20208e452bf971cb737"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/network/0003-created"
+        "-subnet.json"
+    ): (
+        "bd18020d4c2edf8367354153b7a01793638023de7275ebc543e29b0e5d4f03bd"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/network/0005-created"
+        "-table.json"
+    ): (
+        "03e9e043b30c215052124776b3d85d7ce2fad87ce2eb6d84958cdcec74e6b921"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/network/0008-created"
+        "-address.json"
+    ): (
+        "27c375854125c78927bf9cdba4fd14c373fac8f72249a03fa3e37bfb951c7de2"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/network/0010-created"
+        "-nat.json"
+    ): (
+        "dda7aedba910805d096a759d9de5f89a5bc29a0da48c65d9fcaa46055e91f3d7"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/network/0015-result."
+        "json"
+    ): (
+        "8ffe2f722da07bb33701fdedd4b161a2323fd168565cddc3acf4a967ec6e7af1"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/"
+        "binding.json"
+    ): (
+        "643d962d424b073536d2f871a835aeaf5e6a4ca2477598949c769b0a23302663"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/"
+        "launch.json"
+    ): (
+        "93ac867b166beac7cafb53ab949e3feb7344063657f0449316ae8ca1efe6249e"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/"
+        "result.json"
+    ): (
+        "67282c836ca456a5a1ea4c4eb2c36b0eacb071bca5743f99c1a23f5c5f5b533f"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/"
+        "host-setup/result.json"
+    ): (
+        "2448aa1a029e84f90aee95a5bb3e0211201b62f7d5778a92a45a462aeb8c8b45"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/"
+        "host-setup/setup/controls/result.json"
+    ): (
+        "2fbc4f679f3c78e4de6b28f2cc2ba4d3417f0ceb65a7f82b08a32bbdb8b9a338"
+    ),
+    (
+        "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/"
+        "host-setup/setup/controls/control-transfer/result.json"
+    ): (
+        "849c251b39a1f3cd4731b83830a2d51471c0547c8303c629142e3853c6454664"
+    ),
+    (
+        "artifacts/lumi-vm-attempt-020-source-v0.1/scripts/send_sft_vm_setup_inputs_v5.py"
+    ): (
+        "08a2ab7c8959c5409783fcccbb9700603cac773c1b76b4ea21235cb2935282f9"
+    ),
+    (
+        "artifacts/lumi-vm-attempt-020-source-v0.1/scripts/stage_sft_vm_setup_inputs_v5.p"
+        "y"
+    ): (
+        "05a4aa5845ed67a89cc880bf6959a96d45e9de66a2ff65827306407c97f3b00f"
+    ),
+    (
+        "artifacts/lumi-vm-attempt-020-source-v0.1/artifacts/lumi-vm-setup-inputs-release"
+        "-v0.5/setup-inputs.tar"
+    ): (
+        "47575a8184747c7a0486e3e6be3338789937b709a8e45c4be722762c457b793e"
+    ),
+}
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-020-v025-execution-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_v025_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == (PINS[name] if digest is None else digest))
+    return raw
+
+
+def load(name):
+    return json.loads(read(name))
+
+
+def function(raw, name, namespace):
+    nodes = [node for node in ast.parse(raw).body if getattr(node, "name", None) == name]
+    need(len(nodes) == 1)
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<receipt-contract>", "exec"), namespace)
+    return namespace[name]
+
+
+def receipt_diagnostic():
+    sender_name = SOURCE + "/scripts/send_sft_vm_setup_inputs_v5.py"
+    receiver_name = SOURCE + "/scripts/stage_sft_vm_setup_inputs_v5.py"
+    archive_name = SOURCE + "/artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar"
+    sender, receiver, raw = read(sender_name), read(receiver_name), read(archive_name)
+    dictionaries = [
+        node.value
+        for node in ast.parse(receiver).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "FILES" for target in node.targets)
+    ]
+    need(len(dictionaries) == 1 and isinstance(dictionaries[0], ast.Dict))
+    keys = [ast.literal_eval(key) for key in dictionaries[0].keys]
+    need(len(keys) == len(set(keys)) == 19)
+    expected = function(
+        sender,
+        "expected_receipt",
+        {
+            "inputs": type("Inputs", (), {"ATTEMPT": ATTEMPT}),
+            "ARCHIVE_SHA": sha(raw),
+            "ARCHIVE_BYTES": len(raw),
+        },
+    )()
+    produced = function(
+        receiver,
+        "receipt",
+        {
+            "sha": sha,
+            "ATTEMPT": ATTEMPT,
+            "FILES": dict.fromkeys(keys),
+        },
+    )(raw)
+    produced.update(staged_files_readback_match=True, readonly_mounts_established=False)
+    differing = sorted(key for key in produced if produced[key] != expected[key])
+    need(set(produced) == set(expected))
+    need(differing == ["files"] and expected["files"] == 18 and produced["files"] == 19)
+    return {
+        "confirmed_local_contract_defect": "receiver_19_files_sender_expects_18",
+        "sender_expected_files": 18,
+        "receiver_produced_files": 19,
+        "differing_receipt_fields": differing,
+        "otherwise_equal_receipt_contract": True,
+        "successful_receiver_receipt_would_be_rejected": True,
+        "exact_remote_failure_cause_proven": False,
+        "remote_staging_completion_unknown": True,
+    }
+
+
+def local():
+    for name in PINS:
+        read(name)
+    read(PRIOR, PRIOR_SHA)
+    result = load("artifacts/lumi-vm-private-outer-execution-v0.25/entry-result.json")
+    admission = load("artifacts/lumi-vm-private-outer-preflight-v0.25/admission.json")
+    host = load(BASE + "/host/execution/host/result.json")
+    setup = load(BASE + "/host/execution/host/host-setup/result.json")
+    transfer = load(
+        BASE + "/host/execution/host/host-setup/setup/controls/control-transfer/result.json"
+    )
+    controls = load(BASE + "/host/execution/host/host-setup/setup/controls/result.json")
+    network = load(BASE + "/network/0015-result.json")
+    need(
+        result["status"] == "failed_preserve_component_evidence_no_retry"
+        and result["network_cleanup_verified"] is True
+        and result["execution_marker_created"] is True
+        and result["retry_allowed"] is False
+        and admission["admission_call_budget"]["sdk_read_dispatches"] == 57
+        and admission["admission_call_budget"]["credential_identity_dispatches"] == 1
+        and host["launch_attempted"] is True
+        and host["stopped_verified"] is True
+        and host["stop_verification_unresolved"] is False
+        and host["disk_deletion_requested"] is False
+        and host["real_4b_import"] is False
+        and setup["host_admitted"] is False
+        and setup["failed_stage"] == "guarded_setup"
+        and controls["seed_confirmed"] is True
+        and controls["failed_phase"] == "control_transfer"
+        and transfer["ssh_dispatch_attempted"] is True
+        and transfer["remote_staging_confirmed"] is False
+        and transfer["remote_completion_unknown"] is True
+        and network["cost_resources_released"] is True
+        and network["cleanup_unresolved"] is False
+    )
+    return receipt_diagnostic()
+
+
+def live_checker():
+    local()
+    binding = load(BASE + "/host/execution/host/binding.json")
+    nonce = load(BASE + "/network/0001-started.json")["nonce"]
+    subnet = load(BASE + "/network/0003-created-subnet.json")["identifier"]
+    table = load(BASE + "/network/0005-created-table.json")["identifier"]
+    nat = load(BASE + "/network/0010-created-nat.json")["identifier"]
+    eip = load(BASE + "/network/0008-created-address.json")["identifier"]
+    need(binding["attempt"] == ATTEMPT)
+    volumes = {binding["root_volume"], binding["work_volume"]}
+    namespace = dict(
+        ROOT=ROOT,
+        ACCOUNT="573978149073",
+        REGION="us-east-1",
+        ATTEMPT=ATTEMPT,
+        INSTANCE=binding["instance"],
+        VOLUMES=volumes,
+        SUBNET=subnet,
+        TABLE=table,
+        NAT=nat,
+        EIP=eip,
+        ENDPOINT=binding["endpoint"],
+        VM_GROUP=binding["vm_group"],
+        ENDPOINT_GROUP=binding["endpoint_group"],
+        KEY=binding["key_name"],
+        NONCE=nonce,
+        need=need,
+        time=time,
+        os=os,
+        subprocess=subprocess,
+        json=json,
+    )
+    ops = {
+        "identity": ("sts", "get-caller-identity", {}),
+        "instance": ("ec2", "describe-instances", {"InstanceIds": [binding["instance"]]}),
+        "volumes": ("ec2", "describe-volumes", {"VolumeIds": sorted(volumes)}),
+        "subnet": ("ec2", "describe-subnets", {"SubnetIds": [subnet]}),
+        "table": ("ec2", "describe-route-tables", {"RouteTableIds": [table]}),
+        "nat": ("ec2", "describe-nat-gateways", {"NatGatewayIds": [nat]}),
+        "eip": ("ec2", "describe-addresses", {"AllocationIds": [eip]}),
+        "endpoint": (
+            "ec2",
+            "describe-instance-connect-endpoints",
+            {"InstanceConnectEndpointIds": [binding["endpoint"]]},
+        ),
+        "groups": (
+            "ec2",
+            "describe-security-groups",
+            {"GroupIds": [binding["vm_group"], binding["endpoint_group"]]},
+        ),
+        "key": ("ec2", "describe-key-pairs", {"KeyNames": [binding["key_name"]]}),
+        "predecessor_instance": (
+            "ec2",
+            "describe-instances",
+            {"InstanceIds": ["i-068358c462d98a32a"]},
+        ),
+        "predecessor_volumes": (
+            "ec2",
+            "describe-volumes",
+            {"VolumeIds": ["vol-0d22435afc196a589", "vol-0e1c912b1eb8ef89c"]},
+        ),
+    }
+    namespace["OPS"] = ops
+    names = {"Cloud", "tag", "live_verify"}
+    nodes = [
+        node
+        for node in ast.parse(read(PRIOR, PRIOR_SHA)).body
+        if getattr(node, "name", None) in names
+    ]
+    need(len(nodes) == 3)
+
+    class Scope(ast.NodeTransformer):
+        def __init__(self):
+            self.cidr = self.read_limit = 0
+
+        def visit_Constant(self, node):
+            if node.value == "172.31.97.0/27":
+                self.cidr += 1
+                return ast.copy_location(ast.Constant(value="172.31.97.32/27"), node)
+            return node
+
+        def visit_Compare(self, node):
+            if ast.unparse(node) == "self.calls < 10":
+                self.read_limit += 1
+                node.comparators[0] = ast.copy_location(ast.Constant(value=12), node.comparators[0])
+            return self.generic_visit(node)
+
+    scope = Scope()
+    tree = scope.visit(ast.Module(body=nodes, type_ignores=[]))
+    need(scope.cidr == scope.read_limit == 1)
+    exec(compile(ast.fix_missing_locations(tree), "<scoped-readonly-checker>", "exec"), namespace)
+    return namespace
+
+
+def run():
+    diagnostic = local()
+    need(not OUTPUT.exists())
+    checker = live_checker()
+    cloud = checker["Cloud"]()
+    live = checker["live_verify"](cloud)
+    prior = cloud.call("predecessor_instance")["Reservations"]
+    need(len(prior) == 1 and prior[0]["OwnerId"] == checker["ACCOUNT"])
+    prior = prior[0]["Instances"]
+    need(len(prior) == 1 and prior[0]["InstanceId"] == "i-068358c462d98a32a")
+    need(prior[0]["State"]["Name"] == "stopped")
+    need(all(row["Ebs"]["DeleteOnTermination"] is False for row in prior[0]["BlockDeviceMappings"]))
+    disks = cloud.call("predecessor_volumes")["Volumes"]
+    need(len(disks) == 2)
+    need(all(row["Encrypted"] is True and row["State"] == "in-use" for row in disks))
+    need(all(row["Attachments"][0]["InstanceId"] == "i-068358c462d98a32a" for row in disks))
+    live.update(
+        total_verification_reads=cloud.calls,
+        response_bytes=cloud.bytes,
+        predecessor_stopped_and_encrypted_ebs_preserved=True,
+    )
+    result = {
+        "schema": "lumi.vm-attempt020-v025-execution-verification.v0.1",
+        "attempt": ATTEMPT,
+        "status": "failed_setup_preserved_no_retry_cleanup_independently_verified",
+        "source_bindings": PINS,
+        "execution": {
+            "instance_launches": 1,
+            "instance": checker["INSTANCE"],
+            "checkpoint_download_started": False,
+            "real_4b_import": False,
+            "seed_confirmed": True,
+            "control_staging_confirmed": False,
+            "remote_completion_unknown": True,
+            "retry": False,
+        },
+        "admission_sdk_read_dispatches_including_identity": 57,
+        "local_receipt_contract_diagnostic": diagnostic,
+        "live_verification": live,
+        "cleanup": {
+            "instance_stopped_verified": True,
+            "encrypted_ebs_retained": True,
+            "nat_deleted_verified": True,
+            "eip_released_verified": True,
+            "private_subnet_route_table_endpoint_groups_key_retained": True,
+            "cleanup_unresolved": False,
+        },
+        "verification_cloud_mutations": 0,
+        "verification_object_access": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "production_eligible": False,
+    }
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    print(
+        json.dumps(
+            {
+                "status": result["status"],
+                "reads": cloud.calls,
+                "instance_state": live["instance_state"],
+            },
+            sort_keys=True,
+        )
+    )
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--local-only"]))
+    if len(sys.argv) == 2:
+        print(json.dumps(local(), sort_keys=True))
+    else:
+        run()

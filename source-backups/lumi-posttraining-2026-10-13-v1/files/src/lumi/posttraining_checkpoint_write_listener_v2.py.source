@@ -1,0 +1,211 @@
+"""Versioned dropped-worker final seal over the frozen listener v1 adapter.
+
+The frozen v1 adapter correctly requires root for listener installation and for
+the broker-side listener adoption, but its final-seal helper also requires root.
+The full-size bootstrap irreversibly drops to uid/gid 10001 before releasing or
+executing the worker.  Installing the final seal before that drop is invalid:
+the seal denies the credential-changing operations used by the frozen drop.
+
+This successor preserves v1 byte-for-byte.  Root preparation and broker
+adoption still delegate to v1.  Only the final-seal runtime contract changes:
+the same process and main thread that completed the v1 transfer must now have
+exact real/effective/saved uid and gid 10001, no supplementary groups, NNP=1,
+and the inherited listener filter already active.  It may then install exactly
+the frozen final filter once.  No caller-selected identity, filter or flag is
+accepted.
+
+Import is inert.  Local tests replace every native boundary.  This module does
+not perform the privilege drop, transport a listener, establish a READY/release
+channel, qualify a target kernel or authorize execution.  The public entry is
+unconditionally closed.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import threading
+
+from . import posttraining_checkpoint_write_listener_v1 as frozen
+
+SCHEMA = "lumi.checkpoint-write-listener.v0.2"
+WORKER_UID = 10001
+WORKER_GID = 10001
+_SEAL_COMPLETED = False
+ERROR_CODES = frozen.ERROR_CODES
+FALSE_FLAGS = frozen.FALSE_FLAGS + (
+    "privilege_drop_performed_by_this_adapter",
+    "scm_rights_transport_verified",
+    "ready_release_protocol_verified",
+    "bootstrap_integration_verified",
+)
+
+
+class ListenerV2Error(ValueError):
+    def __init__(self, code="listener_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "listener_rejected"
+        super().__init__(self.code)
+
+
+def _need(condition, code="listener_rejected"):
+    if not condition:
+        raise ListenerV2Error(code) from None
+
+
+def _common_runtime():
+    """Fixed non-credential runtime properties shared with the frozen adapter."""
+    try:
+        _need(frozen.sys_platform() == "linux" and platform.machine() == "x86_64"
+              and platform.python_implementation() == "CPython"
+              and frozen.python_version() == (3, 12) and frozen.no_site()
+              and frozen.dont_write_bytecode()
+              and threading.current_thread() is threading.main_thread()
+              and threading.active_count() == 1
+              and not any(name.split(".", 1)[0] in frozen.ML_ROOTS
+                          for name in frozen.loaded_modules()), "runtime_rejected")
+    except ListenerV2Error:
+        raise
+    except BaseException:
+        raise ListenerV2Error("runtime_rejected") from None
+
+
+def _dropped_runtime():
+    """Require the exact irreversible worker identity after the frozen drop."""
+    try:
+        _common_runtime()
+        uids, gids, groups = os.getresuid(), os.getresgid(), os.getgroups()
+        _need(type(uids) is tuple and type(gids) is tuple
+              and len(uids) == len(gids) == 3
+              and all(type(value) is int for value in uids + gids)
+              and uids == (WORKER_UID,) * 3 and gids == (WORKER_GID,) * 3
+              and type(groups) is list and not groups, "runtime_rejected")
+    except ListenerV2Error:
+        raise
+    except BaseException:
+        raise ListenerV2Error("runtime_rejected") from None
+
+
+def install_write_listener(**_arguments):
+    """No approval, identity, hash or callback opens the private successor."""
+    raise ListenerV2Error("host_guard_not_bound") from None
+
+
+def _prepare_listener_admitted_once(*, transfer):
+    """Delegate the exact root installation/transfer phase to frozen v1."""
+    try:
+        report = frozen._prepare_listener_admitted_once(transfer=transfer)
+    except BaseException as error:
+        code = error.code if type(error) is frozen.ListenerError else "installation_failed"
+        raise ListenerV2Error(code) from None
+    return {
+        **report,
+        "schema": SCHEMA,
+        "status": "root_listener_transferred_dropped_final_seal_pending",
+        "root_prepare_completed": True,
+        "dropped_final_seal_installed": False,
+        **dict.fromkeys(FALSE_FLAGS, False),
+    }
+
+
+def _adopt_listener_admitted_once(fd):
+    """Delegate unchanged root broker adoption; returned listener remains v1."""
+    try:
+        return frozen._adopt_listener_admitted_once(fd)
+    except BaseException as error:
+        code = error.code if type(error) is frozen.ListenerError else "listener_rejected"
+        raise ListenerV2Error(code) from None
+
+
+def _seal_admitted_once():
+    """Install only the frozen final seal after the exact irreversible drop."""
+    global _SEAL_COMPLETED
+    # Share preparation's lock so a swallowed nested seal cannot let the outer
+    # operation succeed. Poison the shared preparation on ambiguous reentry.
+    if not frozen._PREPARE_LOCK.acquire(blocking=False):
+        _SEAL_COMPLETED = False
+        frozen._PREPARE_FAILED = True
+        raise ListenerV2Error("reentry") from None
+    _SEAL_COMPLETED = False
+    try:
+        _dropped_runtime()
+        _need(_same_prepare_owner() and frozen._PREPARE_FAILED is False
+              and frozen._TRANSFER_COMPLETED is True
+              and frozen._LOCAL_LISTENER_CLOSED is True, "seal_rejected")
+        _need(frozen._SEAL_ATTEMPTED is False, "already_attempted")
+        frozen._SEAL_ATTEMPTED = True
+        frozen._abi()
+        storage, program = frozen._program(frozen.policy.FILTER)
+        _need(len(storage) == len(frozen.policy.FILTER), "abi_rejected")
+        frozen._kernel_readback()
+        _seal_readback()
+        _need(frozen._PREPARE_FAILED is False, "seal_rejected")
+        installed = frozen._seccomp(frozen.SECCOMP_SET_MODE_FILTER, 0,
+                                     frozen.ctypes.byref(program))
+        _need(type(installed) is int and installed == 0, "installation_failed")
+        _seal_readback()
+        _need(frozen._PREPARE_FAILED is False, "seal_rejected")
+        _SEAL_COMPLETED = True
+    except BaseException as error:
+        _SEAL_COMPLETED = False
+        if type(error) is ListenerV2Error:
+            code = error.code
+        elif type(error) is frozen.ListenerError:
+            code = error.code
+        else:
+            code = "installation_failed"
+        raise ListenerV2Error(code) from None
+    finally:
+        frozen._PREPARE_LOCK.release()
+    return {
+        "schema": SCHEMA,
+        "status": "dropped_worker_final_seal_installed_not_native_qualified",
+        "filter_sha256": frozen.policy.FILTER_SHA256,
+        "listener_filter_inherited": True,
+        "same_prepare_process_and_thread": True,
+        "worker_uid": WORKER_UID,
+        "worker_gid": WORKER_GID,
+        "supplementary_groups_empty": True,
+        "no_new_privileges_readback": True,
+        "final_seal_installed": True,
+        **dict.fromkeys(FALSE_FLAGS, False),
+    }
+
+
+def _seal_readback():
+    for option, expected in ((frozen.PR_GET_NO_NEW_PRIVS, 1),
+                             (frozen.PR_GET_SECCOMP, frozen.SECCOMP_MODE_FILTER)):
+        value = frozen._prctl(option)
+        _need(type(value) is int and value == expected, "readback_failed")
+
+
+def _same_prepare_owner():
+    owner = frozen._PREPARE_OWNER
+    current = (os.getpid(), threading.get_ident())
+    return (type(owner) is tuple and len(owner) == 2
+            and all(type(value) is int and value > 0 for value in owner + current)
+            and owner == current)
+
+
+def _require_sealed_owner():
+    """Validate in-process completion before sealed READY; no credential probes.
+
+    Only getpid and the CPython thread identifier are consulted after the seal.
+    Any rejected use permanently revokes the completed-state acknowledgement.
+    This is trusted in-process state, not a native filter or transport proof.
+    """
+    global _SEAL_COMPLETED
+    if not frozen._PREPARE_LOCK.acquire(blocking=False):
+        _SEAL_COMPLETED = False
+        frozen._PREPARE_FAILED = True
+        raise ListenerV2Error("reentry") from None
+    try:
+        _need(_SEAL_COMPLETED is True and _same_prepare_owner()
+              and frozen._SEAL_ATTEMPTED is True and frozen._PREPARE_FAILED is False
+              and frozen._TRANSFER_COMPLETED is True
+              and frozen._LOCAL_LISTENER_CLOSED is True, "seal_rejected")
+    except BaseException:
+        _SEAL_COMPLETED = False
+        frozen._PREPARE_FAILED = True
+        raise ListenerV2Error("seal_rejected") from None
+    finally:
+        frozen._PREPARE_LOCK.release()

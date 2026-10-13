@@ -1,0 +1,241 @@
+"""Attempt-011 prefix-only policy updater; explicit approval required.
+
+One policy PUT at most, no retry or rollback. Reuses the previously tested
+merge/readback workflow and CLI-argument transport for non-secret policy
+metadata. No raw policy or credentials are saved. Policy metadata is visible
+in short-lived process arguments. S3 replacement is not atomic compare-and-swap:
+a coordinated no-other-writers window is required.
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROPOSAL = ROOT / "configs/lumi-vm-attempt-011-cleanup-policy-proposal-v0.1.json"
+PROPOSAL_SHA = "432502803ab3b8af0fe9eb503860e9572f29130fe2cf0182cd250bc208482ace"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-011-cleanup-policy-update-v0.1/attempt-001"
+APPROVAL = ROOT / "configs/lumi-vm-attempt-011-cleanup-policy-approval-v0.1.json"
+ACCOUNT = "573978149073"
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+
+
+def need(value):
+    if not value:
+        raise ValueError("cleanup_policy_update_rejected") from None
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def merge(old, proposal):
+    need(digest(old) == proposal["expected_before_canonical_sha256"])
+    need(type(old.get("Statement")) is list)
+    need(len(old["Statement"]) == proposal["existing_statement_count"])
+    additions = proposal["statements_to_add"]
+    need(len(additions) == 4 and all(row["Effect"] == "Deny" for row in additions))
+    sids = [row["Sid"] for row in additions]
+    need(len(set(sids)) == 4 and not set(sids) & {r.get("Sid") for r in old["Statement"]})
+    merged = dict(old, Statement=old["Statement"] + additions)
+    need(len(canonical(merged).encode()) <= proposal["maximum_policy_bytes"])
+    need(digest(merged) == proposal["expected_after_canonical_sha256"])
+    return merged
+
+
+class Cloud:
+    def call(self, service, operation, **fields):
+        need(
+            (service, operation)
+            in {
+                ("sts", "get-caller-identity"),
+                ("s3api", "get-bucket-policy"),
+                ("s3api", "put-bucket-policy"),
+                ("s3api", "get-bucket-policy-status"),
+            }
+        )
+        if service == "sts":
+            need(fields == {})
+        else:
+            need(fields.get("Bucket") == BUCKET and fields.get("ExpectedBucketOwner") == ACCOUNT)
+            need(
+                set(fields)
+                == {"Bucket", "ExpectedBucketOwner"}
+                | ({"Policy"} if operation == "put-bucket-policy" else set())
+            )
+        answer = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                service,
+                operation,
+                "--cli-input-json",
+                canonical(fields),
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "5",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=20,
+            env={
+                **{
+                    k: v
+                    for k, v in os.environ.items()
+                    if not k.startswith("AWS_")
+                    and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+                },
+                "AWS_MAX_ATTEMPTS": "1",
+                "AWS_PAGER": "",
+                "AWS_EC2_METADATA_DISABLED": "true",
+            },
+        )
+        need(len(answer.stdout) <= 32768 and len(answer.stderr) <= 4096)
+        need(answer.returncode == 0)
+        return json.loads(answer.stdout, object_pairs_hook=unique) if answer.stdout.strip() else {}
+
+
+def authorize():
+    need(not APPROVAL.is_symlink() and APPROVAL.is_file())
+    need(APPROVAL.stat().st_size <= 16384)
+    approval = json.loads(APPROVAL.read_bytes(), object_pairs_hook=unique)
+    message = approval.get("human_message")
+    need(type(message) is str and 0 < len(message.strip()) <= 4096)
+    expected = dict(
+        schema="lumi.vm-attempt-011-cleanup-policy-approval.v0.1",
+        status="explicit_human_approval_recorded",
+        proposal_sha256=PROPOSAL_SHA,
+        entry_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        human_message=message,
+        scope="one_exact_cleanup_prefix_policy_merge",
+        approved_execution_count=1,
+        no_other_policy_writers_during_update_confirmed=True,
+        maximum_policy_puts=1,
+        retry=False,
+        rollback=False,
+        watchdog_deployment=False,
+        instance_action=False,
+        gpu=False,
+        training=False,
+    )
+    need(canonical(approval) == canonical(expected))
+    return approval
+
+
+def run_once(output, cloud, *, clock=time.monotonic):
+    approval = authorize()
+    raw = PROPOSAL.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == PROPOSAL_SHA)
+    proposal = json.loads(raw, object_pairs_hook=unique)
+    need(proposal["bucket"] == BUCKET and proposal["account"] == ACCOUNT)
+    output = Path(output)
+    need(output == OUTPUT)
+    need(not any(p.is_symlink() for p in (output, *output.parents)))
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+
+    def save(name, value):
+        raw = (canonical(value) + "\n").encode()
+        need(len(raw) <= 8192)
+        fd = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    start = clock()
+    report = dict(
+        status="started",
+        cloud_calls=0,
+        put_attempted=False,
+        put_acknowledged=False,
+        exact_readback_verified=False,
+        existing_policy_preserved=False,
+        object_access=0,
+        resource_launches=0,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+    save(
+        "started.json",
+        dict(
+            proposal_sha256=PROPOSAL_SHA,
+            approval_sha256=hashlib.sha256(canonical(approval).encode()).hexdigest(),
+            entry_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            writer_coordination_confirmed=True,
+        ),
+    )
+
+    def call(service, operation, **fields):
+        need(report["cloud_calls"] < 5 and 0 <= clock() - start < 100)
+        report["cloud_calls"] += 1
+        value = cloud.call(service, operation, **fields)
+        need(clock() - start < 120)
+        return value
+
+    fields = dict(Bucket=BUCKET, ExpectedBucketOwner=ACCOUNT)
+    stage = "identity"
+    try:
+        need(call("sts", "get-caller-identity")["Account"] == ACCOUNT)
+        stage = "policy_precondition"
+        old = json.loads(
+            call("s3api", "get-bucket-policy", **fields)["Policy"], object_pairs_hook=unique
+        )
+        desired = merge(old, proposal)
+        report.update(
+            before_policy_sha256=digest(old),
+            desired_policy_sha256=digest(desired),
+            original_statement_count=len(old["Statement"]),
+            added_statement_count=4,
+        )
+        stage = "single_policy_put"
+        # Consume/persist before dispatch. Any uncertain outcome is read back,
+        # never resent. There is no automatic rollback that could overwrite drift.
+        report["put_attempted"] = True
+        save("put-started.json", report)
+        try:
+            call("s3api", "put-bucket-policy", **fields, Policy=canonical(desired))
+            report["put_acknowledged"] = True
+        except Exception:
+            pass
+        stage = "exact_policy_readback"
+        actual = json.loads(
+            call("s3api", "get-bucket-policy", **fields)["Policy"], object_pairs_hook=unique
+        )
+        report["observed_policy_sha256"] = digest(actual)
+        need(actual == desired)
+        report.update(exact_readback_verified=True, existing_policy_preserved=True)
+        stage = "public_policy_status"
+        need(
+            call("s3api", "get-bucket-policy-status", **fields)["PolicyStatus"]["IsPublic"] is False
+        )
+        report.update(status="applied_and_verified", policy_not_public=True)
+    except BaseException:
+        report.update(status="stopped_unconfirmed", failed_stage=stage)
+    save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    print(canonical(run_once(OUTPUT, Cloud())))

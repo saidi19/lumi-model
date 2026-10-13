@@ -1,0 +1,165 @@
+{
+  "authorization": {
+    "candidate_generation_authorized": false,
+    "candidate_registry_change_authorized": false,
+    "dataset_seal_authorized": false,
+    "external_api_authorized": false,
+    "external_distribution_authorized": false,
+    "model_or_runtime_download_authorized": false,
+    "paid_or_cloud_gpu_authorized": false,
+    "production_sft_authorized": false,
+    "remote_mutation_authorized": false,
+    "runtime_start_authorized": false,
+    "unrelated_data_access_authorized": false
+  },
+  "bindings": {
+    "base_preflight_plan": {
+      "path": "configs/lumi-4b-sft-gpt-oss-teacher-preflight-v0.1.json",
+      "sha256": "98733f04bee048dd445bbf747668b5cf2c466f363ddf6f2c641cedec616310ac"
+    },
+    "base_preflight_report": {
+      "path": "evidence/lumi-4b-sft-gpt-oss-teacher-preflight-v0.1.json",
+      "sha256": "bda4be2f2bb644b47436119fb268b82b6a149f9a5925c6f64bd56622c1417c11"
+    },
+    "base_preflight_verification": {
+      "path": "evidence/lumi-4b-sft-gpt-oss-teacher-preflight-verification-v0.1.json",
+      "sha256": "265133f6b385353a9ca7725bebd2c936f7465786d4830bea586f7e9106b80534"
+    },
+    "implementation": {
+      "path": "src/lumi/posttraining_gpt_oss_teacher_canary.py",
+      "sha256": "4a3c6df4cb7488706aba9072517899c7d2beb307edfff5dd45a52b3eba61a81c"
+    },
+    "known_hosts": {
+      "path": "configs/lumi-4b-sft-gpt-oss-teacher-canary-known-hosts-v0.1",
+      "sha256": "0bfa086e6fd473010f86ae3e4d8fa9d124d97bb692abc399c87adb33bbf93f90"
+    },
+    "plan_runner": {
+      "path": "scripts/plan_sft_gpt_oss_teacher_canary.py",
+      "sha256": "b837d385929cb67b09f2a421a3a4d472045bd3993f1d0a81511961465ded84d9"
+    },
+    "plan_verifier": {
+      "path": "scripts/verify_sft_gpt_oss_teacher_canary_plan.py",
+      "sha256": "7addbcd2429958f7608229856db2f19161e99233c29f8cc7f7bfc4df48b6e730"
+    },
+    "run_runner": {
+      "path": "scripts/run_sft_gpt_oss_teacher_canary.py",
+      "sha256": "48ab90525085d9daca0038474b658910e21fe03af420f111eb8d86ae312c044f"
+    },
+    "run_verifier": {
+      "path": "scripts/verify_sft_gpt_oss_teacher_canary.py",
+      "sha256": "e560ca0fc7778a0dc4055b254928cd93fb827492e5af1805fc8ce94200f279ba"
+    },
+    "test": {
+      "path": "tests/test_gpt_oss_teacher_canary.py",
+      "sha256": "014645a7fd244280e909db4ddf00af7b5debaa9c6b76ea0afd64ae4dcabdb801"
+    }
+  },
+  "limits": {
+    "exact_final_outputs": 160,
+    "exact_prompt_cells": 16,
+    "maximum_context_tokens": 4096,
+    "maximum_generated_tokens_per_call": 1024,
+    "maximum_inference_calls": 200,
+    "maximum_instance_minutes": 240,
+    "maximum_network_bytes": 77040051117,
+    "maximum_private_write_bytes": 171798691840,
+    "maximum_runtime_retries": 40,
+    "maximum_usd_before_tax": 17.16,
+    "owner_review_rows": 32,
+    "prompts_per_cell": 10
+  },
+  "model": {
+    "architecture": "gpt_oss_moe_mxfp4",
+    "bytes": 65276857840,
+    "id": "openai/gpt-oss-120b",
+    "object_count": 25,
+    "revision": "b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
+    "weights_format": "safetensors_mxfp4"
+  },
+  "next_gate": {
+    "authorization_required": true,
+    "authorization_schema": "lumi.sft-gpt-oss-teacher-canary-authorization.v0.1",
+    "exact_authorization_text": "I approve one bounded self-hosted Lumi gpt-oss-120b teacher canary on exact Lambda host 68.209.73.55, bound to ED25519 host-key fingerprint SHA256:2ZSQqNUYJhWNjihHnqLQ1YNHxoqtMJeckVJRKlc5hs4 and exactly one NVIDIA H100 80GB GPU GPU-c7e68b23-95b4-37bd-b40b-c41a7ec716f3. The observed memory binding is 81,559 MiB FB total, including 480 MiB driver-reserved. The original 81,920 MiB nvidia-smi minimum does not pass; this reviewed successor instead binds the exact NVIDIA H100 SXM 80GB product identity and requires reported FB total to remain at least 81,559 MiB without adding reserved memory twice. Use model revision b5c939de8f754692c1647ca79fbf85e8c1e70f8a and vLLM image digest sha256:4d08193d2fd05aadb1b5678f93ae609efb2635df67da45f3efe781c368b34dc8. Maximum 240 instance-minutes / $17.16 before tax / 77,040,051,117 network bytes / 160 GiB private writes / 200 sequential inference calls / 40 runtime retries / 160 final outputs. It may download only the 25 bound model objects and exact digest-pinned runtime image, serve only on remote localhost through pinned SSH, retain only final-channel candidate text, and run the frozen 16-cell machine and 32-row owner-review gates. No external API, public port, registry change, dataset seal, SFT training, production promotion, unrelated access, new instance, or termination.",
+    "runtime_receipt_required_before_inference": true
+  },
+  "observed_at": "2026-08-10",
+  "output": {
+    "production_eligible": false,
+    "raw_training_text_in_outputs": false,
+    "report_path": "evidence/lumi-4b-sft-gpt-oss-teacher-canary-host-bound-v0.1.json",
+    "verification_path": "evidence/lumi-4b-sft-gpt-oss-teacher-canary-host-bound-verification-v0.1.json"
+  },
+  "prohibitions": {
+    "candidate_registry_change": true,
+    "dataset_seal": true,
+    "external_inference_api": true,
+    "external_distribution": true,
+    "human_authorship_claim": true,
+    "new_instance": true,
+    "production_promotion": true,
+    "public_listener": true,
+    "reasoning_or_analysis_retention": true,
+    "sft_training": true,
+    "termination": true,
+    "unrelated_access": true
+  },
+  "prompt_contract": {
+    "final_channel_only": true,
+    "languages": [
+      "banglish",
+      "natural_code_switching",
+      "bengali_script",
+      "english"
+    ],
+    "manifest_sha256": "8da732bcfc718e6651a5afa3a6b69d786f29e6eb6d1688c6791ab529d60fefe3",
+    "reasoning_effort": "medium",
+    "reasoning_or_analysis_retained": false,
+    "request_schema": "openai_chat_completions_json_schema_v0.1",
+    "seed_derivation": "sha256_first_u32_of_record_id",
+    "structured_output_schema": "lumi_gpt_oss_teacher_row",
+    "tasks": [
+      "safety_helpfulness",
+      "writing_summarization",
+      "multilingual_bengali",
+      "factual_qa"
+    ],
+    "temperature": 0.7,
+    "top_p": 0.8
+  },
+  "quality_gates": {
+    "critical_factual_safety_or_tool_failures": 0,
+    "minimum_machine_acceptance_rate": 0.9,
+    "minimum_owner_acceptance_rate": 0.9,
+    "minimum_per_cell_acceptance_rate": 0.8
+  },
+  "runtime": {
+    "endpoint": "http://127.0.0.1:18080/v1/chat/completions",
+    "image": "vllm/vllm-openai:v0.26.0-x86_64-cu129-ubuntu2404",
+    "image_bytes": 11763193277,
+    "image_digest": "sha256:4d08193d2fd05aadb1b5678f93ae609efb2635df67da45f3efe781c368b34dc8",
+    "network_bind": "remote_localhost_only_through_pinned_ssh",
+    "prompt_format": "harmony",
+    "remote_root": "/home/ubuntu/lumi-gpt-oss-teacher-canary-v0.1",
+    "vllm_version": "0.26.0"
+  },
+  "schema_version": "lumi.sft-gpt-oss-teacher-canary-host-bound-plan.v0.1",
+  "server": {
+    "docker_version": "29.2.1",
+    "gpu_count": 1,
+    "gpu_driver_version": "580.105.08",
+    "gpu_fb_memory_reserved_mib": 480,
+    "gpu_fb_memory_total_mib": 81559,
+    "gpu_nominal_memory_gb": 80,
+    "gpu_name": "NVIDIA H100 80GB HBM3",
+    "gpu_uuid": "GPU-c7e68b23-95b4-37bd-b40b-c41a7ec716f3",
+    "host": "68.209.73.55",
+    "host_key_fingerprint": "SHA256:2ZSQqNUYJhWNjihHnqLQ1YNHxoqtMJeckVJRKlc5hs4",
+    "host_key_type": "ssh-ed25519",
+    "legacy_numeric_gate_passed": false,
+    "legacy_preflight_minimum_mib": 81920,
+    "operating_system": "Ubuntu 22.04.5 LTS",
+    "ssh_user": "ubuntu",
+    "successor_minimum_reported_fb_mib": 81559
+  },
+  "status": "host_bound_plan_pending_explicit_execution_authorization"
+}

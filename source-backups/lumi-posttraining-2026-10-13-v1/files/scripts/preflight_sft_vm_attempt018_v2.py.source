@@ -1,0 +1,60 @@
+"""Fresh read-only successor with an explicit pinned SDK runtime binding."""
+
+import hashlib
+import importlib.util
+from pathlib import Path
+
+from scripts import preflight_sft_vm_attempt018_v1 as qualified
+
+ROOT = Path(__file__).resolve().parents[1]
+QUALIFIED_SHA = "6aa956cdf0410b9709ce155c85f1ed833862123b81bf7fb14cc1f3c3abd54200"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-018-readonly-preflight-failure-v0.1.json"
+FAILURE_SHA = "b235d344ce365399d7e3fc6111e284505964729b92877d2fb6a0bc15233e374d"
+SDK = ROOT / "artifacts/lumi-vm-acquisition-sdk-test-runtime-v0.1/lib/python3.13/site-packages"
+BOTOCORE_INIT_SHA = "a67becb8e1a2afa3579e33dd5f79073779aee3809bca0488d0bc7cb2fd9015d5"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.2"
+ATTEMPT = qualified.ATTEMPT
+MAX_CALLS, MAX_SECONDS = qualified.MAX_CALLS, qualified.MAX_SECONDS
+ReadOnlyClient = qualified.ReadOnlyClient
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_readonly_preflight_v2_rejected") from None
+
+
+def runtime():
+    need(hashlib.sha256(Path(qualified.__file__).read_bytes()).hexdigest() == QUALIFIED_SHA)
+    need(hashlib.sha256(FAILURE.read_bytes()).hexdigest() == FAILURE_SHA)
+    need(not SDK.is_symlink() and SDK.is_dir())
+    spec = importlib.util.find_spec("botocore")
+    need(spec is not None and spec.origin is not None)
+    origin = Path(spec.origin).resolve()
+    need(origin == (SDK / "botocore/__init__.py").resolve())
+    need(hashlib.sha256(origin.read_bytes()).hexdigest() == BOTOCORE_INIT_SHA)
+
+
+def bind():
+    runtime()
+    qualified.OUTPUT = OUTPUT
+    result = qualified.bind()
+    result.OUTPUT = OUTPUT
+    return result
+
+
+def local():
+    bind()
+    return qualified.local()
+
+
+def admission(outer):
+    bind()
+    return qualified.admission(outer)
+
+
+def run():
+    return bind().run()
+
+
+if __name__ == "__main__":
+    run()

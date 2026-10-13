@@ -1,0 +1,331 @@
+"""Synthetic authority-transfer tests for checkpoint write guardian v2.
+
+Every runtime, cgroup, descriptor, pidfd, poll, clock, signal and release
+boundary is replaced. No process, socket, cgroup, listener, payload or device is
+created or touched.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import importlib
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, call, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_guardian_v2"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+guardian = importlib.import_module(
+    PACKAGE + ".posttraining_checkpoint_write_guardian_v2"
+)
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+
+PRIVATE = "SYNTHETIC-PRIVATE-PAYLOAD"
+RELEASE_IDENTITY = (3, 33, 0o140000, 0, 0, 1, 2)
+PARENT_IDENTITY = (1, 11, 0o20000, 1)
+BROKER_IDENTITY = (2, 22, 0o20000, 1)
+
+
+class AuthorityBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.lease = object.__new__(guardian.CgroupLease)
+
+    def test_import_is_inert_and_public_entry_is_closed(self):
+        roots = guardian.frozen.frozen.ML_ROOTS
+        self.assertFalse(any(name.split(".", 1)[0] in roots
+                             for name in IMPORT_ADDITIONS))
+        with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+            guardian.watch_write_guardian(approval=True, authority="anything")
+        self.assertEqual(caught.exception.code, "host_guard_not_bound")
+
+    def test_error_vocabulary_cannot_retain_private_text(self):
+        for value in (PRIVATE, None, True, {}, "unknown"):
+            error = guardian.WriteGuardianV2Error(value)
+            self.assertEqual(error.args, ("guardian_failed",))
+            self.assertNotIn(PRIVATE, repr(error))
+
+    def test_bundle_requires_exact_lease_and_descriptor_scalars(self):
+        invalid = (
+            (object(), 97),
+            (self.lease, None),
+            (self.lease, True),
+            (self.lease, 2),
+            (self.lease, 2**31),
+        )
+        for lease, descriptor in invalid:
+            with self.subTest(lease=type(lease).__name__, descriptor=descriptor):
+                with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+                    guardian._AuthorityBundle(lease, descriptor)
+                self.assertEqual(caught.exception.code, "invalid_arguments")
+
+    def test_take_is_one_atomic_in_memory_transition(self):
+        bundle = guardian._AuthorityBundle(self.lease, 97)
+        self.assertEqual(bundle.snapshot()["caller_retains_authority"], True)
+        self.assertEqual(bundle.take_admitted_once(), (self.lease, 97))
+        snapshot = bundle.snapshot()
+        self.assertTrue(snapshot["consumed"])
+        self.assertTrue(snapshot["guardian_consumed_authority"])
+        self.assertFalse(snapshot["caller_retains_authority"])
+        with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+            bundle.take_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertTrue(bundle.snapshot()["terminal_failed"])
+
+    def test_wrong_owner_poison_retains_caller_authority(self):
+        bundle = guardian._AuthorityBundle(self.lease, 97)
+        with patch.object(guardian.threading, "get_ident", return_value=999999):
+            with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+                bundle.take_admitted_once()
+        self.assertEqual(caught.exception.code, "owner_mismatch")
+        snapshot = bundle.snapshot()
+        self.assertFalse(snapshot["consumed"])
+        self.assertTrue(snapshot["caller_retains_authority"])
+        self.assertTrue(snapshot["terminal_failed"])
+
+    def test_bundle_reentry_retains_caller_authority(self):
+        bundle = guardian._AuthorityBundle(self.lease, 97)
+        self.assertTrue(bundle._lock.acquire(blocking=False))
+        try:
+            with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+                bundle.take_admitted_once()
+        finally:
+            bundle._lock.release()
+        self.assertEqual(caught.exception.code, "reentry")
+        self.assertTrue(bundle.snapshot()["caller_retains_authority"])
+
+
+class WriteGuardianV2Tests(unittest.TestCase):
+    def setUp(self):
+        self.parent_pid = 1234
+        self.parent_fd = 71
+        self.borrowed_broker_fd = 83
+        self.broker_fd = 89
+        self.release_fd = 97
+        self.now = 1_000_000_000
+        self.deadline = 1_200_000_000
+        self.lease = object.__new__(guardian.CgroupLease)
+        self.bundle = guardian._AuthorityBundle(self.lease, self.release_fd)
+        self.populated_values = [1, 0]
+
+        self.runtime = self.enterContext(patch.object(
+            guardian.frozen, "_runtime", return_value=None,
+        ))
+        self.verify = self.enterContext(patch.object(
+            guardian.CgroupLease, "verify_limits", return_value=None,
+        ))
+        self.populated = self.enterContext(patch.object(
+            guardian.frozen, "_populated", side_effect=self.populated_value,
+        ))
+        self.release_descriptor = self.enterContext(patch.object(
+            guardian.frozen, "_release_descriptor",
+            return_value=RELEASE_IDENTITY,
+        ))
+        self.identity = self.enterContext(patch.object(
+            guardian.frozen, "_pidfd_identity",
+            side_effect=self.identity_value,
+        ))
+        self.alive = self.enterContext(patch.object(
+            guardian.frozen, "_alive", return_value=True,
+        ))
+        self.poll_ready = self.enterContext(patch.object(
+            guardian.frozen, "_poll_ready", return_value=(False, False),
+        ))
+        self.send_release = self.enterContext(patch.object(
+            guardian.frozen, "_send_release", return_value=1,
+        ))
+        self.retire = self.enterContext(patch.object(
+            guardian.frozen.frozen, "_retire", return_value=None,
+        ))
+        self.duplicate = self.enterContext(patch.object(
+            guardian.fcntl, "fcntl", side_effect=self.duplicate_value,
+        ))
+        self.ppid = self.enterContext(patch.object(
+            guardian.os, "getppid", return_value=self.parent_pid,
+        ))
+        self.pidfd_open = self.enterContext(patch.object(
+            guardian.os, "pidfd_open", return_value=self.parent_fd, create=True,
+        ))
+        self.close = self.enterContext(patch.object(
+            guardian.os, "close", return_value=None,
+        ))
+        self.clock = self.enterContext(patch.object(
+            guardian.time, "monotonic_ns", side_effect=lambda: self.now,
+        ))
+        self.getsignal = self.enterContext(patch.object(
+            guardian.signal, "getsignal", return_value=guardian.signal.SIG_IGN,
+        ))
+        self.pidfd_signal = self.enterContext(patch.object(
+            guardian.signal, "pidfd_send_signal", return_value=None, create=True,
+        ))
+        self.poller = Mock()
+        self.poll = self.enterContext(patch.object(
+            guardian.select, "poll", return_value=self.poller,
+        ))
+
+    def tearDown(self):
+        self.assertFalse(guardian._WATCH_LOCK.locked())
+        for invocation in self.close.call_args_list:
+            self.assertNotEqual(invocation.args[0], self.borrowed_broker_fd)
+
+    def populated_value(self, lease):
+        self.assertIs(lease, self.lease)
+        return self.populated_values.pop(0) if self.populated_values else 1
+
+    def identity_value(self, descriptor, code):
+        self.assertIn(code, {
+            "parent_binding_rejected", "broker_binding_rejected",
+        })
+        if descriptor == self.parent_fd:
+            return PARENT_IDENTITY
+        if descriptor in (self.borrowed_broker_fd, self.broker_fd):
+            return BROKER_IDENTITY
+        raise AssertionError(PRIVATE)
+
+    def duplicate_value(self, descriptor, operation, minimum):
+        self.assertEqual(
+            (descriptor, operation, minimum),
+            (self.borrowed_broker_fd, fcntl.F_DUPFD_CLOEXEC, 3),
+        )
+        return self.broker_fd
+
+    def watch(self, **changes):
+        options = {
+            "expected_parent_pid": self.parent_pid,
+            "broker_pidfd": self.borrowed_broker_fd,
+            "deadline_ns": self.deadline,
+            "cleanup_timeout_ms": 100,
+        }
+        options.update(changes)
+        return guardian._watch_admitted_once(self.bundle, **options)
+
+    def error(self, code, **changes):
+        with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+            self.watch(**changes)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertNotIn(PRIVATE, repr(caught.exception))
+
+    def assert_consumed(self):
+        snapshot = self.bundle.snapshot()
+        self.assertTrue(snapshot["consumed"])
+        self.assertFalse(snapshot["caller_retains_authority"])
+
+    def assert_retired_and_release_closed(self):
+        self.retire.assert_called_once_with(
+            self.lease, cleanup_timeout_ms=100,
+        )
+        self.assertEqual(
+            sum(entry == call(self.release_fd)
+                for entry in self.close.call_args_list),
+            1,
+        )
+
+    def test_runtime_rejection_precedes_bundle_consumption(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        self.error("runtime_rejected")
+        self.assertTrue(self.bundle.snapshot()["caller_retains_authority"])
+        self.verify.assert_not_called()
+        self.retire.assert_not_called()
+        self.close.assert_not_called()
+
+    def test_scalar_rejection_precedes_bundle_consumption(self):
+        self.error("invalid_arguments", expected_parent_pid=True)
+        self.assertTrue(self.bundle.snapshot()["caller_retains_authority"])
+        self.verify.assert_not_called()
+        self.retire.assert_not_called()
+        self.close.assert_not_called()
+
+    def test_watcher_reentry_precedes_bundle_consumption(self):
+        self.assertTrue(guardian._WATCH_LOCK.acquire(blocking=False))
+        try:
+            with self.assertRaises(guardian.WriteGuardianV2Error) as caught:
+                self.watch()
+        finally:
+            guardian._WATCH_LOCK.release()
+        self.assertEqual(caught.exception.code, "reentry")
+        self.assertTrue(self.bundle.snapshot()["caller_retains_authority"])
+        self.retire.assert_not_called()
+
+    def test_lease_verification_failure_is_consumed_and_cleaned(self):
+        self.verify.side_effect = OSError(PRIVATE)
+        self.error("guardian_failed")
+        self.assert_consumed()
+        self.populated.assert_not_called()
+        self.assert_retired_and_release_closed()
+
+    def test_release_validation_failure_is_consumed_and_cleaned(self):
+        self.release_descriptor.side_effect = guardian.frozen.WriteGuardianError(
+            "release_rejected"
+        )
+        self.error("release_rejected")
+        self.assert_consumed()
+        self.assert_retired_and_release_closed()
+        self.identity.assert_not_called()
+
+    def test_broker_duplication_failure_closes_transferred_authorities(self):
+        self.duplicate.side_effect = OSError(PRIVATE)
+        self.error("broker_binding_rejected")
+        self.assert_consumed()
+        self.assert_retired_and_release_closed()
+        self.assertNotIn(call(self.borrowed_broker_fd), self.close.call_args_list)
+
+    def test_release_cleanup_failure_is_terminal_without_retry(self):
+        self.verify.side_effect = OSError(PRIVATE)
+
+        def fail_release(descriptor):
+            if descriptor == self.release_fd:
+                raise OSError(PRIVATE)
+
+        self.close.side_effect = fail_release
+        self.error("cleanup_unconfirmed")
+        self.assert_consumed()
+        self.retire.assert_called_once()
+        self.assertEqual(
+            sum(entry == call(self.release_fd)
+                for entry in self.close.call_args_list),
+            1,
+        )
+
+    def test_parent_loss_priority_still_retires_every_owned_authority(self):
+        self.ppid.return_value = 1
+        report = self.watch()
+        self.assertEqual(report["reason"], "parent_lost")
+        self.assertFalse(report["release_sent"])
+        self.assertTrue(report["authority_bundle_consumed"])
+        self.assert_consumed()
+        self.assert_retired_and_release_closed()
+        self.pidfd_open.assert_not_called()
+        self.pidfd_signal.assert_called_once_with(
+            self.broker_fd, guardian.signal.SIGKILL, None, 0,
+        )
+
+    def test_natural_empty_success_retains_only_aggregate_false_claims(self):
+        report = self.watch()
+        self.assertEqual(report["schema"], guardian.SCHEMA)
+        self.assertEqual(report["reason"], "workload_empty")
+        self.assertTrue(report["authority_bundle_consumed"])
+        self.assertTrue(report["release_sent"])
+        self.assertTrue(report["release_fd_closed"])
+        self.assertTrue(report["workload_retired"])
+        self.assertTrue(report["broker_stop_attempted"])
+        self.assertTrue(report["owned_broker_pidfd_closed"])
+        self.assertTrue(report["parent_pidfd_closed"])
+        self.assertFalse(report["borrowed_broker_pidfd_closed"])
+        self.assertTrue(all(report[name] is False
+                            for name in guardian.FALSE_FLAGS))
+        self.assert_consumed()
+        self.assert_retired_and_release_closed()
+        self.send_release.assert_called_once_with(self.release_fd)
+        self.assertIn(call(self.broker_fd), self.close.call_args_list)
+        self.assertIn(call(self.parent_fd), self.close.call_args_list)
+
+
+if __name__ == "__main__":
+    unittest.main()

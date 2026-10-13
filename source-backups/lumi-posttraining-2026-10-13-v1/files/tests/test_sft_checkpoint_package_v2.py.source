@@ -1,0 +1,639 @@
+"""Only tiny fake safeweights and exact frozen checksum functions; no ML imports.
+
+Synthetic evidence below tests structural binding, not CPU conversion or real
+checkpoint origin. The frozen consumer functions are compiled verbatim from the
+existing source AST to avoid importing its unrelated ML/training dependencies.
+"""
+
+from __future__ import annotations
+
+import ast
+import copy
+import hashlib
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_plan_v1 as planner
+from lumi import posttraining_checkpoint_package_v2 as m
+from lumi.posttraining_final_base_metadata_v1 import canonical, json_object, sha
+from tests.test_sft_checkpoint_io_contract_v1 import fixture_contract
+
+
+def frozen_consumer():
+    source = Path(m.__file__).with_name("posttraining_sft_runtime_v4.py")
+    tree = ast.parse(source.read_text())
+    names = {"_sha256_file", "_require_private_regular", "_verify_checksum_manifest"}
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    assert len(nodes) == 3
+    namespace = {"Path": Path, "hashlib": hashlib, "os": os, "stat": stat,
+                 "_PRIVATE_DIRECTORY_MODE": 0o700, "_PRIVATE_FILE_MODE": 0o600}
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), namespace)
+    return namespace["_verify_checksum_manifest"]
+
+
+def write_fixture(path, raw):
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    path.parent.chmod(0o700)
+    path.write_bytes(raw)
+    path.chmod(0o600)
+
+
+def fixture_plan(tokens):
+    # Reuse the existing wholly synthetic metadata document builder.
+    from tests.test_sft_checkpoint_import_plan_v1 import documents
+
+    docs = documents()
+    base = json_object(docs[0])
+    normalized = [{"relative_path": name, "bytes": len(raw), "sha256": sha(raw)}
+                  for name, raw in sorted(tokens.items())]
+    base["tokenizer"] = {"files": normalized, "manifest_sha256": sha(canonical(normalized))}
+    docs[0] = canonical(base)
+    return planner.build_import_plan(*docs, expected_base_sha256=sha(docs[0]), dtype="bfloat16")
+
+
+def fixture_evidence(plan, payload):
+    bounds = plan["resource_bounds"]
+    evidence = dict.fromkeys(m.kernel.EVIDENCE_KEYS)
+    evidence.update({
+        "schema_version": "lumi.sft-checkpoint-import-kernel.v0.5",
+        "status": "PASS_cpu_kernel_roundtrip_not_execution_authority",
+        "dtype": "bfloat16", "parameter_dtype": "bfloat16",
+        "buffer_dtype_policy": plan["buffer_dtype_policy"],
+        "model_parameters": plan["model_parameters"],
+        "model_tensor_count": plan["model_tensor_count"],
+        "source_tensor_sha256": "1" * 64, "cast_tensor_sha256": "2" * 64,
+        "reload_tensor_sha256": "2" * 64,
+        "source_state_bytes": bounds["source_fp32_tensor_bytes_including_aliases"],
+        "cast_state_bytes": bounds["cast_tensor_bytes_including_aliases"],
+        "largest_tensor_bytes": bounds["maximum_individual_tensor_bytes"],
+        "projected_live_tensor_bytes": bounds["maximum_projected_live_tensor_bytes"] - 14 * 1024**2,
+        "projected_output_bytes": bounds["maximum_backend_output_bytes"],
+        "output_bytes": sum(map(len, payload.values())), "output_file_count": len(payload),
+        "safetensor_file_count": 1, "chunk_bytes": m.CHUNK_BYTES, "budget_checks": 20,
+        "runtime_code_sha256": {name: sha(payload[name]) for name in m.CODE_NAMES},
+        "dcp_read_verification": {
+            "dcp_read_bytes_reserved": bounds["checkpoint_inventory_bytes"] + 128,
+            "dcp_input_audit_bytes": bounds["checkpoint_inventory_bytes"],
+            "model_payload_read_bytes_reserved": 128,
+            "hash_verified_files": bounds["checkpoint_inventory_files"] - 1,
+            "dcp_reads_metered": True, "physical_disk_bytes_measured": False,
+            "os_resource_limits_enforced": False, "real_4b_import": False,
+            "training_authorized": False, "production_eligible": False,
+        },
+        "hf_content_verification": {
+            "hf_content_read_bytes_reserved": 2 * sum(map(len, payload.values())),
+            "hf_content_write_bytes_reserved": sum(map(len, payload.values())),
+            "hf_content_byte_accounting": "cooperative_predebit_no_refund",
+            "physical_io_bytes_measured": False, "os_resource_limits_enforced": False,
+            "memory_limits_enforced": False, "hard_timeout_enforced": False,
+            "serialization_scratch_bytes": 4 * 4096 + 2 * m.CHUNK_BYTES,
+            "maximum_serialized_shard_bytes": 4096,
+            "actual_HF_from_pretrained_with_in_memory_state": True,
+            "native_path_checkpoint_read_or_write_used": False,
+        },
+    })
+    for name in ("complete_keys_shapes_verified", "hf_reload_tensor_equal",
+                 "strict_assign_verified",
+                 "tied_aliases_verified", "source_dicts_released_before_reload",
+                 "configuration_fields_preserved", "cpu_only", "no_forward_pass"):
+        evidence[name] = True
+    for name in ("real_4b_import", "training_authorized", "production_eligible",
+                 "os_resource_limits_enforced", "complete_source_read_budget_verified"):
+        evidence[name] = False
+    cast = evidence["cast_state_bytes"]
+    evidence["projected_live_tensor_bytes"] = max(
+        max(evidence["source_state_bytes"] + cast, 2 * cast)
+        + evidence["largest_tensor_bytes"] + 2 * m.CHUNK_BYTES,
+        2 * cast + evidence["hf_content_verification"]["serialization_scratch_bytes"],
+    )
+    return evidence
+
+
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.root.chmod(0o700)
+        self.output, self.tokens = self.root / "attempt" / "checkpoint", self.root / "source"
+        self.output.mkdir(parents=True, mode=0o700)
+        self.output.parent.chmod(0o700)
+        self.tokens.mkdir(mode=0o700)
+        self.payload = {"config.json": b'{"model_type":"lumi"}\n',
+                        "model.safetensors": b"tiny FAKE safeweights; never parsed",
+                        "configuration_lumi.py": b"# synthetic configuration stub\n",
+                        "modeling_lumi.py": b"# synthetic model stub\n"}
+        self.token_payload = {name: ("fake " + name).encode() for name in sorted(m.TOKEN_NAMES)}
+        for name, raw in self.payload.items():
+            write_fixture(self.output / name, raw)
+        for name, raw in self.token_payload.items():
+            write_fixture(self.tokens / name, raw)
+        self.plan = fixture_plan(self.token_payload)
+        self.evidence = fixture_evidence(self.plan, self.payload)
+        self.contract = fixture_contract(self.plan)
+        self.consumer = frozen_consumer()
+        self.mock_consumer = patch.object(m, "_frozen_consumer", return_value=self.consumer)
+        self.loader = self.mock_consumer.start()
+        self.addCleanup(self.mock_consumer.stop)
+        self.kwargs = {
+            "output": self.output, "tokenizer_root": self.tokens, "plan": self.plan,
+            "expected_plan_sha256": self.plan["plan_sha256"], "kernel_evidence": self.evidence,
+            "kernel_io_contract": self.contract,
+            "expected_kernel_io_contract_sha256": self.contract["contract_sha256"],
+            "maximum_read_bytes": 1024**2, "maximum_write_bytes": 1024**2,
+            "maximum_control_bytes": 65536, "check_budget": lambda: None,
+        }
+
+    def finalize(self, **changes):
+        return m.finalize_package(**(self.kwargs | changes))
+
+    def verify(self, result, **changes):
+        args = {key: value for key, value in self.kwargs.items()
+                if key not in {"tokenizer_root", "maximum_write_bytes"}}
+        args["expected_manifest_sha256"] = result["manifest_file_sha256"]
+        return m.verify_package(**(args | changes))
+
+    def reject(self, code=None, **changes):
+        with self.assertRaises(m.CheckpointPackageError) as caught:
+            self.finalize(**changes)
+        if code:
+            self.assertEqual(caught.exception.args, (code,))
+        self.assertEqual(len(caught.exception.args), 1)
+        self.assertNotIn(str(self.root), str(caught.exception))
+
+    def test_roundtrip_exact_frozen_consumer_private_complete_inventory(self):
+        before = {name: (self.tokens / name).read_bytes() for name in self.token_payload}
+        result = self.finalize()
+        self.assertTrue(result["real_worker_checksum_verifier_passed"])
+        self.assertTrue(all(result[name] is False for name in m.FALSE_FLAGS))
+        receipt = json_object((self.output / m.RECEIPT).read_bytes())
+        self.assertEqual(receipt["schema_version"], m.SCHEMA)
+        self.assertEqual(receipt["model_evidence"], self.evidence)
+        self.assertEqual(receipt["plan_sha256"], self.plan["plan_sha256"])
+        self.assertEqual(receipt["kernel_io_contract"], self.contract)
+        self.assertEqual(receipt["kernel_io_contract_sha256"], self.contract["contract_sha256"])
+        self.assertEqual(result["kernel_io_contract_sha256"], self.contract["contract_sha256"])
+        self.assertEqual(receipt["tokenizer_inventory"], self.plan["tokenizer_inventory"])
+        names = set(self.payload) | m.TOKEN_NAMES | {m.MANIFEST, m.RECEIPT}
+        self.assertEqual({p.relative_to(self.output).as_posix() for p in self.output.rglob("*")
+                          if p.is_file()}, names)
+        for path in self.output.rglob("*"):
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
+        self.assertEqual(before, {name: (self.tokens / name).read_bytes() for name in before})
+        verified = self.verify(result)
+        self.assertEqual(verified["package_write_bytes_reserved"], 0)
+        self.assertEqual(verified["manifest_file_sha256"], result["manifest_file_sha256"])
+        self.assertEqual(self.loader.call_count, 2)
+
+    def test_exact_logical_read_and_write_accounting(self):
+        result = self.finalize()
+        backend = sum(map(len, self.payload.values()))
+        token_bytes = sum(map(len, self.token_payload.values()))
+        receipt = (self.output / m.RECEIPT).stat().st_size
+        manifest = (self.output / m.MANIFEST).stat().st_size
+        self.assertEqual(result["package_read_bytes_reserved"],
+                         3 * backend + 3 * token_bytes + 2 * receipt + 3 * manifest)
+        self.assertEqual(result["package_write_bytes_reserved"], token_bytes + receipt + manifest)
+
+    def test_no_retry_or_control_overwrite(self):
+        self.finalize()
+        self.reject("already_finalized")
+
+    def test_legacy_receipt_rejected_without_overwrite(self):
+        write_fixture(self.output / m.RECEIPT, b"historical receipt")
+        self.reject("already_finalized")
+        self.assertEqual((self.output / m.RECEIPT).read_bytes(), b"historical receipt")
+
+    def test_tokenizer_manifest_is_not_admitted(self):
+        write_fixture(self.tokens / m.MANIFEST, b"not the normalized inventory")
+        self.reject("inventory_mismatch")
+
+    def test_extra_or_missing_tokenizer_file(self):
+        write_fixture(self.tokens / "tokenizer" / "extra.json", b"extra")
+        self.reject("inventory_mismatch")
+
+    def test_tokenizer_digest_changed(self):
+        path = self.tokens / "tokenizer/tokenizer.json"
+        write_fixture(path, b"x" * path.stat().st_size)
+        self.reject("content_changed")
+        self.assertFalse((self.output / m.MANIFEST).exists())
+
+    def test_tokenizer_size_changed_before_content_copy(self):
+        write_fixture(self.tokens / "tokenizer/tokenizer.json", b"x")
+        self.reject("content_changed")
+
+    def test_output_size_mismatch_before_payload_read(self):
+        write_fixture(self.output / "model.safetensors", b"changed")
+        with patch.object(m, "_hash", side_effect=AssertionError("must not read")):
+            self.reject("inventory_mismatch")
+
+    def test_code_hash_mismatch(self):
+        path = self.output / "modeling_lumi.py"
+        write_fixture(path, b"x" * path.stat().st_size)
+        self.reject("content_changed")
+
+    def test_unexpected_pickle_output_rejected(self):
+        write_fixture(self.output / "pytorch_model.bin", b"no pickle")
+        self.reject("inventory_mismatch")
+
+    def test_safeweight_basename_must_match_kernel_contract(self):
+        (self.output / "model.safetensors").rename(self.output / "arbitrary.safetensors")
+        self.reject("inventory_mismatch")
+
+    def test_output_symlink_rejected(self):
+        (self.output / "link.safetensors").symlink_to(self.output / "model.safetensors")
+        self.reject()
+
+    def test_input_hardlink_rejected(self):
+        os.link(self.tokens / "tokenizer/tokenizer.json", self.root / "linked")
+        self.reject()
+
+    def test_public_tokenizer_file_mode_rejected(self):
+        (self.tokens / "tokenizer/tokenizer.json").chmod(0o644)
+        self.reject()
+
+    def test_read_only_source_tokenizer_files_are_preserved(self):
+        for name in self.token_payload:
+            (self.tokens / name).chmod(0o400)
+        self.finalize()
+        for name in self.token_payload:
+            self.assertEqual(stat.S_IMODE((self.tokens / name).stat().st_mode), 0o400)
+            self.assertEqual(stat.S_IMODE((self.output / name).stat().st_mode), 0o600)
+
+    def test_symlink_ancestor_rejected(self):
+        (self.root / "alias").symlink_to(self.tokens, target_is_directory=True)
+        self.reject(tokenizer_root=self.root / "alias")
+
+    def test_input_output_overlap_rejected(self):
+        self.reject("path_rejected", tokenizer_root=self.output)
+
+    def test_physical_root_aliases_rejected(self):
+        def tree(identities):
+            return SimpleNamespace(guard=SimpleNamespace(ancestry=[
+                (None, None, None, identity) for identity in identities
+            ]))
+        for left, right in (([(1, 1), (1, 2)], [(1, 1), (1, 2)]),
+                            ([(1, 1), (1, 2)], [(1, 1), (1, 2), (1, 3)])):
+            with self.subTest(left=left, right=right), self.assertRaises(m.CheckpointPackageError):
+                m._physical_disjoint(tree(left), tree(right))
+
+    def test_physical_alias_check_precedes_new_output_files(self):
+        error = m.CheckpointPackageError("path_rejected")
+        with patch.object(m, "_physical_disjoint", side_effect=error):
+            self.reject("path_rejected")
+        self.assertFalse((self.output / "tokenizer").exists())
+
+    def test_wrong_plan_pin_fails_before_filesystem(self):
+        self.reject("plan_binding", expected_plan_sha256="f" * 64,
+                    output=self.root / "absent")
+
+    def test_mutated_plan_fails_before_filesystem(self):
+        plan = copy.deepcopy(self.plan)
+        plan["dtype"] = "float32"
+        self.reject("plan_binding", plan=plan, output=self.root / "absent")
+
+    def test_forged_normalized_inventory_digest_rejected(self):
+        plan = copy.deepcopy(self.plan)
+        plan["metadata"]["tokenizer_inventory_sha256"] = "e" * 64
+        plan["plan_sha256"] = sha(canonical({k: v for k, v in plan.items() if k != "plan_sha256"}))
+        self.reject("plan_binding", plan=plan, expected_plan_sha256=plan["plan_sha256"])
+
+    def test_evidence_false_authority_flags(self):
+        for name in ("real_4b_import", "training_authorized", "production_eligible",
+                     "complete_source_read_budget_verified", "os_resource_limits_enforced"):
+            with self.subTest(name=name):
+                evidence = dict(self.evidence, **{name: True})
+                self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_evidence_missing_key_or_roundtrip_rejected(self):
+        evidence = dict(self.evidence)
+        evidence.pop("cpu_only")
+        self.reject("kernel_evidence", kernel_evidence=evidence)
+        changed = dict(self.evidence, reload_tensor_sha256="3" * 64)
+        self.reject("kernel_evidence", kernel_evidence=changed)
+
+    def test_only_v5_kernel_evidence_accepted(self):
+        for version in ("v0.3", "v0.4", "v0.6"):
+            self.reject("kernel_evidence", kernel_evidence=dict(
+                self.evidence, schema_version="lumi.sft-checkpoint-import-kernel." + version))
+
+    def test_independent_io_contract_pin_before_filesystem(self):
+        with patch.object(m, "_Tree", side_effect=AssertionError("must not touch paths")):
+            self.reject("kernel_io_contract", expected_kernel_io_contract_sha256="0" * 64)
+        self.assertFalse((self.output / "tokenizer").exists())
+
+    def test_contract_mutation_rejected_without_new_artifacts(self):
+        contract = copy.deepcopy(self.contract)
+        contract["hf_io_contract"]["maximum_write_bytes"] -= 1
+        self.reject("kernel_io_contract", kernel_io_contract=contract)
+        self.assertFalse((self.output / "tokenizer").exists())
+
+    def test_nested_evidence_closed_keysets(self):
+        for group in ("dcp_read_verification", "hf_content_verification"):
+            for action in ("add", "remove"):
+                evidence = copy.deepcopy(self.evidence)
+                if action == "add":
+                    evidence[group]["unrecognized"] = False
+                else:
+                    evidence[group].pop(next(iter(evidence[group])))
+                self.reject("kernel_evidence", kernel_evidence=evidence)
+            self.reject("kernel_evidence", kernel_evidence=dict(self.evidence, **{group: []}))
+
+    def test_nested_evidence_positive_counters_reject_bool_float_zero(self):
+        groups = {"dcp_read_verification": (
+            "dcp_read_bytes_reserved", "dcp_input_audit_bytes",
+            "model_payload_read_bytes_reserved", "hash_verified_files"),
+            "hf_content_verification": (
+                "hf_content_read_bytes_reserved", "hf_content_write_bytes_reserved",
+                "serialization_scratch_bytes", "maximum_serialized_shard_bytes")}
+        for group, keys in groups.items():
+            for key in keys:
+                for value in (True, 1.0, 0):
+                    with self.subTest(group=group, key=key, value=value):
+                        evidence = copy.deepcopy(self.evidence)
+                        evidence[group][key] = value
+                        self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_dcp_exact_audit_arithmetic_and_plan_file_count(self):
+        for key in ("dcp_read_bytes_reserved", "dcp_input_audit_bytes",
+                    "model_payload_read_bytes_reserved", "hash_verified_files"):
+            evidence = copy.deepcopy(self.evidence)
+            evidence["dcp_read_verification"][key] += 1
+            self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_dcp_read_contract_cap_not_ignored(self):
+        evidence = copy.deepcopy(self.evidence)
+        dcp = evidence["dcp_read_verification"]
+        dcp["dcp_read_bytes_reserved"] = (
+            self.contract["checkpoint_read_contract"]["maximum_read_bytes"] + 1)
+        dcp["model_payload_read_bytes_reserved"] = (
+            dcp["dcp_read_bytes_reserved"] - dcp["dcp_input_audit_bytes"])
+        self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_hf_read_write_and_serialized_caps(self):
+        changes = (
+            ("hf_content_read_bytes_reserved", self.evidence["output_bytes"] - 1),
+            ("hf_content_read_bytes_reserved",
+             self.contract["hf_io_contract"]["maximum_read_bytes"] + 1),
+            ("hf_content_write_bytes_reserved", self.evidence["output_bytes"] - 1),
+            ("maximum_serialized_shard_bytes",
+             self.contract["hf_io_contract"]["maximum_file_bytes"] + 1),
+        )
+        for key, value in changes:
+            evidence = copy.deepcopy(self.evidence)
+            evidence["hf_content_verification"][key] = value
+            self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_all_nested_authority_nonclaims_remain_false(self):
+        for group in ("dcp_read_verification", "hf_content_verification"):
+            for key, value in self.evidence[group].items():
+                if value is False:
+                    for replacement in (True, 0):
+                        evidence = copy.deepcopy(self.evidence)
+                        evidence[group][key] = replacement
+                        self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_nested_metering_and_actual_hf_claims_require_exact_true(self):
+        for group, key in (("dcp_read_verification", "dcp_reads_metered"),
+                           ("hf_content_verification",
+                            "actual_HF_from_pretrained_with_in_memory_state")):
+            for replacement in (False, 1):
+                evidence = copy.deepcopy(self.evidence)
+                evidence[group][key] = replacement
+                self.reject("kernel_evidence", kernel_evidence=evidence)
+        evidence = copy.deepcopy(self.evidence)
+        evidence["hf_content_verification"]["hf_content_byte_accounting"] = "physical"
+        self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_exact_scratch_and_live_formulas_are_required(self):
+        evidence = copy.deepcopy(self.evidence)
+        evidence["hf_content_verification"]["serialization_scratch_bytes"] += 1
+        self.reject("kernel_evidence", kernel_evidence=evidence)
+        for increment in (-1, 1):
+            self.reject("kernel_evidence", kernel_evidence=dict(
+                self.evidence,
+                projected_live_tensor_bytes=self.evidence["projected_live_tensor_bytes"]
+                + increment))
+
+    def test_original_plan_live_ceiling_never_raised_by_io_contract(self):
+        evidence = copy.deepcopy(self.evidence)
+        evidence["projected_live_tensor_bytes"] = (
+            self.plan["resource_bounds"]["maximum_projected_live_tensor_bytes"] + 1)
+        self.reject("kernel_evidence", kernel_evidence=evidence)
+        self.assertFalse((self.output / "tokenizer").exists())
+
+    def test_actual_safeweight_size_must_fit_reported_serialized_bound(self):
+        evidence = copy.deepcopy(self.evidence)
+        hf = evidence["hf_content_verification"]
+        hf["maximum_serialized_shard_bytes"] = 1
+        hf["serialization_scratch_bytes"] = 4 + 2 * m.CHUNK_BYTES
+        cast = evidence["cast_state_bytes"]
+        evidence["projected_live_tensor_bytes"] = max(
+            max(evidence["source_state_bytes"] + cast, 2 * cast)
+            + evidence["largest_tensor_bytes"] + 2 * m.CHUNK_BYTES,
+            2 * cast + hf["serialization_scratch_bytes"],
+        )
+        self.reject("inventory_mismatch", kernel_evidence=evidence)
+        self.assertFalse((self.output / "tokenizer").exists())
+
+    def test_verified_receipt_cannot_rebind_a_different_valid_io_contract(self):
+        result = self.finalize()
+        contract = copy.deepcopy(self.contract)
+        contract["hf_io_contract"]["maximum_read_bytes"] -= 1
+        contract["contract_sha256"] = sha(canonical({
+            key: value for key, value in contract.items() if key != "contract_sha256"}))
+        with self.assertRaises(m.CheckpointPackageError) as caught:
+            self.verify(result, kernel_io_contract=contract,
+                        expected_kernel_io_contract_sha256=contract["contract_sha256"])
+        self.assertEqual(caught.exception.code, "receipt_invalid")
+
+    def test_package_plan_bytes_are_unchanged(self):
+        before = canonical(self.plan)
+        self.finalize()
+        self.assertEqual(canonical(self.plan), before)
+
+    def test_tied_alias_evidence_must_match_original_plan(self):
+        evidence = dict(self.evidence, tied_aliases_verified=False)
+        self.reject("kernel_evidence", kernel_evidence=evidence)
+
+    def test_boolean_model_counts_rejected(self):
+        for key in ("model_parameters", "model_tensor_count"):
+            self.reject("kernel_evidence", kernel_evidence=dict(self.evidence, **{key: True}))
+
+    def test_read_cap_admitted_before_payload_reads(self):
+        with patch.object(m, "_hash", side_effect=AssertionError("must not read")):
+            self.reject("read_limit", maximum_read_bytes=1)
+
+    def test_write_cap_admitted_before_payload_reads(self):
+        with patch.object(m, "_hash", side_effect=AssertionError("must not read")):
+            self.reject("write_limit", maximum_write_bytes=1)
+
+    def test_control_cap_rejects_evidence_before_writes(self):
+        self.reject("control_limit", maximum_control_bytes=32)
+        self.assertFalse((self.output / "tokenizer").exists())
+
+    def test_callback_failure_precedes_filesystem(self):
+        def fail():
+            raise RuntimeError("private detail")
+        self.reject("budget_failed", check_budget=fail, output=self.root / "absent")
+
+    def test_callback_checked_after_final_close(self):
+        original = m._Tree.close
+        closed = []
+
+        def close(tree):
+            original(tree)
+            closed.append(tree)
+
+        def budget():
+            if len(closed) == 2:
+                raise TimeoutError("late")
+
+        with patch.object(m._Tree, "close", close):
+            self.reject("budget_failed", check_budget=budget)
+
+    def test_close_failure_does_not_skip_remaining_tree_cleanup(self):
+        original = m._Tree.close
+        closed = []
+
+        def close(tree):
+            original(tree)
+            closed.append(tree)
+            if len(closed) == 1:
+                raise OSError("private detail")
+
+        with patch.object(m._Tree, "close", close):
+            self.reject("package_failed")
+        self.assertEqual(len(closed), 2)
+
+    def test_receipt_tamper_fails(self):
+        result = self.finalize()
+        write_fixture(self.output / m.RECEIPT, b"{}\n")
+        with self.assertRaises(m.CheckpointPackageError):
+            self.verify(result)
+
+    def test_manifest_tamper_fails(self):
+        result = self.finalize()
+        write_fixture(self.output / m.MANIFEST, b"f" * 64 + b"  config.json\n")
+        with self.assertRaises(m.CheckpointPackageError):
+            self.verify(result)
+
+    def test_verifier_exact_cap_passes_one_less_fails(self):
+        result = self.finalize()
+        verified = self.verify(result)
+        bound = verified["package_read_bytes_reserved"]
+        self.assertEqual(self.verify(result, maximum_read_bytes=bound)["status"], m.STATUS)
+        with self.assertRaises(m.CheckpointPackageError) as caught:
+            self.verify(result, maximum_read_bytes=bound - 1)
+        self.assertEqual(caught.exception.code, "read_limit")
+
+    def test_duplicate_manifest_entry_rejected(self):
+        line = "a" * 64 + "  config.json\n"
+        with self.assertRaises(m.CheckpointPackageError):
+            m._manifest((line + line).encode())
+
+    def test_package_manifest_not_limited_by_legacy_metadata_cap(self):
+        raw = "".join("a" * 64 + f"  model-{i:05d}.safetensors\n" for i in range(150)).encode()
+        self.assertEqual(len(m._manifest(raw)), 150)
+
+    def test_no_unbounded_content_read_during_frozen_consumer(self):
+        requests = []
+        original = os.read
+
+        def bounded(fd, size):
+            self.assertGreater(size, 0)
+            self.assertLessEqual(size, m.CHUNK_BYTES)
+            requests.append(size)
+            return original(fd, size)
+
+        with patch.object(m.os, "read", bounded):
+            result = self.finalize()
+        self.assertEqual(sum(requests), result["package_read_bytes_reserved"])
+
+    def test_actual_consumer_failure_prevents_success(self):
+        self.loader.return_value = lambda *_args, **_kwargs: "f" * 64
+        self.reject("consumer_failed")
+
+    def test_unbounded_read_is_rejected(self):
+        def consumer(root, **_kwargs):
+            with (root / "model.safetensors").open("rb") as handle:
+                handle.read()
+        self.loader.return_value = consumer
+        self.reject("read_limit")
+
+    def test_consumer_reads_cannot_escape_closed_inventory(self):
+        def consumer(root, **_kwargs):
+            (root / "../outside").open("rb")
+        self.loader.return_value = consumer
+        self.reject("inventory_mismatch")
+
+    def test_consumer_extra_reads_charge_budget(self):
+        calls = []
+
+        def consumer(root, **kwargs):
+            with (root / "model.safetensors").open("rb") as handle:
+                calls.append(len(handle.read(m.CHUNK_BYTES)))
+            return self.consumer(root, **kwargs)
+
+        self.loader.return_value = consumer
+        result = self.finalize()
+        self.assertEqual(calls, [len(self.payload["model.safetensors"])])
+        self.assertGreater(result["package_read_bytes_reserved"], 0)
+
+    def test_short_write_not_retried(self):
+        with patch.object(m.os, "write", return_value=0) as write:
+            self.reject("package_failed")
+        self.assertEqual(write.call_count, 1)
+
+    def test_create_chmod_failure_closes_writable_descriptor(self):
+        tree = m._Tree(self.output, m._Ledger(1024, 1024, 1024, lambda: None))
+        self.addCleanup(tree.close)
+        opened, original = [], os.open
+
+        def record(name, flags, *args, **kwargs):
+            fd = original(name, flags, *args, **kwargs)
+            if flags & os.O_WRONLY:
+                opened.append(fd)
+            return fd
+
+        with patch.object(m.os, "open", record), patch.object(
+            m.os, "fchmod", side_effect=OSError("private detail")
+        ), self.assertRaises(OSError):
+            tree.create("new-file")
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+
+    def test_create_parent_close_failure_closes_writable_descriptor(self):
+        (self.output / "tokenizer").mkdir(mode=0o700)
+        tree = m._Tree(self.output, m._Ledger(1024, 1024, 1024, lambda: None))
+        self.addCleanup(tree.close)
+        opened, original, close = [], os.open, tree.guard.close
+
+        def record(name, flags, *args, **kwargs):
+            fd = original(name, flags, *args, **kwargs)
+            if flags & os.O_WRONLY:
+                opened.append(fd)
+            return fd
+
+        def fail(fd):
+            close(fd)
+            raise OSError("private detail")
+
+        with patch.object(m.os, "open", record), patch.object(
+            tree.guard, "close", side_effect=fail
+        ) as closer, self.assertRaises(OSError):
+            tree.create("tokenizer/new-file")
+        self.assertEqual(closer.call_count, 1)
+        self.assertEqual(len(opened), 1)
+        with self.assertRaises(OSError):
+            os.fstat(opened[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

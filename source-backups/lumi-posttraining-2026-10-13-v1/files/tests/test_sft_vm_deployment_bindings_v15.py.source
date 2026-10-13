@@ -1,0 +1,32 @@
+"""Offline verification for v0.4 authenticated-source bindings."""
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v15 as m
+
+
+class Tests(unittest.TestCase):
+    def test_plan_release_and_sources_verify(self):
+        manifest = m.verify()
+        plan = m.build()
+        self.assertEqual(len(manifest["outputs"]), 156)
+        self.assertEqual(manifest["repair"], "propagate_sha256_and_byte_count_bindings")
+        self.assertTrue(plan["source_repair"]["outer_source_authentication_verified"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_prior_controls_are_preserved_evidence(self):
+        self.assertEqual(set(m.controls()), {m.WATCH, m.STORE})
+
+    def test_drift_rejected(self):
+        for key in ("CONTROLS_SHA", "RELEASE_SHA", "PLAN_SHA", "PLAN_RELEASE_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

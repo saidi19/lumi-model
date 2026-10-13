@@ -1,0 +1,83 @@
+"""Offline structural verifier for attempt-018 read-only preflight v0.3."""
+
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+EVIDENCE = ROOT / "evidence/lumi-vm-attempt-018-readonly-preflight-verification-v0.3.json"
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_preflight_v3_verification_rejected") from None
+
+
+def read(path, digest):
+    raw = (ROOT / path).read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == digest)
+    return raw
+
+
+def verify():
+    evidence = json.loads(EVIDENCE.read_bytes())
+    need(evidence["attempt"] == ATTEMPT)
+    need(evidence["status"] == "readonly_preflight_passed")
+    for path, digest in evidence["source_bindings"].items():
+        read(path, digest)
+
+    started = json.loads(
+        read(
+            "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.3/started.json",
+            evidence["source_bindings"][
+                "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.3/started.json"
+            ],
+        )
+    )
+    admission = json.loads(
+        read(
+            "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.3/admission.json",
+            evidence["source_bindings"][
+                "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.3/admission.json"
+            ],
+        )
+    )
+    result = json.loads(
+        read(
+            "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.3/result.json",
+            evidence["source_bindings"][
+                "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.3/result.json"
+            ],
+        )
+    )
+
+    need(started["execution_authorized"] is False and started["max_calls"] == 79)
+    need(len(started["control_evidence"]) == 2)
+    need(admission["status"] == "all_readonly_admission_passed_before_execution_marker")
+    need(admission["network"]["fresh_network_admitted"] is True)
+    need(admission["watchdog"]["status"] == "verified_fresh_inert_watchdog")
+    need(admission["cleanup_store"]["object_reads"] == 0)
+    need(admission["host_launch_authorized"] is False)
+    need(result["status"] == "readonly_preflight_passed" and result["calls"] == 56)
+    for key in ("cloud_mutations", "object_access"):
+        need(result[key] == 0 and admission[key] == 0)
+    for key in (
+        "execution_marker_created",
+        "cpu_launch_authorized",
+        "outer_invoked",
+        "gate_5_complete",
+        "gpu",
+        "training",
+    ):
+        need(result[key] is False)
+    need(evidence["failed_preflight_v0.1_preserved"] is True)
+    need(evidence["failed_preflight_v0.2_preserved"] is True)
+    need(evidence["execution_authority_created"] is False)
+    need(evidence["cpu_instance_launched"] is False)
+    need(evidence["checkpoint_access"] is False)
+    return evidence
+
+
+if __name__ == "__main__":
+    print(json.dumps(verify(), sort_keys=True))

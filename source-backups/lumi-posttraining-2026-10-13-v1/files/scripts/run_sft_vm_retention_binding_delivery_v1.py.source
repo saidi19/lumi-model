@@ -1,0 +1,223 @@
+"""Private detached admission delivery; not a retention worker or authority.
+
+The caller owns live bucket/volume checks and original-deadline host STOP.
+No fresh clock, public launch, credentials or retry after dispatch ambiguity.
+"""
+
+import hashlib
+import time
+from pathlib import Path
+
+import run_sft_vm_native_readiness_delivery_v1 as readiness
+import run_sft_vm_retention_binding_detached_v1 as native
+
+sender = readiness.sender
+SOURCE = Path(__file__).with_name("run_sft_vm_retention_binding_detached_v1.py")
+SOURCE_SHA = "fa0f72a89d09a6258d0e5c0c8626c37d1a3d290af836e6cfa0ae3ec1898542d8"
+HELPERS = {
+    "core.py": "run_sft_vm_native_binding_detached_v1.py",
+    "binder.py": "bind_sft_vm_native_admission_v1.py",
+    "admission.py": "admit_sft_vm_retention_native_v1.py",
+    "entry.py": "run_sft_vm_retention_parent_v1.py",
+}
+MAX_POLLS = 24
+ABORT_RESERVE = 35
+CAP = 32 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_binding_delivery_rejected") from None
+
+
+def payload():
+    source = SOURCE.read_bytes()
+    need(0 < len(source) <= 32768 and hashlib.sha256(source).hexdigest() == SOURCE_SHA)
+    bodies = {name: SOURCE.with_name(path).read_bytes() for name, path in HELPERS.items()}
+    native.sources(bodies)
+    return [source, *bodies.values()]
+
+
+def launcher(operation, request, prior_pin, end, lengths):
+    need(operation in {"dispatch", "status", "finish", "cancel"})
+    need(native.pin(prior_pin) and native.number(end))
+    need(len(lengths) == 5 and all(type(n) is int and 0 < n <= 32768 for n in lengths))
+    action = (
+        "m.dispatch(request,prior_pin,end,bodies,source)"
+        if operation == "dispatch"
+        else f"m.{operation}(request,prior_pin,end,bodies)"
+    )
+    return f"""import hashlib,json,os,signal,sys,types
+try:
+ signal.alarm(75)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ raw=sys.stdin.buffer.read({sum(lengths) + 1})
+ assert len(raw)=={sum(lengths)}
+ pieces=[];offset=0
+ for size in {lengths!r}:
+  pieces.append(raw[offset:offset+size]);offset+=size
+ source=pieces[0]
+ assert hashlib.sha256(source).hexdigest()=={SOURCE_SHA!r}
+ m=types.ModuleType('_authenticated_retention_binding')
+ m.__file__='/opt/lumi-bootstrap-input/run_sft_vm_retention_binding_detached_v1.py'
+ exec(compile(source,m.__file__,'exec'),m.__dict__)
+ bodies=dict(zip({list(HELPERS)!r},pieces[1:],strict=True))
+ request={request!r};prior_pin={prior_pin!r};end={end!r}
+ answer={action}
+ encoded=json.dumps(answer,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+ assert len(encoded)<=4096
+ sys.stdout.buffer.write(encoded)
+except BaseException:
+ sys.exit(1)
+"""
+
+
+def state_reply(value, states, prior_pin, end):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "state",
+            "observation",
+            "binding_may_exist",
+            "host_admitted",
+            "gate_5_complete",
+            "retry_allowed",
+        }
+    )
+    need(value["state"] in states and value["binding_may_exist"] is True)
+    need(all(value[k] is False for k in ("host_admitted", "gate_5_complete", "retry_allowed")))
+    if value["state"] in {"returned", "completed"}:
+        native.validate_report(value["observation"], prior_pin, end)
+    else:
+        need(value["observation"] is None)
+    return value
+
+
+def _bind_retention_channel_once(
+    output,
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    request,
+    prior_pin,
+    *,
+    deadline,
+    retention_deadline,
+    host_deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+    wait=time.sleep,
+):
+    readiness.validate_request(request, binding)
+    need(native.pin(prior_pin))
+    need(all(native.number(t) for t in (deadline, retention_deadline, host_deadline)))
+    now = clock()
+    need(300 < deadline - now <= 350)
+    need(deadline + 180 < retention_deadline <= min(now + 1800, host_deadline - 700))
+    # Map the fixed controller deadline using the original admitted host end;
+    # never derive a fresh native end from the later dispatch/serve observation.
+    end = request["host_deadline_boottime"] - (host_deadline - retention_deadline)
+    need(native.number(end) and 0 < end <= request["host_deadline_boottime"] - 700)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= CAP)
+    pieces = payload()
+    body, lengths = b"".join(pieces), list(map(len, pieces))
+    need((MAX_POLLS + 3) * (len(body) + 16384) <= remaining_control_bytes)
+    sender.command(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        launcher("dispatch", request, prior_pin, end, lengths),
+    )
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = sender.delivery.connection.issuer.base.save
+    report = dict(
+        status="started",
+        dispatch_attempted=False,
+        finish_attempted=False,
+        cancel_attempted=False,
+        cancellation_observed=False,
+        binding_delivery_completed=False,
+        binding_state="not_dispatched",
+        status_reads=0,
+        control_content_bytes_charged=0,
+        retention_deadline_monotonic=retention_deadline,
+        retention_deadline_boottime=end,
+        host_admitted=False,
+        credentials_issued=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+        outer_stop_required_on_failure=True,
+        cancellation_revokes_binding=False,
+    )
+    save(output / "started.json", report)
+
+    def exchange(operation):
+        argv = sender.command(
+            binding,
+            key,
+            directory,
+            config_sha,
+            hosts_sha,
+            launcher(operation, request, prior_pin, end, lengths),
+        )
+        need(len(argv[-1].encode()) <= 16384)
+        charge = len(argv[-1].encode()) + len(body)
+        reserve = 0 if operation == "cancel" else ABORT_RESERVE
+        timeout = min(80, deadline - clock() - reserve)
+        need(timeout > 0 and (operation != "dispatch" or timeout == 80))
+        need(report["control_content_bytes_charged"] + charge <= remaining_control_bytes)
+        report["control_content_bytes_charged"] += charge
+        value = sender.delivery.decode(sender.pipe_exchange(argv, body, timeout))
+        need(clock() < deadline - reserve)
+        return value
+
+    try:
+        report.update(dispatch_attempted=True, binding_state="unknown_after_dispatch")
+        state_reply(exchange("dispatch"), {"dispatch_requested"}, prior_pin, end)
+        for _ in range(MAX_POLLS):
+            report["status_reads"] += 1
+            observed = state_reply(exchange("status"), {"running", "returned"}, prior_pin, end)
+            if observed["state"] == "returned":
+                report["finish_attempted"] = True
+                final = state_reply(exchange("finish"), {"completed"}, prior_pin, end)
+                need(final["observation"] == observed["observation"])
+                report.update(
+                    binding_delivery_completed=True,
+                    binding_state="created_and_reaped",
+                    observation=final["observation"],
+                )
+                break
+            pause = min(10, deadline - clock() - ABORT_RESERVE - 1)
+            need(pause > 0)
+            wait(pause)
+        need(report["binding_delivery_completed"] and retention_deadline - clock() > 180)
+        report["status"] = "retention_binding_delivered_not_full_host_admission"
+        save(output / "result.json", report)
+    except BaseException:
+        report.update(
+            status="failed_preserve_no_retry",
+            binding_state="unknown_after_dispatch",
+            binding_delivery_completed=False,
+        )
+        if report["dispatch_attempted"]:
+            report["cancel_attempted"] = True
+            try:
+                state_reply(exchange("cancel"), {"cancelled"}, prior_pin, end)
+                report["cancellation_observed"] = True
+            except BaseException:
+                pass  # Even observed cancellation cannot revoke the binding or replace host STOP.
+        target = "failure.json" if (output / "result.json").exists() else "result.json"
+        save(output / target, report)
+        raise ValueError("retention_binding_delivery_failed_outer_stop_required") from None
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_admission_controller_required") from None

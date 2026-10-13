@@ -1,0 +1,334 @@
+"""Join seed/control delivery to one detached bootstrap and bounded status reads.
+
+Private API for the future full-size admitted controller. No cloud provisioning,
+disk formatting, credentials, model reads or host/import admission is granted.
+Reuses the existing pinned SSH channel, seed and control archive unchanged.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import re
+import time
+
+import start_sft_vm_setup_bootstrap_v4 as seed
+
+SOURCE_SHA = "2ae425618be36078487da6f62956dd73cc9229b806d2a61d36485ab6e773f706"
+SOURCE_BYTES = 12765
+BOOTSTRAP_SHA = "ab94bac20ffc47ac419f5f15cab3f9dd84b5b5a636274bcd84a3dcae66b386fb"
+SOURCE = "/opt/lumi-bootstrap-input/run_sft_vm_setup_detached_v2.py"
+MAX_POLLS = 180
+MAX_EXCHANGE = 25
+ABORT_RESERVE_SECONDS = 30
+ABORT_RESERVE_BYTES = 8192
+STATES = {
+    "dispatch_requested",
+    "running",
+    "setup_returned",
+    "completed",
+    "failed",
+    "failed_or_interrupted",
+    "shutdown_requested",
+}
+BASE = {
+    "host_admitted": False,
+    "binding_created": False,
+    "gate_5_complete": False,
+    "retry_allowed": False,
+}
+PINS = {
+    "start_sft_vm_setup_bootstrap_v4.py": (
+        "613feedd723ef9bc4717ba784de8776e51f52affa046f5f49166e65e0b287076"
+    ),
+    "send_sft_vm_setup_inputs_v4.py": (
+        "b5cd11e6c839c99d0ff869a980289697f0c4d79050d265e03ad2699e7b1e1b57"
+    ),
+    "run_sft_vm_detached_delivery_v1.py": (
+        "e9dff26db2a86bfca4c75e5ddfcf74a3a696f7c709a143d253ab39c472be2a99"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_delivery_join_rejected") from None
+
+
+def validate_parameters(volumes, host_deadline):
+    need(type(volumes) is dict and set(volumes) == {"root_volume", "work_volume"})
+    need(all(type(v) is str and re.fullmatch(r"vol-[0-9a-f]{17}", v) for v in volumes.values()))
+    need(volumes["root_volume"] != volumes["work_volume"])
+    need(
+        type(host_deadline) in {int, float}
+        and math.isfinite(host_deadline)
+        and 1800 < host_deadline <= 14400
+    )
+
+
+def request_from(seed_receipt, volumes, host_deadline):
+    receipt = seed.validate_seed(seed.INPUTS.canonical(seed_receipt))
+    validate_parameters(volumes, host_deadline)
+    return {
+        "schema": "lumi.vm-detached-setup-request.v0.1",
+        "attempt": seed.ATTEMPT,
+        "machine_id": receipt["machine_id"],
+        "boot_id": receipt["boot_id"],
+        "volumes": dict(volumes),
+        "setup_deadline_boottime": 1800,
+        "host_deadline_boottime": host_deadline,
+    }
+
+
+def reply(raw):
+    value = seed.sender.delivery.decode(raw)
+    need(set(value) == {"state", "setup_unit_reaped", *BASE})
+    need(type(value["state"]) is str and value["state"] in STATES)
+    need(type(value["setup_unit_reaped"]) is bool)
+    need(all(value[k] is expected for k, expected in BASE.items()))
+    need(value["setup_unit_reaped"] is (value["state"] == "completed"))
+    return value
+
+
+def launcher(operation, request):
+    need(operation in {"dispatch", "status", "finish", "abort"})
+    # request_from validates every caller value before it can enter this code.
+    # Every later connection reauthenticates the frozen bootstrap and new source.
+    invoke = (
+        f"raw=sys.stdin.buffer.read({SOURCE_BYTES + 1});assert len(raw)=={SOURCE_BYTES};"
+        f"assert hashlib.sha256(raw).hexdigest()=={SOURCE_SHA!r};"
+        if operation == "dispatch"
+        else (
+            f"raw=b.read(Path({SOURCE!r}),32768);"
+            f"assert hashlib.sha256(raw).hexdigest()=={SOURCE_SHA!r};"
+        )
+    )
+    call = (
+        "m._deploy_and_dispatch_once(request,raw)"
+        if operation == "dispatch"
+        else {
+            "status": "m._status(request)",
+            "finish": "m._finish_once(request)",
+            "abort": "m._abort_once(request)",
+        }[operation]
+    )
+    return f"""import hashlib,json,os,signal,sys,types
+from pathlib import Path
+try:
+ signal.alarm(20)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ p=Path('/opt/lumi-bootstrap-input/run_sft_vm_network_bootstrap_v3.py')
+ fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ with os.fdopen(fd,'rb') as f: body=f.read(131073)
+ assert hashlib.sha256(body).hexdigest()=={BOOTSTRAP_SHA!r}
+ b=types.ModuleType('_authenticated_bootstrap');b.__file__=str(p)
+ exec(compile(body,str(p),'exec'),b.__dict__)
+ assert b.read(p)==body
+ {invoke}
+ m=types.ModuleType('_authenticated_detached_setup');m.__file__={SOURCE!r}
+ exec(compile(raw,m.__file__,'exec'),m.__dict__)
+ request={request!r}
+ answer={call}
+ result=json.dumps(answer,sort_keys=True,separators=(',',':'),allow_nan=False).encode()+b'\\n'
+ assert len(result)<=4096
+ sys.stdout.buffer.write(result);sys.stdout.buffer.flush()
+except BaseException:
+ sys.exit(2)
+"""
+
+
+def source_bytes():
+    for name, pin in PINS.items():
+        need(
+            hashlib.sha256(
+                seed.INPUTS.read(seed.INPUTS.REPO / "scripts" / name, 131072)
+            ).hexdigest()
+            == pin
+        )
+    raw = seed.INPUTS.read(seed.INPUTS.REPO / "scripts/run_sft_vm_setup_detached_v2.py", 32768)
+    need(len(raw) == SOURCE_BYTES and hashlib.sha256(raw).hexdigest() == SOURCE_SHA)
+    return raw
+
+
+def run(**_arguments):
+    raise ValueError("fullsize_host_admission_not_bound") from None
+
+
+def _run_staged_admitted_once(
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    seed_receipt,
+    volumes,
+    output,
+    *,
+    original_host_deadline_boottime,
+    deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+    sleep=time.sleep,
+):
+    need(
+        type(deadline) in {int, float}
+        and math.isfinite(deadline)
+        and 60 < deadline - clock() <= 1800
+    )
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= seed.INPUTS.CAP)
+    source = source_bytes()
+    request = request_from(seed_receipt, volumes, original_host_deadline_boottime)
+    need(volumes == {key: binding[key] for key in ("root_volume", "work_volume")})
+    commands = {
+        op: seed.sender.command(
+            binding, key, directory, config_sha, hosts_sha, launcher(op, request)
+        )
+        for op in ("dispatch", "status", "finish", "abort")
+    }
+    need(all(len(argv[-1].encode()) <= ABORT_RESERVE_BYTES for argv in commands.values()))
+    need(
+        len(source) + len(commands["dispatch"][-1].encode()) + ABORT_RESERVE_BYTES
+        <= remaining_control_bytes
+    )
+    seed.sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    seed.INPUTS.sync(output.parent)
+    report = {
+        **BASE,
+        "dispatch_attempted": False,
+        "setup_completed": False,
+        "setup_unit_reaped": False,
+        "remote_completion_unknown": False,
+        "abort_attempted": False,
+        "shutdown_requested": False,
+        "status_reads": 0,
+        "control_content_bytes_charged": 0,
+    }
+    seed.INPUTS.write(output / "started.json", seed.INPUTS.canonical(report))
+    seed.INPUTS.sync(output)
+
+    def exchange(operation, body=b""):
+        reserve = 0 if operation == "abort" else ABORT_RESERVE_BYTES
+        # Recheck the existing SSH configuration and host-key pins each time.
+        argv = seed.sender.command(
+            binding, key, directory, config_sha, hosts_sha, launcher(operation, request)
+        )
+        charge = len(body) + len(argv[-1].encode())
+        need(report["control_content_bytes_charged"] + charge + reserve <= remaining_control_bytes)
+        # Do not restart the deadline after config/hash checks consumed time.
+        seconds = deadline - clock() - (0 if operation == "abort" else ABORT_RESERVE_SECONDS)
+        need(seconds > 0)
+        report["control_content_bytes_charged"] += charge
+        return reply(seed.sender.delivery.pipe_exchange(argv, body, min(MAX_EXCHANGE, seconds)))
+
+    phase = "dispatch"
+    try:
+        report["dispatch_attempted"] = True
+        need(exchange("dispatch", source)["state"] == "dispatch_requested")
+        phase = "observation"
+        for _ in range(MAX_POLLS):
+            report["status_reads"] += 1
+            observed = exchange("status")
+            if observed["state"] == "setup_returned":
+                phase = "reap"
+                finished = exchange("finish")
+                need(finished["state"] == "completed" and finished["setup_unit_reaped"] is True)
+                report["setup_completed"] = report["setup_unit_reaped"] = True
+                break
+            need(observed["state"] in {"running", "dispatch_requested"})
+            pause = min(10, deadline - clock() - ABORT_RESERVE_SECONDS)
+            need(pause > 0)
+            sleep(pause)
+        need(report["setup_completed"])
+    except BaseException:
+        report["failed_phase"] = phase
+        report["remote_completion_unknown"] = report["dispatch_attempted"]
+        if report["dispatch_attempted"]:
+            report["abort_attempted"] = True
+            try:
+                report["shutdown_requested"] = exchange("abort")["state"] == "shutdown_requested"
+            except BaseException:
+                pass
+        seed.INPUTS.write(output / "result.json", seed.INPUTS.canonical(report))
+        seed.INPUTS.sync(output)
+        raise ValueError("detached_setup_delivery_failed") from None
+    seed.INPUTS.write(output / "result.json", seed.INPUTS.canonical(report))
+    seed.INPUTS.sync(output)
+    return report
+
+
+def _seed_send_and_setup_admitted_once(
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    receiver,
+    archive,
+    volumes,
+    output,
+    *,
+    original_host_deadline_boottime,
+    deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+    sleep=time.sleep,
+):
+    source_bytes()  # Reject a changed successor before seed, upload or local claim.
+    validate_parameters(volumes, original_host_deadline_boottime)
+    need(volumes == {key: binding[key] for key in ("root_volume", "work_volume")})
+    need(
+        type(deadline) in {int, float}
+        and math.isfinite(deadline)
+        and 145 < deadline - clock() <= 1800
+    )
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= seed.INPUTS.CAP)
+    # Reserve the complete bounded command channel before the old control upload.
+    channel_reserve = SOURCE_BYTES + (MAX_POLLS + 3) * ABORT_RESERVE_BYTES
+    need(remaining_control_bytes > channel_reserve)
+    seed.sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    seed.INPUTS.sync(output.parent)
+    staged = seed._seed_and_send_admitted_once(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        receiver,
+        archive,
+        output / "controls",
+        deadline=deadline,
+        remaining_control_bytes=remaining_control_bytes - channel_reserve,
+        clock=clock,
+    )
+    seed_receipt = seed.sender.delivery.decode(
+        seed.INPUTS.read(output / "controls/seed.json", 4096)
+    )
+    completed = _run_staged_admitted_once(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        seed_receipt,
+        volumes,
+        output / "setup",
+        original_host_deadline_boottime=original_host_deadline_boottime,
+        deadline=deadline,
+        remaining_control_bytes=remaining_control_bytes
+        - staged["total_control_content_bytes_charged"],
+        clock=clock,
+        sleep=sleep,
+    )
+    result = {
+        **completed,
+        "control_staging_confirmed": True,
+        "total_control_content_bytes_charged": staged["total_control_content_bytes_charged"]
+        + completed["control_content_bytes_charged"],
+    }
+    need(result["total_control_content_bytes_charged"] <= remaining_control_bytes)
+    seed.INPUTS.write(output / "result.json", seed.INPUTS.canonical(result))
+    seed.INPUTS.sync(output)
+    return result

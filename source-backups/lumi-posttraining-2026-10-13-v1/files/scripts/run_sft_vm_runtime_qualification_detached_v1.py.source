@@ -1,0 +1,284 @@
+"""Fixed generated-only qualification parent independent of the SSH tunnel.
+
+Reuse the frozen same-host qualification, CPU runtime and generated workers.
+No import binding, credentials, resource creation or real model access. The
+authenticated controller supplies public source only; original setup identity
+and deadlines are read from the existing root-owned native request, not guessed.
+"""
+
+import hashlib
+import json
+import os
+import signal
+import stat
+import sys
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+QUALIFICATION = hashlib.sha256(("generated-runtime-v1:" + ATTEMPT).encode()).hexdigest()[:32]
+ROOT = Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "runtime-qualification"
+INPUT = Path("/opt/lumi-bootstrap-input")
+UNIT = "lumi-generated-runtime-qualification-v1.service"
+BOOTSTRAP_SHA = "804c5121c7aaab818c9d6f3e70fe7463b8963619617e1117cab5387997fb37b8"
+SETUP_SHA = "923a8f8d93ecfcf003662416a6239ef4cacd334478f9d07a883feb9eddb337ad"
+PINS = {
+    "qualification.py": "1922beb8a6c49f7d8bf4d89e22a73259b3d37f38b4e910f0680499d49e4a064b",
+    "readiness.py": "c6d65a5e1dc90c46855f76be9ccf241193cf2ac0fedb20c6b8ad1d95bbefdfda",
+    "source-release.tar.gz": "dbae54038d86d712bf14e4ebb50a6ff3fd83c17a42c5e75659c2f280a1465bca",
+}
+MAXIMUM = {"qualification.py": 32768, "readiness.py": 32768, "source-release.tar.gz": 181868}
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_runtime_qualification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def load(raw, path):
+    module = types.ModuleType("_fixed_generated_" + path.stem)
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def read_root(path, cap):
+    for parent in path.parents:
+        info = parent.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(not info.st_mode & 0o022)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(before.st_uid == before.st_gid == 0 and stat.S_IMODE(before.st_mode) == 0o400)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(cap + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, k) == getattr(after, k)
+            for k in (
+                "st_dev",
+                "st_ino",
+                "st_mode",
+                "st_uid",
+                "st_gid",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+                "st_ctime_ns",
+            )
+        )
+    )
+    return raw
+
+
+def context(expected):
+    need(sys.platform == "linux" and sys.version_info[:2] == (3, 12))
+    need(os.geteuid() == os.getegid() == 0 and sys.flags.isolated and sys.dont_write_bytecode)
+    path = INPUT / "run_sft_vm_network_bootstrap_v4.py"
+    raw = read_root(path, 131072)
+    need(0 < len(raw) <= 131072 and sha(raw) == BOOTSTRAP_SHA)
+    bootstrap = load(raw, path)
+    need(bootstrap.read(path) == raw)
+    path = INPUT / "run_sft_vm_setup_detached_v3.py"
+    raw = bootstrap.read(path)
+    need(sha(raw) == SETUP_SHA)
+    setup = load(raw, path)
+    request = setup.decode(bootstrap.read(setup.OUTPUT / "request.json", 4096))
+    setup.validate_request(request, bootstrap, starting=False)
+    need(
+        type(expected) is dict and set(expected) == {"attempt", "machine_id", "boot_id", "volumes"}
+    )
+    need(all(request[k] == expected[k] for k in expected))
+    need(setup._status(request) == setup.result("completed", reaped=True))
+    return bootstrap, setup.helpers(bootstrap), request
+
+
+def units():
+    return [UNIT] + [
+        f"lumi-vm-coordinator-v3-{QUALIFICATION}-{mode}.service" for mode in ("prepare", "import")
+    ]
+
+
+def result(state, *, observation=None):
+    return dict(
+        state=state,
+        observation=observation,
+        host_admitted=False,
+        binding_created=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+
+
+def original_request(expected):
+    bootstrap, _, request = context(expected)
+    return dict(
+        request=request,
+        observed_boottime=bootstrap.boot_time(),
+        host_admitted=False,
+        binding_created=False,
+        retry_allowed=False,
+    )
+
+
+def command(pin):
+    need(type(pin) is str and len(pin) == 64 and all(c in "0123456789abcdef" for c in pin))
+    path = str(ROOT / "receiver.py")
+    code = (
+        "import hashlib,runpy;from pathlib import Path;"
+        f"p=Path({path!r});raw=p.read_bytes();"
+        f"assert hashlib.sha256(raw).hexdigest()=={pin!r};"
+        "runpy.run_path(str(p),run_name='__qualification__')['_serve_once']()"
+    )
+    properties = dict(
+        User="root",
+        Group="root",
+        UMask="0077",
+        Restart="no",
+        RemainAfterExit="yes",
+        RuntimeMaxSec="620",
+        TimeoutStopSec="10",
+        KillMode="control-group",
+        SendSIGKILL="yes",
+        FailureAction="poweroff",
+        MemoryMax="256M",
+        MemorySwapMax="0",
+        TasksMax="64",
+        LimitCORE="0",
+        NoNewPrivileges="yes",
+        StandardInput="null",
+        StandardOutput="null",
+        StandardError="null",
+    )
+    # Same PID1 mount/network namespaces are required by the unchanged inspector.
+    return (
+        [
+            "/usr/bin/systemd-run",
+            "--quiet",
+            "--no-ask-password",
+            "--no-block",
+            "--service-type=exec",
+            "--unit=" + UNIT,
+        ]
+        + [f"--property={k}={v}" for k, v in properties.items()]
+        + ["--", "/usr/bin/python3", "-I", "-B", "-c", code]
+    )
+
+
+def dispatch(expected, request, sources, receiver):
+    bootstrap, helper, original = context(expected)
+    need(request == original and set(sources) == set(PINS))
+    need(type(receiver) is bytes and 0 < len(receiver) <= 32768)
+    for name, raw in sources.items():
+        need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM[name] and sha(raw) == PINS[name])
+    need(0 <= bootstrap.boot_time() < request["host_deadline_boottime"] - 11315 - 650)
+    need(not os.path.lexists(ROOT))
+    need(not os.path.lexists(Path("/opt/lumi-vm-coordinator-v3")))
+    for unit in units():
+        need(bootstrap.show(unit, "LoadState") == b"not-found" and helper.cgroup_empty(unit))
+    bootstrap.owned(ROOT.parent)
+    ROOT.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(ROOT.parent)
+    bootstrap.write(ROOT / "request.json", bootstrap.encode(request))
+    bootstrap.write(ROOT / "receiver.py", receiver)
+    for name, raw in sources.items():
+        if name != "source-release.tar.gz":
+            bootstrap.write(ROOT / name, raw)
+        else:
+            # The frozen metadata writer has a 32 KiB cap; do not widen it.
+            need(len(raw) == 181868 and sha(raw) == PINS[name])
+            fd = os.open(ROOT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+            with os.fdopen(fd, "wb") as stream:
+                need(stream.write(raw) == len(raw))
+                stream.flush()
+                os.fsync(stream.fileno())
+            bootstrap.sync(ROOT)
+            need(bootstrap.read(ROOT / name, 181868) == raw)
+    # This record consumes a lost acknowledgement; there is never redispatch.
+    bootstrap.write(ROOT / "dispatch.json", bootstrap.encode(result("dispatch_requested")))
+    bootstrap.command(command(sha(receiver)), seconds=15)
+    return result("dispatch_requested")
+
+
+def _serve_once():
+    need(Path(__file__) == ROOT / "receiver.py")
+    raw = read_root(ROOT / "request.json", 4096)
+    request = json.loads(raw)
+    expected = {k: request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")}
+    bootstrap, _, original = context(expected)
+    need(request == original and bootstrap.read(ROOT / "request.json", 4096) == raw)
+    need(bootstrap.show(UNIT, "ActiveState") == b"active")
+    need(bootstrap.boot_time() < request["host_deadline_boottime"] - 11315 - 600)
+    # A generated run has its own exclusive marker, independent of SSH lifetime.
+    bootstrap.write(ROOT / "started.json", bootstrap.encode(result("running")))
+
+    def expired(*_):
+        raise TimeoutError("qualification_deadline")
+
+    signal.signal(signal.SIGALRM, expired)
+    signal.alarm(600)
+    try:
+        sources = {name: bootstrap.read(ROOT / name, MAXIMUM[name]) for name in PINS}
+        need(all(sha(sources[name]) == pin for name, pin in PINS.items()))
+        qualification = load(sources["qualification.py"], ROOT / "qualification.py")
+        answer = qualification._qualify_same_host(
+            request, sources["source-release.tar.gz"], sources["readiness.py"]
+        )
+        bootstrap.write(ROOT / "result.json", bootstrap.encode(answer))
+    except BaseException:
+        bootstrap.write(ROOT / "failed.json", bootstrap.encode(result("failed")))
+        raise ValueError("generated_runtime_parent_failed") from None
+    finally:
+        signal.alarm(0)
+
+
+def status(expected, request):
+    bootstrap, helper, original = context(expected)
+    need(request == original)
+    need(json.loads(bootstrap.read(ROOT / "request.json", 4096)) == request)
+    observed = helper.observe(UNIT)
+    if (observed["ActiveState"], observed["SubState"]) in {
+        ("active", "running"),
+        ("activating", "start"),
+    }:
+        return result("running")
+    helper.validate_terminal("chain", observed)
+    need(all(helper.cgroup_empty(unit) for unit in units()))
+    # The frozen generated result itself attests unmount only after real cleanup.
+    answer = json.loads(bootstrap.read(ROOT / "result.json", 4096))
+    return result("returned", observation=answer)
+
+
+def finish(expected, request):
+    answer = status(expected, request)
+    need(answer["state"] == "returned")
+    bootstrap, helper, _ = context(expected)
+    bootstrap.write(ROOT / "finish.started", b"consumed\n")
+    bootstrap.command(["/usr/bin/systemctl", "stop", UNIT], seconds=10)
+    need(all(helper.cgroup_empty(unit) for unit in units()))
+    need(bootstrap.show(UNIT, "ActiveState") == b"inactive")
+    bootstrap.write(ROOT / "reaped.json", bootstrap.encode(result("completed")))
+    return result("completed", observation=answer["observation"])
+
+
+def cancel(expected, request):
+    bootstrap, helper, original = context(expected)
+    need(original == request)
+    bootstrap.write(ROOT / "cancel.started", b"consumed\n")
+    # Parent first, so it cannot dispatch another child after cancellation.
+    for unit in units():
+        bootstrap.command(["/usr/bin/systemctl", "stop", unit], seconds=10)
+    need(all(helper.cgroup_empty(unit) for unit in units()))
+    return result("cancelled")
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_generated_qualification_channel_required") from None

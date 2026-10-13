@@ -1,0 +1,629 @@
+"""Credential-refresh successor for one approved private-report CPU watchdog attempt.
+
+No console dependency, model access, package installation, SSH or launch retry.
+Secrets and binary user-data stay in memory. Every cloud failure is recorded by
+fixed stage, never exception text. Independent cleanup continues after failures.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import json
+import logging
+import os
+import re
+import resource
+import secrets
+import signal
+import stat
+import sys
+import time
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "artifacts/lumi-vm-watchdog-object-attempt-v0.2"
+APPROVAL = ROOT / "configs/lumi-vm-watchdog-object-approval-v0.2.json"
+ACCOUNT, REGION = "573978149073", "us-east-1"
+AMI = "ami-0045d7fc2ad003464"
+SUBNET, VPC = "subnet-0dc6039a6453f7c95", "vpc-0905fbf9490a2dead"
+PINS = {
+    "sft_vm_watchdog_login_refresh_v1.py": (
+        "808711ef95670de7df90c7fdbbe7274bd622f61cd4b9aa9386d28a414498cce5"
+    ),
+    "prepare_sft_vm_watchdog_object_v2.py": (
+        "0f54b3f422f8be1bef7dcc98f475376dc7f2610717ecaa492099f4c2ef96954d"
+    ),
+    "sft_vm_watchdog_report_channel_v1.py": (
+        "7ea5adf3bc5209421daba9dd3d943a968defd369fe8443c328dbcc8e0bb66f35"
+    ),
+}
+PUBLIC_BLOCK = dict.fromkeys(
+    ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"), True
+)
+ENCRYPTION = {"Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}]}
+OWNERSHIP = {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]}
+BOUNDS = {
+    "account": ACCOUNT,
+    "region": REGION,
+    "instance_count": 1,
+    "instance_type": "t3.small",
+    "encrypted_root_gib": 8,
+    "max_controller_seconds": 1800,
+    "max_observation_seconds": 1100,
+    "guest_max_boottime_shutdown_seconds": 1500,
+    "new_private_bucket_count": 1,
+    "max_report_puts": 4,
+    "report_object_bytes": 8192,
+    "max_report_body_bytes": 32768,
+    "max_report_gets": 4,
+    "max_report_read_bytes": 32772,
+    "presigned_put_lifetime_seconds": 900,
+    "local_evidence_bytes": 131072,
+    "body_cap_is_not_wire_cap": True,
+    "synthetic_only": True,
+    "retry_allowed": False,
+    "existing_instance_access": False,
+    "other_bucket_access": False,
+    "model_dataset_access": False,
+    "gpu_inference_training": False,
+    "package_acquisition": False,
+    "iam_mutation": False,
+    "ssh_access": False,
+    "cleanup_new_resources_only": True,
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("object_controller_rejected") from None
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def load(name):
+    path = ROOT / "scripts" / name
+    raw = path.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == PINS[name])
+    module = types.ModuleType("_watchdog_object_" + name)
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def approval_contract():
+    builder = load("prepare_sft_vm_watchdog_object_v2.py")
+    return {
+        "schema": "lumi.watchdog-object-approval.v0.2",
+        "approved": True,
+        "bounds": BOUNDS,
+        "controller_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "source_sha256": {**PINS, **builder.PINS},
+    }
+
+
+def validate_approval():
+    # No approval file is shipped with preparation. A consumed output directory
+    # prevents a second invocation even if the same approval remains present.
+    need(APPROVAL.is_file() and not APPROVAL.is_symlink())
+    need(APPROVAL.stat().st_size <= 8192)
+    raw = APPROVAL.read_bytes()
+    need(canonical(json.loads(raw, object_pairs_hook=unique)) == canonical(approval_contract()))
+    return hashlib.sha256(raw).hexdigest()
+
+
+class Evidence:
+    def __init__(self, path):
+        self.path, self.written = path, 0
+        need(not path.is_symlink() and path.parent.resolve() == path.parent)
+        path.mkdir(mode=0o700, exist_ok=False)
+        need(stat.S_IMODE(path.stat().st_mode) == 0o700)
+
+    def save(self, name, value):
+        need(re.fullmatch(r"[a-z][a-z0-9-]*\.json", name))
+        raw = canonical(value) + b"\n"
+        need(self.written + len(raw) <= BOUNDS["local_evidence_bytes"])
+        fd = os.open(self.path / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        self.written += len(raw)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
+@contextlib.contextmanager
+def timeout(seconds):
+    def expired(_signum, _frame):
+        raise TimeoutError("bounded_call_timeout")
+
+    old = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def credentials(*, deadline):
+    return load("sft_vm_watchdog_login_refresh_v1.py").credentials(deadline=deadline)
+
+
+def clients(secret):
+    return load("sft_vm_watchdog_login_refresh_v1.py").clients(secret)
+
+
+def code(error):
+    # Only compared internally; never serialize AWS errors (which can contain secrets).
+    return getattr(error, "response", {}).get("Error", {}).get("Code")
+
+
+class API:
+    def __init__(self, supplied, deadline):
+        self.clients, self.deadline = supplied, deadline
+
+    def call(self, service, operation, **params):
+        remaining = self.deadline - time.monotonic()
+        need(remaining > 1)
+        with timeout(min(20, remaining)):
+            return getattr(self.clients[service], operation)(**params)
+
+
+def launch_request(attempt, group, payload):
+    need(type(payload) is bytes and payload.startswith(b"\x1f\x8b") and len(payload) <= 16384)
+    tags = [{"Key": "LumiAttempt", "Value": attempt}]
+    return dict(
+        ImageId=AMI,
+        InstanceType="t3.small",
+        MinCount=1,
+        MaxCount=1,
+        ClientToken=attempt,
+        UserData=payload,
+        CreditSpecification={"CpuCredits": "standard"},
+        MetadataOptions={"HttpTokens": "required", "HttpEndpoint": "enabled"},
+        InstanceInitiatedShutdownBehavior="stop",
+        NetworkInterfaces=[
+            dict(DeviceIndex=0, SubnetId=SUBNET, Groups=[group], AssociatePublicIpAddress=True)
+        ],
+        BlockDeviceMappings=[
+            dict(
+                DeviceName="/dev/sda1",
+                Ebs=dict(VolumeSize=8, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True),
+            )
+        ],
+        TagSpecifications=[dict(ResourceType=kind, Tags=tags) for kind in ("instance", "volume")],
+    )
+
+
+class Attempt:
+    def __init__(self, api, evidence, attempt, channel, builder):
+        channel.identity(attempt, builder.BINDINGS)
+        self.api, self.evidence, self.attempt = api, evidence, attempt
+        self.channel, self.builder = channel, builder
+        self.bucket = channel.target(attempt, "boot")[0]
+        self.group_name = "lumi-watchdog-object-" + attempt
+        self.group = self.instance = None
+        self.bucket_started = self.group_started = self.launch_started = False
+        self.bucket_confirmed = False
+        self.reports = {}
+        self.stage = "preflight"
+        self.result = dict(
+            attempt=attempt,
+            bucket=self.bucket,
+            errors=[],
+            reports={},
+            stopped_observed=False,
+            reports_persisted=False,
+            cleanup_verified=False,
+            native_watchdog_qualified=False,
+            complete_bootstrap_qualified=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            gpu_inference_training=False,
+            production_eligible=False,
+            retry_allowed=False,
+        )
+
+    def s3(self, operation, **params):
+        return self.api.call(
+            "s3", operation, Bucket=self.bucket, ExpectedBucketOwner=ACCOUNT, **params
+        )
+
+    def ec2(self, operation, **params):
+        return self.api.call("ec2", operation, **params)
+
+    def bucket_absent(self):
+        try:
+            self.s3("head_bucket")
+        except Exception as error:
+            if code(error) in {"404", "NoSuchBucket", "NotFound"}:
+                return True
+            raise
+        return False
+
+    def guard(self, stage, operation):
+        try:
+            operation()
+            return True
+        except BaseException:
+            self.result["errors"].append(stage)
+            return False
+
+    def poll(self, operation, seconds):
+        deadline = min(time.monotonic() + seconds, self.api.deadline - 25)
+        while time.monotonic() < deadline:
+            value = operation()
+            if value:
+                return value
+            time.sleep(min(5, max(0, deadline - time.monotonic())))
+        raise TimeoutError("observation_deadline")
+
+    def own_instance(self, row):
+        need(row.get("ClientToken") == self.attempt and row.get("VpcId") == VPC)
+        need(row.get("ImageId") == AMI and row.get("InstanceType") == "t3.small")
+        need({"Key": "LumiAttempt", "Value": self.attempt} in row.get("Tags", []))
+        need(re.fullmatch(r"i-[0-9a-f]{17}", row.get("InstanceId", "")))
+        self.instance = row["InstanceId"]
+        self.result["instance"] = self.instance
+        return row
+
+    def instance_row(self):
+        params = (
+            {"InstanceIds": [self.instance]}
+            if self.instance
+            else {"Filters": [{"Name": "client-token", "Values": [self.attempt]}]}
+        )
+        try:
+            reply = self.ec2("describe_instances", **params)
+        except Exception as error:
+            if code(error) == "InvalidInstanceID.NotFound":
+                return None
+            raise
+        rows = [i for reservation in reply["Reservations"] for i in reservation["Instances"]]
+        need(len(rows) <= 1)
+        return self.own_instance(rows[0]) if rows else None
+
+    def preflight(self):
+        need(self.api.call("sts", "get_caller_identity")["Account"] == ACCOUNT)
+        images = self.ec2("describe_images", ImageIds=[AMI], Owners=["099720109477"])["Images"]
+        need(len(images) == 1 and images[0]["State"] == "available")
+        need(images[0]["Architecture"] == "x86_64" and images[0]["RootDeviceName"] == "/dev/sda1")
+        subnets = self.ec2("describe_subnets", SubnetIds=[SUBNET])["Subnets"]
+        need(len(subnets) == 1 and subnets[0]["VpcId"] == VPC)
+        need(subnets[0]["State"] == "available")
+        need(self.bucket_absent())  # Never CreateBucket on an existing us-east-1 bucket.
+
+    def setup_bucket(self):
+        self.stage = "bucket_create"
+        self.bucket_started = True  # Also cover an ambiguous successful creation.
+        self.api.call(
+            "s3", "create_bucket", Bucket=self.bucket, ObjectOwnership="BucketOwnerEnforced"
+        )
+        self.s3("head_bucket")  # Expected owner verified before any further mutation.
+        self.bucket_confirmed = True
+        self.evidence.save("bucket.json", {"bucket": self.bucket, "attempt": self.attempt})
+        self.stage = "bucket_private_configuration"
+        self.s3(
+            "put_bucket_tagging",
+            Tagging={"TagSet": [{"Key": "LumiAttempt", "Value": self.attempt}]},
+        )
+        self.s3("put_public_access_block", PublicAccessBlockConfiguration=PUBLIC_BLOCK)
+        self.s3("put_bucket_encryption", ServerSideEncryptionConfiguration=ENCRYPTION)
+        need(self.s3("get_public_access_block")["PublicAccessBlockConfiguration"] == PUBLIC_BLOCK)
+        need(self.s3("get_bucket_ownership_controls")["OwnershipControls"] == OWNERSHIP)
+        rules = self.s3("get_bucket_encryption")["ServerSideEncryptionConfiguration"]["Rules"]
+        need(
+            len(rules) == 1
+            and rules[0]["ApplyServerSideEncryptionByDefault"] == {"SSEAlgorithm": "AES256"}
+        )
+        need(self.s3("get_bucket_versioning").get("Status") is None)
+        self.result["private_bucket_verified"] = True
+
+    def group_rows(self):
+        reply = self.ec2(
+            "describe_security_groups",
+            Filters=[
+                {"Name": "group-name", "Values": [self.group_name]},
+                {"Name": "vpc-id", "Values": [VPC]},
+            ],
+        )
+        rows = reply["SecurityGroups"]
+        need(len(rows) <= 1)
+        if rows:
+            row = rows[0]
+            need(row["VpcId"] == VPC and row["GroupName"] == self.group_name)
+            need({"Key": "LumiAttempt", "Value": self.attempt} in row.get("Tags", []))
+            need(re.fullmatch(r"sg-[0-9a-f]{17}", row["GroupId"]))
+            need(self.group is None or self.group == row["GroupId"])
+            self.group = row["GroupId"]
+            self.result["security_group"] = self.group
+        return rows
+
+    def setup_group(self):
+        self.stage = "network_create"
+        self.group_started = True
+        reply = self.ec2(
+            "create_security_group",
+            GroupName=self.group_name,
+            Description="Disposable Lumi synthetic watchdog report probe",
+            VpcId=VPC,
+            TagSpecifications=[
+                {
+                    "ResourceType": "security-group",
+                    "Tags": [{"Key": "LumiAttempt", "Value": self.attempt}],
+                }
+            ],
+        )
+        self.group = reply["GroupId"]
+        rows = self.poll(self.group_rows, 90)
+        self.evidence.save("network.json", {"group": self.group, "attempt": self.attempt})
+        need(rows[0]["IpPermissions"] == [])
+        if rows[0]["IpPermissionsEgress"]:
+            self.ec2(
+                "revoke_security_group_egress",
+                GroupId=self.group,
+                IpPermissions=rows[0]["IpPermissionsEgress"],
+            )
+        self.ec2(
+            "authorize_security_group_egress",
+            GroupId=self.group,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": 443,
+                    "ToPort": 443,
+                    "IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+                }
+            ],
+        )
+        row = self.group_rows()[0]
+        need(row["IpPermissions"] == [] and len(row["IpPermissionsEgress"]) == 1)
+        rule = row["IpPermissionsEgress"][0]
+        need(rule["IpProtocol"] == "tcp" and rule["FromPort"] == rule["ToPort"] == 443)
+        need(rule["IpRanges"] == [{"CidrIp": "0.0.0.0/0"}])
+        need(not any(rule.get(k) for k in ("Ipv6Ranges", "PrefixListIds", "UserIdGroupPairs")))
+
+    def launch_and_observe(self, payload):
+        self.stage = "launch"
+        request = launch_request(self.attempt, self.group, payload)
+        self.evidence.save(
+            "launch-public.json", {k: v for k, v in request.items() if k != "UserData"}
+        )
+        self.launch_started = True
+        self.ec2("run_instances", **request)  # Exactly one dispatch, never repeat on ambiguity.
+        self.stage = "instance_observation"
+        row = self.poll(self.instance_row, 120)
+        self.evidence.save(
+            "instance.json", {"instance": row["InstanceId"], "attempt": self.attempt}
+        )
+        observe_until = min(
+            time.monotonic() + BOUNDS["max_observation_seconds"], self.api.deadline - 480
+        )
+        while time.monotonic() < observe_until:
+            row = self.instance_row()
+            need(row is not None)
+            state = row["State"]["Name"]
+            if state == "stopped":
+                self.result["stopped_observed"] = True
+                return
+            if state in {"shutting-down", "terminated"}:
+                return
+            time.sleep(10)
+        raise TimeoutError("stop_observation_deadline")
+
+    def cleanup_instance(self):
+        if not self.launch_started:
+            self.result["terminated_verified"] = True
+            return
+        row = self.poll(self.instance_row, 120)  # Resolve ambiguity only by fresh client token.
+        if row["State"]["Name"] != "terminated":
+            self.ec2("terminate_instances", InstanceIds=[self.instance])
+
+        def terminated():
+            observed = self.instance_row()
+            return observed is not None and observed["State"]["Name"] == "terminated"
+
+        self.poll(terminated, 180)
+        self.result["terminated_verified"] = True
+
+    def cleanup_volumes(self):
+        if self.launch_started:
+            need(self.result.get("terminated_verified") is True)
+            self.poll(
+                lambda: (
+                    not self.ec2(
+                        "describe_volumes",
+                        Filters=[{"Name": "tag:LumiAttempt", "Values": [self.attempt]}],
+                    )["Volumes"]
+                ),
+                45,
+            )
+        self.result["volumes_absent_verified"] = True
+
+    def cleanup_group(self):
+        if self.group_started:
+            rows = self.group_rows()
+            if not rows:
+                # Creation may be ambiguous; one empty propagation read is not proof.
+                rows = self.poll(self.group_rows, 90)
+            if rows:
+                self.poll(
+                    lambda: (
+                        not self.ec2(
+                            "describe_network_interfaces",
+                            Filters=[{"Name": "group-id", "Values": [self.group]}],
+                        )["NetworkInterfaces"]
+                    ),
+                    60,
+                )
+                self.ec2("delete_security_group", GroupId=self.group)
+            self.poll(lambda: not self.group_rows(), 30)
+        self.result["security_group_absent_verified"] = True
+
+    def collect_reports(self):
+        if not self.launch_started:
+            self.result["reports_persisted"] = True
+            return
+        # Existing channel validates all four exact keys, raw schema and body bounds.
+        client = types.SimpleNamespace(
+            meta=self.api.clients["s3"].meta,
+            get_object=lambda **params: self.api.call("s3", "get_object", **params),
+        )
+        self.reports = self.channel.collect(
+            client, attempt=self.attempt, bindings=self.builder.BINDINGS
+        )
+        self.evidence.save("reports.json", self.reports)
+        self.result["reports"] = self.reports
+        self.result["reports_persisted"] = True
+
+    def cleanup_bucket(self):
+        if not self.bucket_started:
+            self.result["bucket_absent_verified"] = True
+            return
+        if not self.bucket_confirmed:
+            # A timed-out create followed by a single 404 is not proof of absence.
+            self.poll(lambda: not self.bucket_absent(), 60)
+            self.bucket_confirmed = True
+        if self.bucket_absent():
+            self.result["bucket_absent_verified"] = True
+            return
+        # A new random name was proven absent immediately before creation. All
+        # later operations require this account as bucket owner, including recovery.
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "RevokeReportPuts",
+                    "Effect": "Deny",
+                    "Principal": "*",
+                    "Action": "s3:PutObject",
+                    "Resource": "arn:aws:s3:::" + self.bucket + "/*",
+                }
+            ],
+        }
+        self.s3("put_bucket_policy", Policy=canonical(policy).decode())
+        need(
+            canonical(json.loads(self.s3("get_bucket_policy")["Policy"], object_pairs_hook=unique))
+            == canonical(policy)
+        )
+        self.result["deny_put_policy_readback"] = True
+        # Policy readback alone is not a propagation guarantee. A terminated guest
+        # has no sender; if it could still run, wait for all URL capabilities to expire.
+        if self.launch_started and not self.result.get("terminated_verified"):
+            need(time.time() >= self.urls_expire_at + 30)
+        need(self.result["reports_persisted"])  # Do not erase evidence after failed collection.
+        for slot in self.channel.SLOTS:
+            self.s3("delete_object", Key=self.channel.target(self.attempt, slot)[1])
+        self.s3("delete_bucket")
+        self.poll(self.bucket_absent, 30)
+        self.result["bucket_absent_verified"] = True
+
+    def execute(self):
+        try:
+            self.preflight()
+            self.stage = "package"
+            config, self.urls_expire_at = load("sft_vm_watchdog_login_refresh_v1.py").issue(
+                self.api.clients["s3"],
+                channel=self.channel,
+                attempt=self.attempt,
+                bindings=self.builder.BINDINGS,
+            )
+            payload, summary = self.builder.build(config)
+            del config
+            self.evidence.save("package-public.json", summary)
+            self.setup_bucket()
+            self.setup_group()
+            # Slow provisioning must not start a guest with near-expired capabilities.
+            self.stage = "capability_freshness"
+            need(self.urls_expire_at - time.time() >= 600)
+            self.launch_and_observe(payload)
+        except BaseException:
+            self.result["errors"].append(self.stage)
+        finally:
+            # Each cleanup is independent; a failed VM operation must not skip
+            # report preservation or bucket revocation. No cleanup mutation retry.
+            self.guard("instance_cleanup", self.cleanup_instance)
+            self.guard("volume_cleanup", self.cleanup_volumes)
+            self.guard("group_cleanup", self.cleanup_group)
+            self.guard("report_collection", self.collect_reports)
+            self.guard("bucket_cleanup", self.cleanup_bucket)
+            self.result["cleanup_verified"] = all(
+                self.result.get(k) is True
+                for k in (
+                    "terminated_verified",
+                    "volumes_absent_verified",
+                    "security_group_absent_verified",
+                    "bucket_absent_verified",
+                )
+            )
+            self.result.update(
+                self.channel.assess(
+                    self.reports,
+                    stopped_observed=self.result["stopped_observed"],
+                    cleanup_verified=self.result["cleanup_verified"] and not self.result["errors"],
+                )
+            )
+            self.result["controller_seconds"] = time.monotonic() - (self.api.deadline - 1800)
+            self.evidence.save("result.json", self.result)
+        return self.result
+
+
+def main():
+    need(sys.argv[1:] == ["--execute-approved-once"])
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    os.umask(0o077)
+    logging.disable(logging.CRITICAL)  # SDK debug output must never expose capabilities.
+    digest = validate_approval()  # Before credentials, network, output claims or mutations.
+    builder = load("prepare_sft_vm_watchdog_object_v2.py")
+    channel = load("sft_vm_watchdog_report_channel_v1.py")
+    need(not OUT.exists())
+    need(not (ROOT / "artifacts/lumi-vm-watchdog-object-attempt-v0.1").exists())
+    supplied = {}
+    try:
+        deadline = time.monotonic() + 1800
+        supplied = clients(credentials(deadline=deadline))
+        # Readiness failures do not consume the one-shot cloud attempt.
+        evidence = Evidence(OUT)
+        token = secrets.token_hex(16)
+        evidence.save(
+            "authorization.json",
+            {"approval_sha256": digest, "attempt": token, "contract": approval_contract()},
+        )
+        api = API(supplied, deadline)
+        result = Attempt(api, evidence, token, channel, builder).execute()
+        print(
+            canonical(
+                {
+                    "native_watchdog_qualified": result["native_watchdog_qualified"],
+                    "cleanup_verified": result["cleanup_verified"],
+                    "gate_5_complete": False,
+                }
+            ).decode(),
+            flush=True,
+        )
+        return 0 if result["native_watchdog_qualified"] else 1
+    except BaseException:
+        # Do not print exception/SDK response text, including on CLI export failure.
+        print('{"controller_completed":false,"gate_5_complete":false}', flush=True)
+        return 1
+    finally:
+        for client in supplied.values():
+            client.close()
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception:
+        raise SystemExit("object_controller_preflight_rejected") from None

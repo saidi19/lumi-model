@@ -1,0 +1,266 @@
+import hashlib
+import importlib
+import json
+import os
+import stat
+import threading
+import types
+import unittest
+from unittest.mock import patch
+
+from tests import test_sft_vm_fullsize_credential_setup_v1 as prior
+
+m = importlib.import_module(prior.fixture.PACKAGE + ".posttraining_vm_detached_parent_v1")
+ID = prior.fixture.ID
+
+
+class DetachedTests(unittest.TestCase):
+    def setUp(self):
+        self.host = prior.SetupTests(
+            "test_pipe_mount_write_acquire_cleanup_and_frozen_handoff_joined"
+        )
+        self.addCleanup(self.host.doCleanups)
+        self.host.setUp()
+        previous_commands = self.host.run.side_effect
+
+        def commands(args, *a, **kw):
+            if args[0] == "/usr/bin/systemd-run" and "--unit=" + m.unit(ID) in args:
+                self.host.events.append(args)
+                return types.SimpleNamespace(returncode=0, stdout=b"")
+            return previous_commands(args, *a, **kw)
+
+        self.host.run.side_effect = commands
+        self.root = self.host.destination
+        self.entry = self.root / "controller" / "parent.py"
+        self.entry.parent.mkdir(mode=0o700)
+        self.entry.write_bytes(b"synthetic admitted wrapper placeholder; never executed")
+        self.entry.chmod(0o400)
+        self.pin = hashlib.sha256(self.entry.read_bytes()).hexdigest()
+        self.enterContext(patch.object(m.handoff.frozen, "root_owned"))
+        small = m.handoff.frozen.small
+        self.enterContext(
+            patch.object(
+                m.handoff.frozen,
+                "small",
+                side_effect=lambda path, *a: (
+                    f"0::/system.slice/{m.unit(ID)}".encode()
+                    if str(path) == "/proc/self/cgroup"
+                    else small(path, *a)
+                ),
+            )
+        )
+        self.raw = json.dumps(prior.credentials()).encode()
+
+    def dispatch(self):
+        return m._dispatch_admitted_once(ID, self.pin, machine_id="b" * 32)
+
+    def submit(self):
+        return m._submit_admitted_once(ID, self.raw, machine_id="b" * 32)
+
+    def serve(self):
+        return m._serve_admitted_once(ID, self.host.pins, prior.fixture.PINS, machine_id="b" * 32)
+
+    def test_detached_command_no_ssh_pipe_no_logs_or_restart(self):
+        command = m.command(ID, self.pin)
+        self.assertIn("--no-block", command)
+        for setting in (
+            "Restart=no",
+            "StandardInput=null",
+            "StandardOutput=null",
+            "StandardError=null",
+            "PrivateMounts=no",
+            "PrivateNetwork=no",
+            "RuntimeMaxSec=8435",
+            "TimeoutStopSec=60",
+            "LimitCORE=0",
+            "RemainAfterExit=no",
+        ):
+            self.assertIn("--property=" + setting, command)
+        self.assertTrue(any(c.startswith("--property=ExecStopPost=") for c in command))
+        self.assertNotIn("--pipe", command)
+        self.assertNotIn("--wait", command)
+
+    def test_wrong_entry_hash_prevents_dispatch(self):
+        with self.assertRaises(ValueError):
+            m._dispatch_admitted_once(ID, "0" * 64, machine_id="b" * 32)
+        self.assertFalse((self.root / "detached-dispatch.started.json").exists())
+
+    def test_dispatch_marker_consumed_even_if_start_ambiguous(self):
+        original = m.handoff.frozen.run_command
+
+        def commands(args, *a, **kw):
+            if args[0] == "/usr/bin/systemd-run":
+                raise TimeoutError("private-error")
+            return original(args, *a, **kw)
+
+        with patch.object(m.handoff.frozen, "run_command", side_effect=commands):
+            with self.assertRaises(TimeoutError):
+                self.dispatch()
+        with self.assertRaises(FileExistsError):
+            self.dispatch()
+
+    def test_fifo_end_to_end_into_existing_workflow(self):
+        self.dispatch()
+        errors = []
+
+        def worker():
+            try:
+                self.serve()
+            except BaseException as error:
+                errors.append(type(error).__name__)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        self.assertFalse(self.submit()["workflow_completed"])
+        thread.join(timeout=3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.host.done.assert_called_once()
+        self.assertFalse((self.root / "credential-delivery.fifo").exists())
+        self.assertFalse(self.host.secret.exists())
+        self.assertTrue((self.root / "detached-parent.result.json").exists())
+        for path in self.root.glob("*.json"):
+            raw = path.read_bytes()
+            self.assertNotIn(b"synthetic-secret", raw)
+            self.assertNotIn(b"synthetic-token", raw)
+        with self.assertRaises((ValueError, FileNotFoundError, FileExistsError)):
+            self.submit()
+
+    def test_oversize_and_invalid_credentials_not_written(self):
+        self.dispatch()
+        for raw in (b"x" * 65537, b"{}"):
+            with self.assertRaises(ValueError):
+                m._submit_admitted_once(ID, raw, machine_id="b" * 32)
+        self.assertFalse((self.root / "credential-delivery.started.json").exists())
+
+    def test_partial_write_marks_consumed_and_cannot_resubmit(self):
+        self.dispatch()
+        fifo = self.root / "credential-delivery.fifo"
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        self.addCleanup(os.close, reader)
+        write = os.write
+        calls = []
+
+        def partial(fd, data):
+            if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                return write(fd, data)
+            calls.append(len(data))
+            if len(calls) == 1:
+                return write(fd, data[:3])
+            raise OSError("synthetic-secret")
+
+        with patch.object(m.os, "write", side_effect=partial), self.assertRaises(ValueError):
+            self.submit()
+        self.assertEqual(os.read(reader, 100), self.raw[:3])
+        with self.assertRaises(FileExistsError):
+            self.submit()
+        self.assertFalse((self.root / "credential-delivery.sent.json").exists())
+
+    def test_receive_timeout_no_workflow(self):
+        self.dispatch()
+        with patch.object(m, "WAIT_INPUT", 0.01), self.assertRaises(ValueError):
+            self.serve()
+        self.host.done.assert_not_called()
+        failure = json.loads((self.root / "detached-parent.failed.json").read_text())
+        self.assertEqual(failure["phase"], "receive")
+
+    def test_wrong_parent_cgroup_prevents_credential_read(self):
+        self.dispatch()
+        with (
+            patch.object(m.handoff.frozen, "small", return_value=b"0::/wrong.service"),
+            patch.object(m.setup, "_run_admitted_once") as workflow,
+            self.assertRaises(ValueError),
+        ):
+            self.serve()
+        workflow.assert_not_called()
+        self.assertFalse((self.root / "detached-parent.started.json").exists())
+
+    def test_stop_post_reads_all_exact_units_without_deleting_evidence(self):
+        seen = []
+
+        def commands(args, *a, **kw):
+            seen.append(args)
+            return types.SimpleNamespace(returncode=0, stdout=b"not-found\n")
+
+        with patch.object(m.handoff.frozen, "run_command", side_effect=commands):
+            m._stop_children_admitted(ID)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(
+            {a[2] for a in seen},
+            {
+                m.handoff.unit_name(ID, "acquire"),
+                m.handoff.unit_name(ID, "import"),
+                m.setup.completion.verify_unit(ID),
+            },
+        )
+        self.assertTrue((self.root / "detached-stop.result.json").exists())
+        with self.assertRaises(FileExistsError):
+            m._stop_children_admitted(ID)
+
+    def test_cleanup_failure_still_attempts_all_three_units(self):
+        with (
+            patch.object(
+                m.handoff.frozen,
+                "run_command",
+                return_value=types.SimpleNamespace(returncode=0, stdout=b"loaded\n"),
+            ),
+            patch.object(
+                m.handoff, "_stop_and_reap", side_effect=[ValueError(), None, None]
+            ) as stop,
+            self.assertRaises(ValueError),
+        ):
+            m._stop_children_admitted(ID)
+        self.assertEqual(stop.call_count, 3)
+        result = json.loads((self.root / "detached-stop.result.json").read_text())
+        self.assertFalse(result["children_reaped"])
+        self.assertEqual(result["failed_phases"], ["acquire"])
+        self.assertFalse(result["output_deletion_allowed"])
+
+    def test_status_never_launches_or_reads_secret(self):
+        def commands(args, *a, **kw):
+            self.assertEqual(args[:2], ["/usr/bin/systemctl", "show"])
+            return types.SimpleNamespace(
+                returncode=0, stdout=b"ActiveState=inactive\nSubState=dead\nResult=success\n"
+            )
+
+        with patch.object(m.handoff.frozen, "run_command", side_effect=commands):
+            for _ in range(2):
+                result = m._status_admitted(ID)
+                self.assertEqual(result["state"], "not_started")
+                self.assertFalse(result["children_reaped"])
+
+    def test_interrupted_parent_status_does_not_restart(self):
+        m.marker(self.root, "detached-parent.started.json", {"retry_allowed": False})
+        with patch.object(
+            m.handoff.frozen,
+            "run_command",
+            return_value=types.SimpleNamespace(
+                returncode=0, stdout=b"ActiveState=inactive\nSubState=dead\nResult=success\n"
+            ),
+        ) as commands:
+            result = m._status_admitted(ID)
+        self.assertEqual(result["state"], "interrupted")
+        self.assertFalse(result["retry_allowed"])
+        self.assertEqual(commands.call_args.args[0][:2], ["/usr/bin/systemctl", "show"])
+
+    def test_saved_cleanup_receipt_requires_current_empty_children(self):
+        m.marker(self.root, "detached-stop.result.json", {"children_reaped": True})
+        with (
+            patch.object(
+                m.handoff.frozen,
+                "run_command",
+                return_value=types.SimpleNamespace(returncode=0, stdout=b"ActiveState=inactive\n"),
+            ),
+            patch.object(
+                m.handoff.frozen,
+                "cgroup_empty",
+                side_effect=lambda name: name != m.handoff.unit_name(ID, "import"),
+            ),
+        ):
+            result = m._status_admitted(ID)
+        self.assertFalse(result["children_reaped"])
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_public_entry_remains_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)

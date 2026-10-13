@@ -1,0 +1,65 @@
+# SFT execution status v0.58
+
+Local-only handoff, 2026-09-09. User requested a proper cost-conscious fix and
+asked whether GPU would accelerate Gate 5. GPU does not address this test/CI
+blocker; no GPU rental, instance or native workload was started.
+
+## Completed correction
+
+The exact four-file Source-test correction in v0.57 was committed and published:
+
+- Commit: `535ffc2c9be4f9611fd051a8e632b3696f30250d`.
+- Parent/accepted runtime commit: `c4272e36bc98354067dd23a83931a3db58823d76`.
+- Same private repository and branch: `saidi19/lumi-model`,
+  `codex/lumi-posttraining-product-v0.1`.
+- GitHub tree/commit identities and branch readback matched local objects;
+  update was non-force, exactly three modified paths and one added plan.
+- Corrected guard now checks its own stdlib-only/AST-only behavior while allowing
+  unrelated tests' earlier ML imports. Two synthetic-registry regressions retain
+  native-probe rejection and verify that failure without importing ML locally.
+- No test skip, xfail, version-policy relaxation or runtime change was added.
+- 416 selected pure/synthetic/AST tests passed; affected 42 tests passed again
+  after tightening the exact workflow-condition assertion. Exact-file Ruff passed.
+
+The accepted CPU workflow now requires the exact already-accepted parent SHA,
+in addition to its private repository and first-attempt guards. A workflow run
+on this repair commit therefore cannot execute its acceptance job. Source/Spark
+remain the intended checks. No second image build or accepted-workload retry.
+The original accepted commit's workflow and reports remain preserved in Git.
+
+## Remote verification is not complete
+
+After publication, repeated bounded read-only checks found zero Actions runs
+and zero commit check-runs for the repair SHA. Branch readback confirms the
+commit is present. The Source, Spark and CPU-lookup workflow definitions are
+all active, but the available evidence does not explain why this push has not
+produced checks. Do not claim they are queued, running, passed or failed.
+
+No dummy commit, repush, force update, workflow dispatch, acceptance rerun,
+automation or billing action was used to work around this state. The next safe
+action is read-only inspection of this same repair SHA. If checks appear,
+confirm the CPU job is skipped and inspect Source/Spark outcomes. Do not treat
+the local tests as a substitute for the new monolithic Source-CI result.
+
+Current confirmed results remain:
+
+- Accepted CPU run `34345663337`: passed, tied to c4272e3 and its saved private
+  software image. No invalidation or repeat is needed for this test-only fix.
+- Prior Spark run `34345663220`: 3 passed.
+- Prior Source run `34345663154`: 1 failed (the repaired guard), 5,051 passed;
+  its failure remains historical evidence, not silently relabelled success.
+
+## Roadmap and cost boundary
+
+Gate 5 remains partial. Finish this Source-CI verification, then complete the
+accepted image's guardian/worker/supervisor admission integration. A GPU does
+not remove these requirements. Dedicated host binding, original pretrained
+S3 checkpoint restoration, exact data relocation and approved H100/CUDA tests
+follow only when their dependencies are ready. No real SFT or production
+eligibility is granted by this change.
+
+The Mac performed small source edits, pure/AST tests, lint and metadata checks
+only. No native builder/fixture/ML imports, image or wheel download, real
+checkpoint/data reads, S3/SSH, GPU/instance, real inference/training, registry
+push, seal or promotion occurred. No further paid runtime was started while
+waiting for absent CI registration.

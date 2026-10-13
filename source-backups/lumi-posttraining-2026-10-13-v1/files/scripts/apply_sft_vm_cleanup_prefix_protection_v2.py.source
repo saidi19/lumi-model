@@ -1,0 +1,88 @@
+"""Transport-only successor after v1 failed before its policy PUT.
+
+Use the verified CLI JSON argument mode for non-secret policy metadata. No raw
+policy is printed or saved; unlike v1 it is visible in the short-lived process
+arguments. Never put credentials in these fields. Preserve v1 and attempt-001.
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+from pathlib import Path
+
+import apply_sft_vm_cleanup_prefix_protection_v1 as base
+
+BASE_SHA = "265cc029e35e68c516c49736b937b6a7ec972a906bc6012d690e85f4ed7dc80f"
+FAILED_SHA = "83732c4cd1667474ac3308b053a578bae87675bb79a9309bd577984157662678"
+OUTPUT = base.ROOT / "artifacts/lumi-vm-cleanup-prefix-policy-update-v0.1/attempt-002"
+
+
+class Cloud:
+    def call(self, service, operation, **fields):
+        base.need(
+            (service, operation)
+            in {
+                ("sts", "get-caller-identity"),
+                ("s3api", "get-bucket-policy"),
+                ("s3api", "put-bucket-policy"),
+                ("s3api", "get-bucket-policy-status"),
+            }
+        )
+        if service == "sts":
+            base.need(fields == {})
+        else:
+            base.need(
+                fields.get("Bucket") == base.BUCKET
+                and fields.get("ExpectedBucketOwner") == base.ACCOUNT
+            )
+            base.need(
+                set(fields)
+                == {"Bucket", "ExpectedBucketOwner"}
+                | ({"Policy"} if operation == "put-bucket-policy" else set())
+            )
+        answer = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                service,
+                operation,
+                "--cli-input-json",
+                base.canonical(fields),
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "5",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=20,
+            env=dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER=""),
+        )
+        base.need(len(answer.stdout) <= 32768 and len(answer.stderr) <= 4096)
+        base.need(answer.returncode == 0)
+        return (
+            json.loads(answer.stdout, object_pairs_hook=base.unique)
+            if answer.stdout.strip()
+            else {}
+        )
+
+
+def run():
+    base.need(hashlib.sha256(Path(base.__file__).read_bytes()).hexdigest() == BASE_SHA)
+    previous = base.OUTPUT / "result.json"
+    raw = previous.read_bytes()
+    base.need(hashlib.sha256(raw).hexdigest() == FAILED_SHA)
+    result = json.loads(raw)
+    base.need(result["put_attempted"] is False and result["failed_stage"] == "identity")
+    return base.run_once(OUTPUT, Cloud())
+
+
+if __name__ == "__main__":
+    print(base.canonical(run()))

@@ -1,0 +1,458 @@
+"""Generated source is real; native identity/commands and SSH are doubled."""
+
+import copy
+import hashlib
+import importlib
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("qualify_sft_vm_existing_runtime_v1")
+d = importlib.import_module("run_sft_vm_runtime_qualification_delivery_v1")
+
+
+def reply():
+    return dict(
+        schema="lumi.vm-existing-runtime-qualification.v0.1",
+        attempt=m.ATTEMPT,
+        qualification_attempt=m.QUALIFICATION,
+        status="passed_generated_only",
+        source_files_verified=49,
+        generated_files_unchanged=61,
+        full_input_audits=2,
+        **{key: True for key in d.TRUE},
+        **{key: False for key in d.FALSE},
+    )
+
+
+def native_reply():
+    return dict(
+        schema="lumi.vm-coordinator-native-rehearsal.v0.1",
+        status="passed_generated_only",
+        summary=dict(
+            schema="lumi.vm-coordinator-generated-result.v0.1",
+            status="passed",
+            control_sha256="a" * 64,
+            full_input_audits=2,
+            independent_checksum_consumer=True,
+            coordinator_read_bytes_reserved=1024,
+            private_write_bytes_reserved=1024,
+            package_manifest_sha256="b" * 64,
+            real_4b_import=False,
+            training_authorized=False,
+            production_eligible=False,
+            fullsize_resource_admission=False,
+        ),
+        both_cgroups_empty=True,
+        staged_input_and_source_files_unchanged=61,
+        real_4b_import=False,
+        training_authorized=False,
+        production_eligible=False,
+        cumulative_native_write_limit_claimed=False,
+        billing_managed=False,
+        generated_tmpfs_unmounted=True,
+    )
+
+
+class SourceTests(unittest.TestCase):
+    def setUp(self):
+        self.raw = d.ARCHIVE.read_bytes()
+        self.bodies = m.unpack(self.raw)
+        self.base = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.root, self.attempts = self.base / "source", self.base / "attempts"
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.enterContext(patch.object(m, "ATTEMPTS", self.attempts))
+        self.enterContext(patch.object(m, "trusted_directory"))
+        self.enterContext(patch.object(m, "root_owner"))
+
+    def test_frozen_corrected_bundle_contains_only_49_sources_and_two_controls(self):
+        self.assertEqual(len(self.bodies), 51)
+        self.assertEqual(hashlib.sha256(self.raw).hexdigest(), m.ARCHIVE_SHA)
+        self.assertEqual(m.sha(d.SOURCE.read_bytes()), d.SOURCE_SHA)
+        self.assertEqual(m.sha(d.readiness.SOURCE.read_bytes()), m.READINESS_SHA)
+        self.assertNotIn(m.ATTEMPT, m.QUALIFICATION)
+
+    def test_changed_or_truncated_archive_rejected_before_writes(self):
+        for raw in (self.raw[:-1], self.raw + b"x", bytes(len(self.raw))):
+            with self.assertRaises(ValueError):
+                m.unpack(raw)
+        self.assertFalse(self.root.exists())
+
+    def test_install_does_not_reinstall_runtime_and_survives_private_umask(self):
+        old = os.umask(0o077)
+        try:
+            m.install_sources(self.bodies)
+        finally:
+            os.umask(old)
+        m.verify_sources(self.bodies)
+        self.assertEqual(len(list(self.root.rglob("*.py"))), 49)
+        self.assertEqual({p.name for p in self.base.iterdir()}, {"source", "attempts"})
+        self.assertEqual(self.attempts.stat().st_mode & 0o777, 0o700)
+
+    def test_existing_release_is_consumed_not_repaired_or_retried(self):
+        m.install_sources(self.bodies)
+        with self.assertRaises(FileExistsError):
+            m.install_sources(self.bodies)
+        m.verify_sources(self.bodies)
+
+    def test_partial_installation_is_preserved_and_cannot_be_retried(self):
+        original = m.write_new
+        calls = []
+
+        def fail_second(path, raw, mode):
+            calls.append(path)
+            if len(calls) == 2:
+                raise OSError("synthetic_disk_full")
+            return original(path, raw, mode)
+
+        with patch.object(m, "write_new", side_effect=fail_second):
+            with self.assertRaises(OSError):
+                m.install_sources(self.bodies)
+        self.assertTrue(calls[0].is_file())
+        with self.assertRaises(FileExistsError):
+            m.install_sources(self.bodies)
+
+    def test_modified_source_rejected(self):
+        m.install_sources(self.bodies)
+        path = self.root / m.CONTROL
+        path.chmod(0o600)
+        path.write_bytes(b"bad")
+        path.chmod(0o444)
+        with self.assertRaises(ValueError):
+            m.verify_sources(self.bodies)
+
+    def test_extra_directory_rejected(self):
+        m.install_sources(self.bodies)
+        (self.root / "unexpected").mkdir(mode=0o755)
+        with self.assertRaises(ValueError):
+            m.verify_sources(self.bodies)
+
+    def test_link_replacing_source_rejected(self):
+        m.install_sources(self.bodies)
+        path = self.root / m.CONTROL
+        path.unlink()
+        path.symlink_to(self.root / "release-manifest.json")
+        with self.assertRaises(ValueError):
+            m.verify_sources(self.bodies)
+
+    def test_hardlinked_source_rejected(self):
+        m.install_sources(self.bodies)
+        os.link(self.root / m.CONTROL, self.base / "alias")
+        with self.assertRaises(ValueError):
+            m.verify_sources(self.bodies)
+
+    def test_writable_source_rejected(self):
+        m.install_sources(self.bodies)
+        (self.root / m.CONTROL).chmod(0o644)
+        with self.assertRaises(ValueError):
+            m.verify_sources(self.bodies)
+
+    def test_frozen_real_validator_rejects_claimed_fullsize_success(self):
+        m.install_sources(self.bodies)
+        control = m.load("_test_frozen_generated", self.bodies[m.CONTROL], self.root / m.CONTROL)
+        self.assertEqual(m.validate_native(native_reply(), control), 61)
+        for scope, key, value in (
+            ("outer", "generated_tmpfs_unmounted", False),
+            ("outer", "real_4b_import", True),
+            ("outer", "staged_input_and_source_files_unchanged", True),
+            ("summary", "fullsize_resource_admission", True),
+            ("summary", "full_input_audits", 1),
+            ("summary", "control_sha256", "bad"),
+            ("summary", "private_write_bytes_reserved", 4 * 1024**2 + 1),
+        ):
+            report = native_reply()
+            (report if scope == "outer" else report["summary"])[key] = value
+            with self.assertRaises(ValueError):
+                m.validate_native(report, control)
+
+    def test_mac_boundary_precedes_all_installed_host_access(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "unpack") as unpack:
+            with self.assertRaises(ValueError):
+                m._qualify_same_host({}, b"", b"")
+            unpack.assert_not_called()
+
+
+class NativeCompositionTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.ready = d.readiness.SOURCE.read_bytes()
+        self.request = dict(machine_id="a" * 32, host_deadline_boottime=14300)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.enterContext(patch.object(m, "boundary"))
+        self.enterContext(patch.object(m, "unpack", return_value={m.CONTROL: b"source"}))
+        self.install = self.enterContext(
+            patch.object(m, "install_sources", side_effect=lambda _: self.events.append("install"))
+        )
+        self.verify = self.enterContext(
+            patch.object(m, "verify_sources", side_effect=lambda _: self.events.append("verify"))
+        )
+        self.boot = self.enterContext(patch.object(m, "boot_time", return_value=1000))
+        self.enterContext(patch.object(m.time, "monotonic", return_value=1))
+        self.readiness = types.SimpleNamespace(
+            _inspect_same_host=Mock(side_effect=lambda _: self.events.append("readiness"))
+        )
+        self.control = types.SimpleNamespace(
+            ROOT=self.root,
+            ATTEMPTS=m.ATTEMPTS,
+            TOTAL_SECONDS=240,
+            MODES=("prepare", "import"),
+            launch=Mock(side_effect=lambda **_: (self.events.append("launch"), native_reply())[1]),
+            cgroup_empty=Mock(return_value=True),
+            unit_name=lambda attempt, mode: mode,
+        )
+        self.enterContext(patch.object(m, "load", side_effect=[self.readiness, self.control]))
+        self.enterContext(patch.object(m, "validate_native", return_value=61))
+
+    def call(self):
+        return m._qualify_same_host(self.request, b"synthetic", self.ready)
+
+    def test_same_boot_readiness_before_and_after_exact_frozen_launch(self):
+        result = self.call()
+        self.assertEqual(
+            self.events, ["readiness", "install", "verify", "launch", "verify", "readiness"]
+        )
+        self.control.launch.assert_called_once_with(
+            machine_id="a" * 32, attempt=m.QUALIFICATION, release_sha256=m.MANIFEST_SHA
+        )
+        self.assertEqual(d.validate_reply(result), result)
+        self.assertFalse(result["host_admitted"] or result["real_4b_import"])
+        self.assertTrue((self.root / "qualification.json").is_file())
+
+    def test_deadline_reserves_full_workflow_before_source_write(self):
+        self.boot.return_value = 14300 - m.RESERVE - m.SECONDS
+        with self.assertRaises(ValueError):
+            self.call()
+        self.install.assert_not_called()
+        self.control.launch.assert_not_called()
+
+    def test_failed_original_request_or_readiness_never_stages(self):
+        self.readiness._inspect_same_host.side_effect = ValueError("bad_boot")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.install.assert_not_called()
+
+    def test_readiness_source_drift_never_executes(self):
+        with self.assertRaises(ValueError):
+            m._qualify_same_host(self.request, b"synthetic", self.ready + b"x")
+        self.readiness._inspect_same_host.assert_not_called()
+
+    def test_launch_failure_preserved_without_exception_text_or_retry(self):
+        self.control.launch.side_effect = ValueError("private-secret")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.control.launch.assert_called_once()
+        self.assertNotIn("private-secret", (self.root / "qualification-failed.json").read_text())
+        self.assertFalse((self.root / "qualification.json").exists())
+
+    def test_unclean_cgroup_cannot_qualify(self):
+        self.control.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "qualification.json").exists())
+
+    def test_postflight_guard_failure_cannot_qualify(self):
+        self.readiness._inspect_same_host.side_effect = [None, ValueError("guard_changed")]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertTrue((self.root / "qualification-failed.json").exists())
+
+    def test_postflight_source_change_cannot_qualify(self):
+        self.verify.side_effect = [None, ValueError("source_changed")]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "qualification.json").exists())
+        self.control.launch.assert_called_once()
+
+
+class ChannelTests(unittest.TestCase):
+    def setUp(self):
+        from tests.test_sft_vm_retention_delivery_v1 import BINDING
+
+        self.binding = dict(BINDING)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.key = self.root / "synthetic-key"
+        self.key.write_bytes(b"SYNTHETIC-NOT-KEY")
+        self.key.chmod(0o600)
+        conn = d.sender.delivery.connection
+        config = conn.ssh_config(self.binding, self.key, self.root / "known_hosts").encode()
+        hosts = b"SYNTHETIC-PINNED-HOST"
+        for name, raw in (("ssh_config", config), ("known_hosts", hosts)):
+            (self.root / name).write_bytes(raw)
+            (self.root / name).chmod(0o600)
+        self.config_pin, self.hosts_pin = map(m.sha, (config, hosts))
+        self.request = dict(
+            schema="lumi.vm-detached-setup-request.v0.1",
+            attempt=m.ATTEMPT,
+            machine_id="a" * 32,
+            boot_id="12345678-1234-1234-1234-123456789012",
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14300,
+            volumes={k: self.binding[k] for k in ("root_volume", "work_volume")},
+        )
+        self.reply = reply()
+        self.exchange = self.enterContext(
+            patch.object(d, "pipe_exchange", side_effect=lambda *a: json.dumps(self.reply).encode())
+        )
+
+    def call(self, **changes):
+        kw = dict(deadline=1000, remaining_control_bytes=300000, clock=lambda: 0)
+        return d._qualify_channel_once(
+            self.root / "qualification",
+            self.binding,
+            self.key,
+            self.root,
+            self.config_pin,
+            self.hosts_pin,
+            self.request,
+            **(kw | changes),
+        )
+
+    def test_single_source_only_exchange_uses_authentic_pins_and_charges_bytes(self):
+        result = self.call()
+        argv, raw, timeout = self.exchange.call_args.args
+        self.assertEqual(timeout, 610)
+        self.assertGreater(len(raw), 65536)
+        self.assertEqual(
+            raw, d.SOURCE.read_bytes() + d.readiness.SOURCE.read_bytes() + d.ARCHIVE.read_bytes()
+        )
+        self.assertEqual(result["control_content_bytes_charged"], len(raw) + len(argv[-1].encode()))
+        self.assertIn("signal.alarm(600)", argv[-1])
+        self.assertNotIn("ASIA", argv[-1])
+        self.assertFalse(result["host_admitted"])
+        self.exchange.assert_called_once()
+
+    def test_lost_reply_consumes_attempt_and_scrubs_error(self):
+        self.exchange.side_effect = TimeoutError("private-secret")
+        with self.assertRaises(ValueError):
+            self.call()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.exchange.assert_called_once()
+        self.assertNotIn("private-secret", (self.root / "qualification/result.json").read_text())
+
+    def test_expired_deadline_or_byte_budget_rejected_before_exchange(self):
+        for change in (
+            {"deadline": 610},
+            {"deadline": float("nan")},
+            {"remaining_control_bytes": 65536},
+            {"remaining_control_bytes": True},
+        ):
+            with self.assertRaises(ValueError):
+                self.call(**change)
+        self.exchange.assert_not_called()
+
+    def test_known_host_drift_rejected_before_exchange(self):
+        (self.root / "known_hosts").write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_original_volume_mismatch_rejected_before_exchange(self):
+        self.request["volumes"]["root_volume"] = "vol-" + "9" * 17
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_false_cleanup_or_extra_text_or_admission_rejected(self):
+        for key, value in (
+            ("host_admitted", True),
+            ("retry_allowed", True),
+            ("generated_tmpfs_unmounted", False),
+            ("exception_text", "secret"),
+            ("full_input_audits", True),
+            ("generated_files_unchanged", 300),
+        ):
+            bad = copy.deepcopy(self.reply)
+            bad[key] = value
+            with self.assertRaises(ValueError):
+                d.validate_reply(bad)
+
+    def test_public_entries_remain_closed(self):
+        for module in (m, d):
+            with self.assertRaises(ValueError):
+                module.run(approved=True)
+
+
+class TransportTests(unittest.TestCase):
+    def setUp(self):
+        self.process = Mock(pid=123, wait=Mock(return_value=0))
+        self.process.stdin.fileno.return_value = 10
+        self.process.stdout.fileno.return_value = 11
+        self.popen = self.enterContext(
+            patch.object(d.subprocess, "Popen", return_value=self.process)
+        )
+        self.kill = self.enterContext(patch.object(d.os, "killpg"))
+        self.enterContext(patch.object(d.os, "set_blocking"))
+        self.write = self.enterContext(
+            patch.object(d.os, "write", side_effect=lambda fd, data: len(data))
+        )
+        self.read = self.enterContext(patch.object(d.os, "read", side_effect=[b"{}", b""]))
+        self.enterContext(patch.object(d.time, "monotonic", return_value=1))
+        self.keys = {}
+        selector = Mock()
+        selector.__enter__ = Mock(return_value=selector)
+        selector.__exit__ = Mock(return_value=None)
+
+        def register(stream, events, tag):
+            self.keys[tag] = types.SimpleNamespace(fd=stream.fileno(), data=tag, fileobj=stream)
+
+        def unregister(stream):
+            for tag, key in list(self.keys.items()):
+                if key.fileobj is stream:
+                    del self.keys[tag]
+
+        selector.register.side_effect = register
+        selector.unregister.side_effect = unregister
+        selector.get_map.side_effect = lambda: self.keys
+        selector.select.side_effect = lambda _: [(key, 0) for key in list(self.keys.values())]
+        self.enterContext(patch.object(d.selectors, "DefaultSelector", return_value=selector))
+
+    def test_actual_transport_logic_accepts_source_body_over_old_credential_cap(self):
+        self.assertEqual(d.pipe_exchange(["synthetic-ssh"], b"x" * 230000, 610), b"{}")
+        self.assertEqual(sum(len(call.args[1]) for call in self.write.call_args_list), 230000)
+        self.assertGreater(self.write.call_count, 1)
+        self.assertTrue(self.process.stdin.close.called and self.process.stdout.close.called)
+        self.kill.assert_called_once()
+
+    def test_oversized_body_and_timeout_reject_before_spawn(self):
+        for body, seconds in ((b"x" * 247405, 610), (b"x", 611), (b"x", float("nan"))):
+            with self.assertRaises(ValueError):
+                d.pipe_exchange(["synthetic-ssh"], body, seconds)
+        self.popen.assert_not_called()
+
+    def test_reply_overflow_kills_and_reaps_without_leaking_payload(self):
+        self.read.side_effect = [b"x" * 4097]
+        with self.assertRaisesRegex(ValueError, "^qualification_ssh_exchange_failed$"):
+            d.pipe_exchange(["synthetic-ssh"], b"input", 610)
+        self.kill.assert_called_once()
+        self.process.wait.assert_called_once_with(timeout=5)
+
+    def test_partial_write_and_transient_backpressure(self):
+        self.write.side_effect = [BlockingIOError(), 1, 2]
+        self.assertEqual(d.pipe_exchange(["synthetic-ssh"], b"abc", 610), b"{}")
+        self.assertEqual(self.write.call_count, 3)
+
+    def test_remote_failure_is_reaped_without_retry(self):
+        self.process.wait.side_effect = [1, 1]
+        with self.assertRaisesRegex(ValueError, "^qualification_ssh_exchange_failed$"):
+            d.pipe_exchange(["synthetic-ssh"], b"abc", 610)
+        self.popen.assert_called_once()
+        self.kill.assert_called_once()
+
+    def test_elapsed_deadline_kills_once_without_waiting_for_more_output(self):
+        with patch.object(d.time, "monotonic", side_effect=[1, 612]):
+            with self.assertRaisesRegex(ValueError, "^qualification_ssh_exchange_failed$"):
+                d.pipe_exchange(["synthetic-ssh"], b"abc", 610)
+        self.write.assert_not_called()
+        self.kill.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

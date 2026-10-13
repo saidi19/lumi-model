@@ -1,0 +1,130 @@
+"""Offline structural verifier for attempt-018 read-only preflight v0.5."""
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+SOURCE_RELEASE_SHA = "29b71cbaf944c97867bc8466e19aa8ff3e89834ec12641ff0744f651b70d9bfb"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-018-source-v0.4-verification-v0.1.json"
+SOURCE_PROOF_SHA = "51e9601a927d7e183e2c8006c625e8435e592bcf93905f3eb7288945532f8150"
+FAILURE = "evidence/lumi-vm-attempt-018-source-v0.3-authentication-failure-v0.1.json"
+FAILURE_SHA = "8d6de31036d320ca2d4e588981450596f08a361b6a77ee7d321fd7dcfdbf2543"
+ENTRY = "scripts/preflight_sft_vm_attempt018_v5.py"
+ENTRY_SHA = "cb1f32ffc2cee047e1274ffea93af86be011245c3829df0f7e6748b6a2204dec"
+TEST = "tests/test_sft_vm_attempt018_readonly_preflight_v5.py"
+TEST_SHA = "ae6821f03d57623ad6c5cdbcd34d60b1f9a85f64ac2c55b840a685487468132e"
+BINDINGS = "scripts/prepare_sft_vm_deployment_bindings_v15.py"
+BINDINGS_SHA = "3e52f542a37d49aafd292fb211682c81644372aba0f3ced6c70a4becf328ab80"
+RUN = "artifacts/lumi-vm-attempt-018-readonly-preflight-v0.5"
+FILES = {
+    "started.json": "d212a13db0947ef8e0e2283d0ead2ecb424dac192c0c166a15fe6aa0b5c5bba5",
+    "admission.json": "972a79f6c3e48ed2b5ab484c7ca9b19895b83f296f7097079f6f76742f3873b9",
+    "result.json": "0ee1be78e32e4b58902cfe3007cb2b0f59eebb1df6f67654dd7fb421cd8387af",
+}
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-018-readonly-preflight-verification-v0.5.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_preflight_v5_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest):
+    path = ROOT / name
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def verify():
+    for name, digest in (
+        (ENTRY, ENTRY_SHA),
+        (TEST, TEST_SHA),
+        (BINDINGS, BINDINGS_SHA),
+        (SOURCE_PROOF, SOURCE_PROOF_SHA),
+        (FAILURE, FAILURE_SHA),
+    ):
+        read(name, digest)
+    source = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    need(
+        source["source_release_sha256"] == SOURCE_RELEASE_SHA
+        and source["outer_source_authentication_verified"] is True
+        and source["sha256_and_byte_count_closure_verified"] is True
+    )
+    started, admission, result = (
+        json.loads(read(RUN + "/" + name, digest)) for name, digest in FILES.items()
+    )
+    need(
+        started["execution_authorized"] is False
+        and started["max_calls"] == 79
+        and len(started["control_evidence"]) == 2
+        and admission["status"] == "all_readonly_admission_passed_before_execution_marker"
+        and admission["total_control_calls"] == result["calls"] == 56
+        and admission["network"]["fresh_network_admitted"] is True
+        and admission["cpu"]["status"] == "fresh_cpu_and_exact_attempt_preflight_passed"
+        and admission["watchdog"]["status"] == "verified_fresh_inert_watchdog"
+        and admission["cleanup_store"]["object_reads"] == 0
+        and admission["host_launch_authorized"] is False
+        and result["status"] == "readonly_preflight_passed"
+    )
+    for key in ("cloud_mutations", "object_access"):
+        need(result[key] == 0 and admission[key] == 0)
+    for key in (
+        "execution_marker_created",
+        "cpu_launch_authorized",
+        "outer_invoked",
+        "gate_5_complete",
+        "gpu",
+        "training",
+    ):
+        need(result[key] is False)
+    return {
+        "schema": "lumi.vm-attempt018-readonly-preflight-verification.v0.5",
+        "attempt": ATTEMPT,
+        "status": "readonly_preflight_passed",
+        "source_release_sha256": SOURCE_RELEASE_SHA,
+        "source_verification_sha256": SOURCE_PROOF_SHA,
+        "v03_authentication_failure_sha256": FAILURE_SHA,
+        "entry_sha256": ENTRY_SHA,
+        "test_sha256": TEST_SHA,
+        "bindings_sha256": BINDINGS_SHA,
+        "run_bindings": {RUN + "/" + name: digest for name, digest in FILES.items()},
+        "calls": 56,
+        "cloud_mutations": 0,
+        "object_access": 0,
+        "network_admitted": True,
+        "cpu_admitted": True,
+        "inert_watchdog_verified": True,
+        "cleanup_store_verified": True,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

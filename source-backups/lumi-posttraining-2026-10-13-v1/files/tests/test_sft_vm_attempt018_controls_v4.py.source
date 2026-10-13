@@ -1,0 +1,24 @@
+"""Offline control-plan tests for the v0.4 byte-count closure."""
+import unittest
+
+from scripts import prepare_sft_vm_attempt018_controls_v4 as m
+
+
+class Tests(unittest.TestCase):
+    def test_plan_binds_authenticated_v04_and_requires_preflight(self):
+        plan = m.build()
+        self.assertEqual(plan["release_manifest_sha256"], m.RELEASE_SHA)
+        self.assertTrue(plan["source_repair"]["sha256_and_byte_count_closure"])
+        self.assertTrue(plan["source_repair"]["outer_source_authentication_verified"])
+        self.assertTrue(plan["source_repair"]["failed_v03_preserved"])
+        self.assertIsNone(plan["approval_record"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["gate_5_complete"])
+
+    def test_public_execution_entry_is_closed(self):
+        with self.assertRaisesRegex(ValueError, "not_cloud_or_cpu_authority"):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

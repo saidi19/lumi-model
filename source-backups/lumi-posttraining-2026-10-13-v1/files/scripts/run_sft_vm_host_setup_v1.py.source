@@ -1,0 +1,160 @@
+"""Connect fresh-host cloud observations to the existing guarded setup delivery.
+
+Private API only: the future authorized provisioner owns resource creation,
+authentic launch receipts, initial expiry, API timeouts and independent STOP.
+No launch, key generation, IAM change, network creation, import or retry here.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import time
+
+import prepare_sft_vm_host_connection_v2 as connection
+import run_sft_vm_setup_delivery_v3 as delivery
+
+PINS = {
+    "prepare_sft_vm_host_connection_v2.py": (
+        "84413461ea481527950667890342ed39dce81e6daca3ce558a895cef714ad7fd"
+    ),
+    "run_sft_vm_setup_delivery_v3.py": (
+        "97fefdd9e07afb8eb26aa41c09353155466e881acd4832c795f096fcdf7eb43b"
+    ),
+}
+OPERATIONS = {
+    ("sts", "get-caller-identity"),
+    *(
+        ("ec2", name)
+        for name in (
+            "describe-instances",
+            "describe-instance-status",
+            "describe-instance-attribute",
+            "describe-images",
+            "describe-instance-connect-endpoints",
+            "describe-security-groups",
+            "describe-volumes",
+            "describe-route-tables",
+            "describe-nat-gateways",
+            "describe-internet-gateways",
+            "get-console-output",
+        )
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("host_setup_join_rejected") from None
+
+
+def _prepare_and_setup_admitted_once(
+    binding,
+    key,
+    output,
+    launch,
+    *,
+    cloud,
+    deadline,
+    original_host_deadline_boottime,
+    remaining_control_bytes,
+    clock=time.monotonic,
+    sleep=time.sleep,
+):
+    need(type(deadline) in {int, float} and math.isfinite(deadline))
+    need(200 < deadline - clock() <= 1800)
+    need(
+        type(remaining_control_bytes) is int
+        and 0 < remaining_control_bytes <= delivery.seed.INPUTS.CAP
+    )
+    connection.validate_launch(launch, binding)
+    volumes = {name: binding[name] for name in ("root_volume", "work_volume")}
+    delivery.validate_parameters(volumes, original_host_deadline_boottime)
+    for name, pin in PINS.items():
+        need(
+            hashlib.sha256(
+                delivery.seed.INPUTS.read(delivery.seed.INPUTS.REPO / "scripts" / name, 131072)
+            ).hexdigest()
+            == pin
+        )
+    # Existing entry is authenticated before cloud observations or private writes.
+    delivery.source_bytes()
+    connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    delivery.seed.INPUTS.sync(output.parent)
+    report = dict(
+        fresh_host_control_plane_verified=False,
+        setup_completed=False,
+        setup_unit_reaped=False,
+        host_admitted=False,
+        binding_created=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+        execution_permitted=False,
+        outer_lifecycle_stop_required_on_failure=True,
+        cloud_observation_calls=0,
+    )
+
+    def save(name):
+        delivery.seed.INPUTS.write(output / name, connection.canonical(report))
+
+    class ReadOnlyCloud:
+        def cli(self, service, operation, **fields):
+            need((service, operation) in OPERATIONS)
+            need(report["cloud_observation_calls"] < 12)
+            # Leave the old bounded CLI call plus SSH setup reserve inside the
+            # original deadline; do not manufacture a fresh 1800-second budget.
+            need(deadline - clock() > 180)
+            report["cloud_observation_calls"] += 1
+            return cloud.cli(service, operation, **fields)
+
+    save("started.json")
+    stage = "cloud_admission"
+    try:
+        directory = output / "connection"
+        prepared = connection._prepare_bound_connection(
+            binding, key, directory, launch=launch, cloud=ReadOnlyCloud()
+        )
+        need(prepared["status"] == "prepared_pinned_connection_not_native_admission")
+        for flag in (
+            "control_plane_matches",
+            "fresh_launch_and_work_volume_match",
+            "work_snapshot_absent",
+            "private_egress_route_configured",
+        ):
+            need(prepared[flag] is True)
+        need(
+            prepared["native_host_admitted"] is False
+            and prepared["egress_reachability_proven"] is False
+        )
+        report["fresh_host_control_plane_verified"] = True
+        stage = "guarded_setup"
+        root = delivery.seed.INPUTS.REPO
+        result = delivery._seed_send_and_setup_admitted_once(
+            binding,
+            key,
+            directory,
+            prepared["ssh_config_sha256"],
+            hashlib.sha256(delivery.seed.INPUTS.read(directory / "known_hosts", 4096)).hexdigest(),
+            root / "scripts/stage_sft_vm_setup_inputs_v5.py",
+            root / "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar",
+            volumes,
+            output / "setup",
+            original_host_deadline_boottime=original_host_deadline_boottime,
+            deadline=deadline,
+            remaining_control_bytes=remaining_control_bytes,
+            clock=clock,
+            sleep=sleep,
+        )
+        need(result["setup_completed"] is True and result["setup_unit_reaped"] is True)
+        report.update(setup_completed=True, setup_unit_reaped=True)
+    except BaseException:
+        report["failed_stage"] = stage
+        save("result.json")
+        raise ValueError("host_setup_join_failed") from None
+    save("result.json")
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("fullsize_host_admission_not_bound") from None

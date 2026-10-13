@@ -1,0 +1,133 @@
+"""WorkerRun.synchronize adapter: CUDA completion plus parent-confirmed phases.
+
+Borrows admitted context, v2 control/ledger clients and post-import health check.
+Imports no ML and creates no group, socket, thread, model or authority. The outer
+guardian bounds CUDA synchronization, health callbacks and control-socket waits.
+The completed-step fence is consumed by WorkerRun BEFORE invoking this adapter;
+we check that boundary without consuming a second frame or inventing a receipt.
+
+Parent-confirmed all-rank barriers replace no FSDP/NCCL tensor collectives. They
+only order existing WorkerRun callbacks. Retain all native collectives inside
+WorkerRun and the model/optimizer. No added tensor or dummy resource reservations.
+"""
+
+import os
+import sys
+import threading
+from types import ModuleType
+
+from .posttraining_sft_phase_bridge_v1 import phases
+from .posttraining_sft_supervisor_v2 import SEQUENCE
+from .posttraining_sft_worker_client_v2 import WorkerLedgerClient
+from .posttraining_sft_worker_control_v2 import WorkerControlClient
+
+ERRORS = frozenset({"invalid_arguments", "owner_mismatch", "reentry", "terminal_failure",
+                    "phase_rejected", "runtime_rejected", "health_rejected",
+                    "cuda_failed", "fence_rejected", "control_failed"})
+
+
+class RankPhaseError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "control_failed"
+        super().__init__(self.code)
+
+
+class RankPhases:
+    def __init__(self, *, control, ledger, context, invocation_index, check_health, interrupt):
+        if (hasattr(self, "_owner") or type(control) is not WorkerControlClient
+                or type(ledger) is not WorkerLedgerClient
+                or type(invocation_index) is not int or not 0 <= invocation_index < 3
+                or not callable(check_health) or not callable(interrupt)
+                or control._phases != phases(invocation_index) or control._index != 0
+                or control._failure is not None or control._state != "ready"
+                or not 0 <= ledger._rank < 8):
+            raise RankPhaseError("invalid_arguments") from None
+        self._owner = os.getpid(), threading.get_ident()
+        self._control, self._ledger, self._context = control, ledger, context
+        self._health, self._interrupt = check_health, interrupt
+        self._phases, self._start = phases(invocation_index), SEQUENCE[invocation_index][1]
+        self._index = 0
+        self._failure = None
+        self._busy = self._interrupted = False
+
+    def _fail(self, code):
+        if self._failure is None:
+            self._failure = code
+            if not self._interrupted:
+                self._interrupted = True
+                try:
+                    self._interrupt()
+                except BaseException:
+                    pass
+        raise RankPhaseError(self._failure) from None
+
+    def _call(self, fn, code, *args):
+        try:
+            result = fn(*args)
+        except BaseException:
+            self._fail(code)
+        if self._failure is not None or result is not None:
+            self._fail(code)
+
+    def _runtime(self):
+        torch, distributed = (sys.modules.get(name) for name in
+                              ("torch", "lumi.distributed_training"))
+        if (type(torch) is not ModuleType or type(distributed) is not ModuleType
+                or type(self._context) is not distributed.DistributedContext):
+            self._fail("runtime_rejected")
+        context = self._context
+        if (context.rank != self._ledger._rank or context.local_rank != context.rank
+                or context.world_size != 8 or context.backend != "nccl"
+                or context.device.type != "cuda" or context.device.index != context.local_rank
+                or not torch.distributed.is_initialized()
+                or torch.distributed.get_world_size() != 8
+                or torch.distributed.get_rank() != context.rank
+                or torch.distributed.get_backend() != "nccl"
+                or torch.cuda.current_device() != context.local_rank):
+            self._fail("runtime_rejected")
+        return torch
+
+    def __call__(self, phase, step):
+        if self._index == len(self._phases):
+            # An old completed helper cannot poison a later shared-ledger epoch.
+            raise RankPhaseError("phase_rejected") from None
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._busy:
+            self._fail("reentry")
+        if self._failure is not None:
+            self._fail("terminal_failure")
+        if (type(phase) is not str or type(step) is not int
+                or self._index >= len(self._phases)
+                or (phase, step) != self._phases[self._index]
+                or self._control._index != self._index):
+            self._fail("phase_rejected")
+        self._busy = True
+        try:
+            self._call(self._health, "health_rejected")
+            try:
+                torch = self._runtime()
+            except BaseException:
+                self._fail("runtime_rejected")
+            try:
+                ledger = self._ledger.summary()
+            except BaseException:
+                self._fail("fence_rejected")
+            expected = step - self._start - int(phase in ("reserved", "updated"))
+            if (ledger["state"] != "ready" or ledger["step_fence_pending"]
+                    or ledger["step_fences_validated"] != expected):
+                self._fail("fence_rejected")
+            # In particular, an updated report cannot precede outstanding local
+            # CUDA work. No objects/tensor values cross the parent control pipe.
+            self._call(torch.cuda.synchronize, "cuda_failed", self._context.device)
+            self._call(self._health, "health_rejected")
+            self._call(self._control.phase, "control_failed", phase, step)
+            self._call(self._health, "health_rejected")
+            self._index += 1
+        finally:
+            self._busy = False
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-rank-phases-summary.v0.1",
+                "phases_completed": self._index, "failure_code": self._failure,
+                "execution_authorized": False, "production_eligible": False}

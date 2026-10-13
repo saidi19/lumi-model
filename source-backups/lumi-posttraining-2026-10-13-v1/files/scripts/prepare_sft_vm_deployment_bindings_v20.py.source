@@ -1,0 +1,97 @@
+"""Attempt-019 bindings after successful full read-only admission."""
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v19 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_BINDINGS_SHA = "0aff5899fcf0fcc72e9c3fef8cf50c4be7b65f68ca9d06259312fafcc7439d06"
+ATTEMPT = source.ATTEMPT
+OLD = source.OLD
+BUCKET = source.BUCKET
+RELEASE = source.RELEASE
+RELEASE_SHA = source.RELEASE_SHA
+SOURCE_PROOF = source.SOURCE_PROOF
+SOURCE_PROOF_SHA = source.SOURCE_PROOF_SHA
+ABSENCE = source.ABSENCE
+ABSENCE_SHA = source.ABSENCE_SHA
+PLAN = "artifacts/lumi-vm-attempt-019-control-plan-v0.4/plan.json"
+PLAN_SHA = "2652b3cb98250fe6cd235fce254a812d9dac5e465547e390ba4b05dcd8747991"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-019-control-plan-v0.4/release.json"
+PLAN_RELEASE_SHA = "8d697e45fe956a2653eff73bd59b3b6cadaeb874142d188736af074e19c364cd"
+WATCH = source.WATCH
+WATCH_SHA = source.WATCH_SHA
+STORE = source.STORE
+STORE_SHA = source.STORE_SHA
+PREFLIGHT = "evidence/lumi-vm-attempt-019-readonly-preflight-verification-v0.1.json"
+PREFLIGHT_SHA = "e0fcd19b884e33fead535c9f5f6a46e74050ebffcc039a50f345c4e53b26775e"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_binding_v20_rejected") from None
+
+
+sha = source.sha
+encode = source.encode
+read = source.read
+
+
+def verify():
+    need(sha(Path(source.__file__).read_bytes()) == SOURCE_BINDINGS_SHA)
+    manifest = source.verify()
+    plan_release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    preflight = json.loads(read(PREFLIGHT, PREFLIGHT_SHA))
+    need(
+        plan_release["attempt"] == ATTEMPT
+        and plan_release["plan_sha256"] == PLAN_SHA
+        and plan_release["source_release_sha256"] == RELEASE_SHA
+        and plan_release["successful_readonly_preflight_sha256"] == PREFLIGHT_SHA
+        and plan_release["live_controls_verified"] is True
+        and plan_release["network_admitted"] is True
+        and plan_release["cpu_admitted"] is True
+        and plan_release["execution_permitted"] is False
+        and preflight["attempt"] == ATTEMPT
+        and preflight["status"] == "readonly_preflight_passed"
+        and preflight["source_release_sha256"] == RELEASE_SHA
+        and preflight["watchdog_verification_sha256"] == WATCH_SHA
+        and preflight["cleanup_store_verification_sha256"] == STORE_SHA
+        and preflight["cloud_mutations"] == preflight["object_access"] == 0
+        and preflight["execution_authority_created"] is False
+        and preflight["cpu_instance_launched"] is False
+        and preflight["checkpoint_access"] is False
+    )
+    for name, digest in preflight["run_bindings"].items():
+        read(name, digest)
+    return manifest
+
+
+def build():
+    manifest = verify()
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["release_manifest_sha256"] == RELEASE_SHA
+        and plan["required_control_proofs"] == [WATCH, STORE]
+        and plan["successful_readonly_preflight"]
+        == {"path": PREFLIGHT, "sha256": PREFLIGHT_SHA}
+        and plan["cpu_scope_reference"]["output"]
+        == "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019"
+        and plan["cpu_scope_reference"]["execution_entry_sha256"] is None
+        and plan["approval_record"] is None
+        and plan["execution_permitted"] is False
+    )
+    for name, pin in plan["source_bindings"].items():
+        need(name.startswith(RELEASE + "/"))
+        need(pin == manifest["outputs"][name.removeprefix(RELEASE + "/")])
+        read(name, pin["sha256"], pin["bytes"])
+    return plan
+
+
+def controls():
+    build()
+    return {WATCH: WATCH_SHA, STORE: STORE_SHA}
+
+
+def run(**_arguments):
+    raise ValueError("local_bindings_not_execution_authority") from None

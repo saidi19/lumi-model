@@ -1,0 +1,49 @@
+"""Early-boot-safe diagnostic userdata candidate; no execution authority."""
+
+import json
+
+from scripts import diagnose_sft_vm_transport_live_v1 as prior
+
+
+def user_data():
+    config = json.loads(prior.user_data().split("\n", 1)[1])
+    # cloud-init may precede sysinit.target. Never wait for a timer whose
+    # default dependencies require that target; early expiry must not depend on it.
+    config["bootcmd"] = [
+        [
+            "/bin/sh",
+            "-c",
+            (
+                "printf 'LUMI_DIAG_STAGE:bootcmd_enter\\n' > /dev/console; "
+                "/usr/bin/systemd-run --no-block --unit=lumi-diag-expiry "
+                "--timer-property=DefaultDependencies=no "
+                "--property=DefaultDependencies=no "
+                "--timer-property=AccuracySec=1s --on-boot=600s "
+                "/usr/bin/systemctl --no-block poweroff "
+                "&& printf 'LUMI_DIAG_STAGE:expiry_queued\\n' > /dev/console "
+                "|| { printf 'LUMI_DIAG_STAGE:expiry_rejected\\n' > /dev/console; "
+                "/usr/bin/systemctl --no-block poweroff; }"
+            ),
+        ]
+    ]
+    # Queued is NOT armed. Retain the final-stage active timer check before
+    # publishing a key that the controller could use for SSH.
+    config["runcmd"] = [
+        [
+            "/bin/sh",
+            "-c",
+            (
+                "printf 'LUMI_DIAG_STAGE:final_enter\\n' > /dev/console; "
+                "/usr/bin/systemctl is-active --quiet lumi-diag-expiry.timer "
+                "&& { printf 'LUMI_DIAG_HOSTKEY '; cat /etc/ssh/ssh_host_ed25519_key.pub; } "
+                "> /dev/console "
+                "|| { printf 'LUMI_DIAG_STAGE:expiry_not_active\\n' > /dev/console; "
+                "/usr/bin/systemctl --no-block poweroff; }"
+            ),
+        ]
+    ]
+    return "#cloud-config\n" + json.dumps(config)
+
+
+def run(**_kwargs):
+    raise ValueError("bootstrap_candidate_not_execution_authority")

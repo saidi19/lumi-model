@@ -1,0 +1,86 @@
+# SFT execution status v0.113
+
+2026-09-26. The dropped-worker final-seal, SCM_RIGHTS transfer,
+parent-reservation ledger and sealed READY/release/CONSUMED protocol candidates
+are implemented, hardened and locally verified. **This is still not an
+integrated native write guard; Gate 5 remains incomplete.** No checkpoint,
+tokenizer or dataset payload was read. No child process, native filter,
+listener transfer, socket transaction, ioctl, pidfd, cgroup, worker, remote
+mutation, GPU operation, inference or training occurred. The eleven successor
+files remain local and unpushed.
+
+## Completed
+
+- A real ordering bug was fixed without modifying listener v1: root preparation
+  and transfer remain frozen, while the v2 final seal now requires the same
+  process and main thread after exact irreversible uid/gid 10001 transition,
+  empty supplementary groups, no-new-privileges and inherited listener filter.
+- The private transfer candidate validates one borrowed root-owned connected
+  local seqpacket channel and performs one digest-bound SCM_RIGHTS offer/ACK.
+  Ownership transfer is explicit. Malformed rights, including an unexpected
+  SCM_PIDFD, are retired; descriptor reuse and nonzero receive flags fail
+  closed. Socket metadata still does not prove process origin or exclusivity.
+- Before each CONTINUE, the broker proposes one aggregate ordinal, requested
+  byte count and cumulative reservation. The parent validates and stores that
+  conservative upper bound before attempting its acknowledgement. Later ACK,
+  ID-validation, response or broker failure cannot refund the reservation.
+- Worker control uses two separate precreated channels. READY and CONSUMED use
+  the report channel; the guardian's one-byte release and close use the release
+  channel. This permits the worker to close the release FD before acknowledging
+  consumption on the still-open report FD.
+- Post-seal reads, writes and poll are fixed raw scalar syscalls allowed by the
+  frozen filter. Poll does not receive Python's implicit EINTR retry. An empty
+  read with HUP is recorded only as that observation—not as queue-drain proof.
+- All public entries remain closed, all state is one-shot and fail-closed, and
+  all retained results are fixed codes or aggregate scalars with unproved
+  execution and native-enforcement claims explicitly false.
+
+## Verification
+
+**821 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 31 listener-v2, 33 transport, 36 ledger, 24 protocol and 697
+prior regression tests. The focused 124-test successor suite also passes on
+both runtimes. Every native boundary in the new tests is synthetic.
+
+Syntax/AST checks pass for all eight new source/test files on both runtimes;
+maximum line length is 100 and trailing whitespace is zero. Tests used `-B`,
+and no bytecode file for the new component names is present. Existing unrelated
+repository bytecode was intentionally left untouched. Ruff was unavailable and
+no replacement was downloaded.
+
+All 10 bindings in the direct predecessor plan match their recorded byte counts
+and SHA-256 values. Its 61 earlier recorded bindings were not reread in this
+successor. Tracked unstaged and staged diffs remain empty; existing untracked
+evidence was preserved.
+
+Development record:
+`configs/lumi-4b-sft-write-transport-ledger-protocol-development-v0.1.json`.
+
+SHA-256: `90f4756a896fcfe6d99b76428915d45cf890b85a24f0ad61e9e48b1d6f040d48`.
+
+Verification:
+`evidence/lumi-4b-sft-write-transport-ledger-protocol-development-verification-v0.1.json`.
+
+SHA-256: `5acceb744646c2e6e2cff0694d7b243efe503bf5b40dcd9ae37d45c86788cb31`.
+
+## Exact next work and unchanged boundary
+
+The next successor must first version the guardian so cgroup-lease and release
+descriptor ownership transfer is unambiguous on every early error. It must then
+implement the controller-owned process topology: dedicated broker spawn, exact
+inherited-FD close matrix, listener handoff/adoption, worker privilege drop and
+seal, READY verification before guardian arming, release consumption,
+parent-ledger callbacks, terminal kill handling and pidfd-based broker/worker
+reap. Trusted single-writer/no-extra-packet topology must be constructed rather
+than inferred from socket metadata.
+
+After that comes integration into the frozen full-size bootstrap, dispatcher
+and lifecycle closure; successor source-closure authentication; and a separately
+authorized bounded Linux native qualification. Only a passing native
+qualification can return to the unchanged host, input, resource and real-import
+admission gates. These are remaining parts of Gate 5, not new roadmap gates.
+
+GPU is not needed for the next local guardian/composition work. The S3-backed
+pretrained checkpoint remains the intended base, but no current remote
+availability check was made. Real import, training and production remain
+disabled.

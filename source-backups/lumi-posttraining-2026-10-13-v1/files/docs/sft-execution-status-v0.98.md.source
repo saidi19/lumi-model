@@ -1,0 +1,71 @@
+# SFT execution status v0.98
+
+2026-09-17. The approved new CPU-only Linux setup preflight completed on its
+first attempt. It identifies insufficient free disk on the current disposable
+runner. It is not a retry or a pass of native qualification.
+
+Commit: `716774386cc3eba22f860c7699d6a33654882a02`.
+Parent: `9ae708c73a327b7cac69c16d29d075450a500e9d`.
+Exactly four new files were published; no existing files were modified/deleted.
+
+## Observed result
+
+[Preflight run 35211052193](https://github.com/saidi19/lumi-model/actions/runs/35211052193)
+completed successfully, with `status=observed`, `code=disk_floor_insufficient`,
+and `ready_for_unchanged_setup=false`. Workflow success means the diagnostic
+completed, not that the disk or qualification was accepted.
+
+- All source/helper/rootfs setup checks completed: 78 bound source files,
+  successful process-local Linux subreaper setup.
+- Both newly created empty temporary directories were identity-checked and
+  removed. No ambiguous creation or cleanup failure was reported.
+- Available disk: **14,347,816,960 bytes / 13.36 GiB**.
+- Unchanged post-acquisition floor: **17,179,869,184 bytes / 16 GiB**.
+- Required pre-acquisition free space, including allocation for the retained
+  pinned TAR: **18,241,982,464 bytes / 16.99 GiB**. ZIP/TAR acquisition peak is
+  also included in the calculation. Current shortfall: **3,894,165,504 bytes**.
+- This is a measurement, not reserved capacity. Filesystem metadata and other
+  writers can consume additional space.
+
+This demonstrates the current runner's capacity blocker and is consistent with
+the old coarse failure. It cannot retroactively prove the exact cause on the old
+disposable host, whose disk measurement was not retained.
+
+## Verification and CI
+
+53 new synthetic tests and 40 unchanged harness/workflow regressions passed
+locally on both Python 3.11.15 and 3.13.7. Ruff 0.15.1, workflow YAML parsing and
+independent source review passed. The new workflow's own synthetic tests passed
+on Linux before its single observation.
+
+Only the named 651-byte artifact ZIP was downloaded, checked against GitHub's
+digest, and decoded in memory. Its sole 1,004-byte closed JSON report was retained
+with SHA-256 `448591aa8f0c33fef43e0b7540e929638bb1549ae725035d20341dc7c1de97c8`.
+Two zero-network local verification passes accepted the observation, checked
+seven plan bindings and confirmed ten previous source/evidence bindings unchanged.
+
+[Source checks](https://github.com/saidi19/lumi-model/actions/runs/35211052158)
+passed all four jobs, including the full selected Source suite.
+[Spark checks](https://github.com/saidi19/lumi-model/actions/runs/35211052104)
+also passed. All three workflows succeeded on their first attempt; none was
+rerun. The remote branch tip was reverified after CI and matches the published
+commit. No historical native workflow started for this commit.
+
+## Next required fix
+
+Use a CPU qualification host with sufficient free disk and headroom while
+preserving the 16 GiB floor. Do not try another acquisition/full qualification
+on the unchanged undersized runner. A fresh capacity-suitable host and a newly
+authorized native attempt are required; this diagnostic does not authorize them.
+GPU is not needed to resolve this disk/setup blocker.
+
+Gate 5 remains incomplete. No software image was acquired by the probe, and no
+Docker operation, child workload, GPU, real model/data read, or SFT training ran.
+Source/Spark jobs and GitHub checkout/artifact transport are normal separate
+network-using CI infrastructure; the zero-network claim applies to the probe.
+
+Evidence:
+`evidence/lumi-4b-sft-prepared-setup-preflight-result-v0.1.json`,
+`evidence/lumi-4b-sft-prepared-setup-preflight-verification-v0.1.json`, and
+`artifacts/lumi-sft-prepared-setup-preflight-v0.1/aggregate-setup.json`.
+Final CI: `evidence/lumi-4b-sft-prepared-setup-preflight-ci-result-v0.1.json`.

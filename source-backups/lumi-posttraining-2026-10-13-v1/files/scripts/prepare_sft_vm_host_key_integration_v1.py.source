@@ -1,0 +1,98 @@
+"""Offline hash-closed rehearsal only, retaining consumed identity; never run it."""
+
+import ast
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+from scripts import prepare_sft_vm_host_key_unicode_v2 as repair
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-012-source-v0.1"
+OUTPUT = ROOT / "artifacts/lumi-vm-host-key-integration-v0.1"
+BASE_SHA = "9a5031cdf96c2d34f89915cd6188188d555424c5c9d96f43b44a192dd438a24c"
+SOURCE = "scripts/prepare_sft_vm_host_connection_v3.py"
+INPUTS = "configs/lumi-vm-private-host-source-inputs-v0.1.json"
+OBSERVATION = "artifacts/lumi-vm-attempt-012-host-key-diagnostic-v0.2/result.json"
+OBSERVATION_SHA = "6dcf4937aa634d4551f9ea335267f94c3fcb49cdd2a0c516a5befa7f16a49849"
+
+
+def build():
+    repair.read(
+        "scripts/prepare_sft_vm_host_key_unicode_v2.py",
+        "4697665f078a8de3828d6ea5d6ac13b5ba62a5062add05c64057c9a53feb6b91",
+    )
+    repair.read(
+        "scripts/prepare_sft_vm_attempt012_v1.py",
+        "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc",
+    )
+    observed = json.loads(repair.read(OBSERVATION, OBSERVATION_SHA))
+    repair.need(observed["aggregate"]["repaired_parser_passes"] is True)
+    repair.need(observed["aggregate"]["markers_in_order"] is True)
+    repair.need(observed["console_reads"] == 1 and observed["mutations"] == 0)
+    manifest = json.loads(closure.read(BASE / "release.json", BASE_SHA))
+    original = {
+        name: closure.read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    repair.need(len(original) == 156)
+    seeds = dict(original)
+    seeds[SOURCE] = repair.build()
+    inputs = json.loads(seeds[INPUTS])
+    inputs["sources"][Path(SOURCE).stem]["bytes"] = len(seeds[SOURCE])
+    seeds[INPUTS] = closure.encode(inputs)
+    # These are ancestor manifests, not the current output bindings.
+    ancestors = {name for name in original if name.endswith(".json") and "/" not in name}
+    final = closure.closure(original, seeds, ancestors)
+    for name, raw in final.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name not in {SOURCE, INPUTS}:
+            repair.need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if (
+            name.startswith("evidence/")
+            or name in ancestors
+            or name.endswith((".gz", ".tar", ".pem"))
+        ):
+            repair.need(raw == original[name])
+    current = json.loads(final[INPUTS])
+    for name, pin in current["sources"].items():
+        raw = final["scripts/" + name + ".py"]
+        repair.need(len(raw) == pin["bytes"] and repair.sha(raw) == pin["sha256"])
+    report = dict(
+        schema="lumi.host-key-integration.v0.1",
+        status="offline_hash_closed_rehearsal_not_executable",
+        base_release_sha256=BASE_SHA,
+        consumed_identity_retained=True,
+        fresh_identity_required_before_execution=True,
+        execution_permitted=False,
+        cpu_retry=False,
+        changed_files=[name for name in final if final[name] != original[name]],
+        outputs={
+            name: dict(bytes=len(raw), sha256=repair.sha(raw))
+            for name, raw in sorted(final.items())
+        },
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    repair.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            repair.need(stream.write(raw) == len(raw))
+    return report
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

@@ -1,0 +1,201 @@
+"""Finish the existing VM handoff with separate verification and local retention.
+
+Same route, converter and checksum consumer. Requires the SAME independently
+admitted root-parent/acquisition setup as handoff v1; does not grant it. Never
+uploads, deletes evidence, detaches a volume or terminates an instance. Local
+fsync/rename preserves output on the supplied filesystem, NOT an off-host backup
+or proof that the volume survives instance termination. Billing cleanup must
+wait for separately verified retention under the eventual execution plan.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import stat
+import time
+
+from . import posttraining_vm_fullsize_handoff_v1 as handoff
+
+frozen = handoff.frozen
+VERIFY_SCRIPT = "/work/release/scripts/verify_sft_vm_fullsize_package_v1.py"
+MAX_PACKAGE_BYTES = 8_415_205_181
+
+
+def need(value):
+    if not value:
+        raise ValueError("completion_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def verify_unit(attempt):
+    handoff.unit_name(attempt, "import")
+    return f"lumi-vm-fullsize-v1-{attempt}-verify.service"
+
+
+def verify_command(attempt, package_pin, source_pin):
+    need(frozen.hex_id(package_pin, 64) and frozen.hex_id(source_pin, 64))
+    stage = handoff.ROOT / attempt / "stage"
+    props = handoff.controls._base()
+    props.update({"MemoryMax": str(2*1024**3), "RuntimeMaxSec": "1200",
+        "BindReadOnlyPaths": f"{stage}/release:/work/release "
+            f"{stage}/outputs/import/attempt-001/checkpoint:/package",
+        "BindPaths": f"{stage}/verification:/results"})
+    command = ["/usr/bin/systemd-run", "--quiet", "--no-ask-password",
+               "--service-type=exec", "--unit=" + verify_unit(attempt)]
+    command += [f"--property={key}={value}" for key, value in props.items()]
+    command += [f"--setenv={key}={value}" for key, value in frozen.ENV.items()]
+    return command + ["--", handoff.PYTHON, "-I", "-B", VERIFY_SCRIPT, "--attempt", attempt,
+        "--package-manifest-sha256", package_pin, "--source-manifest-sha256", source_pin]
+
+
+def _read_worker_report(path, maximum):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    info = path.lstat()
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+         and info.st_uid == info.st_gid == 10001 and stat.S_IMODE(info.st_mode) == 0o600)
+    raw = frozen.small(path, maximum)
+    value = json.loads(raw)
+    need(type(value) is dict and info == path.lstat())
+    return raw, value
+
+
+def _run_verifier(attempt, package_pin, source_pin, deadline):
+    unit = verify_unit(attempt)
+    existing = frozen.run_command(["/usr/bin/systemctl", "show", unit,
+                                    "--property=LoadState", "--value"], 5, capture=True)
+    need(existing.returncode in {0, 1, 4} and existing.stdout.strip() == b"not-found")
+    need(time.monotonic() < deadline)
+    try:
+        command = verify_command(attempt, package_pin, source_pin)
+        need(frozen.run_command(command, 15).returncode == 0)
+        while time.monotonic() < deadline:
+            result = frozen.observe(unit)
+            if result["SubState"] in {"exited", "failed", "dead"}:
+                frozen.validate_terminal("chain", result)
+                return
+            time.sleep(0.2)
+        raise ValueError("verification_deadline") from None
+    finally:
+        handoff._stop_and_reap(unit)
+
+
+def _validate_verification(report, pin):
+    fixed = {"schema": "lumi.vm-fullsize-package-verification.v0.1", "status": "passed",
+        "package_manifest_sha256": pin, "independent_checksum_consumer": True,
+        "offhost_retention_verified": False, "real_4b_import": False,
+        "gate_5_complete": False, "training_authorized": False}
+    need(set(report) == set(fixed) | {"files", "package_bytes", "maximum_content_read_bytes"})
+    need(all(type(report[key]) is type(value) and report[key] == value
+             for key, value in fixed.items()))
+    need(type(report["files"]) is int and 3 <= report["files"] <= 512
+         and type(report["package_bytes"]) is int
+         and 0 < report["package_bytes"] <= MAX_PACKAGE_BYTES
+         and type(report["maximum_content_read_bytes"]) is int
+         and report["package_bytes"] < report["maximum_content_read_bytes"]
+         <= report["package_bytes"] + 2*131072)
+
+
+def _fsync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _preserve_local(destination):
+    """Move the complete new output tree once, preserving all evidence bytes.
+
+    No multi-GB copy or reserialization. Fresh root-owned retained directory
+    prevents overwriting any older package. Root parent owns the backing tree;
+    all worker cgroups must already be empty. No automatic deletion on error.
+    """
+    output, retained = destination / "stage/outputs", destination / "retained"
+    need(stat.S_ISDIR(output.lstat().st_mode))
+    directories = [output]
+    for count, path in enumerate(output.rglob("*"), 1):
+        need(count <= 1024)
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            directories.append(path)
+        else:
+            need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            try:
+                os.fsync(fd)  # Flush generated output, never reread or rewrite its content.
+            finally:
+                os.close(fd)
+    for path in reversed(directories):
+        _fsync_directory(path)
+    retained.mkdir(mode=0o700, exist_ok=False)
+    need(output.stat().st_dev == retained.stat().st_dev)
+    os.rename(output, retained / "outputs")
+    _fsync_directory(destination / "stage")
+    _fsync_directory(retained)
+    _fsync_directory(destination)
+
+
+def complete_import(**_arguments):
+    raise handoff.HandoffError("host_guard_not_bound") from None
+
+
+def _complete_admitted_once(attempt, pins, *, machine_id, deadline):
+    """Single existing import followed by independent checksum/retention.
+
+    Private caller still supplies authenticated host/software/storage admission
+    and a COMPLETED acquisition unit. No live source reads are done by this
+    root parent; verification payload reads occur only in the separate worker.
+    """
+    need(type(deadline) in {int, float} and 0 < deadline-time.monotonic() <= 4820)
+    handoff._dispatch_admitted_once(attempt, pins, machine_id=machine_id,
+        deadline=min(deadline, time.monotonic()+3615))
+    destination = handoff.ROOT / attempt
+    stage = "import_result"
+    try:
+        raw_summary, summary = _read_worker_report(destination / "stage/outputs/summary.json", 8192)
+        need(summary.get("schema") == "lumi.vm-fullsize-worker-result.v0.1"
+             and summary.get("independent_checksum_consumer") is False
+             and summary.get("real_4b_import") is False and summary.get("gate_5_complete") is False)
+        entry = summary["entry"]
+        need(entry["status"] == "coordinator_returned_parent_verification_required"
+             and all(entry[key] == pins[key] for key in handoff.PINS)
+             and entry["checkpoint_full_audits"] == entry["tokenizer_full_audits"] == 2)
+        package_pin = summary["package_manifest_sha256"]
+        need(frozen.hex_id(package_pin, 64))
+        stage = "verify_setup"
+        results = destination / "stage/verification"
+        results.mkdir(mode=0o700, exist_ok=False)
+        os.chown(results, 10001, 10001)
+        stage = "verify_unit"
+        _run_verifier(attempt, package_pin, pins["source_manifest_sha256"],
+                      min(deadline, time.monotonic()+1200))
+        raw_verification, verified = _read_worker_report(results / "verification.json", 4096)
+        _validate_verification(verified, package_pin)
+        stage = "retain"
+        need(time.monotonic() < deadline)
+        units = [handoff.unit_name(attempt, phase) for phase in ("acquire", "import")]
+        need(all(frozen.cgroup_empty(unit) for unit in units + [verify_unit(attempt)]))
+        _preserve_local(destination)
+        report = {"schema": "lumi.vm-fullsize-completion.v0.1",
+            "status": "verified_package_preserved_locally_offhost_retention_pending",
+            "source_manifest_sha256": pins["source_manifest_sha256"],
+            "import_summary_sha256": sha(raw_summary),
+            "verification_sha256": sha(raw_verification), "package_manifest_sha256": package_pin,
+            "independent_checksum_consumer": True, "all_three_cgroups_empty": True,
+            "local_output_tree_preserved": True, "offhost_retention_verified": False,
+            "instance_termination_allowed": False, "gpu": False, "training_authorized": False,
+            "real_4b_import": False, "gate_5_complete": False, "production_eligible": False}
+        stage = "report"
+        frozen.write_new(destination / "completion.json", report)
+        return report
+    except BaseException:
+        try:
+            frozen.write_new(destination / "completion-failed.json",
+                {"stage": stage, "retry_allowed": False, "output_deletion_allowed": False})
+        except BaseException:
+            pass
+        raise ValueError("completion_failed_" + stage) from None

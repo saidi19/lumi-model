@@ -1,0 +1,207 @@
+"""Local diagnostics integration only. Consumed attempt-010 is NOT renewed."""
+
+import ast
+import json
+import os
+import re
+
+from scripts.prepare_sft_vm_cidr_successor_v1 import LIMIT, ROOT, encode, need, read, sha
+
+BASE = "artifacts/lumi-vm-attempt-010-source-v0.1"
+BASE_SHA = "6b93341e30ab6e2f1f0dbaacc47d69731a023574fb55fdda43a72dcd258001f6"
+PROOF = "evidence/lumi-vm-client-failure-diagnostics-verification-v0.1.json"
+PROOF_SHA = "6bfa1512fc57a501efaa11fc099b2ec38570486912546f048833bd0473a573da"
+OUTPUT = "artifacts/lumi-vm-diagnostics-candidate-v0.1"
+HELPER = "scripts/sft_vm_safe_failure_v1.py"
+OUTER = "scripts/run_sft_vm_private_outer_v7.py"
+SOURCES = "scripts/prepare_sft_vm_private_host_sources_v4.py"
+
+
+def inputs():
+    manifest = json.loads(read(ROOT / BASE / "release.json", BASE_SHA))
+    files = {
+        n: read(ROOT / BASE / n, p["sha256"], p["bytes"]) for n, p in manifest["outputs"].items()
+    }
+    for n, p in manifest["ancillary"].items():
+        read(ROOT / BASE / n, p["sha256"], p["bytes"])
+    proof = json.loads(read(ROOT / PROOF, PROOF_SHA))
+    donors = {
+        n: read(ROOT / n, p["sha256"], p["bytes"]) for n, p in proof["source_bindings"].items()
+    }
+    return files, donors
+
+
+def functions(raw):
+    tree = ast.parse(raw)
+    result = {}
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            result[node.name] = node
+        elif isinstance(node, ast.ClassDef):
+            for child in node.body:
+                if isinstance(child, ast.FunctionDef):
+                    result[node.name + "." + child.name] = child
+    return result
+
+
+def transplant(raw, donor, names):
+    """Copy only reviewed functions; retain frozen identity and import bindings."""
+    old, new = functions(raw), functions(donor)
+    lines, donor_lines = raw.decode().splitlines(True), donor.decode().splitlines(True)
+    for name in sorted(names, key=lambda n: old[n].lineno, reverse=True):
+        a, b = old[name], new[name]
+        lines[a.lineno - 1 : a.end_lineno] = donor_lines[b.lineno - 1 : b.end_lineno]
+    text = "".join(lines)
+    need("import sft_vm_safe_failure_v1 as failure" not in text)
+    return text.replace(
+        "import hashlib\n", "import hashlib\nimport sft_vm_safe_failure_v1 as failure\n", 1
+    ).encode()
+
+
+def replace(raw, old, new):
+    need(raw.count(old.encode()) == 1)
+    return raw.replace(old.encode(), new.encode())
+
+
+def build():
+    original, donors = inputs()
+    seeds = dict(original)
+    seeds[HELPER] = donors[HELPER]
+    seeds["scripts/sft_vm_controller_credentials_v2.py"] = transplant(
+        seeds["scripts/sft_vm_controller_credentials_v2.py"],
+        donors["scripts/sft_vm_controller_credentials_v3.py"],
+        ["Reader.active", "Reader.__call__", "Clients.__init__"],
+    )
+    seeds["scripts/provision_sft_vm_host_v5.py"] = transplant(
+        seeds["scripts/provision_sft_vm_host_v4.py"],
+        donors["scripts/provision_sft_vm_host_v5.py"],
+        ["Transaction.cli", "Transaction.stop_failed_launch", "_provision_and_setup_admitted_once"],
+    )
+    # The helper is an immutable, hash-checked dependency, not a new logical host role.
+    helper_pin = sha(seeds[HELPER])
+    seeds[SOURCES] = replace(
+        seeds[SOURCES],
+        "BOOT_PINS = {\n",
+        'BOOT_PINS = {\n    "' + HELPER + '": "' + helper_pin + '",\n',
+    )
+    seeds[SOURCES] = replace(
+        seeds[SOURCES], "scripts/provision_sft_vm_host_v4.py", "scripts/provision_sft_vm_host_v5.py"
+    )
+    seeds[SOURCES] = replace(
+        seeds[SOURCES],
+        sha(original["scripts/provision_sft_vm_host_v4.py"]),
+        sha(seeds["scripts/provision_sft_vm_host_v5.py"]),
+    )
+    outer = replace(
+        seeds[OUTER],
+        "import hashlib\n",
+        "import hashlib\nimport sft_vm_safe_failure_v1 as failure\n",
+    )
+    outer = replace(
+        outer, "PINS = {\n", 'PINS = {\n    "sft_vm_safe_failure_v1.py": "' + helper_pin + '",\n'
+    )
+    outer = replace(
+        outer,
+        "        except Exception:\n"
+        '            raise ValueError("private_outer_read_failed") from None',
+        "        except Exception as error:\n"
+        '            raise failure.Failure("private_outer_read_failed",\n'
+        '                                  failure.describe(error, "cloud_call")) from None',
+    )
+    # Preserve workload codes before the unchanged network wrapper sanitizes its error.
+    outer = replace(
+        outer,
+        "            finally:\n                if loaded is not None:",
+        "            except BaseException as error:\n"
+        '                report["primary_failure_diagnostic"] = failure.describe(error)\n'
+        "                raise\n            finally:\n                if loaded is not None:",
+    )
+    outer = replace(
+        outer,
+        '    except BaseException as error:\n        report["status"]',
+        "    except BaseException as error:\n"
+        '        report.setdefault("primary_failure_diagnostic", failure.describe(error))\n'
+        '        report["status"]',
+    )
+    seeds[OUTER] = outer
+    current = dict(seeds)
+    for _iteration in range(64):
+        mapping = {}
+        for name, raw in original.items():
+            before, after = sha(raw), sha(current[name])
+            need(before not in mapping or mapping[before] == after)
+            mapping[before] = after
+        following = {}
+        for name, raw in seeds.items():
+            if name.endswith((".py", ".json")) and not name.startswith("evidence/"):
+                raw = re.sub(
+                    rb"\b[0-9a-f]{64}\b",
+                    lambda m, mapping=mapping: mapping.get(m[0].decode(), m[0].decode()).encode(),
+                    raw,
+                )
+            following[name] = raw
+        if following == current:
+            break
+        current = following
+    else:
+        raise ValueError("diagnostics_candidate_hash_cycle")
+    logical = {
+        HELPER,
+        SOURCES,
+        OUTER,
+        "scripts/provision_sft_vm_host_v5.py",
+        "scripts/sft_vm_controller_credentials_v2.py",
+    }
+    for name, raw in current.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name not in logical:
+            need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if name.endswith((".tar", ".gz", ".pem")) or name.startswith("evidence/"):
+            need(raw == original[name])
+    need(sum(map(len, current.values())) < LIMIT)
+    return current, dict(
+        schema="lumi.vm-diagnostics-candidate.v0.1",
+        status="local_source_candidate_not_execution_ready",
+        source_release_sha256=BASE_SHA,
+        diagnostic_proof_sha256=PROOF_SHA,
+        source_identity_consumed=True,
+        consumed_execution_renewed=False,
+        fresh_operational_identity_bound=False,
+        execution_permitted=False,
+        gate_5_complete=False,
+        real_4b_import=False,
+        gpu=False,
+        training=False,
+        logical_changes=sorted(logical),
+        iterations=_iteration + 1,
+        changed_files=sorted(n for n in current if current[n] != original.get(n)),
+        outputs={n: dict(bytes=len(raw), sha256=sha(raw)) for n, raw in sorted(current.items())},
+        limitations=[
+            "No live entry or authority created; attempt-010 remains consumed.",
+            "Original failure cause remains unknown; component evidence is authoritative.",
+        ],
+    )
+
+
+def prepare():
+    files, report = build()
+    destination = ROOT / OUTPUT
+    need(not destination.exists() and not any(p.is_symlink() for p in destination.parents))
+    files = files | {"release.json": encode(report)}
+    need(sum(map(len, files.values())) < LIMIT)
+    destination.mkdir(mode=0o700)
+    for name, raw in sorted(files.items()):
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("diagnostics_candidate_is_not_execution_authority")

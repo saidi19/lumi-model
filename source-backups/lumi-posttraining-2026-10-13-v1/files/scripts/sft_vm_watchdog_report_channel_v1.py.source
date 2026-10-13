@@ -1,0 +1,308 @@
+"""Prepared private report transport, with no provisioning or public execution.
+
+The controller issues short-lived, exact-key PUT capabilities. Guest writes are
+fixed 8192-byte aggregate reports, never source, logs, model data or credentials.
+Four independent slots retain boot, ready, observer and main-failure evidence.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import http.client
+import json
+import os
+import re
+import ssl
+import stat
+import time
+from urllib.parse import parse_qsl, urlsplit
+
+BODY_BYTES = 8192
+SLOTS = ("boot", "ready", "observer", "failure")
+FLAGS = {
+    "synthetic_receipt_only": True,
+    "complete_bootstrap_qualified": False,
+    "host_admitted": False,
+    "real_4b_import": False,
+    "gate_5_complete": False,
+    "gpu_inference_training": False,
+    "retry_allowed": False,
+}
+READY = {
+    "identity",
+    "fresh_paths",
+    "units_verified",
+    "policy_installed",
+    "watchdog_active",
+    "synthetic_transition",
+}
+SUCCESS = READY | {"watchdog_failure_receipt", "watchdog_exit_code", "before_timer_deadline"}
+FAILURES = READY | {"fault_dispatched", "shutdown_receipt", "bootstrap_load"}
+HEADERS = {
+    "Content-Length": str(BODY_BYTES),
+    "Content-Type": "application/json",
+    "If-None-Match": "*",
+    "x-amz-server-side-encryption": "AES256",
+}
+SIGNED_HEADERS = "content-length;content-type;host;if-none-match;x-amz-server-side-encryption"
+
+
+def need(value):
+    if not value:
+        raise ValueError("report_channel_rejected") from None
+
+
+def unique(pairs):
+    value = {}
+    for key, item in pairs:
+        need(key not in value)
+        value[key] = item
+    return value
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def identity(attempt, bindings):
+    need(type(attempt) is str and re.fullmatch(r"[0-9a-f]{32}", attempt))
+    need(type(bindings) is dict and set(bindings) == {"probe", "bootstrap", "policy"})
+    need(all(type(v) is str and re.fullmatch(r"[0-9a-f]{64}", v) for v in bindings.values()))
+
+
+def target(attempt, slot):
+    need(type(attempt) is str and re.fullmatch(r"[0-9a-f]{32}", attempt))
+    need(slot in SLOTS)
+    bucket = "lumi-watchdog-report-" + attempt
+    return bucket, attempt + "/" + slot + ".json"
+
+
+def validate_report(slot, value):
+    need(type(value) is dict and set(value) == {"schema", "status", "checks", *FLAGS})
+    need(value["schema"] == "lumi.watchdog-native-probe.v0.2")
+    need(all(value[k] is v for k, v in FLAGS.items()))
+    checks = value["checks"]
+    need(type(checks) is dict)
+    status = value["status"]
+    if slot == "boot":
+        need(status == "report_channel_ready" and set(checks) == {"transport_ready"})
+        need(checks["transport_ready"] is True)
+    elif slot == "ready":
+        need(status == "ready_for_deliberate_policy_fault" and set(checks) == READY)
+        need(all(v is True for v in checks.values()))
+    elif slot == "observer" and status == "watchdog_failure_receipt_verified":
+        need(set(checks) == SUCCESS and all(v is True for v in checks.values()))
+    else:
+        need(slot in {"observer", "failure"} and status == "failed")
+        stage = checks.get("failed_stage")
+        need(type(stage) is str and stage in FAILURES)
+        need(set(checks) <= READY | {"failed_stage"})
+        need(all(v is True for k, v in checks.items() if k != "failed_stage"))
+        if slot == "observer":
+            need(stage == "shutdown_receipt")
+    return value
+
+
+def encode(attempt, bindings, slot, report):
+    identity(attempt, bindings)
+    validate_report(slot, report)
+    raw = canonical(
+        {
+            "schema": "lumi.watchdog-report-object.v0.1",
+            "attempt": attempt,
+            "bindings": bindings,
+            "slot": slot,
+            "report": report,
+            "report_sha256": hashlib.sha256(canonical(report)).hexdigest(),
+        }
+    )
+    need(len(raw) < BODY_BYTES)
+    return raw + b" " * (BODY_BYTES - len(raw))
+
+
+def decode(raw, *, attempt, bindings, slot):
+    identity(attempt, bindings)
+    need(type(raw) is bytes and len(raw) == BODY_BYTES)
+    value = json.loads(raw, object_pairs_hook=unique)
+    need(
+        type(value) is dict
+        and set(value) == {"schema", "attempt", "bindings", "slot", "report", "report_sha256"}
+    )
+    need(value["schema"] == "lumi.watchdog-report-object.v0.1")
+    need(value["attempt"] == attempt and value["bindings"] == bindings and value["slot"] == slot)
+    report = validate_report(slot, value["report"])
+    need(value["report_sha256"] == hashlib.sha256(canonical(report)).hexdigest())
+    need(raw == encode(attempt, bindings, slot, report))
+    return report
+
+
+def validate_url(url, *, attempt, slot, now):
+    need(type(url) is str and 0 < len(url) <= 8192)
+    need(all(32 < ord(c) < 127 for c in url))
+    parsed = urlsplit(url)
+    bucket, key = target(attempt, slot)
+    need(parsed.scheme == "https" and not parsed.fragment)
+    need(parsed.netloc == bucket + ".s3.us-east-1.amazonaws.com")
+    need(parsed.path == "/" + key)
+    query = unique(parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True))
+    required = {
+        "X-Amz-Algorithm",
+        "X-Amz-Credential",
+        "X-Amz-Date",
+        "X-Amz-Expires",
+        "X-Amz-SignedHeaders",
+        "X-Amz-Signature",
+    }
+    need(set(query) in (required, required | {"X-Amz-Security-Token"}))
+    need(query["X-Amz-Algorithm"] == "AWS4-HMAC-SHA256")
+    need(query["X-Amz-SignedHeaders"] == SIGNED_HEADERS)
+    need(query["X-Amz-Expires"] == "900")
+    need(re.fullmatch(r"[0-9a-f]{64}", query["X-Amz-Signature"]))
+    date = query["X-Amz-Date"]
+    need(re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", date))
+    need(
+        re.fullmatch(
+            r"[A-Z0-9]{16,128}/" + date[:8] + r"/us-east-1/s3/aws4_request",
+            query["X-Amz-Credential"],
+        )
+    )
+    signed_at = dt.datetime.strptime(date, "%Y%m%dT%H%M%SZ").replace(tzinfo=dt.UTC).timestamp()
+    need(type(now) in (int, float) and signed_at - 30 <= now < signed_at + 890)
+    return parsed.hostname, parsed.path + "?" + parsed.query
+
+
+def issue(client, *, attempt, bindings):
+    """Local signing only with an explicitly supplied S3 client; returns secrets.
+
+    Never print or put the returned capabilities into public evidence, logs or
+    a persisted launch request. No bucket or credential creation is performed.
+    """
+    validate_client(client)
+    identity(attempt, bindings)
+    puts = {}
+    for slot in SLOTS:
+        bucket, key = target(attempt, slot)
+        url = client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": bucket,
+                "Key": key,
+                "ContentLength": BODY_BYTES,
+                "ContentType": "application/json",
+                "IfNoneMatch": "*",
+                "ServerSideEncryption": "AES256",
+            },
+            ExpiresIn=900,
+            HttpMethod="PUT",
+        )
+        validate_url(url, attempt=attempt, slot=slot, now=time.time())
+        puts[slot] = url
+    return {"attempt": attempt, "bindings": bindings, "puts": puts}
+
+
+def validate_client(client):
+    need(client.meta.endpoint_url == "https://s3.us-east-1.amazonaws.com")
+    need(client.meta.region_name == "us-east-1")
+    need(client.meta.config.retries.get("total_max_attempts") == 1)
+    need(client.meta.config.proxies == {})
+    need(client.meta.config.signature_version == "s3v4")
+
+
+def claim(directory, slot):
+    """Exclusive local claim is taken BEFORE the network request, even if it fails."""
+    need(slot in SLOTS)
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        need(info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700)
+        output = os.open(
+            slot + ".started",
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+            dir_fd=fd,
+        )
+        try:
+            need(os.write(output, b"one_attempt\n") == 12)
+            os.fsync(output)
+        finally:
+            os.close(output)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def put_once(config, slot, report, *, claim_directory):
+    """One TLS PUT, no proxy, redirects, retries, response-body or exception logging."""
+    connection = None
+    try:
+        need(type(config) is dict and set(config) == {"attempt", "bindings", "puts"})
+        need(type(config["puts"]) is dict and set(config["puts"]) == set(SLOTS))
+        raw = encode(config["attempt"], config["bindings"], slot, report)
+        host, path = validate_url(
+            config["puts"][slot], attempt=config["attempt"], slot=slot, now=time.time()
+        )
+        claim(claim_directory, slot)
+        connection = http.client.HTTPSConnection(
+            host, timeout=3, context=ssl.create_default_context()
+        )
+        connection.request("PUT", path, body=raw, headers=HEADERS)
+        reply = connection.getresponse()
+        need(reply.status == 200)
+        need(reply.getheader("x-amz-server-side-encryption") == "AES256")
+        return {"slot": slot, "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()}
+    except Exception:
+        raise ValueError("report_upload_failed") from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def collect(client, *, attempt, bindings):
+    """Read only four exact keys, each at most 8193 bytes. No listing or retry."""
+    import botocore.exceptions
+
+    validate_client(client)
+    identity(attempt, bindings)
+    result = {}
+    for slot in SLOTS:
+        bucket, key = target(attempt, slot)
+        try:
+            response = client.get_object(Bucket=bucket, Key=key, ExpectedBucketOwner="573978149073")
+        except botocore.exceptions.ClientError as error:
+            if error.response.get("Error", {}).get("Code") == "NoSuchKey":
+                continue
+            raise ValueError("report_read_failed") from None
+        stream = response["Body"]
+        try:
+            need(response.get("ContentLength") == BODY_BYTES)
+            need(response.get("ServerSideEncryption") == "AES256")
+            result[slot] = decode(
+                stream.read(BODY_BYTES + 1), attempt=attempt, bindings=bindings, slot=slot
+            )
+        finally:
+            stream.close()
+    return result
+
+
+def assess(reports, *, stopped_observed, cleanup_verified):
+    need(type(reports) is dict and set(reports) <= set(SLOTS))
+    for slot, report in reports.items():
+        validate_report(slot, report)
+    complete = (
+        set(reports) == {"boot", "ready", "observer"}
+        and reports["observer"]["status"] == "watchdog_failure_receipt_verified"
+        and stopped_observed is True
+        and cleanup_verified is True
+    )
+    return {
+        "native_watchdog_qualified": complete,
+        "complete_bootstrap_qualified": False,
+        "gate_5_complete": False,
+        "real_4b_import": False,
+        "gpu_inference_training": False,
+    }
+
+
+def run(**_arguments):
+    raise ValueError("report_channel_host_admission_not_bound")

@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Prepare an offline SDK bundle, or install it once on a separately admitted VM.
+
+No cloud launcher, downloader, credentials or model input. Native installation
+requires a root Linux/Python 3.12 systemd unit with private networking and bounded
+resources. Passing these checks is NOT full host admission or import authority.
+Failure consumes the fixed destination; never remove it to retry this installer.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import platform
+import stat
+import subprocess
+import sys
+import tarfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+DEST = Path("/opt/lumi-sft-acquisition")
+UNIT = "lumi-sdk-install-v1.service"
+LOCK = "configs/lumi-vm-acquisition-sdk-v0.1.lock.json"
+CHECK = "scripts/check_sft_vm_acquisition_sdk_v2.py"
+PINS = {
+    LOCK: "8d4b775307c3d70d8b99d17a1bf901ce1ea1a5e8294481a89b2a87f83b2ace4c",
+    CHECK: "abdcdf2d56aa38e9255a4ffd96f72b0e96a5d0df3257abd759f0bdf5d99fe8bd",
+    "scripts/check_sft_vm_fullsize_sdk_wire_v1.py": (
+        "e1ed357b6ae945394d12cfdef9453918574ff67acd51b7d8e2879f8a8ecb7b34"
+    ),
+    "scripts/acquire_sft_vm_fullsize_inputs_v1.py": (
+        "c3fe17fe42b7e5bf7df19e8a5f198568ce7d9efa89dc2af148d3f73e9fd89424"
+    ),
+    "src/lumi/posttraining_vm_fullsize_transport_v1.py": (
+        "cb6b21e6ab1011dcc2902305f67ecaf24687930ef40628b9b01b9ce40e123c30"
+    ),
+    "src/lumi/posttraining_vm_fullsize_staging_v1.py": (
+        "0dd28e571a9b01ef7a2270fc9df81545d5f903acfb1133ba2771ebce1c479c68"
+    ),
+}
+CAP = 20 * 1024**2
+ENV = {
+    "PATH": "/usr/bin:/bin",
+    "HOME": "/nonexistent",
+    "LANG": "C.UTF-8",
+    "PIP_CONFIG_FILE": "/dev/null",
+    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+    "PIP_NO_CACHE_DIR": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("sdk_install_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def read(path, cap):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= cap)
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            raw = stream.read(cap + 1)
+        after = os.fstat(fd)
+        # Reading can legitimately advance atime on Linux relatime filesystems.
+        # Compare identity/content metadata, not the read access timestamp.
+        fields = (
+            "st_dev",
+            "st_ino",
+            "st_mode",
+            "st_nlink",
+            "st_uid",
+            "st_gid",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+        )
+        need(
+            len(raw) == before.st_size
+            and all(getattr(before, key) == getattr(after, key) for key in fields)
+        )
+        return raw
+    finally:
+        os.close(fd)
+
+
+def write(path, raw):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def validate(members):
+    need(all(sha(members[name]) == pin for name, pin in PINS.items()))
+    rows = json.loads(members[LOCK])["requirements"]
+    expected = set(PINS) | {"wheels/" + r["filename"] for r in rows}
+    need(set(members) == expected and len(rows) == 5)
+    for row in rows:
+        body = members["wheels/" + row["filename"]]
+        need(len(body) == row["bytes"] and sha(body) == row["sha256"])
+    return rows
+
+
+def unpack(raw, expected_sha):
+    need(len(raw) <= CAP and sha(raw) == expected_sha)
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        items = archive.getmembers()
+        need(len(items) == 11 and len({m.name for m in items}) == 11)
+        need(all(m.isfile() and 0 < m.size <= CAP for m in items))
+        need(sum(m.size for m in items) <= CAP)
+        members = {m.name: archive.extractfile(m).read() for m in items}
+    validate(members)  # Exact name set before any extraction; no links or traversal.
+    return members
+
+
+def prepare(destination):
+    members = {name: read(ROOT / name, 131072) for name in PINS}
+    for row in json.loads(members[LOCK])["requirements"]:
+        members["wheels/" + row["filename"]] = read(
+            ROOT / "artifacts/lumi-vm-acquisition-sdk-artifacts-v0.2" / row["filename"],
+            row["bytes"],
+        )
+    validate(members)
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+        for name, body in sorted(members.items()):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(body), 0o400
+            archive.addfile(info, io.BytesIO(body))
+    raw = out.getvalue()
+    unpack(raw, sha(raw))
+    need(not any(p.is_symlink() for p in (destination, *destination.parents)))
+    destination.mkdir(mode=0o700, exist_ok=False)
+    write(destination / "sdk-release.tar", raw)
+    report = {
+        "schema": "lumi.vm-sdk-offline-release.v0.1",
+        "archive_sha256": sha(raw),
+        "archive_bytes": len(raw),
+        "members": len(members),
+        "installer_sha256": sha(read(Path(__file__), 131072)),
+        "network_used": False,
+        "native_install_started": False,
+    }
+    write(destination / "build.json", canonical(report))
+    return report
+
+
+def boundary():
+    need(sys.platform == "linux" and platform.machine() == "x86_64")
+    need(sys.version_info[:2] == (3, 12) and sys.flags.isolated and sys.dont_write_bytecode)
+    need(os.geteuid() == os.getegid() == 0)
+    with open("/proc/self/cgroup", "rb") as stream:
+        need(stream.read(4097).strip() == f"0::/system.slice/{UNIT}".encode())
+    group = Path("/sys/fs/cgroup/system.slice") / UNIT
+    # procfs/sysfs pseudo-files report size zero; read those through bounded open.
+    for name, value in (("memory.max", 1024**3), ("memory.swap.max", 0), ("pids.max", 64)):
+        with (group / name).open("rb") as stream:
+            need(stream.read(65).strip() == str(value).encode())
+    need(os.stat("/proc/self/ns/net").st_ino != os.stat("/proc/1/ns/net").st_ino)
+    need(not any(p.is_symlink() for p in (DEST, *DEST.parents)))
+    need(DEST.parent.stat().st_uid == 0 and DEST.parent.stat().st_mode & 0o022 == 0)
+
+
+def run_command(args, timeout, output=None):
+    # Outer systemd timeout kills the complete cgroup if the installer dies.
+    subprocess.run(
+        args,
+        check=True,
+        timeout=timeout,
+        env=ENV,
+        stdin=subprocess.DEVNULL,
+        stdout=output if output is not None else subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def check_report(report, rows):
+    need(report["schema"] == "lumi.vm-acquisition-sdk-wire-check.v0.2")
+    need(report["versions"] == {r["name"]: r["version"] for r in rows})
+    need(report["platform"] == "linux" and report["python"].startswith("3.12."))
+    need(report["passed"] is True and report["tests"] == 4)
+    need(all(report[n] == 0 for n in ("failures", "errors", "skips")))
+    need(report["guard_violations"] == {"network": 0, "payload_or_credentials": 0})
+    need(
+        all(
+            report[n] is True
+            for n in (
+                "production_sdk_factory_used",
+                "existing_four_wire_tests_reused",
+                "http_send_doubled",
+                "dummy_credentials_only",
+            )
+        )
+    )
+    need(
+        all(
+            report[n] is False
+            for n in ("linux_host_qualified", "real_4b_import", "gate_5_complete")
+        )
+    )
+
+
+def install(archive, expected_sha):
+    boundary()
+    members = unpack(read(archive, CAP), expected_sha)
+    rows = validate(members)
+    DEST.mkdir(mode=0o755, exist_ok=False)  # Durable one-shot marker, including failures.
+    stage = "extract"
+    try:
+        write(
+            DEST / "started.json",
+            canonical({"archive_sha256": expected_sha, "retry_allowed": False}),
+        )
+        source = DEST / "qualification"
+        source.mkdir(mode=0o700)
+        for name, body in sorted(members.items()):
+            path = source / name
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            write(path, body)
+        req = source / "offline-requirements.txt"
+        write(
+            req,
+            "".join(
+                f"{r['name']}=={r['version']} --hash=sha256:{r['sha256']}\n" for r in rows
+            ).encode("ascii"),
+        )
+        stage = "venv"
+        run_command(["/usr/bin/python3", "-I", "-B", "-m", "venv", str(DEST / "venv")], 90)
+        python = str(DEST / "venv/bin/python")
+        stage = "offline_install"
+        run_command(
+            [
+                python,
+                "-I",
+                "-B",
+                "-m",
+                "pip",
+                "install",
+                "--no-index",
+                "--find-links=" + str(source / "wheels"),
+                "--only-binary=:all:",
+                "--require-hashes",
+                "--no-deps",
+                "--no-compile",
+                "-r",
+                str(req),
+            ],
+            180,
+        )
+        stage = "dependency_check"
+        run_command([python, "-I", "-B", "-m", "pip", "check"], 30)
+        stage = "wire_check"
+        with (DEST / "wire-check.json").open("xb") as output:
+            run_command([python, "-I", "-B", str(source / CHECK)], 30, output)
+            output.flush()
+            os.fsync(output.fileno())
+        report = json.loads(read(DEST / "wire-check.json", 8192))
+        check_report(report, rows)
+        result = {
+            "schema": "lumi.vm-sdk-offline-install.v0.1",
+            "status": "passed",
+            "archive_sha256": expected_sha,
+            "sdk_native_wire_qualified": True,
+            "http_send_doubled": True,
+            "host_admitted": False,
+            "real_4b_import": False,
+            "gate_5_complete": False,
+            "credential_access": False,
+            "retry_allowed": False,
+        }
+        write(DEST / "result.json", canonical(result))
+        return result
+    except Exception:
+        write(DEST / "failed.json", canonical({"stage": stage, "retry_allowed": False}))
+        raise ValueError("sdk_install_failed") from None
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    choice = parser.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--prepare", type=Path)
+    choice.add_argument("--install", type=Path)
+    parser.add_argument("--sha256")
+    args = parser.parse_args()
+    try:
+        need(
+            (args.prepare is not None and args.sha256 is None)
+            or (args.install is not None and args.sha256 is not None)
+        )
+        result = (
+            prepare(args.prepare.resolve()) if args.prepare else install(args.install, args.sha256)
+        )
+        print(json.dumps(result, sort_keys=True))
+    except Exception:
+        print('{"status":"sdk_setup_rejected","native_success_claimed":false}')
+        raise SystemExit(1) from None

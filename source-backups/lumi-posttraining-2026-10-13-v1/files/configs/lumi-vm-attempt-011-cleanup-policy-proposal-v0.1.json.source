@@ -1,0 +1,87 @@
+{
+  "account": "573978149073",
+  "atomic_compare_and_swap_available": false,
+  "attempt": "ad7b734ba7894916b25d795ac3dab31c",
+  "bucket": "lumi-corpus-prod-27777c02b29b76efcac3",
+  "execution_permitted": false,
+  "existing_fields_and_statements_preserved": true,
+  "existing_statement_count": 13,
+  "expected_after_canonical_sha256": "cd1dc114f6e8e25196fdc1215a4fda2e448604f7615b70d456784b7f1f4153e1",
+  "expected_before_canonical_sha256": "ad33476e035c08cfdba1261b270cad64652059863e79b371caa546d858f9de00",
+  "expected_before_raw_sha256": "70f66eee46bf5e912ed7735e461fe1f0c4454e06a2cf6dc226396d81ed9d4597",
+  "gpu": false,
+  "instance_action": false,
+  "maximum_control_calls": 5,
+  "maximum_policy_bytes": 16384,
+  "maximum_policy_puts": 1,
+  "maximum_seconds": 120,
+  "new_allows": 0,
+  "object_access": false,
+  "plan_sha256": "9f60b8588d9e6bb5561e52f8693b82c8763e250fc477f1b0f707979bd4a72f83",
+  "policy_size_bytes": 5428,
+  "prefix": "lumi-corpus/v0.1/control/sft-import-research/ad7b734ba7894916b25d795ac3dab31c/network-cleanup/",
+  "raw_policy_retained": false,
+  "region": "us-east-1",
+  "required_before_mutation": [
+    "User approves exact four-deny append and confirms no concurrent bucket-policy writers during the update window.",
+    "Bind and validate successor executor and fresh approval; preserve all consumed execution evidence.",
+    "Fresh expected-account and before-policy hash checks; stop on drift.",
+    "One PUT at most, exact readback and non-public policy status; no resend or rollback."
+  ],
+  "resulting_statement_count": 17,
+  "retry": false,
+  "rollback": false,
+  "schema": "lumi.vm-attempt-011-cleanup-policy-proposal.v0.1",
+  "statements_to_add": [
+    {
+      "Action": [
+        "s3:DeleteObject",
+        "s3:DeleteObjectVersion"
+      ],
+      "Effect": "Deny",
+      "Principal": "*",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/ad7b734ba7894916b25d795ac3dab31c/network-cleanup/*",
+      "Sid": "LumiCleanupad7b734ba7894916b25d795ac3dab31c1"
+    },
+    {
+      "Action": "s3:PutObject",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:if-none-match": "*"
+        }
+      },
+      "Effect": "Deny",
+      "Principal": "*",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/ad7b734ba7894916b25d795ac3dab31c/network-cleanup/*",
+      "Sid": "LumiCleanupad7b734ba7894916b25d795ac3dab31c2"
+    },
+    {
+      "Action": "s3:PutObject",
+      "Condition": {
+        "StringNotEquals": {
+          "s3:x-amz-server-side-encryption": "AES256"
+        }
+      },
+      "Effect": "Deny",
+      "Principal": "*",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/ad7b734ba7894916b25d795ac3dab31c/network-cleanup/*",
+      "Sid": "LumiCleanupad7b734ba7894916b25d795ac3dab31c3"
+    },
+    {
+      "Action": "s3:PutObject",
+      "Condition": {
+        "Null": {
+          "s3:x-amz-copy-source": "false"
+        }
+      },
+      "Effect": "Deny",
+      "Principal": "*",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/ad7b734ba7894916b25d795ac3dab31c/network-cleanup/*",
+      "Sid": "LumiCleanupad7b734ba7894916b25d795ac3dab31c4"
+    }
+  ],
+  "status": "prepared_not_authorized",
+  "training": false,
+  "watchdog_deployment": false,
+  "writer_coordination_confirmed": false
+}

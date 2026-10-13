@@ -1,0 +1,602 @@
+"""Independent read-only verification of attempt-022 control deployments."""
+
+from __future__ import annotations
+
+import json
+import os
+import types
+from pathlib import Path
+
+from scripts import inspect_sft_vm_attempt019_control_targets_v1 as transport
+from scripts import sft_vm_dedicated_cleanup_bucket_v13 as bucket_source
+from scripts import verify_sft_vm_attempt019_controls_v1 as qualified
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "afae7b4618174ce084fd3b6a902d74e1"
+ACCOUNT = "573978149073"
+FUNCTION = "lumi-stop-" + ATTEMPT
+WORKER_ROLE = "lumi-stop-worker-" + ATTEMPT
+SCHEDULE_ROLE = "lumi-stop-schedule-" + ATTEMPT
+GROUP = "lumi-stop-" + ATTEMPT
+LOG_GROUP = "/aws/lambda/" + FUNCTION
+BUCKET = "lumi-cleanup-" + ATTEMPT
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/network-cleanup/"
+WATCH_OUTPUT = ROOT / (
+    "evidence/lumi-vm-attempt-022-inert-watchdog-deployment-verification-v0.1.json"
+)
+STORE_OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-cleanup-bucket-verification-v0.1.json"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-022-control-plan-v0.1/plan.json"
+PLAN_SHA = '0b072f68938e74484501c72e60a57965c5e205e4572af06dcc60ceb00d17fc35'
+SOURCE_RELEASE = ROOT / "artifacts/lumi-vm-attempt-022-source-v0.1/release.json"
+SOURCE_RELEASE_SHA = '5cd83aa6c3ce497e45170a5e3165ae28705bf08a92b191098b6b4f66c48f7a8a'
+SOURCE_BINDINGS = {
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-01-result.json': (
+        177,
+        'c4be7defc48ad75c9fc1ca2bf31a26ede2e3acd3a3073fe91d9910bac0b295e3',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-01-started.json': (
+        153,
+        'df7ea15b05721a316cf8e44717632288f8d336b060389c98afd49fec1d84dbf7',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-02-result.json': (
+        165,
+        'b7d462ef959e35643f8f2c3ceea6afd89570b4ef47744651f1cb7374ce8a8726',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-02-started.json': (
+        147,
+        'f32b15ad6a73d9336e6e9638b794650a70e80d16b2b3b44d1a6f3fe642e8b65e',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-03-result.json': (
+        172,
+        'e58f40e90f44cb8fb4993d800d6701ceba47ba18afe5742d55794f6fcea47430',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-03-started.json': (
+        148,
+        'd085c95dd6fe4fb84fb4d25a5d471e6c457f52d6297660126088562c8571a45e',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-04-result.json': (
+        182,
+        '38b610d4d2ea0d54b72f1213f7516893be917b7790383e9beaf46e51f344b3a8',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-04-started.json': (
+        158,
+        '4807ed5214f5459e7dd60381d46397b186a46e63d36d2594d08acba890175553',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-05-result.json': (
+        180,
+        '887d8dd5591d5c412f758045582df6024ad812bfcecceb0a1332776ac7157df6',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-05-started.json': (
+        156,
+        'bad7d6dd1de6a5172c8563c7c17a52912f3df3e3fe384261cd918d15d8d5f8e0',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-06-result.json': (
+        180,
+        '5fda9dbf7877c420b7cc8f260ad4c75f9f1cc5d43c471b5857f9e8bc6a5a5774',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-06-started.json': (
+        156,
+        '4e57c07bb6d3d3de6c7e9dc0b6e07dbaf54f22146e0bab19be82c042ed733679',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-07-result.json': (
+        177,
+        '43a3e665d4cdc1be005341ff86bada25a8649774ea2112478f1c3ebac929fe24',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-07-started.json': (
+        153,
+        'fa8332ae40935578d07f78b75b26d7b0a7697eb0198be7542182f2a4c1ae0b65',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-08-result.json': (
+        176,
+        '66bb55c85eae39f77a64bab946e0d1f499c824bf319f5adef0e60ebd8ad215e7',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-08-started.json': (
+        152,
+        '772bb559a556ff0c2fc1d74aea7850504de3b9f763c3801205f54b0287bc29ec',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-09-result.json': (
+        179,
+        '9728ae227c63b62aee42a6d826783c13a15b424cf075a04da40a67fe1726cd8b',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-09-started.json': (
+        155,
+        'ae9be6eb837dd35545321edc7d5fdf88132b153ba3584a1c240ee2cf4ef462f0',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-10-result.json': (
+        183,
+        '1d9b3d1adfead5d8b8015e3ff5ac2c9e1f6036919fb674839c1c2cfb201861b0',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-10-started.json': (
+        159,
+        '219fa3c2d2359761788eaaadfbde31d42d532bb5b60b59721516d8a0419f9da7',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-11-result.json': (
+        189,
+        '4ed4f92526939e3ad2618af18f3d80ce94cff4aa35f7b10a009d68546ced6f7d',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-11-started.json': (
+        165,
+        '6c4dd3600353c4e98918b9089cfde4addd21d5766a8e31ae9f11c0ef9dc36196',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-12-result.json': (
+        181,
+        '16265279ff193ddf4e3a3b86dd03de350aab37f614117bb4cd306297ca81a754',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-12-started.json': (
+        157,
+        'ad8751503b9012c074a6fe596ddd32011e8baa77a6ddad9b404508cb7b1a59ec',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-13-result.json': (
+        181,
+        'ae766433d3881fbf9a51684e8f73626bbfbde623f40a4dd430dd300eb0115445',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-13-started.json': (
+        157,
+        '7cd4159958d317cac34bc10948fdd89b96b3db111bc45be2889568c03521e0bd',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-14-result.json': (
+        178,
+        '45bd21641925425f90fce45d0d906c553e6d65e8ed9d61e0fd0d554e26637c9a',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-14-started.json': (
+        154,
+        '0a7a85a0b75d6e2692d5939d508e4e8a7078b8f17192d5676b5b651a2a89c585',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-15-result.json': (
+        177,
+        'db5017eda3fdfeac0066f125c67087f30c618de3f43f4134b9141a23d6ee8524',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-15-started.json': (
+        153,
+        '15d8ca9b913d032e02e637caf35b181dab6dbef402ce448e08802297d8c77b9d',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-16-result.json': (
+        184,
+        'cbaea8e9359fad47b199954e848cd28047169d96ea71057868d8fa004ae9ed51',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-16-started.json': (
+        160,
+        '7403f9c90454992640da5510b22777019f33462c468cd20644ac679e778f71bb',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-17-result.json': (
+        188,
+        '5e9b8a52a41938ea152349e6f26511e15063beeb798dff411cb50ed2ada79abb',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/call-17-started.json': (
+        170,
+        '54a02b28ede7ad222eafe215586ed636afff16027e85d884e69921b1978fff5c',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/result.json': (
+        440,
+        'd8724024d4fd60954fa76777dc717e396c21ad4c1e6a3291a14ab43a1de33472',
+    ),
+    'artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/started.json': (
+        169,
+        '89037fef8e154556be75178741003f213ff4a92476ef6c8eb4fd7579080f7486',
+    ),
+    'artifacts/lumi-vm-attempt-022-control-package-v0.1/release.json': (
+        2359,
+        '5f49c3e6ed00b4ddfb14346c4c79d11ac09deeb8411de6f6948ef25a56aead9e',
+    ),
+    'artifacts/lumi-vm-attempt-022-control-plan-v0.1/plan.json': (
+        23537,
+        '0b072f68938e74484501c72e60a57965c5e205e4572af06dcc60ceb00d17fc35',
+    ),
+    'artifacts/lumi-vm-attempt-022-control-plan-v0.1/release.json': (
+        596,
+        '87df9d8b8fb0722020277468d5e5071874c4cab89f6731fac0de3b5619cc9813',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-01-result.json': (
+        177,
+        'c4be7defc48ad75c9fc1ca2bf31a26ede2e3acd3a3073fe91d9910bac0b295e3',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-01-started.json': (
+        153,
+        'df7ea15b05721a316cf8e44717632288f8d336b060389c98afd49fec1d84dbf7',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-02-result.json': (
+        176,
+        'cee99d9bf89668f81e0859f6480a4cd5fe4a45c2b37a441ace6337bb959ec03e',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-02-started.json': (
+        158,
+        'bb1863ccb24d1cc3b9401707242a48b81dd34d50ae708b4badb85ccef6a1e538',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-03-result.json': (
+        177,
+        'c4be7defc48ad75c9fc1ca2bf31a26ede2e3acd3a3073fe91d9910bac0b295e3',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-03-started.json': (
+        153,
+        'df7ea15b05721a316cf8e44717632288f8d336b060389c98afd49fec1d84dbf7',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-04-result.json': (
+        160,
+        'e8ad7a9eca284f89a5fcc38decdfd424c81751bc50b2b9968446b32356cb05bf',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-04-started.json': (
+        142,
+        '4f504c0ffbee688a95caf169e23a5d2a64ed293a39cfea9081f983b77dfd4832',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-05-result.json': (
+        160,
+        'd4b71880dc58520fddc222f533d431cb56e71138aa7a482aeeeb291074d68636',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-05-started.json': (
+        142,
+        '0641d7ec6d6c3a9a5b5b3eda23dcb2e44babbc4b5acb2bc38d314a3b73e4d076',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-06-result.json': (
+        181,
+        'a6e39c7a4dc99dddff8bc6222d6b6ccaf14720b1e3e93092837cace10f67612e',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-06-started.json': (
+        163,
+        'd20a75b5fb9a4081ac4acb63f1a2cc390edceeafd9d8afc737716257fff636ce',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-07-result.json': (
+        178,
+        '4edbf6b89ed8ac216a7046b0ec9dceac3963dd52458beea93d83c88c9125ebb5',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-07-started.json': (
+        154,
+        'a04f8f31f274cf88a245000b6c55f7e8ac7ede00f36b381134589bb2d7d93791',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-08-result.json': (
+        168,
+        'e9e83d7ccea2355899bf08e09de45a49256c525f43c4aec9b1827d4c3d54d9c7',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-08-started.json': (
+        144,
+        'd160ab2aeae2a50fca8ec75cd31c1730cc117a78bd864eca8e386bdb69f5b037',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-09-result.json': (
+        172,
+        'bbad389aa153d30a6688d09a68a5b46fcdfebdaece453c76332fd2422848c01a',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-09-started.json': (
+        148,
+        '9bfef0c863078c8d951b86d1c3a2ca91c489b9360e5caffaa43bb2afdb9b76c2',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-10-result.json': (
+        166,
+        'ebac7fadf10453af10b30fff239506a7847e7159d6dcc0c596e04cd0d6bf48fe',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-10-started.json': (
+        142,
+        '4f504c0ffbee688a95caf169e23a5d2a64ed293a39cfea9081f983b77dfd4832',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-11-result.json': (
+        173,
+        '65872f3db9fd81791911e7d30e39dbd63aee389d3de9789a285b4bebb592289d',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-11-started.json': (
+        149,
+        '534ccd0fbd34621f7cfb8843f9f2d89b3b80bcdaa9f31e1b823df79379604a39',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-12-result.json': (
+        168,
+        'c2ab9f605922789372c18f7538a6333f71b1c337c5d4d25bf7488470159a6067',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-12-started.json': (
+        144,
+        'bf3cb1e7ed2ab36be7af9e0c977ef2c7d6ee65b65573bac8b42a82880619d2d0',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-13-result.json': (
+        172,
+        '6a7159fbc78e5ec9e616ec265b3a21b37251f9d1a42a1b174c2b6eb9bbd2f633',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-13-started.json': (
+        148,
+        'f09e39c9d4cdf1e6509a6d50021eebc35aed188f5cdbeccdaf650109ae579638',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-14-result.json': (
+        166,
+        'b8c1c36f106f30ee11343652187655396db48fed2858acb5d5a7565dc65bdf16',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-14-started.json': (
+        142,
+        '0641d7ec6d6c3a9a5b5b3eda23dcb2e44babbc4b5acb2bc38d314a3b73e4d076',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-15-result.json': (
+        173,
+        'a3e75628fd604f1a18bea6729aadfe7e57a5b93472e311f848b915e54a539cf0',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-15-started.json': (
+        149,
+        'e26dd900de0ebf1ade8a36067d29ecd13da8e6d97222e8d03950e668c5d61772',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-16-result.json': (
+        174,
+        '7324ae80d093404d972cbb5de0419afd1bf22d6e0a9baac314848abc39349931',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-16-started.json': (
+        150,
+        'e2df0efbb053ab461a9498590e415fe642fa8b5446f284b8e9efff503794e4b3',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-17-result.json': (
+        178,
+        '2bcd4cd8c41c9097ef50c0610772f8635f8aa7e3e29b839df98bef914bab02b7',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-17-started.json': (
+        154,
+        'd284c5ec33c25d818d42d1bfcf3667889c59c06507068f127dbd4044ad2ffc50',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-18-result.json': (
+        175,
+        '80fe89b82ad110b142c9ab408e83d96e8c24817717c33d3e1c0e3038e5bfa6aa',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-18-started.json': (
+        151,
+        '4b53165e212dfd546d879a16e524b9d56dac05de0adb69ef8d09a57069e73a08',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-19-result.json': (
+        184,
+        '36261aa0d9a5f61529e3a5800b09e3102e5e78ed0e0a4351f7b6779b2c3c646b',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-19-started.json': (
+        160,
+        'c91e5c6308b2b22fd40c75f81222508970e4671faa15f836ee7059633465b2f4',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-20-result.json': (
+        192,
+        'ec989c25154f1aea291cde19601a1f19a78e290bded5f993433de982d69014da',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-20-started.json': (
+        168,
+        '9e839234f0405bfb7371e97f5d605edbcc4ae8706637c73c56f6d7cfe29af68d',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-21-result.json': (
+        187,
+        '0b976b6e4ac1e25aa7e9def216f440781a0850ef063962a3a0ee36f7be722472',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-21-started.json': (
+        163,
+        'd20a75b5fb9a4081ac4acb63f1a2cc390edceeafd9d8afc737716257fff636ce',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-22-result.json': (
+        185,
+        '1984e5986906a8c43f666e76e5e2853a871eb4aa7ee2bef761302c35d4342eef',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-22-started.json': (
+        161,
+        '8f7cc9d141c3b27de78f4a06ca08a431ef7cd4eac5c095a431b8891ed1e14edf',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-23-result.json': (
+        193,
+        'ab582fac023cf786a9cb29addf228b49463d7e2137b899ab25f67c5fa18fb804',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-23-started.json': (
+        169,
+        '18769e26e2da6de8ae9b8c7bb9389dca9d6daad7f397965ed10a7abd0744c651',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-24-result.json': (
+        178,
+        '4edbf6b89ed8ac216a7046b0ec9dceac3963dd52458beea93d83c88c9125ebb5',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/call-24-started.json': (
+        154,
+        'a04f8f31f274cf88a245000b6c55f7e8ac7ede00f36b381134589bb2d7d93791',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/deployment/result.json': (
+        593,
+        '1d17cb74e59d3bc570d0ecaf68c6a5d9d907dfee15c711c79478237e486216d3',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/entry-result.json': (
+        967,
+        '087d77b1fb7b7ba5f6ec1391daf764d4aab4d0838bada2a094f1803353a380a7',
+    ),
+    'artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/entry-started.json': (
+        344,
+        '8c892af99fe9ec669d80164f8aeacd9faa9c31124bca1868b32427b0e96694e7',
+    ),
+    'configs/lumi-vm-attempt-022-cleanup-bucket-approval-v0.1.json': (
+        906,
+        'c4d3e877f99754a8930be386328bae261347194d4ac0888ebfca1892aca6217b',
+    ),
+    'configs/lumi-vm-attempt-022-cleanup-bucket-proposal-v0.1.json': (
+        780,
+        '1494fa4c25d7a62ab8abeb220b185b9fdb63c56d35f1060cf63f62ec54576759',
+    ),
+    'configs/lumi-vm-attempt-022-controls-execution-authorization-v0.1.json': (
+        1655,
+        'b80acaf97e77c0a241bd6e748f4a982d79958544a68fa87f38d0510394ccd3ba',
+    ),
+    'configs/lumi-vm-attempt-022-watchdog-execution-approval-v0.1.json': (
+        717,
+        '21850ee138b152155fdb7837c0deff9dd31914474ddbe19da9f5913ad1b02cb1',
+    ),
+    'configs/lumi-vm-attempt-022-watchdog-execution-proposal-v0.1.json': (
+        808,
+        'b0721672e6493a486b17172fae7ba4113312128a693db9261d2394999e1f76b4',
+    ),
+    'evidence/lumi-vm-attempt-022-control-package-test-selection-supplement-v0.1.json': (
+        2855,
+        'a069a8ec5638dabc97280c4ead05eb907ac26be9d775ad290d250e032529335c',
+    ),
+    'evidence/lumi-vm-attempt-022-control-package-verification-v0.1.json': (
+        4334,
+        '8486e67510bde91fc0867fbd5d24a6d6834be8dfdf263ed3e3328d67a4feb7fa',
+    ),
+    'evidence/lumi-vm-attempt-022-control-target-absence-v0.1.json': (
+        2606,
+        '0fae9b018c0565050952bd3f277a94d1c2e544d2d5cb033f2f00165df6f2ca18',
+    ),
+    'evidence/lumi-vm-attempt-022-control-target-absence-verification-v0.1.json': (
+        2848,
+        '8258b2b924aabb1baa158f532e933e820e636c66b00343c6e2503ff0eca28860',
+    ),
+    'evidence/lumi-vm-attempt-022-source-verification-v0.1.json': (
+        27664,
+        '9a152480ad7a8b04866b47e7bf648f7ce7a8dae4aee9273e0d0e832c11be5f66',
+    ),
+    'scripts/execute_sft_vm_inert_watchdog_v15.py': (
+        8183,
+        '05e54fb6cba21a23d39276b9a5ccaccb1e74f2112294ffdcb752b20096ff324c',
+    ),
+    'scripts/prepare_sft_vm_attempt022_control_package_v1.py': (
+        16495,
+        '040d644dfba50cc1fb2cc77395cfec36e19d0b957de6af8197824d021fe4de65',
+    ),
+    'scripts/prepare_sft_vm_attempt022_deployment_bindings_v1.py': (
+        4992,
+        '1f41fec5e8c5313ab062902aea42f1880032c1124efc7873c0c5687e00cbd55c',
+    ),
+    'scripts/sft_vm_dedicated_cleanup_bucket_v13.py': (
+        4140,
+        '87f3232468245c1c9b75e5d17479de9faf4c3c16b7c5c3d5dc2a0b60531a8e1c',
+    ),
+    'scripts/verify_sft_vm_attempt022_control_execution_v1.py': (
+        10063,
+        '735376d5f4b2eb8029cb870785ca395b3359c32f576a0d2416c5efe5ab2b2b42',
+    ),
+    'scripts/verify_sft_vm_attempt022_control_package_v1.py': (
+        6657,
+        '2220532465c94426f59f9baf5a3571a4177790878ea08a1ae324bf23aae49fb0',
+    ),
+    'tests/test_sft_vm_attempt022_control_execution_v1.py': (
+        2302,
+        '2f71703b59cda346a53aa998c24c1a90bb87b57a73a920a3d1a64f18fdcb4547',
+    ),
+    'tests/test_sft_vm_attempt022_control_package_v1.py': (
+        5586,
+        '29157b09b01964064b089eab6c42c6a32b36459cd35a51ddb3dcd878096e5e31',
+    ),
+    'tests/test_sft_vm_dedicated_cleanup_bucket_v13.py': (
+        4051,
+        'f4fd6c0fdb881cd41ca4e5d5ac2c644e2b5cf2f5353a1737997b850d9d7d7ad9',
+    ),
+    'tests/test_sft_vm_inert_watchdog_v15.py': (
+        3234,
+        'd64a69513788f03abd055e1f3631a1b84b679f6c8f663db47e43b3d53b21231c',
+    ),
+    'evidence/lumi-vm-attempt-022-control-execution-verification-v0.1.json': (
+        17611,
+        '5965f8e420c00fae2f04fdaaed9cb4b92dfa2742dca8bbc83e75afb89faad382',
+    ),
+    'artifacts/lumi-vm-attempt-022-source-v0.1/release.json': (
+        27363,
+        '5cd83aa6c3ce497e45170a5e3165ae28705bf08a92b191098b6b4f66c48f7a8a',
+    ),
+}
+MAX_CALLS = 28
+MAX_SECONDS = 300
+ABSENCE_CODES = {name: set(codes) for name, codes in transport.ABSENCE_CODES.items()}
+ABSENCE_CODES["s3"].add("NoSuchLifecycleConfiguration")
+VERIFICATION_TRANSPORT = types.SimpleNamespace(
+    READ_DELAYS=(),
+    MAX_READ_RETRIES=0,
+    ABSENCE_CODES=ABSENCE_CODES,
+    transient=transport.transient,
+    error_code=transport.error_code,
+)
+READBACK_ENCRYPTION = json.loads(json.dumps(bucket_source.ENCRYPTION))
+READBACK_ENCRYPTION["Rules"][0]["BucketKeyEnabled"] = False
+READBACK_ENCRYPTION["Rules"][0]["BlockedEncryptionTypes"] = {"EncryptionType": ["SSE-C"]}
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt022_control_verification_rejected") from None
+
+
+def bind():
+    bucket_source.ENCRYPTION = READBACK_ENCRYPTION
+    values = {
+        "ROOT": ROOT,
+        "ATTEMPT": ATTEMPT,
+        "ACCOUNT": ACCOUNT,
+        "FUNCTION": FUNCTION,
+        "WORKER_ROLE": WORKER_ROLE,
+        "SCHEDULE_ROLE": SCHEDULE_ROLE,
+        "GROUP": GROUP,
+        "LOG_GROUP": LOG_GROUP,
+        "BUCKET": BUCKET,
+        "PREFIX": PREFIX,
+        "WATCH_OUTPUT": WATCH_OUTPUT,
+        "STORE_OUTPUT": STORE_OUTPUT,
+        "PLAN": PLAN,
+        "PLAN_SHA": PLAN_SHA,
+        "SOURCE_RELEASE": SOURCE_RELEASE,
+        "SOURCE_RELEASE_SHA": SOURCE_RELEASE_SHA,
+        "SOURCE_BINDINGS": SOURCE_BINDINGS,
+        "MAX_CALLS": MAX_CALLS,
+        "MAX_SECONDS": MAX_SECONDS,
+        "transport": VERIFICATION_TRANSPORT,
+        "bucket_source": bucket_source,
+        "local": local,
+    }
+    for key, value in values.items():
+        setattr(qualified, key, value)
+    return qualified
+
+
+def local():
+    bind()
+    raw = {name: qualified.read(name, *pin) for name, pin in SOURCE_BINDINGS.items()}
+    plan = json.loads(raw[str(PLAN.relative_to(ROOT))])
+    watch = json.loads(
+        raw["artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/entry-result.json"]
+    )
+    deployed = json.loads(
+        raw["artifacts/lumi-vm-attempt-022-watchdog-deployment-v0.1/deployment/result.json"]
+    )
+    store = json.loads(raw["artifacts/lumi-vm-attempt-022-cleanup-bucket-v0.1/result.json"])
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["execution_permitted"] is False
+        and watch["status"] == "deployed_unarmed_invocation_disabled"
+        and watch["deployment"] == deployed
+        and watch["total_control_calls"] <= 45
+        and watch["mutation_dispatches"] == 9
+        and watch["invocation"] is False
+        and watch["schedule_creation"] is False
+        and watch["instance_actions"] == 0
+        and watch["retry"] is False
+        and store["status"] == "created_private_cleanup_store_verified"
+        and store["calls"] <= 20
+        and store["mutation_dispatches"] == 6
+        and store["privacy_readback_verified"] is True
+        and store["shared_bucket_mutation"] is False
+        and store["object_access"] is False
+        and store["iam_mutation"] is False
+        and store["instance_action"] is False
+        and store["retry"] is False
+    )
+    return plan, watch, store
+
+
+def verify_live(cloud):
+    watch, store = bind().verify_live(cloud)
+    watch["schema"] = "lumi.attempt022-inert-watchdog-deployment-verification.v0.1"
+    store["schema"] = "lumi.attempt022-cleanup-bucket-verification.v0.1"
+    return watch, store
+
+
+Reads = qualified.Reads
+
+
+def run():
+    need(not WATCH_OUTPUT.exists() and not STORE_OUTPUT.exists())
+    cloud = transport.clients()
+    try:
+        watch, store = verify_live(cloud)
+    finally:
+        for client in cloud.values():
+            client.close()
+    for path, value in ((WATCH_OUTPUT, watch), (STORE_OUTPUT, store)):
+        raw = qualified.encode(value)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    print(
+        json.dumps(
+            {"watchdog": watch["status"], "cleanup_store": store["status"]},
+            sort_keys=True,
+        )
+    )
+    return watch, store
+
+
+if __name__ == "__main__":
+    raise ValueError("bounded_readonly_entry_required") from None

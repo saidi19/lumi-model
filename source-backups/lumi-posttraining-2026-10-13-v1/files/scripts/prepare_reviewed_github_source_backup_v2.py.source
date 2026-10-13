@@ -1,0 +1,271 @@
+"""Generate an inert, reviewed private-Git snapshot; never read artifacts or execute source."""
+
+import ast
+import hashlib
+import json
+import os
+import re
+import stat
+import subprocess
+from collections import Counter
+from pathlib import Path, PurePosixPath
+
+ROOT = Path(__file__).resolve().parents[1]
+OUT = ROOT / "source-backups/lumi-posttraining-2026-10-13-v1"
+BASE = "9ab11a99b023409b707b650372f46148ed4a9da1"
+MAX_BYTES = 25 * 1024**2
+EVIDENCE = {
+    "evidence/lumi-setup-production-qualification-verification-v0.4.json",
+    "evidence/lumi-setup-lifecycle-probe-preparation-v0.1.json",
+    "evidence/lumi-setup-control-fault-preparation-v0.1.json",
+    "evidence/lumi-setup-visibility-successor-preparation-v0.1.json",
+    "evidence/lumi-setup-production-probe-preparation-v0.1.json",
+    "evidence/lumi-vm-setup-exchange-diagnostic-preparation-v0.1.json",
+    "evidence/lumi-vm-attempt-022-v027-execution-verification-v0.1.json",
+    "evidence/lumi-setup-production-readiness-v0.1.json",
+}
+REQUIRED = {
+    "scripts/qualify_sft_vm_setup_production_v4.py",
+    "scripts/send_sft_vm_setup_inputs_v7.py",
+    "scripts/prepare_sft_vm_setup_exchange_lifecycle_v1.py",
+    "scripts/prepare_sft_vm_setup_lifecycle_probe_v1.py",
+    "tests/test_sft_vm_setup_exchange_lifecycle_v1.py",
+    "tests/test_sft_vm_setup_lifecycle_probe_v1.py",
+    "configs/lumi-setup-production-qualification-v0.4.json",
+    "evidence/lumi-setup-production-qualification-verification-v0.4.json",
+}
+DUMMY_PATHS = {
+    "scripts/check_sft_vm_fullsize_sdk_wire_v1.py",
+    "tests/test_sft_vm_fullsize_credential_setup_v1.py",
+    "tests/test_sft_vm_retention_v1.py",
+}
+PATTERNS = {
+    "private_key_marker": r"-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----",
+    "aws_key_literal": r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+    "github_token_literal": r"\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{50,})\b",
+    "signed_url": r"X-Amz-Signature=[a-fA-F0-9]{64}",
+    "api_key_literal": r"\bsk-(?:proj-)?[A-Za-z0-9_-]{40,}\b",
+}
+PRIVATE_KEYS = {
+    "humanauthorization",
+    "approvaltext",
+    "authorizationtext",
+    "accesskeyid",
+    "secretaccesskey",
+    "sessiontoken",
+    "apikey",
+    "password",
+    "privatekey",
+    "rawtext",
+    "sourcetext",
+    "candidatetext",
+    "prompt",
+    "response",
+    "completion",
+    "messages",
+    "examples",
+    "samples",
+    "vocab",
+    "vocabulary",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("source_backup_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(root, name):
+    path = PurePosixPath(name)
+    need(not path.is_absolute() and ".." not in path.parts and str(path) == name)
+    target = root / path
+    need(not any(p.is_symlink() for p in (target, *target.parents)))
+    fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= 2**20)
+        raw = stream.read(before.st_size + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    need(
+        all(
+            getattr(before, f) == getattr(after, f)
+            for f in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        )
+    )
+    return raw
+
+
+def private_payload(value):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = re.sub("[^a-z0-9]", "", key.lower())
+            if normalized in PRIVATE_KEYS and item not in (None, "", False, [], {}):
+                return True
+            if normalized == "approved" and item is True:
+                return True
+            if (
+                normalized in {"rows", "records", "decisions"}
+                and isinstance(item, (list, dict))
+                and item
+            ):
+                return True
+            if private_payload(item):
+                return True
+    elif isinstance(value, list):
+        return any(private_payload(item) for item in value)
+    return False
+
+
+def classify(name):
+    path = PurePosixPath(name)
+    if "_private_" in name:
+        return "private_named_input"
+    top = path.parts[0]
+    if top in {"scripts", "src", "tests"} and path.suffix == ".py":
+        return "source"
+    if re.search(
+        r"(?:approval|authorization|owner|decision|delegat|packet|credential)", path.name, re.I
+    ):
+        return "private_named_input"
+    if top == "configs" and path.suffix == ".json":
+        return "configuration"
+    if (
+        top == "docs"
+        and path.suffix == ".md"
+        and (
+            path.name == "posttraining-current.md" or path.name.startswith("sft-execution-status-")
+        )
+    ):
+        return "documentation"
+    if name in EVIDENCE:
+        return "aggregate_evidence"
+    if name == "README.md":
+        return "documentation"
+    return "not_selected"
+
+
+def audit(name, raw):
+    text = raw.decode("utf-8")
+    allowed = 0
+    for label, pattern in PATTERNS.items():
+        for match in re.finditer(pattern, text):
+            if label == "aws_key_literal" and name in DUMMY_PATHS and "EXAMPLE" in match.group():
+                allowed += 1
+            else:
+                return label, allowed
+    if name.endswith(".py"):
+        ast.parse(text, filename=name)
+    if name.endswith(".json") and private_payload(json.loads(text)):
+        return "private_json_payload", allowed
+    return None, allowed
+
+
+def write_new(path, raw):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+
+
+def prepare():
+    need(not OUT.exists() and not OUT.is_symlink())
+    need(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip() == BASE)
+    need(not subprocess.check_output(["git", "diff", "--cached", "--name-only"], cwd=ROOT))
+    rows = (
+        subprocess.check_output(
+            [
+                "git",
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            cwd=ROOT,
+        )
+        .decode()
+        .split("\0")
+    )
+    names = sorted(set(rows) - {""} | {"README.md"})
+    selected, excluded, examples = {}, Counter(), 0
+    for name in names:
+        kind = classify(name)
+        if kind in {"private_named_input", "not_selected"}:
+            excluded[kind] += 1
+            continue
+        raw = read(ROOT, name)
+        reason, count = audit(name, raw)
+        examples += count
+        if reason:
+            excluded[reason] += 1
+            continue
+        selected[name] = (raw, kind)
+    need(REQUIRED <= set(selected))
+    need(sum(len(raw) for raw, _ in selected.values()) < MAX_BYTES)
+    OUT.mkdir(parents=True, mode=0o700)
+    entries = []
+    for name, (raw, kind) in selected.items():
+        destination = "files/" + name + ".source"
+        write_new(OUT / destination, raw)
+        need(read(OUT, destination) == raw == read(ROOT, name))
+        entries.append(
+            dict(
+                original_path=name,
+                stored_path=destination,
+                sha256=sha(raw),
+                bytes=len(raw),
+                classification=kind,
+            )
+        )
+    manifest = dict(
+        schema="lumi.reviewed-github-source-backup.v0.2",
+        base_commit=BASE,
+        format="inert_byte_exact_source_suffix",
+        entries=entries,
+        counts_by_class=dict(Counter(row["classification"] for row in entries)),
+        excluded_counts=dict(excluded),
+        included_files=len(entries),
+        included_bytes=sum(row["bytes"] for row in entries),
+        audited_synthetic_example_key_literals=examples,
+        credential_scan_is_heuristic_not_complete_security_audit=True,
+        private_repository_required=True,
+        approvals_and_artifacts_included=False,
+        active_source_tree_changed=False,
+        active_ci_workflows_changed=False,
+        deployable_or_standalone_package=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu_training_started=False,
+        production_eligible=False,
+    )
+    write_new(
+        OUT / "manifest.json", (json.dumps(manifest, sort_keys=True, indent=2) + "\n").encode()
+    )
+    description = (
+        b"Reviewed private Lumi source backup, 2026-10-13.\n\n"
+        b"This is an inert backup, NOT active CI integration or an executable release.\n"
+        b"Original paths, byte sizes and SHA-256 digests are recorded in manifest.json.\n"
+        b"Each archived file has a .source suffix; its contents are byte-for-byte original.\n"
+        b"The base commit already contains the earlier source. This snapshot adds selected\n"
+        b"local-only source/configuration/documents and aggregate engineering evidence.\n"
+        b"Do not restore over frozen files or execute archived runners without fresh review.\n"
+        b"Private approvals, runtime artifacts, keys, datasets and weights are not included.\n"
+        b"Private dependencies remain absent; missing-input guards must stay fail-closed.\n"
+        b"Secret-pattern scanning is heuristic, not a complete privacy/security audit.\n"
+        b"Keep this repository PRIVATE; public release needs separate rights/privacy review.\n\n"
+        b"Latest verified progress: production source-only Linux transfer and cleanup passed.\n"
+        b"See files/evidence/lumi-setup-production-qualification-verification-v0.4.json.source.\n"
+        b"Full 4B model import and Gate 5 remain incomplete. GPU/SFT training has not started.\n"
+        b"Prior failed evidence is preserved; this backup grants no execution authority.\n"
+    )
+    write_new(OUT / "README.txt", description)
+    print(json.dumps({k: v for k, v in manifest.items() if k != "entries"}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    prepare()

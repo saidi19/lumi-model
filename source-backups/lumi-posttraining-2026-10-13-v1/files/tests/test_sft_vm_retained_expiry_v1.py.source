@@ -1,0 +1,262 @@
+"""Read-only recovery binding/transport tests; fresh process, synthetic replies."""
+
+import copy
+import importlib
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import inspect_sft_vm_retained_expiry_v1 as m
+
+
+class InspectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.armer, cls.failure, classify, cls.bound = m.load()
+        cls.classify = staticmethod(classify)
+        cls.fixtures = importlib.import_module("tests.test_sft_vm_network_cleanup_arming_v1")
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.fake = self.fixtures.Cloud()
+        # Construct only synthetic state using unchanged source-derived policy/code.
+        arm = self.armer.Expiry(
+            self.root / "synthetic-arm",
+            self.fake,
+            admit_claim_store=lambda _: None,
+            clock=lambda: self.fake.t,
+            wall=lambda: self.fake.wall,
+            wait=self.fake.wait,
+        )
+        self.fake.wall = self.bound["expires_at"] - 18000
+        arm.arm(attempt=self.bound["attempt"], nonce=self.bound["nonce"], deadline=18100)
+        self.assertEqual(arm.bound, self.bound)
+        self.fake.calls.clear()
+        self.cloud = m.Cloud(
+            self.armer, self.failure, self.classify, self.bound, clock=lambda: self.fake.t
+        )
+
+    def reply(self, argv, env):
+        self.assertEqual(env["AWS_MAX_ATTEMPTS"], "1")
+        service, op = argv[5:7]
+        endpoint = argv[argv.index("--endpoint-url") + 1]
+        self.assertEqual(
+            endpoint,
+            "https://iam.amazonaws.com"
+            if service == "iam"
+            else f"https://{service}.us-east-1.amazonaws.com",
+        )
+        self.assertEqual(argv[argv.index("--ca-bundle") + 1], str(m.CA))
+        fields = json.loads(argv[8])
+        try:
+            row = self.fake.cli(service, op, **fields)
+        except LookupError:
+            return 254, b"", b"(ResourceNotFoundException) PRIVATE_SENTINEL"
+        return 0, json.dumps(row).encode(), b""
+
+    def inspect(self):
+        with patch.object(m, "command", self.reply):
+            return m.inspect(
+                self.armer,
+                self.failure,
+                self.cloud,
+                self.bound,
+                clock=lambda: self.fake.t,
+                wall=lambda: self.fake.wall,
+            )
+
+    def test_exact_eighteen_reads_no_mutations_no_arm(self):
+        with patch.object(self.armer.Expiry, "arm", side_effect=AssertionError("must_not_arm")):
+            result = self.inspect()
+        self.assertEqual(self.cloud.calls, 18)
+        self.assertEqual(len(self.fake.calls), 18)
+        self.assertFalse(result["original_remote_cause_proven"])
+        self.assertFalse(result["creation_time_role_ids_verified"])
+        self.assertTrue(all(op.startswith(("get-", "list-")) for _, op, _ in self.fake.calls))
+        self.assertFalse(m.OUTPUT.exists())
+
+    def test_writes_and_other_resource_targets_rejected_before_transport(self):
+        with patch.object(m, "command") as command:
+            for service, op, fields in (
+                ("ec2", "run-instances", {}),
+                ("s3", "get-object", {}),
+                ("iam", "put-role-policy", {}),
+                ("lambda", "invoke", {}),
+                ("scheduler", "create-schedule", {}),
+                ("iam", "get-role", {"RoleName": "foreign"}),
+                ("lambda", "get-function-configuration", {"FunctionName": "foreign"}),
+            ):
+                with self.subTest(op=op), self.assertRaises(ValueError):
+                    self.cloud.cli(service, op, **fields)
+            command.assert_not_called()
+        self.assertEqual(self.cloud.calls, 0)
+
+    def test_each_request_repetition_limited(self):
+        with patch.object(m, "command", return_value=(0, b"{}", b"")) as command:
+            self.cloud.cli("sts", "get-caller-identity")
+            with self.assertRaises(ValueError):
+                self.cloud.cli("sts", "get-caller-identity")
+            self.assertEqual(command.call_count, 1)
+
+    def test_role_drift_between_observations_fails(self):
+        def change(op, row):
+            if op == "get-role" and sum(c[1] == op for c in self.fake.calls) == 3:
+                row["Role"]["RoleId"] = "SYNTHETIC_CHANGED"
+            return row
+
+        self.fake.change = change
+        with self.assertRaises(self.failure.Failure) as caught:
+            self.inspect()
+        self.assertEqual(
+            self.failure.describe(caught.exception),
+            dict(stage="expiry_verify", check="get-role", kind="validation"),
+        )
+
+    def test_config_drift_finite_code_no_raw_text(self):
+        self.fake.change = lambda op, row: (
+            dict(row, State="PRIVATE_SENTINEL") if op == "get-schedule" else row
+        )
+        with self.assertRaises(self.failure.Failure) as caught:
+            self.inspect()
+        diagnostic = self.failure.describe(caught.exception)
+        self.assertEqual(diagnostic["check"], "get-schedule")
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(diagnostic))
+
+    def test_api_failure_not_retried_and_classified(self):
+        with patch.object(
+            m, "command", return_value=(254, b"", b"AccessDenied PRIVATE_SENTINEL")
+        ) as command:
+            with self.assertRaises(self.failure.Failure) as caught:
+                self.cloud.cli("sts", "get-caller-identity")
+        self.assertEqual(command.call_count, 1)
+        self.assertEqual(self.cloud.category, "access_denied")
+        self.assertNotIn("PRIVATE_SENTINEL", str(caught.exception))
+
+    def test_absence_is_only_accepted_for_two_lambda_calls(self):
+        n = self.armer.names(self.bound["nonce"])
+        with patch.object(m, "command", return_value=(254, b"", b"(ResourceNotFoundException)")):
+            with self.assertRaises(LookupError):
+                self.cloud.cli("lambda", "get-policy", FunctionName=n["function"])
+            with self.assertRaises(self.failure.Failure):
+                self.cloud.cli("lambda", "get-function-configuration", FunctionName=n["function"])
+
+    def test_deadline_byte_and_call_budgets_reject(self):
+        with patch.object(m, "command", return_value=(0, b"{}", b"")) as command:
+            self.fake.t += m.MAX_SECONDS
+            with self.assertRaises(ValueError):
+                self.cloud.cli("sts", "get-caller-identity")
+            command.assert_not_called()
+            self.fake.t = self.cloud.start
+            self.cloud.calls = m.MAX_CALLS
+            with self.assertRaises(ValueError):
+                self.cloud.cli("sts", "get-caller-identity")
+            command.assert_not_called()
+            self.cloud.calls = 0
+            self.cloud.bytes = m.MAX_RESPONSE_BYTES
+            with self.assertRaises(ValueError):
+                self.cloud.cli("sts", "get-caller-identity")
+
+    def test_pagination_duplicate_json_and_wrong_account_rejected(self):
+        with patch.object(m, "command", return_value=(0, b'{"Account":"foreign"}', b"")):
+            with self.assertRaises(ValueError):
+                m.inspect(self.armer, self.failure, self.cloud, self.bound)
+        with self.assertRaises(ValueError):
+            m.decode(b'{"x":1,"x":2}')
+        self.cloud.seen.clear()
+        with patch.object(m, "command", return_value=(0, b'{"NextToken":"PRIVATE_SENTINEL"}', b"")):
+            with self.assertRaises(ValueError):
+                self.cloud.cli("sts", "get-caller-identity")
+
+    def test_missing_approval_blocks_runtime_loading(self):
+        with (
+            patch.object(m, "authorize", side_effect=ValueError("unapproved")),
+            patch.object(m, "load") as load,
+        ):
+            with self.assertRaises(ValueError):
+                m.run()
+            load.assert_not_called()
+
+    def test_approval_exact_scope_and_consumed_output_rejected(self):
+        p = self.root / "plan.json"
+        a = self.root / "approval.json"
+        out = self.root / "output"
+        with (
+            patch.object(m, "PLAN", p),
+            patch.object(m, "APPROVAL", a),
+            patch.object(m, "OUTPUT", out),
+        ):
+            with patch.object(m, "plan", return_value={"scope": "readonly"}):
+                p.write_bytes(m.encode(m.plan()))
+                approval = m.expected_approval("synthetic")
+                for change in (
+                    {"mutation": True},
+                    {"cpu_retry": True},
+                    {"approved_execution_count": 2},
+                ):
+                    a.write_bytes(m.encode(approval | change))
+                    with self.assertRaises(ValueError):
+                        m.authorize()
+                a.write_bytes(m.encode(approval))
+                self.assertEqual(m.authorize(), approval)
+                out.mkdir()
+                with self.assertRaises(ValueError):
+                    m.authorize()
+
+    def test_old_deadline_and_policy_binding_not_changed(self):
+        before = copy.deepcopy(self.bound)
+        self.inspect()
+        self.assertEqual(self.bound, before)
+        self.assertFalse(any(op in self.armer.WRITES for _, op, _ in self.fake.calls))
+
+    def test_command_timeout_keeps_operation_and_category(self):
+        with patch.object(m, "command", side_effect=TimeoutError("PRIVATE_SENTINEL")):
+            with self.assertRaises(self.failure.Failure) as caught:
+                self.cloud.cli("sts", "get-caller-identity")
+        self.assertEqual(
+            self.failure.describe(caught.exception),
+            dict(stage="expiry_control", kind="timeout", check="get-caller-identity"),
+        )
+
+    def test_pipe_overflow_kills_process_without_persisting_output(self):
+        process = Mock(pid=123)
+        process.stdout, process.stderr = Mock(), Mock()
+        process.poll.return_value = None
+        with (
+            patch.object(m.subprocess, "Popen", return_value=process),
+            patch.object(m.select, "select", return_value=([process.stderr], [], [])),
+            patch.object(m.os, "read", return_value=b"x" * 4096),
+            patch.object(m.os, "killpg") as kill,
+        ):
+            with self.assertRaises(ValueError):
+                m.command(["synthetic"], {})
+            kill.assert_called_once_with(123, m.signal.SIGKILL)
+        process.stdout.close.assert_called_once()
+        process.stderr.close.assert_called_once()
+
+    def test_result_has_no_raw_responses_and_one_shot_output(self):
+        output = self.root / "inspection"
+        with (
+            patch.object(m, "OUTPUT", output),
+            patch.object(m, "authorize", return_value={"synthetic": True}),
+            patch.object(
+                m, "load", return_value=(self.armer, self.failure, self.classify, self.bound)
+            ),
+            patch.object(
+                m,
+                "command",
+                return_value=(254, b"PRIVATE_SENTINEL", b"AccessDenied PRIVATE_SENTINEL"),
+            ),
+            patch("builtins.print"),
+        ):
+            result = m.run()
+            self.assertEqual(result["control_calls"], 1)
+            self.assertFalse(result["cpu_retry"])
+            self.assertNotIn("PRIVATE_SENTINEL", (output / "result.json").read_text())
+            with self.assertRaises(FileExistsError):
+                m.run()
+
+
+if __name__ == "__main__":
+    unittest.main()

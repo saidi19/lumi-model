@@ -1,0 +1,143 @@
+"""One authorized STS + exact NAT read; no pagination, mutation, or retry."""
+
+import hashlib
+import json
+import signal
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTCOME = "evidence/lumi-vm-v06-leftover-cleanup-outcome-v0.1.json"
+OUTCOME_SHA = "7a32a3c8070bb7a1af426d7c85607aa5fa150ede6441e75eea66929ecb4b1d4c"
+CLEANUP_SHA = "f7a4bb9ea544352fcc9ee4abedf0b7b27fd277aec4b72d96f5a86043a3b6df08"
+OUTPUT = "artifacts/lumi-vm-v06-nat-readback-diagnostic-v0.1"
+ACCOUNT = "573978149073"
+NAT = "nat-0ade5f222f766898b"
+VPC = "vpc-0905fbf9490a2dead"
+SUBNET = "subnet-0d234a4f92365457b"
+STATES = {"pending", "failed", "available", "deleting", "deleted"}
+ERRORS = {"NatGatewayNotFound", "ExpiredToken", "ExpiredTokenException", "AccessDenied",
+          "UnauthorizedOperation", "InvalidParameterValue", "RequestLimitExceeded"}
+
+
+def need(value):
+    if not value:
+        raise ValueError("diagnostic_rejected")
+
+
+def kind(value):
+    return {type(None): "null", str: "string", list: "list", dict: "object",
+            bool: "boolean", int: "integer", float: "number"}.get(type(value), "other")
+
+
+def summarize(value):
+    """Retain only allowlisted types, cardinalities, states and validation booleans."""
+    report = {"response_type": kind(value)}
+    if type(value) is not dict:
+        report["first_failed_check"] = "response_type"
+        return report
+    report["pagination"] = {k: {"present": k in value, "type": kind(value.get(k)),
+                               "truthy": bool(value.get(k))}
+                            for k in ("NextToken", "nextToken", "IsTruncated")}
+    rows = value.get("NatGateways")
+    report.update(rows_present="NatGateways" in value, rows_type=kind(rows),
+                  rows_count=len(rows) if type(rows) is list else None)
+    checks = [("pagination", not any(value.get(k) for k in report["pagination"])),
+              ("nat_rows_shape", type(rows) is list and len(rows) <= 1)]
+    if type(rows) is list and len(rows) == 1:
+        row = rows[0]
+        report["row_type"] = kind(row)
+        checks.append(("nat_row_type", type(row) is dict))
+        if type(row) is dict:
+            report["fields"] = {k: {"present": k in row, "type": kind(row.get(k)),
+                                    "matches_expected": row.get(k) == expected}
+                                for k, expected in (("NatGatewayId", NAT), ("State", "deleted"),
+                                                    ("VpcId", VPC), ("SubnetId", SUBNET))}
+            state = row.get("State")
+            report["state"] = state if type(state) is str and state in STATES else "other"
+            checks.extend(("nat_" + k, v["matches_expected"])
+                          for k, v in report["fields"].items())
+    report["checks"] = dict(checks)
+    report["existing_contract_passes_current_response"] = all(v for _, v in checks)
+    report["first_failed_check"] = next((k for k, v in checks if not v), None)
+    return report
+
+
+def main():
+    need(hashlib.sha256((ROOT / OUTCOME).read_bytes()).hexdigest() == OUTCOME_SHA)
+    need(hashlib.sha256((ROOT / "scripts/cleanup_sft_vm_v06_leftovers_v1.py").read_bytes())
+         .hexdigest() == CLEANUP_SHA)
+    import cleanup_sft_vm_v06_leftovers_v1 as cleanup
+    cleanup.authenticate(ROOT)  # Read-only authentication of frozen source/evidence bindings.
+    journal = cleanup.Journal(ROOT / OUTPUT)
+    def save(name, value):
+        need(journal.written + len(cleanup.canonical(value)) <= 16384)
+        journal.save(name, value)
+    save("started", dict(human_approval="hae dilam kor", outcome_sha256=OUTCOME_SHA,
+                         script_sha256=cleanup.digest(Path(__file__)),
+                         calls_cap=2, wall_seconds_cap=60, mutations_allowed=False,
+                         credential_provider_invocations_cap=1, retry_allowed=False))
+    started, clients = time.monotonic(), []
+    report = dict(status="stopped", stage="imports", calls=0, mutations=0,
+                  credential_provider_invocations=0, response_bytes=0,
+                  raw_response_retained=False, private_key_read=False,
+                  model_access=False, gpu_used=False, training_started=False)
+    def expired(*_):
+        raise TimeoutError("diagnostic_deadline")
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 55)
+    def read(client, operation, **fields):
+        need(report["calls"] < 2 and time.monotonic() - started < 45)
+        need(operation in {"get_caller_identity", "describe_nat_gateways"})
+        report["calls"] += 1
+        value = getattr(client, operation)(**fields)
+        size = len(cleanup.canonical(value))
+        report["response_bytes"] += size
+        need(size <= 262144 and report["response_bytes"] <= 524288)
+        return value
+    try:
+        import sft_vm_controller_credentials_v2 as credentials
+        from botocore.config import Config
+        report["stage"] = "credential_export"
+        report["credential_provider_invocations"] = 1
+        value = json.loads(credentials.export_credentials(), object_pairs_hook=cleanup.unique)
+        need(type(value["Version"]) is int and value["Version"] == 1)
+        expiry = datetime.fromisoformat(value["Expiration"].replace("Z", "+00:00"))
+        need((expiry - datetime.now(UTC)).total_seconds() > 90)
+        secret = dict(aws_access_key_id=value["AccessKeyId"],
+                      aws_secret_access_key=value["SecretAccessKey"],
+                      aws_session_token=value["SessionToken"])
+        need(all(type(v) is str and 0 < len(v) <= 16384 for v in secret.values()))
+        session = credentials.session()
+        report["stage"] = "client_setup"
+        for service in ("sts", "ec2"):
+            clients.append(session.create_client(service, region_name="us-east-1",
+                endpoint_url=credentials.endpoint(service), verify=credentials.ca_path(),
+                config=Config(proxies={}, connect_timeout=3, read_timeout=5,
+                              retries={"total_max_attempts": 1},
+                              ignore_configured_endpoint_urls=True), **secret))
+        secret.clear()
+        value.clear()
+        report["stage"] = "identity"
+        need(read(clients[0], "get_caller_identity")["Account"] == ACCOUNT)
+        report["identity_matches"] = True
+        report["stage"] = "nat_readback"
+        response = read(clients[1], "describe_nat_gateways", NatGatewayIds=[NAT])
+        report["observation"] = summarize(response)
+        report.update(status="diagnostic_completed", stage="complete")
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        report["failure_code"] = code if code in ERRORS else "read_or_validation_failed"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for client in clients:
+            client.close()
+        report["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        save("result", report)
+    print(json.dumps(report, sort_keys=True))
+    return 0 if report["status"] == "diagnostic_completed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,96 @@
+"""Offline diagnostic-policy repairs, not cloud execution or retry authority."""
+
+import base64
+import hashlib
+import json
+import re
+from pathlib import Path
+
+from scripts import diagnose_sft_vm_transport_live_v1 as original
+
+ROOT = Path(__file__).resolve().parents[1]
+PROOF = ROOT / "evidence/lumi-transport-diagnostic-verification-v0.1.json"
+BOOT_POLLS = 23
+BOOT_INTERVAL_SECONDS = 20
+CLEANUP_POLLS = 24
+CLEANUP_INTERVAL_SECONDS = 12
+
+
+def verify_evidence():
+    proof = json.loads(PROOF.read_bytes())
+    for name, pin in proof["source_bindings"].items():
+        raw = (ROOT / name).read_bytes()
+        original.need(len(raw) == pin["bytes"] and hashlib.sha256(raw).hexdigest() == pin["sha256"])
+    original.need(proof["reconciliation"]["terminated_live_verified"] is True)
+    original.need(proof["reconciliation"]["disposable_volume_deleted_live_verified"] is True)
+    return proof
+
+
+def terminal_owned(response, instance):
+    """Terminal readback only: never authorizes terminate/start/SSH operations.
+
+    Require durable ownership fields and a known exact ID. Network fields are
+    intentionally not required after termination; active-host checks stay strict.
+    """
+    original.need(type(instance) is str and re.fullmatch(r"i-[0-9a-f]{17}", instance))
+    original.need(not response.get("NextToken"))
+    reservations = response["Reservations"]
+    original.need(len(reservations) == 1 and reservations[0]["OwnerId"] == original.ACCOUNT)
+    rows = reservations[0]["Instances"]
+    original.need(len(rows) == 1)
+    row = rows[0]
+    original.need(row["InstanceId"] == instance and row["State"]["Name"] == "terminated")
+    original.need(row["ClientToken"] == original.TOKEN and row["ImageId"] == original.AMI)
+    original.need(row["InstanceType"] == "t3.micro")
+    tags = row["Tags"]
+    original.need(len({tag["Key"] for tag in tags}) == len(tags))
+    original.need({t["Key"]: t["Value"] for t in tags}.get("LumiDiagnostic") == original.TOKEN)
+    return dict(instance=instance, terminated_verified=True, mutation_authorized=False)
+
+
+def budget():
+    # Separate budgets: reserve cleanup regardless of workload failure.
+    preflight_and_launch = 6
+    boot_calls = 2 * BOOT_POLLS
+    cleanup_calls = 2 + CLEANUP_POLLS  # ownership read + terminate + state observations
+    total = preflight_and_launch + boot_calls + cleanup_calls
+    original.need(total <= 100)
+    return dict(
+        preflight_and_launch_calls=preflight_and_launch,
+        boot_calls=boot_calls,
+        cleanup_calls=cleanup_calls,
+        maximum_planned_calls=total,
+        unallocated_call_reserve=100 - total,
+        boot_poll_interval_seconds=BOOT_INTERVAL_SECONDS,
+        cleanup_poll_interval_seconds=CLEANUP_INTERVAL_SECONDS,
+        boot_deadline_seconds=480,
+        cleanup_deadline_seconds=820,
+        outer_deadline_seconds=850,
+        wall_deadline_must_override_poll_count=True,
+    )
+
+
+def console_summary(output):
+    """Summarize observation, not guest health; return no raw console/host key."""
+    original.need(type(output) is str and len(output) <= 1048576)
+    if not output:
+        return dict(status="console_empty", boot_failure_proven=False)
+    if "LUMI_DIAG_HOSTKEY " not in output:
+        try:
+            output = base64.b64decode(output, validate=True).decode("utf-8", "replace")
+        except ValueError:
+            pass
+    markers = output.count("LUMI_DIAG_HOSTKEY ")
+    return dict(
+        status="marker_observed" if markers else "marker_not_observed",
+        marker_count=markers,
+        cloud_final_marker_observed="finished at" in output,
+        # ACPI AE_ERROR alone is not evidence that cloud-init or SSH failed.
+        boot_failure_proven=False,
+        ssh_readiness_proven=False,
+        raw_console_retained=False,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("offline_repair_not_cloud_execution_authority")

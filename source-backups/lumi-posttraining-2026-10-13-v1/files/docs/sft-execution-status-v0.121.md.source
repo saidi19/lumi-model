@@ -1,0 +1,122 @@
+# SFT execution status v0.121: generated-only Linux launcher
+
+2026-09-27. Implemented a systemd-backed **generated-only rehearsal launcher**
+and worker entry. Local verification passes **120 tests**: 32 new dispatch,
+resource-readback and attempt tests, plus the previous 88 CPU import/package
+tests. Ruff passes. The Mac CLI rejects launch before any worker dispatch.
+
+**No native Linux rehearsal has run. Gate 5 is not complete.** This is concrete
+launcher code, not a claim that Mac mocks prove Linux containment. It connects
+the existing real tiny import/package integration suite to a fixed supervised
+worker. It does not yet connect real input acquisition or the full-size
+coordinator; those old execution entrypoints remain unchanged and closed.
+
+## Implemented path
+
+`admitted dedicated VM -> pinned staged source -> exclusive attempt marker
+-> four sequential systemd services -> aggregate result / fixed failure code`
+
+The CLI has no model, dataset, checkpoint path, download, arbitrary command or
+training argument. It binds a supplied machine ID and a pre-staged source
+manifest. Before dispatch it requires Linux, root, systemd >= 255, cgroup v2,
+the memory/pids/CPU controllers, and a fresh private attempt directory.
+It never provisions a machine, installs software, contacts S3, or starts a GPU.
+
+| Native case, once separately admitted | Worker RAM cap | Runtime cap | Required result |
+| --- | --- | --- | --- |
+| Real generated DCP/package/reload integration | 2 GiB | 120 s | All four existing integration cases pass |
+| Timeout, including a child process | 128 MiB | 2 s | systemd timeout, then empty workload cgroup |
+| Memory exhaustion | 96 MiB | 15 s | systemd reports OOM kill, then empty workload cgroup |
+| Temporary-storage exhaustion | 256 MiB | 15 s | Near-full 64-MiB tmpfs followed by ENOSPC, then empty cgroup |
+
+Each worker requests no swap, at most 64 tasks, one CPU's quota, UID/GID 10001,
+no capabilities, private network/devices, read-only host filesystem and a fresh
+64-MiB `/work` tmpfs. Worker stdout/stderr go to null; records retain only fixed
+codes and aggregates. Model library output and exception text are not saved.
+Worker entry checks cgroup identity, RAM/swap/task caps, temporary filesystem
+size/ownership and offline environment before imports or probe allocation.
+
+The launcher reserves the attempt before the first dispatch, executes each
+case once, and stops the sequence on failure. It checks for an existing unit
+before dispatch so it does not stop a pre-existing service. On an ambiguous
+start or later failure it attempts exactly one stop of its own named service;
+an unconfirmed stop or populated cgroup cannot produce a pass.
+
+The controller's overall dispatch window is 240 seconds; bounded final cleanup
+can extend beyond it. The per-worker systemd deadlines are independent of the
+controller. Controller-death recovery and a host's billing lifecycle have not
+been qualified by these local tests. The implementation does not stop or
+terminate cloud instances and does not enforce their total bill.
+
+## Important scope limits
+
+- The 32 new tests double systemd/native boundaries. The retained CPU integration
+  tests use genuine tiny tensors but no forward/optimizer step or real payloads.
+- No native memory/disk exhaustion was deliberately run on the Mac. The four
+  native probes must run only on a separately approved dedicated Linux VM.
+- The source-manifest check is not an independent proof of publisher origin.
+  The operator must authenticate the launcher before executing it and separately
+  authenticate/stage its runtime. The source manifest does not cover venv wheels.
+- A storage-capacity limit is not a cumulative-native-write limit. The old host
+  contract is preserved, not silently satisfied or overwritten by this route.
+- Failed real-import evidence is untouched. The rehearsal's own generated
+  fixtures are ephemeral tmpfs content; only aggregate run records persist.
+- Production eligibility, real-4B import verification and training authority
+  remain false. No existing busy Lambda instance may be reused for this work.
+
+## Next action and required staging
+
+There is no admitted Linux target yet. The Mac has no `docker`, `colima`,
+`limactl`, or QEMU executable on the checked PATH. Do not rent a GPU for this
+rehearsal. Obtain a dedicated CPU-only Linux target and explicit duration/cost
+and lifecycle limits before remote work or provisioning.
+
+After target admission, prepare `/opt/lumi-sft-rehearsal` with the authenticated
+runtime at `venv/bin/python`, the new script under `scripts/`, and the source
+and test dependency closure under flat `src/lumi/` and `tests/` directories.
+Create the dedicated UID/GID 10001 account with no unrelated supplementary
+groups. Stage code as root-owned, non-writable by the worker, with no symlinks,
+hardlinks, bytecode, data, or undeclared files in those source directories.
+Stage `release-manifest.json` as a relative-source-name to SHA-256 JSON mapping
+covering those exact directories. Independently pin its file hash. The runtime
+must be compatible with the already tested torch/transformers stack; do not
+silently substitute an unverified image. These staging actions were not run.
+
+The operator-created `/var/lib/lumi-sft-rehearsal` must be root-owned mode 0700.
+The launch CLI then requires `--expected-machine-id`, a fresh 32-hex `--attempt`,
+and `--release-sha256`; none is filled with guessed host data. A failure retains
+its marker and fixed-code failure record. There is no automatic retry.
+
+After native generated-only acceptance, the remaining Gate-5 work is the
+host-bound real-input/full-size-coordinator adapter and independently verified
+real checkpoint import. Gate 6 still requires SFT-specific pre-dispatch approval,
+GPU smoke/save/resume acceptance and the full SFT run. No such steps were skipped
+or marked done here.
+
+## Files and verification
+
+- `src/lumi/posttraining_import_vm_rehearsal_v1.py`
+- `scripts/run_sft_import_vm_rehearsal_v1.py`
+- `tests/test_sft_import_vm_rehearsal_v1.py`
+- `evidence/lumi-4b-sft-vm-rehearsal-development-v0.1.json`
+
+Reproduce the new portable tests with the existing environment:
+
+```sh
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 \
+artifacts/lumi-sft-import-runtime-v0.1/venv/bin/python -B -m unittest \
+  tests.test_sft_import_vm_rehearsal_v1
+```
+
+The final combined run used the same offline/CPU-only audit harness as v0.120,
+adding this module. It passed 120/120 without skips or prohibited audit events.
+The direct Mac CLI negative check returned `host_rejected_linux_required` with
+exit code 2. No real model/tokenizer/dataset reads, GPU, inference, training,
+remote machine actions, staging, commit or push occurred. Public systemd
+documentation was consulted; this is not a whole-turn zero-network claim.
+
+The implementation follows systemd's documented service lifetime and resource
+controls, not equivalence with the old per-write broker contract:
+[service controls](https://raw.githubusercontent.com/systemd/systemd/v255/man/systemd.service.xml),
+[execution isolation and groups](https://raw.githubusercontent.com/systemd/systemd/v255/man/systemd.exec.xml),
+[resource controls](https://raw.githubusercontent.com/systemd/systemd/v255/man/systemd.resource-control.xml).

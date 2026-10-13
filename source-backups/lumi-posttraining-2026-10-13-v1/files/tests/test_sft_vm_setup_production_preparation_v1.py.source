@@ -1,0 +1,39 @@
+"""Pure plan drift checks; no credential or cloud access."""
+
+import copy
+import json
+import unittest
+
+from scripts import qualify_sft_vm_setup_production_v1 as probe
+from scripts import verify_sft_vm_setup_production_preparation_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plan = json.loads(probe.read(probe.PLAN))
+
+    def test_exact_local_plan(self):
+        self.assertTrue(m.validate(self.plan))
+
+    def test_changed_entry_pin_rejected(self):
+        plan = copy.deepcopy(self.plan)
+        plan["entry_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            m.validate(plan)
+
+    def test_false_lifetime_claim_rejected(self):
+        plan = copy.deepcopy(self.plan)
+        plan["host"]["hard_billing_cap_or_guaranteed_15_minute_lifetime_claimed"] = True
+        with self.assertRaises(ValueError):
+            m.validate(plan)
+
+    def test_qualification_claim_rejected(self):
+        plan = copy.deepcopy(self.plan)
+        plan["linux_qualification"] = True
+        with self.assertRaises(ValueError):
+            m.validate(plan)
+
+
+if __name__ == "__main__":
+    unittest.main()

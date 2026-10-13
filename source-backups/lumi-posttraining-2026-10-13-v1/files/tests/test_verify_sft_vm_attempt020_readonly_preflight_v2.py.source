@@ -1,0 +1,50 @@
+"""Reject changed run evidence and unearned admission claims offline."""
+
+import json
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt020_readonly_preflight_v2 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_admission_keeps_execution_closed(self):
+        result = m.verify()
+        self.assertEqual(result["calls"], 56)
+        self.assertTrue(result["consumed_v01_preserved"])
+        self.assertTrue(result["network_admitted"])
+        self.assertFalse(result["cpu_instance_launched"])
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_changed_result_hash_rejected(self):
+        files = dict(m.FILES, **{"result.json": "0" * 64})
+        with patch.object(m, "FILES", files), self.assertRaises(ValueError):
+            m.verify()
+
+    def test_launch_claim_or_component_count_drift_rejected(self):
+        original = m.read
+        for variant in ("launch", "calls"):
+            def changed(name, digest, variant=variant):
+                raw = original(name, digest)
+                if name == m.RUN + "/admission.json":
+                    value = json.loads(raw)
+                    if variant == "launch":
+                        value["host_launch_authorized"] = True
+                    else:
+                        value["network"]["calls"] += 1
+                    return json.dumps(value).encode()
+                if name == m.RUN + "/result.json":
+                    value = json.loads(raw)
+                    value["admission"] = json.loads(
+                        changed(m.RUN + "/admission.json", m.FILES["admission.json"])
+                    )
+                    return json.dumps(value).encode()
+                return raw
+
+            with self.subTest(variant=variant), patch.object(m, "read", changed):
+                with self.assertRaises(ValueError):
+                    m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

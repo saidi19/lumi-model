@@ -1,0 +1,77 @@
+"""Offline control-readback gates before actual read-only execution."""
+
+import sys
+import unittest
+from unittest.mock import Mock
+
+from scripts import execute_sft_vm_attempt022_control_readback_v1 as entry
+from scripts import prepare_sft_vm_attempt022_control_readback_v1 as builder
+from tests import test_verify_sft_vm_attempt020_controls_v1 as previous
+
+
+class Tests(previous.Tests):
+    def setUp(self):
+        original = previous.m
+        previous.m = entry.verification
+        self.addCleanup(setattr, previous, "m", original)
+
+    def test_reproduced_candidate_is_exact(self):
+        self.assertEqual(builder.candidate(), entry.files.read(entry.ROOT / builder.OUTPUT))
+
+    def test_tracked_reads_reject_mutations_and_objects_before_dispatch(self):
+        client = Mock()
+        tracked = entry.TrackedReads({"lambda": client})
+        for operation in ("run_instances", "invoke", "get_object", "head_object"):
+            with self.assertRaises(ValueError):
+                getattr(tracked["lambda"], operation)()
+        self.assertEqual(tracked.calls, 0)
+        self.assertFalse(client.mock_calls)
+
+    def test_call_budget_counts_before_attempt_and_stops(self):
+        client = Mock()
+        client.get_function_configuration.side_effect = TimeoutError("synthetic")
+        tracked = entry.TrackedReads({"lambda": client})
+        with self.assertRaises(TimeoutError):
+            tracked["lambda"].get_function_configuration()
+        self.assertEqual(tracked.calls, 1)
+        tracked.calls = 28
+        with self.assertRaises(ValueError):
+            tracked["lambda"].get_function_configuration()
+        self.assertEqual(client.get_function_configuration.call_count, 1)
+
+    def test_no_transient_read_retry_is_configured(self):
+        entry.verification.bind()
+        transport = entry.verification.VERIFICATION_TRANSPORT
+        self.assertEqual(transport.READ_DELAYS, ())
+        self.assertEqual(transport.MAX_READ_RETRIES, 0)
+
+    def test_unlisted_get_and_expired_budget_stop_before_dispatch(self):
+        client = Mock()
+        clock = Mock(return_value=0)
+        tracked = entry.TrackedReads({"s3": client}, clock=clock)
+        with self.assertRaises(ValueError):
+            tracked["s3"].get_object_acl()
+        clock.return_value = 281
+        with self.assertRaises(ValueError):
+            tracked["s3"].get_bucket_policy()
+        self.assertEqual(tracked.calls, 0)
+        self.assertFalse(client.mock_calls)
+
+    def test_paginated_response_is_rejected_without_followup(self):
+        client = Mock()
+        client.describe_log_groups.return_value = {"nextToken": "synthetic"}
+        tracked = entry.TrackedReads({"logs": client})
+        with self.assertRaises(ValueError):
+            tracked["logs"].describe_log_groups()
+        self.assertEqual(tracked.calls, 1)
+        self.assertEqual(tracked.last_operation, "logs.describe_log_groups")
+
+
+if __name__ == "__main__":
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

@@ -1,0 +1,84 @@
+# SFT execution status v0.87
+
+2026-09-13. Fixed generator worker, private packet transport, generator source
+installation and the internal generation-to-import pipeline now have local
+implementation and synthetic tests. Gate 5 remains incomplete. This is work
+within the existing checkpoint-import task, not an additional roadmap gate.
+
+## Completed in this step
+
+- Fixed generator entry: 16 tests. Authenticates entry/helper/source bytes,
+  stages private source copies, bypasses initializer autoregistration, calls
+  the fixed tiny generator once and writes one private success packet.
+- Private packet codec: 18 tests. Checks exact synthetic metadata, 736-parameter
+  configuration, inventories, fixed trainer/tokenizer placeholders and
+  source-copy receipts; rejects tampering, malformed encodings and excess size.
+- Generator bootstrap: 19 tests. Fixed Linux worker/arguments/environment,
+  root-only software mount, private scratch, privilege/descriptor reduction
+  and guardian-controlled release.
+- Generator guardian: 27 tests. Parent/deadline watch before release, bounded
+  private transport, worker exit/EOF, one kill, empty cgroup and removal.
+  Both socket endpoints are configured/read back before forks and rechecked
+  before release. Missing buffer capacity fails closed.
+- Generator source add-on: 14 tests. Exact pinned helper, absent destinations,
+  full pre-write bounds, tracked owned writes and freeze. Started failures
+  taint the fresh software tree; prior files are never overwritten.
+- Internal pipeline: 23 tests. Connects generator -> codec -> controls ->
+  separate fresh import layout -> existing guarded launcher exactly once.
+  Only aggregate hashes/counts leave the pipeline. Success explicitly means
+  two guardian passes with whole-harness cleanup still pending.
+
+All 117 new tests plus 292 regression tests pass on Python 3.11.15 and 3.13.7:
+409 tests per runtime, with no failures, errors or skips. Final test processes
+had audit hooks denying network/process/native-library calls and ML imports.
+No denied operation was attempted and no ML module was loaded. All 12 new
+Python files pass syntax and 100-column checks. Ruff was unavailable.
+
+Tests exercise the actual frozen metadata writer using in-memory filesystem
+doubles, packet encoding/decoding, actual controls builder, doubled layout
+filesystem and actual launch validators with guardian doubles. One generator
+receipt roundtrip uses its own generated tempfile with only the tensor generator
+and runtime gate doubled. None of these is native tensor-generation, isolation,
+kernel containment or full-size import evidence.
+
+## Review corrections completed
+
+Parent paths now require different parent device/inode identities as well as
+non-overlapping lexical paths, rejecting same-parent bind-mount aliases.
+The shared deadline is rechecked after root preflight and immediately before
+import-layout writes. The full generator lifecycle/resource/nonclaim receipt
+is mandatory, including one kill and verified reaping. Regression tests cover
+these cases and failures after generation, during installation and import.
+
+## Exact remaining work before native qualification
+
+1. Add identity-tracked cleanup for external checkpoint/tokenizer/output and
+   mountpoint trees, including partial installation and failed workers.
+   Frozen OwnedRootfs cleanup does not own these sibling trees.
+2. Update the standalone accepted-runtime harness and fresh pinned host-source
+   admission, preserving authenticated-loader namespaces and a single exact
+   OwnedRootfs class identity. Bind that harness to independent supervision.
+3. Then run and verify the generated-only Linux qualification with the required
+   execution approval. The current internal pipeline is not a standalone CLI,
+   does not perform acquisition or whole-harness cleanup, and is not run here.
+
+After qualification, the existing dedicated-host/runtime, external-writer
+exclusion, full-size resource admission and real checkpoint CPU import remain,
+then the documented GPU-worker/private-data/CUDA-smoke and SFT prerequisites.
+
+Worker packets are capped at 65,536 bytes, outer private envelopes at 131,072
+bytes and verified socket buffers at a minimum of 262,144 bytes. These are
+separate transport bounds. Scratch/shm capacities and generated final-size
+limits are not cumulative write accounting. The pipeline's 240-second shared
+deadline is cooperative and still requires an independent hard supervisor.
+No GPU is needed for the outstanding cleanup/admission/supervisor code.
+
+All new files remain local. Prior source/evidence bindings are preserved; no
+tracked/staged diff, CI change, commit or push was made. No actual model,
+tokenizer or dataset payload, network/S3/instance, GPU, inference, native Linux
+worker or training operation occurred. Public real import remains closed at
+host_guard_not_bound. Execution permission, training authorization and
+production eligibility remain false.
+
+Plan: configs/lumi-4b-sft-checkpoint-generator-pipeline-development-v0.1.json.
+Report and verification: matching files under evidence/.

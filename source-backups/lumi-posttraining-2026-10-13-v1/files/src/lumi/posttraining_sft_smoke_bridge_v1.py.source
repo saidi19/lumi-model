@@ -1,0 +1,387 @@
+"""Cooperative eight-rank smoke wiring; not an executable or admission authority.
+
+Reuses WorkerRun v2, EpochLedgerSession v2 and ONE caller-owned Supervisor v2.
+The trusted target launcher supplies admission, prepared model/optimizer/roots,
+owned transports, independent deadlines, continuous OS limits and process cleanup.
+No boolean, metadata receipt or public CLI enables real execution here.
+
+AdmittedRank calls admission BEFORE preparation may import ML or touch inputs,
+then WorkerRun checks admission again. Preparation must construct AdamW after
+FSDP wrapping and clean up its own partial failures. Returned resources are
+closed exactly once even if WorkerRun fails. Results remain private.
+
+ParentInvocation sends ACKs only after reservations and marks them sent only
+after its trusted full-send callback returns None. It emits commit fences after
+all eight confirmations, drains checkpoint I/O at phase barriers, and requires
+all complete rank reports and a trusted memory observation before ledger finish.
+The caller must reuse the SAME Supervisor for the three prescribed invocations,
+allocate fresh epoch/tokens durably, and reap the old workers before the next.
+This adapter does not spawn, import ML, read files, verify an approver, impose OS
+quotas, prove target readiness, compare tensors or authorize a GPU run.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from dataclasses import dataclass
+
+from .posttraining_sft_epoch_protocol_v2 import (
+    MAXIMUM_FRAME_BYTES,
+    EpochLedgerSession,
+    encode_frame,
+)
+from .posttraining_sft_supervisor_v2 import SEQUENCE, Supervisor
+from .posttraining_sft_worker_client_v2 import STEP_FENCE_SCHEMA
+from .posttraining_sft_worker_run_v2 import WorkerRun
+
+ERROR_CODES = frozenset({
+    "invalid_arguments", "owner_mismatch", "already_consumed", "reentry",
+    "admission_rejected", "prepare_failed", "worker_failed", "cleanup_failed",
+    "lifecycle_rejected", "transport_failed", "wire_exhausted", "protocol_failed",
+    "phase_rejected", "reports_rejected", "resource_rejected",
+})
+
+
+class BridgeError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERROR_CODES else "lifecycle_rejected"
+        super().__init__(self.code)
+
+
+def _integer(value, low, high):
+    return type(value) is int and low <= value <= high
+
+
+def _need(condition):
+    if not condition:
+        raise BridgeError("invalid_arguments") from None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class PreparedRank:
+    """Trusted preparation output, borrowed by the worker; never public JSON."""
+
+    model: object
+    optimizer: object
+    encoded_root: object
+    output_parent_fd: int
+    close: object
+
+
+class AdmittedRank:
+    """One local rank invocation; constructor is inert and imports no ML."""
+
+    def __init__(self, *, worker_options, prepare):
+        if hasattr(self, "_owner"):
+            self._fail("already_consumed")
+        _need(type(worker_options) is dict and callable(prepare))
+        _need(worker_options.get("world_size") == 8
+              and worker_options.get("device_type") == "cuda"
+              and type(worker_options.get("profile")) is dict
+              and worker_options["profile"].get("strategy") == "fsdp_full_shard")
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._stage, self._failure = "idle", "idle", None
+        self._interrupted = False
+        self._prepare = prepare
+        self._admit = worker_options.get("admit")
+        self._interrupt = worker_options.get("interrupt")
+        try:
+            self._worker = WorkerRun(**{**worker_options, "interrupt": self._interrupt_once})
+        except BaseException:
+            raise BridgeError("invalid_arguments") from None
+        _need(callable(self._interrupt))
+
+    def _interrupt_once(self):
+        if self._state == "complete":
+            return
+        if not self._interrupted:
+            self._interrupted = True
+            try:
+                self._interrupt()
+            except BaseException:
+                pass
+
+    def _fail(self, code):
+        if self._state == "complete":
+            raise BridgeError("already_consumed") from None
+        if self._failure is None:
+            self._failure, self._state = code, "failed"
+            self._interrupt_once()
+        raise BridgeError(self._failure) from None
+
+    def run(self, *, resume_checkpoint_name=None, resume_manifest_sha256=None):
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._state != "idle":
+            self._fail("reentry" if self._state == "running" else "already_consumed")
+        self._state, self._stage = "running", "admission"
+        prepared = None
+        result = None
+        try:
+            # Reject inconsistent resume arguments before preparation can do I/O.
+            resumed = self._worker._from == 1
+            valid_hash = (type(resume_manifest_sha256) is str
+                          and len(resume_manifest_sha256) == 64
+                          and all(c in "0123456789abcdef" for c in resume_manifest_sha256))
+            if (resumed and (type(resume_checkpoint_name) is not str
+                             or resume_checkpoint_name != "checkpoint-00000001" or not valid_hash)
+                    or not resumed and (resume_checkpoint_name is not None
+                                        or resume_manifest_sha256 is not None)):
+                self._fail("invalid_arguments")
+            if self._admit() is not None or self._failure is not None:
+                self._fail("admission_rejected")
+            self._stage = "prepare"
+            prepared = self._prepare()
+            if (type(prepared) is not PreparedRank or not callable(prepared.close)
+                    or not _integer(prepared.output_parent_fd, 0, 2**31 - 1)):
+                self._fail("prepare_failed")
+            if self._failure is not None:
+                self._fail(self._failure)
+            self._stage = "worker"
+            result = self._worker.run(
+                prepared.model, prepared.optimizer, encoded_root=prepared.encoded_root,
+                output_parent_fd=prepared.output_parent_fd,
+                resume_checkpoint_name=resume_checkpoint_name,
+                resume_manifest_sha256=resume_manifest_sha256,
+            )
+        except BaseException:
+            if self._failure is None:
+                self._failure = {"admission": "admission_rejected", "prepare": "prepare_failed",
+                                 "worker": "worker_failed"}[self._stage]
+                self._state = "failed"
+                self._interrupt_once()
+        finally:
+            if type(prepared) is PreparedRank and callable(prepared.close):
+                try:
+                    if prepared.close() is not None:
+                        raise BridgeError("cleanup_failed")
+                except BaseException:
+                    if self._failure is None:
+                        self._failure, self._stage = "cleanup_failed", "cleanup"
+                        self._state = "failed"
+                        self._interrupt_once()
+        if self._failure is not None:
+            raise BridgeError(self._failure) from None
+        self._state, self._stage = "complete", "complete"
+        return result
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-admitted-rank-summary.v0.1",
+                "state": self._state, "stage": self._stage, "failure_code": self._failure,
+                "worker": self._worker.summary(), "real_execution_authorized": False,
+                "os_resource_enforcement_verified": False, "production_eligible": False}
+
+
+class ParentInvocation:
+    """One consumed epoch, attached to a cumulative eight-rank Supervisor.
+
+    All calls belong to one event-loop thread. send_frame(rank, bytes) and
+    release_phase(rank, phase, step) must complete their bounded sends or raise.
+    Their None return is completion, not an admission/host-ownership proof.
+    Phase-control transport bytes require an independently bounded outer channel.
+    """
+
+    def __init__(self, *, supervisor, epoch, rank_tokens, invocation_index,
+                 admit, send_frame, release_phase, interrupt,
+                 maximum_wire_bytes, maximum_feeds):
+        if hasattr(self, "_owner"):
+            self._fail("already_consumed")
+        _need(type(supervisor) is Supervisor and supervisor._world_size == 8
+              and _integer(invocation_index, 0, 2)
+              and all(callable(fn) for fn in (admit, send_frame, release_phase, interrupt))
+              and _integer(maximum_wire_bytes, 1, 2**63 - 1)
+              and _integer(maximum_feeds, 1, 2**31 - 1))
+        try:
+            self._session = EpochLedgerSession(
+                supervisor, world_size=8, epoch=epoch, rank_tokens=rank_tokens)
+        except BaseException:
+            raise BridgeError("invalid_arguments") from None
+        self._ledger, self._epoch = supervisor, epoch
+        self._invocation = SEQUENCE[invocation_index]
+        self._admit, self._send, self._release, self._interrupt = (
+            admit, send_frame, release_phase, interrupt)
+        self._wire_cap, self._feed_cap = maximum_wire_bytes, maximum_feeds
+        self._wire = self._feeds = self._fenced = self._phase_index = 0
+        self._rank_requests = [0] * 8
+        self._phases = set()
+        start, stop = self._invocation[1:3]
+        self._expected_phases = [("inputs", start), ("restored", start)] + [
+            ("checkpoint", step) for step in range(start + 1, stop + 1)]
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._failure, self._busy = "idle", None, False
+
+    def _fail(self, code):
+        # Late events on a retired epoch cannot poison a later shared epoch.
+        if self._state == "complete":
+            raise BridgeError("already_consumed") from None
+        if self._failure is None:
+            self._failure, self._state = code, "failed"
+            try:
+                self._ledger.interrupt()
+            except BaseException:
+                pass
+            try:
+                self._interrupt()
+            except BaseException:
+                pass
+        raise BridgeError(self._failure) from None
+
+    def _check(self, state="active"):
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._busy:
+            self._fail("reentry")
+        if self._state != state:
+            self._fail("lifecycle_rejected")
+        try:
+            self._ledger.checkpoint()
+        except BaseException:
+            self._fail("resource_rejected")
+
+    def _callback(self, callback, code, *args):
+        self._busy = True
+        try:
+            if callback(*args) is not None:
+                self._fail(code)
+        except BaseException:
+            self._fail(code)
+        finally:
+            self._busy = False
+        if self._failure is not None:
+            self._fail(self._failure)
+
+    def begin(self):
+        self._check("idle")
+        self._callback(self._admit, "admission_rejected")
+        try:
+            self._session.begin_invocation(*self._invocation)
+        except BaseException:
+            self._fail("lifecycle_rejected")
+        self._state = "active"
+
+    def _charge_wire(self, count):
+        if self._wire + count > self._wire_cap:
+            self._fail("wire_exhausted")
+        self._wire += count
+
+    def _send_frame(self, rank, frame):
+        self._charge_wire(len(frame))
+        self._callback(self._send, "transport_failed", rank, frame)
+
+    def feed(self, rank, chunk):
+        self._check()
+        if (not _integer(rank, 0, 7) or type(chunk) is not bytes
+                or not 1 <= len(chunk) <= MAXIMUM_FRAME_BYTES + 4):
+            self._fail("protocol_failed")
+        if self._feeds >= self._feed_cap:
+            self._fail("wire_exhausted")
+        self._feeds += 1
+        self._charge_wire(len(chunk))
+        try:
+            for ack in self._session.feed(rank, chunk):
+                self._send_frame(rank, ack.frame)
+                self._session.mark_ack_sent(ack)
+                self._rank_requests[ack.rank] += 1
+        except BaseException:
+            self._fail("protocol_failed")
+        snapshot = self._session.summary()
+        completed = snapshot["global_optimizer_steps_completed"]
+        if completed > self._fenced:
+            if (completed != self._fenced + 1 or snapshot["pending_acknowledgements"]
+                    or snapshot["rank_step_confirmations_pending"]):
+                self._fail("protocol_failed")
+            for peer in range(8):
+                self._send_frame(peer, encode_frame({
+                    "schema_version": STEP_FENCE_SCHEMA, "epoch": self._epoch, "rank": peer,
+                    "to_step": self._invocation[1] + completed, "status": "committed",
+                }))
+            self._fenced = completed
+        self._release_ready_phase()
+
+    def phase(self, rank, phase, step):
+        self._check()
+        if (not _integer(rank, 0, 7) or rank in self._phases
+                or type(phase) is not str or type(step) is not int
+                or self._phase_index >= len(self._expected_phases)
+                or (phase, step) != self._expected_phases[self._phase_index]
+                or self._fenced != (step - self._invocation[1])):
+            self._fail("phase_rejected")
+        self._phases.add(rank)
+        self._release_ready_phase()
+
+    def poll(self):
+        """Poll the combined runtime/cost cap; an outer watchdog remains mandatory."""
+        self._check()
+
+    def expire_ack_deadline(self):
+        """Outer transport calls at its independent, bounded ACK deadline."""
+        self._check()
+        try:
+            self._session.check_pending()
+        except BaseException:
+            self._fail("protocol_failed")
+
+    def abort(self):
+        """Trusted transport/host failure; consume this invocation, never retry."""
+        self._check()
+        self._fail("transport_failed")
+
+    def _release_ready_phase(self):
+        snapshot = self._session.summary()
+        ledger = self._ledger.summary()
+        if (len(self._phases) == 8 and not snapshot["pending_acknowledgements"]
+                and not snapshot["rank_step_confirmations_pending"]
+                and ledger["global_optimizer_steps_reserved"]
+                == ledger["global_optimizer_steps_completed"]):
+            phase, step = self._expected_phases[self._phase_index]
+            if self._fenced != step - self._invocation[1]:
+                self._fail("phase_rejected")
+            for rank in range(8):
+                self._callback(self._release, "transport_failed", rank, phase, step)
+            self._phase_index += 1
+            self._phases.clear()
+
+    def finish(self, *, worker_summaries, rank_requests, host_ram_bytes, per_gpu_memory_bytes):
+        self._check()
+        steps = self._invocation[2] - self._invocation[1]
+        expected = {
+            "schema_version": "lumi.sft-worker-run-summary.v0.2", "state": "complete",
+            "stage": "complete", "failure_code": None, "failure_stage": None,
+            "completed_steps": steps, "saved_checkpoints": steps,
+            "restored_checkpoints": int(self._invocation[3]),
+            "os_admission_verified": False, "os_resource_enforcement": False,
+            "real_sft_execution_permitted": False, "production_eligible": False,
+        }
+        valid_reports = (type(worker_summaries) is list and len(worker_summaries) == 8
+                         and all(type(item) is dict and set(item) == set(expected)
+                                 and all(type(item[key]) is type(value) and item[key] == value
+                                         for key, value in expected.items())
+                                 for item in worker_summaries))
+        if (not valid_reports or type(rank_requests) is not list or len(rank_requests) != 8
+                or not all(_integer(count, 1, 2**31 - 1) for count in rank_requests)):
+            self._fail("reports_rejected")
+        snapshot = self._session.summary()
+        requests = sum(rank_requests)
+        if (rank_requests != self._rank_requests
+                or self._phase_index != len(self._expected_phases) or self._phases
+                or self._fenced != steps or snapshot["pending_acknowledgements"]
+                or snapshot["rank_step_confirmations_pending"]
+                or not (requests == snapshot["requests_predebited"]
+                        == snapshot["acknowledgements_sent"]
+                        == snapshot["acknowledgements_confirmed"])):
+            self._fail("reports_rejected")
+        try:
+            self._session.observe_memory(host_ram_bytes, per_gpu_memory_bytes)
+            self._session.finish_invocation(self._invocation[2])
+        except BaseException:
+            self._fail("resource_rejected")
+        self._state = "complete"
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-parent-invocation-summary.v0.1",
+                "state": self._state, "failure_code": self._failure,
+                "ledger_wire_bytes": self._wire, "ledger_feed_calls": self._feeds,
+                "global_step_fences": self._fenced, "released_phases": self._phase_index,
+                "real_execution_authorized": False, "os_resource_enforcement_verified": False,
+                "production_eligible": False}

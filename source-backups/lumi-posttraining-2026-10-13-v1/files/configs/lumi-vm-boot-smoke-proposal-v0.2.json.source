@@ -1,0 +1,38 @@
+{
+  "schema": "lumi.vm-boot-smoke-proposal.v0.2",
+  "date": "2026-10-08",
+  "approved": false,
+  "execution_permitted": false,
+  "token": "lumi-boot-v2-smoke-20261008-02",
+  "instance_type": "t3.small",
+  "max_seconds": 720,
+  "instance_count": 1,
+  "scope": "One fresh disposable native boot smoke; no retry, data download, GPU, training, SSH, public IP, NAT, new IAM, or retained-resource mutation.",
+  "cleanup": "Terminate only the new owned instance, delete only its new root disk via DeleteOnTermination, remove only the new tagged security group. Preserve retained attempt-007 instance/storage/subnet/routes.",
+  "credential_change": "Reuse existing bounded refresh Reader, at most four generations and four additional read-only STS identity checks. No credentials saved and no cloud mutating operation retry.",
+  "caps": {
+    "resource_api_calls": 128,
+    "credential_identity_calls": 4,
+    "api_response_bytes": 16777216,
+    "private_journal_bytes": 1048576,
+    "root_disk_gib": 16,
+    "root_disk_encrypted": true
+  },
+  "bindings": {
+    "scripts/execute_sft_vm_boot_smoke_v1.py": "0d85ef9adf9068f00aef220db7f852c28ed0cb06432901e3754e60464997ed8e",
+    "tests/test_sft_vm_boot_smoke_v1.py": "b145c32bd38588ec73e6c3ccb5017a75f80b09a06572bb72da0ea3566086e426",
+    "scripts/execute_sft_vm_boot_smoke_v2.py": "c614e63c7d90329254f94889c98f81e1512633d2ce913e6ae938a1e856837721",
+    "tests/test_sft_vm_boot_smoke_v2.py": "d8db1844b5452f5bf9a470029cb7ae8f2ffa14b63ffd29830f3fcb5becc97c00",
+    "scripts/sft_vm_controller_credentials_v2.py": "8de7a85755d79aebd2f27b98482a51cf0b65af4356cd8bd3e583e00e8211aadb",
+    "scripts/run_sft_vm_early_stop_v2.py": "c5df93301f80b1f91a9bb8bb3cc2c833134e7a487d88332604dc657c41fce71d",
+    "scripts/build_sft_vm_initial_boot_v2.py": "b54e195627d91e54e409459b08a544596538496a764de49c675418dba7b7b3a2"
+  },
+  "validation": {
+    "tests_run": 62,
+    "failures": 0,
+    "errors": 0,
+    "ruff": "pass"
+  },
+  "billing": "Execution timeout is not a hard cloud billing cap; unresolved cleanup is reported, not hidden.",
+  "requires": "Fresh human approval after consumed v0.1 entry; then write exact v0.2 approval and execute once."
+}

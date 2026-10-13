@@ -1,0 +1,69 @@
+# SFT execution status v0.101
+
+2026-09-22. The separately scoped read-only SDK census diagnostic completed
+successfully on one fresh Ubuntu VM. It did not delete or mutate anything. It
+identified the bounded traversal limit reached by the previous cleanup attempt,
+but it did not authorize or perform capacity recovery, setup probing, native
+qualification, GPU use, or training.
+
+## Diagnostic publication and run
+
+Commit `7da33c657497386dc0e5cf4c6fb1f66bf03cfc05` is a child of the consumed
+cleanup commit `7d6007defa8868c4276372411b7ae6ca1189ec75` and adds only the
+versioned read-only workflow, implementation, synthetic tests, and plan. The
+private repository and branch parent were checked before publication. The
+fresh diagnostic run was [35635788177](https://github.com/saidi19/lumi-model/actions/runs/35635788177),
+attempt 1, job `106452752027`, completed successfully in 54 seconds. Its 19
+new synthetic tests pass on CPython 3.11.15 and 3.13.7; Ruff 0.15.1 is clean.
+
+The exact aggregate artifact `10656720076` contained one 722-byte canonical
+member. ZIP size/digest: 547 bytes,
+`61cd8b8a53a82e8a82ffc1d9ec2eb623d60c0b7aac651918d310abf0721f834f`.
+Aggregate SHA-256:
+`e61e83793f37a07fd0ecce2df880cccc374810a9053b42b281eecf95fc479af1`.
+No raw logs or ZIP were retained; two offline structural checks passed.
+
+## Exact bounded observation
+
+The report is `status=observed`, `stage=census`, `code=budget_hit`, with:
+
+- `visited_nodes = 250000` (the exact global descendant-node cap);
+- `accepted_allocated_bytes = 11051053056`;
+- `accepted_relative_name_bytes = 19371269`;
+- `maximum_directory_depth = 15`;
+- `largest_listing_entries = 2850`;
+- then one attempted entry with a remaining listing allowance of zero.
+
+The report’s immediate `budget_kind=listing_entries`, `budget_limit=0`,
+`attempted_value=1` is a consequence of the frozen traversal asking for the
+next directory listing after the global node allowance was exhausted. Thus the
+useful localized conclusion is: **the 250,000-node cap was reached, and the
+next entry could not be admitted**. It is not evidence of a separate SDK
+directory containing zero entries. No source text, names, payload bytes,
+exceptions, or IDs were retained in the aggregate.
+
+All mutation flags are false: SDK mutation, payload reads, setup-probe run,
+GPU/model/dataset access, image acquisition, qualification, training, and
+production eligibility. The result localizes this fresh observation; it does
+not prove the historical cause of the consumed run. The 16 GiB floor and all
+previous caps remain unchanged.
+
+Spark CI for this commit passed. Source CI’s main test job was still in
+progress at the last metadata-only check; no logs were fetched and no run was
+retried. Prior evidence and frozen source bindings remain unchanged.
+
+## Boundary and next decision
+
+The diagnostic attempt is consumed. Do not rerun it, raise the node cap, or
+start cleanup based on this report. Gate 5 remains incomplete and capacity is
+not accepted. Any future action—such as a separately reviewed change to handle
+the 250,000-node SDK census or a new capacity strategy—needs a fresh bounded
+approval. It must not infer that deleting the SDK is safe or sufficient.
+
+Local receipts:
+
+- `artifacts/lumi-sft-sdk-census-diagnostic-v0.1/aggregate-census.json`
+- `evidence/lumi-4b-sft-sdk-census-diagnostic-result-v0.1.json`
+- `evidence/lumi-4b-sft-sdk-census-diagnostic-verification-v0.1.json`
+
+`production_eligible=false` remains unchanged.

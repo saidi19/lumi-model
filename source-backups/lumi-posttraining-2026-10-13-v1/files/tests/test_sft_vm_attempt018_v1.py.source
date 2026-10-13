@@ -1,0 +1,128 @@
+"""Offline verification for the fresh attempt-018 source graph."""
+
+import base64
+import hashlib
+import importlib
+import json
+import socket
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_attempt018_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.manifest = json.loads((m.OUTPUT / "release.json").read_bytes())
+        sys.path.insert(0, str(m.OUTPUT / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        cls.sources = importlib.import_module("prepare_sft_vm_private_host_sources_v4")
+        cls.arm = importlib.import_module("arm_sft_vm_external_watchdog_v2")
+
+    def test_all_156_hashes_and_reconstruction(self):
+        self.assertEqual(len(self.manifest["outputs"]), 156)
+        rebuilt, report = m.build()
+        self.assertEqual(report, self.manifest)
+        self.assertEqual(set(rebuilt), set(self.manifest["outputs"]))
+        for name, pin in self.manifest["outputs"].items():
+            raw = (m.OUTPUT / name).read_bytes()
+            self.assertEqual(rebuilt[name], raw)
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(hashlib.sha256(raw).hexdigest(), pin["sha256"])
+
+    def test_full_graph_authenticates_with_fresh_identity(self):
+        self.outer.authenticate()
+        self.outer.loading.fresh_identity()
+        self.assertEqual(self.manifest["attempt"], m.NEW)
+        self.assertEqual(self.manifest["operational_predecessor"], m.OLD)
+        self.assertEqual(self.manifest["selected_cidr"], m.NEW_CIDR)
+
+    def test_fresh_text_bindings_replace_consumed_attempt(self):
+        bodies = []
+        for directory in ("scripts", "configs"):
+            bodies.extend(
+                path.read_bytes()
+                for path in (m.OUTPUT / directory).rglob("*")
+                if path.is_file()
+            )
+        joined = b"\n".join(bodies)
+        self.assertNotIn(m.OLD.encode(), joined)
+        self.assertNotIn(b"attempt-017", joined)
+        self.assertNotIn(m.OLD_CIDR.encode(), joined)
+        self.assertIn(m.NEW.encode(), joined)
+        self.assertIn(b"attempt-018", joined)
+        self.assertIn(m.NEW_CIDR.encode(), joined)
+
+    def test_both_watchdog_baselines_match_exact_worker_zip(self):
+        original = self.sources.inputs()["sft_vm_external_watchdog_v1"]
+        expected = base64.b64encode(
+            hashlib.sha256(self.sources.package(original)).digest()
+        ).decode()
+        self.assertEqual(expected, self.manifest["watchdog_code_sha256_base64"])
+        self.assertEqual(expected, self.sources.OLD_CODE)
+        self.assertEqual(expected, self.arm.CODE)
+
+    def test_private_subnet_specialization_builds_offline(self):
+        binding = self.sources.binding
+        base = json.loads(binding.PROPOSAL_PATH.read_bytes())
+        ids = {}
+        digits = iter("1234567")
+        for kind, spec in binding.network.KINDS.items():
+            ids[kind] = f"{spec[4]}-{next(digits) * 17}"
+        ids["association"] = "rtbassoc-" + "f" * 17
+        base["host"]["subnet"] = ids["subnet"]
+        base["private_network_binding"] = {
+            "schema": "lumi.vm-private-host-network-binding.v0.1",
+            "base_proposal_sha256": binding.PROPOSAL_SHA,
+            "network_controller_sha256": binding.NETWORK_SHA,
+            "attempt": binding.network.selection.ATTEMPT,
+            "nonce": "e" * 32,
+            "resources": ids,
+            "workload_deadline_monotonic": 20000.0,
+            "network_deadline_monotonic": 21800.0,
+            "cleanup_reserve_seconds": 1800,
+            "usable_only_in_original_controller_process": True,
+        }
+        raw = binding.encoded(base)
+        files, result = self.sources.build(
+            raw, Path("/private/tmp/lumi-attempt018-synthetic-host-proposal.json")
+        )
+        self.assertEqual(len(files), 34)
+        self.assertEqual(len(result["modules"]), 34)
+        self.assertFalse(result["live_execution_authorized"])
+        specialized = result["watchdog_code_sha256_base64"]
+        self.assertNotEqual(specialized, self.sources.OLD_CODE)
+        arm = next(
+            body
+            for name, body in files.items()
+            if name.startswith("arm_sft_vm_external_watchdog_v2")
+        )
+        self.assertEqual(arm.count(specialized.encode()), 1)
+        self.assertNotIn(self.sources.OLD_CODE.encode(), arm)
+
+    def test_no_execution_authority_and_no_overwrite(self):
+        self.assertTrue(self.manifest["fresh_controls_required"])
+        self.assertFalse(self.manifest["execution_permitted"])
+        self.assertFalse(self.manifest["old_authorization_reused"])
+        self.assertFalse(self.manifest["old_timer_reused"])
+        self.assertFalse(self.manifest["gate_5_complete"])
+        self.assertFalse(self.manifest["gpu"])
+        self.assertFalse(self.manifest["training"])
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "OUTPUT", m.OUTPUT), self.assertRaises(ValueError):
+            m.prepare()
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()

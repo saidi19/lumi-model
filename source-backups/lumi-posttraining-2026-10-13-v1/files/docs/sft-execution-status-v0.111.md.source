@@ -1,0 +1,77 @@
+# SFT execution status v0.111
+
+2026-09-24. The write-guard policy and scalar reservation core are implemented
+and locally tested. **This is not native write-limit enforcement; Gate 5 remains
+incomplete.** No kernel filter/listener, remote action, payload read, GPU work,
+inference or training occurred. The seven new files remain local and unpushed.
+
+## Completed
+
+- Two fixed cBPF candidates: a temporary bootstrap listener notifies every
+  `write`/`pwrite64`, and a closed final seal rejects other data-write channels
+  and further policy installation. All descriptors are counted. Neither filter
+  alone provides the intended meter, and the temporary listener is unsafe alone.
+- The broker preserves full unsigned requested-byte counts and reserves before
+  either ID-validation or response callback. Zero-length writes consume the
+  notification limit. Stale IDs, duplicates, budget exhaustion, callback
+  ambiguity/cancellation, reentry, ownership and deadline failures are terminal;
+  no refund, retry or budget reset is offered.
+- Exact candidate wire parsing discards PID/IP/FD/buffer/offset fields. Only
+  aggregate snapshots and fixed error codes are retention-safe. Exception
+  objects and tracebacks can retain private frames and must not be stored.
+
+The public installer and server always return `host_guard_not_bound`. Component
+limits are bounded planning inputs, not approved native-run budgets. The actual
+SFT resource envelope and historical host contract are unchanged. Requested
+data-byte accounting is not physical disk/journal or metadata accounting;
+creation/mode/fsync effects and sparse-file growth still need separate bounds.
+
+## Verification
+
+**608 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures, errors
+or skips: 37 policy tests, 50 broker tests and 521 earlier regressions.
+
+An independent cBPF interpreter verifies dispatch, x32/foreign-architecture
+rejection, full-width flags, all-FD write notification, alternate-channel denial
+and two-filter precedence. The integration case passes twelve generated
+notifications through both policy decisions into the real broker core, checking
+precharge and exact response bytes without invoking the kernel.
+
+Independent review found no accounting or cBPF control-flow bypass in this local
+model. A fixed ENOSYS refusal for `clone3` keeps that syscall denied while
+permitting a potential libc fallback to the flag-checked legacy thread syscall;
+actual native compatibility is not established by these tests.
+
+Syntax/AST, 100-column and whitespace checks pass. Ruff remains unavailable at
+the previous temporary path; no replacement was downloaded. All 53 previous
+readiness/development bindings, 78 qualified native source rows and 39 worker
+source rows match. Earlier evidence/manifests are unchanged, and tracked/staged
+diffs are empty.
+
+Development record:
+`configs/lumi-4b-sft-write-guard-core-development-v0.1.json`.
+
+SHA-256: `5abd3ce88efc86a8128bae13c66349301e13e8f583cf01d0173eeb04b327916f`.
+
+Verification:
+`evidence/lumi-4b-sft-write-guard-core-development-verification-v0.1.json`.
+
+## Next work and unchanged boundary
+
+Next is the native adapter and guardian integration: authenticate target Linux
+headers/ABI, transfer exactly one listener during trusted bootstrap, install and
+read back both filters, then connect kernel ID-validation/response operations to
+this core before payload release. Every terminal error must retire the owned
+workload. Parent-loss and deadline protection must remain independently armed:
+poll readiness alone cannot prove notification receive stays nonblocking after
+cancellation. Existing `RLIMIT_CORE=0` and authority/mapping exclusions must be
+preserved, alongside separate setup/scratch/report/metadata/capacity bounds.
+
+The dispatcher output boundary and lifecycle limitation from v0.108 also remain.
+After integrated source closure, bounded Linux qualification and the existing
+host/input/resource/real-import admission are still required. These are the
+remaining parts of the existing work, not additional roadmap gates.
+
+The S3-backed pretrained checkpoint remains the intended base; no current S3
+availability check was made. Training and production stay disabled. GPU is not
+needed for the next local implementation work.

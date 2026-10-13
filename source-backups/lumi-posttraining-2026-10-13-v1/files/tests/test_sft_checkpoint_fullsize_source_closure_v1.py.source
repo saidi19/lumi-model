@@ -1,0 +1,212 @@
+"""Content-bound worker source closure; no payload, ML import or native admission.
+
+The flat source manifest is conditional on the fixed entry installing an inert
+``lumi`` package. The shipped initializer and tiny fixture are required by the
+frozen helper format but are not worker entry points. In particular the public
+initializer's dynamic attribute registry is not executed or expanded here.
+This audit binds reviewed source bytes and known dynamic-import expressions; it
+does not prove arbitrary Python dependency completeness or source immutability.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib
+import importlib.util
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST_PATH = ROOT / "configs/lumi-4b-sft-fullsize-import-source-manifest-v0.1.json"
+SEEDS = frozenset({"__init__", "posttraining_checkpoint_guard_fixture_v1",
+    "posttraining_checkpoint_fullsize_entry_v1", "configuration_lumi", "modeling_lumi"})
+KERNEL_DEPENDENCIES = (
+    "torch", "torch.distributed.checkpoint", "transformers", "safetensors", "numpy",
+    "lumi.configuration_lumi", "lumi.modeling_lumi",
+)
+RUNTIME_MODULES = ("lumi.configuration_lumi", "lumi.modeling_lumi")
+EXPECTED_DYNAMIC_CALLS = {
+    "__init__": ["importlib.import_module(target[0], __name__)",
+                 "importlib.util.find_spec('torch')", "importlib.util.find_spec('transformers')"],
+    "posttraining_checkpoint_import_torch_v5": ["importlib.import_module(module_name)",
+                                                "importlib.import_module(name)"],
+    "posttraining_checkpoint_dcp_reader_v1": [
+        "importlib.import_module('torch.distributed.checkpoint.filesystem')"],
+}
+ML_ROOTS = {"lumi", "torch", "numpy", "transformers", "safetensors", "tokenizers",
+            "tensorflow", "jax", "cupy", "cuda"}
+HELPER_SHA256 = "687a2989ccefdf2466dc77cda62d99d5c6428bc60c74e0e32e15991cec120690"
+PACKAGE = "_lumi_fullsize_source_closure_tests"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before = set(sys.modules)
+subject = importlib.import_module(PACKAGE + ".posttraining_checkpoint_guard_sources_v1")
+spec = importlib.util.spec_from_file_location(
+    "_lumi_fullsize_source_closure_helper", ROOT / "scripts/run_checkpoint_guarded_import_v1.py")
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)  # Definitions only; never its synthetic/native main.
+IMPORTED = set(sys.modules) - before
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def local_dependencies(tree):
+    """Walk functions as well as module scope; resolve the flat Lumi package."""
+    result = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if node.level:
+                if node.level != 1:
+                    raise AssertionError("unexpected non-flat relative import")
+                if node.module:
+                    result.add(node.module.split(".")[0])
+                else:
+                    result.update(alias.name for alias in node.names)
+            elif node.module == "lumi":
+                result.update(alias.name for alias in node.names)
+            elif node.module and node.module.startswith("lumi."):
+                result.add(node.module.split(".")[1])
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("lumi."):
+                    result.add(alias.name.split(".")[1])
+    if "*" in result:
+        raise AssertionError("unexpected wildcard Lumi import")
+    return result
+
+
+def closure():
+    """Read only existing flat Python source files, never import worker modules."""
+    pending = list(SEEDS | {name.split(".")[1] for name in RUNTIME_MODULES})
+    files, trees = {}, {}
+    while pending:
+        name = pending.pop()
+        if name in trees:
+            continue
+        if not name.isidentifier():
+            raise AssertionError("non-flat source name")
+        raw = (ROOT / "src/lumi" / (name + ".py")).read_bytes()
+        tree = ast.parse(raw, filename="lumi/" + name + ".py")
+        files["lumi/" + name + ".py"], trees[name] = raw, tree
+        pending.extend(local_dependencies(tree) - trees.keys())
+    return files, trees
+
+
+def dynamic_calls(tree):
+    result = []
+    attributes = {"import_module", "find_spec", "spec_from_file_location", "module_from_spec"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if ((isinstance(node.func, ast.Attribute) and node.func.attr in attributes)
+                or (isinstance(node.func, ast.Name)
+                    and node.func.id in {"__import__", "exec", "eval"})):
+            result.append(ast.unparse(node))
+    return sorted(result)
+
+
+class FullsizeSourceClosureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.trees = closure()
+        cls.raw = MANIFEST_PATH.read_bytes()
+        cls.manifest = json.loads(cls.raw)
+
+    def test_only_stdlib_validation_helpers_are_imported(self):
+        self.assertFalse({name.split(".")[0] for name in IMPORTED} & ML_ROOTS)
+        self.assertNotIn("lumi", IMPORTED)
+
+    def test_manifest_is_exact_frozen_canonical_source_schema(self):
+        self.assertEqual(self.raw, subject.build_manifest(self.files))
+        rows = helper.validate_source_manifest(self.raw, digest(self.raw))
+        self.assertEqual(set(rows), set(self.files))
+        self.assertEqual(set(self.manifest), {"schema", "files"})
+
+    def test_every_listed_source_has_exact_size_and_digest(self):
+        self.assertEqual(len(self.manifest["files"]), len(self.files))
+        for row in self.manifest["files"]:
+            with self.subTest(path=row["path"]):
+                raw = self.files[row["path"]]
+                self.assertEqual(row["bytes"], len(raw))
+                self.assertEqual(row["sha256"], digest(raw))
+
+    def test_closure_equals_seeds_and_recursive_relative_absolute_lazy_imports(self):
+        expected = {"lumi/" + name + ".py" for name in self.trees}
+        self.assertEqual(expected, set(self.files))
+        self.assertTrue(SEEDS <= self.trees.keys())
+        for tree in self.trees.values():
+            self.assertTrue(local_dependencies(tree) <= self.trees.keys())
+        self.assertEqual({row["path"] for row in self.manifest["files"]}, expected)
+
+    def test_known_lazy_package_consumer_and_its_dependencies_are_retained(self):
+        expected = {"posttraining_sft_runtime_v4", "pilot_training", "posttraining_shards",
+                    "posttraining_seal", "posttraining_format", "tokenizer_gate"}
+        self.assertTrue(expected <= self.trees.keys())
+        self.assertIn("posttraining_sft_runtime_v4",
+                      local_dependencies(self.trees["posttraining_checkpoint_package_v2"]))
+
+    def test_finite_dynamic_import_expressions_remain_the_reviewed_set(self):
+        actual = {name: calls for name, tree in self.trees.items()
+                  if (calls := dynamic_calls(tree))}
+        self.assertEqual(actual, EXPECTED_DYNAMIC_CALLS)
+
+    def test_kernel_dynamic_loop_values_are_exact_and_local_names_are_bound(self):
+        tree = self.trees["posttraining_checkpoint_import_torch_v5"]
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "require_dependencies")
+        loops = [node for node in ast.walk(function) if isinstance(node, ast.For)]
+        self.assertEqual(len(loops), 1)
+        self.assertEqual(ast.literal_eval(loops[0].iter), KERNEL_DEPENDENCIES)
+        runtime_loops = [node for node in ast.walk(tree) if isinstance(node, ast.For)
+                         and isinstance(node.target, ast.Name)
+                         and node.target.id == "module_name"]
+        self.assertEqual(len(runtime_loops), 1)
+        self.assertEqual(ast.literal_eval(runtime_loops[0].iter), RUNTIME_MODULES)
+        self.assertTrue({name.split(".")[1] for name in RUNTIME_MODULES} <= self.trees.keys())
+
+    def test_source_caps_and_helper_binding_remain_frozen(self):
+        self.assertLessEqual(len(self.files), 128)
+        self.assertLessEqual(sum(map(len, self.files.values())), 4 * 1024**2)
+        self.assertTrue(all(len(raw) <= 256 * 1024 for raw in self.files.values()))
+        self.assertLessEqual(len(self.raw), 65536)
+        raw = (ROOT / "scripts/run_checkpoint_guarded_import_v1.py").read_bytes()
+        self.assertEqual(len(raw), 14356)
+        self.assertEqual(digest(raw), HELPER_SHA256)
+
+    def test_unneeded_native_lifecycle_installer_modules_are_not_worker_roots(self):
+        excluded = {"posttraining_checkpoint_fullsize_bootstrap_v1",
+                    "posttraining_checkpoint_fullsize_composition_v1",
+                    "posttraining_checkpoint_fullsize_guard_v1",
+                    "posttraining_checkpoint_prepared_layout_v2",
+                    "posttraining_sft_oci_rootfs_v1"}
+        self.assertFalse(excluded & self.trees.keys())
+
+    def test_source_change_missing_dependency_or_extra_file_breaks_canonical_binding(self):
+        name = "lumi/posttraining_checkpoint_fullsize_entry_v1.py"
+        changed = dict(self.files)
+        changed[name] += b"\n# changed source\n"
+        self.assertNotEqual(subject.build_manifest(changed), self.raw)
+        changed = dict(self.files)
+        del changed["lumi/parameter_count.py"]
+        self.assertNotEqual(subject.build_manifest(changed), self.raw)
+        changed = dict(self.files, **{"lumi/unreviewed_extra.py": b"VALUE = 1\n"})
+        self.assertNotEqual(subject.build_manifest(changed), self.raw)
+
+    def test_import_parser_includes_lazy_relative_and_absolute_lumi_dependencies(self):
+        tree = ast.parse("from . import a\ndef lazy():\n from .b import c\n"
+                         " import lumi.d\n from lumi.e import f\n from lumi import g\n")
+        self.assertEqual(local_dependencies(tree), {"a", "b", "d", "e", "g"})
+        for raw in ("from ..escape import x", "from . import *"):
+            with self.assertRaises(AssertionError):
+                local_dependencies(ast.parse(raw))
+
+
+if __name__ == "__main__":
+    unittest.main()

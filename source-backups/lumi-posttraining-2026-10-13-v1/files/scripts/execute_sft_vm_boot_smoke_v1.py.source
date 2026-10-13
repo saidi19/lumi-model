@@ -1,0 +1,559 @@
+"""One authorized disposable CPU boot test. No checkpoint, SSH, IAM or training.
+
+The retained attempt-007 subnet is read-only. Only newly tagged smoke resources
+may be terminated/deleted. No mutating API is retried, including on ambiguity.
+"""
+
+import gzip
+import hashlib
+import json
+import os
+import re
+import shlex
+import signal
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+import build_sft_vm_initial_boot_v2 as boot
+
+ROOT = Path(__file__).resolve().parents[1]
+PLAN = ROOT / "configs/lumi-vm-boot-smoke-approval-v0.1.json"
+OUTPUT = ROOT / "artifacts/lumi-vm-boot-smoke-v0.1"
+ACCOUNT = "573978149073"
+VPC = "vpc-0905fbf9490a2dead"
+SUBNET = "subnet-09acdd244d70aa502"
+AMI = "ami-0045d7fc2ad003464"
+AMI_NAME = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260923"
+TOKEN = "lumi-boot-v2-smoke-20261008-01"
+TAG = "LumiBootSmoke"
+MUTATIONS = {
+    "create_security_group",
+    "revoke_security_group_egress",
+    "run_instances",
+    "terminate_instances",
+    "delete_security_group",
+}
+READS = {
+    "get_caller_identity",
+    "describe_images",
+    "describe_subnets",
+    "describe_instance_type_offerings",
+    "describe_instances",
+    "describe_security_groups",
+    "describe_network_interfaces",
+    "describe_volumes",
+    "get_console_output",
+}
+STAGES = (
+    "wrapper_entry",
+    "entry",
+    "identity",
+    "source",
+    "context",
+    "units",
+    "verify",
+    "reload",
+    "host_timer",
+    "setup_timer",
+    "proof",
+    "ready",
+    "wrapper_rejected",
+    "rejected",
+    "stop_failed",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("boot_smoke_rejected")
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+
+
+def tags(kind):
+    return dict(ResourceType=kind, Tags=[dict(Key=TAG, Value=TOKEN)])
+
+
+def owned(row):
+    need([t.get("Value") for t in row.get("Tags", []) if t.get("Key") == TAG] == [TOKEN])
+
+
+def user_data():
+    """Keep exact v2 boot command; add pre-sysinit observation and final poweroff."""
+    cfg = json.loads(gzip.decompress(boot.user_data()).removeprefix(b"#cloud-config\n"))
+    inner = cfg["bootcmd"][0][-1]
+    pre = (
+        "s=$(/usr/bin/timeout 5s /usr/bin/systemctl show sysinit.target "
+        "--property=ActiveState --value 2>/dev/null); "
+        "if [ \"$s\" = inactive ]; then printf 'LUMI_SMOKE_V1:pre_sysinit\\n'; "
+        "else printf 'LUMI_SMOKE_V1:ordering_rejected\\n'; "
+        "/usr/bin/systemctl --no-block poweroff >/dev/null 2>&1; exit 2; fi; "
+    )
+    post = (
+        "; printf 'LUMI_SMOKE_V1:finished\\n'; /usr/bin/sync; "
+        "/usr/bin/systemctl --no-block poweroff >/dev/null 2>&1"
+    )
+    # Outer timeout also covers observation/sync; controller owns the 20m limit.
+    shell = "/usr/bin/timeout --signal=KILL 180s /bin/sh -c " + shlex.quote(pre + inner + post)
+    shell += " || /usr/bin/systemctl --no-block poweroff >/dev/null 2>&1"
+    cfg["bootcmd"] = [["/bin/sh", "-c", shell]]
+    raw = gzip.compress(b"#cloud-config\n" + json.dumps(cfg).encode() + b"\n", mtime=0)
+    need(len(raw) <= 16384)
+    return raw
+
+
+def console_summary(response, instance):
+    need(response["InstanceId"] == instance)
+    text = response.get("Output", "")
+    need(type(text) is str and len(text.encode()) <= 262144)
+    # Never retain raw console, command lines, exception text or arbitrary IDs.
+    # Match complete fixed markers, allowing CR from the serial terminal.
+    lines = text.replace("\r", "").splitlines()
+    counts = {stage: lines.count("LUMI_BOOT_V2:" + stage) for stage in STAGES}
+    smoke = {
+        stage: lines.count("LUMI_SMOKE_V1:" + stage)
+        for stage in ("pre_sysinit", "ordering_rejected", "finished")
+    }
+    required = STAGES[:12]
+    passed = (
+        all(counts[k] == 1 for k in required)
+        and all(counts[k] == 0 for k in STAGES[12:])
+        and smoke == dict(pre_sysinit=1, ordering_rejected=0, finished=1)
+    )
+    return dict(bytes=len(text.encode()), markers=counts, smoke=smoke, passed=passed)
+
+
+def launch_request(group, root_device, payload):
+    return dict(
+        ImageId=AMI,
+        InstanceType="t3.small",
+        MinCount=1,
+        MaxCount=1,
+        ClientToken=TOKEN,
+        UserData=payload,
+        CreditSpecification=dict(CpuCredits="standard"),
+        InstanceInitiatedShutdownBehavior="stop",
+        DisableApiTermination=False,
+        Monitoring=dict(Enabled=False),
+        MetadataOptions=dict(
+            HttpTokens="required",
+            HttpEndpoint="enabled",
+            HttpPutResponseHopLimit=1,
+            HttpProtocolIpv6="disabled",
+            InstanceMetadataTags="disabled",
+        ),
+        NetworkInterfaces=[
+            dict(
+                DeviceIndex=0,
+                SubnetId=SUBNET,
+                Groups=[group],
+                AssociatePublicIpAddress=False,
+                DeleteOnTermination=True,
+                Ipv6AddressCount=0,
+            )
+        ],
+        BlockDeviceMappings=[
+            dict(
+                DeviceName=root_device,
+                Ebs=dict(VolumeSize=16, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True),
+            )
+        ],
+        TagSpecifications=[tags("instance"), tags("volume")],
+    )
+
+
+class Smoke:
+    def __init__(self, clients, save, *, clock=time.monotonic, sleep=time.sleep):
+        self.clients, self.save, self.clock, self.sleep = clients, save, clock, sleep
+        self.started = clock()
+        self.group = self.instance = self.volume = None
+        self.launched = self.created_group = False
+        self.mutations, self.calls, self.response_bytes = set(), 0, 0
+        self.stage = "preflight"
+        self.last_operation = None
+        self.report = dict(
+            status="failed",
+            boot_passed=False,
+            cleanup_verified=False,
+            instance_terminated=False,
+            root_volume_deleted=False,
+            security_group_deleted=False,
+            launch_attempted=False,
+        )
+
+    def call(self, operation, **fields):
+        need(operation in READS | MUTATIONS and self.calls < 128)
+        need(self.clock() - self.started < 690)
+        if operation in MUTATIONS:
+            need(operation not in self.mutations)
+            self.mutations.add(operation)
+            self.save(
+                "mutation-" + operation,
+                dict(operation=operation, started=True, instance=self.instance, group=self.group),
+            )
+        self.calls += 1
+        self.last_operation = operation
+        client = self.clients["sts" if operation == "get_caller_identity" else "ec2"]
+        # Socket deadlines alone do not bound DNS or other pre-request work.
+        need(signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0))
+        previous = signal.getsignal(signal.SIGALRM)
+
+        def expired(*_):
+            raise TimeoutError("boot_smoke_api_deadline")
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, 10)
+        try:
+            result = getattr(client, operation)(**fields)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        size = len(canonical(result))
+        self.response_bytes += size
+        need(size <= 524288 and self.response_bytes <= 16777216)
+        need(not result.get("NextToken"))
+        return result
+
+    def groups(self):
+        rows = self.call(
+            "describe_security_groups",
+            Filters=[dict(Name="vpc-id", Values=[VPC]), dict(Name="group-name", Values=[TOKEN])],
+        )["SecurityGroups"]
+        need(len(rows) <= 1)
+        if not rows:
+            return None
+        row = rows[0]
+        owned(row)
+        need(row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC and row["GroupName"] == TOKEN)
+        need(re.fullmatch(r"sg-[0-9a-f]{17}", row["GroupId"]))
+        need(self.group in (None, row["GroupId"]))
+        self.group = row["GroupId"]
+        return row
+
+    def instance_row(self):
+        reservations = self.call(
+            "describe_instances", Filters=[dict(Name="client-token", Values=[TOKEN])]
+        )["Reservations"]
+        need(len(reservations) <= 1)
+        if not reservations:
+            return None
+        res = reservations[0]
+        need(res["OwnerId"] == ACCOUNT and len(res["Instances"]) == 1)
+        row = res["Instances"][0]
+        owned(row)
+        need(row["ClientToken"] == TOKEN and row["ImageId"] == AMI)
+        need(row["InstanceType"] == "t3.small" and row["VpcId"] == VPC)
+        need(
+            row["SubnetId"] == SUBNET
+            and not row.get("KeyName")
+            and not row.get("IamInstanceProfile")
+        )
+        need(re.fullmatch(r"i-[0-9a-f]{17}", row["InstanceId"]))
+        need(self.instance in (None, row["InstanceId"]))
+        self.instance = row["InstanceId"]
+        return row
+
+    def preflight(self):
+        self.stage = "identity"
+        need(self.call("get_caller_identity")["Account"] == ACCOUNT)
+        self.stage = "fresh_resources"
+        need(self.instance_row() is None and self.groups() is None)
+        self.stage = "subnet"
+        subnets = self.call("describe_subnets", SubnetIds=[SUBNET])["Subnets"]
+        need(len(subnets) == 1)
+        subnet = subnets[0]
+        need(subnet["SubnetId"] == SUBNET and subnet["VpcId"] == VPC)
+        need(subnet["OwnerId"] == ACCOUNT and subnet["State"] == "available")
+        need(
+            subnet["AvailableIpAddressCount"] > 2 and not subnet.get("AssignIpv6AddressOnCreation")
+        )
+        self.stage = "image"
+        images = self.call("describe_images", ImageIds=[AMI], Owners=["099720109477"])["Images"]
+        need(len(images) == 1)
+        image = images[0]
+        need(image["ImageId"] == AMI and image["OwnerId"] == "099720109477")
+        need(image["Name"] == AMI_NAME and image["Architecture"] == "x86_64")
+        need(image["State"] == "available" and image["RootDeviceType"] == "ebs")
+        mappings = image["BlockDeviceMappings"]
+        need(len(mappings) == 1 and mappings[0]["DeviceName"] == image["RootDeviceName"])
+        need(0 < mappings[0]["Ebs"]["VolumeSize"] <= 16)
+        self.stage = "offering"
+        offerings = self.call(
+            "describe_instance_type_offerings",
+            LocationType="availability-zone",
+            Filters=[
+                dict(Name="location", Values=[subnet["AvailabilityZone"]]),
+                dict(Name="instance-type", Values=["t3.small"]),
+            ],
+        )["InstanceTypeOfferings"]
+        need(len(offerings) == 1)
+        self.save(
+            "preflight",
+            dict(
+                identity_matches=True,
+                image_matches=True,
+                subnet_readonly=True,
+                fresh_resource_names=True,
+                instance_type="t3.small",
+            ),
+        )
+        return image["RootDeviceName"]
+
+    def launch(self, root_device):
+        need(self.clock() - self.started < 120)
+        self.stage = "security_group"
+        self.created_group = True
+        result = self.call(
+            "create_security_group",
+            GroupName=TOKEN,
+            VpcId=VPC,
+            Description="One-shot no-data Lumi boot smoke",
+            TagSpecifications=[tags("security-group")],
+        )
+        self.group = result["GroupId"]
+        group = self.groups()
+        need(group is not None and not group["IpPermissions"])
+        if group["IpPermissionsEgress"]:
+            self.call(
+                "revoke_security_group_egress",
+                GroupId=self.group,
+                IpPermissions=group["IpPermissionsEgress"],
+            )
+        group = self.groups()
+        need(not group["IpPermissions"] and not group["IpPermissionsEgress"])
+        payload = user_data()
+        self.save("payload", dict(sha256=hashlib.sha256(payload).hexdigest(), bytes=len(payload)))
+        self.stage = "launch"
+        self.launched = self.report["launch_attempted"] = True
+        result = self.call("run_instances", **launch_request(self.group, root_device, payload))
+        need(len(result["Instances"]) == 1)
+        self.instance = result["Instances"][0]["InstanceId"]
+        self.save(
+            "launch",
+            dict(
+                instance=self.instance,
+                group=self.group,
+                instance_type="t3.small",
+                delete_root_on_termination=True,
+            ),
+        )
+
+    def volume_check(self, row):
+        need(not row.get("PublicIpAddress") and not row.get("PublicDnsName"))
+        need([g["GroupId"] for g in row["SecurityGroups"]] == [self.group])
+        need(
+            not any(
+                n.get("Ipv6Addresses") or n.get("Association") for n in row["NetworkInterfaces"]
+            )
+        )
+        blocks = row["BlockDeviceMappings"]
+        if not blocks:
+            return False
+        need(len(blocks) == 1 and blocks[0]["Ebs"]["DeleteOnTermination"] is True)
+        volume = blocks[0]["Ebs"]["VolumeId"]
+        need(self.volume in (None, volume))
+        rows = self.call("describe_volumes", VolumeIds=[volume])["Volumes"]
+        need(len(rows) == 1)
+        v = rows[0]
+        owned(v)
+        need(v["VolumeId"] == volume and v["Encrypted"] is True and v["Size"] == 16)
+        need(len(v["Attachments"]) == 1 and v["Attachments"][0]["InstanceId"] == self.instance)
+        self.volume = volume
+        self.save("volume", dict(volume=volume, encrypted=True, size_gib=16))
+        return True
+
+    def observe(self):
+        self.stage = "boot_observation"
+        summaries = []
+        for poll in range(24):
+            need(self.clock() - self.started < 360)
+            row = self.instance_row()
+            if row is None:
+                self.sleep(10)
+                continue
+            if self.volume is None and row["State"]["Name"] in {"running", "stopping", "stopped"}:
+                self.volume_check(row)
+            state = row["State"]["Name"]
+            self.save(f"state-{poll:02d}", dict(instance=self.instance, state=state))
+            if state in {"running", "stopping", "stopped"} and (
+                poll % 2 == 0 or state == "stopped"
+            ):
+                summary = console_summary(
+                    self.call("get_console_output", InstanceId=self.instance, Latest=True),
+                    self.instance,
+                )
+                summaries.append(summary)
+                self.save(f"console-{poll:02d}", summary)
+                if summary["passed"] and self.volume:
+                    self.report["boot_passed"] = True
+                    break
+                if summary["smoke"]["ordering_rejected"] or any(
+                    summary["markers"][k] for k in STAGES[12:]
+                ):
+                    break
+                if state == "stopped" and len(summaries) >= 6:
+                    break
+            need(state not in {"shutting-down", "terminated"})
+            self.sleep(10)
+        self.report["console_observations"] = len(summaries)
+
+    def cleanup(self):
+        self.stage = "cleanup"
+        if self.launched:
+            # A lost launch response is reconciled by exact client token, not retried.
+            row = None
+            for _ in range(6):
+                row = self.instance_row()
+                if row is not None:
+                    break
+                self.sleep(10)
+            need(row is not None)
+            if row["State"]["Name"] != "terminated":
+                self.call("terminate_instances", InstanceIds=[self.instance])
+            for _ in range(18):
+                row = self.instance_row()
+                need(row is not None)
+                if row["State"]["Name"] == "terminated":
+                    self.report["instance_terminated"] = True
+                    break
+                self.sleep(10)
+            need(self.report["instance_terminated"])
+            for _ in range(8):
+                volumes = self.call(
+                    "describe_volumes", Filters=[dict(Name="tag:" + TAG, Values=[TOKEN])]
+                )["Volumes"]
+                if not volumes:
+                    break
+                for volume in volumes:
+                    owned(volume)
+                    need(volume["VolumeId"] == self.volume)
+                self.sleep(5)
+            self.report["root_volume_deleted"] = not volumes
+            need(not volumes)
+        if self.created_group:
+            group = self.groups()
+            need(group is not None)
+            for _ in range(12):
+                enis = self.call(
+                    "describe_network_interfaces",
+                    Filters=[dict(Name="group-id", Values=[self.group])],
+                )["NetworkInterfaces"]
+                if not enis:
+                    break
+                need(
+                    all(
+                        e["OwnerId"] == ACCOUNT
+                        and e["VpcId"] == VPC
+                        and e.get("Attachment", {}).get("InstanceId") == self.instance
+                        for e in enis
+                    )
+                )
+                self.sleep(10)
+            need(not enis)
+            self.call("delete_security_group", GroupId=self.group)
+            need(self.groups() is None)
+            self.report["security_group_deleted"] = True
+        self.report["cleanup_verified"] = True
+
+    def run(self):
+        try:
+            root_device = self.preflight()
+            self.launch(root_device)
+            self.observe()
+        except Exception:
+            self.report["failed_stage"] = self.stage
+            self.report["failed_operation"] = self.last_operation
+        finally:
+            try:
+                self.cleanup()
+            except Exception:
+                self.report["cleanup_failed"] = True
+            self.report.update(
+                instance=self.instance,
+                group=self.group,
+                volume=self.volume,
+                calls=self.calls,
+                mutations=sorted(self.mutations),
+                response_bytes=self.response_bytes,
+                elapsed_seconds=round(self.clock() - self.started, 3),
+            )
+            if self.report["boot_passed"] and self.report["cleanup_verified"]:
+                self.report["status"] = "boot_passed_cleanup_verified"
+            self.save("result", self.report)
+        return self.report
+
+
+def main():
+    approval = json.loads(PLAN.read_bytes())
+    need(approval["approved"] is True and approval["token"] == TOKEN)
+    need(approval["max_seconds"] == 720 and approval["instance_type"] == "t3.small")
+    for name, digest in approval["bindings"].items():
+        need(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest)
+    need(
+        approval["bindings"][str(Path(__file__).relative_to(ROOT))]
+        == hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    )
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = canonical(value)
+        need(re.fullmatch(r"[a-z0-9_-]+", name) and written + len(raw) <= 1048576)
+        fd = os.open(OUTPUT / (name + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    save(
+        "started",
+        dict(
+            token=TOKEN,
+            approval_sha256=hashlib.sha256(PLAN.read_bytes()).hexdigest(),
+            timestamp=datetime.now(UTC).isoformat(),
+            retry_allowed=False,
+        ),
+    )
+    clients = {}
+    try:
+        import sft_vm_controller_credentials_v2 as credentials
+        from botocore.config import Config
+
+        value = json.loads(credentials.export_credentials())
+        expiry = datetime.fromisoformat(value["Expiration"].replace("Z", "+00:00"))
+        need((expiry - datetime.now(UTC)).total_seconds() > 810)
+        for service in ("sts", "ec2"):
+            clients[service] = credentials.session().create_client(
+                service,
+                region_name="us-east-1",
+                endpoint_url=credentials.endpoint(service),
+                verify=credentials.ca_path(),
+                config=Config(
+                    connect_timeout=3,
+                    read_timeout=5,
+                    retries={"total_max_attempts": 1},
+                    proxies={},
+                    ignore_configured_endpoint_urls=True,
+                ),
+                aws_access_key_id=value["AccessKeyId"],
+                aws_secret_access_key=value["SecretAccessKey"],
+                aws_session_token=value["SessionToken"],
+            )
+        value.clear()
+        result = Smoke(clients, save).run()
+        print(json.dumps(result))
+    except Exception:
+        save("entry-failed", dict(stage="credentials_or_entry", raw_error_retained=False))
+        print('{"status":"entry_failed_no_retry"}')
+    finally:
+        for client in clients.values():
+            client.close()
+
+
+if __name__ == "__main__":
+    main()

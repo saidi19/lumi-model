@@ -1,0 +1,67 @@
+"""Prepare the immutable fresh read-only control verifier; zero cloud calls."""
+
+import ast
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt021_controls_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "scripts/verify_sft_vm_attempt020_controls_v1.py"
+BASE_SHA = "16caaae3d4da5a80e7609a7760087b7372a4f900010049bfb45f9aa1faea08a7"
+PROOF = "evidence/lumi-vm-attempt-021-control-execution-verification-v0.1.json"
+PROOF_SHA = "b4abfe194c916911c13a4fc245db543cbffd28e1de8b25fbb2006b784bd59b73"
+OUTPUT = "scripts/verify_sft_vm_attempt021_controls_v1.py"
+need, sha, read = source.need, source.sha, source.read
+
+
+def candidate():
+    proof = json.loads(read(PROOF, PROOF_SHA))
+    need(proof["status"] == "both_control_deployments_succeeded_receipts_verified")
+    pins = dict(proof["source_bindings"])
+    pins[PROOF] = PROOF_SHA
+    pins[source.RELEASE + "/release.json"] = source.RELEASE_SHA
+    bindings = {}
+    for path, digest in pins.items():
+        raw = read(path, digest)
+        bindings[path] = len(raw), digest
+    raw = source.rewrite(read(BASE, BASE_SHA))
+    raw = raw.replace(
+        b"sft_vm_dedicated_cleanup_bucket_v11", b"sft_vm_dedicated_cleanup_bucket_v12"
+    )
+    assignments = {
+        "PLAN_SHA": "0eaa303701eeb464e7a65826b455e90efc398828c29999f5613fe56dcf2ab1e1",
+        "SOURCE_RELEASE_SHA": source.RELEASE_SHA,
+        "SOURCE_BINDINGS": bindings,
+    }
+    for name, value in assignments.items():
+        row = next(
+            node
+            for node in ast.parse(raw).body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == name
+        )
+        lines = raw.splitlines(keepends=True)
+        if name == "SOURCE_BINDINGS":
+            body = "SOURCE_BINDINGS = {\n"
+            for path, (size, digest) in bindings.items():
+                body += f"    {path!r}: (\n        {size},\n        {digest!r},\n    ),\n"
+            body += "}\n"
+        else:
+            body = f"{name} = {value!r}\n"
+        lines[row.lineno - 1 : row.end_lineno] = [body.encode()]
+        raw = b"".join(lines)
+    raw = raw.replace(
+        b'if __name__ == "__main__":\n    run()',
+        b'if __name__ == "__main__":\n'
+        b'    raise ValueError("bounded_readonly_entry_required") from None',
+    )
+    compile(raw, OUTPUT, "exec")
+    return raw
+
+
+if __name__ == "__main__":
+    raw = candidate()
+    source.write_new(OUTPUT, raw)
+    print(json.dumps(dict(output=OUTPUT, sha256=sha(raw), aws_calls=0), sort_keys=True))

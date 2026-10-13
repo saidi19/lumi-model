@@ -1,0 +1,80 @@
+"""VM-route group compatibility and unchanged coordinator regressions."""
+
+from __future__ import annotations
+
+import ast
+import importlib
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_checkpoint_import_runner_v3 as predecessor
+
+m = importlib.import_module(predecessor.PACKAGE + ".posttraining_checkpoint_import_runner_v4")
+
+
+class CoordinatorRegressionTests(predecessor.RunnerTests):
+    def setUp(self):
+        self.enterContext(patch.object(predecessor, "m", m))
+        super().setUp()
+
+
+class RuntimeTests(unittest.TestCase):
+    def runtime(self, *, groups=(), modules=None, uid=(10001, 10001, 10001)):
+        flags = types.SimpleNamespace(isolated=1, ignore_environment=1, no_user_site=1,
+                                      optimize=0)
+        runtime = types.SimpleNamespace(platform="linux", flags=flags, dont_write_bytecode=True,
+            implementation=types.SimpleNamespace(name="cpython"), version_info=(3, 12),
+            byteorder="little", modules={} if modules is None else modules)
+        operating = types.SimpleNamespace(uname=lambda: types.SimpleNamespace(machine="x86_64"),
+            getresuid=lambda: uid, getresgid=lambda: (10001, 10001, 10001),
+            getgroups=lambda: list(groups))
+        thread = object()
+        threads = types.SimpleNamespace(current_thread=lambda: thread, main_thread=lambda: thread,
+                                        active_count=lambda: 1)
+        with patch.object(m, "sys", runtime), patch.object(m, "os", operating), \
+                patch.object(m, "threading", threads):
+            m._runtime()
+
+    def test_primary_group_only_and_empty_groups_accepted(self):
+        for groups in ((), (10001,)):
+            self.runtime(groups=groups)
+
+    def test_unrelated_or_duplicate_groups_rejected(self):
+        for groups in ((0,), (10002,), (10001, 10002), (10001, 10001)):
+            with self.subTest(groups=groups), self.assertRaisesRegex(m.ImportRunnerError,
+                                                                     "^runtime_rejected$"):
+                self.runtime(groups=groups)
+
+    def test_wrong_uid_or_preloaded_ml_rejected(self):
+        with self.assertRaisesRegex(m.ImportRunnerError, "^runtime_rejected$"):
+            self.runtime(uid=(0, 0, 0))
+        for name in ("torch", "numpy.random", "transformers", "tokenizers", "jax", "cupy"):
+            with self.subTest(name=name), self.assertRaisesRegex(m.ImportRunnerError,
+                                                                 "^runtime_rejected$"):
+                self.runtime(modules={name: object()})
+
+    def test_only_group_rule_and_version_bindings_change_executable_core(self):
+        root = Path(__file__).resolve().parents[1] / "src/lumi"
+        old = (root / "posttraining_checkpoint_import_runner_v3.py").read_text()
+        new = (root / "posttraining_checkpoint_import_runner_v4.py").read_text()
+        expected = old.replace('runner.v0.3', 'runner.v0.4').replace('v0.5.json', 'v0.6.json')
+        expected = expected.replace('os.getgroups() == []', 'os.getgroups() in ([], [10001])')
+
+        class NoDocstrings(ast.NodeTransformer):
+            def strip(self, node):
+                self.generic_visit(node)
+                if (node.body and isinstance(node.body[0], ast.Expr)
+                        and isinstance(node.body[0].value, ast.Constant)
+                        and isinstance(node.body[0].value.value, str)):
+                    node.body.pop(0)
+                return node
+            visit_Module = visit_FunctionDef = visit_ClassDef = strip
+
+        self.assertEqual(ast.dump(NoDocstrings().visit(ast.parse(new))),
+                         ast.dump(NoDocstrings().visit(ast.parse(expected))))
+
+
+if __name__ == "__main__":
+    unittest.main()

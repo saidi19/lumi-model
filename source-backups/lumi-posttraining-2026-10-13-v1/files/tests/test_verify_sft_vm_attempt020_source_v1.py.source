@@ -1,0 +1,47 @@
+"""Offline tests for the attempt-020 source verifier."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt020_source_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_release_preserves_fail_closed_nonclaims(self):
+        result = m.verify()
+        self.assertEqual(result["nested_setup_members_verified"], 19)
+        self.assertTrue(result["nested_setup_stage_contract_verified"])
+        self.assertTrue(result["nested_setup_sender_binding_verified"])
+        self.assertTrue(result["predecessor_failure_preserved"])
+        self.assertFalse(result["execution_authority_created"])
+        self.assertFalse(result["real_4b_import"])
+        self.assertFalse(result["gate_5_complete"])
+        self.assertFalse(result["gpu"])
+
+    def test_release_hash_drift_rejected(self):
+        original = m.read
+
+        def changed(path, digest, size=None, maximum=64 * 1024**2):
+            if path == m.RELEASE / "release.json":
+                digest = "0" * 64
+            return original(path, digest, size, maximum)
+
+        with patch.object(m, "read", changed), self.assertRaises(ValueError):
+            m.verify()
+
+    def test_nested_archive_member_drift_rejected(self):
+        original = m.source.setup_members
+
+        def changed(raw):
+            members = original(raw)
+            if m.source.sha(raw) == m.source.sha((m.RELEASE / m.source.SETUP_TAR).read_bytes()):
+                name = sorted(members)[0]
+                members[name] += b"x"
+            return members
+
+        with patch.object(m.source, "setup_members", changed), self.assertRaises(ValueError):
+            m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,119 @@
+"""Prepare an inert successor: bounded visibility reads, strict ownership unchanged."""
+
+import hashlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "scripts/qualify_sft_vm_setup_production_v1.py"
+BASE_SHA = "917069181e296206ac97b55d4572a2b34d05900122327d989812d7dd066a9d12"
+OUTPUT = ROOT / "scripts/qualify_sft_vm_setup_production_v2.py"
+
+HELPERS = """
+def cloud_failure_code(error):
+    from botocore.exceptions import ClientError
+    if not isinstance(error, ClientError):
+        return "other"
+    code = error.response.get("Error", {}).get("Code")
+    return code if code in {
+        "InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed", "UnauthorizedOperation",
+        "AuthFailure", "RequestExpired", "Throttling", "RequestLimitExceeded",
+    } else "other"
+
+
+def visible_response(cloud, instance, *, cleanup=False):
+    from botocore.exceptions import ClientError
+    need(re.fullmatch(r"i-[0-9a-f]{17}", instance))
+    try:
+        return cloud.call("describe_instances", cleanup=cleanup, InstanceIds=[instance])
+    except ClientError as error:
+        if cloud_failure_code(error) != "InvalidInstanceID.NotFound":
+            raise
+        return None
+
+
+"""
+
+
+def build():
+    raw = BASE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("visibility_successor_base_rejected") from None
+    text = raw.decode()
+
+    def replace(old, new):
+        nonlocal text
+        if text.count(old) != 1:
+            raise ValueError("visibility_successor_anchor_rejected") from None
+        text = text.replace(old, new, 1)
+
+    replace(
+        "        value = getattr(client, operation)(**fields)",
+        "        self.last_operation, self.last_cloud_failure = operation, None\n"
+        "        try:\n"
+        "            value = getattr(client, operation)(**fields)\n"
+        "        except Exception as error:\n"
+        "            self.last_cloud_failure = cloud_failure_code(error)\n"
+        "            raise",
+    )
+    replace(
+        "def execute(cloud, seed, receiver, archive,",
+        HELPERS + "def execute(cloud, seed, receiver, archive,",
+    )
+    replace(
+        '            vm = owned(cloud.call("describe_instances", '
+        'InstanceIds=[instance]), instance)',
+        "            response = visible_response(cloud, instance)\n"
+        "            if response is None:\n"
+        "                sleep(min(20, max(0, 425 - (clock() - cloud.started))))\n"
+        "                continue\n"
+        "            vm = owned(response, instance)",
+    )
+    replace(
+        '                response = cloud.call("describe_instances", cleanup=True, **fields)',
+        "                for _ in range(6):\n"
+        "                    response = (visible_response(cloud, instance, cleanup=True)\n"
+        '                        if instance else cloud.call("describe_instances", '
+        'cleanup=True, **fields))\n'
+        "                    if response is not None:\n"
+        "                        break\n"
+        "                    sleep(3)\n"
+        "                need(response is not None)",
+    )
+    replace(
+        "                    response = cloud.call(\n"
+        '                        "describe_instances", cleanup=True, InstanceIds=[instance]\n'
+        "                    )",
+        "                    response = visible_response(cloud, instance, cleanup=True)\n"
+        "                    if response is None:\n"
+        "                        sleep(min(12, max(0, 820 - (clock() - cloud.started))))\n"
+        "                        continue",
+    )
+    replace(
+        "    except BaseException as error:\n"
+        "        if type(error) is seed.sender.SetupExchangeFailure:",
+        "    except BaseException as error:\n"
+        '        if getattr(cloud, "last_cloud_failure", None) is not None:\n'
+        '            report["cloud_failure_code"] = cloud.last_cloud_failure\n'
+        '            report["cloud_failure_operation"] = cloud.last_operation\n'
+        "        if type(error) is seed.sender.SetupExchangeFailure:",
+    )
+    replace(
+        '            except BaseException:\n                report["cleanup_unresolved"] = True',
+        "            except BaseException:\n"
+        '                if getattr(cloud, "last_cloud_failure", None) is not None:\n'
+        '                    report["cleanup_cloud_failure_code"] = cloud.last_cloud_failure\n'
+        '                    report["cleanup_cloud_failure_operation"] = cloud.last_operation\n'
+        '                report["cleanup_unresolved"] = True',
+    )
+    for old, new in (
+        ("lumi-setup-production-20261013-6c81e926", "lumi-setup-production-20261013-f8275a9c"),
+        ("lumi-setup-production-qualification-v0.1", "lumi-setup-production-qualification-v0.2"),
+        (
+            "lumi-setup-production-qualification-approval-v0.1",
+            "lumi-setup-production-qualification-approval-v0.2",
+        ),
+        ("lumi-setup-production-readiness-v0.1", "lumi-setup-production-readiness-v0.2"),
+    ):
+        text = text.replace(old, new)
+    compile(text, str(OUTPUT), "exec")
+    return text.encode()

@@ -1,0 +1,79 @@
+# SFT execution status v0.119
+
+2026-09-26. Local integration exposed defects that isolated component tests
+missed. The corrected controller and child-role candidates now pass **970 tests
+on each of CPython 3.11.15 and 3.13.7**: 46 new tests and 924 regressions, with
+zero failures, errors or skips. **Gate 5 is not complete.** These are synthetic
+tests, not proof that native Linux checkpoint import works.
+
+## Corrections completed in this successor
+
+- Authority v2 uses the topology's `S_IFMT(st_mode)` identity representation.
+  The new test reproduces authority v1's failure with realistic permission
+  bits, then passes through the actual corrected authority and topology.
+  Device/inode, ownership, FD flags and status flags remain checked.
+- The controller now services the actual parent reservation ledger before
+  READY and throughout the attempt. It reserves before ACK, never refunds an
+  ambiguous ACK, and attempts ARM once. Tests cover cross-channel report
+  ordering, terminal EOF, deadlines, duplicate frames and descriptor replacement.
+- Process v2 places only the worker in the workload leaf. Putting a blocking
+  broker there prevented guardian-v2 from observing an empty worker leaf.
+  Broker resource admission is still required before any real launch.
+- Child transitions now close unrelated inherited descriptors and require an
+  exact readback of the retained non-stdio set. Topology v1 by itself closes
+  only topology-owned endpoints; the earlier wording overstated exclusivity.
+- An inherited pidfd close attempt is consumed before the call. An ambiguous
+  failure is not retried through a possibly reused descriptor number.
+
+The old sources and records were not modified. Nineteen predecessor bound
+files, the v0.118 plan/evidence/status hashes, and twelve new-plan bindings
+were checked without mismatch. New Python files pass AST parsing, have no
+trailing whitespace and have maximum line length 88.
+
+## Important unresolved findings
+
+Process v1 can fork before pidfd binding has succeeded. No child start gate
+yet prevents setup during that interval. Its controller-first guardian
+termination also does not prove cleanup of guardian-owned descendants.
+Guardian-v2 consumes cleanup authority, while composition cleanup still needs
+an explicit handoff to avoid duplicate lease retirement.
+
+These lifecycle issues are **not fixed or native-qualified by this record**.
+The process-v2 private compositor now rejects before runtime checks, socket
+creation or fork. The public path also remains closed. No approval flag can
+open either entry. The controller's wire protocol has synthetic tests, but
+the broker/worker/guardian producers are not yet connected to it. A received
+digest or cleanup report is not independent artifact or process verification.
+
+## Remaining Gate-5 work, in order
+
+1. Complete one cohesive role/bootstrap/lifecycle integration: child start
+   admission, broker resource limits, guardian ARM and final-report production,
+   listener handoff, broker ledger transport, sealed worker entry,
+   ownership-aware cleanup, and full-size authenticated source closure.
+2. Run separately admitted Linux native qualification with synthetic fixtures,
+   including actual socket modes/order, fork/pidfd/waitid, descriptor exclusion,
+   cgroup completion, seccomp and failure cleanup. Mac tests do not substitute
+   for this. This phase does not require a training GPU.
+3. After unchanged admission succeeds, perform the bounded real checkpoint
+   import and independently verify its output. The pretrained S3 checkpoint
+   remains relevant; it was not accessed in this local work.
+
+These are three remaining work phases, not a claim that only three small
+tests or approvals remain. No reliable number of days is established yet.
+The earlier component-by-component approach delayed discovery of cross-module
+defects; buying a faster GPU would not correct those defects. Completion
+estimates should follow the first end-to-end Linux qualification result.
+
+## Records and execution boundary
+
+- Plan: `configs/lumi-4b-sft-write-controller-integration-recovery-v0.1.json`.
+- Evidence and exact regression manifest:
+  `evidence/lumi-4b-sft-write-controller-integration-recovery-verification-v0.1.json`.
+- New code: authority v2, controller v1 and process v2; two new test files.
+
+No real model/tokenizer/dataset access, network, GPU, inference, training,
+instance action, registry mutation, staging, commit or push occurred. Existing
+remote CI failures were not inspected and are not claimed resolved. All eight
+new files are local development artifacts. Prior untracked work remains in
+place; this is not a clean-worktree claim. Production eligibility stays false.

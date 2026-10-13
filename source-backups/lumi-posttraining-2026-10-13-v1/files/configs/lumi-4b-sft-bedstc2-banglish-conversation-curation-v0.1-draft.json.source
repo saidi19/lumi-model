@@ -1,0 +1,297 @@
+{
+  "authorization": {
+    "active_data_contract_change_authorized": false,
+    "candidate_mutation_authorized": false,
+    "dataset_seal_authorized": false,
+    "external_api_authorized": false,
+    "full_local_acquisition_and_curation_authorized": false,
+    "gpu_authorized": false,
+    "inference_authorized": false,
+    "instance_action_authorized": false,
+    "network_authorized": false,
+    "production_promotion_authorized": false,
+    "registry_change_authorized": false,
+    "remote_access_authorized": false,
+    "s3_action_authorized": false,
+    "sft_training_authorized": false,
+    "source_promotion_authorized": false
+  },
+  "bindings": {
+    "benchmark_registry": {
+      "path": "data/benchmark-signatures-v0.3.jsonl.gz",
+      "sha256": "1ffb5e938ab28c2fc876b9efd6c6ed59059f1e85aed2c396c024ae5925a4745e"
+    },
+    "candidate_mix_v0_15_plan": {
+      "path": "configs/lumi-4b-sft-candidate-mix-reaudit-v0.15.json",
+      "sha256": "7d37369d115b0c666d96d138508f7b31a442cc8c6d990470ec62cf47096282fb"
+    },
+    "candidate_mix_v0_15_report": {
+      "internal_sha256": "19fc82952653c7e1a022338fbe58bafeae25a6a88d63a2a3e3bc4154e5d99504",
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-v0.15.json",
+      "sha256": "fc81dc5827ebc1a039df7c7692b9f4ccd9144ad1ba1f2a32754ff6f6449d94bf"
+    },
+    "candidate_mix_v0_15_verification": {
+      "internal_sha256": "bf11960dee2f429d11c964ef2e3f8960062796bf950d27f8e55a88576f19b9da",
+      "path": "evidence/lumi-4b-sft-candidate-mix-reaudit-verification-v0.15.json",
+      "sha256": "1af422f2fbb5dcf21b2d4212891ab4d60c9c4cb63a797ac87acfa7598b9be782"
+    },
+    "chat_template": {
+      "path": "configs/lumi-4b-chat-template-v0.1.json",
+      "sha256": "bc7853a9277feddae2fd3db786c6a12f4fa3602a135a0408c38d4390f33bec12"
+    },
+    "data_contract": {
+      "path": "configs/lumi-4b-sft-data-contract-v0.1.json",
+      "sha256": "9a283d9333d29deb7b516fa45eb4eec50232be9925f4ee4aa3a8f624213b2f06"
+    },
+    "quality_config": {
+      "path": "configs/data-quality-v0.3.json",
+      "sha256": "23fba21dbc822c84a5d16e63147fc1a7716576b8f1258cda8c035391f04f52c0"
+    },
+    "source_registry_v0_21": {
+      "bytes": 28405,
+      "path": "configs/lumi-4b-sft-source-registry-v0.21.json",
+      "sha256": "daa2d81755456728c5c72bca9ee95d5424aba0fc05e9fdd13223018f4055e3a1",
+      "sources": 24
+    },
+    "tokenizer_json": {
+      "path": "../lumi-artifacts/4b-segment2-throughput-gate-v0.1/8bedfbc868e8/staging/input/tokenizer/tokenizer.json",
+      "sha256": "1022c9538d9ec795b07c2e2bda3c5c6f21c321de933cfe5ad197628a94caa2ee"
+    }
+  },
+  "candidate_mix_baseline": {
+    "included_candidate_sources": 17,
+    "input_records": 314716,
+    "input_train_supervised_tokens": 10604149,
+    "input_validation_supervised_tokens": 628604,
+    "remaining_behavior_safe_gaps": {
+      "language": {
+        "banglish": 772114,
+        "natural_code_switching": 365420
+      },
+      "strict_targeted_gap_lower_bound": 1137534,
+      "task": {
+        "conversation": 5934,
+        "factual_qa": 114306,
+        "tool_api": 2
+      }
+    }
+  },
+  "curation_contract": {
+    "accepted_credit": {
+      "language_mode": "banglish",
+      "skill_id": "conversation"
+    },
+    "assistant_response": "exact paired natural-language source response without model rewrite; independently required to pass the Romanized Bengali and English anchor gate",
+    "disallowed_floor_credit": [
+      "natural_code_switching",
+      "factual_qa",
+      "tool_api"
+    ],
+    "factual_entity_policy": "retain only when the preceding exact source dialogue or included API-result context grounds the response; otherwise reject",
+    "gates": [
+      "sft_schema",
+      "repository_apache_2_0_with_upstream_dstc2_rights_chain_blocker",
+      "truthful_mixed_provenance",
+      "secret",
+      "pii",
+      "benchmark_decontamination",
+      "tokenizer",
+      "chat_template",
+      "assistant_only_masking",
+      "4096_token_fit_without_truncation",
+      "roman_script_bengali_english_dual_language_anchor",
+      "punctuation",
+      "factual_grounding",
+      "safety",
+      "exact_duplicate",
+      "train_validation_overlap",
+      "five_token_shingle_minhash_128_permutations_threshold_0_9",
+      "task_floor",
+      "language_floor",
+      "source_family_cap"
+    ],
+    "provenance_claim": "human_in_house_annotated_source_derived_bengali_code_mixed_surface_wording_with_underlying_dstc2_authorship_and_origin_not_established",
+    "rejection_reasons": [
+      "silence_prompt",
+      "missing_or_unknown_response",
+      "kb_only_record",
+      "api_call_only_assistant_response",
+      "ungrounded_entity_or_factual_response",
+      "generated_metadata",
+      "assistant_not_roman_script_bengali_english_code_mixed"
+    ],
+    "user_prompt": "deterministic exact source dialogue prefix through the current user turn; the current user turn is independently required to pass the Romanized Bengali and English anchor gate"
+  },
+  "acquisition_integrity": {
+    "before_curation": [
+      "resolve_only_the_exact_repository_revision_and_five_authorized_paths",
+      "require_exact_path_and_byte_size_for_every_object",
+      "recompute_git_blob_sha1_as_sha1_of_blob_space_decimal_byte_length_nul_payload",
+      "require_recomputed_git_blob_sha1_to_match_the_bound_object",
+      "compute_and_record_sha256_of_each_exact_payload",
+      "fail_closed_before_any_source_parse_on_any_mismatch"
+    ],
+    "download_once_without_git_clone": true,
+    "local_sha256_receipts_required": true
+  },
+  "evaluation_prohibition": {
+    "claimed_be_dstc2_dev_evaluation_permanently_prohibited_after_candidate_construction": true,
+    "claimed_be_dstc2_test_evaluation_permanently_prohibited_after_candidate_construction": true,
+    "excluded_object": {
+      "bytes": 2283372,
+      "git_blob_sha1": "85a9a4a43f3d1a9c54772c84d4a43872c9589ae6",
+      "path": "data/bengali/dialog-dstc2-tst.txt"
+    },
+    "test_object_access_authorized": false
+  },
+  "limits": {
+    "maximum_all_candidate_audit_row_reads": 669432,
+    "maximum_existing_candidate_row_reads": 629432,
+    "maximum_full_passes": 2,
+    "maximum_gpu_use": 0,
+    "maximum_inference_calls": 0,
+    "maximum_input_dialogues": 1668,
+    "maximum_network_payload_bytes": 8388608,
+    "maximum_new_candidate_row_reads": 40000,
+    "maximum_private_write_bytes": 134217728,
+    "maximum_retained_records": 20000,
+    "maximum_runtime_minutes": 60,
+    "maximum_source_line_reads": 400000,
+    "maximum_validation_supervised_tokens": 20000,
+    "minimum_train_supervised_tokens": 60000,
+    "maximum_train_supervised_tokens": 200000,
+    "owner_review_minimum_accepts": 29,
+    "owner_review_rows": 32
+  },
+  "outputs": {
+    "exact_paths": {
+      "acquisition_receipt": "evidence/lumi-4b-sft-bedstc2-acquisition-receipt-v0.1.json",
+      "candidate": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/bedstc2-banglish-conversation-candidate.jsonl",
+      "implementation": "src/lumi/posttraining_bedstc2_banglish_conversation_curation_v1.py",
+      "owner_review_html": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/owner-review-32.html",
+      "owner_review_packet": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/owner-review-32.json",
+      "plan": "configs/lumi-4b-sft-bedstc2-banglish-conversation-curation-v0.1.json",
+      "raw_license": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/raw/LICENSE",
+      "raw_readme": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/raw/README.md",
+      "raw_train": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/raw/data/bengali/dialog-dstc2-trn.txt",
+      "raw_validation": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/raw/data/bengali/dialog-dstc2-dev.txt",
+      "raw_vocab_splits": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/raw/data/bengali/vocab_splits.json",
+      "rejection_ledger": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/rejection-ledger.jsonl",
+      "report": "evidence/lumi-4b-sft-bedstc2-banglish-conversation-curation-v0.1.json",
+      "runner": "scripts/curate_sft_bedstc2_banglish_conversation_v1.py",
+      "telemetry": "artifacts/lumi-sft-bedstc2-banglish-conversation-v0.1/attempt-001/private/telemetry.jsonl",
+      "test": "tests/test_bedstc2_banglish_conversation_curation_v1.py",
+      "verification": "evidence/lumi-4b-sft-bedstc2-banglish-conversation-curation-verification-v0.1.json",
+      "verifier": "scripts/verify_sft_bedstc2_banglish_conversation_v1.py"
+    },
+    "exact_path_inventory_required": true,
+    "other_writes_authorized": false,
+    "production_eligible": false,
+    "production_blockers": [
+      "upstream_dstc2_rights_chain_not_independently_verified",
+      "owner_quality_review_not_complete",
+      "source_promotion_and_full_cross_source_reaudit_not_authorized",
+      "production_dataset_seal_and_sft_authorization_not_complete"
+    ],
+    "promotion_authorized": false
+  },
+  "owner_review_contract": {
+    "decision_download_filename": "lumi-owner-review-decisions-v0.3.json",
+    "decision_schema_version": "lumi.ai-assisted-owner-decisions.v0.3",
+    "html_must_bind_exact_packet_file_and_semantic_hashes": true,
+    "minimum_accepts": 29,
+    "packet_file_sha256_domain": "sha256_of_pretty_utf8_json_file_bytes_with_trailing_newline",
+    "packet_hash_domains_must_not_be_equated": true,
+    "packet_rows": 32,
+    "packet_semantic_sha256_domain": "sha256_of_canonical_utf8_json_ensure_ascii_false_sorted_keys_compact",
+    "report_validator_requires_exact_output_inventory_bytes_file_hashes_semantic_packet_hash_and_frozen_gate_results": true,
+    "verifier_preflight_must_validate_report_artifacts_packet_and_html_before_the_independent_second_pass": true
+  },
+  "provenance_evidence": {
+    "acl_anthology_id": "C18-1319",
+    "paper_page_url": "https://aclanthology.org/C18-1319/",
+    "paper_pdf_url": "https://aclanthology.org/C18-1319.pdf",
+    "repository_license_url": "https://github.com/sumanbanerjee1/Code-Mixed-Dialog/blob/9df1d4dc800548a883f8bc1a9ce4116c77aebc02/LICENSE",
+    "repository_tree_url": "https://github.com/sumanbanerjee1/Code-Mixed-Dialog/tree/9df1d4dc800548a883f8bc1a9ce4116c77aebc02"
+  },
+  "raw_text_boundary": {
+    "allowed": [
+      "exact_private_source_objects",
+      "private_canonical_candidate",
+      "private_owner_review_packet",
+      "private_owner_review_html"
+    ],
+    "forbidden": [
+      "plan",
+      "acquisition_receipt",
+      "telemetry",
+      "rejection_ledger",
+      "report",
+      "verification",
+      "logs",
+      "tests"
+    ]
+  },
+  "schema_version": "lumi.sft-bedstc2-banglish-conversation-curation-plan.v0.1-draft",
+  "source": {
+    "dataset_id": "sumanbanerjee1/Code-Mixed-Dialog",
+    "license_id": "apache-2.0",
+    "objects": [
+      {
+        "bytes": 11357,
+        "git_blob_sha1": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64",
+        "path": "LICENSE"
+      },
+      {
+        "bytes": 5978,
+        "git_blob_sha1": "ef54e017c4bf440b89cf3644a76acef22cdf3981",
+        "path": "README.md"
+      },
+      {
+        "bytes": 4085040,
+        "git_blob_sha1": "4683420d14bf546c31e7698ce9ecd799ba0f88d3",
+        "path": "data/bengali/dialog-dstc2-trn.txt"
+      },
+      {
+        "bytes": 1361043,
+        "git_blob_sha1": "543eb0aa02d9ec7f1af65516017a1bfcace1f636",
+        "path": "data/bengali/dialog-dstc2-dev.txt"
+      },
+      {
+        "bytes": 19767,
+        "git_blob_sha1": "39bba927098a8792ff3b4f611bf35362eb0b8e4f",
+        "path": "data/bengali/vocab_splits.json"
+      }
+    ],
+    "origin": "mixed",
+    "repository_url": "https://github.com/sumanbanerjee1/Code-Mixed-Dialog",
+    "revision": "9df1d4dc800548a883f8bc1a9ce4116c77aebc02",
+    "source_inventory": {
+      "dev_dialogues": 500,
+      "total_dialogues": 1668,
+      "train_dialogues": 1168
+    },
+    "total_payload_bytes": 5483185,
+    "upstream_rights_status": "repository_apache_2_0_observed_but_dstc2_derivative_rights_chain_not_independently_verified_nonproduction_blocker"
+  },
+  "split_contract": {
+    "group_key": "deterministic_dialogue_identity_sha256",
+    "input_objects": [
+      "data/bengali/dialog-dstc2-trn.txt",
+      "data/bengali/dialog-dstc2-dev.txt"
+    ],
+    "name": "combined_train_dev_dialogue_identity_95_train_5_validation.v0.1",
+    "train_percent": 95,
+    "validation_percent": 5
+  },
+  "status": "draft_requires_exact_owner_authorization_and_local_sha256_receipts",
+  "unresolved_execution_bindings": [
+    "exact_owner_authorization_text_and_sha256",
+    "downloaded_object_sha256_receipts",
+    "implementation_sha256",
+    "runner_sha256",
+    "verifier_sha256",
+    "test_sha256",
+    "exact_retained_candidate_hash_counts_and_token_totals"
+  ]
+}

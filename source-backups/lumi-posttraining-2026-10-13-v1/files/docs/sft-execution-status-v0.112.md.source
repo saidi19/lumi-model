@@ -1,0 +1,95 @@
+# SFT execution status v0.112
+
+2026-09-24. The import-inert listener-adapter and independent guardian
+candidates are implemented, hardened and locally verified. **This is not an
+integrated native write guard; Gate 5 remains incomplete.** No checkpoint,
+tokenizer or dataset payload was read. No native filter/listener/ioctl, pidfd,
+cgroup, release socket, worker, remote mutation, GPU operation, inference or
+training occurred. The seven successor files remain local and unpushed.
+
+## Completed
+
+- The private listener candidate fixes the Linux v6.8 x86_64 notification ABI,
+  reads back candidate kernel sizes/action support, sets and reads back
+  no-new-privileges, installs only the frozen listener program, requires one
+  exact transfer callback acknowledgement, verifies descriptor stability and
+  closes its local copy. The final seal is a distinct same-owner one-shot after
+  that handshake. Public installation remains unconditionally closed.
+- The private supervisor candidate owns one adopted CLOEXEC listener descriptor
+  and enforces one receive, one ID-validity check and one exact CONTINUE response
+  per outstanding notification. All ambiguous or malformed operations consume
+  it terminally without retry. Native SCM_RIGHTS receipt/origin and the target
+  ABI are not established by these local tests.
+- Notification receive may block, so the design now requires a separately
+  killable broker process. It cannot share the guardian's failure domain or rely
+  on a cancellable thread.
+- The guardian binds the frozen cgroup lease, parent pidfd, an owned duplicate of
+  the borrowed broker pidfd and a root-owned CLOEXEC O_RDWR local seqpacket
+  release descriptor. The fixed release byte uses per-call nonblocking and
+  no-SIGPIPE flags. Pidfd readiness catches exited zombies even if signal zero
+  still succeeds.
+- After binding, terminal priority is fixed as parent loss, deadline, broker
+  loss and then workload empty. Every admitted terminal path retires the owned
+  cgroup and makes one generation-stable broker-stop attempt. Reports retain
+  only aggregate state and explicitly keep all unproved origin, receipt, reap,
+  exclusivity, containment and native-enforcement claims false.
+
+## Verification
+
+**697 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 37 listener tests, 52 guardian tests and 608 prior regressions.
+All native boundaries in the 89 new tests are synthetic.
+
+An independent review found no concrete blocker in the local candidate. It
+confirmed the seqpacket send flags, signal sanitation, borrowed-versus-owned
+pidfd handling, zero-time readiness checks and cleanup/report semantics. The
+review also confirmed that broker origin/receipt/reap, release-channel origin and
+exclusivity, release consumption, release/liveness atomicity, guardian-death
+containment and native enforcement remain unproved.
+
+Syntax/AST checks pass on both runtimes; maximum line length is 100 and trailing
+whitespace is zero. Ruff was unavailable and no replacement was downloaded.
+All 61 earlier bound files, 78 qualified native source rows and 39 worker source
+rows matched their recorded hashes. Earlier evidence and resource envelopes are
+unchanged; tracked and staged diffs are empty.
+
+Five public Linux v6.8 references were read to check the candidate ABI. There
+were no project/runtime network operations or remote mutations. The kernel
+documentation describes USER_NOTIF listener transfer as an intended supervisor
+pattern and warns that receiving a notification can wait; this supports the
+separate broker-process boundary but does not qualify the target host:
+
+- <https://www.kernel.org/doc/html/v6.8/userspace-api/seccomp_filter.html>
+- <https://raw.githubusercontent.com/torvalds/linux/v6.8/include/uapi/linux/seccomp.h>
+- <https://raw.githubusercontent.com/torvalds/linux/v6.8/kernel/seccomp.c>
+- <https://raw.githubusercontent.com/torvalds/linux/v6.8/arch/x86/entry/syscalls/syscall_64.tbl>
+- <https://raw.githubusercontent.com/torvalds/linux/v6.8/include/uapi/asm-generic/ioctl.h>
+
+Development record:
+`configs/lumi-4b-sft-write-listener-guardian-development-v0.1.json`.
+
+SHA-256: `091e3845f604004a72f13d28e8ae4cc69e668cb9b7a91596f6fdc8e1e0608d3f`.
+
+Verification:
+`evidence/lumi-4b-sft-write-listener-guardian-development-verification-v0.1.json`.
+
+SHA-256: `9595c24be51385b2d19169a63e161a3b0b07a8005885562fefff66d49f9b668e`.
+
+## Exact next work and unchanged boundary
+
+The next successor must implement the exact SCM_RIGHTS bootstrap transport and
+dedicated broker child, connect the adopted listener to the frozen scalar broker
+loop, and prove the sealed READY/release channel's origin, peer exclusivity,
+one-byte consumption and lifecycle order. The parent must obtain and own
+aggregate receipt/reap evidence while every receive, ID-validation, response or
+transport failure remains inside the guardian's retirement boundary.
+
+After that comes integration into the frozen bootstrap/dispatcher/lifecycle,
+successor source-closure authentication, and a separately authorized bounded
+Linux native qualification. Only a passing native qualification can return to
+the unchanged host, input, resource and real-import admission gates. These are
+remaining parts of Gate 5, not new roadmap gates.
+
+GPU is not needed for the next local integration work. The S3-backed pretrained
+checkpoint remains the intended base, but no current remote availability check
+was made. Real import, training and production remain disabled.

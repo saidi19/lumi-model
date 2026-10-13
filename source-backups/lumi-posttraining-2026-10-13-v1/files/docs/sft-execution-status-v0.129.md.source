@@ -1,0 +1,69 @@
+# SFT execution status v0.129: concrete output-parent mismatch reproduced and fixed locally
+
+2026-09-28. **280 local tests passed; zero failures, errors or skips. Ruff
+passed.** A deterministic native-layout incompatibility is reproduced in the
+frozen coordinator's actual validator and coordinator control flow. The v3
+entry corrects the layout without relaxing the path gate. No AWS action,
+native retry, GPU, real checkpoint access, inference or training occurred.
+
+## Concrete defect
+
+The v1/v2 entry selects `/work/import-attempt`. Inside the coordinator,
+`parent = attempt.parent` is `/work`, followed by `_path(parent)`. The frozen
+validator requires at least three Path.parts; `/work` has only two. It thus
+raises `path_rejected` before creating the attempt directory. Prior local
+integration substituted a longer temporary path, inadvertently hiding the
+native-depth mismatch.
+
+A regression calls the unchanged validator on exactly `/work` and proves
+rejection before filesystem inspection. Another calls the actual coordinator
+with generated controls and the old native output path, substituting only
+host runtime/other namespace observations, and observes `path_rejected`
+before mkdir. This establishes a real defect in the dispatched layout; the
+previous native exit 47 did not preserve the internal rejection code, so it
+does not retrospectively prove that this was its first failing check or its
+only issue. No such stronger claim is made.
+
+## Narrow correction
+
+The new fixed v3 entry uses `/work/imports/attempt`. After all controls are
+validated and the entry is marked consumed, it exclusively creates the parent
+`/work/imports` with mode 0700. Existing parents are rejected, not reused.
+The pre-creation writable-filesystem probe uses the existing `/work` root,
+not the not-yet-created parent. The coordinator still creates the actual
+attempt and applies its original depth, ownership, permissions, symlink and
+overlap checks. All original admission, resource and accounting gates remain.
+The extra parent directory is within the existing bounded tmpfs; no cumulative
+native write quota is claimed.
+
+V3 supervisor/launcher/source-builder differ from v2 only in versioned file,
+release-root and unit-name bindings, checked by exact textual normalization.
+Parser/control helper function ASTs match v2. The generated fixture and frozen
+coordinator/kernel/loader/package sources were not changed. Diagnostic fixed
+exit-code transport remains in place. Source bundle v0.4 and staging v3 are
+prepared but were not uploaded or run.
+
+## Evidence and limitations
+
+- 16 new regression tests plus 264 prior tests passed in 5.928 seconds.
+- Actual tiny generated conversion, two input audits, packaging and independent
+  checksum verification passed with local host observations substituted.
+- New regressions cover exact old path rejection, coordinator rejection before
+  writes, correct new private parent, rejection of reused parents/no retry,
+  invalid controls creating no parent and correct pre-creation filesystem probe.
+- Parent audit hook recorded zero network/real-artifact violations. It is not
+  OS isolation and is not claimed to propagate into child interpreters.
+- Ruff passed for all six new Python files. All 49 source hashes in the new
+  51-member archive match the workspace; all ten previous prepared bindings
+  remain unchanged. Previous failed attempts are preserved.
+
+Archive v0.4 SHA-256:
+`dbae54038d86d712bf14e4ebb50a6ff3fd83c17a42c5e75659c2f280a1465bca`.
+Manifest SHA-256:
+`66b35b30f3d8d98ca9f241794fed2f52e8479a918704be14792edaf6583550fa`.
+49 source files / 816,390 bytes; compressed archive 181,868 bytes.
+
+Gate 5 remains incomplete; real 4B import and full-size host admission remain
+false. Next is a separately authorized fresh bounded native check of this
+exact correction, not another diagnostic-only rerun or reuse of a consumed
+attempt. No commit/push or cloud resources were created in this step.

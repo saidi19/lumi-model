@@ -1,0 +1,253 @@
+"""Tiny synthetic strict-read tests; no ML or actual checkpoint inputs."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_audit_v1 as module
+
+
+class StrictAuditTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name).resolve()
+        self.root = self.parent / "input"
+        self.root.mkdir(mode=0o700)
+        (self.root / "model").mkdir(mode=0o700)
+        self.inventory = []
+        for name, raw in (("model/weights", b"0123456789"), ("trainer", b"opaque trainer")):
+            path = self.root / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            self.inventory.append({"path": name, "bytes": len(raw),
+                                   "sha256": hashlib.sha256(raw).hexdigest()})
+        self.total = sum(row["bytes"] for row in self.inventory)
+        self.options = {"maximum_read_bytes": self.total, "maximum_files": 2,
+                        "maximum_seconds": 5, "chunk_bytes": 4, "require_private": True,
+                        "check_budget": lambda: None}
+
+    def audit(self, **changes):
+        return module.verify_inventory(self.root, self.inventory, **{**self.options, **changes})
+
+    def test_full_read_request_counters_are_exact(self):
+        original = module.os.read
+        requests = []
+        def read(fd, size):
+            requests.append(size)
+            return original(fd, size)
+        with patch.object(module.os, "read", read):
+            result = self.audit()
+        self.assertEqual(sum(requests), self.total)
+        self.assertEqual(result["logical_read_bytes_requested"], self.total)
+        self.assertEqual(result["bytes_hashed"], self.total)
+        self.assertEqual(result["read_chunks"], len(requests))
+        self.assertTrue(all(0 < amount <= 4 for amount in requests))
+        self.assertTrue(result["short_reads_are_terminal"])
+        self.assertFalse(result["reservations_refunded"])
+        self.assertFalse(result["os_resource_limits_enforced"])
+
+    def test_empty_file_hash_needs_no_content_or_eof_read(self):
+        root = self.parent / "empty-checkpoint"
+        root.mkdir(mode=0o700)
+        (root / "empty").touch(mode=0o600)
+        rows = [{"path": "empty", "bytes": 0, "sha256": hashlib.sha256(b"").hexdigest()}]
+        with patch.object(module.os, "read", side_effect=AssertionError("read forbidden")):
+            result = module.verify_inventory(
+                root, rows, maximum_read_bytes=0, maximum_files=1, maximum_seconds=5,
+                check_budget=lambda: None,
+            )
+        self.assertEqual(result["files_verified"], 1)
+        self.assertEqual(result["logical_read_bytes_requested"], 0)
+        self.assertEqual(result["read_chunks"], 0)
+
+    def _failed_read(self, behavior, code):
+        holders, requests = [], []
+        initialize = module._StrictVerifier.__init__
+        original = module.os.read
+        def initialized(verifier, *args, **kwargs):
+            initialize(verifier, *args, **kwargs)
+            holders.append(verifier)
+        def read(fd, size):
+            requests.append(size)
+            self.assertEqual(holders[0].read_bytes, sum(requests))
+            if behavior == "short":
+                return original(fd, size - 1)
+            if behavior == "eof":
+                return b""
+            if behavior == "type":
+                return bytearray(size)
+            raise OSError("PRIVATE TEXT")
+        with patch.object(module._StrictVerifier, "__init__", initialized), \
+             patch.object(module.os, "read", read):
+            with self.assertRaisesRegex(module.CheckpointAuditError, code) as caught:
+                self.audit()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertEqual(requests, [4])
+        self.assertEqual(holders[0].read_bytes, 4)
+        self.assertEqual(holders[0].chunks, 1)
+        self.assertEqual(holders[0].owned, [])
+
+    def test_short_successful_read_is_terminal_and_not_refunded(self):
+        self._failed_read("short", "short_read")
+
+    def test_eof_is_terminal_and_not_refunded(self):
+        self._failed_read("eof", "short_read")
+
+    def test_read_exception_is_terminal_and_not_refunded(self):
+        self._failed_read("error", "read_failed")
+
+    def test_nonbytes_result_is_terminal_and_not_refunded(self):
+        self._failed_read("type", "short_read")
+
+    def test_inherited_permissive_content_helper_is_not_called(self):
+        with patch.object(module.stream._Verifier, "file", side_effect=AssertionError("forbidden")):
+            self.assertEqual(self.audit()["bytes_hashed"], self.total)
+
+    def test_short_later_read_cannot_continue_to_remainder_or_next_file(self):
+        original = module.os.read
+        requests = []
+        def read(fd, size):
+            requests.append(size)
+            return original(fd, size if len(requests) == 1 else size - 1)
+        with patch.object(module.os, "read", read):
+            with self.assertRaisesRegex(module.CheckpointAuditError, "short_read"):
+                self.audit()
+        self.assertEqual(requests, [4, 4])
+
+    def test_read_budget_rejects_before_open(self):
+        with patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.CheckpointAuditError, "bounds_exhausted"):
+                self.audit(maximum_read_bytes=self.total - 1)
+            opened.assert_not_called()
+
+    def test_chunk_cap_rejects_before_open(self):
+        with patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.CheckpointAuditError, "invalid_plan"):
+                self.audit(chunk_bytes=1048577)
+            opened.assert_not_called()
+
+    def test_callback_non_none_rejects_before_open(self):
+        with patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.CheckpointAuditError, "budget_check_failed"):
+                self.audit(check_budget=lambda: True)
+            opened.assert_not_called()
+
+    def test_callback_none_argument_is_rejected(self):
+        with self.assertRaisesRegex(module.CheckpointAuditError, "invalid_plan"):
+            self.audit(check_budget=None)
+
+    def test_callback_failure_after_request_blocks_next_read_and_closes(self):
+        holders, requests = [], []
+        initialize, original = module._StrictVerifier.__init__, module.os.read
+        def initialized(verifier, *args, **kwargs):
+            initialize(verifier, *args, **kwargs)
+            holders.append(verifier)
+        def read(fd, size):
+            requests.append(size)
+            return original(fd, size)
+        def budget():
+            if requests:
+                raise RuntimeError("PRIVATE TEXT")
+        with patch.object(module._StrictVerifier, "__init__", initialized), \
+             patch.object(module.os, "read", read):
+            with self.assertRaisesRegex(module.CheckpointAuditError, "budget_check_failed"):
+                self.audit(check_budget=budget)
+        self.assertEqual(requests, [4])
+        self.assertEqual(holders[0].read_bytes, 4)
+        self.assertEqual(holders[0].owned, [])
+
+    def test_close_failure_is_terminal_and_all_descriptors_are_closed_once(self):
+        opened, closed = [], []
+        original_open, original_close = module.os.open, module.os.close
+        def opening(*args, **kwargs):
+            fd = original_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+        def closing(fd):
+            closed.append(fd)
+            original_close(fd)
+            if len(closed) == 1:
+                raise OSError("PRIVATE TEXT")
+        with patch.object(module.os, "open", opening), patch.object(module.os, "close", closing):
+            with self.assertRaisesRegex(module.CheckpointAuditError, "close_failed"):
+                self.audit()
+        self.assertEqual(sorted(opened), sorted(closed))
+
+    def test_post_close_callback_failure_does_not_publish_success(self):
+        holders = []
+        initialize = module._StrictVerifier.__init__
+        def initialized(verifier, *args, **kwargs):
+            initialize(verifier, *args, **kwargs)
+            holders.append(verifier)
+        def budget():
+            if holders and holders[0].files and not holders[0].owned:
+                raise RuntimeError("PRIVATE TEXT")
+        with patch.object(module._StrictVerifier, "__init__", initialized):
+            with self.assertRaisesRegex(module.CheckpointAuditError, "budget_check_failed"):
+                self.audit(check_budget=budget)
+
+    def test_hash_mismatch_preserves_frozen_validation(self):
+        self.inventory[0]["sha256"] = "0" * 64
+        with self.assertRaisesRegex(module.CheckpointAuditError, "hash_mismatch"):
+            self.audit()
+
+    def test_extra_empty_directory_is_rejected(self):
+        (self.root / "extra").mkdir(mode=0o700)
+        with self.assertRaisesRegex(module.CheckpointAuditError, "inventory_mismatch"):
+            self.audit()
+
+    def test_symlink_ancestor_is_rejected(self):
+        alias = self.parent / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(module.CheckpointAuditError):
+            module.verify_inventory(alias, self.inventory, **self.options)
+
+    def test_0400_source_remains_allowed_without_chmod(self):
+        (self.root / "model/weights").chmod(0o400)
+        self.assertEqual(self.audit()["bytes_hashed"], self.total)
+        self.assertEqual((self.root / "model/weights").stat().st_mode & 0o777, 0o400)
+
+    def test_mode_relaxation_does_not_relax_owner_or_regular_file(self):
+        (self.root / "model/weights").chmod(0o644)
+        with self.assertRaisesRegex(module.CheckpointAuditError, "metadata_rejected"):
+            self.audit()
+        self.assertEqual(self.audit(require_private=False)["bytes_hashed"], self.total)
+
+    def test_foreign_gid_is_rejected(self):
+        original = module.os.stat
+        def observed(*args, **kwargs):
+            info = original(*args, **kwargs)
+            if args[0] == "weights":
+                return types.SimpleNamespace(
+                    st_mode=info.st_mode, st_uid=info.st_uid, st_gid=info.st_gid + 1,
+                    st_ino=info.st_ino, st_nlink=info.st_nlink)
+            return info
+        with patch.object(module.os, "stat", observed):
+            with self.assertRaisesRegex(module.CheckpointAuditError, "metadata_rejected"):
+                self.audit(require_private=False)
+
+    def test_hardlink_is_rejected(self):
+        os.link(self.root / "model/weights", self.parent / "alias")
+        with self.assertRaisesRegex(module.CheckpointAuditError, "metadata_rejected"):
+            self.audit()
+
+    def test_mutation_between_walks_is_rejected(self):
+        original = module._StrictVerifier.check_ancestry
+        def ancestry(verifier):
+            if verifier.files:
+                (self.root / "model/weights").write_bytes(b"ABCDEFGHIJ")
+            return original(verifier)
+        with patch.object(module._StrictVerifier, "check_ancestry", ancestry):
+            with self.assertRaisesRegex(module.CheckpointAuditError, "identity_changed"):
+                self.audit()
+
+
+if __name__ == "__main__":
+    unittest.main()

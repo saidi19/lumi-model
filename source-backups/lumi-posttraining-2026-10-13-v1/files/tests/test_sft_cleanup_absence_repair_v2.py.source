@@ -1,0 +1,179 @@
+"""Synthetic kernel sequences plus data-free local full-transport checks."""
+
+import ast
+import json
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_cleanup_absence_repair_v2 as m
+
+
+class Failure(Exception):
+    pass
+
+
+def cleanup_code(source):
+    fn = next(n for n in ast.parse(source).body if getattr(n, "name", None) == "pipe_exchange")
+    body = next(n.finalbody for n in fn.body if isinstance(n, ast.Try) and n.finalbody)
+    return compile(ast.Module(body=body, type_ignores=[]), "<cleanup-test>", "exec")
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = m.build()
+        cls.code = cleanup_code(cls.source)
+
+    def execute(self, outcomes, *, code=None, kind="zero", returncode=0,
+                failure=None, sleep_jump=None, interrupt_sleep=False):
+        process, kernel, clock = Mock(), Mock(), Mock()
+        process.pid, process.returncode = 12345, returncode
+        kernel.killpg.side_effect = outcomes
+        now = [0.0]
+        clock.monotonic.side_effect = lambda: now[0]
+
+        def sleep(seconds):
+            if interrupt_sleep:
+                raise KeyboardInterrupt()
+            now[0] += seconds if sleep_jump is None else sleep_jump
+
+        clock.sleep.side_effect = sleep
+        if failure:
+            target = {"wait": process.wait, "stdin": process.stdin.close,
+                      "stdout": process.stdout.close}[failure]
+            target.side_effect = OSError(5, "synthetic")
+        ns = dict(process=process, os=kernel, signal=signal, time=clock,
+                  exit_kind=kind, remote_stage="none", ExchangeFailure=Failure)
+        try:
+            exec(self.code if code is None else code, ns)
+            result = None
+        except Failure as error:
+            result = error.args[0]
+        process.wait.assert_called_once()
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
+        self.assertEqual(kernel.killpg.call_args_list[0].args, (12345, signal.SIGKILL))
+        self.assertTrue(all(c.args == (12345, 0) for c in kernel.killpg.call_args_list[1:]))
+        return result, kernel, clock, process
+
+    def test_regression_old_fails_new_accepts_delayed_absence(self):
+        def outcomes():
+            return [PermissionError(1, "denied"), PermissionError(1, "settling"),
+                    ProcessLookupError(3, "gone")]
+        old, *_ = self.execute(outcomes(), code=cleanup_code(m.prior.build()))
+        new, kernel, clock, process = self.execute(outcomes())
+        self.assertEqual(old, "cleanup_kill_permission")
+        self.assertIsNone(new)
+        self.assertEqual(kernel.killpg.call_count, 3)
+        clock.sleep.assert_called_once_with(0.01)
+        self.assertAlmostEqual(process.wait.call_args.kwargs["timeout"], 1.99)
+
+    def test_immediate_absence_no_sleep(self):
+        result, _, clock, _ = self.execute([PermissionError(1, "x"), ProcessLookupError(3, "x")])
+        self.assertIsNone(result)
+        clock.sleep.assert_not_called()
+
+    def test_live_and_denied_stay_failed_at_count_bound(self):
+        for state in (None, PermissionError(1, "x")):
+            with self.subTest(state=type(state).__name__):
+                result, kernel, clock, process = self.execute(
+                    [PermissionError(1, "x")] + [state]*20)
+                self.assertEqual(result, "cleanup_kill_permission")
+                self.assertEqual(kernel.killpg.call_count, 21)
+                self.assertEqual(clock.sleep.call_count, 19)
+                self.assertAlmostEqual(process.wait.call_args.kwargs["timeout"], 1.81)
+
+    def test_oversleep_cannot_extend_wait_budget(self):
+        result, kernel, _, process = self.execute(
+            [PermissionError(1, "x"), None], sleep_jump=3)
+        self.assertEqual(result, "cleanup_kill_permission")
+        self.assertEqual(kernel.killpg.call_count, 2)
+        process.wait.assert_called_once_with(timeout=0)
+
+    def test_interrupted_observation_stays_failed_and_closes_pipes(self):
+        result, kernel, _, _ = self.execute(
+            [PermissionError(1, "x"), None], interrupt_sleep=True)
+        self.assertEqual(result, "cleanup_kill_permission")
+        self.assertEqual(kernel.killpg.call_count, 2)
+
+    def test_unknown_kernel_errors_fail_without_polling(self):
+        for error in (PermissionError(13, "x"), ProcessLookupError(99, "x"),
+                      OSError(5, "x"), RuntimeError(), KeyboardInterrupt()):
+            with self.subTest(error=type(error).__name__):
+                result, kernel, clock, _ = self.execute([PermissionError(1, "x"), error])
+                self.assertEqual(result, "cleanup_kill_permission")
+                self.assertEqual(kernel.killpg.call_count, 2)
+                clock.sleep.assert_not_called()
+
+    def test_ineligible_leader_never_reconciles(self):
+        for kind, code in (("exit_255", 255), ("none", None), ("zero", None), ("zero", 1)):
+            result, kernel, _, _ = self.execute(
+                [PermissionError(1, "x")], kind=kind, returncode=code)
+            self.assertEqual(result, "cleanup_kill_permission")
+            self.assertEqual(kernel.killpg.call_count, 1)
+
+    def test_other_permission_errno_never_reconciles(self):
+        result, kernel, _, _ = self.execute([PermissionError(13, "x")])
+        self.assertEqual(result, "cleanup_kill_permission")
+        self.assertEqual(kernel.killpg.call_count, 1)
+
+    def test_post_absence_cleanup_failures_still_reject(self):
+        for component in ("wait", "stdin", "stdout"):
+            result, *_ = self.execute([PermissionError(1, "x"), ProcessLookupError(3, "x")],
+                                      failure=component)
+            self.assertEqual(result, "cleanup_" + component)
+
+    def test_original_success_paths_unchanged(self):
+        for state in (None, ProcessLookupError(3, "x")):
+            result, kernel, clock, _ = self.execute([state])
+            self.assertIsNone(result)
+            self.assertEqual(kernel.killpg.call_count, 1)
+            clock.sleep.assert_not_called()
+
+    def test_only_declared_cleanup_changes(self):
+        source = self.source
+        changes = ((m.BEFORE, m.AFTER), (m.START, m.START_AFTER), (m.WAIT, m.WAIT_AFTER))
+        for before, after in changes:
+            source = source.replace(after, before)
+        self.assertEqual(source, m.prior.SOURCE.read_text())
+
+    def test_no_live_authority_and_drift_rejection(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "PROOF_SHA", "0"*64), self.assertRaises(ValueError):
+            m.build()
+
+    def test_full_transport_local_only(self):
+        names = {"EXCHANGE_STAGES", "EXIT_KINDS", "REMOTE_STAGES", "ExchangeFailure",
+                 "exchange_diagnostic", "remote_failure_stage", "pipe_exchange"}
+        nodes = [n for n in ast.parse(self.source).body if getattr(n, "name", None) in names
+                 or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id in names
+                                                     for t in n.targets))]
+        self.assertEqual(len(nodes), len(names))
+        ns = dict(os=os, selectors=selectors, signal=signal, subprocess=subprocess,
+                  time=time, json=json, MAX_REPLY=4096)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "<local-transport>", "exec"), ns)
+        for body in (b"", b"synthetic"):
+            argv = [sys.executable, "-I", "-B", "-c",
+                    "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"]
+            self.assertEqual(ns["pipe_exchange"](argv, body, 2), body)
+        for program, stage in (("raise SystemExit(2)", "exit"),
+                               ("import time; time.sleep(1)", "select"),
+                               ("print('x'*4097)", "reply_limit")):
+            with self.subTest(stage=stage), self.assertRaises(ns["ExchangeFailure"]) as caught:
+                ns["pipe_exchange"]([sys.executable, "-I", "-B", "-c", program], b"", 0.1)
+            self.assertEqual(caught.exception.stage, stage)
+
+
+if __name__ == "__main__":
+    def guard(event, _args):
+        if event.startswith("socket."):
+            raise RuntimeError("network_forbidden")
+    sys.addaudithook(guard)
+    unittest.main()

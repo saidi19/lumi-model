@@ -1,0 +1,145 @@
+"""Exact parent-side ACK/phase ordering with real ledger, no ML/model work."""
+
+import hashlib
+import importlib
+import unittest
+
+from . import test_sft_smoke_bridge_v1 as fixture
+
+bridge = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_phase_bridge_v1")
+
+
+class ParentPhaseTests(unittest.TestCase):
+    def setUp(self):
+        self.f = fixture.ParentBridgeTests()
+        self.f.setUp()
+        self.new()
+
+    def new(self, index=0):
+        self.f.new(index)
+        self.f.parent = bridge.ParentInvocation(
+            supervisor=self.f.ledger, epoch=self.f.epoch, rank_tokens=self.f.tokens,
+            invocation_index=index, admit=lambda: None,
+            send_frame=lambda rank, raw: self.f.sent.append((rank, raw)),
+            release_phase=lambda *args: self.f.released.append(args),
+            interrupt=lambda: self.f.events.append("interrupt"),
+            maximum_wire_bytes=2**20, maximum_feeds=1000)
+        return self.f.parent
+
+    def ready(self):
+        self.f.parent.begin()
+        start = self.f.parent._invocation[1]
+        self.f.phase("inputs", start)
+        self.f.phase("restored", start)
+
+    def reserve(self, step=1, confirm=True):
+        return self.f.request(0, "reserve_step", {"from_step": step-1, "to_step": step},
+                              confirm=confirm)
+
+    def test_control_arrives_before_reserve_and_confirmation_no_early_release(self):
+        self.ready()
+        self.f.phase("reserved", 1)
+        self.assertEqual(len(self.f.released), 16)
+        ack, sequence = self.reserve(confirm=False)
+        self.assertEqual(len(self.f.released), 16)
+        self.f.confirm(0, ack, sequence)
+        self.assertEqual(self.f.released[-8:], [(rank, "reserved", 1) for rank in range(8)])
+        snapshot = self.f.ledger.summary()
+        self.assertEqual(snapshot["resource_reservations"], 0)
+        self.assertTrue(all(n == 0 for n in snapshot["resources_reserved"].values()))
+
+    def test_confirmation_before_last_rank_still_waits(self):
+        self.ready()
+        self.reserve()
+        for rank in range(7):
+            self.f.parent.phase(rank, "reserved", 1)
+        self.assertEqual(len(self.f.released), 16)
+        self.f.parent.phase(7, "reserved", 1)
+        self.assertEqual(len(self.f.released), 24)
+
+    def test_partial_confirmation_does_not_release(self):
+        self.ready()
+        ack, sequence = self.reserve(confirm=False)
+        self.f.phase("reserved", 1)
+        raw = self.f.message(0, "confirm_ack",
+                             {"ack_sha256": hashlib.sha256(ack).hexdigest()}, sequence)
+        self.f.parent.feed(0, raw[:-1])
+        self.assertEqual(len(self.f.released), 16)
+        self.f.parent.feed(0, raw[-1:])
+        self.assertEqual(len(self.f.released), 24)
+
+    def test_wrong_confirmation_fails_without_release_or_retry(self):
+        self.ready()
+        _, sequence = self.reserve(confirm=False)
+        self.f.phase("reserved", 1)
+        raw = self.f.message(0, "confirm_ack", {"ack_sha256": "0"*64}, sequence)
+        self.f.error("protocol_failed", self.f.parent.feed, 0, raw)
+        self.assertEqual(len(self.f.released), 16)
+        self.assertEqual(self.f.ledger.summary()["global_optimizer_steps_completed"], 0)
+
+    def test_step_request_before_input_barriers_cannot_reserve(self):
+        self.f.parent.begin()
+        self.f.error("protocol_failed", self.reserve)
+        self.assertEqual(self.f.ledger.summary()["global_optimizer_steps_reserved"], 0)
+
+    def test_step_complete_before_updated_barrier_rejected_before_mutation(self):
+        self.ready()
+        self.reserve()
+        self.f.phase("reserved", 1)
+        self.f.error("protocol_failed", self.f.request, 1, "step_complete", {"to_step": 1})
+        self.assertEqual(self.f.ledger.summary()["global_optimizer_steps_completed"], 0)
+
+    def test_completed_control_cannot_precede_all_rank_commit_fence(self):
+        self.ready()
+        self.reserve()
+        self.f.phase("reserved", 1)
+        self.f.phase("updated", 1)
+        self.f.error("phase_rejected", self.f.parent.phase, 0, "completed", 1)
+
+    def test_duplicate_rank_cannot_release_barrier(self):
+        self.ready()
+        self.f.parent.phase(0, "reserved", 1)
+        self.f.error("phase_rejected", self.f.parent.phase, 0, "reserved", 1)
+        self.assertEqual(len(self.f.released), 16)
+
+    def test_bool_step_and_skipped_reserved_rejected(self):
+        self.ready()
+        self.f.error("phase_rejected", self.f.parent.phase, 0, "reserved", True)
+
+    def test_all_three_invocations_preserve_cumulative_step_counts(self):
+        for index in range(3):
+            if index:
+                self.new(index)
+            self.ready()
+            start, stop = self.f.parent._invocation[1:3]
+            for step in range(start+1, stop+1):
+                self.reserve(step)
+                self.f.phase("reserved", step)
+                self.f.phase("updated", step)
+                for rank in range(8):
+                    self.f.request(rank, "step_complete", {"to_step": step})
+                self.f.phase("completed", step)
+                self.f.phase("checkpoint", step)
+            self.f.parent.finish(worker_summaries=self.f.reports(index),
+                                 rank_requests=self.f.counts, host_ram_bytes=256,
+                                 per_gpu_memory_bytes=[64]*8)
+            self.assertEqual(self.f.parent.summary()["released_phases"], (10, 6, 6)[index])
+        counts = self.f.ledger.summary()
+        self.assertEqual(counts["invocations_completed"], 3)
+        self.assertEqual(counts["global_optimizer_steps_completed"], 4)
+        self.assertEqual(counts["resource_reservations"], 0)
+
+    def test_unconfirmed_normal_io_keeps_parent_phase_closed(self):
+        self.f.parent.begin()
+        ack, sequence = self.f.request(1, confirm=False)
+        self.f.phase("inputs", 0)
+        self.assertEqual(self.f.released, [])
+        self.f.confirm(1, ack, sequence)
+        self.assertEqual(len(self.f.released), 8)
+
+    def test_phase_shape_for_each_invocation_is_frozen(self):
+        self.assertEqual(bridge.phases(2), [("inputs", 1), ("restored", 1), ("reserved", 2),
+                                          ("updated", 2), ("completed", 2), ("checkpoint", 2)])
+        for value in (-1, 3, True, "0"):
+            with self.assertRaises(ValueError):
+                bridge.phases(value)

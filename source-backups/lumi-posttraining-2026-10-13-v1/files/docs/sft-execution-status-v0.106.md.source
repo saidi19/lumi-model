@@ -1,0 +1,93 @@
+# SFT execution status v0.106
+
+2026-09-23. Local full-size resource preparation is complete. **No remote
+probe, instance action, S3 download, GPU use or real checkpoint import occurred.**
+This step reuses the existing contracts; no conversion kernel, historical guard
+or previous evidence was changed.
+
+## Completed in this step
+
+Three local proposals now bind the successful v3 generated-only qualification
+to the existing real checkpoint plan without treating synthetic success as
+real-import permission:
+
+- `configs/lumi-4b-sft-real-import-readiness-plan-v0.1.json`
+- `configs/lumi-4b-sft-real-import-resource-envelope-proposal-v0.1.json`
+- `configs/lumi-4b-sft-real-import-kernel-io-proposal-v0.1.json`
+
+Readiness-plan SHA-256:
+`43e19c94da22fddecbf4fa835c427e85d4a67d2445478a278670f96e003206eb`.
+
+The unchanged pure resource validator accepts the algebra. The unchanged
+kernel-I/O builder/validator accepts and reproduces its corresponding proposal.
+The historical host contract remains unchanged with its original eight
+unresolved fields; the public runner still rejects with `host_guard_not_bound`.
+
+## Exact input and proposed budgets
+
+The base remains the pinned 80B-token pretrained checkpoint backed up in S3.
+Its saved inventory declares 19 checkpoint files totaling 48,839,117,190 bytes
+plus three tokenizer files totaling 4,648,253 bytes. Current S3 availability
+was not checked. Eight trainer files account for 32,019,583,243 checkpoint
+bytes: the frozen two-audit contract includes hashing them as opaque bytes,
+but never deserializing them. They cannot silently be omitted.
+
+| Item | Proposal, not measured or authorized execution |
+| --- | --- |
+| Import worker memory cap | 64 GiB |
+| Host planning target | 128 GiB RAM, with at least 80 GiB MemAvailable before import; actual cgroup/host readback still required |
+| Available disk target | 128 GiB; disk-backed private staging/output, not RAM-backed full-checkpoint storage |
+| Logical coordinator reads | 200,055,533,069 bytes |
+| Cumulative private content-write cap | 8,415,205,181 bytes, unchanged frozen ceiling |
+| Import deadline | 3,600 seconds |
+| HF per-file / shard target | 2 GiB / 256 MiB |
+| Retries after a started import | Zero |
+
+The resource algebra requires 8,413,764,005 private-write bytes and
+74,438,839,808 staged/output/reserve disk bytes. The larger disk/host proposals
+provide planning headroom; they are not measurements or reservations.
+
+The 64 GiB DCP payload allowance and one-hour deadline are unmeasured proposals,
+not guarantees of full-size serializer I/O sufficiency or performance.
+The logical read/write caps exclude dependency-module and physical-device I/O.
+Acquisition, staging copies, software extraction, host setup and aggregate
+retention require their own combined budgets before execution approval.
+
+An initial in-memory draft confused the aggregate HF output cap with a per-file
+cap. The unchanged validator rejected it. The proposal now uses its existing
+2 GiB per-file maximum; no guard, kernel policy or remote attempt was changed.
+
+## Verification
+
+All 21 readiness bindings and all 78 qualified source hashes match. The saved
+v3 verification was recomputed exactly without native execution or live Mac
+capacity checks. Its execution record is unchanged.
+
+Seventy existing synthetic tests passed on CPython 3.11.15 and 3.13.7.
+Two offline revalidations additionally rejected twelve malformed/underbudget/
+approval-injection proposals each. These twelve are metadata boundary cases,
+not twelve native runs. An independent review reproduced the resource/kernel
+calculations and confirmed the unchanged execution boundary.
+
+Verification:
+`evidence/lumi-4b-sft-real-import-readiness-verification-v0.1.json`.
+
+## Concrete next work
+
+The private full-size coordinator already exists. Next local implementation
+should wire a versioned fixed full-size guardian/entry around it, reusing
+the resource, kernel-I/O and input-mount components. Preserve the qualified
+tiny synthetic entry and the old public runner's unconditional rejection.
+
+That integration must bind actual host/runtime identity, immutable backing or
+excluded external writers, exact input ownership and recursive read-only mount
+readback, fresh exclusive output, independent PID/cgroup supervision and native
+resource enforcement. Read-only binds do not prove source immutability, and a
+filesystem quota is not cumulative write accounting. Current cooperative
+content ledgers do not prove arbitrary native writes are metered.
+
+No host is selected or admitted. No full-size adapter is yet admitted, resource
+or transfer budget approved, or S3 input acquired. Gate 5, real import,
+training authorization and production eligibility remain incomplete/false.
+No GPU needs to be turned on for this local integration work. All five files
+created in this step remain local and unpushed.

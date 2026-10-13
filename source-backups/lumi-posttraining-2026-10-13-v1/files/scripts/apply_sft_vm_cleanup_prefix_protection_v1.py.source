@@ -1,0 +1,195 @@
+"""One approved prefix-only bucket-policy merge, never a launch authority.
+
+Fixed proposal/hash, exclusive attempt record, one PUT at most, no automatic
+rollback/retry. Policy stays in memory/stdin; only hashes and stage codes persist.
+AWS does not provide policy compare-and-swap here: no concurrent edits permitted.
+"""
+
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PROPOSAL = ROOT / "configs/lumi-vm-cleanup-prefix-protection-proposal-v0.1.json"
+PROPOSAL_SHA = "fdc44207028988ddd512230586afac985d99f7b78d7d78eee13cd5625a3a345a"
+OUTPUT = ROOT / "artifacts/lumi-vm-cleanup-prefix-policy-update-v0.1/attempt-001"
+ACCOUNT = "573978149073"
+BUCKET = "lumi-corpus-prod-27777c02b29b76efcac3"
+
+
+def need(value):
+    if not value:
+        raise ValueError("cleanup_policy_update_rejected") from None
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
+
+
+def merge(old, proposal):
+    need(digest(old) == proposal["expected_current_policy_canonical_sha256"])
+    need(type(old.get("Statement")) is list)
+    need(len(old["Statement"]) == proposal["expected_existing_statement_count"])
+    additions = proposal["statements_to_add"]
+    need(len(additions) == 4 and all(row["Effect"] == "Deny" for row in additions))
+    sids = [row["Sid"] for row in additions]
+    need(len(set(sids)) == 4 and not set(sids) & {r.get("Sid") for r in old["Statement"]})
+    merged = dict(old, Statement=old["Statement"] + additions)
+    need(len(canonical(merged).encode()) <= 20480)
+    return merged
+
+
+class Cloud:
+    def call(self, service, operation, **fields):
+        need(
+            (service, operation)
+            in {
+                ("sts", "get-caller-identity"),
+                ("s3api", "get-bucket-policy"),
+                ("s3api", "put-bucket-policy"),
+                ("s3api", "get-bucket-policy-status"),
+            }
+        )
+        if service == "sts":
+            need(fields == {})
+        else:
+            need(fields.get("Bucket") == BUCKET and fields.get("ExpectedBucketOwner") == ACCOUNT)
+            need(
+                set(fields)
+                == {"Bucket", "ExpectedBucketOwner"}
+                | ({"Policy"} if operation == "put-bucket-policy" else set())
+            )
+        answer = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                service,
+                operation,
+                "--cli-input-json",
+                "file:///dev/stdin",
+                "--no-paginate",
+                "--output",
+                "json",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "5",
+            ],
+            input=canonical(fields).encode(),
+            capture_output=True,
+            timeout=20,
+            env=dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER=""),
+        )
+        need(len(answer.stdout) <= 32768 and len(answer.stderr) <= 4096)
+        need(answer.returncode == 0)
+        return json.loads(answer.stdout, object_pairs_hook=unique) if answer.stdout.strip() else {}
+
+
+def run_once(output, cloud, *, clock=time.monotonic):
+    raw = PROPOSAL.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == PROPOSAL_SHA)
+    proposal = json.loads(raw, object_pairs_hook=unique)
+    need(proposal["bucket"] == BUCKET and proposal["account"] == ACCOUNT)
+    output = Path(output)
+    output.mkdir(mode=0o700, parents=True, exist_ok=False)
+
+    def save(name, value):
+        raw = (canonical(value) + "\n").encode()
+        need(len(raw) <= 8192)
+        fd = os.open(output / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    start = clock()
+    report = dict(
+        status="started",
+        cloud_calls=0,
+        put_attempted=False,
+        put_acknowledged=False,
+        exact_readback_verified=False,
+        existing_policy_preserved=False,
+        object_access=0,
+        resource_launches=0,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+    save(
+        "started.json",
+        dict(
+            proposal_sha256=PROPOSAL_SHA,
+            authorization="User ok kor approving the four scoped protections",
+        ),
+    )
+
+    def call(service, operation, **fields):
+        need(report["cloud_calls"] < 5 and 0 <= clock() - start < 100)
+        report["cloud_calls"] += 1
+        value = cloud.call(service, operation, **fields)
+        need(clock() - start < 120)
+        return value
+
+    fields = dict(Bucket=BUCKET, ExpectedBucketOwner=ACCOUNT)
+    stage = "identity"
+    try:
+        need(call("sts", "get-caller-identity")["Account"] == ACCOUNT)
+        stage = "policy_precondition"
+        old = json.loads(
+            call("s3api", "get-bucket-policy", **fields)["Policy"], object_pairs_hook=unique
+        )
+        desired = merge(old, proposal)
+        report.update(
+            before_policy_sha256=digest(old),
+            desired_policy_sha256=digest(desired),
+            original_statement_count=len(old["Statement"]),
+            added_statement_count=4,
+        )
+        stage = "single_policy_put"
+        # Consume/persist before dispatch. Any uncertain outcome is read back,
+        # never resent. There is no automatic rollback that could overwrite drift.
+        report["put_attempted"] = True
+        save("put-started.json", report)
+        try:
+            call("s3api", "put-bucket-policy", **fields, Policy=canonical(desired))
+            report["put_acknowledged"] = True
+        except Exception:
+            pass
+        stage = "exact_policy_readback"
+        actual = json.loads(
+            call("s3api", "get-bucket-policy", **fields)["Policy"], object_pairs_hook=unique
+        )
+        report["observed_policy_sha256"] = digest(actual)
+        need(actual == desired)
+        report.update(exact_readback_verified=True, existing_policy_preserved=True)
+        stage = "public_policy_status"
+        need(
+            call("s3api", "get-bucket-policy-status", **fields)["PolicyStatus"]["IsPublic"] is False
+        )
+        report.update(status="applied_and_verified", policy_not_public=True)
+    except BaseException:
+        report.update(status="stopped_unconfirmed", failed_stage=stage)
+    save("result.json", report)
+    return report
+
+
+if __name__ == "__main__":
+    print(canonical(run_once(OUTPUT, Cloud())))

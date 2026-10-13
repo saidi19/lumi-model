@@ -1,0 +1,181 @@
+"""Private same-boot source staging through the unchanged frozen v2 installer.
+
+No credentials, package payload, binding creation or worker dispatch. Requires
+the existing import binding as identity/time evidence, never as retention
+authorization. Partial staging consumes the attempt. Outer STOP, not retry, is
+required after a failed or lost acknowledgement. Remote entry supplies a timer.
+"""
+
+import hashlib
+import os
+import types
+from pathlib import Path
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+ROOT = Path("/var/lib/lumi-vm-bootstrap") / ATTEMPT / "retention-source"
+FULLSIZE = Path("/var/lib/lumi-vm-fullsize") / ATTEMPT
+ARCHIVE_SHA = "1a2f3831042fa5e1158944acf8bfd4f883c676e8d5e6e94873319ffc8fdf7a10"
+ARCHIVE_BYTES = 235520
+MANIFEST_SHA = "ad03a7c26f8c4a68a741ad3bcf2e7d0f1771e07441e3f91062a7321b158a05e0"
+PINS = {
+    "bind_sft_vm_native_admission_v1.py": (
+        "8c649038548fd16d6fce88cc92e1730f3cdce117c82e9e36954f6a1c175dbe88"
+    ),
+    "prepare_sft_vm_retention_release_v1.py": (
+        "bdf67917259e28e02e64ef57c48fc62cef5606eca5b22f2533f74119f34c705c"
+    ),
+    "prepare_sft_vm_retention_release_v2.py": (
+        "98a12dd1caae1c5175428a871fe6052fa80f9b5feddc550a1b5ed9f7a9fa1633"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("retention_source_stage_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def sources(bodies):
+    need(type(bodies) is dict and set(bodies) == set(PINS))
+    need(
+        all(
+            type(raw) is bytes and 0 < len(raw) <= 32768 and sha(raw) == PINS[name]
+            for name, raw in bodies.items()
+        )
+    )
+    result = {}
+    for name, raw in bodies.items():
+        module = types.ModuleType("_retention_source_" + name[:-3])
+        module.__file__ = str(ROOT / "scripts" / name)
+        exec(compile(raw, module.__file__, "exec"), module.__dict__)
+        result[name] = module
+    return result
+
+
+def unpack(archive, loaded):
+    need(type(archive) is bytes and len(archive) == ARCHIVE_BYTES and sha(archive) == ARCHIVE_SHA)
+    old = loaded["prepare_sft_vm_retention_release_v1.py"]
+    successor = loaded["prepare_sft_vm_retention_release_v2.py"]
+    members = successor.unpack(archive, ARCHIVE_SHA, old)
+    need(len(members) == 22 and sha(members["release-manifest.json"]) == MANIFEST_SHA)
+    return members
+
+
+def report(prior_pin):
+    return dict(
+        schema="lumi.vm-retention-source-stage.v0.1",
+        attempt=ATTEMPT,
+        prior_binding_sha256=prior_pin,
+        archive_sha256=ARCHIVE_SHA,
+        archive_bytes=ARCHIVE_BYTES,
+        release_manifest_sha256=MANIFEST_SHA,
+        source_files_verified=22,
+        release_staged=True,
+        binding_created=False,
+        host_admitted=False,
+        credentials_included=False,
+        worker_dispatched=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+
+
+def _stage_once(request, prior_pin, bodies, archive):
+    loaded = sources(bodies)  # Entire helper closure authenticates before execution.
+    binder = loaded["bind_sft_vm_native_admission_v1.py"]
+    binder.boundary()  # Never read native paths on Mac.
+    need(
+        type(prior_pin) is str
+        and len(prior_pin) == 64
+        and all(c in "0123456789abcdef" for c in prior_pin)
+    )
+    members = unpack(archive, loaded)
+    detached, ready = binder.helpers()
+    expected = {k: request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")}
+    bootstrap, _, original = detached.context(expected)
+    need(original == request)
+    binder.private_directory(FULLSIZE)
+    binder.private_directory(FULLSIZE / "controller")
+    entry = ready.modules()["parent.py"]
+    prior_raw = binder.root_read(FULLSIZE / "controller/binding.json")
+    need(sha(prior_raw) == prior_pin)
+    need(binder.root_read(FULLSIZE / "controller/binding.sha256") == (prior_pin + "\n").encode())
+    prior = entry.validate_binding(
+        entry.decode(prior_raw),
+        ATTEMPT,
+        "status",
+        request["machine_id"],
+        request["boot_id"],
+        bootstrap.boot_time(),
+    )
+    need(prior["host_deadline_boottime"] == request["host_deadline_boottime"])
+    # Retain the lifecycle's 2560-second post-import admission/retention allowance.
+    need(0 <= bootstrap.boot_time() < request["host_deadline_boottime"] - 2560 - 80)
+    for path in (
+        ROOT,
+        FULLSIZE / "retention-release",
+        FULLSIZE / "retention-controller",
+        FULLSIZE / "retention-admission",
+        FULLSIZE / "retention-parent",
+        FULLSIZE / "retention-worker",
+    ):
+        need(not os.path.lexists(path))
+    bootstrap.owned(ROOT.parent)
+    ROOT.mkdir(mode=0o700, exist_ok=False)
+    bootstrap.sync(ROOT.parent)
+    bootstrap.write(
+        ROOT / "started.json",
+        bootstrap.encode(
+            dict(attempt=ATTEMPT, prior_binding_sha256=prior_pin, retry_allowed=False)
+        ),
+    )
+    old = loaded["prepare_sft_vm_retention_release_v1.py"]
+    successor = loaded["prepare_sft_vm_retention_release_v2.py"]
+    try:
+        (ROOT / "scripts").mkdir(mode=0o700, exist_ok=False)
+        for name, raw in bodies.items():
+            bootstrap.write(ROOT / "scripts" / name, raw)
+            need(binder.root_read(ROOT / "scripts" / name) == raw)
+        # Keep frozen metadata writer's 32 KiB limit; the authenticated builder's
+        # own bounded source-archive writer handles this exact 235520-byte file.
+        bundle = ROOT / "retention-source.tar"
+        old.write(bundle, archive)
+        bootstrap.sync(ROOT)
+        need(binder.root_read(bundle, ARCHIVE_BYTES) == archive)
+        value = successor._install_admitted_once(bundle, ARCHIVE_SHA, request["machine_id"])
+        need(
+            value
+            == dict(
+                staged_file_hashes_verified=True, binding_created=False, execution_permitted=False
+            )
+        )
+        release = FULLSIZE / "retention-release"
+        binder.private_directory(release)
+        for name, raw in members.items():
+            need(binder.root_read(release / name, 131072) == raw)
+        need(bootstrap.boot_time() < request["host_deadline_boottime"] - 2560)
+        need(binder.root_read(FULLSIZE / "controller/binding.json") == prior_raw)
+        result = report(prior_pin)
+        bootstrap.write(ROOT / "result.json", bootstrap.encode(result))
+        return result
+    except BaseException:
+        bootstrap.write(
+            ROOT / "failed.json",
+            bootstrap.encode(
+                dict(
+                    status="failed_preserve_no_retry",
+                    release_may_be_partial=True,
+                    outer_stop_required=True,
+                    retry_allowed=False,
+                )
+            ),
+        )
+        raise ValueError("retention_source_staging_failed_outer_stop_required") from None
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_retention_source_channel_required") from None

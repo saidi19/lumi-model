@@ -1,0 +1,160 @@
+"""Join fresh cloud readback and detached qualification after existing setup.
+
+This is preparation FOR admission, not an admission callback. It cannot create
+binding.json, return an import channel, issue credentials or launch a VM. The
+outer lifecycle retains STOP responsibility on any failure. Writer exclusion
+and the separate post-import retention admission are still required.
+"""
+
+import hashlib
+import math
+import time
+from pathlib import Path
+
+import build_sft_vm_initial_boot_v1 as initial
+import prepare_sft_vm_host_connection_v2 as connection
+import run_sft_vm_host_setup_v2 as setup
+import run_sft_vm_runtime_qualification_delivery_v2 as qualification
+
+INPUTS = initial.delivery.seed.INPUTS
+PINS = {
+    "build_sft_vm_initial_boot_v1.py": (
+        "b284326ae7e6c612763f63889a9cc12533cfa3c598be759e5180fa304fbc368c"
+    ),
+    "prepare_sft_vm_host_connection_v2.py": (
+        "84413461ea481527950667890342ed39dce81e6daca3ce558a895cef714ad7fd"
+    ),
+    "run_sft_vm_host_setup_v2.py": (
+        "2674fe884b0a58848d08ab8bf1e41dd050e419c53f1b3bf3837cd6c6ef3290b0"
+    ),
+    "run_sft_vm_runtime_qualification_delivery_v2.py": (
+        "f5d0ce6727d3f641b293676f5020e02ceeed68bec6c1d80c82bb86bb8d9c449d"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("native_admission_preparation_rejected") from None
+
+
+def number(value):
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def read_json(path):
+    return qualification.sender.delivery.decode(INPUTS.read(path, 32768))
+
+
+def _prepare_native_admission_once(
+    provisioned, host_output, output, *, cloud, clock=time.monotonic, wait=time.sleep
+):
+    for name, pin in PINS.items():
+        need(hashlib.sha256(INPUTS.read(Path(__file__).with_name(name), 131072)).hexdigest() == pin)
+    binding = dict(provisioned["binding"])
+    connection.targets(binding, {"prepared_attempt": qualification.ATTEMPT})
+    launch_clock, end = provisioned["launch_monotonic"], provisioned["host_deadline_monotonic"]
+    need(all(number(t) for t in (launch_clock, end, clock())))
+    # The reused fresh-host cloud validator admits only the first 1350 seconds.
+    # Keep that frozen restriction and reject stale work before AWS/SSH, not
+    # by supplying an artificial observation timestamp to its validator.
+    need(end == launch_clock + 14400 and 0 <= clock() - launch_clock < 1350)
+    need(end - clock() > 11315 + 700 + 240)
+    need(read_json(host_output / "binding.json") == binding)
+    prior = read_json(host_output / "result.json")
+    need(prior == provisioned["report"] and prior["setup_completed"] is True)
+    spent = prior["total_control_content_bytes_charged"]
+    need(type(spent) is int and 0 < spent < qualification.CAP)
+    launch = read_json(host_output / "launch.json")
+    connection.validate_launch(launch, binding)
+    proof = initial.validate_proof(INPUTS.read(host_output / "host-setup/initial-proof.json", 4096))
+    previous = read_json(host_output / "host-setup/connection/result.json")
+    need(previous["status"] == "prepared_pinned_connection_not_native_admission")
+    need(previous["control_plane_matches"] is True and previous["native_host_admitted"] is False)
+    key = host_output / "connection-key"
+    expected = dict(
+        attempt=binding["attempt"],
+        machine_id=proof["machine_id"],
+        boot_id=proof["boot_id"],
+        volumes={k: binding[k] for k in ("root_volume", "work_volume")},
+    )
+    connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = connection.issuer.base.save
+    report = dict(
+        status="started",
+        cloud_observation_calls=0,
+        fresh_cloud_readback_verified=False,
+        native_qualification_completed=False,
+        binding_created=False,
+        host_admitted=False,
+        gate_5_complete=False,
+        real_4b_import=False,
+        retry_allowed=False,
+        outer_stop_required_on_failure=True,
+    )
+    save(output / "started.json", report)
+
+    class ReadOnlyCloud:
+        def cli(self, service, operation, **fields):
+            need((service, operation) in setup.OPERATIONS)
+            need(report["cloud_observation_calls"] < 12)
+            need(end - clock() > 11315 + 700 + 20)
+            report["cloud_observation_calls"] += 1
+            return cloud.cli(service, operation, **fields)
+
+    phase = "fresh_cloud_readback"
+    try:
+        directory = output / "connection"
+        prepared = connection._prepare_bound_connection(
+            binding, key, directory, launch=launch, cloud=ReadOnlyCloud()
+        )
+        need(prepared["status"] == "prepared_pinned_connection_not_native_admission")
+        for flag in (
+            "control_plane_matches",
+            "fresh_launch_and_work_volume_match",
+            "work_snapshot_absent",
+            "private_egress_route_configured",
+        ):
+            need(prepared[flag] is True)
+        need(prepared["native_host_admitted"] is False)
+        need(prepared["host_key_fingerprint"] == previous["host_key_fingerprint"])
+        report["fresh_cloud_readback_verified"] = True
+        phase = "same_boot_generated_qualification"
+        need(end - clock() > 11315 + 700)
+        result = qualification._qualify_prepared_channel_once(
+            output / "qualification",
+            binding,
+            key,
+            directory,
+            prepared["ssh_config_sha256"],
+            hashlib.sha256(INPUTS.read(directory / "known_hosts", 4096)).hexdigest(),
+            expected,
+            deadline=clock() + 700,
+            host_deadline=end,
+            remaining_control_bytes=qualification.CAP - spent,
+            clock=clock,
+            wait=wait,
+        )
+        need(result["qualification_completed"] is True)
+        need(result["status"] == "generated_runtime_qualified_and_reaped_not_admission")
+        need(result["host_admitted"] is False and result["binding_created"] is False)
+        qualification.previous.validate_reply(result["observation"])
+        charge = result["control_content_bytes_charged"]
+        need(type(charge) is int and 0 < charge <= qualification.CAP - spent)
+        report.update(
+            status="native_qualification_prepared_not_host_admission",
+            native_qualification_completed=True,
+            total_control_content_bytes_charged=spent + charge,
+            qualification=result["observation"],
+        )
+    except BaseException:
+        report.update(status="failed_preserve_no_retry", failed_phase=phase)
+        save(output / "result.json", report)
+        raise ValueError("native_admission_preparation_failed") from None
+    save(output / "result.json", report)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("remaining_host_admission_and_execution_authority_not_bound") from None

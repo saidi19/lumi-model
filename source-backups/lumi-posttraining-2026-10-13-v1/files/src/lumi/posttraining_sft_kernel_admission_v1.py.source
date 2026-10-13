@@ -1,0 +1,243 @@
+"""Read-only live pre-ML check for an externally admitted Linux workload.
+
+Callable as ProcessPeers.admit or a cold worker's pre-ML check. authorize() must
+authenticate the external target/attempt/source authority BEFORE any kernel
+metadata is opened; constructor pins are not themselves authorization. Checks
+exact boot digest, cgroup inode/device, namespace identities, configured CPU/RAM/
+PID limits and unprivileged no-new-privileges status at both ends of one bounded
+observation. A successful return is a prerequisite check, not execution consent.
+
+No host setup, namespace creation, cgroup writes, process spawn, model/data read
+or GPU discovery is performed. The outer privileged guardian must install and
+retain the limits, prevent escape/mutation, enforce disk/network/GPU policy and
+retire the workload. Procfs views and supplied pins are trusted host premises;
+endpoint snapshots cannot prove continuous confinement or full source lineage.
+No JSON receipt, boolean switch or fallback to the old CPU fixture enables SFT.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import stat
+import sys
+import threading
+import time
+
+from . import posttraining_sft_cgroup_v1 as cgroup
+from . import posttraining_sft_child_status_v1 as status
+from . import posttraining_sft_host_observer_v1 as host
+from . import posttraining_sft_host_snapshot_v1 as snapshot
+
+ML = frozenset({"torch", "transformers", "numpy", "safetensors", "tokenizers",
+                "cuda", "cupy", "tensorflow", "jax"})
+ERRORS = frozenset({"invalid_arguments", "runtime_rejected", "owner_mismatch",
+                    "check_exhausted", "terminal_failure", "reentry",
+                    "authority_rejected", "boot_rejected", "identity_rejected",
+                    "privilege_rejected", "limits_rejected", "kernel_read_failed",
+                    "cleanup_failed", "deadline_exhausted"})
+
+
+class KernelAdmissionError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "kernel_read_failed"
+        super().__init__(self.code)
+
+
+def need(value, code):
+    if not value:
+        raise KernelAdmissionError(code) from None
+
+
+def _identity(value):
+    return (type(value) is tuple and len(value) == 2
+            and all(type(n) is int and 0 <= n < 2**64 for n in value)
+            and value[1] > 0)
+
+
+def _root_owned(fd):
+    info = os.fstat(fd)
+    need(info.st_uid == 0 and not stat.S_IMODE(info.st_mode) & 0o022,
+         "privilege_rejected")
+
+
+class _Reader(host.Reader):
+    def __init__(self, deadline):
+        super().__init__(deadline)
+        self.protected = set()
+
+    def open(self, name, *, parent=None, **options):
+        fd = super().open(name, parent=parent, **options)
+        if parent in self.protected:
+            _root_owned(fd)
+        return fd
+
+    def group(self, parent, parts, device):
+        _root_owned(parent)
+        self.protected.add(parent)
+        for part in parts:
+            parent = self.directory(part, parent, host.CGROUP_MAGIC, device)
+            _root_owned(parent)
+            self.protected.add(parent)
+        return parent
+
+
+class KernelAdmissionCheck:
+    """Bounded repeatable checks in one cold owner; ANY failed check is terminal.
+
+    Each successful call returns None for existing admission callback APIs.
+    maximum_checks explicitly bounds repeat reads (e.g. parent then process
+    handoff); never reuse a parent's object as a child admission capability.
+    Copy pins from authenticated outer target state, never from this observation.
+    The default host.Reader ceilings apply per call: 5 seconds, 128 opens,
+    32 metadata files, 128 read syscalls and 524288 bytes reserved capacity.
+    """
+
+    def __init__(self, *, boot_sha256, group_identity, namespaces, uid, gid,
+                 limits, maximum_checks, authorize):
+        need(not hasattr(self, "_owner"), "invalid_arguments")
+        need(type(boot_sha256) is str and re.fullmatch(r"[a-f0-9]{64}", boot_sha256)
+             and _identity(group_identity) and type(namespaces) is dict
+             and set(namespaces) == set(host.NAMESPACES)
+             and all(_identity(value) for value in namespaces.values())
+             and type(uid) is int and 0 < uid < 2**31
+             and type(gid) is int and 0 < gid < 2**31
+             and type(maximum_checks) is int and 1 <= maximum_checks <= 32
+             and callable(authorize), "invalid_arguments")
+        try:
+            settings = cgroup._settings(limits)
+        except BaseException:
+            raise KernelAdmissionError("invalid_arguments") from None
+        self._boot, self._group = boot_sha256, group_identity
+        self._namespaces, self._settings = dict(namespaces), settings
+        self._uid, self._gid, self._maximum, self._authorize = uid, gid, maximum_checks, authorize
+        self._owner = os.getpid(), threading.get_ident()
+        self._calls = self._passed = self._bytes = self._capacity = 0
+        self._failure, self._busy, self._cleanup_failed = None, False, False
+
+    def _runtime(self):
+        host.runtime.require_abi()
+        need(threading.current_thread() is threading.main_thread()
+             and threading.active_count() == 1 and os.getuid() == self._uid
+             and os.getgid() == self._gid and os.getgroups() == []
+             and not any(name.split('.')[0] in ML for name in sys.modules), "runtime_rejected")
+
+    def _boot_check(self, reader, random):
+        raw = reader.read("boot_id", random, 64, host.PROC_MAGIC)
+        need(re.fullmatch(rb"[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\n", raw)
+             and hashlib.sha256(raw).hexdigest() == self._boot, "boot_rejected")
+
+    def _privileges(self, reader, own, pid, parent):
+        need(os.getpid() == pid and os.getppid() == parent, "identity_rejected")
+        try:
+            status.parse_status(reader.read("status", own, status.MAXIMUM_STATUS_BYTES,
+                                            host.PROC_MAGIC), expected_pid=pid,
+                                expected_ppid=parent, expected_uid=self._uid,
+                                expected_gid=self._gid)
+        except BaseException:
+            raise KernelAdmissionError("privilege_rejected") from None
+
+    def _limits(self, reader, group, device):
+        for name, expected in self._settings.items():
+            need(reader.read(name, group, 4096, host.CGROUP_MAGIC, device=device) == expected,
+                 "limits_rejected")
+        need(reader.read("cgroup.type", group, 4096, host.CGROUP_MAGIC,
+                         device=device) == b"domain\n", "limits_rejected")
+        events = snapshot.parse_events(reader.read("cgroup.events", group, 4096,
+                                                   host.CGROUP_MAGIC, device=device))
+        need(events["populated"] == 1 and events["frozen"] == 0, "limits_rejected")
+        need(reader.interface_exists(group, "cgroup.kill", device), "limits_rejected")
+
+    def _observe(self, reader):
+        pid, parent = os.getpid(), os.getppid()
+        proc = reader.directory("/proc", None, host.PROC_MAGIC)
+        own = reader.directory(str(pid), proc, host.PROC_MAGIC)
+        ns = reader.directory("ns", own, host.PROC_MAGIC)
+        sysctl = reader.directory("sys", proc, host.PROC_MAGIC)
+        kernel = reader.directory("kernel", sysctl, host.PROC_MAGIC)
+        random = reader.directory("random", kernel, host.PROC_MAGIC)
+        membership = snapshot.parse_membership(reader.read("cgroup", own, 4096, host.PROC_MAGIC))
+        need(bool(membership), "identity_rejected")
+        mount = snapshot.parse_mountinfo(reader.read("mountinfo", own, 131072, host.PROC_MAGIC))
+        device = mount["device"]
+        sysroot = reader.directory("/sys", None, host.SYS_MAGIC)
+        fs = reader.directory("fs", sysroot, host.SYS_MAGIC)
+        root = reader.directory("cgroup", fs, host.CGROUP_MAGIC, device)
+        group = reader.group(root, membership, device)
+        for index in range(2):
+            self._boot_check(reader, random)
+            self._privileges(reader, own, pid, parent)
+            need(all(reader.namespace(ns, name) == identity
+                     for name, identity in self._namespaces.items()), "identity_rejected")
+            need(reader.filesystem(group, host.CGROUP_MAGIC, device) == self._group,
+                 "identity_rejected")
+            self._limits(reader, group, device)
+            if index == 0:
+                need(snapshot.parse_membership(reader.read("cgroup", own, 4096,
+                                                            host.PROC_MAGIC)) == membership,
+                     "identity_rejected")
+                need(snapshot.parse_mountinfo(reader.read("mountinfo", own, 131072,
+                                                           host.PROC_MAGIC)) == mount,
+                     "identity_rejected")
+                fresh = reader.directory("cgroup", fs, host.CGROUP_MAGIC, device)
+                group = reader.group(fresh, membership, device)
+        need(snapshot.parse_membership(reader.read("cgroup", own, 4096,
+                                                    host.PROC_MAGIC)) == membership,
+             "identity_rejected")
+        need(snapshot.parse_mountinfo(reader.read("mountinfo", own, 131072,
+                                                   host.PROC_MAGIC)) == mount,
+             "identity_rejected")
+
+    def __call__(self):
+        need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        need(self._failure is None, "terminal_failure")
+        if self._busy or self._calls >= self._maximum:
+            self._failure = "reentry" if self._busy else "check_exhausted"
+            raise KernelAdmissionError(self._failure) from None
+        self._busy = True
+        self._calls += 1
+        reader = None
+        stage = "runtime_rejected"
+        try:
+            self._runtime()
+            stage = "authority_rejected"
+            need(self._authorize() is None and self._failure is None, "authority_rejected")
+            # A trusted authority helper can still accidentally import the ML
+            # package or alter process state. Recheck the actual cold runtime.
+            stage = "runtime_rejected"
+            need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+            self._runtime()
+            stage = "kernel_read_failed"
+            reader = _Reader(time.monotonic() + host.MAXIMUM_SECONDS)
+            self._observe(reader)
+            reader.check()
+        except BaseException as error:
+            self._failure = self._failure or (error.code if type(error) is KernelAdmissionError
+                                              else stage)
+        finally:
+            if reader is not None:
+                try:
+                    closed = reader.finish()
+                except BaseException:
+                    closed = False
+                if not closed:
+                    self._cleanup_failed = True
+                    self._failure = self._failure or "cleanup_failed"
+                accounting = reader.summary()
+                self._bytes += accounting["metadata_bytes_read"]
+                self._capacity += accounting["read_capacity_bytes"]
+                if time.monotonic() >= reader.deadline:
+                    self._failure = self._failure or "deadline_exhausted"
+            self._busy = False
+        if self._failure is not None:
+            raise KernelAdmissionError(self._failure) from None
+        self._passed += 1
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-kernel-admission-check.v0.1",
+                "checks_started": self._calls, "checks_passed": self._passed,
+                "failure_code": self._failure, "cleanup_failed": self._cleanup_failed,
+                "metadata_bytes_read": self._bytes, "read_capacity_bytes": self._capacity,
+                "execution_authorized": False, "continuous_containment_verified": False,
+                "gpu_limits_verified": False, "production_eligible": False}

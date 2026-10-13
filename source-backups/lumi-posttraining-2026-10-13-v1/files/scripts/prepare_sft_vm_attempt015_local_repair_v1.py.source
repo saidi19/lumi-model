@@ -1,0 +1,78 @@
+"""Offline repair candidates only; consumed sources and execution remain frozen."""
+
+import ast
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-015-source-v0.1"
+BASE_SHA = "2263eece783f6678a07efb148a191c6b2b55a52e1b59785ed41c3d4dc2081b94"
+PROOF = ROOT / "evidence/lumi-vm-attempt-015-cpu-execution-verification-v0.1.json"
+PROOF_SHA = "1e00cd0cdf2ba5b0831f04d2b6d947df1c76a3116424649ae75186f743c5aabd"
+
+
+def once(raw, before, after):
+    if raw.count(before) != 1:
+        raise ValueError("repair_source_mismatch")
+    return raw.replace(before, after)
+
+
+def provision(raw):
+    # A known ID is authoritative only after the unchanged ownership/token checks.
+    # Unknown launch outcomes still use bounded discovery and reject pagination.
+    return once(
+        raw,
+        '            if reconcile or "instance" not in self.binding',
+        '            if "instance" not in self.binding',
+    )
+
+
+def transport(raw):
+    # Do NOT suppress kill failures or skip process-group cleanup after leader exit.
+    # The historical receipt has no exception category: preserve fail-closed behavior.
+    raw = once(
+        raw,
+        '        "cleanup_kill",',
+        '        "cleanup_kill",\n        "cleanup_kill_permission",\n'
+        '        "cleanup_kill_os",\n        "cleanup_kill_other",',
+    )
+    return once(
+        raw,
+        '        except BaseException:\n            cleanup_stage = "cleanup_kill"',
+        "        except PermissionError:\n"
+        '            cleanup_stage = "cleanup_kill_permission"\n'
+        "        except OSError:\n"
+        '            cleanup_stage = "cleanup_kill_os"\n'
+        "        except BaseException:\n"
+        '            cleanup_stage = "cleanup_kill_other"',
+    )
+
+
+def build():
+    proof_raw = PROOF.read_bytes()
+    if hashlib.sha256(proof_raw).hexdigest() != PROOF_SHA:
+        raise ValueError("repair_evidence_mismatch")
+    for name, pin in json.loads(proof_raw)["source_bindings"].items():
+        body = (ROOT / name).read_bytes()
+        if len(body) != pin["bytes"] or hashlib.sha256(body).hexdigest() != pin["sha256"]:
+            raise ValueError("repair_evidence_binding_mismatch")
+    raw = (BASE / "release.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("repair_release_mismatch")
+    manifest = json.loads(raw)
+    result = {}
+    for name, transform in (
+        ("scripts/provision_sft_vm_host_v5.py", provision),
+        ("scripts/run_sft_vm_detached_delivery_v1.py", transport),
+    ):
+        body = (BASE / name).read_bytes()
+        if hashlib.sha256(body).hexdigest() != manifest["outputs"][name]["sha256"]:
+            raise ValueError("repair_source_mismatch")
+        result[name] = transform(body.decode())
+        ast.parse(result[name])
+    return result
+
+
+def run(**_arguments):
+    raise ValueError("local_repair_not_execution_authority")

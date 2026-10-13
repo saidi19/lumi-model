@@ -1,0 +1,927 @@
+"""Synthetic checkpoint write-guardian tests; no native authority is exercised.
+
+Every runtime, cgroup, pidfd, poll, clock, signal, and descriptor operation used
+by the private watcher is replaced below.  These tests do not create a cgroup,
+process, listener, workload, model, network connection, or device allocation.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import fcntl
+import importlib
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, call, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_guardian_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+guardian = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_guardian_v1")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+
+PRIVATE = "SYNTHETIC-PRIVATE-PAYLOAD"
+PARENT_IDENTITY = (1, 11, 0o20000, 1)
+BROKER_IDENTITY = (2, 22, 0o20000, 1)
+CHANGED_IDENTITY = (9, 99, 0o20000, 1)
+EXPECTED_FALSE_FLAGS = {
+    "broker_origin_verified", "broker_receipt_verified", "broker_reaped",
+    "listener_origin_verified", "release_reader_exclusive_verified",
+    "release_writer_exclusive_verified", "release_channel_origin_verified",
+    "release_consumed_verified", "release_atomic_with_liveness_verified",
+    "native_write_enforcement_verified", "worker_exit_success_verified",
+    "guardian_death_containment", "host_admission_verified", "execution_permitted",
+    "real_import_permitted", "gate_5_complete", "training_authorized",
+    "production_eligible", "retry_allowed",
+}
+
+
+class ReleaseSendTests(unittest.TestCase):
+    def test_release_socket_properties_require_exact_linux_options(self):
+        calls = []
+
+        def getsockopt(fd, level, option, value_pointer, size_pointer):
+            calls.append((fd, level, option))
+            value = ctypes.cast(value_pointer, ctypes.POINTER(ctypes.c_int)).contents
+            size = ctypes.cast(size_pointer, ctypes.POINTER(ctypes.c_uint32)).contents
+            self.assertEqual(size.value, ctypes.sizeof(ctypes.c_int))
+            value.value = (guardian.AF_UNIX if option == guardian.SO_DOMAIN
+                           else guardian.SOCK_SEQPACKET)
+            return 0
+
+        call = Mock(side_effect=getsockopt)
+        library = types.SimpleNamespace(getsockopt=call)
+        with patch.object(guardian, "_libc", return_value=library):
+            self.assertEqual(guardian._socket_properties(97), (
+                guardian.AF_UNIX, guardian.SOCK_SEQPACKET,
+            ))
+        self.assertEqual(calls, [
+            (97, guardian.SOL_SOCKET, guardian.SO_DOMAIN),
+            (97, guardian.SOL_SOCKET, guardian.SO_TYPE),
+        ])
+
+    def test_fixed_release_uses_per_call_nonblocking_no_sigpipe_flags(self):
+        send = Mock(return_value=1)
+        library = types.SimpleNamespace(send=send)
+        with patch.object(guardian, "_libc", return_value=library):
+            self.assertEqual(guardian._send_release(97), 1)
+        send.assert_called_once()
+        descriptor, pointer, size, flags = send.call_args.args
+        self.assertEqual((descriptor, size, flags), (
+            97, 1, guardian.MSG_DONTWAIT | guardian.MSG_NOSIGNAL,
+        ))
+        self.assertEqual(ctypes.string_at(pointer, size), guardian.RELEASE_TOKEN)
+        self.assertEqual(send.argtypes, [
+            ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+        ])
+        self.assertIs(send.restype, ctypes.c_ssize_t)
+
+
+class WriteGuardianTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.now = 1_000_000_000
+        self.deadline = 1_200_000_000
+        self.parent_pid = 1234
+        self.parent_fd = 71
+        self.borrowed_broker_fd = 83
+        self.broker_fd = 89
+        self.release_fd = 97
+        self.lease = object.__new__(guardian.CgroupLease)
+        self.snapshots = [1, 0]
+        self.identities = {
+            self.parent_fd: PARENT_IDENTITY,
+            self.borrowed_broker_fd: BROKER_IDENTITY,
+            self.broker_fd: BROKER_IDENTITY,
+        }
+        self.identity_sequences = {}
+        self.dead_fds = set()
+        self.zero_signal_counts = {}
+        self.dead_on_zero_call = {}
+        self.signal_errors = {}
+
+        self.runtime = self.enterContext(patch.object(
+            guardian.frozen, "_runtime_check",
+            side_effect=lambda: self.events.append("runtime"),
+        ))
+        self.valid_signals = self.enterContext(patch.object(
+            guardian.signal, "valid_signals",
+            return_value={guardian.signal.SIGPIPE, guardian.signal.SIGTERM},
+        ))
+        self.sigpipe = self.enterContext(patch.object(
+            guardian.signal, "getsignal", return_value=guardian.signal.SIG_IGN,
+        ))
+        self.verify = self.enterContext(patch.object(
+            guardian.CgroupLease, "verify_limits",
+            side_effect=lambda: self.events.append("verify"),
+        ))
+        self.snapshot = self.enterContext(patch.object(
+            guardian.CgroupLease, "snapshot", side_effect=self.snapshot_value,
+        ))
+        self.lease_kill = self.enterContext(patch.object(guardian.CgroupLease, "kill"))
+        self.lease_close = self.enterContext(patch.object(guardian.CgroupLease, "close"))
+        self.retire = self.enterContext(patch.object(
+            guardian.frozen, "_retire",
+            side_effect=lambda lease, **options: self.events.append(
+                ("retire", lease, options)),
+        ))
+        self.identity = self.enterContext(patch.object(
+            guardian.frozen, "_pidfd_identity", side_effect=self.identity_value,
+        ))
+        self.fcntl = self.enterContext(patch.object(
+            guardian.fcntl, "fcntl", side_effect=self.fcntl_value,
+        ))
+        self.fstat = self.enterContext(patch.object(
+            guardian.os, "fstat", side_effect=self.fstat_value,
+        ))
+        self.socket_properties = self.enterContext(patch.object(
+            guardian, "_socket_properties",
+            return_value=(guardian.AF_UNIX, guardian.SOCK_SEQPACKET),
+        ))
+        self.ppid = self.enterContext(patch.object(
+            guardian.os, "getppid", return_value=self.parent_pid,
+        ))
+        self.pidfd_open = self.enterContext(patch.object(
+            guardian.os, "pidfd_open", side_effect=self.pidfd_value, create=True,
+        ))
+        self.close = self.enterContext(patch.object(
+            guardian.os, "close", side_effect=self.close_value,
+        ))
+        self.write = self.enterContext(patch.object(
+            guardian, "_send_release", side_effect=self.write_value,
+        ))
+        self.raw_write = self.enterContext(patch.object(
+            guardian.os, "write", side_effect=AssertionError("SYNTHETIC-RAW-WRITE"),
+        ))
+        self.pidfd_signal = self.enterContext(patch.object(
+            guardian.signal, "pidfd_send_signal", side_effect=self.signal_value, create=True,
+        ))
+        self.poller = Mock()
+        self.poller.register.side_effect = self.register_value
+        self.poller.poll.side_effect = self.poll_value
+        self.poll = self.enterContext(patch.object(
+            guardian.select, "poll", return_value=self.poller,
+        ))
+        self.clock = self.enterContext(patch.object(
+            guardian.time, "monotonic_ns", side_effect=self.clock_value,
+        ))
+        # Tripwires for prohibited fallbacks.  Pidfd and cgroup operations above
+        # are doubled separately, so neither bare-PID signaling nor arbitrary
+        # filesystem access can silently enter these tests.
+        self.real_open = self.enterContext(patch.object(
+            guardian.os, "open", side_effect=AssertionError("SYNTHETIC-REAL-OPEN"),
+        ))
+        self.numeric_kill = self.enterContext(patch.object(
+            guardian.os, "kill", side_effect=AssertionError("SYNTHETIC-NUMERIC-KILL"),
+        ))
+
+    def tearDown(self):
+        self.real_open.assert_not_called()
+        self.raw_write.assert_not_called()
+        self.numeric_kill.assert_not_called()
+        self.lease_kill.assert_not_called()
+        self.lease_close.assert_not_called()
+        self.assertFalse(guardian._WATCH_LOCK.locked())
+        for invocation in self.close.call_args_list:
+            self.assertNotEqual(invocation.args[0], self.borrowed_broker_fd)
+
+    def snapshot_value(self):
+        value = self.snapshots.pop(0) if self.snapshots else 1
+        result = {"populated": value} if type(value) is int else value
+        self.events.append(("snapshot", result))
+        return result
+
+    def identity_value(self, descriptor):
+        self.events.append(("identity", descriptor))
+        sequence = self.identity_sequences.get(descriptor)
+        if sequence:
+            value = sequence.pop(0) if len(sequence) > 1 else sequence[0]
+        else:
+            value = self.identities.get(descriptor, CHANGED_IDENTITY)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def fcntl_value(self, descriptor, operation, *arguments):
+        self.events.append(("fcntl", descriptor, operation, *arguments))
+        if operation == fcntl.F_DUPFD_CLOEXEC:
+            self.assertEqual((descriptor, arguments), (self.borrowed_broker_fd, (3,)))
+            return self.broker_fd
+        self.assertEqual(descriptor, self.release_fd)
+        if operation == fcntl.F_GETFD:
+            return fcntl.FD_CLOEXEC
+        self.assertEqual(operation, fcntl.F_GETFL)
+        return guardian.os.O_RDWR
+
+    def fstat_value(self, descriptor):
+        self.events.append(("fstat", descriptor))
+        self.assertEqual(descriptor, self.release_fd)
+        return types.SimpleNamespace(
+            st_dev=3, st_ino=33, st_mode=stat.S_IFSOCK | 0o600, st_uid=0, st_gid=0,
+        )
+
+    def pidfd_value(self, pid, flags):
+        self.events.append(("pidfd_open", pid, flags))
+        return self.parent_fd
+
+    def close_value(self, descriptor):
+        self.events.append(("close", descriptor))
+
+    def write_value(self, descriptor):
+        self.events.append("release")
+        self.assertEqual(descriptor, self.release_fd)
+        return len(guardian.RELEASE_TOKEN)
+
+    def signal_value(self, descriptor, number, info, flags):
+        self.events.append(("signal", descriptor, number, info, flags))
+        error = self.signal_errors.get((descriptor, number))
+        if error is not None:
+            raise error
+        if number == 0:
+            count = self.zero_signal_counts.get(descriptor, 0) + 1
+            self.zero_signal_counts[descriptor] = count
+            if count >= self.dead_on_zero_call.get(descriptor, sys.maxsize):
+                raise ProcessLookupError(PRIVATE)
+        if descriptor in self.dead_fds:
+            raise ProcessLookupError(PRIVATE)
+
+    def register_value(self, descriptor, flags):
+        self.events.append(("register", descriptor, flags))
+
+    def poll_value(self, milliseconds):
+        self.events.append(("poll", milliseconds))
+        self.now += milliseconds * 1_000_000
+        return []
+
+    def clock_value(self):
+        self.events.append(("clock", self.now))
+        return self.now
+
+    def watch(self, **changes):
+        options = {
+            "expected_parent_pid": self.parent_pid,
+            "broker_pidfd": self.borrowed_broker_fd,
+            "release_fd": self.release_fd,
+            "deadline_ns": self.deadline,
+            "cleanup_timeout_ms": 100,
+        }
+        options.update(changes)
+        return guardian._watch_admitted_once(self.lease, **options)
+
+    def error(self, code, **changes):
+        with self.assertRaises(guardian.WriteGuardianError) as caught:
+            self.watch(**changes)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertNotIn(PRIVATE, repr(caught.exception))
+
+    def assert_retired_once(self, timeout=100):
+        self.retire.assert_called_once_with(
+            self.lease, cleanup_timeout_ms=timeout,
+        )
+
+    def assert_fd_closed_once(self, descriptor):
+        self.assertEqual(sum(entry == call(descriptor)
+                             for entry in self.close.call_args_list), 1)
+
+    def assert_fd_not_closed(self, descriptor):
+        self.assertNotIn(call(descriptor), self.close.call_args_list)
+
+    def assert_report(self, report, reason, *, released=True, parent_bound=True,
+                      parent_closed=True):
+        expected = {
+            "schema": guardian.SCHEMA,
+            "reason": reason,
+            "release_sent": released,
+            "release_fd_bound": True,
+            "release_fd_closed": True,
+            "workload_retired": True,
+            "broker_pidfd_bound": True,
+            "broker_stop_attempted": True,
+            "borrowed_broker_pidfd_closed": False,
+            "owned_broker_pidfd_closed": True,
+            "parent_pidfd_bound": parent_bound,
+            "parent_pidfd_closed": parent_closed,
+            **dict.fromkeys(guardian.FALSE_FLAGS, False),
+        }
+        self.assertEqual(report, expected)
+        self.assert_retired_once()
+
+    def test_import_is_inert_and_public_entrypoint_is_closed(self):
+        ml_roots = guardian.frozen.ML_ROOTS
+        self.assertFalse(any(name.split(".", 1)[0] in ml_roots
+                             for name in IMPORT_ADDITIONS))
+        with self.assertRaises(guardian.WriteGuardianError) as caught:
+            guardian.watch_write_guardian(
+                lease=self.lease, broker_pidfd=self.broker_fd,
+                deadline_ns=self.deadline, approval=True,
+            )
+        self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.runtime.assert_not_called()
+        self.verify.assert_not_called()
+        self.identity.assert_not_called()
+        self.pidfd_signal.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_error_vocabulary_is_fixed_and_private_free(self):
+        for value in (PRIVATE, None, True, {}, "not-a-code"):
+            error = guardian.WriteGuardianError(value)
+            self.assertEqual(error.code, "guardian_failed")
+            self.assertEqual(error.args, ("guardian_failed",))
+            self.assertNotIn(PRIVATE, repr(error))
+
+    def test_runtime_denial_precedes_argument_and_authority_checks(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        self.lease = object()
+        self.error(
+            "runtime_rejected", expected_parent_pid=True, broker_pidfd=True,
+            release_fd=True, deadline_ns=0, cleanup_timeout_ms=0,
+        )
+        self.runtime.assert_called_once_with()
+        self.verify.assert_not_called()
+        self.snapshot.assert_not_called()
+        self.identity.assert_not_called()
+        self.pidfd_open.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_sigpipe_must_be_ignored_before_any_authority_is_acquired(self):
+        self.sigpipe.return_value = guardian.signal.SIG_DFL
+        self.error("runtime_rejected")
+        self.verify.assert_not_called()
+        self.snapshot.assert_not_called()
+        self.fstat.assert_not_called()
+        self.identity.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_callable_signal_handler_is_rejected_before_authority(self):
+        self.sigpipe.side_effect = lambda number: (
+            (lambda *_arguments: None)
+            if number == guardian.signal.SIGTERM else guardian.signal.SIG_IGN
+        )
+        self.error("runtime_rejected")
+        self.verify.assert_not_called()
+        self.snapshot.assert_not_called()
+        self.identity.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_argument_types_and_bounds_are_exact(self):
+        invalid = {
+            "expected_parent_pid": (None, True, 1, -1, 2**31, 1234.0),
+            "broker_pidfd": (None, True, 2, -1, 83.0),
+            "release_fd": (None, True, 2, -1, 83, 97.0),
+            "deadline_ns": (None, True, 0, -1, 2**63, 1.0),
+            "cleanup_timeout_ms": (None, True, 0, -1, 10_001, 1.0),
+        }
+        for field, values in invalid.items():
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.error("invalid_arguments", **{field: value})
+        self.verify.assert_not_called()
+        self.snapshot.assert_not_called()
+        self.identity.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_exact_cgroup_lease_type_is_required(self):
+        self.lease = object()
+        self.error("invalid_arguments")
+
+        class LeaseSubclass(guardian.CgroupLease):
+            pass
+
+        self.lease = object.__new__(LeaseSubclass)
+        self.error("invalid_arguments")
+        self.verify.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_failed_lease_verification_grants_no_cleanup_authority(self):
+        self.verify.side_effect = OSError(PRIVATE)
+        self.error("guardian_failed")
+        self.snapshot.assert_not_called()
+        self.identity.assert_not_called()
+        self.pidfd_signal.assert_not_called()
+        self.retire.assert_not_called()
+
+    def test_invalid_initial_population_retires_once_without_broker_authority(self):
+        self.snapshots = [True]
+        self.error("lease_rejected")
+        self.assert_retired_once()
+        self.identity.assert_not_called()
+        self.pidfd_signal.assert_not_called()
+        self.write.assert_not_called()
+
+    def test_release_fd_must_be_a_root_owned_cloexec_read_write_socket(self):
+        def wrong_access_mode(descriptor, operation, *arguments):
+            if operation == fcntl.F_DUPFD_CLOEXEC:
+                return self.fcntl_value(descriptor, operation, *arguments)
+            if operation == fcntl.F_GETFD:
+                return fcntl.FD_CLOEXEC
+            return guardian.os.O_WRONLY
+
+        self.fcntl.side_effect = wrong_access_mode
+        self.error("release_rejected")
+        self.assert_retired_once()
+        self.identity.assert_not_called()
+        self.write.assert_not_called()
+        self.assert_fd_not_closed(self.release_fd)
+
+    def test_release_socket_must_be_local_seqpacket_not_network(self):
+        self.socket_properties.return_value = (2, guardian.SOCK_SEQPACKET)
+        self.error("release_rejected")
+        self.assert_retired_once()
+        self.identity.assert_not_called()
+        self.write.assert_not_called()
+        self.assert_fd_not_closed(self.release_fd)
+
+    def test_failed_broker_duplication_closes_only_adopted_release_fd(self):
+        def duplicate_failure(descriptor, operation, *arguments):
+            if operation == fcntl.F_DUPFD_CLOEXEC:
+                raise OSError(PRIVATE)
+            return self.fcntl_value(descriptor, operation, *arguments)
+
+        self.fcntl.side_effect = duplicate_failure
+        self.error("broker_binding_rejected")
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.release_fd)
+        self.assert_fd_not_closed(self.broker_fd)
+        self.assert_fd_not_closed(self.borrowed_broker_fd)
+        self.pidfd_signal.assert_not_called()
+
+    def test_failed_duplicate_identity_closes_fresh_owned_duplicate_once(self):
+        self.identity_sequences[self.broker_fd] = [OSError(PRIVATE)]
+        self.error("broker_binding_rejected")
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.release_fd)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_not_closed(self.borrowed_broker_fd)
+        self.pidfd_signal.assert_not_called()
+
+    def test_broker_must_be_live_and_generation_stable_before_ownership(self):
+        self.identity_sequences[self.broker_fd] = [BROKER_IDENTITY, CHANGED_IDENTITY]
+        self.error("cleanup_unconfirmed")
+        self.assert_retired_once()
+        self.assertEqual(self.identity.call_args_list,
+                         [call(self.borrowed_broker_fd), call(self.broker_fd),
+                          call(self.broker_fd), call(self.broker_fd)])
+        self.pidfd_signal.assert_called_once_with(self.broker_fd, 0, None, 0)
+        self.pidfd_open.assert_not_called()
+        self.write.assert_not_called()
+        self.assertFalse(any(entry.args[1] == guardian.signal.SIGKILL
+                             for entry in self.pidfd_signal.call_args_list))
+
+    def test_dead_broker_never_becomes_owned_or_signaled_for_cleanup(self):
+        self.dead_fds.add(self.broker_fd)
+        self.error("broker_binding_rejected")
+        self.assert_retired_once()
+        self.pidfd_signal.assert_called_once_with(self.broker_fd, 0, None, 0)
+        self.pidfd_open.assert_not_called()
+        self.write.assert_not_called()
+
+    def test_parent_loss_precedes_an_already_exhausted_deadline(self):
+        self.ppid.return_value = 1
+        self.now = self.deadline
+        report = self.watch()
+        self.assert_report(
+            report, "parent_lost", released=False,
+            parent_bound=False, parent_closed=False,
+        )
+        self.clock.assert_not_called()
+        self.pidfd_open.assert_not_called()
+        self.write.assert_not_called()
+
+    def test_expired_deadline_stops_before_parent_pidfd_open(self):
+        self.now = self.deadline
+        report = self.watch()
+        self.assert_report(
+            report, "deadline_exhausted", released=False,
+            parent_bound=False, parent_closed=False,
+        )
+        self.pidfd_open.assert_not_called()
+        self.write.assert_not_called()
+
+    def test_parent_exit_during_pidfd_open_has_no_descriptor_to_close(self):
+        self.pidfd_open.side_effect = ProcessLookupError(PRIVATE)
+        report = self.watch()
+        self.assert_report(
+            report, "parent_lost", released=False,
+            parent_bound=False, parent_closed=False,
+        )
+        self.assert_fd_not_closed(self.parent_fd)
+        self.write.assert_not_called()
+
+    def test_initial_parent_identity_failure_closes_fresh_owned_fd_once(self):
+        self.identity_sequences[self.parent_fd] = [OSError(PRIVATE)]
+        self.error("parent_binding_rejected")
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.parent_fd)
+        self.write.assert_not_called()
+
+    def test_parent_change_after_open_prevents_release_but_closes_owned_fd(self):
+        self.ppid.side_effect = [self.parent_pid, 1]
+        report = self.watch()
+        self.assert_report(
+            report, "parent_lost", released=False,
+            parent_bound=False, parent_closed=True,
+        )
+        self.write.assert_not_called()
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_dead_parent_pidfd_prevents_release(self):
+        self.dead_fds.add(self.parent_fd)
+        report = self.watch()
+        self.assert_report(
+            report, "parent_lost", released=False,
+            parent_bound=False, parent_closed=True,
+        )
+        self.write.assert_not_called()
+
+    def test_deadline_precedes_broker_loss_immediately_before_release(self):
+        self.clock.side_effect = [self.now, self.deadline]
+        self.dead_on_zero_call[self.broker_fd] = 2
+        report = self.watch()
+        self.assert_report(
+            report, "deadline_exhausted", released=False,
+            parent_closed=True,
+        )
+        self.assertEqual(self.zero_signal_counts[self.broker_fd], 1)
+        self.write.assert_not_called()
+
+    def test_broker_loss_immediately_before_release_is_terminal(self):
+        self.dead_on_zero_call[self.broker_fd] = 2
+        report = self.watch()
+        self.assert_report(
+            report, "broker_lost", released=False,
+            parent_closed=True,
+        )
+        self.write.assert_not_called()
+
+    def test_priority_is_rechecked_after_release_descriptor_validation(self):
+        calls = 0
+
+        def lose_everything_during_validation(descriptor):
+            nonlocal calls
+            calls += 1
+            value = self.fstat_value(descriptor)
+            if calls == 2:
+                self.ppid.return_value = 1
+                self.now = self.deadline
+                self.dead_fds.add(self.broker_fd)
+            return value
+
+        self.fstat.side_effect = lose_everything_during_validation
+        report = self.watch()
+        self.assert_report(report, "parent_lost", released=False)
+        self.write.assert_not_called()
+
+    def test_natural_empty_releases_once_and_returns_closed_summary(self):
+        report = self.watch()
+        self.assert_report(report, "workload_empty")
+        self.write.assert_called_once_with(self.release_fd)
+        mask = guardian.select.POLLIN | guardian.select.POLLHUP | guardian.select.POLLERR
+        self.assertEqual(self.poller.register.call_args_list, [
+            call(self.parent_fd, mask), call(self.broker_fd, mask),
+        ])
+        self.assert_fd_closed_once(self.release_fd)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_closed_once(self.parent_fd)
+        self.assertEqual(
+            [entry for entry in self.pidfd_signal.call_args_list
+             if entry.args[1] == guardian.signal.SIGKILL],
+            [call(self.broker_fd, guardian.signal.SIGKILL, None, 0)],
+        )
+        self.assertLess(self.events.index("release"),
+                        self.events.index(("snapshot", {"populated": 0})))
+        self.assertLess(self.events.index(("snapshot", {"populated": 0})),
+                        next(index for index, value in enumerate(self.events)
+                             if type(value) is tuple and value[0] == "retire"))
+
+    def test_short_release_write_is_rejected_once_then_cleanup_runs_once(self):
+        self.write.side_effect = None
+        self.write.return_value = 0
+        self.error("release_rejected")
+        self.write.assert_called_once_with(self.release_fd)
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.release_fd)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_closed_once(self.parent_fd)
+        self.assertEqual(len([
+            entry for entry in self.pidfd_signal.call_args_list
+            if entry.args[1] == guardian.signal.SIGKILL
+        ]), 1)
+
+    def test_release_write_exception_is_consumed_without_retry(self):
+        self.write.side_effect = RuntimeError(PRIVATE)
+        self.error("release_rejected")
+        self.write.assert_called_once_with(self.release_fd)
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.release_fd)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_sigpipe_change_before_release_write_fails_without_writing(self):
+        calls = 0
+
+        def change_sigpipe(number):
+            nonlocal calls
+            if number == guardian.signal.SIGPIPE:
+                calls += 1
+                return guardian.signal.SIG_IGN if calls < 3 else guardian.signal.SIG_DFL
+            return guardian.signal.SIG_IGN
+
+        self.sigpipe.side_effect = change_sigpipe
+        self.error("release_rejected")
+        self.write.assert_not_called()
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.release_fd)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_release_descriptor_change_after_write_is_cleanup_unconfirmed(self):
+        calls = 0
+
+        def changed_after_write(descriptor):
+            nonlocal calls
+            calls += 1
+            value = self.fstat_value(descriptor)
+            if calls >= 3:
+                value.st_ino = 44
+            return value
+
+        self.fstat.side_effect = changed_after_write
+        self.error("cleanup_unconfirmed")
+        self.write.assert_called_once_with(self.release_fd)
+        self.assert_fd_not_closed(self.release_fd)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_release_close_failure_is_cleanup_unconfirmed_without_retry(self):
+        def fail_release_close(descriptor):
+            self.events.append(("close", descriptor))
+            if descriptor == self.release_fd:
+                raise OSError(PRIVATE)
+
+        self.close.side_effect = fail_release_close
+        self.error("cleanup_unconfirmed")
+        self.write.assert_called_once_with(self.release_fd)
+        self.assertEqual(sum(entry == call(self.release_fd)
+                             for entry in self.close.call_args_list), 1)
+        self.assert_fd_closed_once(self.broker_fd)
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_parent_loss_wins_over_deadline_broker_loss_and_empty_after_release(self):
+        def lose_everything(descriptor):
+            result = self.write_value(descriptor)
+            self.ppid.return_value = 1
+            self.now = self.deadline
+            self.dead_fds.add(self.broker_fd)
+            return result
+
+        self.write.side_effect = lose_everything
+        report = self.watch()
+        self.assert_report(report, "parent_lost")
+        self.assertEqual(self.snapshot.call_count, 1)
+
+    def test_deadline_wins_over_broker_loss_and_empty_after_release(self):
+        def exhaust_and_lose_broker(descriptor):
+            result = self.write_value(descriptor)
+            self.now = self.deadline
+            self.dead_fds.add(self.broker_fd)
+            return result
+
+        self.write.side_effect = exhaust_and_lose_broker
+        report = self.watch()
+        self.assert_report(report, "deadline_exhausted")
+        self.assertEqual(self.snapshot.call_count, 1)
+
+    def test_broker_loss_wins_over_apparently_empty_workload(self):
+        def lose_broker(descriptor):
+            result = self.write_value(descriptor)
+            self.dead_fds.add(self.broker_fd)
+            return result
+
+        self.write.side_effect = lose_broker
+        report = self.watch()
+        self.assert_report(report, "broker_lost")
+        self.assertEqual(self.snapshot.call_count, 1)
+
+    def test_empty_snapshot_rechecks_parent_loss_before_committing_reason(self):
+        calls = 0
+
+        def lose_parent_during_snapshot():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.ppid.return_value = 1
+                self.now = self.deadline
+                self.dead_fds.add(self.broker_fd)
+                return {"populated": 0}
+            return {"populated": 1}
+
+        self.snapshot.side_effect = lose_parent_during_snapshot
+        report = self.watch()
+        self.assert_report(report, "parent_lost")
+        self.assertEqual(self.snapshot.call_count, 2)
+
+    def test_empty_snapshot_rechecks_deadline_then_broker_before_empty(self):
+        calls = 0
+
+        def exhaust_during_snapshot():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                self.now = self.deadline
+                self.dead_fds.add(self.broker_fd)
+                return {"populated": 0}
+            return {"populated": 1}
+
+        self.snapshot.side_effect = exhaust_during_snapshot
+        report = self.watch()
+        self.assert_report(report, "deadline_exhausted")
+        self.assertEqual(self.snapshot.call_count, 2)
+
+    def test_waits_are_bounded_by_one_unchanged_absolute_deadline(self):
+        self.snapshots = [1] * 8
+        report = self.watch()
+        self.assert_report(report, "deadline_exhausted")
+        nonzero = [entry for entry in self.poller.poll.call_args_list
+                   if entry.args[0] != 0]
+        self.assertEqual(nonzero, [call(50), call(50), call(50), call(50)])
+        self.assertTrue(any(entry == call(0) for entry in self.poller.poll.call_args_list))
+        self.assertTrue(all(0 <= entry.args[0] <= 50
+                            for entry in self.poller.poll.call_args_list))
+        self.assertEqual(self.now, self.deadline)
+        self.write.assert_called_once_with(self.release_fd)
+
+    def test_valid_parent_poll_event_is_resolved_by_priority_recheck(self):
+        self.snapshots = [1, 1]
+
+        def parent_event(milliseconds):
+            if milliseconds == 0:
+                return []
+            self.now += milliseconds * 1_000_000
+            self.dead_fds.add(self.parent_fd)
+            return [(self.parent_fd, guardian.select.POLLHUP)]
+
+        self.poller.poll.side_effect = parent_event
+        report = self.watch()
+        self.assert_report(report, "parent_lost")
+        self.assertEqual(self.poller.poll.call_args_list[-1], call(50))
+
+    def test_parent_pidfd_event_is_loss_even_while_signal_zero_succeeds(self):
+        self.snapshots = [1, 1]
+        self.poller.poll.side_effect = None
+        self.poller.poll.return_value = [(self.parent_fd, guardian.select.POLLIN)]
+        report = self.watch()
+        self.assert_report(report, "parent_lost", released=False)
+        self.assertNotIn(self.parent_fd, self.dead_fds)
+
+    def test_broker_pidfd_event_is_loss_even_while_signal_zero_succeeds(self):
+        self.snapshots = [1, 1]
+        self.poller.poll.side_effect = None
+        self.poller.poll.return_value = [(self.broker_fd, guardian.select.POLLHUP)]
+        report = self.watch()
+        self.assert_report(report, "broker_lost", released=False)
+        self.assertNotIn(self.broker_fd, self.dead_fds)
+
+    def test_broker_readiness_after_empty_snapshot_wins_while_signal_zero_succeeds(self):
+        polls = 0
+
+        def ready_after_snapshot(milliseconds):
+            nonlocal polls
+            self.assertEqual(milliseconds, 0)
+            polls += 1
+            if polls == 3:
+                return [(self.broker_fd, guardian.select.POLLIN)]
+            return []
+
+        self.poller.poll.side_effect = ready_after_snapshot
+        report = self.watch()
+        self.assert_report(report, "broker_lost")
+        self.assertEqual(self.snapshot.call_count, 2)
+        self.assertNotIn(self.broker_fd, self.dead_fds)
+
+    def test_wrong_poll_descriptor_fails_closed(self):
+        self.snapshots = [1, 1]
+        self.poller.poll.side_effect = None
+        self.poller.poll.return_value = [(999, guardian.select.POLLIN)]
+        self.error("guardian_failed")
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_invalid_poll_flags_fail_closed(self):
+        self.snapshots = [1, 1]
+        mask = guardian.select.POLLIN | guardian.select.POLLHUP | guardian.select.POLLERR
+        self.poller.poll.side_effect = None
+        self.poller.poll.return_value = [(self.parent_fd, mask | (1 << 20))]
+        self.error("guardian_failed")
+        self.assert_retired_once()
+
+    def test_poll_exception_fails_closed_without_retry(self):
+        self.snapshots = [1, 1]
+        self.poller.poll.side_effect = OSError(PRIVATE)
+        self.error("guardian_failed")
+        self.poller.poll.assert_called_once_with(0)
+        self.assert_retired_once()
+
+    def test_changed_broker_generation_is_never_sigkilled(self):
+        self.identity_sequences[self.broker_fd] = [
+            BROKER_IDENTITY, BROKER_IDENTITY,
+            CHANGED_IDENTITY, CHANGED_IDENTITY,
+        ]
+        self.error("cleanup_unconfirmed")
+        self.assert_retired_once()
+        self.assertFalse(any(entry.args[1] == guardian.signal.SIGKILL
+                             for entry in self.pidfd_signal.call_args_list))
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_changed_parent_generation_is_not_closed(self):
+        self.identity_sequences[self.parent_fd] = [
+            PARENT_IDENTITY, PARENT_IDENTITY, CHANGED_IDENTITY,
+        ]
+        self.error("cleanup_unconfirmed")
+        self.assert_retired_once()
+        self.assert_fd_not_closed(self.parent_fd)
+        self.assertEqual(len([
+            entry for entry in self.pidfd_signal.call_args_list
+            if entry.args[1] == guardian.signal.SIGKILL
+        ]), 1)
+
+    def test_retire_failure_is_cleanup_unconfirmed_and_not_retried(self):
+        self.retire.side_effect = OSError(PRIVATE)
+        self.error("cleanup_unconfirmed")
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.parent_fd)
+        self.assertEqual(len([
+            entry for entry in self.pidfd_signal.call_args_list
+            if entry.args[1] == guardian.signal.SIGKILL
+        ]), 1)
+
+    def test_broker_stop_failure_is_cleanup_unconfirmed_and_not_retried(self):
+        self.signal_errors[(self.broker_fd, guardian.signal.SIGKILL)] = OSError(PRIVATE)
+        self.error("cleanup_unconfirmed")
+        self.assert_retired_once()
+        self.assertEqual(len([
+            entry for entry in self.pidfd_signal.call_args_list
+            if entry.args[1] == guardian.signal.SIGKILL
+        ]), 1)
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_parent_close_failure_overrides_operational_error_without_retry(self):
+        self.write.side_effect = RuntimeError(PRIVATE)
+
+        def fail_parent_close(descriptor):
+            self.events.append(("close", descriptor))
+            if descriptor == self.parent_fd:
+                raise OSError(PRIVATE)
+
+        self.close.side_effect = fail_parent_close
+        self.error("cleanup_unconfirmed")
+        self.write.assert_called_once_with(self.release_fd)
+        self.assert_retired_once()
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_nested_watch_is_reentry_and_does_not_duplicate_authority(self):
+        observed = []
+
+        def nested(descriptor):
+            result = self.write_value(descriptor)
+            with self.assertRaises(guardian.WriteGuardianError) as caught:
+                self.watch()
+            observed.append(caught.exception.code)
+            return result
+
+        self.write.side_effect = nested
+        report = self.watch()
+        self.assert_report(report, "workload_empty")
+        self.assertEqual(observed, ["reentry"])
+        self.verify.assert_called_once_with()
+        self.write.assert_called_once_with(self.release_fd)
+        self.assertEqual(self.runtime.call_count, 2)
+        self.assert_fd_closed_once(self.parent_fd)
+
+    def test_report_aggregates_only_explicit_false_nonclaims(self):
+        report = self.watch()
+        self.assert_report(report, "workload_empty")
+        self.assertEqual(set(guardian.FALSE_FLAGS), EXPECTED_FALSE_FLAGS)
+        self.assertTrue(all(report[name] is False for name in EXPECTED_FALSE_FLAGS))
+        self.assertFalse({"pid", "parent_pid", "broker_pid", "path", "listener_fd"}
+                         & set(report))
+        self.assertEqual(set(report), {
+            "schema", "reason", "release_sent", "release_fd_bound",
+            "release_fd_closed", "workload_retired", "broker_pidfd_bound",
+            "broker_stop_attempted", "borrowed_broker_pidfd_closed",
+            "owned_broker_pidfd_closed",
+            "parent_pidfd_bound", "parent_pidfd_closed", *EXPECTED_FALSE_FLAGS,
+        })
+
+
+if __name__ == "__main__":
+    unittest.main()

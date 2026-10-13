@@ -1,0 +1,423 @@
+"""Real pinned commands, schemas and binding composition; no native/SSH execution."""
+
+import importlib
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("run_sft_vm_native_binding_detached_v1")
+d = importlib.import_module("run_sft_vm_native_binding_delivery_v1")
+fixtures = importlib.import_module("tests.test_sft_vm_runtime_qualification_v1")
+binding_fixtures = importlib.import_module("tests.test_sft_vm_native_binding_v1")
+
+
+def observation(request):
+    return dict(
+        schema="lumi.vm-native-binding.v0.1",
+        attempt=m.ATTEMPT,
+        trust_scope=m.TRUST,
+        binding_sha256=d.expected_binding_sha(request),
+        census_before=dict(processes=2, threads=3, vanished=0, bytes_read=400),
+        census_after=dict(processes=2, threads=3, vanished=0, bytes_read=400),
+        **{k: True for k in m.TRUE},
+        **{k: False for k in m.FALSE},
+    )
+
+
+class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.f = fixtures.ChannelTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.t = 0
+        self.responses = [
+            self.response("dispatch_requested"),
+            self.response("running"),
+            self.response("returned"),
+            self.response("completed"),
+        ]
+
+        def exchange(*_):
+            value = self.responses.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return json.dumps(value).encode()
+
+        self.exchange = self.enterContext(
+            patch.object(d.sender, "pipe_exchange", side_effect=exchange)
+        )
+
+    def response(self, state):
+        return m.result(
+            state,
+            observation=observation(self.f.request) if state in {"returned", "completed"} else None,
+        )
+
+    def wait(self, seconds):
+        self.t += seconds
+
+    def call(self, **changes):
+        kwargs = dict(
+            deadline=350,
+            host_deadline=14400,
+            remaining_control_bytes=4000000,
+            clock=lambda: self.t,
+            wait=self.wait,
+        )
+        return d._bind_prepared_channel_once(
+            self.f.root / "native-binding",
+            self.f.binding,
+            self.f.key,
+            self.f.root,
+            self.f.config_pin,
+            self.f.hosts_pin,
+            self.f.request,
+            **(kwargs | changes),
+        )
+
+    def saved(self):
+        return json.loads((self.f.root / "native-binding/result.json").read_bytes())
+
+    def test_actual_pins_commands_original_hash_and_byte_accounting(self):
+        report = self.call()
+        self.assertTrue(report["binding_delivery_completed"])
+        self.assertFalse(report["host_admitted"])
+        self.assertIn("--max-tunnel-duration 120", (self.f.root / "ssh_config").read_text())
+        total = 0
+        for call in self.exchange.call_args_list:
+            argv, body, timeout = call.args
+            self.assertLessEqual(timeout, 80)
+            self.assertIn("signal.alarm(75)", argv[-1])
+            self.assertEqual(body, d.SOURCE.read_bytes() + d.BINDER.read_bytes())
+            total += len(body) + len(argv[-1].encode())
+        self.assertEqual(report["control_content_bytes_charged"], total)
+        self.assertEqual(
+            report["observation"]["binding_sha256"], d.expected_binding_sha(self.f.request)
+        )
+
+    def test_service_outlives_tunnel_without_repeating_dispatch(self):
+        self.responses = (
+            [self.response("dispatch_requested")]
+            + [self.response("running")] * 14
+            + [self.response("returned"), self.response("completed")]
+        )
+        self.assertTrue(self.call()["binding_delivery_completed"])
+        self.assertGreater(self.t, 120)
+        self.assertEqual(
+            sum("answer=m.dispatch" in c.args[0][-1] for c in self.exchange.call_args_list), 1
+        )
+
+    def test_lost_dispatch_ack_unknown_binding_cancel_once_and_no_retry(self):
+        self.responses = [TimeoutError("do-not-retain"), self.response("cancelled")]
+        with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+            self.call()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(self.exchange.call_count, 2)
+        value = self.saved()
+        self.assertEqual(value["binding_state"], "unknown_after_dispatch")
+        self.assertTrue(value["cancellation_observed"] and value["outer_stop_required_on_failure"])
+        self.assertFalse(value["cancellation_revokes_binding"])
+        self.assertNotIn("do-not-retain", json.dumps(value))
+
+    def test_lost_finish_ack_not_repeated(self):
+        self.responses = [
+            self.response("dispatch_requested"),
+            self.response("returned"),
+            TimeoutError(),
+            self.response("cancelled"),
+        ]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(
+            sum("answer=m.finish" in c.args[0][-1] for c in self.exchange.call_args_list), 1
+        )
+        self.assertEqual(self.saved()["binding_state"], "unknown_after_dispatch")
+
+    def test_cancellation_failure_keeps_stop_requirement(self):
+        self.responses = [TimeoutError(), TimeoutError()]
+        with self.assertRaises(ValueError):
+            self.call()
+        value = self.saved()
+        self.assertFalse(value["cancellation_observed"])
+        self.assertTrue(value["outer_stop_required_on_failure"])
+
+    def test_foreign_binding_pin_rejected_before_finish(self):
+        value = self.response("returned")
+        value["observation"]["binding_sha256"] = "f" * 64
+        self.responses = [self.response("dispatch_requested"), value, self.response("cancelled")]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(self.saved()["finish_attempted"])
+
+    def test_changed_terminal_result_rejected(self):
+        value = self.response("completed")
+        value["observation"]["census_after"]["threads"] = 4
+        self.responses = [
+            self.response("dispatch_requested"),
+            self.response("returned"),
+            value,
+            self.response("cancelled"),
+        ]
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_bounded_polls(self):
+        self.responses = (
+            [self.response("dispatch_requested")]
+            + [self.response("running")] * 24
+            + [self.response("cancelled")]
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.saved()["status_reads"], 24)
+        self.assertEqual(self.exchange.call_count, 26)
+
+    def test_deadline_and_budget_reject_before_exchange(self):
+        for kw in (
+            {"deadline": 300},
+            {"deadline": 351},
+            {"deadline": float("nan")},
+            {"host_deadline": 11400},
+            {"remaining_control_bytes": True},
+            {"remaining_control_bytes": 1000},
+        ):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                self.call(**kw)
+        self.exchange.assert_not_called()
+
+    def test_known_host_drift_rejected_before_exchange(self):
+        (self.f.root / "known_hosts").write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_unknown_reply_fields_and_false_claims_rejected(self):
+        for changes in (
+            {"host_admitted": True},
+            {"binding_may_exist": False},
+            {"exception": "raw"},
+            {"retry_allowed": True},
+        ):
+            with self.assertRaises(ValueError):
+                d.state_reply(self.response("completed") | changes, {"completed"})
+
+    def test_no_raw_or_inconsistent_census_report(self):
+        for changes in (
+            {"threads": True},
+            {"threads": 8193},
+            {"processes": 4097},
+            {"vanished": 3},
+            {"bytes_read": 16 * 1024**2},
+            {"source": "raw"},
+        ):
+            value = observation(self.f.request)
+            value["census_before"].update(changes)
+            with self.assertRaises(ValueError):
+                m.validate_report(value)
+
+    def test_local_save_failure_after_commit_attempts_cancel_and_raises(self):
+        save = d.sender.delivery.connection.issuer.base.save
+
+        def fail(path, value):
+            save(path, value)
+            if path.name == "result.json":
+                raise OSError("lost-local-ack")
+
+        self.responses.append(self.response("cancelled"))
+        with patch.object(d.sender.delivery.connection.issuer.base, "save", side_effect=fail):
+            with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+                self.call()
+        # Already written success evidence is preserved, but raised error is authoritative.
+        self.assertTrue((self.f.root / "native-binding/result.json").exists())
+        failed = json.loads((self.f.root / "native-binding/failure.json").read_bytes())
+        self.assertEqual(failed["binding_state"], "unknown_after_dispatch")
+        self.assertTrue(failed["outer_stop_required_on_failure"])
+        self.assertEqual(self.exchange.call_count, 5)
+
+
+class NativeTests(unittest.TestCase):
+    def setUp(self):
+        self.f = binding_fixtures.BindingTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.root = self.f.temp / "detached-binding"
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.enterContext(patch.object(m, "FULLSIZE", self.f.root))
+        self.module = binding_fixtures.m
+        self.b = self.f.b
+        self.b.owned, self.b.command = Mock(), Mock()
+        self.b.encode = lambda value: json.dumps(
+            value, sort_keys=True, separators=(",", ":")
+        ).encode()
+        self.b.show.return_value = b"not-found"
+        self.h = types.SimpleNamespace(
+            cgroup_empty=Mock(return_value=True), observe=Mock(), validate_terminal=Mock()
+        )
+        self.context = self.enterContext(
+            patch.object(m, "context", return_value=(self.module, self.b, self.h, self.f.request))
+        )
+        self.raw, self.receiver = d.BINDER.read_bytes(), d.SOURCE.read_bytes()
+
+    def dispatch(self):
+        return m.dispatch(self.f.expected, self.f.request, self.raw, self.receiver)
+
+    def serve(self):
+        self.b.show.return_value = b"active"
+        with (
+            patch.object(m, "__file__", str(self.root / "receiver.py")),
+            patch.object(m, "binder", return_value=self.module),
+            patch.object(m, "read_root", side_effect=lambda p, *a: p.read_bytes()),
+            patch.object(
+                m,
+                "sys",
+                types.SimpleNamespace(
+                    platform="linux",
+                    version_info=(3, 12),
+                    flags=types.SimpleNamespace(isolated=1),
+                    dont_write_bytecode=True,
+                ),
+            ),
+            patch.object(m.os, "geteuid", return_value=0),
+            patch.object(m.os, "getegid", return_value=0),
+            patch.object(m.signal, "signal"),
+            patch.object(m.signal, "alarm"),
+        ):
+            # Original binder's generated units are inactive; this service is active.
+            self.b.show.side_effect = lambda unit, field: (
+                b"active" if unit == m.UNIT else b"inactive"
+            )
+            m._serve_once()
+        self.b.show.side_effect = None
+        self.b.show.return_value = b"inactive"
+
+    def test_authentic_source_pins_and_service_limits(self):
+        self.assertEqual(m.sha(self.receiver), d.SOURCE_SHA)
+        self.assertEqual(m.sha(self.raw), m.BINDER_SHA)
+        self.assertEqual(m.binder(self.raw).TRUST, m.TRUST)
+        self.dispatch()
+        argv = self.b.command.call_args.args[0]
+        for item in (
+            "--property=RuntimeMaxSec=240",
+            "--property=Restart=no",
+            "--property=FailureAction=poweroff",
+            "--property=MemorySwapMax=0",
+        ):
+            self.assertIn(item, argv)
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_called_once()
+
+    def test_actual_binder_service_and_reaping_composition(self):
+        self.dispatch()
+        self.serve()
+        self.h.observe.return_value = dict(ActiveState="active", SubState="exited")
+        result = m.finish(self.f.expected, self.f.request, self.raw)
+        self.assertEqual(result["state"], "completed")
+        self.assertEqual(
+            result["observation"]["binding_sha256"], d.expected_binding_sha(self.f.request)
+        )
+        self.assertTrue((self.root / "reaped.json").exists())
+        self.assertTrue((self.f.root / "controller/binding.sha256").exists())
+        with self.assertRaises(FileExistsError):
+            m.finish(self.f.expected, self.f.request, self.raw)
+
+    def test_source_and_mac_boundary_fail_before_host_reads(self):
+        with self.assertRaises(ValueError):
+            m.binder(self.raw + b"x")
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "read_root") as read:
+            with self.assertRaises(ValueError):
+                m._serve_once()
+            read.assert_not_called()
+
+    def test_insufficient_original_time_never_dispatches(self):
+        self.b.boot_time = lambda: 14300 - 11315 - 260
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.assertFalse(self.root.exists())
+
+    def test_renewed_request_never_dispatches(self):
+        with self.assertRaises(ValueError):
+            m.dispatch(
+                self.f.expected,
+                dict(self.f.request, host_deadline_boottime=14400),
+                self.raw,
+                self.receiver,
+            )
+        self.assertFalse(self.root.exists())
+
+    def test_existing_unit_or_prior_binding_never_dispatches(self):
+        self.b.show.return_value = b"loaded"
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.show.return_value = b"not-found"
+        (self.f.root / "controller/binding.sha256").write_bytes(b"prior")
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_not_called()
+
+    def test_lost_systemd_ack_retains_marker_never_retries(self):
+        self.b.command.side_effect = TimeoutError("lost")
+        with self.assertRaises(TimeoutError):
+            self.dispatch()
+        self.assertTrue((self.root / "dispatch.json").exists())
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_called_once()
+
+    def test_binding_failure_fixed_error_preserves_native_marker(self):
+        self.dispatch()
+        self.f.ready._inspect_same_host.side_effect = ValueError("private-diagnostics")
+        with self.assertRaisesRegex(ValueError, "native_binding_service_failed"):
+            self.serve()
+        value = (self.root / "failed.json").read_text()
+        self.assertNotIn("private-diagnostics", value)
+        self.assertTrue((self.f.root / "native-admission/started.json").exists())
+
+    def test_cancellation_after_commit_does_not_claim_revocation(self):
+        self.dispatch()
+        self.serve()
+        prior = (self.f.root / "controller/binding.json").read_bytes()
+        value = m.cancel(self.f.expected, self.f.request, self.raw)
+        self.assertTrue(value["binding_may_exist"])
+        self.assertEqual((self.f.root / "controller/binding.json").read_bytes(), prior)
+        with self.assertRaises(FileExistsError):
+            m.cancel(self.f.expected, self.f.request, self.raw)
+        with self.assertRaises(ValueError):
+            m.status(self.f.expected, self.f.request, self.raw)
+
+    def test_empty_cgroup_and_terminal_required(self):
+        self.dispatch()
+        self.h.observe.return_value = dict(ActiveState="activating", SubState="start")
+        self.assertEqual(m.status(self.f.expected, self.f.request, self.raw)["state"], "running")
+        self.h.observe.return_value = dict(ActiveState="failed", SubState="failed")
+        self.h.validate_terminal.side_effect = ValueError("failed")
+        with self.assertRaises(ValueError):
+            m.status(self.f.expected, self.f.request, self.raw)
+        self.h.validate_terminal.side_effect = None
+        self.h.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            m.status(self.f.expected, self.f.request, self.raw)
+
+    def test_binding_and_local_report_readback_drift_rejected(self):
+        self.dispatch()
+        self.serve()
+        self.h.observe.return_value = dict(ActiveState="active", SubState="exited")
+        path = self.f.root / "controller/binding.sha256"
+        path.chmod(0o600)
+        path.write_bytes(b"f" * 64 + b"\n")
+        with self.assertRaises(ValueError):
+            m.status(self.f.expected, self.f.request, self.raw)
+
+    def test_public_entries_closed(self):
+        for module in (m, d):
+            with self.assertRaises(ValueError):
+                module.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,293 @@
+import ast
+import importlib.util
+import io
+import json
+import os
+import stat
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def load(name, source):
+    spec = importlib.util.spec_from_file_location(name, ROOT / source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+m = load("setup_inputs_v3_test", "scripts/stage_sft_vm_setup_inputs_v3.py")
+
+
+class SetupInputsTests(unittest.TestCase):
+    def setUp(self):
+        self.members = {
+            "lumi-bootstrap-input/example.py": b"source",
+            "lumi-cpu-input/runtime-lock.json": b"{}",
+            "lumi-sdk-input/sdk-release.tar": b"synthetic",
+        }
+        self.files = {name: (name, m.sha(raw), 64) for name, raw in self.members.items()}
+
+    def custom_tar(self, names, kind=tarfile.REGTYPE, mode=0o400):
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for name in names:
+                item = tarfile.TarInfo(name)
+                item.type, item.mode = kind, mode
+                if kind == tarfile.REGTYPE:
+                    raw = self.members.get(name, b"unknown")
+                    item.size = len(raw)
+                    archive.addfile(item, io.BytesIO(raw))
+                else:
+                    item.linkname = "/outside"
+                    archive.addfile(item)
+        return output.getvalue()
+
+    def test_exact_synthetic_roundtrip(self):
+        with patch.object(m, "FILES", self.files):
+            raw = m.pack(self.members)
+            self.assertEqual(m.unpack(raw, m.sha(raw)), self.members)
+
+    def test_bad_digest_and_oversize_rejected_before_tar_parser(self):
+        with patch.object(m.tarfile, "open") as parser:
+            for raw, pin in ((b"invalid", "0" * 64), (b"x" * (m.CAP + 1), "0" * 64)):
+                with self.assertRaises(ValueError):
+                    m.unpack(raw, pin)
+            parser.assert_not_called()
+
+    def test_unknown_absolute_traversal_duplicate_and_missing_members_rejected(self):
+        names = sorted(self.members)
+        cases = [
+            names + ["/etc/evil"],
+            names + ["../evil"],
+            names + ["extra"],
+            names + [names[0]],
+            names[:-1],
+        ]
+        with patch.object(m, "FILES", self.files):
+            for case in cases:
+                raw = self.custom_tar(case)
+                with self.subTest(case=case), self.assertRaises(ValueError):
+                    m.unpack(raw, m.sha(raw))
+
+    def test_links_directory_and_wrong_permissions_rejected(self):
+        with patch.object(m, "FILES", self.files):
+            for kind, mode in [
+                (tarfile.SYMTYPE, 0o400),
+                (tarfile.LNKTYPE, 0o400),
+                (tarfile.DIRTYPE, 0o400),
+                (tarfile.REGTYPE, 0o600),
+            ]:
+                raw = self.custom_tar(sorted(self.members), kind, mode)
+                with self.assertRaises(ValueError):
+                    m.unpack(raw, m.sha(raw))
+
+    def test_content_tampering_and_trailing_hidden_data_rejected(self):
+        with patch.object(m, "FILES", self.files):
+            raw = m.pack(self.members)
+            modified = m.pack(self.members | {next(iter(self.members)): b"tampered"})
+            for body in (modified, raw + b"hidden", raw + raw):
+                with self.assertRaises(ValueError):
+                    m.unpack(body, m.sha(body))
+
+    def test_original_setup_and_storage_pins_fully_covered(self):
+        setup = load("input_setup_pins", "scripts/run_sft_vm_setup_sequence_v1.py")
+        storage = load("input_storage_pins", "scripts/check_sft_vm_storage_v1.py")
+        for name, pin in setup.PINS.items():
+            self.assertEqual(m.FILES["lumi-bootstrap-input/" + name][1], pin)
+        for name, (pin, cap) in setup.EXTERNAL.items():
+            self.assertEqual(m.FILES[name.removeprefix("/opt/")][1:], (pin, cap))
+        self.assertEqual(m.FILES[str(storage.SETUP).removeprefix("/opt/")][1], storage.SETUP_SHA)
+        self.assertEqual(m.FILES["lumi-bootstrap-input/source-controls.tar"][1], setup.WORKER_SHA)
+        self.assertEqual(m.FILES["lumi-bootstrap-input/root-controller.tar"][1], setup.ROOT_SHA)
+        self.assertEqual(len(m.FILES), 18)
+
+    def test_actual_existing_controls_assemble_and_roundtrip_without_execution(self):
+        raw = m.assemble()
+        members = m.unpack(raw, m.sha(raw))
+        self.assertEqual(len(members), 18)
+        self.assertLess(len(raw), m.CAP)
+        self.assertEqual(raw, m.pack(members))
+        self.assertFalse(m.receipt(raw)["host_admitted"])
+
+    def test_only_policy_and_bootstrap_members_replaced(self):
+        old = load("old_setup_inputs_v2_comparison", "scripts/stage_sft_vm_setup_inputs_v2.py")
+        replaced_old = {
+            "lumi-bootstrap-input/build_sft_vm_network_expiry_v1.py",
+            "lumi-bootstrap-input/run_sft_vm_network_bootstrap_v1.py",
+        }
+        replaced_new = {
+            "lumi-bootstrap-input/build_sft_vm_network_expiry_v3.py",
+            "lumi-bootstrap-input/run_sft_vm_network_bootstrap_v2.py",
+        }
+        self.assertEqual(set(old.FILES) - set(m.FILES), replaced_old)
+        self.assertEqual(set(m.FILES) - set(old.FILES), replaced_new)
+        for name in set(m.FILES) & set(old.FILES):
+            self.assertEqual(m.FILES[name], old.FILES[name])
+        self.assertEqual(m.CAP, old.CAP)
+        self.assertEqual(m.DIRECTORIES, old.DIRECTORIES)
+        network = load("bundle_network_v2_pins", "scripts/run_sft_vm_network_bootstrap_v2.py")
+        for name, digest in network.PINS.items():
+            self.assertEqual(m.FILES["lumi-bootstrap-input/" + name][1], digest)
+
+    def test_stage_parser_and_boundary_algorithms_unchanged(self):
+        def functions(version):
+            tree = ast.parse((ROOT / f"scripts/stage_sft_vm_setup_inputs_{version}.py").read_text())
+            return {
+                node.name: ast.dump(node)
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name != "receipt"
+            }
+
+        self.assertEqual(functions("v2"), functions("v3"))
+
+    def test_actual_built_release_exactly_matches_manifest(self):
+        root = ROOT / "artifacts/lumi-vm-setup-inputs-release-v0.3"
+        receipt = json.loads(m.read(root / "build.json", 4096))
+        raw = m.read(root / "setup-inputs.tar", m.CAP)
+        self.assertEqual(raw, m.assemble())
+        self.assertEqual(receipt, m.receipt(raw) | {"native_staged": False, "uploaded": False})
+
+    def test_read_rejects_symlink_hardlink_and_size_overrun(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            original = root / "source"
+            m.write(original, b"example")
+            with self.assertRaises(ValueError):
+                m.read(original, 2)
+            alias = root / "alias"
+            alias.symlink_to(original)
+            with self.assertRaises(ValueError):
+                m.read(alias, 64)
+            os.link(original, root / "hardlink")
+            with self.assertRaises(ValueError):
+                m.read(original, 64)
+
+    def test_prepare_is_exclusive_and_readback_verified(self):
+        raw = m.pack(self.members)
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(m, "assemble", return_value=raw),
+        ):
+            root = Path(directory).resolve() / "fresh"
+            result = m.prepare(root)
+            self.assertEqual((root / "setup-inputs.tar").read_bytes(), raw)
+            self.assertFalse(result["uploaded"])
+            self.assertFalse(result["native_staged"])
+            with self.assertRaises(FileExistsError):
+                m.prepare(root)
+
+    def test_public_entry_closed_and_mac_rejected_before_machine_read(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "read") as read:
+            with self.assertRaises(ValueError):
+                m.boundary("a" * 32)
+            read.assert_not_called()
+
+    def staged_fixture(self, callback, actual=False):
+        raw = m.assemble() if actual else m.pack(self.members)
+        files = m.FILES if actual else self.files
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            opt, receipts = root / "opt", root / "receipts"
+            opt.mkdir()
+            receipts.mkdir()
+            real_lstat = Path.lstat
+
+            def root_identity(path, *args, **kwargs):
+                values = list(real_lstat(path, *args, **kwargs))
+                values[4:6] = [0, 0]  # Native ownership alone is mocked.
+                return os.stat_result(values)
+
+            with (
+                patch.object(m, "FILES", files),
+                patch.object(m, "OPT", opt),
+                patch.object(m, "RECEIPTS", receipts),
+                patch.object(m, "boundary"),
+                patch.object(Path, "lstat", root_identity),
+            ):
+                callback(opt, receipts / m.ATTEMPT, raw)
+
+    def test_real_control_archive_stages_with_native_boundary_mocked(self):
+        def check(opt, attempt, raw):
+            result = m._stage_admitted_once(raw, m.sha(raw), "a" * 32)
+            for name, body in m.unpack(raw, m.sha(raw)).items():
+                self.assertEqual(m.read(opt / name, m.FILES[name][2]), body)
+            self.assertEqual(result["files"], 18)
+            self.assertFalse(result["host_admitted"])
+            self.assertTrue((attempt / "result.json").is_file())
+
+        self.staged_fixture(check, actual=True)
+
+    def test_staging_writes_exact_files_readbacks_and_cannot_retry(self):
+        def check(opt, attempt, raw):
+            result = m._stage_admitted_once(raw, m.sha(raw), "a" * 32)
+            for name, body in self.members.items():
+                self.assertEqual((opt / name).read_bytes(), body)
+                self.assertEqual(stat.S_IMODE((opt / name).stat().st_mode), 0o400)
+            self.assertTrue(result["staged_files_readback_match"])
+            self.assertFalse(result["readonly_mounts_established"])
+            self.assertFalse(result["execution_permitted"])
+            self.assertTrue((attempt / "result.json").is_file())
+            with self.assertRaises(ValueError):
+                m._stage_admitted_once(raw, m.sha(raw), "a" * 32)
+
+        self.staged_fixture(check)
+
+    def test_bad_member_blocks_all_stage_writes(self):
+        def check(opt, attempt, raw):
+            with self.assertRaises(ValueError):
+                m._stage_admitted_once(raw, "0" * 64, "a" * 32)
+            self.assertFalse(attempt.exists())
+            self.assertEqual(list(opt.iterdir()), [])
+
+        self.staged_fixture(check)
+
+    def test_existing_destination_or_symlink_preserved(self):
+        def check(opt, attempt, raw):
+            target = opt / m.DIRECTORIES[0]
+            target.symlink_to(opt / "absent", target_is_directory=True)
+            with self.assertRaises(ValueError):
+                m._stage_admitted_once(raw, m.sha(raw), "a" * 32)
+            self.assertTrue(target.is_symlink())
+            self.assertFalse(attempt.exists())
+
+        self.staged_fixture(check)
+
+    def test_failed_stage_preserves_partial_and_raw_text_free_failure(self):
+        def check(opt, attempt, raw):
+            original_write = m.write
+            failed = sorted(self.members)[1]
+
+            def failure(path, body):
+                if path == opt / failed:
+                    raise OSError("secret error must not be recorded")
+                return original_write(path, body)
+
+            with patch.object(m, "write", side_effect=failure):
+                with self.assertRaisesRegex(ValueError, "^setup_input_stage_failed$"):
+                    m._stage_admitted_once(raw, m.sha(raw), "a" * 32)
+            self.assertTrue((opt / sorted(self.members)[0]).is_file())
+            self.assertFalse((attempt / "result.json").exists())
+            value = json.loads((attempt / "failed.json").read_text())
+            self.assertEqual(
+                value,
+                {
+                    "partial_files_preserved": True,
+                    "retry_allowed": False,
+                    "execution_permitted": False,
+                },
+            )
+            with self.assertRaises(ValueError):
+                m._stage_admitted_once(raw, m.sha(raw), "a" * 32)
+
+        self.staged_fixture(check)
+
+
+if __name__ == "__main__":
+    unittest.main()

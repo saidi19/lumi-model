@@ -1,0 +1,92 @@
+# SFT execution status v0.54
+
+Local-only source-contract correction, 2026-09-09. The user approved verifying
+the version lookup and, if supported, a narrow local fix with synthetic tests,
+explicitly without GPU or a new CI run. That scoped work is complete. Nothing
+was staged, committed, pushed, dispatched or retried in this turn.
+
+## Verified contract, without executing the package
+
+Official Transformers tag `v5.15.1` resolves to commit
+`550d7b3834670483a4df436541272c055dc364bf`. Two public source files were read in
+memory, checked against their Git blob IDs, SHA-256 hashed and inspected as AST:
+
+- [Package initialization](https://github.com/huggingface/transformers/blob/550d7b3834670483a4df436541272c055dc364bf/src/transformers/__init__.py):
+  41,736 bytes; Git blob `b932798ab46ec68af25ed41cac93c75e99902d42`;
+  SHA-256 `f6609d7b595627749dc1f51205b504dd63211615f6a6c06cc70a6474d5edd597`.
+- [Lazy-module implementation](https://github.com/huggingface/transformers/blob/550d7b3834670483a4df436541272c055dc364bf/src/transformers/utils/import_utils.py):
+  125,278 bytes; Git blob `dce7cad28fc979c6632be0b1482e18ffba74e1f0`;
+  SHA-256 `ce7371afe0c1705a7f41a7528c590a1a6ae5bf23d9c307bdc19f9fdaedfe15fa`.
+
+Initialization passes the declared version as an extra object to the replacement
+lazy module. Its constructor stores extra objects separately; attribute access
+returns them before any import branch. Thus a valid public version need not
+appear directly in the replacement module dictionary. AST checks confirmed all
+these structural facts without importing or executing either source file.
+
+A minimal independent synthetic module reproduced the old false rejection and
+passed with the corrected lookup. This establishes a real source-contract defect
+in the old dictionary-only accessor. It does not inspect the actual failed image's
+module dictionary, prove byte equality between release-tag files and installed
+wheel members, or prove that subsequent native checks pass. The old diagnostic's
+stale `origin_category=source` remains historical evidence, not a Transformers
+path-origin failure. No old diagnostic or evidence was rewritten.
+
+## Exactly one production expression changed
+
+New, untracked successor `scripts/run_sft_oci_worker_probe_v2.py` differs from
+the frozen v1 by precisely this expression substitution:
+
+```diff
+-str(vars(sys.modules[name]).get("__version__"))
++str(getattr(sys.modules[name], "__version__", None))
+```
+
+Every other byte is identical. In particular, the exact locked equality, `str`
+conversion, missing-value default, failure code, complete installed distribution
+map comparison, module roots, native identities, worker/fixture SHA, counters,
+false flags and existing report schema remain unchanged. There is no metadata
+fallback, accepted missing version, normalization, version range, swallowed
+runtime error, lock change, path allowance or policy relaxation. The fresh v2
+filename and source hash identify the correction; the wire schema did not change.
+
+- Frozen v1: 22,633 bytes,
+  `bed636e8cc08546a6be1b43c00c2f516fdc92dbf907dca674f7fb5aa7b5cb769`.
+- New v2: 22,638 bytes,
+  `b45b04fc9cb93dd2301df0444f2db95666ba4f7a32e8f4d8e28c5b4077314450`.
+- New `tests/test_sft_oci_version_lookup_v2.py`:
+  `855a8712a084fda9fa48eaa319e03d628a79f949a0feab18ff0ec2990000581a`.
+
+Only three local files were added: v2 probe, its test module, and this receipt.
+Existing builders, workflows and diagnostic source bindings still reference
+their frozen versions. The v2 correction is deliberately not wired into a run.
+
+## Verification
+
+- 20 focused tests passed in 0.003s. These cover the eager and lazy contracts,
+  old failure/new success, missing and wrong versions, no cache assumption,
+  exact suffix/case/whitespace behavior, existing string conversion, direct
+  attribute precedence, one selected getter call and exception propagation.
+- Tests bind the standalone synthetic expression to the production predicate
+  structurally and prove that v2 equals frozen v1 with exactly one replacement.
+  Neither the native script nor any subtree of it is compiled or executed.
+- Full selected pure/synthetic/AST regressions: **373 tests passed in 0.379s**,
+  Python `-S -B`, including the 353 prior tests. No ML/native imports.
+- Exact two-file Ruff `E,F,I,B,UP`, line length 100 / Python 3.11 target: passed.
+- Independent read-only diff/test review: no blocking findings.
+- `git diff --quiet HEAD` passed: all previous tracked bytes and index unchanged.
+
+## Remaining boundary
+
+This is a tested local source correction, **not an OCI acceptance result**.
+The only completed diagnostic remains run `34340467851`, with its underlying
+observer failed as recorded in v0.53. No fresh remote observation exists for v2.
+Gate 5 therefore remains partial; acceptance, production eligibility and real
+SFT permission are not granted. A future separately authorized bounded CPU
+acceptance successor must bind this corrected source and preserve the old failed
+evidence before any runtime recovery claim can be made.
+
+No GPU/H100, instance, S3/SSH, software-image/wheel download, real checkpoint/data,
+native probe/builder/fixture execution on the Mac, real-model inference, training,
+registry mutation, seal or promotion occurred. The Mac performed only small
+source edits, source/AST reads, pure synthetic checks and lint.

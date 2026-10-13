@@ -1,0 +1,55 @@
+import contextlib
+import hashlib
+import importlib.util
+import io
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "watchdog_native_test", ROOT / "scripts/probe_sft_vm_watchdog_native_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+class NativeWatchdogPreparationTests(unittest.TestCase):
+    def test_frozen_bootstrap_binding(self):
+        raw = (ROOT / "scripts/run_sft_vm_network_bootstrap_v2.py").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), m.BOOTSTRAP_SHA)
+
+    def test_frozen_policy_binding(self):
+        raw = (ROOT / "scripts/build_sft_vm_network_expiry_v3.py").read_bytes()
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), m.POLICY_SHA)
+
+    def test_mac_rejected_before_input_read(self):
+        with (
+            patch.object(m.sys, "platform", "darwin"),
+            patch.object(Path, "read_bytes", side_effect=AssertionError("unexpected read")) as read,
+            self.assertRaises(AssertionError),
+        ):
+            m.load_bootstrap()
+        read.assert_not_called()
+
+    def test_report_does_not_grant_authority(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            value = m.report({"watchdog_active": True}, "ready_for_deliberate_policy_fault")
+        for name in (
+            "complete_bootstrap_qualified",
+            "host_admitted",
+            "real_4b_import",
+            "gate_5_complete",
+            "gpu_inference_training",
+            "retry_allowed",
+        ):
+            self.assertIs(value[name], False)
+        self.assertTrue(value["synthetic_receipt_only"])
+        for line in output.getvalue().splitlines():
+            self.assertTrue(line.startswith("LUMI_WATCHDOG_PROBE_V1:"))
+            self.assertLess(len(line), 640)
+
+    def test_oversized_report_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            m.report({"oversized": "x" * 9000}, "failed")

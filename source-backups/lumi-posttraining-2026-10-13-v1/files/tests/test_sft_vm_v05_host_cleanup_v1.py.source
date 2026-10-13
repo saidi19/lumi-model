@@ -1,0 +1,197 @@
+"""No SDK calls: exact cleanup state transitions, guardrails, no retry."""
+
+import copy
+import importlib.util
+import tempfile
+import unittest
+from pathlib import Path
+
+PATH = Path(__file__).resolve().parents[1] / "scripts/cleanup_sft_vm_v05_host_resources_v1.py"
+spec = importlib.util.spec_from_file_location("cleanup_under_test", PATH)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class Cloud:
+    def __init__(self):
+        self.rows = {}
+        for group, role, rules in ((m.VM, "vm", ([m.ssh(m.EP)], [m.HTTPS])),
+                                   (m.EP, "endpoint", ([], [m.ssh(m.VM)]))):
+            self.rows[group] = dict(GroupId=group, GroupName=m.KEY_NAME + "-" + role,
+                OwnerId=m.ACCOUNT, VpcId=m.VPC, Tags=[dict(Key="LumiAttempt", Value=m.ATTEMPT)],
+                IpPermissions=copy.deepcopy(rules[0]), IpPermissionsEgress=copy.deepcopy(rules[1]))
+        self.key = dict(KeyPairId="key-0123456789abcdef0", KeyName=m.KEY_NAME, KeyType="ed25519",
+                        PublicKey="synthetic", Tags=[dict(Key="LumiAttempt", Value=m.ATTEMPT)])
+        self.calls, self.writes, self.hook, self.fail, self.uncertain = [], [], None, None, False
+
+    def __getattr__(self, operation):
+        def call(**fields):
+            self.calls.append((operation, fields))
+            if operation in m.WRITES:
+                self.writes.append((operation, fields))
+                if operation == self.fail and not self.uncertain:
+                    raise RuntimeError("do not retain")
+                if operation == "revoke_security_group_ingress":
+                    self.rows[fields["GroupId"]]["IpPermissions"] = []
+                elif operation == "revoke_security_group_egress":
+                    self.rows[fields["GroupId"]]["IpPermissionsEgress"] = []
+                elif operation == "delete_security_group":
+                    del self.rows[fields["GroupId"]]
+                elif operation == "delete_key_pair":
+                    assert fields == {"KeyPairId": "key-0123456789abcdef0"}
+                    self.key = None
+                if operation == self.fail:
+                    raise RuntimeError("uncertain response")
+                return {"Return": True}
+            if operation == "get_caller_identity":
+                result = {"Account": m.ACCOUNT}
+            elif operation == "describe_security_groups":
+                if "GroupIds" in fields:
+                    rows = [self.rows[g] for g in fields["GroupIds"] if g in self.rows]
+                else:
+                    field = ("IpPermissionsEgress" if fields["Filters"][1]["Name"].startswith(
+                        "egress") else "IpPermissions")
+                    rows = [r for r in self.rows.values() if any(
+                        rule.get("UserIdGroupPairs") for rule in r[field])]
+                result = {"SecurityGroups": rows}
+            elif operation == "describe_key_pairs":
+                result = {"KeyPairs": [self.key] if self.key else []}
+            else:
+                result = {dict(describe_instances="Reservations",
+                    describe_network_interfaces="NetworkInterfaces",
+                    describe_security_group_references="SecurityGroupReferenceSet",
+                    describe_security_group_vpc_associations="SecurityGroupVpcAssociations"
+                    )[operation]: []}
+            result = copy.deepcopy(result)
+            if self.hook:
+                self.hook(operation, fields, result)
+            return result
+        return call
+
+
+class CleanupTests(unittest.TestCase):
+    def setup_worker(self, cloud=None, clock=lambda: 0):
+        self.cloud, self.saved = cloud or Cloud(), {}
+        def save(name, value):
+            self.assertNotIn(name, self.saved)
+            self.saved[name] = copy.deepcopy(value)
+        return m.Cleanup(dict(sts=self.cloud, ec2=self.cloud), save, b"synthetic",
+                         lambda raw: raw, clock=clock)
+
+    def test_success_exact_five_mutations_within_budget_and_no_key_text_saved(self):
+        worker = self.setup_worker()
+        worker.run()
+        self.assertEqual(worker.stage, "cleanup_verified")
+        self.assertLessEqual(worker.calls, 64)
+        self.assertEqual(worker.writes, 5)
+        self.assertEqual(self.cloud.rows, {})
+        self.assertIsNone(self.cloud.key)
+        self.assertNotIn(b"synthetic", m.canonical(self.saved))
+        self.assertEqual([op for op, _ in self.cloud.writes], [
+            "revoke_security_group_ingress", "revoke_security_group_egress",
+            "delete_security_group", "delete_security_group", "delete_key_pair"])
+        self.assertEqual([f["Filters"][0]["Name"] for op, f in self.cloud.calls
+                          if op == "describe_instances"][:2], ["tag:LumiAttempt", "key-name"])
+
+    def test_initial_drift_and_missing_resources_block_all_writes(self):
+        for change in (
+            lambda c: c.rows[m.VM].update(OwnerId="000000000000"),
+            lambda c: c.rows[m.VM].update(VpcId="wrong"),
+            lambda c: c.rows[m.VM].update(Tags=[]),
+            lambda c: c.rows[m.EP].update(GroupName="wrong"),
+            lambda c: c.rows[m.EP]["IpPermissions"].append(m.HTTPS),
+            lambda c: c.rows.pop(m.EP),
+            lambda c: setattr(c, "key", None),
+            lambda c: c.key.update(PublicKey="wrong"),
+            lambda c: c.key.update(Tags=[]),
+            lambda c: c.key.update(KeyType="rsa"),
+        ):
+            cloud = Cloud()
+            change(cloud)
+            worker = self.setup_worker(cloud)
+            with self.assertRaises((ValueError, KeyError)):
+                worker.run()
+            self.assertEqual(cloud.writes, [])
+
+    def test_dependencies_and_pagination_block_all_writes(self):
+        cases = [
+            ("describe_instances", "Reservations",
+             [{"Instances": [{"State": {"Name": "running"}}]}]),
+            ("describe_network_interfaces", "NetworkInterfaces", [{"NetworkInterfaceId": "eni-x"}]),
+            ("describe_security_group_references", "SecurityGroupReferenceSet", [{}]),
+            ("describe_security_group_vpc_associations", "SecurityGroupVpcAssociations", [{}]),
+            ("describe_key_pairs", "NextToken", "opaque"),
+            ("get_caller_identity", "Account", "000000000000"),
+        ]
+        for operation, key, value in cases:
+            cloud = Cloud()
+            def hook(op, fields, result, operation=operation, key=key, value=value):
+                if op == operation:
+                    result[key] = value
+            cloud.hook = hook
+            worker = self.setup_worker(cloud)
+            with self.assertRaises(ValueError):
+                worker.run()
+            self.assertEqual(cloud.writes, [])
+
+    def test_external_reference_rejected(self):
+        worker = self.setup_worker()
+        def hook(op, fields, value):
+            if op == "describe_security_groups" and "Filters" in fields:
+                value["SecurityGroups"].append({"GroupId": "sg-unrelated"})
+        self.cloud.hook = hook
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(self.cloud.writes, [])
+
+    def test_each_mutation_failure_or_uncertainty_stops_without_retry(self):
+        for fail in m.WRITES:
+            for uncertain in (False, True):
+                worker = self.setup_worker()
+                self.cloud.fail, self.cloud.uncertain = fail, uncertain
+                with self.assertRaises(ValueError):
+                    worker.run()
+                self.assertEqual(sum(op == fail for op, _ in self.cloud.writes), 1)
+                self.assertIn("uncertain-mutation", self.saved)
+
+    def test_rechecks_between_mutations(self):
+        worker = self.setup_worker()
+        def hook(op, fields, value):
+            if self.cloud.writes and op == "describe_instances":
+                value["Reservations"] = [{"Instances": [{"State": {"Name": "pending"}}]}]
+        self.cloud.hook = hook
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(len(self.cloud.writes), 1)
+
+    def test_caps_prevent_dispatch(self):
+        worker = self.setup_worker()
+        worker.calls = 64
+        with self.assertRaises(ValueError):
+            worker.call("describe_key_pairs")
+        self.assertEqual(self.cloud.calls, [])
+        with self.assertRaises(ValueError):
+            worker.account_response({"too_large": "x" * 262144})
+        worker = self.setup_worker()
+        worker.response_bytes = 2097152
+        with self.assertRaises(ValueError):
+            worker.account_response({})
+        worker = self.setup_worker()
+        worker.clock = lambda: 600
+        with self.assertRaises(ValueError):
+            worker.run()
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_exclusive_protected_journal_and_write_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "attempt"
+            journal = m.Journal(output)
+            journal.save("started", {"fixed": True})
+            self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+            self.assertEqual((output / "started.json").stat().st_mode & 0o777, 0o600)
+            with self.assertRaises(FileExistsError):
+                m.Journal(output)
+            with self.assertRaises(FileExistsError):
+                journal.save("started", {})
+            with self.assertRaises(ValueError):
+                journal.save("oversized", {"value": "x" * 262144})

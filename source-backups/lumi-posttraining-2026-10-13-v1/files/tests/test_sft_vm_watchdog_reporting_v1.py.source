@@ -1,0 +1,206 @@
+"""Report delivery/retention regressions, using generated console data only."""
+
+import ast
+import contextlib
+import copy
+import gzip
+import hashlib
+import importlib.util
+import io
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def module(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / (name + ".py"))
+    value = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(value)
+    return value
+
+
+p = module("probe_sft_vm_watchdog_native_v3")
+c = module("execute_sft_vm_watchdog_native_v2")
+old = module("execute_sft_vm_watchdog_native_v1")
+
+
+def frames(checks=None, status="watchdog_failure_receipt_verified"):
+    stream = io.StringIO()
+    sink = Mock()
+    sink.write.side_effect = stream.write
+    opener = Mock()
+    opener.return_value.__enter__ = Mock(return_value=sink)
+    opener.return_value.__exit__ = Mock(return_value=False)
+    with patch.object(p, "open", opener, create=True):
+        value = p.report(dict.fromkeys(c.CHECKS, True) if checks is None else checks, status)
+    return stream.getvalue(), value, opener, sink
+
+
+def result(native):
+    return dict(
+        native_report=native,
+        stopped_observed=True,
+        terminated_verified=True,
+        volumes_absent_verified=True,
+        security_group_absent_verified=True,
+    )
+
+
+class ReportingTests(unittest.TestCase):
+    def test_direct_console_delivery_and_flush_without_stdout(self):
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            text, expected, opener, sink = frames()
+        opener.assert_called_once_with("/dev/console", "w")
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertGreater(sink.write.call_count, 1)
+        self.assertEqual(sink.flush.call_count, sink.write.call_count)
+        self.assertEqual(c.decode_native_console(text), expected)
+        for line in text.splitlines():
+            self.assertLess(len(line), 640)
+
+    def test_short_console_write_fails_without_retry(self):
+        sink = Mock(write=Mock(return_value=0))
+        opener = Mock()
+        opener.return_value.__enter__ = Mock(return_value=sink)
+        opener.return_value.__exit__ = Mock(return_value=False)
+        with patch.object(p, "open", opener, create=True), self.assertRaises(AssertionError):
+            p.report({}, "failed")
+        opener.assert_called_once()
+        sink.write.assert_called_once()
+        sink.flush.assert_not_called()
+
+    def test_console_open_failure_does_not_retry_or_fallback_to_stdout(self):
+        stdout = io.StringIO()
+        with (
+            contextlib.redirect_stdout(stdout),
+            patch.object(p, "open", side_effect=OSError("synthetic"), create=True) as opened,
+            self.assertRaises(OSError),
+        ):
+            p.report({}, "failed")
+        opened.assert_called_once()
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_previous_decoder_dropped_valid_failure_now_preserved(self):
+        text, expected, _, _ = frames(
+            {"identity": True, "failed_stage": "policy_installed"}, "failed"
+        )
+        self.assertIsNone(old.decode_native_console(text))
+        self.assertEqual(c.decode_native_console(text), expected)
+        self.assertFalse(c.qualified_result(result(expected)))
+
+    def test_failure_overrides_success_in_either_order(self):
+        good = frames()[0]
+        bad, expected, _, _ = frames({"failed_stage": "shutdown_receipt"}, "failed")
+        for text in (good + bad, bad + good):
+            self.assertEqual(c.decode_native_console(text), expected)
+
+    def test_unknown_stage_and_unallowlisted_text_rejected(self):
+        for checks in (
+            {"failed_stage": "PRIVATE_SENTINEL"},
+            {"failed_stage": "identity", "exception": "PRIVATE_SENTINEL"},
+            {"failed_stage": "identity", "identity": "PRIVATE_SENTINEL"},
+            {"failed_stage": {}},
+            {"failed_stage": "identity", "identity": 1},
+        ):
+            self.assertIsNone(c.decode_native_console(frames(checks, "failed")[0]))
+
+    def test_empty_or_partial_console_is_not_success_or_failure(self):
+        text = frames()[0]
+        for raw in ("", text.splitlines()[1] + "\n", None, "x" * 262145):
+            self.assertIsNone(c.decode_native_console(raw))
+
+    def test_qualified_success_requires_independent_stop_and_all_cleanup(self):
+        value = result(frames()[1])
+        self.assertTrue(c.qualified_result(value))
+        for key in (
+            "stopped_observed",
+            "terminated_verified",
+            "volumes_absent_verified",
+            "security_group_absent_verified",
+        ):
+            self.assertFalse(c.qualified_result(dict(value, **{key: False})))
+        self.assertFalse(c.qualified_result(dict(value, controller_error="synthetic")))
+
+    def test_authority_or_missing_check_never_qualifies(self):
+        native = frames()[1]
+        for changed in (
+            dict(native, host_admitted=True),
+            dict(native, checks={"identity": True}),
+            dict(native, status="ready_for_deliberate_policy_fault"),
+        ):
+            self.assertFalse(c.qualified_result(result(changed)))
+
+    def test_probe_changes_only_report_delivery(self):
+        before = ast.parse((ROOT / "scripts/probe_sft_vm_watchdog_native_v2.py").read_text())
+        after = ast.parse((ROOT / "scripts/probe_sft_vm_watchdog_native_v3.py").read_text())
+        for tree in (before, after):
+            tree.body = [
+                node
+                for node in tree.body
+                if not (isinstance(node, ast.FunctionDef) and node.name == "report")
+            ]
+        self.assertEqual(ast.dump(before), ast.dump(after))
+
+    def test_frozen_evidence_preserved_and_successor_fresh(self):
+        evidence = json.loads(
+            (ROOT / "evidence/lumi-vm-watchdog-native-outcome-v0.1.json").read_bytes()
+        )
+        for name, digest in evidence["artifact_bindings"].items():
+            self.assertEqual(hashlib.sha256((ROOT / name).read_bytes()).hexdigest(), digest)
+        self.assertNotEqual(c.OUT, old.OUT)
+        self.assertNotEqual(c.APPROVAL, old.APPROVAL)
+
+    def test_bound_bundle_fits_and_contains_exact_source_bytes(self):
+        for name in c.BINDINGS:
+            c.bound_source(name)
+        raw, _ = c.cloud_config()
+        self.assertLessEqual(len(raw), 16384)
+        config = json.loads(raw.split(b"\n", 1)[1])
+        import base64
+
+        bundle = json.loads(gzip.decompress(base64.b64decode(config["write_files"][0]["content"])))
+        self.assertIn("probe_sft_vm_watchdog_native_v3.py", bundle)
+        for name, source in bundle.items():
+            self.assertEqual(hashlib.sha256(source.encode()).hexdigest(), c.BINDINGS[name])
+        compile(config["runcmd"][0][-1], "seed", "exec")
+
+    def test_missing_approval_stops_before_any_transport_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(c, "APPROVAL", Path(directory) / "missing.json"):
+                with self.assertRaisesRegex(RuntimeError, "fresh_watchdog_approval_required"):
+                    c.main()
+
+    def test_late_failure_is_saved_even_after_legacy_transport_saved_success(self):
+        saved = {}
+        transport = types.SimpleNamespace(
+            aws=Mock(side_effect=AssertionError("network forbidden")),
+            visible=Mock(side_effect=AssertionError("network forbidden")),
+            save=lambda name, value: saved.setdefault(name, copy.deepcopy(value)),
+        )
+
+        def main():
+            success = transport.decode_native_console(frames()[0])
+            transport.save("native-report.json", success)
+            transport.decode_native_console(
+                frames({"failed_stage": "shutdown_receipt"}, "failed")[0]
+            )
+            transport.save("result.json", result(success))
+
+        transport.main = main
+        spec = types.SimpleNamespace(loader=types.SimpleNamespace(exec_module=lambda value: None))
+        with (
+            patch.object(c, "validate_approval", return_value="synthetic-approval"),
+            patch.object(c.importlib.util, "spec_from_file_location", return_value=spec),
+            patch.object(c.importlib.util, "module_from_spec", return_value=transport),
+        ):
+            c.main()
+        self.assertEqual(saved["native-report.json"]["status"], "watchdog_failure_receipt_verified")
+        self.assertEqual(saved["native-failure-report.json"]["status"], "failed")
+        self.assertEqual(saved["result.json"]["native_report"]["status"], "failed")
+        self.assertFalse(saved["result.json"]["native_watchdog_qualified"])

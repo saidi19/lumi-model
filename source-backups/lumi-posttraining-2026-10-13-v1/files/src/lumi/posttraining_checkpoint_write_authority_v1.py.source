@@ -1,0 +1,234 @@
+"""One-shot endpoint authority transfer from a finalized write topology.
+
+The frozen topology owns socket objects so it can close inherited copies.  A
+final role component instead needs sole numeric-descriptor ownership because
+the guardian, worker protocol and listener adoption may consume or close that
+descriptor.  Merely borrowing ``fileno()`` would leave the socket object able
+to close a later descriptor reuse.
+
+This adapter detaches exactly one endpoint from a topology that has already
+reached a final role.  It consumes the topology entry before detach, retains an
+ambiguous object or raw descriptor on failure, and returns a private authority
+object.  That object can either transfer its descriptor once or identity-check
+and close it once.  No public path is opened, and local tests replace the
+runtime, socket, descriptor, process-identity and clock boundaries; they create
+no process or thread.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import threading
+
+from . import posttraining_checkpoint_write_topology_v1 as frozen
+
+SCHEMA = "lumi.checkpoint-write-endpoint-authority.v0.1"
+FINAL_STAGES = frozenset({"controller", "broker", "worker", "guardian_watch"})
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "owner_mismatch", "reentry", "already_attempted", "already_failed",
+    "topology_rejected", "descriptor_changed", "transfer_failed",
+    "cleanup_unconfirmed",
+})
+FALSE_FLAGS = (
+    "endpoint_peer_authenticated", "endpoint_exclusivity_verified",
+    "process_topology_verified", "native_transfer_qualified",
+    "native_write_enforcement_verified", "bootstrap_integration_verified",
+    "execution_permitted", "real_4b_import", "gate_5_complete",
+    "training_authorized", "production_eligible", "retry_allowed",
+)
+_BUILD = object()
+
+
+class EndpointAuthorityError(ValueError):
+    def __init__(self, code="transfer_failed"):
+        self.code = (
+            code if type(code) is str and code in ERROR_CODES
+            else "transfer_failed"
+        )
+        super().__init__(self.code)
+
+
+def _need(condition, code="transfer_failed"):
+    if not condition:
+        raise EndpointAuthorityError(code) from None
+
+
+def transfer_topology_endpoint(**_arguments):
+    """No topology, endpoint name, approval or receipt opens this path."""
+    raise EndpointAuthorityError("host_guard_not_bound") from None
+
+
+def _runtime():
+    try:
+        frozen._runtime()
+        _need(hasattr(fcntl, "F_GETFD") and hasattr(fcntl, "F_GETFL"),
+              "runtime_rejected")
+    except BaseException:
+        raise EndpointAuthorityError("runtime_rejected") from None
+
+
+def _fd_identity(fd):
+    try:
+        _need(type(fd) is int and 3 <= fd < 2**31, "descriptor_changed")
+        info = os.fstat(fd)
+        descriptor_flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        status_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        row = (
+            fd, info.st_dev, info.st_ino, info.st_mode,
+            info.st_uid, info.st_gid, descriptor_flags, status_flags,
+        )
+        _need(all(type(value) is int for value in row), "descriptor_changed")
+        return row
+    except EndpointAuthorityError:
+        raise
+    except BaseException:
+        raise EndpointAuthorityError("descriptor_changed") from None
+
+
+class _EndpointAuthority:
+    """Own one detached descriptor until one transfer or one close."""
+
+    def __init__(self, fd, identity, stage, token):
+        _need(token is _BUILD and type(fd) is int and type(identity) is tuple
+              and len(identity) == 8 and type(stage) is str
+              and stage in FINAL_STAGES and fd == identity[0],
+              "arguments_rejected")
+        self._fd = fd
+        self._identity = identity
+        self._stage = stage
+        self._owner = os.getpid(), threading.get_ident()
+        self._lock = threading.Lock()
+        self._taken = False
+        self._close_attempted = False
+        self._closed = False
+        self._failed = False
+
+    def _enter(self, *, validate_identity):
+        acquired = False
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()),
+                  "owner_mismatch")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            _need(not self._failed, "already_failed")
+            _need(not self._taken and not self._close_attempted
+                  and self._fd is not None, "already_attempted")
+            if validate_identity:
+                _need(_fd_identity(self._fd) == self._identity,
+                      "descriptor_changed")
+            return True
+        except BaseException as error:
+            if acquired:
+                self._lock.release()
+            code = (
+                error.code if type(error) is EndpointAuthorityError
+                else "transfer_failed"
+            )
+            raise EndpointAuthorityError(code) from None
+
+    def take_admitted_once(self):
+        acquired = False
+        try:
+            acquired = self._enter(validate_identity=True)
+            fd, self._fd = self._fd, None
+            self._taken = True
+            return fd
+        except BaseException as error:
+            self._failed = True
+            code = (
+                error.code if type(error) is EndpointAuthorityError
+                else "transfer_failed"
+            )
+            raise EndpointAuthorityError(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def close_admitted_once(self):
+        acquired = False
+        closing = None
+        try:
+            acquired = self._enter(validate_identity=False)
+            closing, self._fd = self._fd, None
+            self._close_attempted = True
+            try:
+                _need(_fd_identity(closing) == self._identity,
+                      "descriptor_changed")
+                os.close(closing)
+                self._closed = True
+            except BaseException:
+                self._failed = True
+                raise EndpointAuthorityError("cleanup_unconfirmed") from None
+            return self.snapshot()
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def snapshot(self):
+        return {
+            "schema": SCHEMA,
+            "stage": self._stage,
+            "descriptor_owned": self._fd is not None,
+            "descriptor_transferred": self._taken,
+            "descriptor_close_attempted": self._close_attempted,
+            "descriptor_closed": self._closed,
+            "terminal_failed": self._failed,
+            **dict.fromkeys(FALSE_FLAGS, False),
+        }
+
+
+def _detach_admitted_once(topology, name):
+    """Consume one finalized topology entry and return its sole authority."""
+    try:
+        _runtime()
+    except BaseException:
+        raise EndpointAuthorityError("runtime_rejected") from None
+    _need(type(topology) is frozen._Topology and type(name) is str
+          and name in {part for pair in frozen.PAIR_ENDPOINTS for part in pair},
+          "arguments_rejected")
+    acquired = False
+    endpoint = None
+    fd = None
+    try:
+        try:
+            acquired = topology._enter()
+        except BaseException:
+            raise EndpointAuthorityError("topology_rejected") from None
+        _need(topology._stage in FINAL_STAGES
+              and name in frozen.STAGE_ENDPOINTS[topology._stage]
+              and name in topology._live, "topology_rejected")
+        endpoint = topology._live[name]
+        identity = topology._identities[name]
+        try:
+            _need(frozen._endpoint_identity(endpoint) == identity,
+                  "descriptor_changed")
+        except BaseException:
+            raise EndpointAuthorityError("descriptor_changed") from None
+        endpoint = topology._live.pop(name)
+        try:
+            fd = endpoint.detach()
+        except BaseException:
+            topology._ambiguous.append(endpoint)
+            endpoint = None
+            raise EndpointAuthorityError("transfer_failed") from None
+        endpoint = None
+        try:
+            _need(fd == identity[0] and _fd_identity(fd) == identity,
+                  "descriptor_changed")
+        except BaseException:
+            topology._ambiguous.append((fd, identity))
+            fd = None
+            raise EndpointAuthorityError("transfer_failed") from None
+        return _EndpointAuthority(fd, identity, topology._stage, _BUILD)
+    except BaseException as error:
+        topology._failed = True
+        code = (
+            error.code if type(error) is EndpointAuthorityError
+            else "transfer_failed"
+        )
+        raise EndpointAuthorityError(code) from None
+    finally:
+        if acquired:
+            topology._lock.release()

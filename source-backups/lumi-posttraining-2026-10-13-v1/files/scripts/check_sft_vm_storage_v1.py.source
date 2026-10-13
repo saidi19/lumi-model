@@ -1,0 +1,212 @@
+"""Read-only native EBS/mount guard joined to the frozen setup sequence.
+
+No lsblk/blkid, block-device reads, formatting, mounting, AWS calls or binding
+creation. Caller supplies volume IDs already authenticated by control-plane
+admission. This proves only a current initial-mount-namespace snapshot, not
+absence of writers in other namespaces, EBS encryption or whole-host admission.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import stat
+import sys
+import types
+from pathlib import Path
+
+WORK = Path("/var/lib/lumi-vm-fullsize")
+SETUP = Path("/opt/lumi-bootstrap-input/run_sft_vm_setup_sequence_v1.py")
+SETUP_SHA = "47d3b59e116b83cc479104e9d26eac55545470d304cd73114980ab42d4d43688"
+GIB = 1024**3
+
+
+def need(value):
+    if not value:
+        raise ValueError("storage_guard_rejected") from None
+
+
+def small(path, cap=4096):
+    # sysfs/procfs files may have zero stat size. Never open /dev here.
+    with open(path, "rb") as stream:
+        raw = stream.read(cap + 1)
+    need(len(raw) <= cap)
+    return raw
+
+
+def unescape(value):
+    value = re.sub(r"\\(040|011|012|134)", lambda m: chr(int(m[1], 8)), value)
+    need("\\" not in value and all(ord(c) >= 32 for c in value))
+    need(value.startswith("/") and ".." not in value.split("/"))
+    return value
+
+
+def mounts(raw):
+    need(type(raw) is bytes and 0 < len(raw) <= 1024**2)
+    rows, ids = [], set()
+    for line in raw.decode("utf-8", "strict").splitlines():
+        left, right = line.split(" - ")
+        fields, tail = left.split(), right.split()
+        need(len(fields) >= 6 and len(tail) == 3)
+        need(fields[0].isdigit() and fields[1].isdigit() and fields[0] not in ids)
+        need(re.fullmatch(r"[0-9]+:[0-9]+", fields[2]))
+        ids.add(fields[0])
+        rows.append(
+            dict(
+                device=fields[2],
+                root=unescape(fields[3]),
+                mount=unescape(fields[4]),
+                options=set(fields[5].split(",")),
+                propagation=fields[6:],
+                fs=tail[0],
+                super_options=set(tail[2].split(",")),
+            )
+        )
+    return rows
+
+
+def disk_identity(device):
+    need(re.fullmatch(r"[0-9]+:[0-9]+", device))
+    node = (Path("/sys/dev/block") / device).resolve(strict=True)
+    need(str(node).startswith("/sys/devices/"))
+    need(re.fullmatch(r"nvme[0-9]+n[0-9]+(?:p[0-9]+)?", node.name))
+    need(small(node / "dev").strip().decode() == device)
+    disk = node.parent if (node / "partition").exists() else node
+    need(re.fullmatch(r"nvme[0-9]+n[0-9]+", disk.name))
+    if disk != node:
+        need(small(node / "partition").strip().isdigit())
+    for block in {node, disk}:
+        need(not any((block / "holders").iterdir()))
+        need(small(block / "ro").strip() == b"0")
+    model = small(disk / "device/model").strip()
+    serial = small(disk / "device/serial").strip().decode("ascii")
+    need(model == b"Amazon Elastic Block Store" and re.fullmatch(r"vol-?[0-9a-f]{17}", serial))
+    serial = "vol-" + serial.removeprefix("vol").removeprefix("-")
+    sectors = small(disk / "size").strip()
+    need(sectors.isdigit())
+    return {"volume": serial, "bytes": int(sectors) * 512, "disk": disk.name}
+
+
+def selected_mounts(rows):
+    selected = {}
+    for key, target in (("root", "/"), ("work", str(WORK))):
+        candidates = [row for row in rows if row["mount"] == target]
+        need(len(candidates) == 1)
+        row = candidates[0]
+        need(row["root"] == "/" and row["fs"] in {"ext4", "xfs"})
+        need("rw" in row["options"] and "rw" in row["super_options"])
+        need("ro" not in row["options"] | row["super_options"])
+        selected[key] = row
+    work = selected["work"]
+    need(selected["root"]["device"] != work["device"])
+    need({"nodev", "nosuid", "noatime"} <= work["options"])
+    need(not work["propagation"])  # Fresh dedicated private mount only.
+    need(sum(row["device"] == work["device"] for row in rows) == 1)
+    need(not any(row["mount"].startswith(str(WORK) + "/") for row in rows))
+    # CPU/SDK runtime destinations must not be redirected onto an extra mount.
+    for target in ("/opt/lumi-sft-rehearsal", "/opt/lumi-sft-acquisition"):
+        need(
+            not any(
+                row["mount"] != "/"
+                and (
+                    target == row["mount"]
+                    or target.startswith(row["mount"] + "/")
+                    or row["mount"].startswith(target + "/")
+                )
+                for row in rows
+            )
+        )
+    return selected
+
+
+def validate(rows, disks, binding, devices, work_free, root_free):
+    need(type(binding) is dict and set(binding) == {"root_volume", "work_volume"})
+    need(all(type(v) is str and re.fullmatch(r"vol-[0-9a-f]{17}", v) for v in binding.values()))
+    need(binding["root_volume"] != binding["work_volume"])
+    selected = selected_mounts(rows)
+    for key, size in (("root", 32 * GIB), ("work", 128 * GIB)):
+        row, disk = selected[key], disks[key]
+        need(disk["volume"] == binding[key + "_volume"] and disk["bytes"] == size)
+        need(devices[key] == row["device"])
+    need(disks["root"]["disk"] != disks["work"]["disk"])
+    need(type(work_free) is int and work_free >= 100 * GIB)
+    need(type(root_free) is int and root_free >= 4 * GIB)
+    return {
+        "root_volume_matches": True,
+        "work_volume_matches": True,
+        "private_work_mount_matches": True,
+        "no_alias_or_submount_in_current_namespace": True,
+        "work_available_bytes": work_free,
+        "root_available_bytes": root_free,
+        "other_namespace_writer_exclusion_proven": False,
+        "cloud_encryption_or_preservation_rechecked": False,
+        "host_admitted": False,
+    }
+
+
+def device_number(path):
+    value = path.stat().st_dev
+    return f"{os.major(value)}:{os.minor(value)}"
+
+
+def inspect(binding):
+    need(sys.platform == "linux" and os.geteuid() == os.getegid() == 0)
+    need(os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino)
+    for p in (WORK, *WORK.parents):
+        info = p.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    need(stat.S_IMODE(WORK.stat().st_mode) == 0o700)
+    before = small(Path("/proc/self/mountinfo"), 1024**2)
+    rows = mounts(before)
+    selected = selected_mounts(rows)
+    disks = {key: disk_identity(row["device"]) for key, row in selected.items()}
+    devices = {"root": device_number(Path("/")), "work": device_number(WORK)}
+    need(device_number(Path("/opt")) == devices["root"])
+    work_space, root_space = os.statvfs(WORK), os.statvfs("/opt")
+    need(not (work_space.f_flag | root_space.f_flag) & os.ST_RDONLY)
+    result = validate(
+        rows,
+        disks,
+        binding,
+        devices,
+        work_space.f_bavail * work_space.f_frsize,
+        root_space.f_bavail * root_space.f_frsize,
+    )
+    need(small(Path("/proc/self/mountinfo"), 1024**2) == before)
+    need({"root": device_number(Path("/")), "work": device_number(WORK)} == devices)
+    return result
+
+
+def load_setup():
+    for path in SETUP.parents:
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022)
+    fd = os.open(SETUP, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == info.st_gid == 0)
+        need(stat.S_IMODE(info.st_mode) == 0o400 and info.st_nlink == 1)
+        raw = stream.read(131073)
+    need(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == SETUP_SHA)
+    module = types.ModuleType("_storage_bound_setup")
+    module.__file__ = str(SETUP)
+    exec(compile(raw, str(SETUP), "exec"), module.__dict__)
+    return module
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _run_storage_checked_setup(binding, machine_id, deadline):
+    storage = inspect(binding)  # No setup marker, pip or unit before this passes.
+    setup = load_setup()
+    result = setup._run_admitted_once(machine_id, deadline)
+    return {
+        "storage_snapshot": storage,
+        "setup": result,
+        "host_admitted": False,
+        "binding_created": False,
+        "gate_5_complete": False,
+    }

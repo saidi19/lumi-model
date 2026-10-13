@@ -1,0 +1,23 @@
+"""Offline tests for attempt-020 read-only preflight failure verification."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt020_readonly_preflight_failure_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_verified_fail_closed_network_blocker(self):
+        evidence = m.verify()
+        self.assertEqual(evidence["result"]["failed_stage"], "network")
+        self.assertEqual(evidence["result"]["status"], "stopped_no_retry")
+        self.assertEqual(evidence["result"]["cloud_mutations"], 0)
+        self.assertFalse(evidence["localization"]["destructive_cleanup_performed"])
+
+    def test_hash_drift_rejected(self):
+        with patch.object(m, "RESULT_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.verify()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,22 @@
+"""Checks for the additive encryption-readback binding."""
+import unittest
+
+from scripts import verify_sft_vm_attempt019_controls_v3 as m
+
+
+class Tests(unittest.TestCase):
+    def test_required_aes256_and_additive_fields_are_bound(self):
+        rule = m.OBSERVED_ENCRYPTION["Rules"][0]
+        self.assertEqual(
+            rule["ApplyServerSideEncryptionByDefault"],
+            {"SSEAlgorithm": "AES256"},
+        )
+        self.assertFalse(rule["BucketKeyEnabled"])
+        self.assertEqual(rule["BlockedEncryptionTypes"], {"EncryptionType": ["SSE-C"]})
+
+    def test_previous_failures_remain_bound(self):
+        m.runtime()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,98 @@
+{
+  "schema_version": "lumi.sft-write-process-topology-development.v0.1",
+  "date": "2026-09-26",
+  "status": "PASS_local_prefork_descriptor_topology_candidate_NOT_process_composition",
+  "scope": "Local, import-inert six-pair descriptor-topology candidate with synthetic socket and descriptor tests only. No process, socket, cgroup, pidfd, listener, worker, payload, remote, GPU, inference or training execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_topology_v1.py",
+      "bytes": 14780,
+      "sha256": "6e4f271d213d926c2f90c9f0715444f13984545d8452b2e1fc2155e0bf9267dd"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_topology_v1.py",
+      "bytes": 15529,
+      "sha256": "a718ecd15d3de5e0ce2b81367d180e422696ec2beec790ac396baa48b8b782bc"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_listener_v1.py",
+      "bytes": 20848,
+      "sha256": "46df3670f8921e06679b2978c7aecd70700dd71c67a44dcf84c7cd4bb034e64a"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-guardian-authority-development-v0.1.json",
+      "bytes": 5953,
+      "sha256": "acb462ab9b7cb42d2dc7fc0e70e85a4def7cd086136dd6f1fd2ffce8f6048d19"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-guardian-authority-development-verification-v0.1.json",
+      "bytes": 7540,
+      "sha256": "03b0e9bf56e07aa6d48bd7346dd275153a4e8d87a4dc7d2309949f3b69d91db2"
+    }
+  ],
+  "completed": [
+    "The candidate creates exactly six AF_UNIX SOCK_SEQPACKET pairs before any future fork: guardian control, reservation ledger, broker report, worker report, guardian release and listener transfer.",
+    "All twelve endpoints require root ownership, CLOEXEC, O_RDWR, O_NONBLOCK, connected local seqpacket type and a distinct descriptor and socket identity.",
+    "The four final role sets are disjoint and cover every endpoint exactly once: controller 4, broker 3, worker 3 and guardian watch 2. The guardian-prefork set contains the exact eight non-controller endpoints needed before nested child creation.",
+    "A clean immediate child must explicitly adopt its inherited topology copy by matching the recorded parent PID in one main-thread process before it may access or transition any endpoint.",
+    "Allowed state changes are fixed: initial to controller or guardian-prefork; guardian-prefork to broker, worker or guardian-watch. No alternate role, endpoint injection or second transition is accepted.",
+    "Each transition identity-checks all live endpoints, consumes every close once and never retries an ambiguous close. A changed or failed-close socket object is retained so its destructor cannot later close a replacement numeric descriptor.",
+    "Snapshots retain only role counts and aggregate state; they contain no descriptor numbers, socket identities, packets, process identifiers or exception text.",
+    "Public topology creation remains closed and every process, fork-order, inherited-copy, peer-origin, protocol, reap, native-enforcement, execution and training claim remains false."
+  ],
+  "fixed_topology": {
+    "pairs": 6,
+    "endpoints": 12,
+    "controller_final_endpoints": 4,
+    "guardian_prefork_endpoints": 8,
+    "broker_final_endpoints": 3,
+    "worker_final_endpoints": 3,
+    "guardian_watch_final_endpoints": 2,
+    "final_role_sets_disjoint": true,
+    "final_role_sets_cover_all_endpoints": true,
+    "extra_keep_may_alias_topology_endpoint": false
+  },
+  "verification": {
+    "new_topology_tests": 21,
+    "prior_regressions": 836,
+    "unique_tests_per_runtime": 857,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ],
+    "all_socket_and_descriptor_boundaries_synthetic": true,
+    "native_operations_performed": false
+  },
+  "remaining_integration_work": [
+    "Implement the actual private fork composition over this topology: outer controller forks guardian; guardian adopts the prefork copy, creates the lease, forks broker and worker, and each process transitions to its exact final descriptor set.",
+    "Bind generation-stable pidfds immediately after each fork and implement fixed waitid-based guardian, broker and worker reap without numeric-PID signaling or fallback waits.",
+    "Implement the controller event loop over control, ledger, broker-report and worker-report endpoints, including READY verification before guardian arm, aggregate reservation before every CONTINUE, CONSUMED verification, final reports and terminal deadline cleanup.",
+    "Integrate listener handoff/adoption, worker privilege drop and final seal, guardian-v2 authority consumption, full-size bootstrap/entry and authenticated source closure.",
+    "Run a separately authorized bounded Linux native qualification before any real checkpoint payload read or import, then re-run unchanged host, input, resource and real-import admission."
+  ],
+  "nonclaims": {
+    "public_execution_open": false,
+    "processes_spawned_or_reaped": false,
+    "fork_order_verified": false,
+    "inherited_copies_closed": false,
+    "peer_origin_or_exclusivity_verified": false,
+    "target_kernel_abi_qualified": false,
+    "native_listener_bound_or_transferred": false,
+    "parent_received_ready_or_consumed": false,
+    "guardian_armed_after_ready": false,
+    "ledger_exchanged": false,
+    "native_write_continuations_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "children_reaped": false,
+    "bootstrap_or_lifecycle_integration_verified": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "retry_allowed": false,
+    "publication": false
+  }
+}

@@ -1,0 +1,41 @@
+"""Static setup ordering; native quota/timer readback is still mandatory."""
+import unittest
+from pathlib import Path
+
+import yaml
+
+
+class BootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.config = yaml.safe_load((Path(__file__).resolve().parents[1] /
+            'configs/lumi-vm-coordinator-bootstrap-v0.2.yaml').read_text())
+        self.script = self.config['runcmd'][0]
+
+    def test_no_early_or_automatic_download(self):
+        self.assertNotIn('bootcmd', self.config)
+        self.assertNotIn('packages', self.config)
+        self.assertIs(self.config['package_update'], False)
+        self.assertIs(self.config['package_upgrade'], False)
+        self.assertEqual(len(self.config['runcmd']), 1)
+        self.assertTrue(self.script.startswith('set -eu\n'))
+
+    def test_expiry_and_cap_precede_apt(self):
+        self.assertLess(self.script.index('systemctl is-active'), self.script.index('iptables -N'))
+        self.assertLess(self.script.index('iptables -C INPUT'), self.script.index('apt-get'))
+        self.assertEqual(self.script.count('--quota 1073741824'), 1)
+        self.assertIn('--on-boot=3600s', self.script)
+        self.assertIn('ip6tables -I OUTPUT 1 -p tcp -m multiport --dports 80,443 -j REJECT',
+                      self.script)
+        self.assertIn('iptables -I OUTPUT 1 -p tcp --dport 80 -j REJECT', self.script)
+
+    def test_https_sources_no_retry_or_training(self):
+        for name in ('primary', 'security'):
+            self.assertTrue(self.config['apt'][name][0]['uri'].startswith('https://'))
+        self.assertEqual(self.script.count('Acquire::Retries=0'), 2)
+        self.assertEqual(self.script.count('timeout 180'), 2)
+        self.assertNotIn('run_sft', self.script)
+        self.assertNotIn('s3', self.script)
+
+
+if __name__ == '__main__':
+    unittest.main()

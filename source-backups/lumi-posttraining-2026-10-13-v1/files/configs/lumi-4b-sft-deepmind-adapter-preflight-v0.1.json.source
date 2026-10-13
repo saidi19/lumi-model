@@ -1,0 +1,130 @@
+{
+  "adapter_contract": {
+    "assistant_response_template": "The answer is {generated_answer}.",
+    "benchmark_decontamination_required": true,
+    "dependency_lock_required_before_execution": true,
+    "deterministic_same_seed_byte_replay_required": true,
+    "different_seed_prompt_overlap_maximum": 0,
+    "generated_record_fields": [
+      "answer",
+      "module",
+      "question",
+      "seed",
+      "split_namespace"
+    ],
+    "generator_modules": [
+      "mathematics_dataset/modules/algebra.py",
+      "mathematics_dataset/modules/arithmetic.py",
+      "mathematics_dataset/modules/calculus.py",
+      "mathematics_dataset/modules/comparison.py",
+      "mathematics_dataset/modules/measurement.py",
+      "mathematics_dataset/modules/numbers.py",
+      "mathematics_dataset/modules/polynomials.py",
+      "mathematics_dataset/modules/probability.py"
+    ],
+    "network_disabled_during_generation": true,
+    "official_test_or_evaluation_generation_permitted": false,
+    "per_record_attribution_required": true,
+    "pii_secret_filter_required": true,
+    "question_and_answer_only_training_target": true,
+    "raw_generator_trace_training_target_permitted": false,
+    "runtime_ast_import_rng_audit_required": true,
+    "seed_contract": {
+      "algorithm": "sha256_first_u32_big_endian",
+      "derivation": "SHA256(namespace + NUL + module + NUL + decimal_index)[0:4]",
+      "fresh_process_per_shard_required": true,
+      "numpy_and_python_rng_seed_must_match": true,
+      "split_namespaces": {
+        "train": "lumi-deepmind-math-train-v0.1",
+        "validation": "lumi-deepmind-math-validation-v0.1"
+      },
+      "test_namespace_defined": false
+    },
+    "source_registry_check": "deferred_until_separate_promotion",
+    "tokenizer_4k_fit_required": true,
+    "train_validation_exact_and_near_dedup_required": true
+  },
+  "authorization": {
+    "candidate_registry_promotion_authorized": false,
+    "dataset_acquisition_authorized": false,
+    "dataset_seal_authorized": false,
+    "external_api_spend_authorized": false,
+    "generator_execution_authorized": false,
+    "local_preflight_authorized": true,
+    "network_access_authorized": false,
+    "paid_gpu_authorized": false,
+    "production_sft_authorized": false,
+    "purpose": "local_no_download_deepmind_adapter_preflight_only",
+    "test_or_evaluation_generation_authorized": false,
+    "unrelated_dataset_access_authorized": false
+  },
+  "bindings": {
+    "adapter_preflight_checker": {
+      "path": "scripts/check_deepmind_adapter_preflight.py",
+      "sha256": "ba56deb770ee2e92d0153257ce1327798812de045ff32f51eecb5daebb9df76c"
+    },
+    "adapter_preflight_implementation": {
+      "path": "src/lumi/posttraining_deepmind_adapter_preflight.py",
+      "sha256": "feb59204d6b4464675250f45e761ab48e946cebedd54deffe9355e136c93fdda"
+    },
+    "adapter_preflight_verifier": {
+      "path": "scripts/verify_deepmind_adapter_preflight.py",
+      "sha256": "7193592d9f5b2f56ec144462a8a19ec97c49477e91a7ae9cf16c50e1af3bdd3a"
+    },
+    "dmath_curation_report": {
+      "path": "evidence/lumi-4b-sft-dmath-curation-v0.1.json",
+      "sha256": "eba3135a6072ea55cee2b1e16630d54d1c9d95fd30845eda1896509fb4620f45"
+    },
+    "dmath_curation_verification": {
+      "path": "evidence/lumi-4b-sft-dmath-curation-verification-v0.1.json",
+      "sha256": "cacd900762e4414809105fb1358cb5fd588703aaab6f65d13c60339da87fceb8"
+    },
+    "math_replacement_plan": {
+      "path": "configs/lumi-4b-sft-math-replacement-preflight-v0.1.json",
+      "sha256": "a70da582ad00ec0914f37d0da89e51466f08e472312338553b6db290bfbaf020"
+    },
+    "math_replacement_report": {
+      "path": "evidence/lumi-4b-sft-math-replacement-preflight-v0.1.json",
+      "sha256": "edbb77d9a290b05fb8ae2599bbe300fdaabaa49a7578c072256a16dfc8a5d554"
+    },
+    "math_replacement_verification": {
+      "path": "evidence/lumi-4b-sft-math-replacement-preflight-verification-v0.1.json",
+      "sha256": "cf9327b5cc4428e01be17d38c23b1b7bf83d96b7b3829e650a37322ce422403b"
+    }
+  },
+  "limits": {
+    "maximum_network_bytes": 0,
+    "maximum_runtime_minutes": 60,
+    "source_bytes": 234672,
+    "source_objects": 30
+  },
+  "next_gate": {
+    "authorization_required": true,
+    "exact_authorization_statement": "I approve one bounded CPU-only DeepMind Mathematics source acquisition and adapter canary at revision 427f45075f84b8b9774950196ad63867ca20ffb3, limited to the exact 30 pinned source/license/documentation objects (234,672 bytes total), maximum 1 MiB network / 8 MiB decoded / 180 minutes and at most 2,000 locally generated canary records. It may audit imports, dependencies, RNG/global state, build the fixed-seed train and validation adapter, run deterministic replay, schema, PII/secret, deduplication, benchmark-decontamination, 4K-fit and frozen-tokenizer measurement, and write only private non-production canary data plus raw-text-free evidence. No pre-generated bulk data, official test/evaluation generation, external API, package installation, GPU, source-registry promotion, dataset seal, SFT training, unrelated data, or external distribution. Stop fail-closed if the pinned runtime dependencies are not already available.",
+    "limits": {
+      "exact_source_bytes": 234672,
+      "exact_source_objects": 30,
+      "maximum_canary_generated_records": 2000,
+      "maximum_decoded_bytes": 8388608,
+      "maximum_network_bytes": 1048576,
+      "maximum_runtime_minutes": 180
+    }
+  },
+  "observed_at": "2026-08-06",
+  "output": {
+    "raw_training_text_in_report": false,
+    "report_path": "evidence/lumi-4b-sft-deepmind-adapter-preflight-v0.1.json",
+    "verification_path": "evidence/lumi-4b-sft-deepmind-adapter-preflight-verification-v0.1.json"
+  },
+  "schema_version": "lumi.sft-deepmind-adapter-preflight-plan.v0.1",
+  "source": {
+    "declared_license_id": "apache-2.0",
+    "exact_object_bytes": 234672,
+    "exact_object_count": 30,
+    "exact_object_inventory_sha256": "47e472f97f7092cf264edb727bd0821db59869133f56b12cddf3f8a4ef1a6ce9",
+    "repository_url": "https://github.com/google-deepmind/mathematics_dataset",
+    "revision": "427f45075f84b8b9774950196ad63867ca20ffb3",
+    "source_id": "deepmind_mathematics_dataset"
+  },
+  "status": "local_no_download_deepmind_adapter_preflight_authorized"
+}

@@ -1,0 +1,210 @@
+"""Synthetic collision, retention, read-budget and no-retry coverage."""
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import inspect_sft_vm_attempt022_targets_v1 as m
+
+BINDING = dict(
+    attempt="retained", instance="i-retained", root_volume="vol-root", work_volume="vol-work"
+)
+
+
+class CodedError(Exception):
+    def __init__(self, code):
+        self.response = {"Error": {"Code": code}, "ResponseMetadata": {"HTTPStatusCode": 400}}
+
+
+class Fixture:
+    def __init__(self):
+        self.subnets, self.endpoints = [], []
+        self.function_present, self.denied, self.encrypted = False, False, True
+        self.calls = []
+
+    def client(self, service):
+        owner = self
+
+        class Client:
+            def __getattr__(self, operation):
+                def call(**fields):
+                    owner.calls.append((service, operation))
+                    if service == "sts":
+                        return dict(Account=m.ACCOUNT)
+                    if operation == "describe_subnets":
+                        return dict(Subnets=owner.subnets)
+                    if operation == "describe_instance_connect_endpoints":
+                        vpc_query = fields["Filters"][0]["Name"] == "vpc-id"
+                        return dict(InstanceConnectEndpoints=owner.endpoints if vpc_query else [])
+                    if operation == "describe_instances":
+                        if "InstanceIds" not in fields:
+                            return dict(Reservations=[])
+                        return dict(
+                            Reservations=[
+                                dict(
+                                    Instances=[
+                                        dict(
+                                            InstanceId=BINDING["instance"],
+                                            InstanceType="r6i.4xlarge",
+                                            State=dict(Name="stopped"),
+                                            BlockDeviceMappings=[
+                                                dict(
+                                                    Ebs=dict(VolumeId=v, DeleteOnTermination=False)
+                                                )
+                                                for v in (
+                                                    BINDING["root_volume"],
+                                                    BINDING["work_volume"],
+                                                )
+                                            ],
+                                        )
+                                    ]
+                                )
+                            ]
+                        )
+                    if operation == "describe_key_pairs":
+                        return dict(KeyPairs=[])
+                    if operation == "describe_security_groups":
+                        return dict(SecurityGroups=[])
+                    if operation == "describe_volumes":
+                        return dict(
+                            Volumes=[
+                                dict(VolumeId=v, Encrypted=owner.encrypted)
+                                for v in fields["VolumeIds"]
+                            ]
+                        )
+                    if service == "iam":
+                        raise CodedError("AccessDenied" if owner.denied else "NoSuchEntity")
+                    if service == "lambda":
+                        if owner.function_present:
+                            return {}
+                        raise CodedError("ResourceNotFoundException")
+                    if service == "scheduler":
+                        raise CodedError("ResourceNotFoundException")
+                    if service == "logs":
+                        return dict(logGroups=[])
+                    if service == "s3":
+                        raise CodedError("404")
+                    raise AssertionError("unexpected_fixture_operation")
+
+                return call
+
+            def close(self):
+                pass
+
+        return Client()
+
+    def clients(self):
+        return {service: self.client(service) for service in m.OPS}
+
+
+class Tests(unittest.TestCase):
+    def inspect(self, fixture):
+        bounded = m.BoundedClients(fixture.clients())
+        return m.inspect(bounded, BINDING), bounded
+
+    def test_full_bound_source_and_retained_binding(self):
+        binding = m.local()
+        self.assertNotEqual(binding["attempt"], m.ATTEMPT)
+        self.assertEqual(m.CIDR, "172.31.97.96/27")
+
+    def test_free_targets_and_retention_take_nineteen_reads(self):
+        result, bounded = self.inspect(Fixture())
+        self.assertEqual(result["status"], "fresh_targets_absent_network_slot_free")
+        self.assertEqual(result["read_only_aws_calls"], 19)
+        self.assertEqual(bounded.calls, 19)
+        self.assertEqual(result["bounded_transient_read_retries"], 0)
+        self.assertFalse(result["cpu_network_admitted"])
+        self.assertEqual(result["predecessor_retention"]["encrypted_volume_count"], 2)
+
+    def test_occupied_vpc_endpoint_blocks_without_deletion_authority(self):
+        fixture = Fixture()
+        fixture.endpoints = [
+            dict(
+                OwnerId=m.ACCOUNT,
+                VpcId=m.VPC,
+                State="create-complete",
+                InstanceConnectEndpointId="eice-synthetic",
+                SubnetId="subnet-synthetic",
+            )
+        ]
+        result, _ = self.inspect(fixture)
+        self.assertEqual(result["status"], "fresh_targets_absent_network_slot_blocked")
+        self.assertFalse(result["frozen_vpc_endpoint_gate_passed"])
+        self.assertFalse(result["endpoint_deletion_authorized"])
+
+    def test_overlapping_larger_subnet_rejects_even_if_exact_cidr_is_absent(self):
+        fixture = Fixture()
+        fixture.subnets = [dict(OwnerId=m.ACCOUNT, VpcId=m.VPC, CidrBlock="172.31.97.64/26")]
+        with self.assertRaises(ValueError):
+            self.inspect(fixture)
+
+    def test_access_denied_is_not_absence(self):
+        fixture = Fixture()
+        fixture.denied = True
+        with self.assertRaises(CodedError):
+            self.inspect(fixture)
+
+    def test_existing_function_collision_is_not_adopted(self):
+        fixture = Fixture()
+        fixture.function_present = True
+        with self.assertRaises(ValueError):
+            self.inspect(fixture)
+
+    def test_retention_encryption_or_endpoint_owner_drift_is_rejected(self):
+        fixture = Fixture()
+        fixture.encrypted = False
+        with self.assertRaises(ValueError):
+            self.inspect(fixture)
+        fixture = Fixture()
+        fixture.endpoints = [dict(OwnerId="foreign", VpcId=m.VPC, State="create-complete")]
+        with self.assertRaises(ValueError):
+            self.inspect(fixture)
+
+    def test_mutations_objects_and_budget_overrun_rejected_before_dispatch(self):
+        fixture = Fixture()
+        bounded = m.BoundedClients(fixture.clients(), clock=lambda: 1)
+        for service, operation in (
+            ("ec2", "run_instances"),
+            ("s3", "get_object"),
+            ("s3", "head_object"),
+            ("lambda", "update_function_code"),
+        ):
+            with self.subTest(operation=operation), self.assertRaises(ValueError):
+                getattr(bounded[service], operation)()
+        self.assertEqual(bounded.calls, 0)
+        bounded.calls = 20
+        with self.assertRaises(ValueError):
+            bounded["sts"].get_caller_identity()
+        self.assertFalse(fixture.calls)
+
+    def test_credential_setup_time_is_in_read_window(self):
+        fixture = Fixture()
+        bounded = m.BoundedClients(fixture.clients(), clock=lambda: 281, started=0)
+        with self.assertRaises(ValueError):
+            bounded["sts"].get_caller_identity()
+        self.assertEqual(bounded.calls, 0)
+
+    def test_consumed_scan_cannot_be_reexecuted(self):
+        fixture = Fixture()
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            output, report = root / "attempt", root / "report.json"
+            with (
+                patch.object(m, "OUTPUT", output),
+                patch.object(m, "REPORT", report),
+                patch.object(m, "local", return_value=BINDING),
+                patch.object(m.transport, "clients", side_effect=fixture.clients) as construct,
+            ):
+                result = m.run()
+                self.assertEqual(result["read_only_aws_calls"], 19)
+                self.assertFalse(result["execution_permitted"])
+                self.assertEqual(json.loads(report.read_bytes())["cloud_mutations"], 0)
+                with self.assertRaises(ValueError):
+                    m.run()
+                construct.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

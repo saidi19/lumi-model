@@ -1,0 +1,131 @@
+# SFT execution status v0.71
+
+2026-09-10. **Real-sized import components are implemented and tiny CPU tests pass.**
+This completes a bounded software-development stage, not the real 4B import or
+Gate 5. No real weights, trainer payloads, tokenizer payloads or datasets were
+read; no network operation, GPU, inference, training, instance action, dependency
+installation, GitHub publication or CI run was initiated.
+
+## Completed implementation
+
+- `posttraining_checkpoint_import_plan_v1.py` integrates the corrected final-base
+  metadata validator with the independently base-pinned handoff. It checks the
+  handoff file/internal hashes, state/run/cursor/rank lineage and the complete
+  checkpoint manifest. The whole 19-file inventory remains required, including
+  trainer files. Tokenizer binding remains the original canonical JSON inventory,
+  never a fabricated checksum-line file.
+- `posttraining_checkpoint_stream_v1.py` verifies an exact closed tree using
+  at most 1 MiB per content read. It uses pinned directory descriptors,
+  no-symlink traversal, ownership/mode/single-link checks, before/after identity
+  checks, an aggregate read bound and cooperative deadline. It reads each file
+  once; the final walk checks metadata only. Late cleanup cannot publish success
+  after the deadline. This is change detection for quiescent inputs, not an
+  atomic snapshot against a hostile owner or a hard syscall timeout.
+- `posttraining_checkpoint_import_torch_v3.py` is a new internal CPU conversion
+  kernel with mandatory parameter, projected live-tensor and output limits plus
+  a synchronous budget callback. It does not raise or reuse v2's synthetic caps.
+  A meta-only architecture supplies exact roles/shapes. DCP destinations preserve
+  both tied aliases independently until dtype/value equality is checked. Only
+  parameters are cast; persistent rotary buffers preserve their values at FP32.
+  Strict `assign=True` restoration, validated re-tying, chunked finite/equality/
+  digest checks, staged tensor lifetimes and complete local HF reload comparison
+  replace the large simultaneous-copy pattern in v2.
+
+The source model configuration now admits only known scalar Lumi fields and the
+original architecture metadata. Unknown quantization, remote-code, attention
+loader or device-selection kwargs are rejected before ML dependencies. Generated
+configuration serialization is bounded before output creation and its complete
+saved content is compared before reload. The existing runtime has no Accelerate;
+reload uses explicit `device_map=None` inside a CPU context, safetensors only and
+local files only, with no quantizer/automatic placement configuration admitted.
+
+HF normally copies registered custom model code with source file permissions.
+The new kernel disables that copying only on its new model/config instances and
+instead writes exactly the two current Lumi runtime modules exclusively at 0600,
+verifying their bytes afterward. The original `auto_map` and self-contained
+package are preserved. Other code files or changed runtime-module bytes fail.
+Output directories are 0700 and the temporary private umask is restored on failure.
+Old classes, source modules, v2 behavior and prior evidence are unchanged.
+
+## Real metadata arithmetic, no model allocation
+
+The five original metadata inputs total **15,599 bytes**. Their hashes, the
+complete handoff declarations and the original tokenizer inventory semantics
+pass. The exact 616-byte source config also passes the new closed source schema
+without importing ML. The model is still our step-76,294 / 80B-token base.
+
+The analytical inventory has **4,002,376,704 unique parameters**, **363 state
+entries**, 36 persistent FP32 rotary buffers / 1,152 buffer elements, and the
+deliberately wider 4,096 query dimension over a 3,072 residual width.
+
+| BF16 planning quantity | Bytes |
+| --- | ---: |
+| Complete checkpoint declarations | 48,839,117,190 |
+| Projected live tensor payload cap, including staging/scratch | 26,044,312,576 |
+| Conservative host-RAM planning minimum | 68,719,476,736 (64 GiB) |
+| Backend output cap | 8,408,459,776 |
+| Output plus tokenizer/control write allowance | 8,415,205,181 |
+| Staged input/output disk planning minimum | 57,258,970,624 |
+| Two full checkpoint inventory audits | 97,678,234,380 |
+
+These are **computed planning values, not measured RSS/disk requirements or an
+execution approval**. The audit figure excludes DCP restore and HF/output reload
+reads; those still need a real runner limit. Host/library/allocator headroom is
+not OS-enforced by this kernel. The original 1 MiB backend overhead allowance
+contains the real config/header/code projection of 958,728 bytes. Tokenizer copy
+and final control files have a separate allowance. FP32 alternative planning is
+80 GiB host RAM; no alternate dtype or host was selected for execution.
+
+Saved plan: `configs/lumi-4b-sft-checkpoint-import-plan-v0.1.json`, 70,554 bytes,
+file SHA-256 `3138f88ddb871c0a24134a5aae84cb28128581b8d943ca599f24553bd3c3cbd8`.
+Its internal SHA-256 is
+`6b193d89febd605717ce7c5ef18f9d3355fc63f221c5b21b986e15e759c0231a`.
+Original floating-point JSON representation is retained so the saved internal
+binding matches the Python planner; structural verification recalculates it.
+
+## Verification
+
+There are **98 new tests**: 25 planner, 34 stream, 38 CPU kernel and one combined
+tiny integration test. Including regressions, **282 distinct tests pass**:
+
+- 226 stdlib/source tests on Python 3.11.15, 3.13.7 and 3.14.6, respectively
+  0.285s, 0.279s and 0.288s; no failures or skips.
+- 56 genuine tiny CPU tests on Python 3.13.7, including 17 unchanged v2 CPU
+  regressions; 0.442s test time / 1.691s supervised wall time under a 60s timeout.
+  These use torch 2.10.0, transformers 5.2.0, safetensors 0.7.0,
+  tokenizers 0.22.2 and numpy 2.2.6; no packages were installed. No failures/skips.
+- Exact Ruff E,F,I,B,UP / py311 / line length 100 passes for all seven new code/
+  test files. The integration test binds a tiny synthetic metadata plan, hashes
+  its entire checkpoint, performs actual CPU DCP-to-HF conversion and compares
+  the second complete unchanged audit. Synthetic trainer placeholders are hashed
+  but never deserialized. It is not a real-base receipt.
+
+Review/test findings were fixed before the final pass, including late deadline
+success, malformed-row key-copy bounds, unsafe config kwargs, output expansion,
+private custom-code copying and CPU reload compatibility. Native Linux/GPU
+qualification has not been performed. Known pinned DCP deprecation/platform
+warnings are not reported as failures or silently turned into acceptance.
+
+Aggregate evidence: `evidence/lumi-4b-sft-import-components-v0.1.json`, 8,008 bytes,
+SHA-256 `27edab822b2a4b629644b68faf2b1f649273c7fb94bae8736abbbd3d9bafaba9`.
+Structural verification:
+`evidence/lumi-4b-sft-import-components-verification-v0.1.json`.
+It independently checks ten new/runtime file bindings, five frozen predecessor
+bindings, the saved plan's internal digest, resource/count arithmetic and false
+execution claims. It does not claim to rerun tests or verify real payloads.
+
+## Next existing dependency, not another data-policy gate
+
+The **full real-import runner remains unwired**. Next integrate these implemented
+components with a separately bound dedicated host/runtime, immutable read-only
+inputs, actual read/RAM/runtime/write enforcement, exclusive no-retry attempt
+marker, tokenizer copy, private import receipt and frozen worker checksum consumer.
+Then qualify that runner on native Linux and perform the explicitly bounded real
+checkpoint restore when the execution target and limits are approved.
+
+GPU-compatible worker/profile, actual data relocation and CUDA/smoke requirements
+remain downstream as described in v0.70. No GPU is needed for the remaining
+runner code work. Gate 5, real SFT and production eligibility remain false.
+
+All new files are local/unpublished. HEAD remains
+`ecc545fc423650bf1089311915290523c10b3172`; tracked/staged diffs are unchanged.

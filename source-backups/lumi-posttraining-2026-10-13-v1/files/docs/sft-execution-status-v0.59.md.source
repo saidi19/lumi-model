@@ -1,0 +1,86 @@
+# SFT execution status v0.59
+
+Local-only verification handoff, 2026-09-09. The user requested correction of
+the assistant-created error and step-by-step completion of Gate 5. The exact
+test correction already published in `535ffc2c9be4f9611fd051a8e632b3696f30250d`
+has now passed its remote Source/Spark verification. No additional executable
+change, commit, workflow dispatch or retry was needed in this turn.
+
+## Test-isolation blocker closed
+
+[Source run 34348014421](https://github.com/saidi19/lumi-model/actions/runs/34348014421)
+completed successfully on that exact SHA. All four jobs passed:
+
+- `test`: `102454132502`.
+- `isolated-sft-controls`: `102454132769`.
+- `frozen-lint-integrity`: `102454132780`.
+- `source-only-validators`: `102454132920`.
+
+The source suite reports **5,054 passed, zero failed, 58 skipped, 329 deselected,
+36 warnings and 9,975 subtests passed in 438.79 seconds**. The partition is
+`SOURCE_SCOPE_ACCOUNTED`: 5,112 source-selected, 327 private integrations
+`NOT_EXECUTED`, and two historical tests routed separately. Consequently
+`private_integration_passed=false` and `full_ci_passed=false` remain unchanged.
+The lint job preserves 815 frozen historical findings; it is not an all-source
+zero-lint claim. No new skip or xfail was introduced to conceal the repaired test.
+
+[Spark run 34348014388](https://github.com/saidi19/lumi-model/actions/runs/34348014388),
+job `102454131568`, passed **three tests, zero skips, in 108.04 seconds** on the
+same SHA. [Lookup acceptance run 34348014401](https://github.com/saidi19/lumi-model/actions/runs/34348014401)
+was correctly **skipped** by its accepted-SHA condition. This is not a second
+acceptance pass, and no accepted image was rebuilt.
+
+Each completed Source/Spark job log was read once in memory with a 2 MiB cap;
+only hashes, aggregate counts and the allowlisted partition result were retained.
+No raw log was saved locally:
+
+- Source: 60,609 bytes; SHA-256
+  `a4575798affb82fa93fd86fcc67b95c0f133fa3b0f4bd43e007e5cc0d5452160`.
+- Spark: 51,696 bytes; SHA-256
+  `a2eac6b8049085d8cc75b1c85c17c27e75b7cb54f02bfd265e00df30d7ded82a`.
+
+The earlier no-checks observation in v0.58 and the historical failed Source run
+remain unchanged evidence. Checks subsequently appeared; their initial delay's
+cause was not established. These final results supersede the pending status,
+not the historical records.
+
+## Accepted runtime preserved
+
+The accepted CPU runtime is still tied to
+`c4272e36bc98354067dd23a83931a3db58823d76`, run `34345663337`, image
+`sha256:321d50ae5207dee05cd58ec5436d97978becde2ee8a767f2e8768229e6a9ad43`.
+The saved build-report SHA-256 was rechecked as
+`24712f08f2522a0319da1179178aa8c73eef5969303faea73de16d89a23b386b`.
+The repair's `src`, `scripts` and `configs` diff against that accepted commit
+is empty. Its three changed test/workflow hashes still match v0.57. Local HEAD
+and origin tracking both resolve to `535ffc2`. Prior evidence is untouched.
+
+## Next existing integration step, not a new policy gate
+
+Gate 5 overall is not complete. Read-only source review identified the concrete
+remaining connection:
+
+1. `run_sft_release_gate_fixture_v1.watch_parent` passes generated `TREE` and
+   `DECLARED` stand-ins to `VerifiedRelease`. The existing manifest requires
+   `runtime/`, `dependencies/`, `source/`; the accepted OCI uses `/usr/local`,
+   `/usr/lib` and `/opt/lumi-release/source` with separate lock/base/source
+   controls. Its observer report cannot simply be relabelled a release-tree
+   verification receipt.
+2. The existing guardian release callback must be controlled by verification of
+   that actual accepted software identity before ML starts. That trusted identity
+   must reach the worker/controller rather than the fixture's synthetic `admit`
+   callback and `source_identity_sha256="f" * 64`. `WorkerRun.run` already has an
+   admission seam; Supervisor resource accounting does not authenticate software.
+3. This connection needs its own bounded remote integration verification before
+   claiming guardian-integrated acceptance. No implementation or native run for
+   this next step occurred here. The public real-worker admission remains closed.
+
+Preserve the accepted work and existing data, rights, training-profile and
+resource constraints while completing this wiring. Dedicated host/S3/data
+binding and approved H100/CUDA validation remain downstream. Do not treat the
+old FSDP/context-4096 draft as supported by the current DDP worker automatically.
+
+The Mac performed lightweight source/metadata reads only. No local native/ML
+execution, image or wheel download, GPU/instance action, S3/SSH, real model/data
+read, training, registry mutation, dataset seal or production promotion occurred.
+This result-only document must not be pushed merely to trigger another CI run.

@@ -1,0 +1,110 @@
+"""Correct the attempt-018 network selector target; offline source rebake only."""
+
+import ast
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.1"
+BASE_SHA = "c63f773396dbee9e293615d24633d70039712cf1226de75225b7b66ce4d75809"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.2"
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD_CIDR = "172.31.97.0/27"
+NEW_CIDR = "172.31.96.224/27"
+PROOF = "evidence/lumi-vm-attempt-018-readonly-preflight-failure-v0.2.json"
+PROOF_SHA = "6f2554a53f56be98f0d49a272a0d2c8f822d50caac908824031e22ca446c0c4d"
+CONTROL_CODE = (
+    "scripts/sft_vm_external_watchdog_v1.py",
+    "scripts/prepare_sft_vm_external_watchdog_v1.py",
+)
+
+
+def build():
+    proof = json.loads(closure.read(ROOT / PROOF, PROOF_SHA))
+    need = closure.need
+    need(proof["attempt"] == ATTEMPT)
+    need(proof["result"]["calls"] == 47 and proof["result"]["cloud_mutations"] == 0)
+    need(proof["localized_cause"]["configured_target"] == OLD_CIDR)
+    need(proof["localized_cause"]["selector_target"] == NEW_CIDR)
+    need(proof["localized_cause"]["selector_target_live_subnets"] == 0)
+    manifest = json.loads(closure.read(BASE / "release.json", BASE_SHA))
+    original = {
+        name: closure.read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    preserved = {
+        name
+        for name in original
+        if "/" not in name
+        or name.startswith("evidence/")
+        or name.endswith((".gz", ".tar", ".pem"))
+    }
+    seeds = dict(original)
+    for name, raw in original.items():
+        if name not in preserved and name.endswith((".py", ".json")):
+            seeds[name] = raw.replace(OLD_CIDR.encode(), NEW_CIDR.encode())
+    direct = sorted(name for name in original if seeds[name] != original[name])
+    need(direct)
+    final = closure.closure(original, seeds, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            need(raw == original[name])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    for name in CONTROL_CODE:
+        need(final[name] == original[name])
+    plan = json.loads(final["configs/lumi-vm-private-network-plan-v0.1.json"])
+    need(plan["attempt"] == ATTEMPT)
+    need(plan["targets"]["new_private_subnet_cidr"] == NEW_CIDR)
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        need(len(raw) == pin["bytes"] and closure.sha(raw) == pin["sha256"])
+    report = {
+        "schema": "lumi.vm-attempt018-source.v0.2",
+        "attempt": ATTEMPT,
+        "base_release_sha256": BASE_SHA,
+        "failure_proof_sha256": PROOF_SHA,
+        "previous_selected_cidr": OLD_CIDR,
+        "selected_cidr": NEW_CIDR,
+        "selected_cidr_live_absence_verified": True,
+        "direct_source_changes": direct,
+        "watchdog_control_code_byte_identical": True,
+        "watchdog_code_sha256_base64": manifest["watchdog_code_sha256_base64"],
+        "fresh_controls_already_deployed": True,
+        "control_reverification_required": True,
+        "execution_permitted": False,
+        "old_authorization_reused": False,
+        "old_timer_reused": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "outputs": {
+            name: {"bytes": len(raw), "sha256": closure.sha(raw)}
+            for name, raw in sorted(final.items())
+        },
+    }
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(
+        not OUTPUT.exists()
+        and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents))
+    )
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("corrected_source_is_not_execution_authority") from None

@@ -1,0 +1,115 @@
+# SFT execution status v0.75
+
+2026-09-10. **The metered DCP/HF kernel is now integrated with a new tiny-only
+coordinator and private packager.** The full tiny CPU import-to-package chain
+passes, with exactly two complete checkpoint audits and aggregate requested-byte
+accounting. This completes v0.74's coordinator/package software integration task.
+It does not complete native host containment, real import or Gate 5.
+
+No real checkpoint/trainer/tokenizer payloads or datasets were opened. No GPU,
+inference, training, network action, installation, instance action, GitHub push
+or CI was initiated. Existing code, evidence and the saved real plan are unchanged.
+
+## Integrated path
+
+The new `posttraining_checkpoint_import_runner_v2.py` invokes frozen kernel v5
+and new `posttraining_checkpoint_package_v2.py`. Its public real-input API still
+refuses before I/O. The executable entry remains restricted to explicitly bound
+tiny synthetic metadata, at most one million parameters, and the unchanged
+source/output/read/write/time ceilings. Approval booleans cannot unlock it.
+
+The pure `posttraining_checkpoint_io_contract_v1.py` binds the exact existing
+plan hash, DCP manifest/read limits and HF/control limits in an independently
+pinned contract. It never adds a larger live-memory allowance or raises the old
+plan's backend output ceiling. A metadata-only construction check accepted the
+saved real plan's shape; that was not a sufficient-budget or execution test,
+and no real runtime contract was saved or authorized.
+
+Before creating an attempt, the coordinator admits aggregate read/write
+envelopes. Before invoking each component it prepays that component's cap.
+Unused reservations are not refunded, including after failure. The completed
+result separates successful logical content requests from unspent prepaid
+capacity. Original marker, path, deadline and ledger helpers remain unchanged;
+markers now have versioned names and bind the I/O contract as well as the plan.
+
+## Exactly two checkpoint audits
+
+The coordinator no longer performs a duplicate first checkpoint content scan.
+It first audits tokenizer files, then records a strict metadata-only source
+snapshot immediately before v5. The frozen DCP reader performs the first complete
+manifest/file audit before deserialization. Its successful audit byte/file counts
+must match the same plan and the invoked manifest-bound contract. Another source
+snapshot is compared immediately after kernel return.
+
+After private packaging, the coordinator performs the second complete checkpoint
+audit and second tokenizer audit, then compares a third source snapshot. Thus
+success has one kernel checkpoint audit plus one coordinator checkpoint audit,
+not three. The new `posttraining_checkpoint_identity_v1.py` preserves the exact
+closed directory tree, file sizes, uid/gid, link and private-mode checks without
+reading payloads. Snapshots stay private in memory; they are observations, not
+authenticated content-audit receipts or atomic locks. Existing DCP files must
+already satisfy 0600/0700 rules; no source was chmodded.
+
+## Short-read accounting correction
+
+Independent review found that the old generic stream verifier counted bytes
+returned by a short read, then requested the remainder. This could make an
+aggregate *requested-byte* claim too small even though full-read tests passed.
+The frozen verifier was preserved. New `posttraining_checkpoint_audit_v1.py`
+reuses its structural/path/hash checks but debits each request before `os.read`
+and terminates on any short read, EOF or exception before another content read.
+No refund or remainder retry is possible. Empty files require no probe read.
+
+The packager retains tokenizer-copy semantics, lineage, receipt, manifest and
+the genuine frozen worker checksum consumer. Its v0.4 receipt contains the exact
+v5 kernel evidence and I/O contract. Nested counters, authority flags, audit
+arithmetic, shard scratch formula and the unchanged plan's live/output ceilings
+are validated before package artifacts are created. A late completion failure
+can still leave provisional files, but cannot return success or grant authority.
+
+## Verification
+
+**711 distinct targeted tests pass, with no failures or skips.**
+
+- 613 stdlib tests on Python 3.11.15, 3.13.7 and 3.14.6: 1.590s, 1.597s and
+  1.666s. All previous 464 stdlib regressions remain included.
+- 98 genuine tiny CPU tests on Python 3.13.7: 1.658s test time / 2.997s supervised
+  wall time under a 60-second parent timeout. All previous 85 native regressions
+  remain included.
+- 162 new tests: 23 identity, 23 strict-audit, 17 contract, 61 package,
+  25 coordinator-control and 13 coordinator-native tests.
+- Ruff E,F,I,B,UP / py311 / line length 100 passes on all eleven new code/test
+  files. Existing Torch DCP/platform/deprecation warnings remain visible.
+
+Native instrumentation observes the audit owners/counts and three zero-content
+snapshots. Aggregate successful read requests equal intercepted targeted
+`read`/`pread` request sizes; intercepted writes fit the nonrefundable private
+envelope. An exactly sized aggregate read cap succeeds without a third audit.
+Short first-token and final-source reads stop after one short request. Forged
+audit counts, changed HF counters, source mutations, consumed attempts and late
+completion failures cannot produce an authoritative success. These are tiny
+fixtures, not a full-repository or real-checkpoint qualification claim.
+
+Report: `evidence/lumi-4b-sft-import-metered-coordinator-v0.1.json`.
+Structural verification:
+`evidence/lumi-4b-sft-import-metered-coordinator-verification-v0.1.json`.
+
+## Next remaining boundary
+
+The coordinator/package integration is done for the bounded tiny path. Next is
+native Linux process-guardian and filesystem/network/write containment wiring,
+then actual host/runtime qualification and exact input/resource compatibility.
+Mac tests do not establish Linux cgroup enforcement. These logical content
+ledgers exclude dependency/module reads, physical disk measurements and native
+allocator RSS; metadata pickle still requires trusted hash-bound inputs.
+
+Only after those prerequisites and separately bound execution authorization can
+the real checkpoint import proceed, followed by the remaining GPU worker/profile,
+data relocation and CUDA/smoke prerequisites recorded in v0.70-v0.74. A Linux CPU
+environment is sufficient for containment qualification; GPU/SFT is not started
+by this stage. **Gate 5 is still incomplete; execution permission and production
+eligibility remain false.** No base, dataset, rights or evaluation rule changed.
+
+HEAD remains `ecc545fc423650bf1089311915290523c10b3172`; tracked and staged diffs
+are empty. This stage adds five modules, six test files, a report, its structural
+verification and this status successor. All fourteen files are local/unpublished.

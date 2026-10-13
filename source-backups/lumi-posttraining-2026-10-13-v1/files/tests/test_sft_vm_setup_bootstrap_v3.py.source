@@ -1,0 +1,250 @@
+import builtins
+import importlib
+import io
+import json
+import os
+import stat
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_setup_delivery_v3 as prior
+
+m = importlib.import_module("start_sft_vm_setup_bootstrap_v3")
+BOOT, MACHINE = prior.BOOT, prior.MACHINE
+
+
+def seed_receipt():
+    return dict(
+        schema="lumi.vm-setup-seed.v0.1",
+        attempt=m.ATTEMPT,
+        machine_id=MACHINE,
+        boot_id=BOOT,
+        observed_boottime=100.0,
+        setup_deadline_boottime=1800,
+        receipt_parents_created=True,
+        host_admitted=False,
+        expiry_enforced=False,
+        execution_permitted=False,
+        retry_allowed=False,
+    )
+
+
+class BootstrapTests(unittest.TestCase):
+    setUp = prior.SetupDeliveryTests.setUp
+    reply = prior.SetupDeliveryTests.reply
+
+    def bootstrap(self):
+        return m._seed_and_send_admitted_once(
+            self.binding,
+            self.key,
+            self.root,
+            self.config_sha,
+            self.hosts_sha,
+            self.receiver,
+            self.archive,
+            self.output,
+            deadline=self.deadline,
+            remaining_control_bytes=self.budget,
+            clock=lambda: 0,
+        )
+
+    def test_bootstrap_seed_then_frozen_sender_same_deadline_budget_decrement(self):
+        events = []
+
+        def exchange(argv, body, timeout):
+            events.append("seed")
+            self.assertEqual(body, b"")
+            self.assertEqual(timeout, 25)
+            return m.INPUTS.canonical(seed_receipt())
+
+        def upload(*args, **kwargs):
+            events.append("upload")
+            self.assertEqual(args[7:10], (MACHINE, BOOT, 1800))
+            self.assertEqual(kwargs["deadline"], self.deadline)
+            self.assertLess(kwargs["remaining_control_bytes"], self.budget)
+            return dict(remote_staging_confirmed=True, control_content_bytes_charged=17011000)
+
+        with (
+            patch.object(m.sender.delivery, "pipe_exchange", side_effect=exchange),
+            patch.object(m.sender, "_send_admitted_once", side_effect=upload),
+        ):
+            result = self.bootstrap()
+        self.assertEqual(events, ["seed", "upload"])
+        self.assertTrue(result["control_staging_confirmed"])
+        self.assertFalse(result["host_admitted"])
+        self.assertFalse(result["expiry_enforced"])
+
+    def test_real_frozen_sender_joined_with_both_network_calls_mocked(self):
+        with (
+            patch.object(
+                m.sender.delivery, "pipe_exchange", return_value=m.INPUTS.canonical(seed_receipt())
+            ) as seed,
+            patch.object(m.sender, "pipe_exchange", return_value=self.reply()) as upload,
+        ):
+            result = self.bootstrap()
+            self.assertEqual(seed.call_count, 1)
+            self.assertEqual(upload.call_count, 1)
+            self.assertTrue(result["control_staging_confirmed"])
+            with self.assertRaises(FileExistsError):
+                self.bootstrap()
+            self.assertEqual(seed.call_count, 1)
+            self.assertEqual(upload.call_count, 1)
+
+    def test_ambiguous_seed_does_not_upload_or_retry(self):
+        with (
+            patch.object(
+                m.sender.delivery, "pipe_exchange", side_effect=TimeoutError("private")
+            ) as seed,
+            patch.object(m.sender, "_send_admitted_once") as upload,
+        ):
+            with self.assertRaisesRegex(ValueError, "^setup_bootstrap_failed$"):
+                self.bootstrap()
+            upload.assert_not_called()
+            self.assertEqual(seed.call_count, 1)
+        raw = (self.output / "result.json").read_bytes()
+        self.assertNotIn(b"private", raw)
+        self.assertEqual(json.loads(raw)["failed_phase"], "seed")
+        self.assertFalse(json.loads(raw)["control_staging_confirmed"])
+
+    def test_invalid_seed_blocks_upload(self):
+        cases = [
+            seed_receipt() | {"setup_deadline_boottime": 1900},
+            seed_receipt() | {"receipt_parents_created": 1},
+            seed_receipt() | {"host_admitted": True},
+            seed_receipt() | {"observed_boottime": float("nan")},
+            seed_receipt() | {"observed_boottime": 1670},
+            seed_receipt() | {"machine_id": "bad"},
+            seed_receipt() | {"extra": "x"},
+        ]
+        for value in cases:
+            with self.assertRaises(ValueError):
+                m.validate_seed(m.INPUTS.canonical(value))
+
+    def test_preflight_budget_deadline_payload_failure_before_seed(self):
+        with patch.object(m.sender.delivery, "pipe_exchange") as seed:
+            self.deadline = 145
+            with self.assertRaises(ValueError):
+                self.bootstrap()
+            self.deadline = 1800
+            self.budget = m.sender.MAX_BODY
+            with self.assertRaises(ValueError):
+                self.bootstrap()
+            self.budget = m.INPUTS.CAP
+            self.receiver = self.root / "bad-source"
+            m.INPUTS.write(self.receiver, b"bad")
+            with self.assertRaises(ValueError):
+                self.bootstrap()
+            seed.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_transfer_failure_keeps_seed_and_stops(self):
+        with (
+            patch.object(
+                m.sender.delivery, "pipe_exchange", return_value=m.INPUTS.canonical(seed_receipt())
+            ) as seed,
+            patch.object(m.sender, "pipe_exchange", side_effect=TimeoutError()) as upload,
+        ):
+            with self.assertRaises(ValueError):
+                self.bootstrap()
+            self.assertEqual(seed.call_count, 1)
+            self.assertEqual(upload.call_count, 1)
+        self.assertTrue((self.output / "seed.json").is_file())
+        self.assertEqual(
+            json.loads((self.output / "result.json").read_text())["failed_phase"],
+            "control_transfer",
+        )
+
+    def test_public_bootstrap_stays_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)
+
+
+class NativeSeedTests(unittest.TestCase):
+    setUp = prior.SetupDeliveryTests.setUp
+
+    def native(self, now=10, wrong_namespace=False):
+        base = self.root / "varlib"
+        base.mkdir(exist_ok=True)
+        source = m.SEED.replace('Path("/var/lib")', f"Path({str(base)!r})")
+        code = compile(source, "<seed-test>", "exec")
+        real_open, real_stat, real_lstat = builtins.open, os.stat, Path.lstat
+
+        def opened(path, *args, **kwargs):
+            if path == "/etc/machine-id":
+                return io.BytesIO(MACHINE.encode())
+            if path == "/proc/sys/kernel/random/boot_id":
+                return io.BytesIO(BOOT.encode())
+            return real_open(path, *args, **kwargs)
+
+        def observed(path, *args, **kwargs):
+            if str(path) in {"/proc/self/ns/mnt", "/proc/1/ns/mnt"}:
+                return types.SimpleNamespace(
+                    st_ino=2 if wrong_namespace and "self" in str(path) else 1
+                )
+            return real_stat(path, *args, **kwargs)
+
+        def owned(path, *args, **kwargs):
+            value = list(real_lstat(path, *args, **kwargs))
+            value[4:6] = [0, 0]
+            return os.stat_result(value)
+
+        out = io.BytesIO()
+        with (
+            patch.object(
+                sys,
+                "stdout",
+                types.SimpleNamespace(buffer=out, write=lambda s: out.write(s.encode())),
+            ),
+            patch.object(sys, "platform", "linux"),
+            patch.object(sys, "version_info", (3, 12)),
+            patch.object(sys, "flags", types.SimpleNamespace(isolated=True)),
+            patch.object(sys, "dont_write_bytecode", True),
+            patch.object(os, "geteuid", return_value=0),
+            patch.object(os, "getegid", return_value=0),
+            patch.object(os, "stat", side_effect=observed),
+            patch.object(Path, "lstat", owned),
+            patch("builtins.open", side_effect=opened),
+            patch("signal.alarm") as alarm,
+            patch.object(m.time, "CLOCK_BOOTTIME", 7, create=True),
+            patch.object(m.time, "clock_gettime", return_value=now),
+        ):
+            try:
+                exec(code, {})
+                status = 0
+            except SystemExit as exc:
+                status = exc.code
+            alarm.assert_called_once_with(20)
+        return status, json.loads(out.getvalue()), base
+
+    def test_native_seed_real_exclusive_directories_and_receipt(self):
+        status, value, base = self.native()
+        self.assertEqual(status, 0)
+        self.assertEqual(m.validate_seed(m.INPUTS.canonical(value)), value)
+        for name in ("lumi-vm-bootstrap", "lumi-vm-input-deployment", "lumi-vm-setup"):
+            self.assertEqual(stat.S_IMODE((base / name).stat().st_mode), 0o700)
+        receipt = base / "lumi-vm-bootstrap" / m.ATTEMPT / "seed.json"
+        self.assertEqual(json.loads(receipt.read_text()), value)
+        before = receipt.read_bytes()
+        self.assertEqual(self.native()[0], 2)
+        self.assertEqual(receipt.read_bytes(), before)
+
+    def test_expired_boot_and_wrong_namespace_no_directories(self):
+        for kwargs in [dict(now=1670), dict(wrong_namespace=True)]:
+            status, _, base = self.native(**kwargs)
+            self.assertEqual(status, 2)
+            self.assertEqual(list(base.iterdir()), [])
+
+    def test_partial_seed_is_preserved_and_not_retried(self):
+        with patch.object(os, "fsync", side_effect=OSError("private")):
+            status, value, base = self.native()
+        self.assertEqual(status, 2)
+        self.assertEqual(value, {"status": "setup_seed_failed", "execution_permitted": False})
+        self.assertTrue((base / "lumi-vm-bootstrap").is_dir())
+        self.assertEqual(self.native()[0], 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

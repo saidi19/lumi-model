@@ -1,0 +1,128 @@
+"""Offline reconciliation of acknowledged cleanup calls and preserved inputs."""
+
+import json
+import sys
+from pathlib import Path
+
+from scripts import cleanup_sft_vm_attempt020_endpoint_v1 as entry
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE_SHA = "d143006bb3ad25b7b76e67bef2ae41a643e5d66a19c2479999bc312caa69ec46"
+TEST = ROOT / "tests/test_sft_vm_attempt020_endpoint_cleanup_v1.py"
+TEST_SHA = "ee9ea40fb3f9a776aab54b218fcb863ea92b5363a0c920cd7cdc3a21b405c4bd"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-020-endpoint-cleanup-verification-v0.1.json"
+
+
+def load(path):
+    return json.loads(files.read(path))
+
+
+def verify():
+    files.need(files.sha(files.read(Path(entry.__file__))) == SOURCE_SHA)
+    files.need(files.sha(files.read(TEST)) == TEST_SHA)
+    files.need(files.sha(files.read(entry.QUALIFIED)) == entry.QUALIFIED_SHA)
+    entry.local()  # Checks original immutable launch, approval and blocker bindings.
+    run = entry.OUTPUT
+    started = load(run / "started.json")
+    result = load(run / "result.json")
+    preflight = load(run / "preflight.json")
+    dispatch = load(run / "delete-dispatch.json")
+    files.need(started["source_sha256"] == SOURCE_SHA)
+    files.need(started["approval_sha256"] == entry.APPROVAL_SHA)
+    files.need(started["audit_sha256"] == entry.AUDIT_SHA)
+    files.need(started["blocker_sha256"] == entry.BLOCKER_SHA)
+    files.need(started["endpoint"] == entry.ENDPOINT)
+    files.need(started["maximum_reads"] == 30 and started["maximum_seconds"] == 600)
+    files.need(started["maximum_delete_dispatches"] == 1 and started["retry"] is False)
+    files.need(preflight == dict(ownership_verified=True, preserved_resources_verified=True))
+    files.need(dispatch == dict(endpoint=entry.ENDPOINT, retry=False))
+    files.need(result["status"] == "endpoint_removed_preserved_resources_verified")
+    files.need(result["cleanup_verified"] is True and result["endpoint"] == entry.ENDPOINT)
+    files.need(result["delete_dispatches"] == 1 and 17 <= result["reads"] <= 30)
+    files.need(result["elapsed_seconds"] < 600)
+    files.need(result["instance_actions"] == result["s3_actions"] == 0)
+    files.need(all(result[k] is False for k in ("gate_5_complete", "gpu", "training")))
+    paths = sorted(run.glob("call-*.json"))
+    files.need(len(paths) == result["reads"] + 1)
+    receipts = [load(path) for path in paths]
+    files.need(all(row["acknowledged"] is True for row in receipts))
+    operations = [row["operation"] for row in receipts]
+    preserve = [
+        "describe-instances",
+        "describe-volumes",
+        "describe-subnets",
+        "describe-route-tables",
+        "describe-security-groups",
+        "describe-key-pairs",
+    ]
+    prefix = [
+        "get-caller-identity",
+        *preserve,
+        "describe-instance-connect-endpoints",
+        "describe-network-interfaces",
+        "delete-instance-connect-endpoint",
+    ]
+    tail = ["describe-network-interfaces", *preserve]
+    files.need(operations[: len(prefix)] == prefix and operations[-len(tail) :] == tail)
+    middle = operations[len(prefix) : -len(tail)]
+    files.need(1 <= len(middle) <= 12)
+    files.need(all(op == "describe-instance-connect-endpoints" for op in middle))
+    files.need(operations.count("delete-instance-connect-endpoint") == 1)
+    bindings = {
+        str(path.relative_to(ROOT)): files.sha(files.read(path))
+        for path in [
+            Path(entry.__file__),
+            entry.QUALIFIED,
+            TEST,
+            ROOT / entry.APPROVAL,
+            ROOT / entry.AUDIT,
+            ROOT / entry.BLOCKER,
+            run / "started.json",
+            run / "preflight.json",
+            run / "delete-dispatch.json",
+            run / "result.json",
+            *paths,
+        ]
+    }
+    return dict(
+        schema="lumi.vm-attempt020-endpoint-cleanup-verification.v0.1",
+        status=result["status"],
+        attempt=entry.ATTEMPT,
+        endpoint=entry.ENDPOINT,
+        source_bindings=bindings,
+        reads=result["reads"],
+        delete_dispatches=1,
+        elapsed_seconds=result["elapsed_seconds"],
+        retry=False,
+        endpoint_interface_absent=True,
+        verification_kind="offline_binding_and_acknowledged_live_controller_checks",
+        additional_cloud_calls=0,
+        preserved=dict(
+            stopped_instance=entry.VM,
+            encrypted_ebs_volumes=sorted(entry.VOLUMES),
+            subnet=entry.SUBNET,
+            route_table=entry.TABLE,
+            security_groups=[entry.VM_GROUP, entry.ENDPOINT_GROUP],
+            key_pair=entry.KEY,
+            pre_and_post_checks_passed=True,
+            buckets_and_watchdogs_not_mutated=True,
+        ),
+        prior_evidence_preserved=True,
+        instance_actions=0,
+        s3_actions=0,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        next_required="Fresh attempt-021 control preparation and read-only admission; "
+        "never rerun the consumed target scan or CPU attempt.",
+    )
+
+
+if __name__ == "__main__":
+    files.need(sys.argv[1:] == ["--write-once"] and not OUTPUT.exists())
+    result = verify()
+    files.save(OUTPUT, result)
+    print(
+        json.dumps({k: result[k] for k in ("status", "reads", "delete_dispatches")}, sort_keys=True)
+    )

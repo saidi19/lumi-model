@@ -1,0 +1,137 @@
+"""Private native entry for the prepared S3 aggregate-report route.
+
+Requires an admitted disposable Linux host and root-owned input deployment.
+No public launch/approval option. Production bootstrap and policy remain frozen.
+"""
+
+import hashlib
+import json
+import os
+import signal
+import sys
+import types
+from pathlib import Path
+
+INPUT = Path("/opt/lumi-bootstrap-input")
+PINS = {
+    "run_sft_vm_network_bootstrap_v2.py": (
+        "3034eca29487b089729aafb29748da2333a54f6ac4cc630d24a7cb3867c07202"
+    ),
+    "probe_sft_vm_watchdog_native_v4.py": (
+        "07279452a79eef3f9d6f3a3b9b6ea5561950863bb68adc22a118e2de98660f7c"
+    ),
+    "sft_vm_watchdog_report_channel_v1.py": (
+        "7ea5adf3bc5209421daba9dd3d943a968defd369fe8443c328dbcc8e0bb66f35"
+    ),
+}
+
+
+def load(name, read):
+    raw = read(INPUT / name)
+    if hashlib.sha256(raw).hexdigest() != PINS[name]:
+        raise ValueError("report_source_binding_rejected")
+    module = types.ModuleType("_object_" + name)
+    module.__file__ = str(INPUT / name)
+    exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def prepare(*, observer):
+    if not (
+        sys.platform == "linux"
+        and sys.version_info[:2] == (3, 12)
+        and sys.flags.isolated
+        and sys.flags.dont_write_bytecode
+        and os.getuid() == os.getgid() == 0
+    ):
+        raise ValueError("native_object_probe_required")
+    bootstrap = load("run_sft_vm_network_bootstrap_v2.py", Path.read_bytes)
+    bootstrap.read(INPUT / "run_sft_vm_network_bootstrap_v2.py")
+    channel = load("sft_vm_watchdog_report_channel_v1.py", bootstrap.read)
+    config = json.loads(
+        bootstrap.read(INPUT / "report-channel.json", 40000), object_pairs_hook=channel.unique
+    )
+    channel.identity(config["attempt"], config["bindings"])
+    expected = {
+        "probe": hashlib.sha256(bootstrap.read(Path(__file__))).hexdigest(),
+        "bootstrap": PINS["run_sft_vm_network_bootstrap_v2.py"],
+        "policy": bootstrap.PINS["build_sft_vm_network_expiry_v3.py"],
+    }
+    channel.need(config["bindings"] == expected)
+    claims = Path("/var/lib/lumi-watchdog-reports") / config["attempt"]
+    if not observer:
+        claims.mkdir(parents=True, mode=0o700, exist_ok=False)
+    bootstrap.owned(claims)
+    probe = load("probe_sft_vm_watchdog_native_v4.py", bootstrap.read)
+    # Its existing authenticated ExecStop must re-enter THIS reporting adapter,
+    # whose hash is independently checked, rather than the console-only probe.
+    probe.__file__ = __file__
+    original_unit = probe.observer_unit
+
+    def observer_unit(source_sha):
+        return original_unit(source_sha).replace(
+            "After=dbus.service systemd-journald.service\n",
+            "After=dbus.service systemd-journald.service network.target nss-lookup.target\n",
+        )
+
+    def report(checks, status):
+        slot = (
+            "observer"
+            if observer
+            else ("ready" if status == "ready_for_deliberate_policy_fault" else "failure")
+        )
+        value = {
+            "schema": "lumi.watchdog-native-probe.v0.2",
+            "status": status,
+            "checks": checks,
+            **channel.FLAGS,
+        }
+        channel.put_once(config, slot, value, claim_directory=claims)
+        return value
+
+    probe.observer_unit, probe.report = observer_unit, report
+    return bootstrap, channel, config, claims, probe
+
+
+def shutdown_observation():
+    # Keep the upload within the unchanged observer unit's 10-second stop bound.
+    signal.alarm(8)
+    _, _, _, _, probe = prepare(observer=True)
+    probe.shutdown_observation()
+
+
+def native_once():
+    bootstrap, channel, config, claims, probe = prepare(observer=False)
+    signal.alarm(8)
+    try:
+        channel.put_once(
+            config,
+            "boot",
+            {
+                "schema": "lumi.watchdog-native-probe.v0.2",
+                "status": "report_channel_ready",
+                "checks": {"transport_ready": True},
+                **channel.FLAGS,
+            },
+            claim_directory=claims,
+        )
+    except Exception:
+        bootstrap.stop_host()
+        raise SystemExit(1) from None
+    finally:
+        signal.alarm(0)
+    try:
+        # The frozen probe performs the same native checks and deliberate fault.
+        probe.native_once()
+    finally:
+        bootstrap.stop_host()
+
+
+def run(**_arguments):
+    raise ValueError("object_report_native_admission_not_bound")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--native-once"]:
+        raise SystemExit("native_probe_requires_exact_entry")
+    native_once()

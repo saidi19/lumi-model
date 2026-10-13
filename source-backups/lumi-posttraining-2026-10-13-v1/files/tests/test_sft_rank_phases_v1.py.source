@@ -1,0 +1,281 @@
+"""Actual local socket/ledger/step-gate composition; CUDA and step bodies doubled."""
+
+import importlib
+import socket
+import sys
+import time
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+from . import test_sft_smoke_bridge_v1 as fixture
+from . import test_sft_socket_transport_v1 as transport_fixture
+
+module = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_rank_phases_v1")
+transport = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_socket_transport_v2")
+
+
+class RankPhaseTests(unittest.TestCase):
+    def setUp(self):
+        self.pairs = [socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM) for _ in range(2)]
+        deadline = time.monotonic_ns() + 2_000_000_000
+        self.ledger = module.WorkerLedgerClient(
+            self.pairs[0][0], epoch="a"*64, rank=0, token="b"*64,
+            interrupt=lambda: None, maximum_wire_bytes=2**20,
+            deadline_ns=deadline, maximum_exchange_ns=1_000_000_000)
+        self.control = module.WorkerControlClient(
+            self.pairs[1][0], invocation_index=0, interrupt=lambda: None,
+            maximum_wire_bytes=2**20, maximum_reads=1000,
+            deadline_ns=deadline, maximum_exchange_ns=1_000_000_000)
+        self.events = []
+        self.context = types.SimpleNamespace(device=object())
+        self.health = Mock(side_effect=lambda: self.events.append("health"))
+        self.interrupt = Mock(return_value=None)
+        self.cuda = Mock(side_effect=lambda device: self.events.append("cuda"))
+        self.torch = types.SimpleNamespace(cuda=types.SimpleNamespace(synchronize=self.cuda))
+        self.adapter = self.make()
+
+    def tearDown(self):
+        self.ledger.close()
+        self.control.close()
+        for pair in self.pairs:
+            for sock in pair:
+                sock.close()
+
+    def make(self, **changes):
+        return module.RankPhases(**{
+            "control": self.control, "ledger": self.ledger, "context": self.context,
+            "invocation_index": 0, "check_health": self.health,
+            "interrupt": self.interrupt, **changes})
+
+    def error(self, code, fn):
+        with self.assertRaises(module.RankPhaseError) as caught:
+            fn()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def commit(self, name, step):
+        self.events.append("parent")
+        self.control._index += 1
+
+    def call(self, name, step):
+        with patch.object(self.adapter, "_runtime", return_value=self.torch), \
+                patch.object(self.control, "phase", side_effect=self.commit):
+            self.adapter(name, step)
+
+    def test_construction_inert_and_invalid_binding_rejected(self):
+        self.assertEqual(self.events, [])
+        for changes in ({"ledger": None}, {"control": None}, {"invocation_index": True},
+                        {"invocation_index": 2}, {"check_health": None}):
+            self.error("invalid_arguments", lambda changes=changes: self.make(**changes))
+
+    def test_native_cuda_completion_before_parent_phase(self):
+        self.call("inputs", 0)
+        self.assertEqual(self.events, ["health", "cuda", "health", "parent", "health"])
+        self.cuda.assert_called_once_with(self.context.device)
+
+    def test_all_callbacks_order_with_existing_ledger_fences(self):
+        for name, step in self.adapter._phases:
+            self.ledger._fences = step - int(name in ("reserved", "updated"))
+            self.call(name, step)
+        self.assertEqual(self.adapter.summary()["phases_completed"], 10)
+        self.assertEqual(self.cuda.call_count, 10)
+        self.assertFalse(self.adapter.summary()["execution_authorized"])
+        self.error("phase_rejected", lambda: self.call("checkpoint", 2))
+        self.interrupt.assert_not_called()
+
+    def test_wrong_order_stops_before_health_cuda_or_socket(self):
+        self.error("phase_rejected", lambda: self.call("reserved", 1))
+        self.assertEqual(self.events, [])
+        self.interrupt.assert_called_once()
+
+    def test_cold_health_callback_is_not_silently_ignored(self):
+        self.health.side_effect = ValueError("PRIVATE")
+        self.error("health_rejected", lambda: self.call("inputs", 0))
+        self.cuda.assert_not_called()
+        self.assertEqual(self.control._index, 0)
+
+    def test_native_runtime_rejection_before_cuda(self):
+        self.error("runtime_rejected", lambda: self.adapter("inputs", 0))
+        self.cuda.assert_not_called()
+
+    def test_cuda_failure_never_reports_phase(self):
+        self.cuda.side_effect = ValueError("PRIVATE")
+        self.error("cuda_failed", lambda: self.call("inputs", 0))
+        self.assertEqual(self.control._index, 0)
+
+    def test_updated_cuda_failure_never_sends_updated_control(self):
+        self.call("inputs", 0)
+        self.call("restored", 0)
+        self.call("reserved", 1)
+        self.cuda.side_effect = ValueError("PRIVATE")
+        self.error("cuda_failed", lambda: self.call("updated", 1))
+        self.assertEqual(self.control._index, 3)
+        self.assertEqual(self.adapter.summary()["phases_completed"], 3)
+
+    def test_post_cuda_health_failure_never_reports_phase(self):
+        self.health.side_effect = [None, False]
+        self.error("health_rejected", lambda: self.call("inputs", 0))
+        self.cuda.assert_called_once()
+        self.assertEqual(self.control._index, 0)
+
+    def test_pending_or_wrong_step_fence_rejected(self):
+        self.ledger._pending_step = 1
+        self.error("fence_rejected", lambda: self.call("inputs", 0))
+        self.cuda.assert_not_called()
+
+    def test_completed_requires_worker_run_to_have_consumed_commit_fence(self):
+        for phase in ("inputs", "restored"):
+            self.call(phase, 0)
+        for phase in ("reserved", "updated"):
+            self.call(phase, 1)
+        before = self.cuda.call_count
+        self.error("fence_rejected", lambda: self.call("completed", 1))
+        self.assertEqual(self.cuda.call_count, before)
+        self.assertEqual(self.control._index, 4)
+
+    def test_failed_parent_cannot_advance_local_phase(self):
+        with patch.object(self.adapter, "_runtime", return_value=self.torch), \
+                patch.object(self.control, "phase", side_effect=ValueError("PRIVATE")):
+            self.error("control_failed", lambda: self.adapter("inputs", 0))
+        self.assertEqual(self.adapter.summary()["phases_completed"], 0)
+        self.error("control_failed", lambda: self.call("inputs", 0))
+
+    def test_swallowed_reentry_stays_terminal_before_native_work(self):
+        self.health.side_effect = lambda: self.error("reentry", lambda: self.adapter("inputs", 0))
+        self.error("reentry", lambda: self.call("inputs", 0))
+        self.cuda.assert_not_called()
+        self.interrupt.assert_called_once()
+
+    def test_cross_owner_rejected(self):
+        self.adapter._owner = (-1, -1)
+        self.error("owner_mismatch", lambda: self.call("inputs", 0))
+        self.assertEqual(self.events, [])
+
+    def test_actual_native_metadata_check_rejects_rank_or_backend_mismatch(self):
+        class Context:
+            rank, local_rank, world_size, backend = 0, 0, 8, "nccl"
+            device = types.SimpleNamespace(type="cuda", index=0)
+        context = Context()
+        torch = types.ModuleType("torch")
+        distributed = types.ModuleType("lumi.distributed_training")
+        distributed.DistributedContext = Context
+        torch.cuda = types.SimpleNamespace(current_device=lambda: 0)
+        torch.distributed = types.SimpleNamespace(is_initialized=lambda: True,
+            get_world_size=lambda: 8, get_rank=lambda: 0, get_backend=lambda: "nccl")
+        self.adapter._context = context
+        with patch.dict(sys.modules, {"torch": torch, "lumi.distributed_training": distributed}):
+            self.assertIs(self.adapter._runtime(), torch)
+            context.backend = "gloo"
+            self.error("runtime_rejected", self.adapter._runtime)
+
+
+class PhaseCompositionTests(unittest.TestCase):
+    def run_epochs(self, *, drop_reservation_confirmation=False, cuda_failure=False):
+        harness = transport_fixture.SocketTransportTests()
+        harness.setUp()
+        template = fixture.RankBridgeTests()
+        template.setUp()
+        clients, adapters, bodies, gpu_syncs = [], [], [], []
+        parent_results = []
+
+        def worker(rank):
+            ledger = control = None
+            try:
+                deadline = time.monotonic_ns() + 4_000_000_000
+                ledger = module.WorkerLedgerClient(
+                    harness.peers[rank][0], epoch=harness.f.epoch, rank=rank,
+                    token=harness.f.tokens[rank], interrupt=lambda: None,
+                    maximum_wire_bytes=2**20, deadline_ns=deadline,
+                    maximum_exchange_ns=2_000_000_000)
+                if rank == 0 and drop_reservation_confirmation:
+                    original = ledger._send
+                    sent = [0]
+                    def drop_once(raw, end):
+                        sent[0] += 1
+                        if sent[0] != 2:  # Request, then deliberately LOST confirmation.
+                            return original(raw, end)
+                    ledger._send = drop_once
+                control = module.WorkerControlClient(
+                    harness.peers[rank][1], invocation_index=harness.index,
+                    deadline_ns=deadline, maximum_exchange_ns=2_000_000_000,
+                    maximum_wire_bytes=2**20, maximum_reads=1000, interrupt=lambda: None)
+                clients.append(control)
+                def sync(device):
+                    if cuda_failure and rank == 3:
+                        raise ValueError("SYNTHETIC_CUDA_FAILURE")
+                    gpu_syncs.append(rank)
+                adapter = module.RankPhases(
+                    control=control, ledger=ledger, context=types.SimpleNamespace(device=object()),
+                    invocation_index=harness.index, check_health=lambda: None,
+                    interrupt=lambda: None)
+                adapter._runtime = lambda: types.SimpleNamespace(
+                    cuda=types.SimpleNamespace(synchronize=sync))
+                adapters.append(adapter)
+                _, start, stop, _ = fixture.bridge.SEQUENCE[harness.index]
+                run = fixture.worker.WorkerRun(**{
+                    **template.options, "client": ledger, "rank": rank,
+                    "from_step": start, "stop_step": stop, "synchronize": adapter,
+                    "admit": lambda: None, "interrupt": lambda: None})
+                # Exercise actual _helpers, StepGate and _sync, not WorkerRun.run:
+                # no model/input/checkpoint work, reports are explicit fixtures.
+                run._state = "running"
+                run._helpers()
+                run._sync("inputs", start)
+                run._sync("restored", start)
+                for step in range(start+1, stop+1):
+                    with run._gate.step(step):
+                        bodies.append((harness.index, rank, step))
+                    run._sync("checkpoint", step)
+                control.report_and_wait(harness.f.reports(harness.index)[rank],
+                                        ledger.summary()["requests_sent"])
+                control.retire(ledger.close)
+            except BaseException:
+                harness.errors.append(rank)
+            finally:
+                if ledger is not None:
+                    ledger.close()
+                if control is not None:
+                    control.close()
+
+        harness.worker = worker
+        failed = drop_reservation_confirmation or cuda_failure
+        try:
+            for index in range(1 if failed else 3):
+                if index:
+                    harness.f.new(index)
+                    harness.parents, harness.peers, harness.threads = [], [], []
+                harness.index = index
+                parent = transport.SocketTransport(**harness.options(
+                    maximum_exchange_ns=200_000_000 if failed else 1_000_000_000))
+                if failed:
+                    with self.assertRaises(transport.TransportError):
+                        parent.run()
+                    self.assertEqual(bodies, [])
+                    self.assertEqual(
+                        harness.f.ledger.summary()["global_optimizer_steps_completed"], 0)
+                else:
+                    parent_results.append(parent.run())
+                    self.assertEqual(harness.errors, [])
+            if not failed:
+                self.assertEqual(len(clients), 24)
+                self.assertEqual(len(bodies), 32)
+                self.assertEqual(len(gpu_syncs), 176)  # Doubled CUDA synchronization calls.
+                self.assertEqual([r["control_messages"] for r in parent_results], [96, 64, 64])
+                self.assertTrue(all(r["eof_channels"] == 16 for r in parent_results))
+                self.assertEqual([a.summary()["phases_completed"] for a in adapters].count(10), 8)
+                self.assertEqual(harness.f.ledger.summary()["global_optimizer_steps_completed"], 4)
+                self.assertEqual(harness.f.ledger.summary()["resource_reservations"], 0)
+                self.assertTrue(all(c.summary()["state"] == "closed" for c in clients))
+        finally:
+            harness.tearDown()
+            template.tearDown()
+
+    def test_three_epochs_real_parent_and_worker_step_gate_no_dummy_reservation(self):
+        self.run_epochs()
+
+    def test_missing_reservation_confirmation_never_starts_any_step_body(self):
+        self.run_epochs(drop_reservation_confirmation=True)
+
+    def test_cuda_completion_failure_never_reports_success_or_starts_body(self):
+        self.run_epochs(cuda_failure=True)

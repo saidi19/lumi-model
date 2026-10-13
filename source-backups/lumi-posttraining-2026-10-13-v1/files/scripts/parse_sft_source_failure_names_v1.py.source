@@ -1,0 +1,86 @@
+"""Observed failure identifiers only, independent of pytest footer formatting."""
+
+import builtins
+import re
+
+MAX_LOG = 131_072
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ")
+HEADER = re.compile(r"=+ short test summary info =+")
+EXIT = re.compile(r"##\[error\]Process completed with exit code ([0-9]{1,3})\.")
+NODE = re.compile(
+    r"^(FAILED|ERROR) (tests/test_[A-Za-z0-9_]+\.py"
+    r"(?:::[A-Za-z_][A-Za-z0-9_]*){0,3})(?=\[|\s|$)"
+)
+ERROR_TYPES = {
+    name for name, value in vars(builtins).items()
+    if isinstance(value, type) and issubclass(value, BaseException)
+} | {"Failed"}
+
+
+class Rejected(ValueError):
+    """Fixed public diagnostic code only."""
+
+
+def need(value, code):
+    if not value:
+        raise Rejected(code) from None
+
+
+def parse_names(data: bytes, allowed_nodes: set[str], source_group: str) -> list[dict]:
+    """Return observed bound names; never claim the list or summary is exhaustive."""
+    need(type(data) is bytes and 0 < len(data) <= MAX_LOG, "log_bound")
+    need(type(allowed_nodes) is set and bool(allowed_nodes), "node_bindings")
+    need(type(source_group) is str and source_group.startswith("##[group]Run "), "source_group_binding")
+    try:
+        lines = [STAMP.sub("", ANSI.sub("", row)).strip() for row in data.decode("utf-8").splitlines()]
+    except UnicodeError:
+        raise Rejected("log_encoding") from None
+    sections, current, header = [], None, False
+    for row in lines:
+        if row.startswith("##[group]"):
+            if current is not None:
+                sections.append(current)
+            current = [] if row == source_group else None
+            header = current is not None
+        elif row == "##[endgroup]" and current is not None:
+            header = False
+        elif current is not None and not header:
+            current.append(row)
+    if current is not None:
+        sections.append(current)
+    need(len(sections) == 1, "source_group_missing_or_ambiguous")
+    section = sections[0]
+    exits = [(index, EXIT.fullmatch(row)) for index, row in enumerate(section) if EXIT.fullmatch(row)]
+    need(len(exits) == 1 and 1 <= int(exits[0][1].group(1)) <= 255, "source_exit_missing_or_ambiguous")
+    body = section[:exits[0][0]]
+    headers = [index for index, row in enumerate(body) if HEADER.fullmatch(row)]
+    need(len(headers) == 1, "summary_header_missing_or_ambiguous")
+    observed, rows = {}, 0
+    for row in body[headers[0] + 1:]:
+        if not row.startswith(("FAILED ", "ERROR ")):
+            continue
+        rows += 1
+        need(rows <= 512, "summary_row_bound")
+        if len(row) > 65_536:
+            continue
+        match = NODE.match(row)
+        if not match:
+            continue
+        node = match.group(2)
+        if node not in allowed_nodes or len(node) > 512:
+            continue
+        remainder, error_type = row[match.end():], None
+        if remainder.startswith("["):
+            if "]" not in remainder:
+                continue
+        else:
+            message = re.match(r"^ - ([A-Za-z_][A-Za-z0-9_]*)(?=:|$)", remainder)
+            if message and message.group(1) in ERROR_TYPES:
+                error_type = message.group(1)
+        observed.setdefault(node, set()).add(error_type)
+    need(bool(observed), "no_bound_failure_names")
+    return [
+        {"test": node, "error_type": next(iter(kinds)) if len(kinds) == 1 else None}
+        for node, kinds in sorted(observed.items())
+    ]

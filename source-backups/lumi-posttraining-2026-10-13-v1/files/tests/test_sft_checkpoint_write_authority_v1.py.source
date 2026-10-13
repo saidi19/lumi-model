@@ -1,0 +1,349 @@
+"""Synthetic finalized-endpoint authority tests; no socket or FD exists."""
+
+from __future__ import annotations
+
+import fcntl
+import importlib
+import os
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import call, patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_authority_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_authority_v1")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+RAW_FD_IDENTITY = m._fd_identity
+
+PRIVATE = "SYNTHETIC-PRIVATE-PAYLOAD"
+
+
+class Endpoint:
+    def __init__(self, fd, events):
+        self.fd = fd
+        self.events = events
+        self.closed = False
+        self.detached = False
+        self.fail_detach = False
+
+    def fileno(self):
+        return -1 if self.detached else self.fd
+
+    def close(self):
+        self.events.append(("close_socket", self.fd))
+        if self.closed or self.detached:
+            raise AssertionError(PRIVATE)
+        self.closed = True
+
+    def detach(self):
+        self.events.append(("detach", self.fd))
+        if self.closed or self.detached:
+            raise AssertionError(PRIVATE)
+        if self.fail_detach:
+            raise OSError(PRIVATE)
+        self.detached = True
+        return self.fd
+
+
+class EndpointAuthorityTests(unittest.TestCase):
+    def setUp(self):
+        self.pid = 100
+        self.ppid = 50
+        self.now = 10
+        self.deadline = 100
+        self.reset_endpoints()
+        self.raw_overrides = {}
+        self.socket_overrides = {}
+
+        self.runtime = self.enterContext(patch.object(
+            m, "_runtime", return_value=None,
+        ))
+        self.clock = self.enterContext(patch.object(
+            m.frozen.time, "monotonic_ns", side_effect=lambda: self.now,
+        ))
+        self.getpid = self.enterContext(patch.object(
+            m.os, "getpid", side_effect=lambda: self.pid,
+        ))
+        self.getppid = self.enterContext(patch.object(
+            m.os, "getppid", side_effect=lambda: self.ppid,
+        ))
+        self.socket_identity = self.enterContext(patch.object(
+            m.frozen, "_endpoint_identity", side_effect=self.endpoint_identity,
+        ))
+        self.raw_identity = self.enterContext(patch.object(
+            m, "_fd_identity", side_effect=self.fd_identity,
+        ))
+        self.close = self.enterContext(patch.object(
+            m.os, "close", side_effect=self.close_fd,
+        ))
+
+    def reset_endpoints(self):
+        self.events = []
+        self.endpoints = {
+            name: Endpoint(fd, self.events)
+            for fd, name in enumerate(
+                (part for pair in m.frozen.PAIR_ENDPOINTS for part in pair),
+                start=10,
+            )
+        }
+        self.identities = {
+            name: self.identity_for(endpoint.fd)
+            for name, endpoint in self.endpoints.items()
+        }
+
+    @staticmethod
+    def identity_for(fd):
+        return (fd, 1, fd + 1000, 0o140000, 0, 0,
+                fcntl.FD_CLOEXEC, os.O_RDWR | os.O_NONBLOCK)
+
+    def endpoint_identity(self, endpoint):
+        value = self.socket_overrides.get(endpoint.fd)
+        if isinstance(value, BaseException):
+            raise value
+        return value if value is not None else self.identity_for(endpoint.fd)
+
+    def fd_identity(self, fd):
+        value = self.raw_overrides.get(fd)
+        if isinstance(value, BaseException):
+            raise value
+        return value if value is not None else self.identity_for(fd)
+
+    def close_fd(self, fd):
+        self.events.append(("close_fd", fd))
+
+    def topology(self, stage="controller"):
+        value = m.frozen._Topology(
+            self.endpoints, self.identities, self.deadline, m.frozen._BUILD,
+        )
+        if stage == "controller":
+            value.transition_admitted_once(stage)
+        elif stage in {"guardian_watch", "broker", "worker"}:
+            parent_pid = self.pid
+            self.pid, self.ppid = parent_pid + 100, parent_pid
+            value.adopt_fork_child_admitted_once()
+            value.transition_admitted_once("guardian_prefork")
+            if stage == "guardian_watch":
+                value.transition_admitted_once(stage)
+            else:
+                parent_pid = self.pid
+                self.pid, self.ppid = parent_pid + 100, parent_pid
+                value.adopt_fork_child_admitted_once()
+                value.transition_admitted_once(stage)
+        elif stage is not None:
+            raise AssertionError(stage)
+        return value
+
+    def detach(self, topology=None, name="control_controller"):
+        return m._detach_admitted_once(
+            self.topology() if topology is None else topology, name,
+        )
+
+    def test_import_is_inert_and_public_entry_is_closed(self):
+        roots = m.frozen.listener.ML_ROOTS
+        self.assertFalse(any(name.split(".", 1)[0] in roots
+                             for name in IMPORT_ADDITIONS))
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            m.transfer_topology_endpoint(approval=True, endpoint=PRIVATE)
+        self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.runtime.assert_not_called()
+
+    def test_error_vocabulary_cannot_retain_private_text(self):
+        for value in (PRIVATE, None, True, {}, "unknown"):
+            error = m.EndpointAuthorityError(value)
+            self.assertEqual(error.args, ("transfer_failed",))
+            self.assertNotIn(PRIVATE, repr(error))
+
+    def test_runtime_rejection_precedes_private_argument_checks(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            m._detach_admitted_once(PRIVATE, PRIVATE)
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+
+    def test_exact_topology_and_endpoint_name_are_required(self):
+        topology = self.topology()
+        for topology, name in ((object(), "control_controller"),
+                               (topology, PRIVATE), (topology, True)):
+            with self.subTest(name=name):
+                with self.assertRaises(m.EndpointAuthorityError) as caught:
+                    m._detach_admitted_once(topology, name)
+                self.assertEqual(caught.exception.code, "arguments_rejected")
+
+    def test_only_final_role_endpoint_can_be_detached(self):
+        initial = self.topology(stage=None)
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            self.detach(initial)
+        self.assertEqual(caught.exception.code, "topology_rejected")
+        self.assertTrue(initial.snapshot()["terminal_failed"])
+
+        value = self.topology()
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            self.detach(value, "release_guardian")
+        self.assertEqual(caught.exception.code, "topology_rejected")
+        self.assertTrue(value.snapshot()["terminal_failed"])
+
+    def test_detach_then_take_transfers_one_descriptor_without_close(self):
+        topology = self.topology()
+        authority = self.detach(topology)
+        self.assertEqual(self.events.count(("detach", 10)), 1)
+        self.assertEqual(topology.snapshot()["live_endpoints"], 3)
+        report = authority.snapshot()
+        self.assertTrue(report["descriptor_owned"])
+        self.assertEqual(report["stage"], "controller")
+        self.assertTrue(all(report[name] is False for name in m.FALSE_FLAGS))
+        self.assertEqual(authority.take_admitted_once(), 10)
+        report = authority.snapshot()
+        self.assertTrue(report["descriptor_transferred"])
+        self.assertFalse(report["descriptor_owned"])
+        self.assertNotIn(("close_fd", 10), self.events)
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            authority.take_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+
+    def test_authority_can_identity_check_and_close_once(self):
+        authority = self.detach()
+        report = authority.close_admitted_once()
+        self.assertTrue(report["descriptor_close_attempted"])
+        self.assertTrue(report["descriptor_closed"])
+        self.assertEqual(self.events.count(("close_fd", 10)), 1)
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            authority.close_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertEqual(self.events.count(("close_fd", 10)), 1)
+
+    def test_taken_authority_cannot_be_closed_by_prior_owner(self):
+        authority = self.detach()
+        self.assertEqual(authority.take_admitted_once(), 10)
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            authority.close_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        self.assertNotIn(("close_fd", 10), self.events)
+
+    def test_changed_descriptor_cannot_be_taken(self):
+        authority = self.detach()
+        self.raw_overrides[10] = self.identity_for(10)[:2] + (
+            9999, *self.identity_for(10)[3:],
+        )
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            authority.take_admitted_once()
+        self.assertEqual(caught.exception.code, "descriptor_changed")
+        self.assertTrue(authority.snapshot()["terminal_failed"])
+        with self.assertRaises(m.EndpointAuthorityError) as second:
+            authority.take_admitted_once()
+        self.assertEqual(second.exception.code, "already_failed")
+
+    def test_changed_descriptor_close_is_consumed_without_closing_replacement(self):
+        authority = self.detach()
+        self.raw_overrides[10] = self.identity_for(10)[:2] + (
+            9999, *self.identity_for(10)[3:],
+        )
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            authority.close_admitted_once()
+        self.assertEqual(caught.exception.code, "cleanup_unconfirmed")
+        self.assertNotIn(("close_fd", 10), self.events)
+        with self.assertRaises(m.EndpointAuthorityError) as second:
+            authority.close_admitted_once()
+        self.assertEqual(second.exception.code, "already_failed")
+
+    def test_socket_identity_change_prevents_detach(self):
+        topology = self.topology()
+        self.socket_overrides[10] = self.identity_for(10)[:2] + (
+            9999, *self.identity_for(10)[3:],
+        )
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            self.detach(topology)
+        self.assertEqual(caught.exception.code, "descriptor_changed")
+        self.assertNotIn(("detach", 10), self.events)
+        self.assertTrue(topology.snapshot()["terminal_failed"])
+
+    def test_detach_failure_is_retained_and_never_retried(self):
+        topology = self.topology()
+        self.endpoints["control_controller"].fail_detach = True
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            self.detach(topology)
+        self.assertEqual(caught.exception.code, "transfer_failed")
+        self.assertEqual(self.events.count(("detach", 10)), 1)
+        self.assertEqual(topology.snapshot()["ambiguous_endpoints"], 1)
+        with self.assertRaises(m.EndpointAuthorityError):
+            self.detach(topology)
+        self.assertEqual(self.events.count(("detach", 10)), 1)
+
+    def test_postdetach_identity_failure_retains_raw_authority(self):
+        topology = self.topology()
+        self.raw_overrides[10] = m.EndpointAuthorityError(
+            "descriptor_changed"
+        )
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            self.detach(topology)
+        self.assertEqual(caught.exception.code, "transfer_failed")
+        self.assertEqual(topology.snapshot()["ambiguous_endpoints"], 1)
+        self.assertNotIn(("close_fd", 10), self.events)
+
+    def test_topology_owner_mismatch_prevents_detach(self):
+        topology = self.topology()
+        self.pid += 1
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            self.detach(topology)
+        self.assertEqual(caught.exception.code, "topology_rejected")
+        self.assertNotIn(("detach", 10), self.events)
+
+    def test_authority_owner_mismatch_prevents_take_or_close(self):
+        authority = self.detach()
+        self.pid += 1
+        with self.assertRaises(m.EndpointAuthorityError) as caught:
+            authority.take_admitted_once()
+        self.assertEqual(caught.exception.code, "owner_mismatch")
+        self.assertNotIn(("close_fd", 10), self.events)
+
+    def test_authority_reentry_does_not_release_foreign_lock(self):
+        authority = self.detach()
+        self.assertTrue(authority._lock.acquire(blocking=False))
+        try:
+            with self.assertRaises(m.EndpointAuthorityError) as caught:
+                authority.take_admitted_once()
+            self.assertEqual(caught.exception.code, "reentry")
+            self.assertTrue(authority._lock.locked())
+        finally:
+            authority._lock.release()
+
+    def test_every_final_role_endpoint_is_transferable_once(self):
+        for stage in sorted(m.FINAL_STAGES):
+            with self.subTest(stage=stage):
+                self.pid, self.ppid = 100, 50
+                self.reset_endpoints()
+                self.raw_overrides.clear()
+                self.socket_overrides.clear()
+                topology = self.topology(stage)
+                expected = sorted(
+                    self.identities[name][0]
+                    for name in m.frozen.STAGE_ENDPOINTS[stage]
+                )
+                transferred = []
+                for name in sorted(m.frozen.STAGE_ENDPOINTS[stage]):
+                    authority = self.detach(topology, name)
+                    transferred.append(authority.take_admitted_once())
+                self.assertEqual(sorted(transferred), expected)
+                self.assertEqual(topology.snapshot()["live_endpoints"], 0)
+
+    def test_raw_fd_identity_reads_exact_descriptor_state(self):
+        info = types.SimpleNamespace(
+            st_dev=1, st_ino=2, st_mode=3, st_uid=4, st_gid=5,
+        )
+        with patch.object(m.os, "fstat", return_value=info) as fstat, \
+                patch.object(m.fcntl, "fcntl", side_effect=(6, 7)) as fcntl_call:
+            self.assertEqual(RAW_FD_IDENTITY(99), (99, 1, 2, 3, 4, 5, 6, 7))
+        fstat.assert_called_once_with(99)
+        self.assertEqual(fcntl_call.call_args_list, [
+            call(99, fcntl.F_GETFD),
+            call(99, fcntl.F_GETFL),
+        ])
+
+
+if __name__ == "__main__":
+    unittest.main()

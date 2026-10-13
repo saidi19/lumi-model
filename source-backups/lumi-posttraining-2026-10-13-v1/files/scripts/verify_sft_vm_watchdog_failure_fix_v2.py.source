@@ -1,0 +1,194 @@
+"""Fresh read-only successor after restored login; no consumed pass retry."""
+
+import ast
+import importlib.util
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+from scripts import prepare_sft_vm_watchdog_failure_fix_v1 as builder
+from scripts import sft_vm_admission_budget_v1 as budget
+
+ROOT = builder.ROOT
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-021-watchdog-full-readback-v0.2"
+REPORT = ROOT / "evidence/lumi-vm-attempt-021-watchdog-full-readback-v0.2.json"
+need, sha, encode = builder.need, builder.evidence.sha, builder.evidence.encode
+
+
+def local():
+    prior_path = "evidence/lumi-vm-watchdog-failure-fix-verification-v0.1.json"
+    prior = json.loads(
+        builder.read(prior_path, "9cacb07849ee210d43bde7f07604345492f19c13ab9e1bbb0c88a200bd916676")
+    )
+    need(prior["full_live_qualification_complete"] is False)
+    need(prior["full_live_qualification_sdk_reads"] == 0)
+    for name, digest in prior["bindings"].items():
+        builder.read(name, digest)
+    outer, _, target, _ = builder.evidence.local()
+    raw = (ROOT / builder.OUTPUT).read_bytes()
+    need(raw == builder.build())
+    frozen = builder.read(builder.SOURCE, builder.SOURCE_SHA)
+    for name in ("_inert_checks", "preflight_fresh_inert", "Loaded", "FreshBaseConfiguration"):
+        nodes = [
+            next(node for node in ast.parse(body).body if getattr(node, "name", None) == name)
+            for body in (raw, frozen)
+        ]
+        need(ast.dump(nodes[0]) == ast.dump(nodes[1]))
+    spec = importlib.util.spec_from_file_location(
+        "_qualified_fixed_watchdog", ROOT / builder.OUTPUT
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return outer, module, target
+
+
+class Meter(budget.AdmissionBudget):
+    def consume(self, service, **fields):
+        need(self.calls < 16 and 0 <= self.clock() - self.start < 160)
+        return super().consume(service, **fields)
+
+
+def run():
+    outer, fixed, target = local()
+    need(not OUTPUT.exists() and not REPORT.exists())
+    need(not any(path.is_symlink() for path in (OUTPUT, *OUTPUT.parents, REPORT)))
+    OUTPUT.mkdir(mode=0o700)
+    outer.loading.save(
+        OUTPUT / "started.json",
+        encode(
+            dict(
+                maximum_sdk_reads=16,
+                maximum_seconds=180,
+                retry=False,
+                verifier_sha256=sha(Path(__file__).read_bytes()),
+            )
+        ),
+    )
+    result = dict(
+        status="started",
+        read_only=True,
+        predecessor_pass_preserved=True,
+        consumed_predecessor_reexecuted=False,
+        cloud_mutations=0,
+        instance_actions=0,
+        object_access=0,
+        code_updates=0,
+        invocations=0,
+        schedules_created=0,
+        retry=False,
+        cpu_launch_authorized=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        original_failure_cause_proven=False,
+        calls=[],
+    )
+    bundle = None
+    with Meter(outer.credentials) as meter:
+        try:
+            start, first = float(math.floor(time.monotonic())), True
+
+            def clock():
+                nonlocal first
+                if first:
+                    first = False
+                    return start
+                return time.monotonic()
+
+            bundle = meter.clients(outer.credentials.Reader(start + 18000, clock=clock))
+            guard = fixed.original_guard
+            transport = fixed.WatchdogCloud({s: bundle.clients[s] for s in guard.OPS})
+
+            class BoundConfiguration:
+                @staticmethod
+                def configuration(value, environment):
+                    need(type(value) is dict and value.get("CodeSha256") == target)
+                    guard.configuration({**value, "CodeSha256": guard.CODE}, environment)
+
+            def call(service, operation, **fields):
+                need(operation.startswith(("get-", "list-")))
+                need(service in guard.OPS and operation in guard.OPS[service])
+                row = dict(service=service, operation=operation, status="started")
+                result["calls"].append(row)
+                try:
+                    value = transport.cli(service, operation, **fields)
+                    need(type(value) is dict and len(json.dumps(value, default=str)) <= 262144)
+                    need(not any(value.get(k) for k in ("NextToken", "Marker", "IsTruncated")))
+                    row["status"] = "response_checked"
+                    return value
+                except LookupError:
+                    row["status"] = "expected_absence"
+                    raise
+                except fixed.WatchdogCloudFailure as error:
+                    row["status"] = "failed"
+                    row["diagnostic"] = dict(error.diagnostic)
+                    raise
+
+            verified = fixed._inert_checks(guard, BoundConfiguration, call)
+            need(len(result["calls"]) == 14)
+            fenced = call(
+                "lambda", "get-function-configuration", FunctionName=guard.worker.FUNCTION
+            )
+            BoundConfiguration.configuration(fenced, guard.inert.UNARMED)
+            need(fenced["RevisionId"] == verified["RevisionId"])
+            need(meter.calls == 16 and meter.credential_calls == 1)
+            result.update(
+                status="complete_current_successor_inert_readback_and_fence_passed",
+                current_stage_passed=True,
+                completed_revision_stable=True,
+                configuration_policies_absence_and_concurrency_verified=True,
+                original_failure_reproduced=False,
+            )
+        except BaseException as error:
+            result.update(
+                status="stopped_preserve_no_retry",
+                current_stage_passed=False,
+                failure_diagnostic=dict(error.diagnostic)
+                if type(error) is fixed.WatchdogCloudFailure
+                else fixed.safe_cloud_error(error),
+                credential_failure_diagnostic=outer.credentials.failure.describe(
+                    error, "client_setup"
+                )
+                if type(error) is outer.credentials.failure.Failure
+                else None,
+            )
+        finally:
+            if bundle is not None:
+                bundle.close()
+            result.update(
+                read_budget=meter.report(),
+                maximum_sdk_reads=16,
+                maximum_seconds=180,
+                elapsed_seconds=round(time.monotonic() - meter.start, 3),
+            )
+    paths = (
+        builder.SOURCE,
+        builder.DIAGNOSTIC,
+        builder.OUTPUT,
+        "scripts/prepare_sft_vm_watchdog_failure_fix_v1.py",
+        "tests/test_sft_vm_watchdog_failure_fix_v1.py",
+        "scripts/verify_sft_vm_watchdog_failure_fix_v2.py",
+        "scripts/verify_sft_vm_watchdog_failure_fix_v1.py",
+        "evidence/lumi-vm-watchdog-failure-fix-verification-v0.1.json",
+    )
+    result["source_bindings"] = {name: sha(builder.read(name)) for name in paths}
+    outer.loading.save(OUTPUT / "result.json", encode(result))
+    outer.loading.save(REPORT, encode(result))
+    print(
+        json.dumps(
+            {
+                key: result[key]
+                for key in ("status", "read_budget", "cloud_mutations", "code_updates")
+            },
+            sort_keys=True,
+        )
+    )
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--verify-once"])
+    run()

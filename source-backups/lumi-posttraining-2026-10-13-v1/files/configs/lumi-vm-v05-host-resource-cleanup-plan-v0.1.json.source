@@ -1,0 +1,112 @@
+{
+  "schema": "lumi.vm-v05-host-resource-cleanup-plan.v0.1",
+  "date": "2026-10-07",
+  "status": "proposal_requires_explicit_cleanup_authorization",
+  "execution_permitted": false,
+  "approval_record": null,
+  "scope": "Remove only the two owned unassociated attempt-005 security groups and its imported EC2 public-key registration. Not a new CPU execution or retry.",
+  "account": "573978149073",
+  "region": "us-east-1",
+  "vpc": "vpc-0905fbf9490a2dead",
+  "prepared_attempt": "606d788073f1f0b66a39eabeb4b32c2c",
+  "targets": {
+    "vm_security_group": {
+      "id": "sg-0f44659cfec8fa6b7",
+      "name": "lumi-fullsize-606d788073f1f0b66a39eabeb4b32c2c-vm"
+    },
+    "endpoint_security_group": {
+      "id": "sg-0befee7e888d24436",
+      "name": "lumi-fullsize-606d788073f1f0b66a39eabeb4b32c2c-endpoint"
+    },
+    "key_pair": {
+      "name": "lumi-fullsize-606d788073f1f0b66a39eabeb4b32c2c",
+      "id": null,
+      "id_resolution": "Resolve exactly one owned ed25519 key by exact name with IncludePublicKey. Require canonical algorithm/blob equality with the hash-bound local public key. Persist verified KeyPairId, then delete by that ID only."
+    }
+  },
+  "bindings": {
+    "evidence/lumi-vm-private-outer-execution-outcome-v0.5.json": "44e5c01fe2b2b9abd5665bc22c42b1b453a224ee2933b26710f60cfeac40e605",
+    "artifacts/lumi-vm-private-outer-execution-v0.5/attempt-005/host/execution/host/vm-group.json": "db3c1bc628b0d07f1d48f2d963186b6e05332ee7cd0be31637545c1ded2afa00",
+    "artifacts/lumi-vm-private-outer-execution-v0.5/attempt-005/host/execution/host/endpoint-group.json": "52cd6804c7de87b6f849d2d4db469e6a804bd5b163bef97770b04ce3fa278424",
+    "artifacts/lumi-vm-private-outer-execution-v0.5/attempt-005/host/execution/host/mutation-08.json": "e1b247cd0fc575ed6da38f48b0ac55251da6763d2efa066c475f9ca26a1a4627",
+    "artifacts/lumi-vm-private-outer-execution-v0.5/attempt-005/host/execution/host/connection-key.pub": "60bac787b6fd01d4644366f88e77f85c6b516f43a61566ec1dec97a0ce1ed610",
+    "scripts/provision_sft_vm_host_v3.py": "cf637b8fd84d8cc1e9f2992fa027f118d8c5d99029203d6abfc2f203c085d532"
+  },
+  "caps": {
+    "resource_api_calls": 64,
+    "mutation_api_calls": 5,
+    "credential_provider_invocations": 1,
+    "wall_seconds": 600,
+    "single_response_bytes": 262144,
+    "aggregate_response_bytes": 2097152,
+    "private_write_bytes": 262144,
+    "aws_sdk_total_max_attempts": 1,
+    "mutating_retries": 0
+  },
+  "fresh_admission": [
+    "Verify all bound hashes, exact account and region before resource mutations.",
+    "Create an exclusive local cleanup-start journal bound to this plan, authorization and attempt. Never reuse an existing or uncertain started cleanup.",
+    "Verify both group IDs, names, VPC, owner account and LumiAttempt tag; require exact frozen rule sets, allowing only empty optional AWS rule lists to be normalized.",
+    "VM ingress is only TCP/22 from the endpoint group with exact account. VM egress is only TCP/443 to 0.0.0.0/0. Endpoint ingress is empty; endpoint egress is only TCP/22 to the VM group with exact account.",
+    "Resolve and verify the key as specified above; never read the local private key or retain returned public-key text.",
+    "Describe instances by attempt tag and separately by exact key name; require no nonterminated instances in either complete result.",
+    "Describe network interfaces by both group IDs; require empty complete results.",
+    "Inspect same-VPC ingress and egress group-reference queries separately. Permit only the exact mutual references within these two groups; require no external references.",
+    "DescribeSecurityGroupReferences for both groups must return empty (cross-VPC peering/transit-gateway references).",
+    "DescribeSecurityGroupVpcAssociations for these group IDs must return empty.",
+    "Reject any pagination token, incomplete response, identity/tag drift, unexpected dependency/rule or exceeded budget. No writes after a failed admission."
+  ],
+  "ordered_mutations": [
+    {
+      "operation": "RevokeSecurityGroupIngress",
+      "group_id": "sg-0f44659cfec8fa6b7",
+      "exact_rule": "TCP/22 from sg-0befee7e888d24436, UserId 573978149073"
+    },
+    {
+      "operation": "RevokeSecurityGroupEgress",
+      "group_id": "sg-0befee7e888d24436",
+      "exact_rule": "TCP/22 to sg-0f44659cfec8fa6b7, UserId 573978149073"
+    },
+    {
+      "operation": "DeleteSecurityGroup",
+      "group_id": "sg-0befee7e888d24436"
+    },
+    {
+      "operation": "DeleteSecurityGroup",
+      "group_id": "sg-0f44659cfec8fa6b7"
+    },
+    {
+      "operation": "DeleteKeyPair",
+      "key_pair_id": "Only freshly verified KeyPairId; never unbound name",
+      "prerequisite": "Both bound groups confirmed absent"
+    }
+  ],
+  "write_protocol": [
+    "Immediately before each mutation, recheck relevant ownership, exact current rules and absence of dependencies; pre-record exact operation and target in exclusive protected journal.",
+    "After each rule revocation verify only the authorized rule was removed. After each deletion verify the exact resource is absent with bounded read-only calls.",
+    "Any uncertain mutation consumes that operation. Perform only bounded readback, then stop and preserve evidence; never reissue, delete dependents or broaden targets.",
+    "Already absent or drifted targets at initial admission stop this plan without mutation; report them for a separately reviewed recovery if necessary.",
+    "All reads and polls share the same call, response, runtime and write caps. Sanitize stored output to allowlisted resource IDs, hashes, counters, booleans and fixed stage/error codes."
+  ],
+  "forbidden": [
+    "New instance, endpoint, network or key creation",
+    "Checkpoint or dataset reads/downloads",
+    "CPU import, GPU, training or inference",
+    "Instance stop/terminate or mutation of existing instances",
+    "EBS or S3 deletion or mutation",
+    "Private-key read/copy/deletion",
+    "Deleting any third-party group, dependent resource or unlisted rule",
+    "IAM, Lambda, Scheduler, remote mutation-claim or registry mutation",
+    "Replaying v0.5 execution",
+    "Automatic new paid execution",
+    "Deleting prior local evidence or either local key file"
+  ],
+  "consequences": "EC2 public-key registration and these two security groups are removed and cannot be restored with the same IDs. Preserve all local receipts and key files. No instance or storage deletion is authorized.",
+  "verification": "Confirm both security groups and the verified KeyPairId are absent. Partial or uncertain cleanup is not success.",
+  "executor_implemented": false,
+  "real_4b_import": false,
+  "gate_5_complete": false,
+  "gpu_used": false,
+  "training_authorized": false,
+  "production_eligible": false
+}

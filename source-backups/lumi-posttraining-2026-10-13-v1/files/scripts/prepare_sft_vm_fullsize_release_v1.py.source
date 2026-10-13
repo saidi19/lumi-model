@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""Assemble an offline source/control bundle; no SDK, model data or host action.
+
+Reuses the existing rehearsal import-closure scanner and fullsize control
+validator. A bundle is preparation, not an execution authorization. It contains
+no credentials, runtime wheels, checkpoint, tokenizer or dataset payload.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import importlib.util
+import io
+import json
+import os
+import re
+import stat
+import sys
+import tarfile
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+HELPERS = {
+    "prepare_sft_vm_coordinator_release_v3": (
+        "d0c48e0dbb13e2d62b732961d6853c2f5426d478584e114c2c8f795a6e0dff34"
+    ),
+    "prepare_sft_vm_fullsize_metadata_v1": (
+        "d06fe9d321c70bca68606b922d32af320ec938b5eef327b94f4351929f653cb9"
+    ),
+}
+SELECTION = "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"
+SELECTION_SHA = "014edb565d4c678903194a5ae06995b3cb7596bea8760937bb4554858bb8fb42"
+IMPORT_ENTRY = "scripts/run_sft_vm_fullsize_entry_v1.py"
+ACQUIRE_ENTRY = "scripts/acquire_sft_vm_fullsize_inputs_v1.py"
+SEEDS = (
+    IMPORT_ENTRY,
+    ACQUIRE_ENTRY,
+    "scripts/verify_sft_vm_fullsize_package_v1.py",
+    "src/lumi/posttraining_vm_fullsize_acquisition_unit_v1.py",
+    "src/lumi/posttraining_checkpoint_vm_fullsize_entry_v1.py",
+    "src/lumi/posttraining_checkpoint_vm_loader_v1.py",
+    # Acquisition loads these hash-pinned bodies by string, not Python import AST.
+    "src/lumi/posttraining_vm_fullsize_staging_v1.py",
+    "src/lumi/posttraining_vm_fullsize_transport_v1.py",
+    "src/lumi/posttraining_import_vm_rehearsal_v3.py",
+    "src/lumi/configuration_lumi.py",
+    "src/lumi/modeling_lumi.py",
+)
+MAX_ARCHIVE = 4 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("fullsize_release_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def canonical(value):
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n"
+    )
+
+
+def read_bound(path, pin, maximum=131072):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    info = path.stat()
+    need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and 0 < info.st_size <= maximum)
+    with path.open("rb") as source:
+        raw = source.read(maximum + 1)
+    need(len(raw) == info.st_size and info == path.stat() and sha(raw) == pin)
+    return raw
+
+
+def helper(root, name):
+    path = root / "scripts" / (name + ".py")
+    raw = read_bound(path, HELPERS[name])
+    module = types.ModuleType("_fullsize_release_" + name)
+    module.__file__ = str(path)
+    exec(compile(raw, str(path), "exec"), module.__dict__)
+    return module
+
+
+def adapter(root):
+    name = "_fullsize_release_control"
+    if name not in sys.modules:
+        package = types.ModuleType(name)
+        package.__path__ = [str(root / "src/lumi")]
+        sys.modules[name] = package
+    need(sys.modules[name].__path__ == [str(root / "src/lumi")])
+    return importlib.import_module(name + ".posttraining_checkpoint_vm_fullsize_entry_v1")
+
+
+def assemble(root, attempt):
+    need(type(attempt) is str and re.fullmatch(r"[a-f0-9]{32}", attempt) and attempt != "0" * 32)
+    closure = helper(root, "prepare_sft_vm_coordinator_release_v3")
+    closure.SEEDS = SEEDS  # Private scanner instance; frozen file is unchanged.
+    sources = closure.source_closure(root)
+    need(set(SEEDS) <= set(sources))
+    metadata = helper(root, "prepare_sft_vm_fullsize_metadata_v1")
+    bodies = {
+        name: read_bound(root / relative, pin) for name, (relative, pin) in metadata.FILES.items()
+    }
+    selection = read_bound(root / SELECTION, SELECTION_SHA)
+    selected = json.loads(selection)
+    expected = metadata.select_objects(
+        json.loads(bodies["base.json"]),
+        json.loads(bodies["plan.json"]),
+        json.loads(bodies["backup.json"]),
+    )
+    need(
+        selected["objects"] == expected
+        and len(expected) == 22
+        and sum(row["bytes"] for row in expected) == 48_843_765_443
+    )
+    del bodies["backup.json"]  # Only required control bodies enter the release.
+    lock = read_bound(root / closure.LOCK, closure.LOCK_SHA256)
+    manifest = canonical({name: sha(raw) for name, raw in sources.items()})
+    nonce = sha(b"lumi.vm-fullsize-attempt.v0.1\0" + attempt.encode("ascii"))
+    a = adapter(root)
+    pins = {
+        "entry_sha256": sha(sources[IMPORT_ENTRY]),
+        "source_manifest_sha256": sha(manifest),
+        "attempt_nonce_sha256": nonce,
+    }
+    control = a.build_control(bodies, **pins)
+    pins["control_sha256"] = sha(control)
+    a.prepare_entry(
+        control,
+        bodies,
+        **{"expected_" + k: v for k, v in pins.items()},
+        runtime_sources={name: sources["src/lumi/" + name] for name in a.RUNTIME_NAMES},
+    )
+    descriptor = {
+        "schema": "lumi.vm-fullsize-prepared-attempt.v0.1",
+        "attempt": attempt,
+        "import_pins": pins,
+        "acquisition_pins": {
+            "entry_sha256": sha(sources[ACQUIRE_ENTRY]),
+            "source_manifest_sha256": sha(manifest),
+        },
+        "selection_sha256": SELECTION_SHA,
+        "runtime_lock_sha256": closure.LOCK_SHA256,
+        "host_admitted": False,
+        "sdk_runtime_bound": False,
+        "execution_permitted": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "training_authorized": False,
+    }
+    members = (
+        sources
+        | {"controls/" + name: raw for name, raw in bodies.items()}
+        | {
+            "controls/control.json": control,
+            "controls/input-selection.json": selection,
+            "release-manifest.json": manifest,
+            "runtime-lock.json": lock,
+            "prepared-attempt.json": canonical(descriptor),
+        }
+    )
+    return members, descriptor
+
+
+def archive_bytes(members):
+    need(
+        type(members) is dict
+        and 1 <= len(members) <= 256
+        and all(type(raw) is bytes and len(raw) <= 1024**2 for raw in members.values())
+        and sum(map(len, members.values())) <= 3 * 1024**2
+    )
+    output = io.BytesIO()
+    # Uncompressed USTAR is deterministic and removes decompression-bomb risk.
+    with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+        for name, raw in sorted(members.items()):
+            need(
+                type(name) is str
+                and re.fullmatch(r"[A-Za-z0-9_./-]+", name)
+                and not name.startswith("/")
+                and all(p not in {".", "..", ""} for p in name.split("/"))
+            )
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(raw), 0o400
+            member.uid = member.gid = member.mtime = 0
+            tar.addfile(member, io.BytesIO(raw))
+    raw = output.getvalue()
+    need(len(raw) <= MAX_ARCHIVE)
+    return raw
+
+
+def write_new(path, raw):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def build(root, output, attempt):
+    members, descriptor = assemble(root, attempt)
+    raw = archive_bytes(members)
+    need(not any(p.is_symlink() for p in (output, *output.parents)))
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    write_new(output / "source-controls.tar", raw)
+    report = {
+        "schema": "lumi.vm-fullsize-release-build.v0.1",
+        "attempt": attempt,
+        "archive_bytes": len(raw),
+        "archive_sha256": sha(raw),
+        "members": len(members),
+        "member_bytes": sum(map(len, members.values())),
+        "source_files": len(json.loads(members["release-manifest.json"])),
+        "prepared_attempt_sha256": sha(members["prepared-attempt.json"]),
+        "source_manifest_sha256": descriptor["import_pins"]["source_manifest_sha256"],
+        "runtime_lock_sha256": descriptor["runtime_lock_sha256"],
+        "acquisition_runtime_lock_included": False,
+        "uploaded": False,
+        "runtime_installed": False,
+        "host_admitted": False,
+        "execution_permitted": False,
+        "real_payload_included": False,
+        "credentials_included": False,
+    }
+    write_new(output / "build.json", canonical(report))
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--attempt", required=True)
+    args = parser.parse_args()
+    try:
+        print(json.dumps(build(ROOT, args.output.absolute(), args.attempt), sort_keys=True))
+    except BaseException:
+        parser.exit(1, "fullsize_release_preparation_failed\n")
+
+
+if __name__ == "__main__":
+    main()

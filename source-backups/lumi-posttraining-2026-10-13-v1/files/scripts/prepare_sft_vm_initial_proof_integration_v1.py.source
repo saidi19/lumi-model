@@ -1,0 +1,109 @@
+"""Offline diagnostic integration; consumed identity, never execution authority."""
+
+import ast
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+from scripts import prepare_sft_vm_initial_proof_diagnostics_v1 as repair
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = repair.BASE
+OUTPUT = ROOT / "artifacts/lumi-vm-initial-proof-integration-v0.1"
+INPUTS = "configs/lumi-vm-private-host-source-inputs-v0.1.json"
+CLOSURE_SHA = "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc"
+
+
+def build():
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt012_v1.py", CLOSURE_SHA)
+    manifest = json.loads(closure.read(BASE / "release.json", repair.BASE_SHA))
+    original = {
+        name: closure.read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    repair.need(len(original) == 156)
+    fragments, fragment_report = repair.build()
+    seeds = dict(original)
+    replacements = {repair.sha(original["scripts/" + name]): raw for name, raw in fragments.items()}
+    changed_sources = set()
+    # Identical frozen source aliases must remain identical after hash closure.
+    for name, raw in original.items():
+        if repair.sha(raw) in replacements:
+            repair.need(name.startswith(("scripts/", "identity/")) and name.endswith(".py"))
+            seeds[name] = replacements[repair.sha(raw)]
+            changed_sources.add(name)
+    repair.need(
+        changed_sources
+        == {
+            *("scripts/" + name for name in repair.NAMES),
+            "scripts/build_sft_vm_initial_boot_v2.py",
+            "identity/build_sft_vm_initial_boot_v2.py",
+        }
+    )
+    inputs = json.loads(seeds[INPUTS])
+    for name in changed_sources:
+        role = Path(name).stem
+        if role in inputs["sources"]:
+            inputs["sources"][role]["bytes"] = len(seeds[name])
+    seeds[INPUTS] = closure.encode(inputs)
+    ancestors = {name for name in original if name.endswith(".json") and "/" not in name}
+    final = closure.closure(original, seeds, ancestors)
+    for name, raw in final.items():
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name not in changed_sources | {INPUTS}:
+            repair.need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[name])
+            )
+        if (
+            name.startswith("evidence/")
+            or name in ancestors
+            or name.endswith((".gz", ".tar", ".pem"))
+        ):
+            repair.need(raw == original[name])
+    for role, pin in json.loads(final[INPUTS])["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        repair.need(len(raw) == pin["bytes"] and repair.sha(raw) == pin["sha256"])
+    report = dict(
+        schema="lumi.initial-proof-integration.v0.1",
+        status="offline_hash_closed_rehearsal_not_execution_authority",
+        base_release_sha256=repair.BASE_SHA,
+        consumed_identity_retained=True,
+        fresh_identity_required_before_execution=True,
+        execution_permitted=False,
+        cpu_retry=False,
+        historical_failure_cause_resolved=False,
+        timeout_or_policy_relaxation=False,
+        fragment_report=fragment_report,
+        semantic_source_changes=sorted(changed_sources),
+        changed_files=[name for name in final if final[name] != original[name]],
+        outputs={
+            name: dict(bytes=len(raw), sha256=repair.sha(raw))
+            for name, raw in sorted(final.items())
+        },
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    repair.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            repair.need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("integration_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

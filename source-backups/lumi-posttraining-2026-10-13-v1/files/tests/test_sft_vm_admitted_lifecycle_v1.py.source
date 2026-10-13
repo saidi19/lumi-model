@@ -1,0 +1,385 @@
+"""Actual issuer/delivery join, synthetic IAM/SSH/EC2, no model or AWS access."""
+
+import importlib
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_acquisition_issuer_v1 as source
+from tests import test_sft_vm_retention_delivery_v1 as delivery
+from tests import test_sft_vm_retention_issuer_v1 as retained
+
+m = importlib.import_module("run_sft_vm_admitted_lifecycle_v1")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.output = self.root / "lifecycle"
+        self.elapsed = 1000
+        self.source, self.retained, self.host = source.Fake(), retained.Fake(), delivery.Cloud()
+        self.enterContext(patch.object(source, "NOW", retained.NOW))
+        self.events = []
+        self.source_failure = False
+        self.retention_failure = False
+        self.admission_failure = False
+        self.bad_pin = False
+        self.credentials = []
+
+    def wait(self, seconds):
+        self.elapsed += seconds
+
+    def workflow(self, op, body=b"", **_kw):
+        self.events.append("import:" + op)
+        if op == "dispatch":
+            return dict(dispatch_requested=True, workflow_completed=False)
+        if op == "submit":
+            self.credentials.append(body)
+            self.assertFalse(self.source.keys)
+            self.assertNotIn("role", self.retained.entities)
+            return dict(delivery_sent=True, workflow_completed=False)
+        if op == "cancel":
+            return None
+        return dict(
+            state="failed" if self.source_failure else "workflow_returned",
+            parent_cgroup_empty=True,
+            children_reaped=True,
+            gate_5_complete=False,
+            retry_allowed=False,
+        )
+
+    def backup(self, op, body=b"", **_kw):
+        self.events.append("backup:" + op)
+        if op == "dispatch":
+            return dict(dispatch_requested=True, workflow_completed=False, gate_5_complete=False)
+        if op == "submit":
+            self.credentials.append(body)
+            self.assertFalse(self.retained.keys)
+            self.assertFalse(self.source.entities)
+            return dict(delivery_sent=True, workflow_completed=False, gate_5_complete=False)
+        if op == "cancel":
+            return delivery.observed("failed")
+        value = delivery.observed("failed" if self.retention_failure else "retention_returned")
+        if self.bad_pin and value["receipt"]:
+            value["receipt"]["binding_sha256"] = "c" * 64
+        return value
+
+    def admit(self, binding, pin, host_deadline):
+        self.events.append("admit_retention")
+        self.assertEqual(binding, delivery.BINDING)
+        self.assertEqual(pin, "a" * 64)
+        self.assertEqual(host_deadline, 14400)
+        self.assertFalse(self.source.entities)
+        self.assertIn("import:status", self.events)
+        if self.admission_failure:
+            raise RuntimeError("private-native-error")
+        return self.backup, self.elapsed + 1800
+
+    def call(self, **changes):
+        arguments = dict(
+            selection_raw=(ROOT / m.acquisition.permissions.SELECTION).read_bytes(),
+            proposal_raw=m.workflow.connection.PROPOSAL.read_bytes(),
+            prior_binding_sha="a" * 64,
+            workflow_exchange=self.workflow,
+            admit_retention=self.admit,
+            acquisition_cloud=self.source,
+            retention_cloud=self.retained,
+            host_cloud=self.host,
+            launch_monotonic=0,
+            host_deadline=14400,
+            workflow_deadline=10000,
+            clock=lambda: self.elapsed,
+            wait=self.wait,
+            now=lambda: retained.NOW,
+        )
+        return m._run_after_native_admission(self.output, delivery.BINDING, **(arguments | changes))
+
+    def stops(self):
+        return sum(op == "stop-instances" for _, op, _ in self.host.calls)
+
+    def test_join_real_issuers_deliveries_cleanup_and_single_stop(self):
+        result = self.call()
+        self.assertTrue(result["lifecycle_completed"])
+        self.assertTrue(result["offhost_retention_verified"])
+        self.assertTrue(result["stopped_verified"])
+        self.assertEqual(self.stops(), 1)
+        self.assertEqual(self.source.issues, 1)
+        self.assertEqual(self.retained.issues, 1)
+        self.assertFalse(self.source.entities or self.retained.entities)
+        self.assertEqual(
+            self.events,
+            [
+                "import:dispatch",
+                "import:submit",
+                "import:status",
+                "admit_retention",
+                "backup:dispatch",
+                "backup:submit",
+                "backup:status",
+            ],
+        )
+        self.assertFalse(
+            any(result[k] for k in ("real_4b_import", "gate_5_complete", "training_authorized"))
+        )
+        self.assertEqual(len(self.credentials), 2)
+        self.assertTrue(all(not any(raw) for raw in self.credentials))
+        for path in self.output.rglob("*.json"):
+            raw = path.read_text()
+            for secret in (
+                "session-secret",
+                "session-token",
+                "ASIASYNTHETIC",
+                "private-native-error",
+            ):
+                self.assertNotIn(secret, raw)
+
+    def test_acquisition_issuer_failure_stops_no_retention(self):
+        self.source.fail = "create-role"
+        result = self.call()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(result["failed_phase"], "acquisition_and_import")
+        self.assertEqual(self.stops(), 1)
+        self.assertFalse(self.events or self.retained.calls)
+
+    def test_import_failure_blocks_retention_and_stops(self):
+        self.source_failure = True
+        result = self.call()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertNotIn("admit_retention", self.events)
+        self.assertFalse(self.retained.calls)
+        self.assertEqual(self.stops(), 1)
+
+    def test_native_retention_admission_failure_stops_no_new_credentials(self):
+        self.admission_failure = True
+        result = self.call()
+        self.assertEqual(result["failed_phase"], "retention_admission")
+        self.assertFalse(self.retained.calls)
+        self.assertEqual(self.stops(), 1)
+
+    def test_retention_issuer_failure_stops_before_backup(self):
+        self.retained.fail = "create-role"
+        result = self.call()
+        self.assertEqual(result["failed_phase"], "retention")
+        self.assertNotIn("backup:dispatch", self.events)
+        self.assertEqual(self.stops(), 1)
+
+    def test_retention_delivery_failure_does_not_double_stop(self):
+        self.retention_failure = True
+        result = self.call()
+        self.assertFalse(result["offhost_retention_verified"])
+        self.assertTrue(result["stopped_verified"])
+        self.assertEqual(self.stops(), 1)
+
+    def test_foreign_receipt_rejected(self):
+        self.bad_pin = True
+        result = self.call()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.stops(), 1)
+
+    def test_lost_stop_ack_observed_never_resent(self):
+        self.host.lost_stop = True
+        self.assertTrue(self.call()["lifecycle_completed"])
+        self.assertEqual(self.stops(), 1)
+
+    def test_stuck_host_cannot_claim_completion(self):
+        self.host.states = ["running"]
+        result = self.call()
+        self.assertFalse(result["lifecycle_completed"] or result["stopped_verified"])
+        self.assertEqual(self.stops(), 1)
+        self.assertLessEqual(result["stop_observation_reads"], 64)
+
+    def test_wrong_host_no_stop(self):
+        self.host.change = lambda row: row | {"ClientToken": "0" * 32}
+        result = self.call()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.stops(), 0)
+
+    def test_original_deadline_may_not_be_renewed(self):
+        with self.assertRaises(ValueError):
+            self.call(host_deadline=14401)
+        self.assertFalse(self.source.calls or self.host.calls)
+
+    def test_insufficient_retention_reserve_rejected_before_issue(self):
+        with self.assertRaises(ValueError):
+            self.call(workflow_deadline=12100)
+        self.assertFalse(self.source.calls)
+
+    def test_input_hash_drift_rejected_before_issue(self):
+        with self.assertRaises(ValueError):
+            self.call(selection_raw=b"{}")
+        self.assertFalse(self.source.calls)
+
+    def test_existing_attempt_is_not_reused(self):
+        self.output.mkdir()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertFalse(self.source.calls or self.host.calls)
+
+    def test_no_ambient_credentials_fallback(self):
+        with self.assertRaises(ValueError):
+            self.call(retention_cloud=None)
+        self.assertFalse(self.source.calls)
+
+    def test_public_entry_does_not_accept_approval_boolean(self):
+        with self.assertRaisesRegex(ValueError, "not_bound"):
+            m.run(approved=True)
+
+    def test_ledger_consumes_lost_stop_and_restricts_target(self):
+        self.host.lost_stop = True
+        ledger = m.StopLedger(self.host, delivery.BINDING, 14400, lambda: 1000)
+        kwargs = dict(InstanceIds=[delivery.BINDING["instance"]], Force=False, Hibernate=False)
+        with self.assertRaises(TimeoutError):
+            ledger.cli("ec2", "stop-instances", **kwargs)
+        with self.assertRaises(ValueError):
+            ledger.cli("ec2", "stop-instances", **kwargs)
+        with self.assertRaises(ValueError):
+            ledger.cli("ec2", "describe-instances", InstanceIds=["foreign"])
+        self.assertEqual(self.stops(), 1)
+
+    def joined(self, admit=None, fail_provision=False):
+        def native(provisioned, directory):
+            self.assertEqual(provisioned["binding"], delivery.BINDING)
+            self.assertEqual(directory, self.root / "joined/host")
+            self.assertFalse(self.source.calls)
+            return dict(
+                workflow_exchange=self.workflow,
+                workflow_deadline=10000,
+                prior_binding_sha="a" * 64,
+                admit_retention=self.admit,
+            )
+
+        prepared = dict(
+            binding=dict(delivery.BINDING),
+            launch_monotonic=0,
+            host_deadline_monotonic=14400,
+            report=dict(setup_completed=True),
+        )
+        with patch.object(
+            m.guard,
+            "_provision_guarded_once",
+            return_value=prepared,
+            side_effect=RuntimeError("synthetic") if fail_provision else None,
+        ) as provision:
+            result = m._provision_then_run_once(
+                self.root / "joined",
+                admit_native=admit or native,
+                selection_raw=(ROOT / m.acquisition.permissions.SELECTION).read_bytes(),
+                proposal_raw=m.workflow.connection.PROPOSAL.read_bytes(),
+                host_cloud=self.host,
+                watchdog_cloud=object(),
+                acquisition_cloud=self.source,
+                retention_cloud=self.retained,
+                clock=lambda: self.elapsed,
+                wait=self.wait,
+                now=lambda: retained.NOW,
+            )
+            provision.assert_called_once()
+            return result
+
+    def test_guarded_provision_to_existing_post_admission_lifecycle(self):
+        result = self.joined()
+        self.assertTrue(result["lifecycle_completed"] and result["stopped_verified"])
+        self.assertEqual(self.stops(), 1)
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_native_admission_failure_after_setup_stops_no_credentials(self):
+        def reject(*_args):
+            raise RuntimeError("private-native-error")
+
+        result = self.joined(admit=reject)
+        self.assertEqual(result["failed_phase"], "native_admission")
+        self.assertTrue(result["stopped_verified"])
+        self.assertEqual(self.stops(), 1)
+        self.assertFalse(self.source.calls or self.retained.calls)
+
+    def test_native_boolean_cannot_open_lifecycle(self):
+        result = self.joined(admit=lambda *_args: True)
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertFalse(self.source.calls)
+        self.assertEqual(self.stops(), 1)
+
+    def test_failed_provisioner_not_retried_or_guessed(self):
+        result = self.joined(fail_provision=True)
+        self.assertEqual(result["failed_phase"], "guarded_provision")
+        self.assertTrue(result["provisioner_failure_evidence_authoritative"])
+        self.assertFalse(self.host.calls or self.source.calls)
+
+    def test_source_iam_cleanup_failure_blocks_retention(self):
+        self.source.fail = "delete-role"
+        result = self.call()
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertFalse(self.retained.calls)
+        self.assertEqual(self.stops(), 1)
+
+    def test_retention_iam_cleanup_failure_blocks_final_success(self):
+        self.retained.fail = "delete-role"
+        result = self.call()
+        self.assertTrue(result["offhost_retention_verified"])
+        self.assertFalse(result["lifecycle_completed"])
+        self.assertEqual(self.stops(), 1)
+
+    def test_backup_deadline_cannot_spend_external_timer_reserve(self):
+        def late(*_args):
+            self.elapsed = 12300
+            return self.backup, 14100
+
+        result = self.call(admit_retention=late)
+        self.assertEqual(result["failed_phase"], "retention_admission")
+        self.assertFalse(self.retained.calls)
+        self.assertEqual(self.stops(), 1)
+
+    def test_full_guard_provision_setup_issuer_delivery_join_synthetic_boundaries(self):
+        from tests.test_sft_vm_initial_provisioning_v1 import ProvisionTests
+        from tests.test_sft_vm_watchdog_launch_interlock_v1 import Cloud as Watchdog
+
+        fixture = ProvisionTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        watchdog = Watchdog()
+
+        def native(provisioned, _directory):
+            self.assertEqual(fixture.cloud.launch_count, 1)
+            self.assertTrue(provisioned["report"]["setup_completed"])
+            self.assertFalse(self.source.calls)
+            expected_binding = dict(provisioned["binding"])
+
+            def admit_backup(binding, pin, end):
+                self.assertEqual(binding, expected_binding)
+                self.assertEqual(pin, "a" * 64)
+                self.assertEqual(end, provisioned["host_deadline_monotonic"])
+                self.assertFalse(self.source.entities)
+                return self.backup, fixture.now + 1800
+
+            return dict(
+                workflow_exchange=self.workflow,
+                workflow_deadline=fixture.now + 9000,
+                prior_binding_sha="a" * 64,
+                admit_retention=admit_backup,
+            )
+
+        result = m._provision_then_run_once(
+            self.root / "whole-join",
+            admit_native=native,
+            selection_raw=(ROOT / m.acquisition.permissions.SELECTION).read_bytes(),
+            proposal_raw=m.workflow.connection.PROPOSAL.read_bytes(),
+            host_cloud=fixture.cloud,
+            watchdog_cloud=watchdog,
+            acquisition_cloud=self.source,
+            retention_cloud=self.retained,
+            clock=lambda: fixture.now,
+            wait=fixture.sleep,
+            now=lambda: retained.NOW,
+        )
+        self.assertTrue(result["lifecycle_completed"] and result["stopped_verified"])
+        self.assertEqual(fixture.cloud.launch_count, 1)
+        self.assertEqual(fixture.cloud.stop_count, 1)
+        self.assertEqual(self.source.issues, 1)
+        self.assertEqual(self.retained.issues, 1)
+        self.assertEqual(sum(op == "create-schedule" for _, op, _ in watchdog.calls), 1)
+        self.assertFalse(self.source.entities or self.retained.entities)
+
+
+if __name__ == "__main__":
+    unittest.main()

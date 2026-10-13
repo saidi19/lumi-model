@@ -1,0 +1,299 @@
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_fullsize_credential_setup_v1 as receiver
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+SPEC = importlib.util.spec_from_file_location(
+    "source_issuer", ROOT / "scripts/issue_sft_vm_acquisition_credentials_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+NOW = dt.datetime(2026, 9, 29, tzinfo=dt.UTC)
+RAW = json.dumps(
+    {
+        "account": m.base.ACCOUNT,
+        "region": m.base.REGION,
+        "bucket": m.permissions.BUCKET,
+        "object_count": 22,
+        "objects": [
+            {"key": f"synthetic/object-{i}", "bytes": 48843765443 if i == 0 else 0}
+            for i in range(22)
+        ],
+    }
+).encode()
+
+
+class Fake:
+    def __init__(self, fail=None):
+        self.fail = fail
+        self.entities = {}
+        self.policies = {}
+        self.keys = []
+        self.calls = []
+        self.issues = 0
+
+    def absent(self, kind, name):
+        return kind not in self.entities
+
+    def cli(self, service, operation, **fields):
+        self.calls.append(operation)
+        if operation == self.fail:
+            raise m.base.CloudError("synthetic_error")
+        if operation == "get-caller-identity":
+            return {"Account": m.base.ACCOUNT}
+        if operation.startswith("create-") and operation in {"create-user", "create-role"}:
+            kind = operation[7:]
+            name = fields[kind.title() + "Name"]
+            value = {
+                "Arn": f"arn:aws:iam::{m.base.ACCOUNT}:{kind}{m.PATH}{name}",
+                "Path": m.PATH,
+                "Tags": fields["Tags"],
+                kind.title() + "Id": "id-" + kind,
+            }
+            if kind == "role":
+                value.update(
+                    MaxSessionDuration=fields["MaxSessionDuration"],
+                    AssumeRolePolicyDocument=json.loads(fields["AssumeRolePolicyDocument"]),
+                )
+            self.entities[kind] = value
+            return {kind.title(): value}
+        if operation in {"get-user", "get-role"}:
+            kind = operation[4:]
+            if kind not in self.entities:
+                raise m.base.CloudError("absent")
+            return {kind.title(): self.entities[kind]}
+        if operation in {"put-role-policy", "put-user-policy"}:
+            self.policies[fields["PolicyName"]] = json.loads(fields["PolicyDocument"])
+        if operation in {"get-role-policy", "get-user-policy"}:
+            return {"PolicyDocument": self.policies[fields["PolicyName"]]}
+        if operation == "create-access-key":
+            self.keys.append("AKIASYNTHETIC")
+            if self.fail == "lost_key_response":
+                raise m.base.CloudError("synthetic_error")
+            return {"AccessKey": {"AccessKeyId": self.keys[0], "SecretAccessKey": "issuer-secret"}}
+        if operation == "list-access-keys":
+            return {"AccessKeyMetadata": [{"AccessKeyId": key} for key in self.keys]}
+        if operation == "delete-access-key":
+            self.keys.remove(fields["AccessKeyId"])
+        if operation in {"delete-user-policy", "delete-role-policy"}:
+            if fields["PolicyName"] not in self.policies:
+                raise m.base.CloudError("absent")
+            del self.policies[fields["PolicyName"]]
+        if operation in {"delete-user", "delete-role"}:
+            kind = operation[7:]
+            if kind == "user" and self.keys:
+                raise m.base.CloudError("keys_remain")
+            del self.entities[kind]
+        return {}
+
+    def issue_source_session(self, key, arn):
+        self.issues += 1
+        if self.fail == "issue":
+            raise RuntimeError("issuer-secret")
+        if self.fail == "owner_changed":
+            self.entities["role"]["Tags"] = [{"Key": "LumiOwnerNonce", "Value": "different"}]
+        return {
+            "AccessKeyId": "ASIASYNTHETIC",
+            "SecretAccessKey": "session-secret",
+            "SessionToken": "session-token",
+            "Expiration": NOW + dt.timedelta(seconds=3600 if self.fail == "short" else 7199),
+        }
+
+
+class IssuerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "attempt"
+        self.pin = patch.object(m.permissions, "SELECTION_SHA", hashlib.sha256(RAW).hexdigest())
+        self.pin.start()
+        self.addCleanup(self.pin.stop)
+
+    def run_case(self, cloud, deliver=lambda body: None):
+        result = m._run_for_admitted_delivery(
+            RAW,
+            "1" * 32,
+            self.path,
+            deliver,
+            cloud=cloud,
+            now=lambda: NOW,
+            wait=lambda seconds: None,
+        )
+        saved = (self.path / "result.json").read_text()
+        for secret in ("issuer-secret", "session-secret", "session-token", "ASIASYNTHETIC"):
+            self.assertNotIn(secret, saved)
+        self.assertFalse(result["gate_5_complete"])
+        return result
+
+    def test_real_pipe_into_existing_root_receiver(self):
+        cloud = Fake()
+        delivered = []
+
+        def deliver(body):
+            self.assertEqual(cloud.keys, [])
+            self.assertIn("role", cloud.entities)
+            read_fd, write_fd = os.pipe()
+            try:
+                os.write(write_fd, body)
+                os.close(write_fd)
+                write_fd = None
+                with patch.object(receiver.m.workflow, "ROOT_UID", os.geteuid()):
+                    raw = receiver.m._read_pipe(read_fd, time.monotonic() + 2)
+                normalized, _ = receiver.m._normalize(raw, NOW.timestamp())
+                self.assertEqual(
+                    set(json.loads(normalized)), {"access_key", "secret_key", "session_token"}
+                )
+                delivered.append(body)
+            finally:
+                os.close(read_fd)
+                if write_fd is not None:
+                    os.close(write_fd)
+
+        result = self.run_case(cloud, deliver)
+        self.assertTrue(result["delivery_returned"] and result["cleanup_verified"])
+        self.assertEqual(cloud.entities, {})
+        self.assertEqual(cloud.issues, 1)
+        self.assertFalse(any(delivered[0]))
+
+    def test_failed_delivery_still_cleans_up(self):
+        def deliver(body):
+            raise RuntimeError("session-secret")
+
+        result = self.run_case(Fake(), deliver)
+        self.assertEqual(result["failed_stage"], "deliver")
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_issuer_joins_existing_setup_acquisition_and_cleanup(self):
+        host = receiver.SetupTests(
+            "test_pipe_mount_write_acquire_cleanup_and_frozen_handoff_joined"
+        )
+        self.addCleanup(host.doCleanups)
+        host.setUp()
+        cloud = Fake()
+
+        def deliver(body):
+            self.assertEqual(cloud.keys, [])
+            host.body = bytes(body)
+            with patch.object(receiver.m.time, "time", return_value=NOW.timestamp()):
+                result = host.execute()
+            self.assertFalse(result["gate_5_complete"])
+            self.assertFalse(host.secret.exists())
+            self.assertFalse(host.mounted)
+            host.done.assert_called_once()
+
+        result = self.run_case(cloud, deliver)
+        self.assertTrue(result["delivery_returned"] and result["cleanup_verified"])
+        self.assertEqual(cloud.entities, {})
+
+    def test_wrong_policy_readback_prevents_key_issue(self):
+        cloud = Fake()
+        original = cloud.cli
+
+        def cli(service, operation, **fields):
+            result = original(service, operation, **fields)
+            if operation == "get-user-policy":
+                result["PolicyDocument"] = {}
+            return result
+
+        cloud.cli = cli
+        result = self.run_case(cloud)
+        self.assertEqual(result["failed_stage"], "policy_readback")
+        self.assertNotIn("create-access-key", cloud.calls)
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_failed_sts_is_not_retried(self):
+        cloud = Fake("issue")
+        result = self.run_case(cloud)
+        self.assertEqual(cloud.issues, 1)
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_lost_key_response_inventory_cleanup(self):
+        cloud = Fake("lost_key_response")
+        self.assertTrue(self.run_case(cloud)["cleanup_verified"])
+        self.assertEqual(cloud.keys, [])
+
+    def test_key_delete_failure_blocks_delivery(self):
+        result = self.run_case(Fake("delete-access-key"))
+        self.assertFalse(result["delivery_returned"])
+        self.assertFalse(result["cleanup_verified"])
+        self.assertIn("user", result["cleanup_errors"])
+
+    def test_cleanup_failure_preserved(self):
+        result = self.run_case(Fake("delete-role"))
+        self.assertFalse(result["cleanup_verified"])
+        self.assertEqual(result["cleanup_errors"], ["role"])
+
+    def test_changed_ownership_never_deleted(self):
+        cloud = Fake("owner_changed")
+        result = self.run_case(cloud)
+        self.assertIn("role", result["cleanup_errors"])
+        self.assertFalse(result["delivery_returned"])
+        self.assertIn("role", cloud.entities)
+        self.assertNotIn("delete-role", cloud.calls)
+
+    def test_short_session_rejected_before_delivery(self):
+        result = self.run_case(Fake("short"))
+        self.assertFalse(result["delivery_returned"])
+        self.assertTrue(result["cleanup_verified"])
+
+    def test_expired_policy_rejected_even_with_fresh_session(self):
+        credentials = Fake().issue_source_session({}, "unused")
+        with self.assertRaises(ValueError):
+            m._credential_body(credentials, NOW + dt.timedelta(seconds=3600), NOW)
+
+    def test_sdk_uses_small_scoped_policy_explicit_keys_and_no_retry(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+
+        # urllib3 probes local IPv6 on import. Stub only that bind in this
+        # synthetic test; the audit guard still rejects real network/processes.
+        with patch("socket.socket.bind", side_effect=OSError("ipv6_probe_disabled")):
+            import botocore.session
+
+        client = Mock()
+        client.assume_role.return_value = {"Credentials": {"synthetic": True}}
+        factory = Mock(return_value=client)
+        session = SimpleNamespace(create_client=factory)
+        key = {"AccessKeyId": "dummy-id", "SecretAccessKey": "dummy-key"}
+        with patch.object(botocore.session, "Session", return_value=session):
+            result = m.Cloud().issue_source_session(key, "arn:aws:iam::573978149073:role/synthetic")
+        self.assertEqual(result, {"synthetic": True})
+        options = factory.call_args.kwargs
+        self.assertEqual(options["aws_access_key_id"], "dummy-id")
+        self.assertEqual(options["config"].retries, {"total_max_attempts": 1})
+        self.assertEqual(options["config"].proxies, {})
+        self.assertEqual(options["endpoint_url"], "https://sts.us-east-1.amazonaws.com")
+        request = client.assume_role.call_args.kwargs
+        self.assertEqual(request["DurationSeconds"], 7200)
+        self.assertEqual(json.loads(request["Policy"]), m.SESSION_POLICY)
+        self.assertLessEqual(len(request["Policy"]), 2048)
+        client.assume_role.assert_called_once()
+        client.close.assert_called_once()
+
+    def test_collision_no_delete_or_issue(self):
+        cloud = Fake()
+        cloud.entities["user"] = {}
+        self.assertFalse(self.run_case(cloud)["cleanup_verified"])
+        self.assertEqual(cloud.calls, ["get-caller-identity"])
+
+    def test_public_entry_closed_even_with_approval(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True, execute=True)
+
+    def test_started_directory_cannot_be_reused(self):
+        self.run_case(Fake())
+        cloud = Fake()
+        with self.assertRaises(FileExistsError):
+            self.run_case(cloud)
+        self.assertEqual(cloud.calls, [])

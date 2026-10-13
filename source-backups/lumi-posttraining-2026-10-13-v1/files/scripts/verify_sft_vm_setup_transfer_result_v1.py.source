@@ -1,0 +1,139 @@
+"""Read-only reconciliation of the single source-only transfer qualification.
+
+No workload retry, termination dispatch or SSH. Verification SDK reads share
+the execution's 100-call ceiling. Preserve failed workload results unchanged.
+"""
+
+import json
+import sys
+import time
+from pathlib import Path
+
+from scripts import qualify_sft_vm_setup_transfer_v1 as q
+from scripts import verify_sft_vm_attempt021_source_v1 as prior
+
+PLAN_SHA = "f1263a673a2e2b63b20d7d68d27a9b62bcf78582a573ba67ba03ce7922ac503d"
+ENTRY_SHA = "defcf6d6ca9e1c3aa6f503d4c8a3e05d7f07422b81bb05caa1d8194f47cbb77a"
+OUTPUT = q.ROOT / "evidence/lumi-setup-transfer-result-verification-v0.1.json"
+
+
+def local():
+    q.need(q.sha(q.read(q.PLAN)) == PLAN_SHA)
+    q.need(q.sha(q.read(Path(q.__file__))) == ENTRY_SHA)
+    q.approve(q.read(q.PLAN))
+    report = json.loads(q.read(q.OUT / "result.json", 65536))
+    launch = json.loads(q.read(q.OUT / "launch.json", 65536))
+    q.need(launch["token"] == q.TOKEN and launch["instance"] == report["instance"])
+    q.need(report["status"] in {"source_only_native_transfer_passed", "failed_no_retry"})
+    q.need(type(report["aws_sdk_calls"]) is int and 0 < report["aws_sdk_calls"] <= 90)
+    q.need(report["launch_dispatched"] is True and report["terminated_verified"] is True)
+    q.need(report["retry_allowed"] is False)
+    q.need(
+        all(report[k] is False for k in ("gate_5_complete", "real_4b_import", "gpu", "training"))
+    )
+    if report["status"] == "source_only_native_transfer_passed":
+        q.need(report["seed_confirmed"] is True and report["transfer_dispatch_attempted"] is True)
+        q.need(report["full_receipt_matches"] is True)
+        q.need(report["native_19_files_readback_verified"] is True)
+        q.need(report["attempted_payload_bytes"] == 17061196)
+    before = prior.verify()
+    q.need(before["prior_evidence_byte_for_byte_preserved"] is True)
+    return report
+
+
+def reconcile(cloud, report, *, sleep=time.sleep):
+    def call(op, **fields):
+        q.need(report["aws_sdk_calls"] + cloud.calls < 100)
+        q.need(cloud.calls < 10 and cloud.clock() - cloud.started < 180)
+        return cloud.call(op, **fields)
+
+    q.need(call("get_caller_identity")["Account"] == q.ACCOUNT)
+    disposable = report["instance"]
+    q.owned(call("describe_instances", InstanceIds=[disposable]), disposable, terminal=True)
+    reservation = q.one(call("describe_instances", InstanceIds=[q.RETAINED])["Reservations"])
+    q.need(reservation["OwnerId"] == q.ACCOUNT)
+    host = q.one(reservation["Instances"])
+    q.need(host["InstanceId"] == q.RETAINED and host["State"]["Name"] == "stopped")
+    q.tag(host, "LumiAttempt", q.OWNER_ATTEMPT)
+    mappings = host["BlockDeviceMappings"]
+    q.need({r["Ebs"]["VolumeId"] for r in mappings} == q.VOLUMES)
+    q.need(all(r["Ebs"]["DeleteOnTermination"] is False for r in mappings))
+    volumes = call("describe_volumes", VolumeIds=sorted(q.VOLUMES))["Volumes"]
+    q.need({v["VolumeId"] for v in volumes} == q.VOLUMES)
+    for volume in volumes:
+        q.need(volume["Encrypted"] is True and volume["State"] == "in-use")
+        q.need(q.one(volume["Attachments"])["InstanceId"] == q.RETAINED)
+        q.tag(volume, "LumiAttempt", q.OWNER_ATTEMPT)
+    endpoint = q.one(
+        call("describe_instance_connect_endpoints", InstanceConnectEndpointIds=[q.ENDPOINT])[
+            "InstanceConnectEndpoints"
+        ]
+    )
+    q.need(endpoint["InstanceConnectEndpointId"] == q.ENDPOINT)
+    q.need(endpoint["State"] == "create-complete" and endpoint["SubnetId"] == q.SUBNET)
+    q.tag(endpoint, "LumiAttempt", q.OWNER_ATTEMPT)
+    rows = None
+    for index in range(5):
+        rows = call(
+            "describe_volumes", Filters=[{"Name": "tag:LumiDiagnostic", "Values": [q.TOKEN]}]
+        )["Volumes"]
+        if not rows:
+            break
+        # Observation only; never delete a volume or resubmit termination.
+        for row in rows:
+            q.tag(row, "LumiDiagnostic", q.TOKEN)
+        if index < 4:
+            sleep(5)
+    return {
+        "disposable_instance_terminated_live_verified": True,
+        "disposable_tagged_volumes_deleted_live_verified": not rows,
+        "retained_host_stopped_live_verified": True,
+        "both_retained_encrypted_volumes_preserved_live_verified": True,
+        "retained_endpoint_create_complete_live_verified": True,
+        "verification_sdk_reads": cloud.calls,
+        "combined_execution_and_verification_sdk_calls": report["aws_sdk_calls"] + cloud.calls,
+        "additional_mutations": 0,
+        "additional_ssh_processes": 0,
+        "workload_retry": False,
+    }
+
+
+def main():
+    q.need(sys.argv[1:] == ["--verify-once"] and not OUTPUT.exists())
+    report = local()
+    cloud = q.Cloud(execute=False)
+    live = reconcile(cloud, report)
+    source_paths = [
+        q.PLAN,
+        Path(q.__file__),
+        Path(__file__),
+        q.APPROVAL,
+        q.OUT / "started.json",
+        q.OUT / "launch-dispatch.json",
+        q.OUT / "launch.json",
+        q.OUT / "result.json",
+    ]
+    if (q.OUT / "terminate-dispatch.json").exists():
+        source_paths.append(q.OUT / "terminate-dispatch.json")
+    result = {
+        "schema": "lumi.setup-transfer-result-verification.v0.1",
+        "status": report["status"],
+        "source_bindings": {str(p.relative_to(q.ROOT)): q.sha(q.read(p)) for p in source_paths},
+        "live_reconciliation": live,
+        "scope": "source_only_setup_transfer_not_real_import",
+        "full_receipt_matches": report["full_receipt_matches"],
+        "native_19_files_readback_verified": report["native_19_files_readback_verified"],
+        "workload_failure_stage": report.get("failure_stage"),
+        "prior_evidence_byte_for_byte_preserved": True,
+        "credential_provider_and_tunnel_requests_not_metered": True,
+        "gpu": False,
+        "training": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+    }
+    q.save(OUTPUT, result)
+    print(json.dumps({"status": result["status"], "live_reconciliation": live}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

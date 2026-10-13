@@ -1,0 +1,35 @@
+{
+  "schema": "lumi.vm-boot-smoke-proposal.v0.4",
+  "date": "2026-10-08",
+  "approved": false,
+  "execution_permitted": false,
+  "token": "lumi-boot-v2-smoke-20261008-04",
+  "instance_type": "t3.small",
+  "instance_count": 1,
+  "max_seconds": 720,
+  "scope": "One fresh boot-only CPU test, no retry, model data, GPU, training, SSH, public IP, NAT, new IAM or retained-resource changes.",
+  "cleanup": "Terminate only newly owned instance; auto-delete only its encrypted 16 GiB root disk; delete only its fresh security group.",
+  "caps": {
+    "resource_api_calls": 128,
+    "credential_identity_calls": 4,
+    "api_response_bytes": 16777216,
+    "private_journal_bytes": 1048576
+  },
+  "bindings": {
+    "scripts/execute_sft_vm_boot_smoke_v4.py": "ca280723c3630eb0e1da69f64c82640d3659479f7b82bb5c4c8849c1d4774de7",
+    "tests/test_sft_vm_boot_smoke_v4.py": "a87dd9859be99eb295663e6abc3cf6093c8c4110df4695ea7cde6f56922cea96",
+    "scripts/sft_vm_controller_credentials_v2.py": "8de7a85755d79aebd2f27b98482a51cf0b65af4356cd8bd3e583e00e8211aadb",
+    "scripts/run_sft_vm_early_stop_v2.py": "c5df93301f80b1f91a9bb8bb3cc2c833134e7a487d88332604dc657c41fce71d",
+    "scripts/build_sft_vm_initial_boot_v2.py": "b54e195627d91e54e409459b08a544596538496a764de49c675418dba7b7b3a2"
+  },
+  "validation": {
+    "tests_run": 63,
+    "failures": 0,
+    "errors": 0,
+    "ruff": "pass",
+    "live_readonly_preflight_passed": true,
+    "native_boot_passed": false
+  },
+  "billing": "720-second execution limit is not a hard AWS billing cap; unresolved cleanup must be reported.",
+  "requires": "Fresh human approval before creating the v0.4 approval and executing once."
+}

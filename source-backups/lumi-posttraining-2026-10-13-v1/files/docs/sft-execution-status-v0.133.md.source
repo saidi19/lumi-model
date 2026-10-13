@@ -1,0 +1,99 @@
+# SFT execution status v0.133: transport, native handoff and cold entry wired locally
+
+2026-09-28. Connected the exact-key SDK transport to the existing opaque input
+staging implementation; implemented the acquisition-to-import systemd handoff
+and the cold full-size worker script. **233 local regression tests plus four
+actual-SDK offline tests pass; Ruff passes.** No AWS request, real payload read,
+instance action, systemd dispatch, mount, GPU or training occurred.
+
+These are executable component integrations, not a completed/admitted cloud
+launcher. The authenticated root-parent setup, acquisition-unit bootstrap,
+independent package verification and retention still need integration. Gate 5
+remains incomplete. No earlier source, plan, failed attempt or evidence changed.
+
+## Implemented behavior
+
+- `posttraining_vm_fullsize_transport_v1.py` creates the S3 client with explicit
+  short-lived credentials, the fixed us-east-1 endpoint, TLS verification, no
+  proxy, one connection, socket timeouts and the expected bucket owner. The
+  pinned selection remains the only source of object keys and sizes.
+- The before-send guard rejects a second physical send for an object, redirects,
+  HEAD/POST, alternate endpoints and extra queries. This protects the one-send
+  rule independently of differences in SDK retry-count conventions.
+- A raw-response gate rejects non-200 status, wrong declared size, range,
+  compression or chunked transfer **before SDK parsing can eagerly consume an
+  error body**. Successful streams go directly to the existing bounded opaque
+  copier and size/hash checks. Bodies and the SDK HTTP pool close on failure.
+  Pool closure does not erase credential memory or prove process termination.
+- `posttraining_vm_fullsize_handoff_v1.py` checks acquisition terminal success,
+  stops that exact unit and reads back an empty cgroup before import dispatch.
+  A durable exclusive marker consumes the dispatch attempt. Existing import
+  units are not overwritten. Import is also stopped/reaped after success,
+  failure, timeout or ambiguous dispatch. Fixed stage codes retain useful
+  diagnostics without logs or exception text; signals/OOM are not stage codes.
+- `run_sft_vm_fullsize_entry_v1.py` requires its fixed Linux path, exact import
+  cgroup, 64-GiB memory/zero-swap/tasks-64 readback, the existing cold runtime
+  gate and read-only input/source/control mounts. It verifies source/control
+  pins, validates the full-size adapter contract, creates the output parent
+  exclusively and invokes the unchanged v4 coordinator through the existing
+  v0.131 adapter once. The completion file must match the returned result hash.
+  The summary exposes the package-manifest hash for later independent checking.
+  It explicitly does not claim independent verification, retention or Gate 5.
+
+The worker checks `/outputs` ownership/mode directly because that path has only
+two components under the frozen path-depth convention. `/outputs/import` is
+created exclusively and satisfies the coordinator's minimum depth. The old
+tiny-entry path regression was not reintroduced.
+
+## Tests and fixes made before any remote attempt
+
+31 new local tests cover transport-to-real-tiny-file staging, closure, exact
+requests, repeat/redirect rejection, failures, native handoff ordering/cleanup,
+controls, exclusive output creation, terminal/result binding and fixed codes.
+Together with the prior 202 cases: **233 tests, zero failures/errors/skips,
+0.512 seconds**, no ML modules and zero network/payload audit violations.
+OS admission, SDK transport and full-size conversion are doubled in this suite.
+
+The separate opt-in `scripts/check_sft_vm_fullsize_sdk_wire_v1.py` ran using the
+already installed AWS CLI 2.35.24's vendored SDK interpreter on this Mac. It
+uses dummy explicit credentials and real SDK signing, endpoint/event handling
+and response parsing; only the HTTP send is replaced by synthetic responses.
+All four tests passed in 0.225 seconds. No SDK was installed or real AWS account
+configuration/credentials read. This script is outside normal test discovery
+so projects without that optional SDK do not acquire a new failing dependency.
+
+The real SDK check caught and corrected two local compatibility assumptions:
+its retry count requires `max_attempts=1`, not zero, and its client lacks a
+public `close()`; the bounded adapter now closes the actual HTTP pool. Stronger
+audit accounting also caught an import-time urllib3 IPv6 loopback bind probe
+that the library swallowed. The audit blocked it. The offline fixture now
+disables only that capability probe during SDK import; the production code and
+network audit are not weakened. Final audit counters are zero. The installed
+SDK emits an upstream `utcnow()` deprecation warning; tests still pass.
+
+This is **not** a Linux SDK/runtime qualification. The transport's private raw
+HTTP integration requires a separately pinned/verified SDK runtime in the
+future acquisition unit. Error bodies are not read; total wire bytes including
+TLS/headers are not claimed to equal the response-content cap. Socket deadlines
+and the future unit deadline have separate responsibilities.
+
+Five v0.132 bindings, seven v0.131 bindings and four saved native-success
+bindings verified unchanged. The native result metadata was read, not checkpoint
+payload. No commit/push or remote execution occurred.
+
+## Next integration boundary
+
+1. Finish the authenticated root-parent setup/release binding and bounded
+   acquisition unit/credential bootstrap; the current handoff assumes those
+   prerequisites, it does not manufacture them. Bind disk capacity/backing,
+   acquisition logs/network scope and source/credential separation there.
+2. Run the existing independent SFT package checker in a separate supervised
+   stage after import teardown, then implement a bounded durable retention
+   destination and cleanup evidence. An import unit's exit zero is insufficient.
+3. Bind the combined setup/acquisition/import/verification/retention budget and
+   concrete host approval before real CPU import. The old generated-only AWS
+   authorization cannot be reused for full-size input acquisition.
+
+The v0.130 tiny native success remains valid and does not need a routine rerun.
+`real_4b_import=false`, `fullsize_host_admission=false`, `gate_5_complete=false`,
+`training_authorized=false`, `production_eligible=false`. GPU/SFT is still later.

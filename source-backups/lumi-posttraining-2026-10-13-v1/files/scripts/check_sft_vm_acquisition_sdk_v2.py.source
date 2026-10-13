@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+"""Run the existing four no-network wire checks with the pinned standard SDK.
+
+No AWS CLI vendor alias. Explicit dummy credentials only; physical HTTP send is
+doubled. A pass proves this SDK's local wire compatibility, NOT Linux admission,
+TLS against S3, actual acquisition or fullsize import. Run in a fresh -I -B venv.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import importlib.metadata
+import importlib.util
+import json
+import os
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PINS = {
+    "configs/lumi-vm-acquisition-sdk-v0.1.lock.json": (
+        "8d4b775307c3d70d8b99d17a1bf901ce1ea1a5e8294481a89b2a87f83b2ace4c"
+    ),
+    "scripts/check_sft_vm_fullsize_sdk_wire_v1.py": (
+        "e1ed357b6ae945394d12cfdef9453918574ff67acd51b7d8e2879f8a8ecb7b34"
+    ),
+    "scripts/acquire_sft_vm_fullsize_inputs_v1.py": (
+        "c3fe17fe42b7e5bf7df19e8a5f198568ce7d9efa89dc2af148d3f73e9fd89424"
+    ),
+    "src/lumi/posttraining_vm_fullsize_transport_v1.py": (
+        "cb6b21e6ab1011dcc2902305f67ecaf24687930ef40628b9b01b9ce40e123c30"
+    ),
+    "src/lumi/posttraining_vm_fullsize_staging_v1.py": (
+        "0dd28e571a9b01ef7a2270fc9df81545d5f903acfb1133ba2771ebce1c479c68"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("sdk_wire_check_rejected") from None
+
+
+def load_script(name, relative, raw):
+    module = types.ModuleType(name)
+    module.__file__ = str(ROOT / relative)
+    exec(compile(raw, module.__file__, "exec"), module.__dict__)
+    return module
+
+
+def run():
+    need(sys.flags.isolated and sys.dont_write_bytecode and sys.prefix != sys.base_prefix)
+    bodies = {}
+    for name, pin in PINS.items():
+        with (ROOT / name).open("rb") as stream:
+            raw = stream.read(131073)
+        need(len(raw) <= 131072 and hashlib.sha256(raw).hexdigest() == pin)
+        bodies[name] = raw
+    lock = json.loads(bodies["configs/lumi-vm-acquisition-sdk-v0.1.lock.json"])
+    versions = {
+        row["name"]: importlib.metadata.version(row["name"]) for row in lock["requirements"]
+    }
+    need(all(versions[row["name"]] == row["version"] for row in lock["requirements"]))
+    previous = load_script(
+        "_sdk_frozen_wire",
+        "scripts/check_sft_vm_fullsize_sdk_wire_v1.py",
+        bodies["scripts/check_sft_vm_fullsize_sdk_wire_v1.py"],
+    )
+    entry = load_script(
+        "_sdk_production_factory",
+        "scripts/acquire_sft_vm_fullsize_inputs_v1.py",
+        bodies["scripts/acquire_sft_vm_fullsize_inputs_v1.py"],
+    )
+
+    def setup(cls):
+        sys.addaudithook(previous.audit)
+        need(
+            not any(
+                n.split(".")[0] in {"awscli", "botocore", "boto3", "torch"} for n in sys.modules
+            )
+        )
+        # Same offline IPv6-probe suppression as the frozen test, with the socket
+        # audit still active. Production SDK/environment factory is unmodified.
+        with patch("socket.has_ipv6", False):
+            session, config = entry.sdk()
+            from botocore.awsrequest import AWSResponse
+        for name in ("botocore", "jmespath", "dateutil", "six", "urllib3"):
+            module = importlib.import_module(name)
+            need(Path(module.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()))
+        cls.Config, cls.Session, cls.AWSResponse = config, type(session), AWSResponse
+        package = types.ModuleType("_pinned_sdk_transport")
+        package.__path__ = [str(ROOT / "src/lumi")]
+        sys.modules[package.__name__] = package
+        cls.transport = importlib.import_module(
+            package.__name__ + ".posttraining_vm_fullsize_transport_v1"
+        )
+
+    previous.SDKWireTests.setUpClass = classmethod(setup)
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(previous.SDKWireTests)
+    with open(os.devnull, "w") as sink:
+        result = unittest.TextTestRunner(stream=sink).run(suite)
+    report = {
+        "schema": "lumi.vm-acquisition-sdk-wire-check.v0.2",
+        "versions": versions,
+        "python": sys.version.split()[0],
+        "platform": sys.platform,
+        "tests": result.testsRun,
+        "failures": len(result.failures),
+        "errors": len(result.errors),
+        "skips": len(result.skipped),
+        "guard_violations": previous.VIOLATIONS,
+        "production_sdk_factory_used": True,
+        "existing_four_wire_tests_reused": True,
+        "http_send_doubled": True,
+        "dummy_credentials_only": True,
+        "linux_host_qualified": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+    }
+    report["passed"] = (
+        result.wasSuccessful()
+        and result.testsRun == 4
+        and not result.skipped
+        and not any(previous.VIOLATIONS.values())
+    )
+    return report
+
+
+if __name__ == "__main__":
+    try:
+        result = run()
+        print(json.dumps(result, sort_keys=True))
+        raise SystemExit(0 if result["passed"] else 1)
+    except Exception:
+        print('{"status":"sdk_wire_check_rejected","linux_host_qualified":false}')
+        raise SystemExit(1) from None

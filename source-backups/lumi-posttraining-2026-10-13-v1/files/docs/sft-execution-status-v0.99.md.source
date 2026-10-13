@@ -1,0 +1,55 @@
+# SFT execution status v0.99
+
+2026-09-18. Capacity-fix options reviewed; no new remote execution or deletion.
+Local HEAD remains `716774386cc3eba22f860c7699d6a33654882a02`.
+The completed preflight and CI results in v0.98 remain unchanged.
+
+## Verified constraints
+
+Read-only GitHub metadata for repository ID `1300831104` confirms that
+`saidi19/lumi-model` is private, belongs to an owner of type `User`, and has
+zero registered repository self-hosted runners. No runner was registered,
+created, changed or removed.
+
+[GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+lists 14 GB storage for standard private-repository Ubuntu runners. Its
+[larger-runner documentation](https://docs.github.com/en/actions/concepts/runners/larger-runners)
+limits larger Linux runners to organizations/enterprises on eligible plans.
+Changing only the existing workflow label is therefore not a verified solution
+for this personal repository. Repository visibility or ownership must not be
+changed as a capacity workaround.
+
+The previous actual measurement is unchanged: 14,347,816,960 bytes available,
+against 18,241,982,464 bytes theoretical pre-acquisition need. The 16 GiB
+post-acquisition floor must remain unchanged.
+
+## Smallest proposed host change — not yet authorized
+
+A fresh disposable standard Ubuntu runner could reclaim space from its
+preinstalled Android SDK at the exact root `/usr/local/lib/android/sdk`.
+That SDK root is documented in the official
+[Ubuntu 24.04 image inventory](https://raw.githubusercontent.com/actions/runner-images/main/images/ubuntu/Ubuntu2404-Readme.md).
+Its actual existence, identity, symlink/mount boundaries and reclaimable size on
+the new VM must be checked before any deletion. No particular reclaimable byte
+count is assumed from the inventory.
+
+The proposal is limited to that unused SDK on the new GitHub VM, followed by one
+fresh capacity/setup check. It must not delete or modify the Mac, checkout,
+model/data, `/opt/hostedtoolcache`, Python, Docker storage, general caches or other
+SDK roots. It must not install packages, acquire the software image, run the full
+native pipeline, retry the consumed attempt, start a GPU, or train.
+
+Deletion would not be recoverable within that VM without reinstalling the SDK;
+the next standard GitHub job starts from a fresh provider image. This proposed
+deletion and fresh workflow require explicit approval before implementation and
+publication. If its checks cannot establish the exact target or adequate space,
+stop rather than expanding deletion targets or lowering the floor.
+
+An alternative is a separately approved dedicated CPU host with adequate disk,
+which introduces new host, provisioning and cost decisions. Neither alternative
+has been executed. A successful capacity check would still not prove Docker,
+cgroup or full worker qualification, nor explain the old host retroactively.
+
+Gate 5 remains incomplete. This turn made only read-only repository/API/docs
+checks and this local status note; no commit, push, workflow, instance, cleanup,
+acquisition or training action occurred.

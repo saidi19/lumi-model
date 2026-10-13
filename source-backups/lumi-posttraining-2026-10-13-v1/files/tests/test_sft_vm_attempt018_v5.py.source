@@ -1,0 +1,129 @@
+"""Offline regression for bounded read-only transport recovery."""
+import importlib
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock
+
+from scripts import prepare_sft_vm_attempt018_v5 as m
+
+
+def meta(service):
+    config = types.SimpleNamespace(
+        retries={"total_max_attempts": 1},
+        connect_timeout=3,
+        read_timeout=5,
+        proxies={},
+    )
+    return types.SimpleNamespace(
+        region_name="us-east-1",
+        endpoint_url=f"https://{service}.us-east-1.amazonaws.com",
+        config=config,
+    )
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.report = m.build()
+        cls.temp = tempfile.TemporaryDirectory()
+        cls.root = Path(cls.temp.name)
+        for name, body in cls.files.items():
+            path = cls.root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(body)
+        cls.before = set(sys.modules)
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.provision = importlib.import_module("provision_sft_vm_host_v5")
+
+    @classmethod
+    def tearDownClass(cls):
+        scripts = str(cls.root / "scripts")
+        while scripts in sys.path:
+            sys.path.remove(scripts)
+        for name in set(sys.modules) - cls.before:
+            module = sys.modules.get(name)
+            module_file = getattr(module, "__file__", None)
+            if module_file is not None and Path(module_file).is_relative_to(cls.root):
+                del sys.modules[name]
+        cls.temp.cleanup()
+
+    def clients(self, ec2):
+        ec2.meta = meta("ec2")
+        sts = types.SimpleNamespace(meta=meta("sts"))
+        return {"ec2": ec2, "sts": sts}
+
+    def test_transient_read_is_retried_within_exact_bound(self):
+        error_type = type(
+            "ReadTimeoutError", (Exception,), {"__module__": "botocore.exceptions"}
+        )
+        ec2 = types.SimpleNamespace(
+            describe_instances=Mock(side_effect=[error_type(), {"Reservations": []}])
+        )
+        sleeps = []
+        cloud = self.provision.SDKCloud(self.clients(ec2), sleep=sleeps.append)
+        self.assertEqual(cloud.cli("ec2", "describe-instances"), {"Reservations": []})
+        self.assertEqual(ec2.describe_instances.call_count, 2)
+        self.assertEqual((cloud.read_attempts, cloud.read_retries), (2, 1))
+        self.assertEqual(sleeps, [1])
+
+    def test_write_is_never_retried_even_for_transport_error(self):
+        error_type = type(
+            "ReadTimeoutError", (Exception,), {"__module__": "botocore.exceptions"}
+        )
+        ec2 = types.SimpleNamespace(run_instances=Mock(side_effect=error_type()))
+        sleeps = []
+        cloud = self.provision.SDKCloud(self.clients(ec2), sleep=sleeps.append)
+        with self.assertRaises(error_type):
+            cloud.cli("ec2", "run-instances")
+        self.assertEqual(ec2.run_instances.call_count, 1)
+        self.assertEqual((cloud.read_attempts, cloud.read_retries), (0, 0))
+        self.assertEqual(sleeps, [])
+
+    def test_nontransient_read_is_not_retried(self):
+        ec2 = types.SimpleNamespace(describe_instances=Mock(side_effect=ValueError("no")))
+        sleeps = []
+        cloud = self.provision.SDKCloud(self.clients(ec2), sleep=sleeps.append)
+        with self.assertRaises(ValueError):
+            cloud.cli("ec2", "describe-instances")
+        self.assertEqual(ec2.describe_instances.call_count, 1)
+        self.assertEqual(cloud.read_retries, 0)
+        self.assertEqual(sleeps, [])
+
+    def test_global_read_retry_cap_is_fail_closed(self):
+        error_type = type(
+            "ReadTimeoutError", (Exception,), {"__module__": "botocore.exceptions"}
+        )
+        ec2 = types.SimpleNamespace(describe_instances=Mock(side_effect=error_type()))
+        sleeps = []
+        cloud = self.provision.SDKCloud(self.clients(ec2), sleep=sleeps.append)
+        cloud.read_retries = self.provision.MAX_READ_RETRIES
+        with self.assertRaises(error_type):
+            cloud.cli("ec2", "describe-instances")
+        self.assertEqual(ec2.describe_instances.call_count, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_outer_graph_authenticates_and_failure_is_preserved(self):
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        outer.authenticate()
+        self.assertEqual(
+            self.report["v022_execution_cleanup_verification_sha256"],
+            m.EXECUTION_RECOVERY_SHA,
+        )
+        self.assertTrue(self.report["prior_evidence_byte_identical"])
+
+    def test_report_does_not_authorize_execution(self):
+        self.assertEqual(self.report["run_instances_attempts"], 1)
+        self.assertEqual(self.report["stop_instances_attempts"], 1)
+        self.assertEqual(self.report["application_read_attempts_per_call_maximum"], 3)
+        self.assertEqual(self.report["application_read_retries_total_maximum"], 8)
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertFalse(self.report["real_4b_import"])
+        self.assertFalse(self.report["gate_5_complete"])
+        self.assertFalse(self.report["gpu"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,308 @@
+"""Nine read-only control requests; no object access or bucket/IAM mutation.
+
+Reuse frozen privacy/ownership checks, then verify explicit claim protection
+and lifecycle safety. Point-in-time admission is not an IAM policy simulator,
+proof of future administrator behavior, or new write/launch authorization.
+"""
+
+import datetime as dt
+import hashlib
+import json
+import math
+import time
+from pathlib import Path
+
+import arm_sft_vm_network_cleanup_v1 as armer
+import check_sft_vm_retention_bucket_v1 as bucket
+import run_sft_vm_joined_admission_v2 as joined
+import run_sft_vm_private_network_v1 as network
+import sft_vm_network_cleanup_bridge_v1 as bridge
+import sft_vm_network_cleanup_v1 as worker
+
+PINS = {
+    "check_sft_vm_retention_bucket_v1.py": (
+        "fc6689efb07d0cd066993b3cb95b19c498cea6e86254e83d6d8a099cd3828c5f"
+    ),
+    "arm_sft_vm_network_cleanup_v1.py": (
+        "166b5e5d5fc586c164d9cc564a0a9dcb07a2d5d7408f1b956ae0c4635b1471e2"
+    ),
+    "sft_vm_network_cleanup_bridge_v1.py": (
+        "91471ad09d9275ca9c50eb556090e5612475b92618081462c7e60ebe2c0a7bd3"
+    ),
+    "sft_vm_network_cleanup_v1.py": (
+        "4c8e49497651b132c5df8b5baef90b6cceb96d5abca80fbbe36f7b5695434799"
+    ),
+    "run_sft_vm_joined_admission_v2.py": (
+        "a9af6100967ccb89f795d59fa72017c02cf78b75c0b11f854b25253d71d66540"
+    ),
+    "run_sft_vm_private_network_v1.py": (
+        "54311c7cf1d76b598a1962eacb9e66ba7bb303cefe18f33c2f6a53d7a4046aac"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("cleanup_store_rejected") from None
+
+
+def timestamp(value):
+    if type(value) is str:
+        value = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    need(isinstance(value, dt.datetime) and value.utcoffset() == dt.timedelta(0))
+    return value.timestamp()
+
+
+def required_denials():
+    """Expected narrow deny fragments, not a replacement policy or a write.
+
+    No new Allow, bucket-wide change, or policy deployment is returned. The
+    verifier also accepts the exact two nonce keys instead of the dedicated
+    cleanup prefix, and a DateLessThan condition covering original expiry.
+    """
+    resource = f"arn:aws:s3:::{worker.BUCKET}/{worker.PREFIX}*"
+    common = dict(Effect="Deny", Principal="*", Resource=resource)
+    return [
+        dict(common, Action=["s3:DeleteObject", "s3:DeleteObjectVersion"]),
+        dict(
+            common, Action="s3:PutObject", Condition={"StringNotEquals": {"s3:if-none-match": "*"}}
+        ),
+        dict(
+            common,
+            Action="s3:PutObject",
+            Condition={"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}},
+        ),
+        dict(common, Action="s3:PutObject", Condition={"Null": {"s3:x-amz-copy-source": "false"}}),
+    ]
+
+
+def protected(policy, bound):
+    need(type(policy) is dict)
+    rows = policy.get("Statement")
+    need(type(rows) is list and len(rows) <= 64)
+    exact = {
+        f"arn:aws:s3:::{worker.BUCKET}/{worker.claim_key(bound['nonce'], op)}"
+        for op in worker.OPERATIONS
+    }
+    prefix = required_denials()[0]["Resource"]
+    for wanted in required_denials():
+        matched = False
+        for row in rows:
+            if type(row) is not dict or set(row) - {
+                "Sid",
+                "Effect",
+                "Principal",
+                "Action",
+                "Resource",
+                "Condition",
+            }:
+                continue
+            if row.get("Effect") != "Deny" or row.get("Principal") != "*":
+                continue
+            resources = row.get("Resource")
+            resources = [resources] if type(resources) is str else resources
+            if type(resources) is not list or not all(type(x) is str for x in resources):
+                continue
+            if set(resources) != {prefix} and set(resources) != exact:
+                continue
+            actual = row.get("Action")
+            actual = [actual] if type(actual) is str else actual
+            expected = wanted["Action"]
+            expected = [expected] if type(expected) is str else expected
+            if type(actual) is not list or sorted(actual) != sorted(expected):
+                continue
+            condition = dict(row.get("Condition", {}))
+            timed = condition.pop("DateLessThan", None)
+            if timed is not None:
+                need(type(timed) is dict and set(timed) == {"aws:CurrentTime"})
+                if timestamp(timed["aws:CurrentTime"]) < bound["expires_at"]:
+                    continue
+            if condition == wanted.get("Condition", {}):
+                matched = True
+                break
+        need(matched)
+
+
+def lifecycle_safe(value, bound):
+    rows = value.get("Rules")
+    need(type(rows) is list and len(rows) <= 1000)
+    keys = [worker.claim_key(bound["nonce"], op) for op in worker.OPERATIONS]
+    relevant = 0
+    for rule in rows:
+        need(type(rule) is dict and rule.get("Status") in {"Enabled", "Disabled"})
+        need(
+            not set(rule)
+            - {
+                "ID",
+                "Status",
+                "Prefix",
+                "Filter",
+                "Expiration",
+                "Transitions",
+                "NoncurrentVersionTransitions",
+                "NoncurrentVersionExpiration",
+                "AbortIncompleteMultipartUpload",
+            }
+        )
+        if rule["Status"] == "Disabled":
+            continue
+        need(not ("Prefix" in rule and "Filter" in rule))
+        filt = rule.get("Filter", {})
+        need(
+            type(filt) is dict
+            and not set(filt)
+            - {"Prefix", "Tag", "And", "ObjectSizeGreaterThan", "ObjectSizeLessThan"}
+        )
+        conjunction = filt.get("And", {})
+        need(
+            type(conjunction) is dict
+            and not set(conjunction)
+            - {"Prefix", "Tags", "ObjectSizeGreaterThan", "ObjectSizeLessThan"}
+        )
+        need(not ("And" in filt and len(filt) != 1))
+        prefix = rule.get("Prefix", conjunction.get("Prefix", filt.get("Prefix", "")))
+        need(type(prefix) is str)
+        if not any(key.startswith(prefix) for key in keys):
+            continue
+        relevant += 1
+        # Tags/size filters conservatively count as possible matches. Current
+        # claim objects are new, at most five hours old; Days>=1 is safe here.
+        actions = [rule["Expiration"]] if "Expiration" in rule else []
+        transitions = rule.get("Transitions", [])
+        need(type(transitions) is list)
+        for action in actions + transitions:
+            need(type(action) is dict)
+            need(not set(action) - {"Days", "Date", "ExpiredObjectDeleteMarker", "StorageClass"})
+            if "Days" in action:
+                need("Date" not in action and type(action["Days"]) is int and action["Days"] >= 1)
+            elif "Date" in action:
+                need(timestamp(action["Date"]) >= bound["expires_at"])
+            else:
+                need(action == {"ExpiredObjectDeleteMarker": True})
+        # Noncurrent cleanup cannot remove an immutable current claim; multipart
+        # abort does not affect these single conditional PUT objects.
+    return relevant
+
+
+class ReadCloud(joined.BucketReadCloud):
+    OPS = {key: set(value) for key, value in joined.BucketReadCloud.OPS.items()}
+    OPS["s3api"].add("get-bucket-lifecycle-configuration")
+
+    def cli(self, service, operation, **fields):
+        if operation != "get-bucket-lifecycle-configuration":
+            return super().cli(service, operation, **fields)
+        need(
+            service == "s3api"
+            and fields == dict(Bucket=worker.BUCKET, ExpectedBucketOwner=worker.ACCOUNT)
+        )
+        try:
+            with joined.lifecycle.guard.provision.timeout(20):
+                return self.clients["s3api"].get_bucket_lifecycle_configuration(**fields)
+        except Exception as error:
+            if (
+                getattr(error, "response", {}).get("Error", {}).get("Code")
+                == "NoSuchLifecycleConfiguration"
+            ):
+                return {"Rules": []}
+            raise ValueError("cleanup_lifecycle_read_failed") from None
+
+
+class Admission:
+    def __init__(self, cloud, proposal_raw, *, clock=time.monotonic, wall=time.time):
+        self.cloud, self.raw, self.clock, self.wall = cloud, proposal_raw, clock, wall
+        self.used, self.report = False, None
+
+    def __call__(self, bound):
+        need(not self.used)
+        self.used = True
+        try:
+            for name, digest in PINS.items():
+                need(
+                    hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
+                    == digest
+                )
+            bound = worker.binding(json.dumps(bound))
+            need(bound["armed"])
+            start, wall = self.clock(), self.wall()
+            need(math.isfinite(start) and math.isfinite(wall))
+            need(wall < bound["not_before"] and 0 < bound["expires_at"] - wall <= 18000)
+            policy = None
+            calls = 0
+
+            class Capture:
+                def cli(inner, service, operation, **fields):
+                    nonlocal policy, calls
+                    need(calls < 9 and self.clock() - start < 200 - 20)
+                    calls += 1
+                    value = self.cloud.cli(service, operation, **fields)
+                    elapsed = self.clock() - start
+                    need(0 <= elapsed < 200 and abs((self.wall() - wall) - elapsed) <= 5)
+                    need(
+                        type(value) is dict
+                        and len(json.dumps(value, default=str).encode()) <= 32768
+                    )
+                    need(not value.get("NextToken") and not value.get("IsTruncated"))
+                    if operation == "get-bucket-policy":
+                        policy = json.loads(value["Policy"], object_pairs_hook=worker.unique)
+                    return value
+
+            transport = Capture()
+            bucket.inspect(transport, self.raw, deadline=start + 180, clock=self.clock)
+            protected(policy, bound)
+            lifecycle = transport.cli(
+                "s3api",
+                "get-bucket-lifecycle-configuration",
+                Bucket=worker.BUCKET,
+                ExpectedBucketOwner=worker.ACCOUNT,
+            )
+            relevant = lifecycle_safe(lifecycle, bound)
+            elapsed = self.clock() - start
+            need(0 <= elapsed < 200 and self.wall() < bound["not_before"])
+            need(abs((self.wall() - wall) - elapsed) <= 5)
+            self.report = dict(
+                schema="lumi.vm-cleanup-store-check.v0.1",
+                observation_calls=calls,
+                private_owner_versioning_encryption_verified=True,
+                claim_protection_verified_at_observation=True,
+                lifecycle_rules_checked=len(lifecycle["Rules"]),
+                potentially_matching_rules=relevant,
+                object_reads=0,
+                object_writes=0,
+                object_lists=0,
+                future_policy_changes_prevented=False,
+                write_authority_granted=False,
+                gate_5_complete=False,
+            )
+        except BaseException:
+            raise ValueError("cleanup_store_admission_failed_no_mutation") from None
+        return None  # Armer contract: rejection raises, successful readback returns None.
+
+
+def _components(
+    output, clients, proposal_raw, *, clock=time.monotonic, wall=time.time, wait=time.sleep
+):
+    """Concrete private composition; no client creation or API calls here.
+
+    Invocation authority, fresh network admission, workload readiness and the
+    extra claim/control-plane scope remain obligations of the outer controller.
+    """
+    admission = Admission(
+        ReadCloud({"sts": clients["sts"], "s3api": clients["s3"]}),
+        proposal_raw,
+        clock=clock,
+        wall=wall,
+    )
+    expiry = armer.Expiry(
+        output,
+        armer.SDKCloud({k: clients[k] for k in armer.OPS}),
+        admit_claim_store=admission,
+        clock=clock,
+        wall=wall,
+        wait=wait,
+    )
+    cloud = bridge.ClaimedCloud(network.SDKCloud(clients["ec2"]), clients["s3"], clock=clock)
+    return cloud, bridge.ExpiryBridge(cloud, expiry), admission
+
+
+def run(**_arguments):
+    raise ValueError("cleanup_store_outer_authority_required") from None

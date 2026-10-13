@@ -1,0 +1,63 @@
+"""Fresh identity integration with actual source loaders and synthetic AWS."""
+
+import hashlib
+import json
+import tempfile
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt010_v1 as builder
+from tests import test_sft_vm_endpoint_successor_v1 as endpoint_tests
+
+
+class Tests(endpoint_tests.Tests):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.ancillary, cls.report = builder.build()
+        cls.base = cls.files
+        cls.temp = tempfile.TemporaryDirectory(prefix="lumi-attempt010-fixture-")
+        cls.addClassCleanup(cls.temp.cleanup)
+        cls.package = Path(cls.temp.name).resolve()
+        for name, raw in cls.files.items():
+            path = cls.package / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+
+    def test_archives_limits_and_history_unchanged_not_execution_authority(self):
+        self.m.authenticate()
+        self.m.loading.fresh_identity()
+        self.assertFalse(self.report["execution_permitted"])
+        with self.assertRaises(ValueError):
+            builder.run()
+
+    def test_fresh_identity_bound_through_host_and_watchdog(self):
+        self.assertEqual(self.m.network.selection.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.loading.original_guard.worker.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.store.worker.ATTEMPT, builder.NEW)
+        self.assertEqual(self.m.loading.BASE_CODE, self.m.loading.original_guard.CODE)
+        self.assertNotIn(builder.PREVIOUS, self.m.store.worker.PREFIX)
+        proposal = json.loads(self.files["configs/lumi-vm-fullsize-host-proposal-v0.1.json"])
+        self.assertEqual(proposal["prepared_attempt"], builder.NEW)
+        self.assertIn(builder.NEW, proposal["retention_proposal"]["prefix"])
+        self.assertFalse(proposal["execution_permitted"])
+
+    def test_native_guard_is_identity_only_change_from_qualified_source(self):
+        proof = json.loads(self.files["evidence/lumi-vm-boot-smoke-closure-v0.5.json"])
+        name = "scripts/run_sft_vm_early_stop_v2.py"
+        raw = self.files[name]
+        self.assertEqual(raw.count(builder.NEW.encode()), 1)
+        restored = raw.replace(
+            builder.NEW.encode(), self.report["qualified_source_ancestor"].encode()
+        )
+        self.assertEqual(hashlib.sha256(restored).hexdigest(), proof["bindings"][name])
+
+    def test_identity_guest_and_composition_manifest_chain(self):
+        identity = self.ancillary["identity/manifest.json"]
+        guest = json.loads(self.ancillary["guest-release.json"])
+        self.assertEqual(guest["identity_manifest_sha256"], builder.sha(identity))
+        self.assertEqual(guest["attempt"], builder.NEW)
+        self.assertEqual(
+            self.report["guest_release_sha256"], builder.sha(self.ancillary["guest-release.json"])
+        )
+        self.assertFalse(
+            self.report["deployment_plan_bound"] or self.report["execution_entry_bound"]
+        )

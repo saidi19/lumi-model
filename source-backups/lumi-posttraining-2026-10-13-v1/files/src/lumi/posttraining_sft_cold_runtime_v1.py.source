@@ -1,0 +1,299 @@
+"""One-shot native runtime startup for an externally admitted eight-rank worker.
+
+Load this stdlib-only file directly, NOT through lumi.__init__. The caller must
+authenticate the complete read-only source/dependency closure, target, data and
+attempt, install continuous resource/network controls and an independent kill
+deadline BEFORE start(). pre_ml performs the cold check; check_health is a
+DIFFERENT post-import-capable check. Neither a pathname nor callback return is
+an authorization proof. There is no CLI, receipt issuer or launch-contract bypass.
+
+Explicit loopback TCPStore and NCCL are for an isolated single-host network
+namespace only. A loopback rendezvous name is NOT network isolation; the guardian
+must constrain native library traffic. No env://, file store, download, device
+fallback or retry is used. Native imports/collectives/destruction can block;
+cooperative deadlines here do not replace the external guardian.
+
+Returns the existing DistributedContext for ModelPreparation. Does not load a
+model, synchronize WorkerRun phases, run training or construct private receipts.
+The process must exit after closure or failure; imports/environment are not
+rolled back to allow reuse. Only a group created successfully here is destroyed.
+Partially failed group initialization remains the guardian's cleanup obligation.
+"""
+
+from __future__ import annotations
+
+import importlib
+import importlib.machinery
+import os
+import re
+import stat
+import sys
+import threading
+import time
+from datetime import timedelta
+from pathlib import Path, PurePosixPath
+from types import ModuleType
+
+ML = frozenset({"torch", "numpy", "transformers", "safetensors", "tokenizers",
+                "cuda", "cupy", "jax", "tensorflow"})
+MODULES = ("torch", "torch.distributed", "torch.distributed.fsdp", "safetensors.torch",
+           "transformers", "lumi.configuration_lumi", "lumi.modeling_lumi",
+           "lumi.parameter_count", "lumi.distributed_training", "lumi.pilot_training",
+           "lumi.posttraining_sft_runtime_v4")
+ERRORS = frozenset({"invalid_arguments", "already_consumed", "owner_mismatch", "reentry",
+                    "cold_runtime_required", "admission_rejected", "source_rejected",
+                    "import_failed", "runtime_rejected", "health_rejected", "cuda_failed",
+                    "group_failed", "deadline_exhausted", "cleanup_failed"})
+_ATTEMPTED = False
+
+
+class ColdRuntimeError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "runtime_rejected"
+        super().__init__(self.code)
+
+
+def _need(condition, code):
+    if not condition:
+        raise ColdRuntimeError(code) from None
+
+
+def _path(value):
+    return (type(value) is str and 1 < len(value) <= 4096 and "\x00" not in value
+            and PurePosixPath(value).is_absolute() and ".." not in PurePosixPath(value).parts
+            and str(PurePosixPath(value)) == value and not value.startswith("//"))
+
+
+def _protected_directory(value):
+    # Authentication and read-only mount lifetime belong to the outer guardian.
+    path = Path(value)
+    for part in (path, *path.parents):
+        info = part.lstat()
+        _need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+              and not stat.S_IMODE(info.st_mode) & 0o022, "source_rejected")
+
+
+def _cold():
+    _need(sys.platform == "linux" and sys.implementation.name == "cpython"
+          and sys.version_info[:2] in {(3, 12), (3, 13)}
+          and sys.flags.isolated == 1 and sys.flags.no_site == 1 and sys.dont_write_bytecode
+          and os.getuid() == os.geteuid() != 0 and os.getgid() == os.getegid() != 0
+          and threading.current_thread() is threading.main_thread()
+          and threading.active_count() == 1
+          and not any(name.split(".")[0] in ML | {"lumi"} for name in sys.modules),
+          "cold_runtime_required")
+
+
+class ColdRuntime:
+    """Inert construction; owner-only start/check_health/close, no restart.
+
+    source_root is the admitted lumi package directory; dependency_root is the
+    admitted site-packages directory. .pth files and Lumi auto-registration are
+    never executed. rank is also the visible local CUDA index for this exact
+    single-host profile. epoch_sha256/port come from authenticated private input,
+    not ambient environment or caller-supplied public flags.
+    """
+
+    def __init__(self, *, source_root, dependency_root, rank, port, epoch_sha256,
+                 deadline_ns, maximum_operation_ns, pre_ml, check_health, interrupt,
+                 clock_ns=time.monotonic_ns):
+        _need(not hasattr(self, "_owner"), "already_consumed")
+        _need(_path(source_root) and _path(dependency_root)
+              and source_root != dependency_root
+              and type(rank) is int and 0 <= rank < 8
+              and type(port) is int and 1024 <= port <= 65535
+              and type(epoch_sha256) is str and re.fullmatch("[0-9a-f]{64}", epoch_sha256)
+              and type(deadline_ns) is int and 0 < deadline_ns < 2**63
+              and type(maximum_operation_ns) is int and 1000 <= maximum_operation_ns < 2**63
+              and all(callable(fn) for fn in (pre_ml, check_health, interrupt, clock_ns))
+              and pre_ml is not check_health, "invalid_arguments")
+        self._source, self._dependencies = source_root, dependency_root
+        self._rank, self._port, self._epoch = rank, port, epoch_sha256
+        self._deadline, self._maximum = deadline_ns, maximum_operation_ns
+        self._pre, self._health, self._interrupt, self._clock = (
+            pre_ml, check_health, interrupt, clock_ns)
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._stage, self._failure = "idle", "idle", None
+        self._busy = self._interrupted = self._cleanup_attempted = self._cleanup_failed = False
+        self._last = None
+        self._torch = self._group = self._store = self._context = None
+
+    def __repr__(self):
+        return "<ColdRuntime: private startup state>"
+
+    def _fail(self, code):
+        if self._failure is None:
+            self._failure, self._state = code, "failed"
+            if not self._interrupted:
+                self._interrupted = True
+                try:
+                    self._interrupt()
+                except BaseException:
+                    pass
+        raise ColdRuntimeError(self._failure) from None
+
+    def _enter(self, state):
+        if self._state == "closed":
+            raise ColdRuntimeError("already_consumed") from None
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._busy:
+            self._fail("reentry")
+        if self._failure is not None:
+            self._fail(self._failure)
+        if self._state != state:
+            self._fail("already_consumed")
+        self._busy = True
+
+    def _remaining(self):
+        if self._failure is not None:
+            self._fail(self._failure)
+        now = self._clock()
+        _need(self._failure is None and type(now) is int and 0 <= now < self._deadline
+              and (self._last is None or now >= self._last), "deadline_exhausted")
+        self._last = now
+        micros = min(self._deadline - now, self._maximum) // 1000
+        _need(micros > 0, "deadline_exhausted")
+        return timedelta(microseconds=micros)
+
+    def _callback(self, callback, code):
+        self._remaining()
+        _need(callback() is None and self._failure is None, code)
+        self._remaining()
+
+    def _load(self):
+        _protected_directory(self._source)
+        _protected_directory(self._dependencies)
+        _cold()
+        # -I -S provides the admitted interpreter's stdlib path, no user site.
+        sys.path.append(self._dependencies)
+        package = ModuleType("lumi")
+        package.__path__, package.__package__ = [self._source], "lumi"
+        package.__spec__ = importlib.machinery.ModuleSpec("lumi", loader=None, is_package=True)
+        package.__spec__.submodule_search_locations = package.__path__
+        sys.modules["lumi"] = package
+        os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1",
+                          HF_HUB_DISABLE_TELEMETRY="1", TOKENIZERS_PARALLELISM="false",
+                          TORCH_NCCL_ASYNC_ERROR_HANDLING="1", OMP_NUM_THREADS="1")
+        loaded = {}
+        for name in MODULES:
+            self._remaining()
+            module = importlib.import_module(name)
+            _need(isinstance(module, ModuleType), "import_failed")
+            loaded[name] = module
+        self._remaining()
+        return loaded
+
+    def _native_check(self):
+        torch = self._torch
+        _need(torch.distributed.is_initialized()
+              and torch.distributed.group.WORLD is self._group
+              and self._group is not None
+              and torch.distributed.get_world_size(self._group) == 8
+              and torch.distributed.get_rank(self._group) == self._rank
+              and torch.distributed.get_backend(self._group) == "nccl"
+              and torch.cuda.current_device() == self._rank, "runtime_rejected")
+
+    def start(self):
+        global _ATTEMPTED
+        self._enter("idle")
+        try:
+            _need(not _ATTEMPTED, "already_consumed")
+            _ATTEMPTED = True  # Failure consumes this interpreter, not just this object.
+            self._state, self._stage = "starting", "cold"
+            _cold()
+            self._stage = "admission"
+            self._callback(self._pre, "admission_rejected")
+            _cold()  # Admission must not accidentally warm the runtime.
+            self._stage = "import"
+            modules = self._load()
+            self._torch = torch = modules["torch"]
+            self._stage = "runtime"
+            _need(re.match(r"2\.(10|14)\.", getattr(torch, "__version__", ""))
+                  and torch.distributed.is_available()
+                  and torch.distributed.is_nccl_available()
+                  and not torch.distributed.is_initialized()
+                  and not torch.cuda.is_initialized(), "runtime_rejected")
+            self._stage = "health"
+            self._callback(self._health, "health_rejected")
+            _need(not torch.distributed.is_initialized() and not torch.cuda.is_initialized(),
+                  "runtime_rejected")
+            self._stage = "cuda"
+            _need(torch.cuda.is_available() and torch.cuda.device_count() == 8, "cuda_failed")
+            torch.cuda.set_device(self._rank)
+            _need(torch.cuda.current_device() == self._rank
+                  and torch.cuda.is_bf16_supported(including_emulation=False), "cuda_failed")
+            device = torch.device("cuda", self._rank)
+            self._callback(self._health, "health_rejected")
+            _need(not torch.distributed.is_initialized(), "runtime_rejected")
+            self._stage = "group"
+            store = torch.distributed.TCPStore(
+                "127.0.0.1", self._port, world_size=8, is_master=self._rank == 0,
+                timeout=self._remaining(), wait_for_workers=True, multi_tenant=False)
+            self._store = torch.distributed.PrefixStore(self._epoch, store)
+            torch.distributed.init_process_group(
+                backend="nccl", store=self._store, rank=self._rank, world_size=8,
+                timeout=self._remaining(), device_id=device)
+            self._group = torch.distributed.group.WORLD
+            self._native_check()
+            context = modules["lumi.distributed_training"].DistributedContext(
+                rank=self._rank, local_rank=self._rank, world_size=8, backend="nccl", device=device)
+            self._stage = "health"
+            self._callback(self._health, "health_rejected")
+            self._native_check()
+            self._context = context
+            self._state, self._stage = "ready", "ready"
+            return context
+        except BaseException as error:
+            code = error.code if type(error) is ColdRuntimeError else {
+                "cold": "cold_runtime_required", "admission": "admission_rejected",
+                "import": "import_failed", "runtime": "runtime_rejected",
+                "health": "health_rejected", "cuda": "cuda_failed", "group": "group_failed",
+            }.get(self._stage, "runtime_rejected")
+            self._fail(code)
+        finally:
+            self._busy = False
+
+    def check_health(self):
+        """Post-import check for ModelPreparation/WorkerRun, never reuses pre_ml."""
+        self._enter("ready")
+        try:
+            self._callback(self._health, "health_rejected")
+            self._native_check()
+            self._remaining()
+        except BaseException as error:
+            self._fail(error.code if type(error) is ColdRuntimeError else "health_rejected")
+        finally:
+            self._busy = False
+
+    def close(self):
+        """One cleanup attempt, including after failure; outer guardian bounds hangs."""
+        if self._owner != (os.getpid(), threading.get_ident()):
+            self._fail("owner_mismatch")
+        if self._busy:
+            self._fail("reentry")
+        if self._cleanup_attempted:
+            if self._cleanup_failed:
+                raise ColdRuntimeError("cleanup_failed") from None
+            return
+        self._cleanup_attempted, self._busy = True, True
+        try:
+            if self._group is not None:
+                self._native_check()  # Never destroy a replacement/unrelated group.
+                group, self._group = self._group, None
+                self._torch.distributed.destroy_process_group(group)
+            self._store = self._context = None
+            if self._failure is None:
+                self._state = "closed"
+        except BaseException:
+            self._cleanup_failed = True
+            self._fail("cleanup_failed")
+        finally:
+            self._busy = False
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-cold-runtime-summary.v0.1",
+                "state": self._state, "stage": self._stage, "failure_code": self._failure,
+                "cleanup_attempted": self._cleanup_attempted,
+                "cleanup_failed": self._cleanup_failed,
+                "execution_authorized": False, "production_eligible": False}

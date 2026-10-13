@@ -1,0 +1,365 @@
+"""One bounded metadata-only inspection; no mutations, model objects or deployment."""
+
+import datetime as dt
+import hashlib
+import ipaddress
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+from scripts import prepare_sft_vm_deployment_bindings_v3 as binding
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-011-prerequisite-inspection-v0.1"
+ATTEMPT = "ad7b734ba7894916b25d795ac3dab31c"
+ACCOUNT, VPC = "573978149073", "vpc-0905fbf9490a2dead"
+CIDR = "172.31.96.64/27"
+PINS = {
+    "scripts/prepare_sft_vm_deployment_bindings_v3.py": (
+        "5a066c5f08dae11c81d5e4dfa069a4b747e4e4baeaab305ad863fe0223946d7f"
+    ),
+    "evidence/lumi-vm-attempt011-entry-binding-verification-v0.1.json": (
+        "e2c6816d5ea98abfdd34fb1023871ea5b82c44af37a4c883f94548b217d377e3"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("prerequisite_inspection_rejected")
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def requests(plan):
+    a = plan["attempt"]
+    need(a == ATTEMPT and plan["account"] == ACCOUNT)
+    rows = [("identity", "sts", "get-caller-identity", {})]
+    for name in [r["role"] for r in plan["watchdog"]["roles"]] + [
+        "lumi-acquire-" + a,
+        "lumi-retain-" + a,
+    ]:
+        rows.append((name + "-role", "iam", "get-role", {"RoleName": name}))
+    for prefix in ("lumi-acquire-", "lumi-retain-"):
+        rows.append((prefix + a + "-user", "iam", "get-user", {"UserName": prefix + a}))
+    rows += [
+        (
+            "function",
+            "lambda",
+            "get-function-configuration",
+            {"FunctionName": plan["watchdog"]["function"]},
+        ),
+        (
+            "schedule_group",
+            "scheduler",
+            "get-schedule-group",
+            {"Name": plan["watchdog"]["schedule_group_reserved"]},
+        ),
+        (
+            "log_group",
+            "logs",
+            "describe-log-groups",
+            {"logGroupNamePrefix": plan["watchdog"]["log_group"], "limit": 50},
+        ),
+        (
+            "instances",
+            "ec2",
+            "describe-instances",
+            {"Filters": [{"Name": "tag:LumiAttempt", "Values": [a]}], "MaxResults": 100},
+        ),
+        (
+            "key_pairs",
+            "ec2",
+            "describe-key-pairs",
+            {"Filters": [{"Name": "key-name", "Values": ["lumi-fullsize-" + a]}]},
+        ),
+        (
+            "security_groups",
+            "ec2",
+            "describe-security-groups",
+            {
+                "Filters": [
+                    {
+                        "Name": "group-name",
+                        "Values": [
+                            "lumi-fullsize-" + a + "-vm",
+                            "lumi-fullsize-" + a + "-endpoint",
+                        ],
+                    }
+                ]
+            },
+        ),
+        (
+            "endpoints",
+            "ec2",
+            "describe-instance-connect-endpoints",
+            {"Filters": [{"Name": "vpc-id", "Values": [VPC]}], "MaxResults": 20},
+        ),
+        (
+            "subnets",
+            "ec2",
+            "describe-subnets",
+            {"Filters": [{"Name": "vpc-id", "Values": [VPC]}], "MaxResults": 100},
+        ),
+    ]
+    for operation in (
+        "get-bucket-policy",
+        "get-public-access-block",
+        "get-bucket-policy-status",
+        "get-bucket-ownership-controls",
+        "get-bucket-encryption",
+        "get-bucket-location",
+    ):
+        rows.append(
+            (
+                operation,
+                "s3api",
+                operation,
+                {"Bucket": plan["cleanup_store"]["bucket"], "ExpectedBucketOwner": ACCOUNT},
+            )
+        )
+    need(len(rows) == 21 and len({r[0] for r in rows}) == 21)
+    return rows
+
+
+class Reader:
+    def __init__(self, plan, save):
+        self.allowed = requests(plan)
+        self.save, self.start = save, time.monotonic()
+        self.calls = self.bytes = 0
+        self.stage = "initial"
+
+    def read(self, row):
+        need(self.calls < 21 and row == self.allowed[self.calls])
+        need(time.monotonic() - self.start < 855)
+        label, service, operation, fields = row
+        self.stage = label
+        self.calls += 1
+        receipt = dict(service=service, operation=operation, label=label, mutation=False)
+        self.save(f"call-{self.calls:02d}-started.json", receipt)
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("AWS_")
+            and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+        endpoint_service = "s3" if service == "s3api" else service
+        endpoint = (
+            "https://iam.amazonaws.com"
+            if service == "iam"
+            else f"https://{endpoint_service}.us-east-1.amazonaws.com"
+        )
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                "--endpoint-url",
+                endpoint,
+                "--no-cli-pager",
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+                service,
+                operation,
+                "--cli-input-json",
+                encode(fields).decode(),
+                "--output",
+                "json",
+                "--no-paginate",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=40,
+            env=env,
+        )
+        need(len(result.stdout) <= 262144 and len(result.stderr) <= 8192)
+        self.bytes += len(result.stdout) + len(result.stderr)
+        need(self.bytes <= 4194304)
+        if result.returncode:
+            match = re.search(rb"An error occurred \(([A-Za-z0-9_.-]+)\)", result.stderr)
+            code = match[1].decode() if match else "unknown"
+            expected = {
+                ("iam", "get-role"): "NoSuchEntity",
+                ("iam", "get-user"): "NoSuchEntity",
+                ("lambda", "get-function-configuration"): "ResourceNotFoundException",
+                ("scheduler", "get-schedule-group"): "ResourceNotFoundException",
+            }
+            absent = code == expected.get((service, operation), "not_an_absence")
+            safe_code = (
+                code
+                if code
+                in {
+                    "NoSuchEntity",
+                    "ResourceNotFoundException",
+                    "AccessDenied",
+                    "AccessDeniedException",
+                    "ExpiredToken",
+                    "ExpiredTokenException",
+                    "RequestExpired",
+                    "InvalidClientTokenId",
+                    "UnrecognizedClientException",
+                }
+                else "unclassified_cli_failure"
+            )
+            self.save(
+                f"call-{self.calls:02d}-result.json",
+                dict(
+                    receipt,
+                    status="expected_absence" if absent else "failed_no_retry",
+                    diagnostic_code=safe_code,
+                ),
+            )
+            need(absent)
+            return None
+        value = json.loads(result.stdout)
+        need(not any(value.get(k) for k in ("NextToken", "nextToken", "IsTruncated")))
+        self.save(f"call-{self.calls:02d}-result.json", dict(receipt, status="acknowledged"))
+        return value
+
+
+def summarize(plan, answers, save):
+    absence = {
+        k: v is None
+        for k, v in answers.items()
+        if k.endswith(("-role", "-user")) or k in {"function", "schedule_group"}
+    }
+    absence.update(
+        log_group=not any(
+            r["logGroupName"] == plan["watchdog"]["log_group"]
+            for r in answers["log_group"]["logGroups"]
+        ),
+        instances=not any(r["Instances"] for r in answers["instances"]["Reservations"]),
+        key_pairs=not answers["key_pairs"]["KeyPairs"],
+        security_groups=not answers["security_groups"]["SecurityGroups"],
+    )
+    endpoints = answers["endpoints"]["InstanceConnectEndpoints"]
+    subnets = answers["subnets"]["Subnets"]
+    need(all(r["VpcId"] == VPC and r["OwnerId"] == ACCOUNT for r in endpoints + subnets))
+    collisions = sum(
+        ipaddress.ip_network(CIDR).overlaps(ipaddress.ip_network(r["CidrBlock"])) for r in subnets
+    )
+    raw = answers["get-bucket-policy"]["Policy"].encode()
+    module = binding.bound_builder()
+    merge = module.merge_policy(raw, hashlib.sha256(raw).hexdigest(), plan)
+    save("bucket-policy-before.json", raw)
+    if merge["candidate"] is not None:
+        save("bucket-policy-candidate.json", module.encode(merge["candidate"]))
+    public = answers["get-public-access-block"]["PublicAccessBlockConfiguration"]
+    checks = dict(
+        all_public_access_blocks_enabled=all(
+            public.get(k) is True
+            for k in (
+                "BlockPublicAcls",
+                "IgnorePublicAcls",
+                "BlockPublicPolicy",
+                "RestrictPublicBuckets",
+            )
+        ),
+        policy_not_public=answers["get-bucket-policy-status"]["PolicyStatus"]["IsPublic"] is False,
+        bucket_owner_enforced=answers["get-bucket-ownership-controls"]["OwnershipControls"]["Rules"]
+        == [{"ObjectOwnership": "BucketOwnerEnforced"}],
+        region_matches=answers["get-bucket-location"]["LocationConstraint"] in (None, "us-east-1"),
+        encryption_config_present=bool(
+            answers["get-bucket-encryption"]["ServerSideEncryptionConfiguration"]["Rules"]
+        ),
+    )
+    ready = all(absence.values()) and collisions == 0 and all(checks.values())
+    active = sum(r["State"] != "delete-complete" for r in endpoints)
+    return dict(
+        status="readonly_inspection_complete",
+        exact_name_absence=absence,
+        current_cidr_overlap_count=collisions,
+        active_vpc_endpoints=active,
+        basic_bucket_checks=checks,
+        no_observed_namespace_or_network_collision=ready and active == 0,
+        policy=dict(
+            status=merge["status"],
+            before_sha256=merge["before_sha256"],
+            candidate_sha256=merge["after_sha256"],
+            existing_statement_count=len(json.loads(raw)["Statement"]),
+            proposed_added_denials=4 if merge["candidate"] is not None else 0,
+            new_allows=0,
+            writer_coordination_verified=False,
+            write_authorized=False,
+        ),
+        complete_cpu_admission=False,
+    )
+
+
+def main():
+    for name, digest in PINS.items():
+        need(hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == digest)
+    plan, _ = binding.build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = value if type(value) is bytes else encode(value)
+        need(written + len(raw) <= 131072)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        written += len(raw)
+
+    save(
+        "started.json",
+        dict(
+            authorization_message="ok kor",
+            attempt=ATTEMPT,
+            started_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+            maximum_calls=21,
+            maximum_seconds=900,
+            maximum_response_bytes=4194304,
+            maximum_private_write_bytes=131072,
+            readonly=True,
+            retry=False,
+            source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        ),
+    )
+    reader = Reader(plan, save)
+    report = dict(
+        status="stopped_no_retry",
+        cloud_mutations=0,
+        s3_object_access=0,
+        instance_actions=0,
+        gpu=False,
+        training=False,
+        gate_5_complete=False,
+    )
+    try:
+        answers = {}
+        for row in reader.allowed:
+            answers[row[0]] = reader.read(row)
+            if row[0] == "identity":
+                need(answers["identity"]["Account"] == ACCOUNT)
+        report.update(summarize(plan, answers, save))
+    except Exception:
+        report["failed_stage"] = reader.stage
+    finally:
+        report.update(
+            calls=reader.calls,
+            response_bytes=reader.bytes,
+            elapsed_seconds=round(time.monotonic() - reader.start, 3),
+            completed_at_utc=dt.datetime.now(dt.UTC).isoformat(),
+        )
+        save("result.json", report)
+        print(json.dumps(report, sort_keys=True))
+    return report
+
+
+if __name__ == "__main__":
+    main()

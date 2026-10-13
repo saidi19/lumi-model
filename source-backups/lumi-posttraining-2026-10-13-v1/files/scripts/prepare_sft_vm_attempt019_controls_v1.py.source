@@ -1,0 +1,237 @@
+"""Build fresh attempt-019 controls; offline preparation only."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "c7124d8fb1a244798d7e41b7b5dfad61"
+OLD = "0532df93f0f2418bb6d467d3e5215759"
+OLD_LABEL = "attempt-018"
+NEW_LABEL = "attempt-019"
+OLD_RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.5"
+RELEASE = "artifacts/lumi-vm-attempt-019-source-v0.1"
+RELEASE_SHA = "eae01e7ff3b23b801c69a6c29f1cf852830a8c33fe6d2605c7afa4c73f131dd0"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-019-source-v0.1-verification-v0.1.json"
+SOURCE_PROOF_SHA = "fc55f988dc5ddc7b833a361209e74fbde44e0bc35494ed95b21e083bbaf6fac9"
+PREDECESSOR_PROOF = "evidence/lumi-vm-attempt-018-v022-execution-cleanup-verification-v0.1.json"
+PREDECESSOR_PROOF_SHA = "3b5c425666588bb7ef24c24599ad523bd411f68db1ee57526a0fdb4ea4c9c36f"
+BASE_PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.6/plan.json"
+BASE_PLAN_SHA = "c49ee31418df6ad3b414feb68904dc9f01a31c22d1d174e303f4eac81cfd8afa"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-019-control-plan-v0.1"
+CIDR = "172.31.97.0/27"
+BINDINGS = (
+    "artifacts/lumi-vm-fullsize-source-release-v0.1/source-controls.tar",
+    "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json",
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+    "identity/host-proposal.json",
+    "scripts/arm_sft_vm_external_watchdog_v2.py",
+    "scripts/build_sft_vm_network_expiry_v3.py",
+    "scripts/issue_sft_vm_acquisition_credentials_v1.py",
+    "scripts/prepare_sft_vm_acquisition_permissions_v2.py",
+    "src/lumi/posttraining_vm_fullsize_staging_v1.py",
+    "src/lumi/posttraining_vm_fullsize_transport_v1.py",
+    "src/lumi/posttraining_vm_retention_unit_v1.py",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_plan_v1_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    return raw
+
+
+def replace_operational_identity(value):
+    raw = encode(value)
+    replacements = (
+        (OLD_RELEASE, RELEASE),
+        (OLD, ATTEMPT),
+        (OLD_LABEL, NEW_LABEL),
+        ("Attempt-018", "Attempt-019"),
+        ("172.31.96.224/27", CIDR),
+        ("lumi-vm-private-outer-execution-v0.23", "lumi-vm-private-outer-execution-v0.24"),
+    )
+    for before, after in replacements:
+        raw = raw.replace(before.encode(), after.encode())
+    return json.loads(raw)
+
+
+def build():
+    base = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    proof = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    predecessor = json.loads(read(PREDECESSOR_PROOF, PREDECESSOR_PROOF_SHA))
+    need(
+        manifest["attempt"] == ATTEMPT
+        and manifest["operational_predecessor"] == OLD
+        and manifest["selected_cidr"] == CIDR
+        and manifest["execution_permitted"] is False
+        and len(manifest["outputs"]) == 156
+        and proof["attempt"] == ATTEMPT
+        and proof["source_release_sha256"] == RELEASE_SHA
+        and proof["fresh_identity_verified"] is True
+        and proof["write_retry_prohibited_verified"] is True
+        and proof["execution_authority_created"] is False
+        and predecessor["execution"]["run_instances_dispatch_count"] == 1
+        and predecessor["execution"]["retry_allowed"] is False
+        and predecessor["execution"]["real_4b_import"] is False
+        and predecessor["cleanup_recovery"]["public_cost_resources_released"] is True
+    )
+    plan = replace_operational_identity(base)
+    # These fields are historical records, not attempt-019 operational targets.
+    for name in (
+        "host_key_repair",
+        "initial_proof_diagnostics",
+        "network_selector_correction_evidence",
+        "v021_launch_denial_evidence",
+        "v03_authentication_failure_evidence",
+    ):
+        plan[name] = base[name]
+    plan["schema"] = "lumi.vm-attempt-019-control-plan.v0.1"
+    plan["attempt"] = ATTEMPT
+    plan["status"] = "fresh_controls_and_readonly_preflight_required"
+    plan["release_manifest_sha256"] = RELEASE_SHA
+    plan["network_candidate_cidr"] = CIDR
+    plan["network_candidate_live_availability_verified"] = False
+    plan["control_target_absence_evidence"] = None
+    plan["source_preparation_evidence"] = {
+        "path": SOURCE_PROOF,
+        "sha256": SOURCE_PROOF_SHA,
+    }
+    plan["source_bindings"] = {
+        RELEASE + "/" + name: manifest["outputs"][name] for name in BINDINGS
+    }
+    plan["source_repair"].update(
+        fresh_attempt_identity=True,
+        predecessor_identity_reuse_prohibited=True,
+        bounded_transient_read_recovery=True,
+        read_attempts_per_call_maximum=3,
+        read_retries_total_maximum=8,
+        write_attempts_per_operation=1,
+    )
+    plan["cpu_scope_reference"]["output"] = (
+        "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019"
+    )
+    plan["cpu_scope_reference"]["execution_entry_sha256"] = None
+    plan["successful_readonly_preflight"] = None
+    plan["predecessor_state"] = {
+        "operational_predecessor_attempt": OLD,
+        "execution_evidence": PREDECESSOR_PROOF,
+        "execution_evidence_sha256": PREDECESSOR_PROOF_SHA,
+        "execution_marker_consumed": True,
+        "run_instances_dispatch_count": 1,
+        "retry_allowed": False,
+        "cpu_instance_launched": True,
+        "real_4b_import": False,
+        "instance_stopped": True,
+        "retained_ebs_preserved": True,
+        "public_cost_resources_released": True,
+        "predecessor_resources_mutated": False,
+        "deletion_authorized": False,
+    }
+    plan["required_control_proofs"] = []
+    plan["watchdog"]["expected_code_sha256_base64"] = manifest[
+        "watchdog_code_sha256_base64"
+    ]
+    plan["watchdog"]["deployment_output"] = (
+        "artifacts/lumi-vm-attempt-019-watchdog-deployment-v0.1"
+    )
+    plan["watchdog"]["status"] = "fresh_deployment_required_authorized_separately"
+    plan["watchdog"]["redeployment_authorized"] = False
+    plan["cleanup_store"]["status"] = "fresh_private_bucket_required_authorized_separately"
+    plan["readiness_review"].update(
+        decision="fresh_control_absence_then_deployment_approval_required",
+        no_old_approval_reuse=True,
+        no_predecessor_endpoint_deletion=True,
+    )
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        (
+            "Read-only absence checks pass for the fresh attempt-019 identity, CIDR, "
+            "watchdog and cleanup store"
+        ),
+        (
+            "Fresh inert watchdog and dedicated cleanup bucket are deployed under an "
+            "exact bounded approval"
+        ),
+        "Fresh read-only admission binds attempt-019 source and control evidence without mutation",
+        (
+            "A separate v0.24 one-shot CPU proposal and explicit approval bind the "
+            "admitted scope and hashes"
+        ),
+        "Immediate pre-launch read-only admission passes before the execution marker",
+    ]
+    plan["readiness_review"]["risk"] = (
+        "The fresh identity and offline repair are verified, but live target absence, "
+        "fresh controls, remote boot and import remain unproved."
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Verify live absence of every fresh attempt-019 control target and the selected CIDR.",
+        (
+            "Deploy and verify the fresh inert stop watchdog and dedicated cleanup bucket "
+            "under exact approval."
+        ),
+        "Pass the fresh read-only CPU/network/store/watchdog admission.",
+        "Bind a separate one-shot CPU proposal and exact human approval.",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-019-control-plan-release.v0.1",
+        "attempt": ATTEMPT,
+        "operational_predecessor": OLD,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": RELEASE_SHA,
+        "source_verification_sha256": SOURCE_PROOF_SHA,
+        "predecessor_execution_cleanup_sha256": PREDECESSOR_PROOF_SHA,
+        "fresh_identity_bound": True,
+        "fresh_control_absence_required": True,
+        "fresh_control_deployment_required": True,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

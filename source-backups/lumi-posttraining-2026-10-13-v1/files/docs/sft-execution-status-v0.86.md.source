@@ -1,0 +1,72 @@
+# SFT execution status v0.86
+
+2026-09-13. Local fixture-preparation and prepared-launch components are now
+implemented and synthetic-tested. Gate 5 remains incomplete. This is progress
+within the existing import task, not an additional roadmap gate.
+
+## Completed local components
+
+- Fixed generated-input preparation: 16 tests. Reuses the frozen 736-parameter
+  generator and metadata writer, accepts only a fresh empty private directory,
+  checks exact generated inventories, and exposes no input checkpoint, model
+  configuration or callback argument. No importer runs in this phase.
+- Pure controls builder/validator: 25 tests. Creates the nine bound control files
+  from fresh tiny metadata, preserving original bytes and every frozen plan
+  limit. Already prepared bases cannot be relabelled with a new nonce.
+- Private layout installer: 21 tests. Checks the pinned source/entry/helper,
+  rebuilt controls and generated input hashes before writes. New destinations
+  are exclusive. Only the fresh private extracted copy is normalized/frozen;
+  old source/archive/evidence is not changed.
+- Prepared launch adapter: 16 tests. Binds the entire private layout and all
+  source/entry/control/nonce pins, copies mutable controls, dispatches the
+  existing guardian once and requires its full lifecycle/cleanup evidence.
+
+All 78 new tests and 195 prior regression tests pass on Python 3.11.15 and
+3.13.7: 273 tests per runtime, no failures, errors or skips. Final test processes
+denied network/process/native-library calls and ML imports with audit hooks.
+No prohibited operation was attempted and no ML module was loaded. Eight new
+Python files pass syntax and 100-column checks; Ruff was not available.
+
+Cross-component tests exercise generation-byte-surrogate to controls, controls
+to the frozen prepared entry/resource validator, controls to layout, and the
+actual installer-returned layout to the launch validator. Tensor generation,
+filesystem/rootfs installation and guardian dispatch are not native results.
+
+Review also fixed two error-code problems in the new generator: consumed
+attempts now consistently report already_attempted even after an ML import;
+deadlines wrapped by the frozen helper still report deadline_exhausted.
+Neither fix changes the old generator or permits a retry.
+
+## What is still required before native qualification
+
+1. Bind the fixed generator to an authenticated unprivileged Linux worker with
+   externally enforced containment and deadline. Its callable API is not that
+   enforcement or an authorization.
+2. Connect generation, controls, installation and the prepared-launch adapter
+   to the existing accepted-runtime qualification harness, with a fresh pinned
+   source-admission manifest and independent parent supervision.
+3. Execute and verify the generated-only Linux qualification. This native run
+   has not happened, and these local tests cannot replace it.
+
+After that, the existing dedicated-host/runtime, external-writer exclusion,
+full-size resource admission and real checkpoint CPU import remain, followed by
+the documented GPU-worker/private-data/CUDA-smoke prerequisites and SFT.
+
+The tiny generator has a 30-second cooperative deadline and a 4 MiB/32-file
+final-input ceiling; final-size checking is not cumulative write metering.
+The controls preserve the frozen import-write cap and use the prior tiny
+8 MiB DCP payload-read reservation. Installer content writes are separately
+bounded at 10 MiB. The installer does not read new inputs back; subsequent
+native import audits remain mandatory. These figures are not combined caps,
+actual host-capacity proof or full-size performance measurements.
+
+No model/tokenizer/dataset payload, native tensor generation, Linux mount or
+guardian, network/S3/instance, GPU, inference or training operation occurred.
+All new files are local. Prior source/evidence and CI are unchanged; there was
+no commit or push. Public real import remains closed at host_guard_not_bound.
+Execution permission, training authorization and production eligibility remain
+false. No GPU is needed for the remaining harness-integration code.
+
+Plan: configs/lumi-4b-sft-checkpoint-prepared-fixture-development-v0.1.json.
+Report: evidence/lumi-4b-sft-checkpoint-prepared-fixture-development-v0.1.json.
+Verification: matching prepared-fixture-development-verification-v0.1.json.

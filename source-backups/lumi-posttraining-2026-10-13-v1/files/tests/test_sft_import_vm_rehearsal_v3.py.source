@@ -1,0 +1,388 @@
+"""Portable supervisor/entry tests; no systemd, real payloads or native probes."""
+
+from __future__ import annotations
+
+import errno
+import hashlib
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from lumi import posttraining_import_vm_rehearsal_v3 as m
+
+ATTEMPT = "a" * 32
+PIN = "b" * 64
+
+
+def terminal(mode="chain"):
+    success = mode in {"chain", "disk"}
+    return {"ActiveState": "active" if success else "failed",
+            "SubState": "exited" if success else "failed",
+            "Result": {"chain": "success", "disk": "success", "timeout": "timeout",
+                       "memory": "oom-kill"}[mode],
+            "ExecMainCode": "1" if success else "2",
+            "ExecMainStatus": "0" if success else "9"}
+
+
+class CommandTests(unittest.TestCase):
+    def test_fixed_command_cannot_select_real_data_or_shell(self):
+        for mode in m.MODES:
+            command = m.launch_command(ATTEMPT, mode)
+            self.assertEqual(command[0], "/usr/bin/systemd-run")
+            self.assertIn("--service-type=exec", command)
+            self.assertNotIn("--wait", command)  # RemainAfterExit is deliberately retained.
+            self.assertNotIn("--collect", command)
+            self.assertEqual(command[-7:], [str(m.PYTHON), "-I", "-B", str(m.SCRIPT),
+                                            "worker", ATTEMPT, mode])
+            self.assertNotIn("/bin/sh", command)
+            self.assertNotIn("--source-checkpoint", command)
+
+    def test_invalid_names_and_modes_rejected(self):
+        for attempt, mode in (("../bad", "chain"), (True, "chain"), ("a" * 31, "chain"),
+                              (ATTEMPT, "real"), (ATTEMPT, "chain;shutdown")):
+            with self.subTest(attempt=attempt, mode=mode), self.assertRaises(m.RehearsalError):
+                m.launch_command(attempt, mode)
+
+    def test_os_limit_and_cleanup_properties(self):
+        for mode in m.MODES:
+            p = m.properties(mode)
+            for key, value in {
+                "KillMode": "control-group", "SendSIGKILL": "yes", "Restart": "no",
+                "MemorySwapMax": "0", "OOMPolicy": "kill", "StandardOutput": "null",
+                "StandardError": "null", "PrivateNetwork": "yes", "PrivateDevices": "yes",
+                "NoNewPrivileges": "yes", "ProtectSystem": "strict",
+            }.items():
+                self.assertEqual(p[key], value)
+            self.assertEqual(int(p["MemoryMax"]), m.LIMITS[mode][0])
+            self.assertEqual(int(p["RuntimeMaxSec"]), m.LIMITS[mode][1])
+            self.assertIn(f"size={m.TMP_BYTES}", p["TemporaryFileSystem"])
+
+    def test_non_linux_launch_rejected_before_reads_writes_or_processes(self):
+        with (patch.object(m.sys, "platform", "darwin"), patch.object(m, "small") as read,
+              patch.object(m, "verify_release") as release,
+              patch.object(m, "run_command") as run):
+            with self.assertRaisesRegex(m.RehearsalError, "host"):
+                m.launch(machine_id=ATTEMPT, attempt=ATTEMPT, release_sha256=PIN)
+        read.assert_not_called()
+        release.assert_not_called()
+        run.assert_not_called()
+
+    def test_non_linux_worker_rejected_before_cgroup_or_ML_access(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "small") as read:
+            with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+                m.worker(ATTEMPT, "memory")
+        read.assert_not_called()
+
+
+class DispatchTests(unittest.TestCase):
+    def setUp(self):
+        self.run = self.enterContext(patch.object(m, "run_command"))
+        self.run.return_value = SimpleNamespace(returncode=0, stdout=b"not-found\n")
+        self.observe = self.enterContext(patch.object(m, "observe", return_value=terminal()))
+        self.empty = self.enterContext(patch.object(m, "cgroup_empty", return_value=True))
+
+    def stops(self):
+        return [call for call in self.run.call_args_list
+                if call.args[0][:2] == ["/usr/bin/systemctl", "stop"]]
+
+    def test_all_expected_outcomes_pass_and_stop_once(self):
+        for mode in m.MODES:
+            self.run.reset_mock()
+            self.observe.return_value = terminal(mode)
+            result = m.run_case(ATTEMPT, mode, float("inf"))
+            self.assertEqual(result, {"case": mode, "status": "passed", "cgroup_empty": True})
+            self.assertEqual(len(self.stops()), 1)
+            self.assertEqual(self.stops()[0].args[0][-1], m.unit_name(ATTEMPT, mode))
+
+    def test_existing_unit_never_started_or_stopped(self):
+        self.run.return_value.stdout = b"loaded\n"
+        with self.assertRaisesRegex(m.RehearsalError, "attempt_used"):
+            m.run_case(ATTEMPT, "chain", float("inf"))
+        self.assertEqual(self.run.call_count, 1)
+        self.assertEqual(self.stops(), [])
+
+    def test_bad_exit_status_is_not_success(self):
+        self.observe.return_value = terminal() | {"ExecMainStatus": "1"}
+        with self.assertRaisesRegex(m.RehearsalError, "case_failed"):
+            m.run_case(ATTEMPT, "chain", float("inf"))
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_unrelated_failure_is_not_accepted_as_memory_limit_proof(self):
+        self.observe.return_value = terminal("memory") | {"Result": "exit-code"}
+        with self.assertRaisesRegex(m.RehearsalError, "case_failed"):
+            m.run_case(ATTEMPT, "memory", float("inf"))
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_ambiguous_dispatch_gets_one_stop_and_no_retry(self):
+        self.run.side_effect = [SimpleNamespace(returncode=0, stdout=b"not-found\n"),
+                               subprocess.TimeoutExpired("fixed_command", 15),
+                               SimpleNamespace(returncode=0)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            m.run_case(ATTEMPT, "chain", float("inf"))
+        self.assertEqual(self.run.call_count, 3)
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_nonempty_cgroup_prevents_pass(self):
+        self.empty.return_value = False
+        with self.assertRaisesRegex(m.RehearsalError, "cleanup"):
+            m.run_case(ATTEMPT, "chain", float("inf"))
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_failed_stop_prevents_pass(self):
+        self.run.side_effect = [SimpleNamespace(returncode=0, stdout=b"not-found\n"),
+                               SimpleNamespace(returncode=0), SimpleNamespace(returncode=1)]
+        with self.assertRaisesRegex(m.RehearsalError, "cleanup"):
+            m.run_case(ATTEMPT, "chain", float("inf"))
+        self.assertEqual(len(self.stops()), 1)
+
+    def test_controller_deadline_always_stops(self):
+        self.observe.return_value = terminal() | {"SubState": "running"}
+        with (patch.object(m.time, "monotonic", side_effect=[0, 0, 0, 200]),
+              patch.object(m.time, "sleep")):
+            with self.assertRaisesRegex(m.RehearsalError, "deadline"):
+                m.run_case(ATTEMPT, "chain", 100)
+        self.assertEqual(len(self.stops()), 1)
+
+
+class ObservationTests(unittest.TestCase):
+    def test_exact_closed_daemon_properties(self):
+        raw = "\n".join(f"{k}={v}" for k, v in terminal().items()).encode()
+        with patch.object(m, "run_command", return_value=SimpleNamespace(
+                returncode=0, stdout=raw)):
+            self.assertEqual(m.observe(m.unit_name(ATTEMPT, "chain")), terminal())
+
+    def test_duplicate_or_missing_fields_rejected(self):
+        for raw in (b"Result=success\nResult=success\n", b"Result=success\n", b"log=secret"):
+            with patch.object(m, "run_command", return_value=SimpleNamespace(
+                    returncode=0, stdout=raw)), self.assertRaises(m.RehearsalError):
+                m.observe(m.unit_name(ATTEMPT, "chain"))
+
+    def test_no_shell_or_inherited_environment_in_command_runner(self):
+        with patch.object(m.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=b"ok")) as run:
+            m.run_command(["/usr/bin/systemctl", "show"], 5, capture=True)
+        self.assertNotIn("shell", run.call_args.kwargs)
+        self.assertTrue(run.call_args.kwargs["close_fds"])
+        self.assertEqual(set(run.call_args.kwargs["env"]), {"PATH", "LC_ALL"})
+
+    def test_oversize_control_reply_rejected(self):
+        with patch.object(m.subprocess, "run", return_value=SimpleNamespace(
+                returncode=0, stdout=b"x" * 4097)), self.assertRaises(m.RehearsalError):
+            m.run_command(["/usr/bin/systemctl", "show"], 5, capture=True)
+
+    def test_disk_probe_accepts_only_actual_ENOSPC(self):
+        with (patch.object(m, "worker_check"), patch.object(Path, "open") as opened):
+            opened.return_value.__enter__.return_value.write.side_effect = (
+                [m.MIB] * 63 + [m.MIB - 4096, OSError(errno.ENOSPC, "synthetic")]
+            )
+            m.worker(ATTEMPT, "disk")
+        with (patch.object(m, "worker_check"), patch.object(Path, "open",
+              side_effect=OSError(errno.EACCES, "synthetic"))):
+            with self.assertRaisesRegex(m.RehearsalError, "probe_failed"):
+                m.worker(ATTEMPT, "disk")
+
+    def test_ENOSPC_before_filling_tmpfs_does_not_prove_capacity(self):
+        with (patch.object(m, "worker_check"), patch.object(Path, "open",
+              side_effect=OSError(errno.ENOSPC, "synthetic"))):
+            with self.assertRaisesRegex(m.RehearsalError, "probe_failed"):
+                m.worker(ATTEMPT, "disk")
+
+    def test_chain_entry_selects_only_frozen_four_integration_cases(self):
+        with (patch.object(m, "worker_check"), patch.object(m, "copy_worker_sources") as copy,
+              patch.object(m.subprocess, "run", return_value=SimpleNamespace(returncode=0)) as run):
+            m.worker(ATTEMPT, "chain")
+        copy.assert_called_once_with()
+        self.assertEqual(run.call_args.args[0], [str(m.PYTHON), '-I', '-B', '-c', m.CHAIN_ENTRY])
+        self.assertIn('tests.test_sft_checkpoint_import_integration_v2', m.CHAIN_ENTRY)
+        self.assertEqual(run.call_args.kwargs['env'], m.ENV)
+        self.assertNotIn('shell', run.call_args.kwargs)
+
+
+class SourceFixtureTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='lumi-worker-source-copy-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.release = self.root / 'immutable'
+        self.work = self.root / 'work'
+        self.release.mkdir()
+        self.work.mkdir()
+        self.names = {'src/lumi/configuration_lumi.py', 'src/lumi/modeling_lumi.py'}
+        manifest = {}
+        for name in self.names:
+            source = self.release / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(b'# synthetic source\n')
+            source.chmod(0o444)
+            manifest[name] = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.manifest = manifest
+        self.manifest_file = self.release / 'release-manifest.json'
+        self.manifest_file.write_text(json.dumps(manifest))
+        self.enterContext(patch.object(m, 'ROOT', self.release))
+        self.enterContext(patch.object(m, 'WORK', self.work))
+        self.enterContext(patch.object(m, 'REQUIRED', self.names))
+
+    def test_exact_private_copy_preserves_originals(self):
+        before = {name: (self.release / name).stat() for name in self.names}
+        result = m.copy_worker_sources()
+        for name, digest in self.manifest.items():
+            self.assertEqual(hashlib.sha256((result / name).read_bytes()).hexdigest(), digest)
+            self.assertEqual((result / name).stat().st_mode & 0o777, 0o600)
+            self.assertEqual((self.release / name).stat(), before[name])
+
+    def test_hash_mismatch_rejected(self):
+        self.manifest[next(iter(self.names))] = 'a' * 64
+        self.manifest_file.write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(m.RehearsalError, 'release'):
+            m.copy_worker_sources()
+
+    def test_path_escape_rejected(self):
+        self.manifest['../escape.py'] = 'a' * 64
+        self.manifest_file.write_text(json.dumps(self.manifest))
+        with self.assertRaisesRegex(m.RehearsalError, 'release'):
+            m.copy_worker_sources()
+        self.assertFalse((self.work / 'escape.py').exists())
+
+    def test_copy_is_exclusive(self):
+        m.copy_worker_sources()
+        with self.assertRaises(FileExistsError):
+            m.copy_worker_sources()
+
+    def test_failed_copy_never_starts_child(self):
+        with (patch.object(m, 'worker_check'),
+              patch.object(m, 'copy_worker_sources', side_effect=m.RehearsalError('release')),
+              patch.object(m.subprocess, 'run') as run):
+            with self.assertRaisesRegex(m.RehearsalError, 'release'):
+                m.worker(ATTEMPT, 'chain')
+        run.assert_not_called()
+
+
+class AttemptTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="lumi-vm-rehearsal-tests-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.root.chmod(0o700)
+        self.enterContext(patch.object(m, "ATTEMPTS", self.root))
+        self.enterContext(patch.object(m, "host_check"))
+        self.verify_release = m.verify_release
+        self.enterContext(patch.object(m, "verify_release"))
+        self.enterContext(patch.object(m, "root_owned"))
+        self.case = self.enterContext(patch.object(m, "run_case"))
+        self.case.side_effect = lambda attempt, mode, deadline: {
+            "case": mode, "status": "passed", "cgroup_empty": True}
+
+    def launch(self):
+        return m.launch(machine_id=ATTEMPT, attempt=ATTEMPT, release_sha256=PIN)
+
+    def test_sequential_cases_and_no_reuse_of_attempt(self):
+        result = self.launch()
+        self.assertEqual([call.args[1] for call in self.case.call_args_list], list(m.MODES))
+        self.assertFalse(result["real_4b_import"])
+        self.assertFalse(result["cumulative_native_writes_bounded"])
+        self.assertFalse(result["instance_billing_or_shutdown_managed"])
+        before = {p.name: p.read_bytes() for p in (self.root / ATTEMPT).iterdir()}
+        with self.assertRaisesRegex(m.RehearsalError, "attempt_used"):
+            self.launch()
+        self.assertEqual(self.case.call_count, 4)
+        self.assertEqual(before, {p.name: p.read_bytes() for p in (self.root / ATTEMPT).iterdir()})
+
+    def test_first_failure_stops_sequence_and_keeps_no_text_evidence(self):
+        self.case.side_effect = RuntimeError("MUST_NOT_BE_RETAINED")
+        with self.assertRaisesRegex(m.RehearsalError, "dispatch"):
+            self.launch()
+        self.assertEqual(self.case.call_count, 1)
+        report = (self.root / ATTEMPT / "failure.json").read_bytes()
+        self.assertNotIn(b"MUST_NOT_BE_RETAINED", report)
+        self.assertEqual(json.loads(report)["completed_cases"], 0)
+        self.assertFalse((self.root / ATTEMPT / "result.json").exists())
+        with self.assertRaisesRegex(m.RehearsalError, "attempt_used"):
+            self.launch()
+
+    def test_exclusive_result_cannot_overwrite_evidence(self):
+        output = self.root / "saved.json"
+        m.write_new(output, {"status": "first"})
+        original = output.read_bytes()
+        with self.assertRaises(FileExistsError):
+            m.write_new(output, {"status": "second"})
+        self.assertEqual(output.read_bytes(), original)
+
+    def test_release_digest_required_before_parsing(self):
+        with tempfile.TemporaryDirectory(prefix="lumi-release-test-") as directory:
+            root = Path(directory)
+            raw = b"not-json"
+            (root / "release-manifest.json").write_bytes(raw)
+            with patch.object(m, "ROOT", root):
+                with self.assertRaisesRegex(m.RehearsalError, "release"):
+                    self.verify_release(hashlib.sha256(b"different").hexdigest())
+
+
+class WorkerReadbackTests(unittest.TestCase):
+    def setUp(self):
+        unit = m.unit_name(ATTEMPT, "chain")
+        self.values = {
+            "/proc/self/cgroup": f"0::/system.slice/{unit}\n".encode(),
+            str(m.CGROUP / "system.slice" / unit / "memory.max"):
+                str(m.LIMITS["chain"][0]).encode(),
+            str(m.CGROUP / "system.slice" / unit / "memory.swap.max"): b"0",
+            str(m.CGROUP / "system.slice" / unit / "pids.max"): b"64",
+        }
+        self.enterContext(patch.object(m, "small", side_effect=lambda p: self.values[str(p)]))
+        self.enterContext(patch.object(m, "sys", SimpleNamespace(
+            platform="linux", flags=SimpleNamespace(isolated=1), dont_write_bytecode=True)))
+        self.enterContext(patch.object(m.os, "geteuid", return_value=10001))
+        self.enterContext(patch.object(m.os, "getegid", return_value=10001))
+        self.enterContext(patch.object(m.os, "getgroups", return_value=[]))
+        self.enterContext(patch.object(m, "WORK", SimpleNamespace(stat=lambda: SimpleNamespace(
+            st_uid=10001, st_mode=0o40700))))
+        self.space = SimpleNamespace(f_blocks=m.TMP_BYTES // 4096, f_frsize=4096)
+        self.enterContext(patch.object(m.os, "statvfs", return_value=self.space))
+        self.enterContext(patch.dict(m.os.environ, m.ENV, clear=True))
+
+    def test_exact_readbacks_admit_generated_worker_only(self):
+        m.worker_check(ATTEMPT, "chain")
+
+    def test_primary_group_membership_is_not_unrelated_privilege(self):
+        with patch.object(m.os, "getgroups", return_value=[10001]):
+            m.worker_check(ATTEMPT, "chain")
+
+    def test_unrelated_supplementary_groups_rejected(self):
+        with patch.object(m.os, "getgroups", return_value=[10001, 42]):
+            with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+                m.worker_check(ATTEMPT, "chain")
+
+    def test_wrong_cgroup_rejected(self):
+        self.values["/proc/self/cgroup"] = b"0::/unrelated.service"
+        with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+            m.worker_check(ATTEMPT, "chain")
+
+    def test_unlimited_memory_rejected(self):
+        key = next(k for k in self.values if k.endswith("memory.max"))
+        self.values[key] = b"max"
+        with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+            m.worker_check(ATTEMPT, "chain")
+
+    def test_swap_not_disabled_rejected(self):
+        key = next(k for k in self.values if k.endswith("memory.swap.max"))
+        self.values[key] = b"1024"
+        with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+            m.worker_check(ATTEMPT, "chain")
+
+    def test_unbounded_tmpfs_rejected(self):
+        self.space.f_blocks *= 2
+        with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+            m.worker_check(ATTEMPT, "chain")
+
+    def test_offline_environment_not_optional(self):
+        del m.os.environ["HF_HUB_OFFLINE"]
+        with self.assertRaisesRegex(m.RehearsalError, "worker_boundary"):
+            m.worker_check(ATTEMPT, "chain")
+
+
+if __name__ == "__main__":
+    unittest.main()
+

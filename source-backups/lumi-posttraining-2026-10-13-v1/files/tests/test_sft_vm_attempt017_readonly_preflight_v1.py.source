@@ -1,0 +1,68 @@
+"""No network: preflight boundary and pinned integration tests."""
+
+import ast
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import preflight_sft_vm_attempt017_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.client = Mock()
+        self.budget = dict(calls=0, start=time.monotonic())
+        self.wrapper = m.ReadOnlyClient(self.client, self.budget)
+
+    def test_mutations_and_objects_rejected_before_client(self):
+        for name in ("run_instances", "stop_instances", "delete_instance_connect_endpoint",
+                     "create_user", "put_bucket_policy", "get_object", "head_object",
+                     "list_objects_v2", "list_object_versions"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                getattr(self.wrapper, name)()
+        self.assertEqual(self.budget["calls"], 0)
+        self.assertFalse(self.client.mock_calls)
+
+    def test_read_budget(self):
+        self.wrapper.describe_instances(InstanceIds=["synthetic"])
+        self.assertEqual(self.budget["calls"], 1)
+        self.budget["calls"] = 79
+        with self.assertRaises(ValueError):
+            self.wrapper.describe_instances()
+        self.assertEqual(self.client.describe_instances.call_count, 1)
+
+    def test_deadline(self):
+        self.budget["start"] -= 1500
+        with self.assertRaises(ValueError):
+            self.wrapper.get_caller_identity()
+        self.assertFalse(self.client.mock_calls)
+
+    def test_corrected_graph_controls_and_cleanup(self):
+        outer, manifest, pins = m.local()
+        self.assertEqual(manifest["attempt"], m.ATTEMPT)
+        self.assertEqual(len(pins), 2)
+        self.assertTrue(callable(m.admission(outer)))
+
+    def test_source_drift(self):
+        with patch.object(m, "SOURCE_SHA", "0" * 64), self.assertRaises(ValueError):
+            m.admission(None)
+
+    def test_no_execution_function_imported(self):
+        function = m.admission(None)
+        self.assertNotIn("run", function.__globals__)
+        self.assertNotIn("authorized", function.__globals__)
+        tree = ast.parse(Path(m.__file__).read_bytes())
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
+        self.assertFalse(any(isinstance(n.func, ast.Attribute)
+                             and n.func.attr == "_run_network_host_once" for n in calls))
+
+
+if __name__ == "__main__":
+    import sys
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+    sys.addaudithook(guard)
+    unittest.main()

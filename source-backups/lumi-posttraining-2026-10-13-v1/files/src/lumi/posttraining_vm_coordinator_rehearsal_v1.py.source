@@ -1,0 +1,290 @@
+"""Fixed two-unit generated-only coordinator rehearsal on an admitted Linux VM.
+
+Preparation exits and its cgroup is empty before input/source read-only binds
+are exposed to a cold import worker. The operator separately admits the host,
+runtime/source pins, expiry and cost. No acquisition or real-input mode exists.
+This uses systemd's already tested controls, not the old bespoke guardian.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path('/opt/lumi-vm-coordinator-v1')
+SCRIPT = ROOT / 'scripts/run_sft_vm_coordinator_rehearsal_v1.py'
+ATTEMPTS = Path('/var/lib/lumi-vm-coordinator')
+WORK = Path('/work')
+PYTHON = Path('/opt/lumi-sft-rehearsal/venv/bin/python')
+MIB = 1024**2
+TOTAL_SECONDS = 240
+MODES = ('prepare', 'import')
+REQUIRED = frozenset({
+    'src/lumi/posttraining_import_vm_rehearsal_v3.py',
+    'src/lumi/posttraining_vm_coordinator_rehearsal_v1.py',
+    'src/lumi/posttraining_checkpoint_import_runner_v4.py',
+    'src/lumi/posttraining_checkpoint_vm_loader_v1.py',
+    'scripts/run_sft_vm_coordinator_rehearsal_v1.py',
+    'scripts/create_sft_vm_coordinator_fixture_v1.py',
+    'scripts/run_sft_vm_coordinator_entry_v1.py',
+})
+
+
+def frozen_helpers():
+    spec = importlib.util.spec_from_file_location('fixed_vm_systemd_helpers',
+        Path(__file__).with_name('posttraining_import_vm_rehearsal_v3.py'))
+    if spec is None or spec.loader is None:
+        raise ValueError('helper_unavailable')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+frozen = frozen_helpers()
+need, small, root_owned = frozen.need, frozen.small, frozen.root_owned
+run_command, cgroup_empty = frozen.run_command, frozen.cgroup_empty
+write_new, Error = frozen.write_new, frozen.RehearsalError
+
+
+def unit_name(attempt, mode):
+    need(frozen.hex_id(attempt, 32) and mode in MODES, 'arguments')
+    return f'lumi-vm-coordinator-{attempt}-{mode}.service'
+
+
+def properties(attempt, mode):
+    unit_name(attempt, mode)
+    stage = ATTEMPTS / attempt / 'stage'
+    result = frozen.properties('chain')
+    result['RuntimeMaxSec'] = '90'
+    if mode == 'prepare':
+        result.pop('TemporaryFileSystem')
+        result['BindPaths'] = f'{stage}:/work'
+    else:
+        result['InaccessiblePaths'] = '/tmp /var/tmp -/outputs -/dev/shm'
+        result['BindReadOnlyPaths'] = f'{stage}/release:/work/release {stage}/fixture:/inputs'
+        result['BindPaths'] = f'{stage}/results:/results'
+    return result
+
+
+def launch_command(attempt, mode, pin):
+    need(frozen.hex_id(pin, 64), 'arguments')
+    command = ['/usr/bin/systemd-run', '--quiet', '--no-ask-password', '--service-type=exec',
+               '--unit=' + unit_name(attempt, mode)]
+    command += [f'--property={key}={value}' for key, value in properties(attempt, mode).items()]
+    command += [f'--setenv={key}={value}' for key, value in frozen.ENV.items()]
+    return command + ['--', str(PYTHON), '-I', '-B', str(SCRIPT), 'worker', attempt, mode, pin]
+
+
+def verify_release(pin):
+    need(frozen.hex_id(pin, 64), 'arguments')
+    root_owned(ROOT / 'release-manifest.json')
+    raw = small(ROOT / 'release-manifest.json', MIB)
+    need(hashlib.sha256(raw).hexdigest() == pin, 'release')
+    manifest = json.loads(raw)
+    need(type(manifest) is dict and REQUIRED <= set(manifest) and len(manifest) <= 128, 'release')
+    total = 0
+    for name, digest in manifest.items():
+        need(type(name) is str and frozen.re.fullmatch(
+            r'(?:src/lumi|scripts|tests)/[A-Za-z0-9_]+\.py', name)
+             and frozen.hex_id(digest, 64), 'release')
+        path = ROOT / name
+        root_owned(path)
+        need(path.stat().st_nlink == 1, 'release')
+        content = small(path, MIB)
+        total += len(content)
+        need(total <= 2 * MIB and hashlib.sha256(content).hexdigest() == digest, 'release')
+    actual = set()
+    for folder in ('src/lumi', 'scripts', 'tests'):
+        for path in (ROOT / folder).iterdir():
+            need(path.is_file() and not path.is_symlink(), 'release')
+            actual.add(path.relative_to(ROOT).as_posix())
+    need(actual == set(manifest), 'release')
+    root_owned(PYTHON.resolve(strict=True))
+    return manifest
+
+
+def run_phase(attempt, mode, pin, deadline):
+    unit = unit_name(attempt, mode)
+    existing = run_command(['/usr/bin/systemctl', 'show', unit,
+                            '--property=LoadState', '--value'], 5, capture=True)
+    need(existing.returncode in {0, 1, 4} and existing.stdout.strip() == b'not-found',
+         'attempt_used')
+    try:
+        need(time.monotonic() < deadline, 'deadline')
+        need(run_command(launch_command(attempt, mode, pin), 15).returncode == 0, 'dispatch')
+        while time.monotonic() < deadline:
+            observed = frozen.observe(unit)
+            if observed['SubState'] in {'exited', 'failed', 'dead'}:
+                frozen.validate_terminal('chain', observed)
+                return
+            time.sleep(0.2)
+        raise Error('deadline')
+    finally:
+        stopped = run_command(['/usr/bin/systemctl', 'stop', unit], 10)
+        need(stopped.returncode == 0 and cgroup_empty(unit), 'cleanup')
+
+
+def inventory(stage):
+    """Bounded generated input/source readback; no strings from payloads retained."""
+    result, total = {}, 0
+    for count, path in enumerate(stage.rglob('*'), start=1):
+        need(count <= 512, 'fixture_failed')
+        info = path.lstat()
+        need((info.st_uid, info.st_gid) == (10001, 10001)
+             and not stat.S_ISLNK(info.st_mode), 'fixture_failed')
+        if stat.S_ISDIR(info.st_mode):
+            need(stat.S_IMODE(info.st_mode) == 0o700, 'fixture_failed')
+            continue
+        need(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+             and stat.S_IMODE(info.st_mode) == 0o600, 'fixture_failed')
+        raw = small(path, MIB)
+        total += len(raw)
+        need(total <= 4 * MIB and len(result) < 256, 'fixture_failed')
+        result[path.relative_to(stage).as_posix()] = hashlib.sha256(raw).hexdigest()
+    return result
+
+
+def validate_summary(raw, control_pin):
+    summary = json.loads(raw)
+    need(type(summary) is dict and set(summary) == {
+        'schema', 'status', 'control_sha256', 'full_input_audits', 'independent_checksum_consumer',
+        'coordinator_read_bytes_reserved', 'private_write_bytes_reserved',
+        'package_manifest_sha256', 'real_4b_import', 'training_authorized',
+        'production_eligible', 'fullsize_resource_admission'}, 'observation')
+    need(summary['schema'] == 'lumi.vm-coordinator-generated-result.v0.1'
+         and summary['status'] == 'passed' and summary['control_sha256'] == control_pin
+         and type(summary['full_input_audits']) is int and summary['full_input_audits'] == 2
+         and summary['independent_checksum_consumer'] is True
+         and frozen.hex_id(summary['package_manifest_sha256'], 64), 'observation')
+    for name in ('real_4b_import', 'training_authorized', 'production_eligible',
+                 'fullsize_resource_admission'):
+        need(summary[name] is False, 'observation')
+    for name, maximum in (('coordinator_read_bytes_reserved', 32 * MIB),
+                           ('private_write_bytes_reserved', 4 * MIB)):
+        need(type(summary[name]) is int and 0 < summary[name] <= maximum, 'observation')
+    return summary
+
+
+def launch(*, machine_id, attempt, release_sha256):
+    unit_name(attempt, 'prepare')
+    frozen.host_check(machine_id)
+    manifest = verify_release(release_sha256)
+    root_owned(ATTEMPTS)
+    need(stat.S_IMODE(ATTEMPTS.stat().st_mode) == 0o700, 'host')
+    destination = ATTEMPTS / attempt
+    try:
+        destination.mkdir(mode=0o700)
+    except FileExistsError:
+        raise Error('attempt_used') from None
+    write_new(destination / 'started.json', {'scope':'generated_only',
+        'release_sha256':release_sha256,
+        'machine_id_sha256':hashlib.sha256(machine_id.encode()).hexdigest()})
+    stage = destination / 'stage'
+    stage.mkdir(mode=0o700)
+    mounted = False
+    deadline = time.monotonic() + TOTAL_SECONDS
+    try:
+        # A fresh bounded host tmpfs persists between the two private service
+        # namespaces. Its root-only parent prevents worker access to RW aliases.
+        mounted = True  # Ambiguous mount gets one exact-target cleanup check.
+        need(run_command(['/usr/bin/mount', '-t', 'tmpfs', '-o',
+            'size=67108864,nosuid,nodev,noexec,mode=0700,uid=10001,gid=10001',
+            'tmpfs', str(stage)], 10).returncode == 0, 'dispatch')
+        run_phase(attempt, 'prepare', release_sha256, deadline)
+        before = inventory(stage)
+        need(all(before.get('release/' + name) == digest for name, digest in manifest.items()),
+             'release')
+        need({name for name in before if name.startswith('release/')} ==
+             {'release/' + name for name in manifest}, 'release')
+        control_pin = before.get('fixture/controls.json')
+        need(frozen.hex_id(control_pin, 64), 'fixture_failed')
+        (stage / 'results').mkdir(mode=0o700)
+        os.chown(stage / 'results', 10001, 10001)  # Own new empty directory only.
+        run_phase(attempt, 'import', control_pin, deadline)
+        after = inventory(stage)
+        need(after.pop('results/summary.json', None) is not None and after == before,
+             'fixture_failed')
+        summary = validate_summary(small(stage / 'results/summary.json'), control_pin)
+        verify_release(release_sha256)
+        report = {'schema':'lumi.vm-coordinator-native-rehearsal.v0.1',
+            'status':'passed_generated_only', 'summary':summary, 'both_cgroups_empty':True,
+            'staged_input_and_source_files_unchanged':len(before),
+            'real_4b_import':False, 'training_authorized':False, 'production_eligible':False,
+            'cumulative_native_write_limit_claimed':False, 'billing_managed':False}
+    except BaseException as error:
+        write_new(destination / 'failure.json', {'status':'failed',
+            'code':error.code if isinstance(error, Error) else 'dispatch', 'retry_allowed':False})
+        raise Error(error.code if isinstance(error, Error) else 'dispatch') from None
+    finally:
+        if mounted:
+            try:
+                # Do not unmount if a failed stop leaves any child alive. Retain
+                # the mount for an operator; never force/lazy-unmount.
+                need(all(cgroup_empty(unit_name(attempt, mode)) for mode in MODES), 'cleanup')
+                if os.path.ismount(stage):
+                    need(run_command(['/usr/bin/umount', str(stage)], 10).returncode == 0,
+                         'cleanup')
+                need(not os.path.ismount(stage), 'cleanup')
+            except BaseException:
+                write_new(destination / 'cleanup-failure.json', {'status':'failed',
+                    'code':'cleanup', 'operator_action_required':True, 'retry_allowed':False})
+                raise Error('cleanup') from None
+    report['generated_tmpfs_unmounted'] = True
+    write_new(destination / 'result.json', report)
+    return report
+
+
+def worker_check(attempt, mode):
+    unit = unit_name(attempt, mode)
+    need(sys.platform == 'linux' and os.getresuid() == os.getresgid() == (10001, 10001, 10001)
+         and os.getgroups() in ([], [10001]) and sys.flags.isolated and sys.dont_write_bytecode,
+         'worker_boundary')
+    need(small(Path('/proc/self/cgroup')).strip() == f'0::/system.slice/{unit}'.encode(),
+         'worker_boundary')
+    group = frozen.CGROUP / 'system.slice' / unit
+    for name, expected in (('memory.max', 2048 * MIB), ('memory.swap.max', 0), ('pids.max', 64)):
+        need(small(group / name).strip() == str(expected).encode(), 'worker_boundary')
+    space = os.statvfs(WORK)
+    need(space.f_blocks * space.f_frsize == 64 * MIB and not space.f_flag & os.ST_RDONLY,
+         'worker_boundary')
+    need(all(os.environ.get(key) == value for key, value in frozen.ENV.items()), 'worker_boundary')
+
+
+def copy_sources(pin):
+    manifest = verify_release(pin)
+    destination = WORK / 'release'
+    destination.mkdir(mode=0o700, exist_ok=False)
+    for name, digest in manifest.items():
+        raw = small(ROOT / name, MIB)
+        need(hashlib.sha256(raw).hexdigest() == digest, 'release')
+        path = destination / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'wb') as output:
+            need(output.write(raw) == len(raw), 'release')
+
+
+def worker(attempt, mode, pin):
+    worker_check(attempt, mode)
+    need(frozen.hex_id(pin, 64), 'arguments')
+    if mode == 'prepare':
+        copy_sources(pin)
+        command = [str(PYTHON), '-I', '-B',
+                   '/work/release/scripts/create_sft_vm_coordinator_fixture_v1.py']
+    else:
+        for path in (Path('/inputs'), WORK / 'release'):
+            need(os.statvfs(path).f_flag & os.ST_RDONLY, 'worker_boundary')
+        command = [str(PYTHON), '-I', '-B',
+                   '/work/release/scripts/run_sft_vm_coordinator_entry_v1.py',
+                   '--control-sha256', pin]
+    result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, timeout=80, check=False, close_fds=True, env=dict(frozen.ENV),
+        cwd=WORK)
+    need(result.returncode == 0, 'fixture_failed')

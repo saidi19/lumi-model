@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Fixed tiny generated data only; invoked once by the isolated preparation unit."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import types
+from pathlib import Path
+
+FIXTURE = Path('/work/fixture')
+SOURCE = Path('/work/release/src/lumi')
+
+
+def generate():
+    # No arguments, source paths, sizes, real controls or checkpoint selectors.
+    root = FIXTURE
+    root.mkdir(mode=0o700, exist_ok=False)
+    from lumi.configuration_lumi import LumiConfig
+    from lumi.posttraining_checkpoint_import_plan_v1 import build_import_plan
+    from lumi.posttraining_checkpoint_import_torch_v5 import MODEL_FIELDS
+    from lumi.posttraining_checkpoint_io_contract_v1 import build_kernel_io_contract
+    from lumi.posttraining_final_base_metadata_v1 import canonical, sha
+    from tests.test_sft_checkpoint_import_runner_v2 import fixture_kernel_contract, seal_fixture
+    from tests.test_sft_checkpoint_import_runner_v3 import RunnerTests
+    from tests.test_sft_checkpoint_import_torch_v3 import CheckpointImportTorchTests
+
+    # Reuse just the frozen deterministic tiny geometry/state generator. No test
+    # runner, runtime bypass or imported test method executes in the cold worker.
+    CheckpointImportTorchTests.setUpClass()
+    fixture = CheckpointImportTorchTests()
+    fixture.root = root
+    fixture.checkpoint_path = root / 'checkpoint'
+    config = LumiConfig(vocab_size=17, hidden_size=8, intermediate_size=16,
+        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
+        head_dim=4, max_position_embeddings=16, tie_word_embeddings=True)
+    fixture.payload = {name: getattr(config, name) for name in MODEL_FIELDS} | {'model_type':'lumi'}
+    fixture._checkpoint()
+    fixture.checkpoint_path.chmod(0o700)
+    tokenizer = root / 'tokenizer'
+    tokenizer.mkdir(mode=0o700)
+    metadata = seal_fixture(fixture.checkpoint_path, tokenizer,
+                            config_raw=canonical(fixture.payload))
+    plan = build_import_plan(*metadata, expected_base_sha256=sha(metadata[0]), dtype='bfloat16')
+    rows = []
+    for name in ('configuration_lumi.py', 'modeling_lumi.py'):
+        raw = (SOURCE / name).read_bytes()
+        rows.append({'path':name, 'bytes':len(raw), 'sha256':sha(raw)})
+    builder = types.SimpleNamespace(plan=plan, metadata=metadata, source_rows=rows,
+                                    source_bytes=sum(row['bytes'] for row in rows))
+    envelope, contract = RunnerTests.bound_resource_inputs(builder)
+    dcp = fixture_kernel_contract(metadata)['checkpoint_read_contract']
+    delta = dcp['maximum_read_bytes'] - envelope['dcp_read_cap_bytes']
+    for key in ('dcp_read_cap_bytes', 'dcp_payload_read_cap_bytes', 'coordinator_read_cap_bytes'):
+        envelope[key] += delta
+    envelope['maximum_seconds'] = 60
+    contract = build_kernel_io_contract(plan, checkpoint_read_contract=dcp,
+                                        hf_io_contract=contract['hf_io_contract'])
+    control = {'schema':'lumi.vm-coordinator-generated-control.v0.1',
+        'metadata':[raw.hex() for raw in metadata], 'plan':canonical(plan).hex(),
+        'envelope':canonical(envelope).hex(), 'kernel_io':contract}
+    raw = canonical(control)
+    if len(raw) > 131072:
+        raise ValueError('generated_control_cap')
+    with (root / 'controls.json').open('xb') as output:
+        output.write(raw)
+    (root / 'controls.json').chmod(0o600)
+    CheckpointImportTorchTests.tearDownClass()
+
+
+def main():
+    if (sys.platform != 'linux' or sys.version_info[:2] != (3, 12)
+            or os.getresuid() != (10001, 10001, 10001) or len(sys.argv) != 1
+            or Path(__file__) !=
+                Path('/work/release/scripts/create_sft_vm_coordinator_fixture_v1.py')
+            or not sys.flags.isolated or not sys.dont_write_bytecode):
+        raise SystemExit('generated_worker_rejected')
+    sys.path[:0] = ['/work/release/src', '/work/release']
+    try:
+        generate()
+    except BaseException:
+        print(json.dumps({'status':'failed_generated_preparation'}), file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+if __name__ == '__main__':
+    main()

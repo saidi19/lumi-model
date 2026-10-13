@@ -1,0 +1,452 @@
+"""Real local FIFO and retention join; host/systemd/network boundaries doubled."""
+
+import importlib
+import importlib.util
+import json
+import os
+import stat
+import sys
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_retention_release_v1 as previous
+
+prior = previous.prior
+p = importlib.import_module(prior.PACKAGE + ".posttraining_vm_retention_parent_v1")
+
+
+def entry():
+    path = prior.ROOT / "scripts/run_sft_vm_retention_parent_v1.py"
+    spec = importlib.util.spec_from_file_location("_retention_parent_entry_test", path)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+class ProtocolTests(unittest.TestCase):
+    def setUp(self):
+        previous.previous.ParentJoinedTests.setUp(self)
+        self.enterContext(patch.object(p, "ROOT", self.root))
+        self.enterContext(patch.object(p.continuation, "ROOT", self.root))
+        self.enterContext(patch.object(p.old.setup.workflow, "_directory"))
+        self.enterContext(patch.object(p.old.setup.workflow, "ROOT_UID", os.geteuid()))
+        self.enterContext(patch.object(p.old.setup.workflow, "ROOT_GID", os.getegid()))
+        self.enterContext(
+            patch.object(
+                p.continuation,
+                "_completed_parent",
+                return_value=(self.completed, time.monotonic() + 1800),
+            )
+        )
+        self.enterContext(patch.object(p.old.setup, "_mount_empty", return_value="synthetic-tmpfs"))
+        self.abandon = self.enterContext(patch.object(p.old.setup, "_abandon_undispatched"))
+        self.enterContext(patch.object(p.old.handoff.frozen, "cgroup_empty", return_value=True))
+        self.enterContext(
+            patch.object(
+                p.old.handoff.frozen, "small", return_value=f"0::/system.slice/{p.unit()}".encode()
+            )
+        )
+        self.parent_launches = 0
+        self.parent_ack_lost = False
+        self.binding = "c" * 64
+        self.end = 1150
+        self.state = self.destination / "retention-parent"
+
+    def commands(self, args, *a, **kw):
+        if args[0] == "/usr/bin/systemd-run" and "--unit=" + p.unit() in args:
+            self.parent_launches += 1
+            if self.parent_ack_lost:
+                raise OSError("SECRET lost launch ack")
+            return types.SimpleNamespace(returncode=0)
+        return previous.previous.ParentJoinedTests.commands(self, args, *a, **kw)
+
+    def dispatch(self):
+        return p._dispatch_admitted_once(self.binding, self.end)
+
+    def test_dispatch_detached_with_stop_hook_and_no_secret_argv(self):
+        value = self.dispatch()
+        self.assertTrue(value["dispatch_requested"])
+        self.assertFalse(value["workflow_completed"])
+        args = p.command(self.end)
+        self.assertIn("--no-block", args)
+        self.assertIn("--property=RuntimeMaxSec=150", args)
+        self.assertTrue(any("ExecStopPost=" in x and x.endswith(" stop") for x in args))
+        self.assertEqual(self.dispatches, 0)
+        with self.assertRaises(FileExistsError):
+            self.dispatch()
+        self.assertEqual(self.parent_launches, 1)
+
+    def test_lost_dispatch_ack_consumes_attempt(self):
+        self.parent_ack_lost = True
+        with self.assertRaises(OSError):
+            self.dispatch()
+        with self.assertRaises(FileExistsError):
+            self.dispatch()
+        self.assertEqual(self.parent_launches, 1)
+
+    def test_actual_fifo_submit_once_without_receipt_secret(self):
+        self.dispatch()
+        fifo = self.state / "credential.fifo"
+        fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        raw = json.dumps(previous.credential()).encode()
+        try:
+            value = p._submit_admitted_once(raw, self.binding, self.end)
+            self.assertTrue(value["delivery_sent"])
+            self.assertEqual(os.read(fd, 65536), raw)
+            with self.assertRaises(FileExistsError):
+                p._submit_admitted_once(raw, self.binding, self.end)
+        finally:
+            os.close(fd)
+        saved = (self.state / "delivery.sent.json").read_bytes()
+        self.assertNotIn(prior.CREDS["secret_key"].encode(), saved)
+        self.assertNotIn(prior.CREDS["access_key"].encode(), saved)
+
+    def test_submit_binding_change_rejected_before_delivery_marker(self):
+        self.dispatch()
+        raw = json.dumps(previous.credential()).encode()
+        for pin, end in (("d" * 64, self.end), (self.binding, self.end + 1)):
+            with self.assertRaises(ValueError):
+                p._submit_admitted_once(raw, pin, end)
+        self.assertFalse((self.state / "delivery.started.json").exists())
+
+    def test_partial_delivery_never_reopens_or_retries_the_pipe(self):
+        self.dispatch()
+        fd = os.open(self.state / "credential.fifo", os.O_RDONLY | os.O_NONBLOCK)
+        real_write = os.write
+        writes = []
+
+        def broken(out, raw):
+            if stat.S_ISFIFO(os.fstat(out).st_mode):
+                writes.append(out)
+                if len(writes) == 1:
+                    return real_write(out, raw[:7])
+                raise OSError("SECRET lost pipe write")
+            return real_write(out, raw)
+
+        try:
+            raw = json.dumps(previous.credential()).encode()
+            with patch.object(p.os, "write", side_effect=broken):
+                with self.assertRaisesRegex(ValueError, "^retention_delivery_failed$"):
+                    p._submit_admitted_once(raw, self.binding, self.end)
+            with self.assertRaises(FileExistsError):
+                p._submit_admitted_once(raw, self.binding, self.end)
+            self.assertEqual(len(writes), 2)
+            self.assertEqual(os.read(fd, 65536), raw[:7])
+        finally:
+            os.close(fd)
+        self.assertFalse((self.state / "delivery.sent.json").exists())
+
+    def test_real_fifo_serve_joins_existing_worker_and_transport(self):
+        self.dispatch()
+        fifo = self.state / "credential.fifo"
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            p._submit_admitted_once(
+                json.dumps(previous.credential()).encode(), self.binding, self.end
+            )
+            p._serve_admitted_once(self.binding, self.end, "b" * 32, "a" * 64)
+        finally:
+            os.close(reader)
+        self.assertEqual(self.dispatches, 1)
+        self.assertEqual(len(self.store.calls), 20)
+        self.assertFalse(fifo.exists())
+        self.assertTrue((self.state / "result.json").exists())
+        self.cleanup.assert_called_once()
+        self.assertFalse(json.loads((self.state / "result.json").read_bytes())["gate_5_complete"])
+
+    def test_no_credential_data_times_out_without_starting_worker(self):
+        self.dispatch()
+        with patch.object(p.select, "select", return_value=([], [], [])):
+            with self.assertRaisesRegex(ValueError, "retention_parent_failed"):
+                p._serve_admitted_once(self.binding, self.end, "b" * 32, "a" * 64)
+        self.assertEqual(self.dispatches, 0)
+        self.assertTrue((self.state / "failed.json").exists())
+
+    def test_stop_allowed_after_expiry_and_no_credential_unlink(self):
+        self.dispatch()
+        with (
+            patch.object(p.time, "clock_gettime", return_value=9999),
+            patch.object(
+                p.old.handoff.frozen,
+                "run_command",
+                return_value=types.SimpleNamespace(
+                    returncode=0, stdout=b"LoadState=loaded\nActiveState=active\n"
+                ),
+            ),
+        ):
+            p._stop_admitted(self.binding, self.end)
+        self.stop.assert_called_once()
+        self.cleanup.assert_not_called()
+        with self.assertRaises(FileExistsError):
+            p._stop_admitted(self.binding, self.end)
+
+    def test_stop_does_not_repeat_successful_worker_teardown(self):
+        self.dispatch()
+        with patch.object(
+            p.old.handoff.frozen,
+            "run_command",
+            return_value=types.SimpleNamespace(
+                returncode=0, stdout=b"LoadState=loaded\nActiveState=inactive\n"
+            ),
+        ):
+            p._stop_admitted(self.binding, self.end)
+        self.stop.assert_not_called()
+        self.assertTrue(
+            json.loads((self.state / "stop.result.json").read_bytes())["retention_cgroup_reaped"]
+        )
+
+    def test_stop_failure_retains_explicit_failure_receipt(self):
+        self.dispatch()
+        self.stop.side_effect = ValueError("stop")
+        with patch.object(
+            p.old.handoff.frozen,
+            "run_command",
+            return_value=types.SimpleNamespace(
+                returncode=0, stdout=b"LoadState=loaded\nActiveState=active\n"
+            ),
+        ):
+            with self.assertRaises(ValueError):
+                p._stop_admitted(self.binding, self.end)
+        self.assertFalse(
+            json.loads((self.state / "stop.result.json").read_bytes())["retention_cgroup_reaped"]
+        )
+
+    def test_status_readonly_and_interruption_reported(self):
+        self.dispatch()
+        p.mark(self.state, "started.json", dict(retry_allowed=False))
+        before = {f: f.read_bytes() for f in self.state.iterdir() if f.is_file()}
+        result = p._status_admitted(self.binding, self.end)
+        self.assertEqual(result["state"], "interrupted")
+        self.assertEqual(before, {f: f.read_bytes() for f in self.state.iterdir() if f.is_file()})
+
+    def test_external_deadline_not_reset_by_successor_adapter(self):
+        captured = {}
+
+        def done(*args, **kwargs):
+            captured.update(kwargs)
+            raise ValueError("stop synthetic worker")
+
+        root = self.destination
+        with (
+            patch.object(p.worker, "_run_admitted_once", side_effect=done),
+            patch.object(
+                p.old.setup,
+                "_read_pipe",
+                return_value=bytearray(json.dumps(previous.credential()).encode()),
+            ),
+            patch.object(p.old.setup, "_abandon_undispatched"),
+        ):
+            deadline = time.monotonic() + 100
+            with self.assertRaises(ValueError):
+                p.continuation._continue_admitted_once(
+                    prior.m.ATTEMPT,
+                    machine_id="b" * 32,
+                    expected_binding_sha256="a" * 64,
+                    credential_fd=123,
+                    deadline=deadline,
+                )
+        self.assertEqual(captured["deadline"], deadline)
+        self.assertTrue((root / "retention-continuation.started.json").exists())
+
+
+class EntryTests(unittest.TestCase):
+    def setUp(self):
+        self.m = entry()
+        self.prior = dict(
+            machine_id="b" * 32,
+            boot_id="boot",
+            host_started_boottime=0,
+            host_deadline_boottime=4000,
+        )
+        self.binding = dict(
+            schema="lumi.vm-retention-host-binding.v0.1",
+            scope="conditional-private-retention-once",
+            attempt=self.m.ATTEMPT,
+            machine_id="b" * 32,
+            boot_id="boot",
+            prior_binding_sha256="a" * 64,
+            entry_sha256="b" * 64,
+            release_manifest_sha256="c" * 64,
+            started_boottime=1000,
+            deadline_boottime=2800,
+        )
+
+    def validate(self, value=None, op="dispatch", now=1100):
+        return self.m.validate_binding(value or self.binding, op, "b" * 32, "boot", now, self.prior)
+
+    def test_separate_exact_scope_and_original_host_teardown_reserve(self):
+        self.assertEqual(self.validate(), self.binding)
+        for key, value in (
+            ("schema", "lumi.vm-root-host-binding.v0.1"),
+            ("scope", "import"),
+            ("machine_id", "c" * 32),
+            ("boot_id", "other"),
+            ("started_boottime", True),
+            ("deadline_boottime", 4000),
+            ("deadline_boottime", float("nan")),
+            ("entry_sha256", "x"),
+        ):
+            with self.assertRaises(ValueError):
+                self.validate(self.binding | {key: value})
+
+    def test_expiry_blocks_work_but_allows_status_and_stop(self):
+        for op in ("dispatch", "submit", "serve"):
+            with self.assertRaises(ValueError):
+                self.validate(op=op, now=3000)
+        for op in ("status", "stop"):
+            self.validate(op=op, now=3000)
+
+    def test_mac_rejects_before_reading_bindings(self):
+        with (
+            patch.object(self.m.sys, "platform", "darwin"),
+            patch.object(self.m, "root_file") as read,
+        ):
+            with self.assertRaises(ValueError):
+                self.m.execute("dispatch")
+        read.assert_not_called()
+
+    def bodies(self):
+        expected = {
+            "src/lumi/" + n + ".py": pin for n, pin in self.m.SOURCES.items()
+        } | self.m.EXTRA
+        return {n: (prior.ROOT / n).read_bytes() for n in expected}
+
+    def test_current_source_pins_and_complete_cold_loader(self):
+        bodies = self.bodies()
+        for name, pin in self.m.SOURCES.items():
+            self.assertEqual(self.m.sha(bodies["src/lumi/" + name + ".py"]), pin)
+        with patch.dict(sys.modules), patch.object(self.m, "RELEASE", prior.ROOT):
+            for name in list(sys.modules):
+                if name.split(".")[0] in {"botocore", "boto3"}:
+                    del sys.modules[name]
+            module = self.m.load_parent(bodies)
+            self.assertTrue(callable(module._serve_admitted_once))
+            self.assertNotIn("torch", sys.modules)
+            self.assertNotIn("lumi", sys.modules)
+            with self.assertRaises(ValueError):
+                self.m.load_parent(bodies)
+
+    def test_late_changed_source_rejected_before_any_closure_execution(self):
+        bodies = self.bodies()
+        bodies["src/lumi/posttraining_vm_retention_parent_v1.py"] += b"#changed"
+        with patch.dict(sys.modules):
+            for name in list(sys.modules):
+                if name.split(".")[0] in {"botocore", "boto3"}:
+                    del sys.modules[name]
+            with self.assertRaises(ValueError):
+                self.m.load_parent(bodies)
+            self.assertNotIn(self.m.PACKAGE, sys.modules)
+
+    def test_release_manifest_exact_names_and_entry_pin(self):
+        bodies = self.bodies()
+        name = "scripts/run_sft_vm_retention_parent_v1.py"
+        bodies[name] = (prior.ROOT / name).read_bytes()
+        manifest = {n: self.m.sha(raw) for n, raw in bodies.items()}
+        raw = json.dumps(manifest, sort_keys=True).encode()
+        binding = self.binding | dict(
+            entry_sha256=manifest[name], release_manifest_sha256=self.m.sha(raw)
+        )
+
+        def read(path, *_):
+            return (
+                raw
+                if path.name == "release-manifest.json"
+                else bodies[str(path.relative_to(self.m.RELEASE))]
+            )
+
+        with patch.object(self.m, "root_file", side_effect=read):
+            self.assertEqual(self.m.authenticated_release(binding), bodies)
+            with self.assertRaises(ValueError):
+                self.m.authenticated_release(binding | {"entry_sha256": "0" * 64})
+
+    def test_public_module_entry_still_requires_native_binding(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            p.run(approved=True)
+
+    def test_missing_retention_binding_cannot_fall_back_to_old_import_binding(self):
+        with (
+            patch.object(self.m, "native_boundary", return_value=("b" * 32, "boot")),
+            patch.object(self.m, "root_file", side_effect=FileNotFoundError) as read,
+            patch.object(self.m, "load_parent") as load,
+        ):
+            with self.assertRaises(FileNotFoundError):
+                self.m.execute("dispatch")
+        self.assertEqual(read.call_args.args[0], self.m.ROOT / "retention-controller/binding.json")
+        load.assert_not_called()
+
+
+class SuccessorReleaseTests(unittest.TestCase):
+    def setUp(self):
+        path = prior.ROOT / "scripts/prepare_sft_vm_retention_release_v2.py"
+        spec = importlib.util.spec_from_file_location("_retention_release_v2_test", path)
+        self.b = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.b)
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.old, self.raw, self.members = self.b.assemble()
+
+    def test_successor_preserves_all_original_members_and_adds_bound_manifest(self):
+        self.assertEqual(len(self.members), 22)
+        _raw, base = self.old.assemble()
+        self.assertTrue(all(self.members[n] == raw for n, raw in base.items()))
+        self.assertEqual(self.b.unpack(self.raw, self.b.sha(self.raw), self.old), self.members)
+        manifest = json.loads(self.members["release-manifest.json"])
+        self.assertEqual(len(manifest), 21)
+        self.assertTrue(all(self.b.sha(self.members[n]) == pin for n, pin in manifest.items()))
+
+    def test_prepare_exact_bytes_exclusive_destination_without_binding(self):
+        output = self.root / "prepared"
+        result = self.b.prepare(output)
+        self.assertEqual((output / "retention-source.tar").read_bytes(), self.raw)
+        self.assertFalse(result["binding_created"] or result["execution_permitted"])
+        with self.assertRaises(FileExistsError):
+            self.b.prepare(output)
+
+    def test_changed_new_source_rejected(self):
+        wrong = self.members.copy()
+        wrong["src/lumi/posttraining_vm_retention_parent_v1.py"] += b"#changed"
+        with self.assertRaises(ValueError):
+            self.b.archive(wrong, self.old)
+
+    def test_trailing_bytes_bad_hash_and_extra_manifest_member_rejected(self):
+        with self.assertRaises(ValueError):
+            self.b.unpack(self.raw, "0" * 64, self.old)
+        raw = self.raw + b"tail"
+        with self.assertRaises(ValueError):
+            self.b.unpack(raw, self.b.sha(raw), self.old)
+        wrong = self.members.copy()
+        wrong["release-manifest.json"] = self.old.canonical({"unlisted": "0" * 64})
+        with self.assertRaises(ValueError):
+            self.b.archive(wrong, self.old)
+
+    def test_private_staging_no_original_controller_replacement_or_authority(self):
+        root = self.root / self.old.ATTEMPT
+        root.mkdir()
+        (root / "controller").mkdir()
+        (root / "controller/parent.py").write_bytes(b"preserve")
+        bundle = self.root / "bundle.tar"
+        bundle.write_bytes(self.raw)
+        with (
+            patch.object(self.b, "helper", return_value=self.old),
+            patch.object(self.old, "ROOT", self.root),
+            patch.object(self.old, "boundary"),
+        ):
+            result = self.b._install_admitted_once(bundle, self.b.sha(self.raw), "b" * 32)
+            self.assertFalse(result["binding_created"])
+            self.assertEqual((root / "controller/parent.py").read_bytes(), b"preserve")
+            self.assertTrue(
+                all(
+                    (root / "retention-release" / n).read_bytes() == raw
+                    for n, raw in self.members.items()
+                )
+            )
+            with self.assertRaises(FileExistsError):
+                self.b._install_admitted_once(bundle, self.b.sha(self.raw), "b" * 32)
+        self.assertFalse((root / "retention-controller/binding.json").exists())
+
+    def test_public_installer_cannot_open_with_approval_flag(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            self.b.install(approved=True)

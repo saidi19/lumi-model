@@ -1,0 +1,251 @@
+"""Synthetic disposable-host lifecycle; no AWS, credentials or native boot."""
+
+import copy
+import gzip
+import importlib
+import json
+import unittest
+from unittest.mock import patch
+
+from tests.test_sft_vm_initial_boot_v2 import builder
+
+m = importlib.import_module("execute_sft_vm_boot_smoke_v1")
+GROUP = "sg-" + "a" * 17
+INSTANCE = "i-" + "b" * 17
+VOLUME = "vol-" + "c" * 17
+
+
+def console():
+    return "\n".join(
+        ["LUMI_SMOKE_V1:pre_sysinit"]
+        + ["LUMI_BOOT_V2:" + stage for stage in m.STAGES[:12]]
+        + ["LUMI_SMOKE_V1:finished"]
+    )
+
+
+class Cloud:
+    def __init__(self):
+        self.group = self.instance = None
+        self.calls = []
+        self.console = console()
+        self.lost_launch = self.lost_group = self.foreign = False
+
+    def __getattr__(self, operation):
+        def call(**fields):
+            self.calls.append((operation, fields))
+            if operation == "get_caller_identity":
+                return dict(Account=m.ACCOUNT)
+            if operation == "describe_subnets":
+                return dict(
+                    Subnets=[
+                        dict(
+                            SubnetId=m.SUBNET,
+                            VpcId=m.VPC,
+                            OwnerId=m.ACCOUNT,
+                            State="available",
+                            AvailableIpAddressCount=10,
+                            AvailabilityZone="us-east-1a",
+                        )
+                    ]
+                )
+            if operation == "describe_images":
+                return dict(
+                    Images=[
+                        dict(
+                            ImageId=m.AMI,
+                            OwnerId="099720109477",
+                            Name=m.AMI_NAME,
+                            State="available",
+                            Architecture="x86_64",
+                            RootDeviceType="ebs",
+                            RootDeviceName="/dev/sda1",
+                            BlockDeviceMappings=[
+                                dict(DeviceName="/dev/sda1", Ebs=dict(VolumeSize=8))
+                            ],
+                        )
+                    ]
+                )
+            if operation == "describe_instance_type_offerings":
+                return dict(InstanceTypeOfferings=[dict(InstanceType="t3.small")])
+            if operation == "describe_security_groups":
+                return dict(
+                    SecurityGroups=[] if self.group is None else [copy.deepcopy(self.group)]
+                )
+            if operation == "create_security_group":
+                self.group = dict(
+                    GroupId=GROUP,
+                    GroupName=m.TOKEN,
+                    VpcId=m.VPC,
+                    OwnerId=m.ACCOUNT,
+                    Tags=m.tags("security-group")["Tags"],
+                    IpPermissions=[],
+                    IpPermissionsEgress=[
+                        dict(IpProtocol="-1", IpRanges=[dict(CidrIp="0.0.0.0/0")])
+                    ],
+                )
+                if self.lost_group:
+                    raise TimeoutError("PRIVATE_ERROR")
+                return dict(GroupId=GROUP)
+            if operation == "revoke_security_group_egress":
+                self.group["IpPermissionsEgress"] = []
+                return dict(Return=True)
+            if operation == "run_instances":
+                assert fields["MinCount"] == fields["MaxCount"] == 1
+                assert fields["NetworkInterfaces"][0]["Groups"] == [GROUP]
+                assert fields["NetworkInterfaces"][0]["AssociatePublicIpAddress"] is False
+                assert not self.group["IpPermissionsEgress"]
+                self.instance = dict(
+                    InstanceId=INSTANCE,
+                    ClientToken=m.TOKEN,
+                    ImageId=m.AMI,
+                    InstanceType="t3.small",
+                    VpcId=m.VPC,
+                    SubnetId=m.SUBNET,
+                    Tags=m.tags("instance")["Tags"],
+                    State=dict(Name="running"),
+                    SecurityGroups=[dict(GroupId=GROUP)],
+                    NetworkInterfaces=[dict(Ipv6Addresses=[])],
+                    BlockDeviceMappings=[
+                        dict(
+                            DeviceName="/dev/sda1",
+                            Ebs=dict(VolumeId=VOLUME, DeleteOnTermination=True),
+                        )
+                    ],
+                )
+                if self.lost_launch:
+                    raise TimeoutError("PRIVATE_ERROR")
+                return dict(Instances=[dict(InstanceId=INSTANCE)])
+            if operation == "describe_instances":
+                if self.instance is None:
+                    return dict(Reservations=[])
+                row = copy.deepcopy(self.instance)
+                if self.foreign:
+                    row["Tags"] = []
+                return dict(Reservations=[dict(OwnerId=m.ACCOUNT, Instances=[row])])
+            if operation == "describe_volumes":
+                if self.instance["State"]["Name"] == "terminated":
+                    return dict(Volumes=[])
+                return dict(
+                    Volumes=[
+                        dict(
+                            VolumeId=VOLUME,
+                            Encrypted=True,
+                            Size=16,
+                            Tags=m.tags("volume")["Tags"],
+                            Attachments=[dict(InstanceId=INSTANCE)],
+                        )
+                    ]
+                )
+            if operation == "get_console_output":
+                self.instance["State"]["Name"] = "stopped"
+                return dict(InstanceId=INSTANCE, Output=self.console)
+            if operation == "terminate_instances":
+                assert fields["InstanceIds"] == [INSTANCE]
+                self.instance["State"]["Name"] = "terminated"
+                return dict(TerminatingInstances=[dict(InstanceId=INSTANCE)])
+            if operation == "describe_network_interfaces":
+                assert self.instance is None or self.instance["State"]["Name"] == "terminated"
+                return dict(NetworkInterfaces=[])
+            if operation == "delete_security_group":
+                assert fields["GroupId"] == GROUP
+                self.group = None
+                return dict(Return=True)
+            raise AssertionError("unexpected operation")
+
+        return call
+
+
+class SmokeTests(unittest.TestCase):
+    def run_smoke(self, cloud):
+        records = {}
+        elapsed = [0]
+
+        def save(name, value):
+            self.assertNotIn(name, records)
+            records[name] = copy.deepcopy(value)
+
+        def sleep(seconds):
+            elapsed[0] += seconds
+
+        smoke = m.Smoke(dict(sts=cloud, ec2=cloud), save, clock=lambda: elapsed[0], sleep=sleep)
+        return smoke.run(), records
+
+    def test_happy_boot_cleanup_and_no_private_console(self):
+        cloud = Cloud()
+        cloud.console += "\nPRIVATE_VALUE arbitrary instruction ignored"
+        result, records = self.run_smoke(cloud)
+        self.assertEqual(result["status"], "boot_passed_cleanup_verified")
+        for flag in ("root_volume_deleted", "instance_terminated", "security_group_deleted"):
+            self.assertTrue(result[flag])
+        self.assertNotIn("PRIVATE_VALUE", json.dumps(records))
+        self.assertEqual([op for op, _ in cloud.calls].count("run_instances"), 1)
+
+    def test_lost_launch_response_reconciles_and_terminates_without_retry(self):
+        cloud = Cloud()
+        cloud.lost_launch = True
+        result, _ = self.run_smoke(cloud)
+        self.assertFalse(result["boot_passed"])
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual([op for op, _ in cloud.calls].count("run_instances"), 1)
+
+    def test_lost_group_response_reconciles_and_deletes_without_launch(self):
+        cloud = Cloud()
+        cloud.lost_group = True
+        result, _ = self.run_smoke(cloud)
+        self.assertTrue(result["cleanup_verified"])
+        self.assertFalse(result["launch_attempted"])
+        self.assertNotIn("run_instances", [op for op, _ in cloud.calls])
+
+    def test_empty_console_is_not_pass_and_still_cleans_up(self):
+        cloud = Cloud()
+        cloud.console = ""
+        result, _ = self.run_smoke(cloud)
+        self.assertFalse(result["boot_passed"])
+        self.assertTrue(result["cleanup_verified"])
+        self.assertEqual(result["console_observations"], 6)
+
+    def test_foreign_instance_never_terminated(self):
+        cloud = Cloud()
+        cloud.foreign = True
+        result, _ = self.run_smoke(cloud)
+        self.assertFalse(result["cleanup_verified"])
+        self.assertNotIn("terminate_instances", [op for op, _ in cloud.calls])
+
+    def test_duplicate_or_missing_or_rejected_markers_never_pass(self):
+        cases = [
+            console() + "\nLUMI_BOOT_V2:ready",
+            console() + "\nLUMI_BOOT_V2:rejected",
+            console().replace("LUMI_BOOT_V2:proof", ""),
+            console().replace("LUMI_SMOKE_V1:pre_sysinit", ""),
+            "",
+        ]
+        for text in cases:
+            with self.subTest(size=len(text)):
+                self.assertFalse(
+                    m.console_summary(dict(InstanceId=INSTANCE, Output=text), INSTANCE)["passed"]
+                )
+        with self.assertRaises(ValueError):
+            m.console_summary(dict(InstanceId="other", Output=console()), INSTANCE)
+
+    def test_payload_contains_exact_frozen_v2_command_and_fresh_no_network_request(self):
+        cfg = json.loads(gzip.decompress(m.user_data()).removeprefix(b"#cloud-config\n"))
+        self.assertEqual(set(cfg), {"bootcmd"})
+        self.assertLessEqual(len(m.user_data()), 16384)
+        self.assertIn("LUMI_SMOKE_V1:pre_sysinit", cfg["bootcmd"][0][-1])
+        request = m.launch_request(GROUP, "/dev/sda1", m.user_data())
+        self.assertEqual(request["InstanceType"], "t3.small")
+        self.assertEqual(request["CreditSpecification"], dict(CpuCredits="standard"))
+        self.assertNotIn("KeyName", request)
+        self.assertNotIn("IamInstanceProfile", request)
+        self.assertTrue(request["BlockDeviceMappings"][0]["Ebs"]["DeleteOnTermination"])
+        self.assertEqual(
+            builder.EARLY_SHA, "c5df93301f80b1f91a9bb8bb3cc2c833134e7a487d88332604dc657c41fce71d"
+        )
+
+    def test_mutation_is_not_retried_and_call_deadline_is_enforced(self):
+        smoke = m.Smoke(dict(ec2=Cloud()), lambda *_: None, clock=lambda: 0)
+        smoke.call("create_security_group")
+        with self.assertRaises(ValueError):
+            smoke.call("create_security_group")
+        with patch.object(smoke, "clock", return_value=1170), self.assertRaises(ValueError):
+            smoke.call("describe_instances")

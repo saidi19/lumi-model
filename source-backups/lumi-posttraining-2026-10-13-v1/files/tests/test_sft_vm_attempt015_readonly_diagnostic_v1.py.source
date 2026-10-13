@@ -1,0 +1,45 @@
+"""Boundary tests only; no credentials or AWS calls."""
+
+import ast
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from scripts import diagnose_sft_vm_attempt015_admission_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_mutation_and_objects_rejected(self):
+        for name in ("RunInstances", "DeleteInstanceConnectEndpoint", "PutObject", "GetObject",
+                     "ListObjectsV2", "HeadObject", "StopInstances"):
+            trace = m.Trace()
+            with self.assertRaises(ValueError):
+                trace.before(SimpleNamespace(name=name))
+            self.assertEqual(trace.calls, 0)
+
+    def test_call_limit(self):
+        trace = m.Trace()
+        for _ in range(80):
+            trace.before(SimpleNamespace(name="GetCallerIdentity"))
+        with self.assertRaises(ValueError):
+            trace.before(SimpleNamespace(name="GetCallerIdentity"))
+        self.assertEqual(trace.calls, 80)
+
+    def test_deadline(self):
+        now = [0]
+        trace = m.Trace(clock=lambda: now[0])
+        now[0] = 1380
+        with self.assertRaises(ValueError):
+            trace.before(SimpleNamespace(name="GetCallerIdentity"))
+
+    def test_instrumentation_does_not_change_admission_predicates(self):
+        fn = m.inspector(m.Trace())
+        self.assertEqual(fn.__name__, "inspect_before_marker")
+        tree = ast.parse(Path(m.entry.__file__).read_text())
+        node = next(n for n in tree.body if getattr(n, "name", None) == fn.__name__)
+        self.assertNotIn("_run_network_host_once", ast.unparse(node))
+        self.assertEqual(fn.__globals__["outer"], m.entry.outer)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,80 @@
+"""Synthetic local pipes and lifecycle faults only; no SSH/cloud/model access."""
+
+import json
+import os
+import sys
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_setup_exchange_lifecycle_v1 as builder
+from tests import test_sft_vm_setup_exchange_diagnostic_v1 as base
+
+
+class Tests(base.Tests):
+    def setUp(self):
+        self.enterContext(patch.object(base, "builder", builder))
+        super().setUp()
+
+    def test_spawn_error_has_finite_diagnostic_and_unknown_counts(self):
+        with patch.object(
+            self.ns["subprocess"], "Popen", side_effect=FileNotFoundError("PRIVATE_SENTINEL")
+        ):
+            result = self.failure("pass")
+        self.assertEqual(result["phase"], "boundary")
+        self.assertEqual(result["kind"], "io")
+        self.assertIsNone(result["stdin_bytes_written"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_validation_error_is_not_silently_lost(self):
+        with self.assertRaises(self.ns["SetupExchangeFailure"]) as caught:
+            self.ns["pipe_exchange"]([sys.executable], b"", 2)
+        self.assertEqual(caught.exception.diagnostic["kind"], "validation")
+
+    def test_cleanup_exception_does_not_replace_primary_diagnostic(self):
+        original = self.ns["_finish_exchange_process"]
+
+        def finish(process):
+            original(process)
+            raise self.ns["ExchangeCleanupFailure"](["wait_failed"])
+
+        with patch.dict(self.ns, {"_finish_exchange_process": finish}):
+            result = self.failure("import sys;sys.stdin.buffer.read();sys.exit(9)")
+        self.assertEqual(result["exit_code"], 9)
+        self.assertEqual(result["diagnostic_origin"], "primary_preserved")
+        self.assertEqual(result["cleanup_failure_codes"], ["wait_failed"])
+
+    def test_successful_receipt_with_cleanup_error_fails_closed(self):
+        with patch.object(os, "killpg", side_effect=PermissionError("PRIVATE_SENTINEL")):
+            result = self.failure("import sys;sys.stdin.buffer.read();print('synthetic_receipt')")
+        self.assertEqual(result["phase"], "cleanup")
+        self.assertEqual(result["cleanup_failure_codes"], ["kill_failed"])
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def test_cleanup_attempts_wait_and_both_closes_after_kill_failure(self):
+        process = Mock(pid=123)
+        process.wait.side_effect = TimeoutError("PRIVATE_SENTINEL")
+        process.stdin.close.side_effect = OSError("PRIVATE_SENTINEL")
+        process.stdout.close.side_effect = OSError("PRIVATE_SENTINEL")
+        with patch.object(os, "killpg", side_effect=PermissionError("PRIVATE_SENTINEL")):
+            with self.assertRaises(self.ns["ExchangeCleanupFailure"]) as caught:
+                self.ns["_finish_exchange_process"](process)
+        self.assertEqual(
+            caught.exception.codes,
+            ("kill_failed", "wait_failed", "stdin_close_failed", "stdout_close_failed"),
+        )
+        process.wait.assert_called_once_with(timeout=5)
+        process.stdin.close.assert_called_once()
+        process.stdout.close.assert_called_once()
+
+    def test_full_synthetic_frame_uses_real_local_pipe(self):
+        reply = self.ns["pipe_exchange"](
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "import sys;sys.stdin.buffer.read();print('synthetic_receipt')",
+            ],
+            b"x" * self.ns["MAX_BODY"],
+            2,
+        )
+        self.assertEqual(reply, b"synthetic_receipt\n")

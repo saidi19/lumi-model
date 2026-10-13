@@ -1,0 +1,263 @@
+"""Tiny opaque bytes only; no AWS SDK, network, mount, unit or real payload."""
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def module(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "src/lumi" / (name + ".py"))
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+m = module("posttraining_vm_fullsize_staging_v1")
+controls = module("posttraining_vm_fullsize_controls_v1")
+
+
+class StagingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
+        self.content = {"model": b"opaque dcp", "trainer": b"not a pickle", "tokenizer": b"{}"}
+        self.rows = [{"role": role, "target_relative_path": name, "key": key,
+                      "bytes": len(self.content[key]),
+                      "sha256": hashlib.sha256(self.content[key]).hexdigest()}
+                     for role, name, key in [
+                         ("checkpoint", "model/.metadata", "model"),
+                         ("checkpoint", "trainer-rank-00000.pt", "trainer"),
+                         ("tokenizer", "tokenizer/tokenizer.json", "tokenizer")]]
+        self.requests, self.bodies = [], []
+        self.pin = mock.patch.object(m, "SELECTION_SHA256")
+        self.pin.start()
+        self.addCleanup(self.pin.stop)
+        self.runtime = mock.patch.object(m, "_runtime")
+        self.runtime.start()
+        self.addCleanup(self.runtime.stop)
+
+    def raw(self):
+        value = {"bucket": "synthetic", "objects": self.rows,
+                 "object_count": len(self.rows), "object_bytes": sum(r["bytes"] for r in self.rows)}
+        raw = json.dumps(value).encode()
+        m.SELECTION_SHA256 = hashlib.sha256(raw).hexdigest()
+        return raw
+
+    def response(self, bucket, key):
+        self.assertEqual(bucket, "synthetic")
+        self.requests.append(key)
+        body = io.BytesIO(self.content[key])
+        self.bodies.append(body)
+        return len(self.content[key]), body
+
+    def run_stage(self, response=None, raw=None, deadline=None):
+        return m._stage_admitted_once(self.fd, self.raw() if raw is None else raw,
+            response or self.response, deadline=deadline or time.monotonic() + 30)
+
+    def test_success_preserves_prefix_opaque_trainer_modes_and_closes_writers(self):
+        result = self.run_stage()
+        self.assertEqual(self.requests, ["model", "trainer", "tokenizer"])
+        self.assertTrue(all(b.closed for b in self.bodies))
+        self.assertEqual(result["content_bytes_written"], sum(map(len, self.content.values())))
+        self.assertFalse(result["readonly_mount_verified"])
+        self.assertFalse(result["acquisition_cgroup_reaped"])
+        for row in self.rows:
+            path = self.root / "inputs" / row["role"] / row["target_relative_path"]
+            self.assertEqual(path.read_bytes(), self.content[row["key"]])
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+
+    def test_success_cannot_be_retried(self):
+        self.run_stage()
+        with self.assertRaisesRegex(m.StagingError, "attempt_used"):
+            self.run_stage()
+        self.assertEqual(len(self.requests), 3)
+
+    def test_hash_mismatch_stops_before_next_object_and_keeps_failure(self):
+        raw = self.raw()
+        self.content["model"] = b"wrong data"
+        with self.assertRaisesRegex(m.StagingError, "hash_mismatch"):
+            self.run_stage(raw=raw)
+        self.assertEqual(self.requests, ["model"])
+        self.assertTrue(self.bodies[0].closed)
+        self.assertTrue((self.root / "acquisition.started").exists())
+        with self.assertRaisesRegex(m.StagingError, "attempt_used"):
+            self.run_stage(raw=raw)
+
+    def test_truncated_and_overlong_body_rejected(self):
+        for data in (b"short", b"opaque dcp extra"):
+            with self.subTest(data_length=len(data)):
+                stream = io.BytesIO(data)
+                with tempfile.TemporaryFile() as output:
+                    with self.assertRaisesRegex(m.StagingError, "stream_rejected"):
+                        m._copy(stream, output.fileno(), self.rows[0], time.monotonic() + 5)
+                    self.assertLessEqual(output.tell(), self.rows[0]["bytes"])
+
+    def test_wrong_length_closes_body_without_reading(self):
+        body = mock.Mock()
+        with self.assertRaisesRegex(m.StagingError, "response_rejected"):
+            self.run_stage(response=lambda *_: (1, body))
+        body.read.assert_not_called()
+        body.close.assert_called_once()
+
+    def test_close_failure_consumes_attempt(self):
+        body = io.BytesIO(self.content["model"])
+        with mock.patch.object(body, "close", side_effect=OSError("private secret")):
+            with self.assertRaisesRegex(m.StagingError, "^close_failed$"):
+                self.run_stage(response=lambda *_: (len(self.content["model"]), body))
+        body.close()
+        with self.assertRaisesRegex(m.StagingError, "attempt_used"):
+            self.run_stage()
+
+    def test_transport_failure_scrubbed_without_retry(self):
+        transport = mock.Mock(side_effect=RuntimeError("private secret"))
+        with self.assertRaisesRegex(m.StagingError, "^staging_failed$"):
+            self.run_stage(response=transport)
+        transport.assert_called_once()
+
+    def test_expired_deadline_does_not_start(self):
+        with self.assertRaisesRegex(m.StagingError, "deadline"):
+            self.run_stage(deadline=time.monotonic() - 1)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_deadline_during_read_rejects_before_write(self):
+        with tempfile.TemporaryFile() as output:
+            with mock.patch.object(m.time, "monotonic", side_effect=[0, 2]):
+                with self.assertRaisesRegex(m.StagingError, "deadline"):
+                    m._copy(io.BytesIO(self.content["model"]), output.fileno(), self.rows[0], 1)
+            self.assertEqual(output.tell(), 0)
+
+    def test_short_writes_are_completed(self):
+        write = os.write
+        with tempfile.TemporaryFile() as output:
+            with mock.patch.object(m.os, "write", side_effect=lambda fd, raw: write(fd, raw[:2])):
+                m._copy(io.BytesIO(self.content["model"]), output.fileno(),
+                        self.rows[0], time.monotonic()+5)
+            output.seek(0)
+            self.assertEqual(output.read(), self.content["model"])
+
+    def test_zero_write_fails(self):
+        with tempfile.TemporaryFile() as output, mock.patch.object(m.os, "write", return_value=0):
+            with self.assertRaisesRegex(m.StagingError, "write_failed"):
+                m._copy(io.BytesIO(self.content["model"]), output.fileno(),
+                        self.rows[0], time.monotonic()+5)
+
+    def test_changed_control_rejected_before_mutation(self):
+        raw = self.raw() + b" "
+        with self.assertRaisesRegex(m.StagingError, "selection_rejected"):
+            self.run_stage(raw=raw)
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_bad_paths_sizes_and_hashes_rejected(self):
+        for key, value in [("target_relative_path", "../escape"), ("target_relative_path", "/abs"),
+                           ("target_relative_path", "a//b"), ("bytes", True), ("bytes", 0),
+                           ("sha256", "bad"), ("role", "dataset")]:
+            original = self.rows[0][key]
+            self.rows[0][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(m.StagingError):
+                m.selection(self.raw())
+            self.rows[0][key] = original
+
+    def test_duplicate_keys_targets_and_file_parent_conflicts_rejected(self):
+        for key, value in [("key", "model"), ("target_relative_path", "model/.metadata"),
+                           ("target_relative_path", "model")]:
+            old = self.rows[1][key]
+            self.rows[1][key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(m.StagingError):
+                m.selection(self.raw())
+            self.rows[1][key] = old
+
+    def test_symlink_existing_input_never_followed(self):
+        (self.root / "inputs").symlink_to(self.root, target_is_directory=True)
+        with self.assertRaisesRegex(m.StagingError, "staging_failed"):
+            self.run_stage()
+        self.assertEqual(self.requests, [])
+
+    def test_public_call_never_grants_admission(self):
+        with self.assertRaisesRegex(m.StagingError, "host_guard_not_bound"):
+            m.stage_inputs(approved=True)
+
+    def test_runtime_before_controls_or_mutation(self):
+        with mock.patch.object(m, "_runtime", side_effect=m.StagingError("runtime_rejected")):
+            with self.assertRaisesRegex(m.StagingError, "runtime_rejected"):
+                self.run_stage(raw=b"invalid")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_nonprivate_directory_rejected_before_response(self):
+        self.root.chmod(0o755)
+        with self.assertRaisesRegex(m.StagingError, "directory_rejected"):
+            self.run_stage()
+        self.assertEqual(self.requests, [])
+
+    def test_disk_failure_closes_stream_and_stops(self):
+        with mock.patch.object(m.os, "write", side_effect=OSError("disk full private path")):
+            with self.assertRaisesRegex(m.StagingError, "^staging_failed$"):
+                self.run_stage()
+        self.assertEqual(self.requests, ["model"])
+        self.assertTrue(self.bodies[0].closed)
+
+    def test_fsync_failure_keeps_marker_and_does_not_start_network(self):
+        with mock.patch.object(m.os, "fsync", side_effect=OSError("private path")):
+            with self.assertRaisesRegex(m.StagingError, "^staging_failed$"):
+                self.run_stage()
+        self.assertTrue((self.root / "acquisition.started").exists())
+        self.assertEqual(self.requests, [])
+
+    def test_read_exception_scrubbed_and_body_closed(self):
+        body = mock.Mock()
+        body.read.side_effect = OSError("source text must not escape")
+        with self.assertRaisesRegex(m.StagingError, "^staging_failed$"):
+            self.run_stage(response=lambda *_: (self.rows[0]["bytes"], body))
+        body.close.assert_called_once()
+
+    def test_chunk_request_size_is_bounded_with_one_eof_probe(self):
+        data = b"x" * (m.CHUNK + 17)
+        stream = io.BytesIO(data)
+        row = {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+        with tempfile.TemporaryFile() as output, mock.patch.object(
+                stream, "read", wraps=stream.read) as reads:
+            m._copy(stream, output.fileno(), row, time.monotonic()+5)
+        self.assertEqual(reads.call_args_list, [mock.call(m.CHUNK), mock.call(17), mock.call(1)])
+
+    def test_too_large_and_nonbyte_reads_rejected_before_write(self):
+        for value in (b"x" * 100, "raw text", None):
+            with self.subTest(kind=type(value).__name__), tempfile.TemporaryFile() as output:
+                body = mock.Mock()
+                body.read.return_value = value
+                with self.assertRaisesRegex(m.StagingError, "stream_rejected"):
+                    m._copy(body, output.fileno(), self.rows[0], time.monotonic()+5)
+                self.assertEqual(output.tell(), 0)
+
+
+class ControlsTests(unittest.TestCase):
+    def test_only_explicit_fullsize_settings_change(self):
+        props, base = controls.import_properties("a" * 32), controls._base()
+        self.assertEqual({k for k in props if props[k] != base.get(k)},
+                         {"MemoryMax", "RuntimeMaxSec", "InaccessiblePaths",
+                          "BindPaths", "BindReadOnlyPaths"})
+        self.assertEqual(props["MemoryMax"], str(64 * 1024**3))
+        self.assertEqual(props["MemorySwapMax"], "0")
+        self.assertEqual(props["PrivateNetwork"], "yes")
+        self.assertEqual(props["RuntimeMaxSec"], "3600")
+        self.assertEqual(props["BindPaths"].split(":"),
+                         ["/var/lib/lumi-vm-fullsize/" + "a" * 32 + "/stage/outputs", "/outputs"])
+        self.assertNotIn("/inputs:", props["TemporaryFileSystem"])
+
+    def test_untrusted_attempt_rejected(self):
+        for attempt in ("../oops", "a" * 31, "A" * 32, True, "/work", "a"*32+" "):
+            with self.subTest(attempt=attempt), self.assertRaises(ValueError):
+                controls.import_properties(attempt)
+
+
+if __name__ == "__main__":
+    unittest.main()

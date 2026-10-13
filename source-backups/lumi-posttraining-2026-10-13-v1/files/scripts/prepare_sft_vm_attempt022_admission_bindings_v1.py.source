@@ -1,0 +1,124 @@
+"""Bind real control readback to fresh admission; no execution authorization."""
+
+import ast
+import json
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_control_package_v1 as source
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE_PLAN = "artifacts/lumi-vm-attempt-022-control-plan-v0.1/plan.json"
+BASE_PLAN_SHA = "0b072f68938e74484501c72e60a57965c5e205e4572af06dcc60ceb00d17fc35"
+WATCH = "evidence/lumi-vm-attempt-022-inert-watchdog-deployment-verification-v0.1.json"
+WATCH_SHA = "90db6968b6a0de3f7d0c600d837a84a288489c639b6cb24c07b8cc4ed65869b7"
+STORE = "evidence/lumi-vm-attempt-022-cleanup-bucket-verification-v0.1.json"
+STORE_SHA = "60e1686affe753f2d94ce9f614d5c796f6288fff5ece48fd2ca5495d9ffdd496"
+PLAN_DIR = "artifacts/lumi-vm-attempt-022-control-plan-v0.2"
+HELPER = "scripts/prepare_sft_vm_attempt022_deployment_bindings_v2.py"
+need, sha, encode, read, write_new = (
+    source.need,
+    source.sha,
+    source.encode,
+    source.read,
+    source.write_new,
+)
+
+
+def build_plan():
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    watch, store = json.loads(read(WATCH, WATCH_SHA)), json.loads(read(STORE, STORE_SHA))
+    for proof in (watch, store):
+        need(proof["attempt"] == source.ATTEMPT)
+        need(proof["cloud_mutations"] == 0 and proof["object_access"] is False)
+        need(proof["full_cpu_execution_authorized"] is False)
+        for path, pin in proof["source_bindings"].items():
+            raw = read(path, pin["sha256"])
+            need(len(raw) == pin["bytes"])
+    need(watch["status"] == "verified_deployed_unarmed_invocation_disabled")
+    need(watch["independent_live_readback"]["reserved_concurrency"] == 0)
+    need(watch["independent_live_readback"]["schedule_group_absent"] is True)
+    need(store["status"] == "verified_private_cleanup_bucket_created")
+    need(store["storage"]["public"] is False)
+    need(store["independent_readback"]["deny_only_policy_verified"] is True)
+    plan.update(
+        schema="lumi.vm-attempt-022-control-plan.v0.2",
+        status="live_controls_verified_fresh_readonly_admission_required",
+        required_control_proofs=[WATCH, STORE],
+        successful_readonly_preflight=None,
+        approval_record=None,
+        execution_permitted=False,
+        gate_5_complete=False,
+    )
+    plan["watchdog"]["status"] = "deployed_unarmed_invocation_disabled_verified"
+    plan["cleanup_store"]["status"] = "private_cleanup_store_verified"
+    plan["readiness_review"]["decision"] = "fresh_full_readonly_preflight_required"
+    plan["unresolved_before_live_execution"] = [
+        "Pass fresh read-only CPU, network, watchdog and cleanup-store admission.",
+        "Bind and approve the final separate one-shot CPU import/private-retention proposal.",
+        "Pass immediate inclusive SDK admission again before the paid execution marker.",
+    ]
+    return plan
+
+
+def prepare():
+    plan = build_plan()
+    raw = encode(plan)
+    release = dict(
+        schema="lumi.vm-attempt-022-control-plan-release.v0.2",
+        attempt=source.ATTEMPT,
+        plan_sha256=sha(raw),
+        plan_bytes=len(raw),
+        source_release_sha256=source.RELEASE_SHA,
+        watchdog_verification_sha256=WATCH_SHA,
+        cleanup_store_verification_sha256=STORE_SHA,
+        live_controls_verified=True,
+        execution_permitted=False,
+    )
+    release_raw = encode(release)
+    helper = helper_source(raw, release_raw)
+    need(not (ROOT / PLAN_DIR).exists() and not (ROOT / HELPER).exists())
+    (ROOT / PLAN_DIR).mkdir(mode=0o700)
+    for path, content in (
+        (PLAN_DIR + "/plan.json", raw),
+        (PLAN_DIR + "/release.json", release_raw),
+        (HELPER, helper),
+    ):
+        write_new(path, content)
+    return dict(plan_sha256=sha(raw), helper_sha256=sha(helper), aws_calls=0)
+
+
+def helper_source(raw, release_raw):
+    helper = read(
+        "scripts/prepare_sft_vm_attempt021_deployment_bindings_v2.py",
+        "711a668f8ed4273fc495e5aa5170f30951cbf8a9cca1549e30ccad5e1c76dc08",
+    )
+    helper = source.rewrite(helper)
+    helper = helper.replace(b"control-plan-v0.3", b"control-plan-v0.2")
+    helper = helper.replace(
+        b"prepare_sft_vm_deployment_bindings_v21",
+        b"prepare_sft_vm_attempt022_deployment_bindings_v1",
+    )
+    values = {
+        "SOURCE_BINDINGS_SHA": "1f41fec5e8c5313ab062902aea42f1880032c1124efc7873c0c5687e00cbd55c",
+        "PLAN_SHA": sha(raw),
+        "PLAN_RELEASE_SHA": sha(release_raw),
+        "WATCH_SHA": WATCH_SHA,
+        "STORE_SHA": STORE_SHA,
+    }
+    for name, value in values.items():
+        row = next(
+            n
+            for n in ast.parse(helper).body
+            if isinstance(n, ast.Assign)
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == name
+        )
+        lines = helper.splitlines(keepends=True)
+        lines[row.lineno - 1 : row.end_lineno] = [f"{name} = {value!r}\n".encode()]
+        helper = b"".join(lines)
+    compile(helper, HELPER, "exec")
+    return helper
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

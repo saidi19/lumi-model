@@ -1,0 +1,205 @@
+"""Bounded CLI process credentials; no global profile changes or secret files.
+
+Each generation is checked against the same AWS account AND principal. SDK calls
+refresh before expiry, but report URLs use one frozen generation and retain its
+original effective expiry. No refresh replays an EC2/S3 operation.
+"""
+
+import datetime as dt
+import json
+import os
+import subprocess
+import time
+from urllib.parse import parse_qs, urlsplit
+
+ACCOUNT, REGION = "573978149073", "us-east-1"
+
+
+def need(value):
+    if not value:
+        raise ValueError("login_refresh_rejected") from None
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def expiry(metadata):
+    parsed = dt.datetime.fromisoformat(metadata["expiry_time"].replace("Z", "+00:00"))
+    need(parsed.tzinfo is not None)
+    return parsed.timestamp()
+
+
+def config(service):
+    from botocore.config import Config
+
+    return Config(
+        signature_version="s3v4" if service == "s3" else "v4",
+        proxies={},
+        retries={"total_max_attempts": 1},
+        connect_timeout=3,
+        read_timeout=5,
+        ignore_configured_endpoint_urls=True,
+        s3={"addressing_style": "virtual"},
+    )
+
+
+def static_client(service, secret):
+    import botocore.session
+
+    return botocore.session.Session().create_client(
+        service,
+        region_name=REGION,
+        endpoint_url=f"https://{service}.{REGION}.amazonaws.com",
+        config=config(service),
+        **secret,
+    )
+
+
+class Reader:
+    def __init__(self, deadline):
+        self.deadline, self.calls, self.principal = deadline, 0, None
+
+    def __call__(self):
+        client = None
+        try:
+            need(time.monotonic() < self.deadline - 30 and self.calls < 8)
+            self.calls += 1
+            response = subprocess.run(
+                [
+                    "/opt/homebrew/bin/aws",
+                    "--profile",
+                    "default",
+                    "configure",
+                    "export-credentials",
+                    "--format",
+                    "process",
+                ],
+                capture_output=True,
+                timeout=20,
+                env=dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER=""),
+            )
+            need(response.returncode == 0 and len(response.stdout) <= 32768)
+            value = json.loads(response.stdout, object_pairs_hook=unique)
+            need(type(value.get("Version")) is int and value["Version"] == 1)
+            need(
+                all(
+                    type(value.get(k)) is str and value[k]
+                    for k in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")
+                )
+            )
+            metadata = dict(
+                access_key=value["AccessKeyId"],
+                secret_key=value["SecretAccessKey"],
+                token=value["SessionToken"],
+                expiry_time=value["Expiration"],
+            )
+            need(expiry(metadata) - time.time() > 60)
+            client = static_client(
+                "sts",
+                dict(
+                    aws_access_key_id=metadata["access_key"],
+                    aws_secret_access_key=metadata["secret_key"],
+                    aws_session_token=metadata["token"],
+                ),
+            )
+            identity = client.get_caller_identity()
+            need(identity["Account"] == ACCOUNT and type(identity.get("Arn")) is str)
+            need(
+                bool(identity["Arn"])
+                and (self.principal is None or identity["Arn"] == self.principal)
+            )
+            self.principal = identity["Arn"]  # Memory-only; never serialized.
+            return metadata
+        except Exception:
+            raise ValueError("login_refresh_failed") from None
+        finally:
+            if client is not None:
+                client.close()
+
+
+def credentials(*, deadline):
+    from botocore.credentials import RefreshableCredentials
+
+    reader = Reader(deadline)
+    initial = reader()
+    remaining = expiry(initial) - time.time()
+    if remaining < 720:
+        # CLI's login provider refreshes cached credentials below five minutes.
+        # Wait BEFORE claiming an attempt or creating any billable resource.
+        delay = max(0, remaining - 290)
+        need(delay <= 430 and time.monotonic() + delay + 900 < deadline)
+        print(
+            json.dumps(
+                {"event": "waiting_for_cli_credential_refresh", "wait_seconds": int(delay) + 1}
+            ),
+            flush=True,
+        )
+        until = time.monotonic() + delay
+        while time.monotonic() < until:
+            time.sleep(min(15, until - time.monotonic()))
+        initial = reader()
+    need(expiry(initial) - time.time() >= 720)
+    return RefreshableCredentials.create_from_metadata(
+        initial,
+        refresh_using=reader,
+        method="lumi-bounded-cli-process",
+        advisory_timeout=180,
+        mandatory_timeout=180,
+    )  # Equal thresholds: refresh errors never silently fall back to stale keys.
+
+
+def clients(secret):
+    import botocore.session
+    from botocore.credentials import RefreshableCredentials
+
+    need(isinstance(secret, RefreshableCredentials))
+    session = botocore.session.Session()
+    session._credentials = secret  # Explicit in-memory provider; no profile/cache mutation.
+    result = {}
+    try:
+        for service in ("sts", "s3", "ec2"):
+            result[service] = session.create_client(
+                service,
+                region_name=REGION,
+                endpoint_url=f"https://{service}.{REGION}.amazonaws.com",
+                config=config(service),
+            )
+        return result
+    except Exception:
+        for client in result.values():
+            client.close()
+        raise ValueError("login_client_setup_failed") from None
+
+
+def issue(client, *, channel, attempt, bindings):
+    """Sign locally with one frozen snapshot. Refresh cannot extend these URLs."""
+    from botocore.credentials import RefreshableCredentials
+
+    provider = client._request_signer._credentials
+    need(isinstance(provider, RefreshableCredentials))
+    frozen = provider.get_frozen_credentials()
+    expires = provider._expiry_time.timestamp()
+    need(expires - time.time() >= 660)
+    signer = static_client(
+        "s3",
+        dict(
+            aws_access_key_id=frozen.access_key,
+            aws_secret_access_key=frozen.secret_key,
+            aws_session_token=frozen.token,
+        ),
+    )
+    try:
+        result = channel.issue(signer, attempt=attempt, bindings=bindings)
+        for url in result["puts"].values():
+            query = parse_qs(urlsplit(url).query)
+            signed = dt.datetime.strptime(query["X-Amz-Date"][0], "%Y%m%dT%H%M%SZ")
+            expires = min(expires, signed.replace(tzinfo=dt.UTC).timestamp() + 900)
+        need(expires - time.time() >= 660)
+        return result, expires
+    finally:
+        signer.close()

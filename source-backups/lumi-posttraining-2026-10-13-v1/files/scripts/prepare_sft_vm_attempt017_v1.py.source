@@ -1,0 +1,92 @@
+"""Offline fresh identity from verified integration; no cloud execution authority."""
+
+import ast
+import json
+import os
+import re
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-cleanup-integration-v0.4"
+BASE_SHA = "2fcea2c3c510d7d12607dc33b8ad5d5aa977cf25dc3953790cf3350ff684f6e1"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-017-source-v0.1"
+OLD = "3f3cb73e00434101943c82601a3fb3bc"
+NEW = "5732548d49854b278ef5ab18199560fc"
+CIDR = "172.31.96.224/27"
+BUCKET = "lumi-cleanup-" + NEW
+PROOF = "evidence/lumi-cleanup-candidate-live-verification-v0.9.json"
+PROOF_SHA = "58bec0be09476188ad1c7d59bffd701853b6efdd89a5396fdcc3b8cd9f152e54"
+CHANGES = ((OLD, NEW), ("attempt-016", "attempt-017"),
+           ("Attempt-016", "Attempt-017"), ("attempt016", "attempt017"),
+           ("172.31.96.192/27", CIDR))
+
+
+def build():
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt012_v1.py",
+                 "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc")
+    proof = json.loads(closure.read(ROOT / PROOF, PROOF_SHA))
+    for name, digest in proof["source_sha256"].items():
+        closure.need(not Path(name).is_absolute() and ".." not in Path(name).parts)
+        closure.read(ROOT / name, digest)
+    closure.need(proof["result"]["probe_reply_matches"] is True)
+    closure.need(proof["result"]["instrumentation"] is False)
+    closure.need(proof["reconciliation"]["disposable_resources_removed"] is True)
+    manifest = json.loads(closure.read(BASE / "release.json", BASE_SHA))
+    original = {n: closure.read(BASE / n, p["sha256"], p["bytes"])
+                for n, p in manifest["outputs"].items()}
+    closure.need(len(original) == 156)
+    preserved = {n for n in original if n.startswith("evidence/")
+                 or "/" not in n or n.endswith((".tar", ".gz", ".pem"))}
+    seeds = dict(original)
+    for name, raw in original.items():
+        if name not in preserved and name.endswith((".py", ".json")):
+            for before, after in CHANGES:
+                raw = raw.replace(before.encode(), after.encode())
+            seeds[name] = raw
+    final = closure.closure(original, seeds, preserved)
+    for name, raw in final.items():
+        if name in preserved:
+            closure.need(raw == original[name])
+        else:
+            closure.need(re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", raw)
+                         == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", seeds[name]))
+        if name.endswith(".py"):
+            ast.parse(raw)
+        if name.startswith("scripts/"):
+            closure.need(OLD.encode() not in raw)
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        closure.need(len(raw) == pin["bytes"] and closure.sha(raw) == pin["sha256"])
+    report = dict(
+        schema="lumi.vm-attempt017-source.v0.1", attempt=NEW, operational_predecessor=OLD,
+        attempt_label="attempt-017", base_release_sha256=BASE_SHA, proof_sha256=PROOF_SHA,
+        cleanup_bucket=BUCKET, selected_cidr=CIDR, selected_cidr_live_absence_verified=False,
+        execution_permitted=False, old_authorization_reused=False, old_timer_reused=False,
+        fresh_controls_required=True, historical_failure_root_cause_resolved=False,
+        predecessor_endpoint="eice-064320cd523dd05e8", live_endpoint_capacity_check_required=True,
+        predecessor_endpoint_disposition_resolved=False,
+        acquisition_and_import_limits_unchanged=True,
+        gate_5_complete=False, gpu=False, training=False,
+        outputs={n: dict(bytes=len(b), sha256=closure.sha(b)) for n, b in sorted(final.items())},
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("source_preparation_is_not_execution_authority")

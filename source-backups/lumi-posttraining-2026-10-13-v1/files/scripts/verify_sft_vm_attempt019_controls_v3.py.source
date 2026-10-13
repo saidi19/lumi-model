@@ -1,0 +1,75 @@
+"""Bind AWS's additive encryption readback fields without weakening AES256."""
+from __future__ import annotations
+
+import hashlib
+from pathlib import Path
+
+from scripts import verify_sft_vm_attempt019_controls_v1 as base
+from scripts import verify_sft_vm_attempt019_controls_v2 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "86efb5b97e8ab6da8a46707f707c12c50e2188d58ea8b2327c94e8154af24f5e"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-019-control-verification-failure-v0.2.json"
+FAILURE_SHA = "e829a6943a1533fba6895dd5afd4928363e1ac2025551846e71159f53bb9c267"
+OBSERVED_ENCRYPTION = {
+    "Rules": [
+        {
+            "ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"},
+            "BucketKeyEnabled": False,
+            "BlockedEncryptionTypes": {"EncryptionType": ["SSE-C"]},
+        }
+    ]
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_verification_v3_rejected") from None
+
+
+def runtime():
+    need(hashlib.sha256(Path(previous.__file__).read_bytes()).hexdigest() == PREVIOUS_SHA)
+    need(FAILURE_SHA is not None)
+    need(hashlib.sha256(FAILURE.read_bytes()).hexdigest() == FAILURE_SHA)
+    previous.runtime()
+    need(not base.WATCH_OUTPUT.exists() and not base.STORE_OUTPUT.exists())
+
+
+def verify_live(cloud):
+    runtime()
+    original = base.bucket_source.ENCRYPTION
+    base.bucket_source.ENCRYPTION = OBSERVED_ENCRYPTION
+    try:
+        return previous.verify_live(cloud)
+    finally:
+        base.bucket_source.ENCRYPTION = original
+
+
+def run():
+    runtime()
+    cloud = base.transport.clients()
+    try:
+        watch, store = verify_live(cloud)
+    finally:
+        for client in cloud.values():
+            client.close()
+    for path, value in ((base.WATCH_OUTPUT, watch), (base.STORE_OUTPUT, store)):
+        raw = base.encode(value)
+        fd = base.os.open(
+            path,
+            base.os.O_WRONLY | base.os.O_CREAT | base.os.O_EXCL | base.os.O_NOFOLLOW,
+            0o400,
+        )
+        with base.os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    print(
+        base.json.dumps(
+            {"watchdog": watch["status"], "cleanup_store": store["status"]},
+            sort_keys=True,
+        )
+    )
+    return watch, store
+
+
+if __name__ == "__main__":
+    run()

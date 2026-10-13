@@ -1,0 +1,364 @@
+"""Pre-fork descriptor topology for the checkpoint write-guard processes.
+
+The outer controller creates six local seqpacket pairs before its guardian
+fork.  After that fork the controller keeps only its four endpoints, while the
+guardian temporarily keeps the eight child-side endpoints required to create
+the broker and worker.  Copies of that guardian-prefork state then transition
+to the broker, worker, or guardian-watch final set.  Those four final sets are
+disjoint and cover all twelve endpoints exactly once.
+
+This component creates no process and performs no protocol operation.  Socket
+metadata and a planned close matrix do not prove that a future compositor used
+the right fork order or excluded inherited copies.  Import is inert, public
+creation is closed, and local tests replace all socket and descriptor calls.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import os
+import socket
+import stat
+import threading
+import time
+from types import MappingProxyType
+
+from . import posttraining_checkpoint_write_listener_v1 as listener
+
+SCHEMA = "lumi.checkpoint-write-topology.v0.1"
+PAIR_ENDPOINTS = (
+    ("control_controller", "control_guardian"),
+    ("ledger_controller", "ledger_broker"),
+    ("broker_report_controller", "broker_report_broker"),
+    ("worker_report_controller", "worker_report_worker"),
+    ("release_guardian", "release_worker"),
+    ("listener_worker", "listener_broker"),
+)
+_CONTROLLER = frozenset({
+    "control_controller", "ledger_controller", "broker_report_controller",
+    "worker_report_controller",
+})
+_GUARDIAN_PREFORK = frozenset(
+    name for pair in PAIR_ENDPOINTS for name in pair if name not in _CONTROLLER
+)
+_BROKER = frozenset({
+    "ledger_broker", "broker_report_broker", "listener_broker",
+})
+_WORKER = frozenset({
+    "worker_report_worker", "release_worker", "listener_worker",
+})
+_GUARDIAN_WATCH = frozenset({"control_guardian", "release_guardian"})
+STAGE_ENDPOINTS = MappingProxyType({
+    "controller": _CONTROLLER,
+    "guardian_prefork": _GUARDIAN_PREFORK,
+    "broker": _BROKER,
+    "worker": _WORKER,
+    "guardian_watch": _GUARDIAN_WATCH,
+})
+_ALLOWED = MappingProxyType({
+    "initial": frozenset({"controller", "guardian_prefork"}),
+    "guardian_prefork": frozenset({"broker", "worker", "guardian_watch"}),
+})
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "already_attempted", "already_failed", "reentry", "socket_rejected",
+    "descriptor_changed", "transition_rejected", "cleanup_unconfirmed",
+})
+FALSE_FLAGS = (
+    "processes_spawned", "fork_order_verified", "inherited_copies_closed",
+    "peer_origin_authenticated", "peer_exclusivity_verified",
+    "listener_transferred", "ready_received", "guardian_armed",
+    "release_consumed", "ledger_exchanged", "children_reaped",
+    "native_write_enforcement_verified", "bootstrap_integration_verified",
+    "execution_permitted", "real_4b_import", "gate_5_complete",
+    "training_authorized", "production_eligible", "retry_allowed",
+)
+_ATTEMPTED = False
+_BUILD = object()
+
+
+class TopologyError(ValueError):
+    def __init__(self, code="socket_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "socket_rejected"
+        super().__init__(self.code)
+
+
+def _need(condition, code="socket_rejected"):
+    if not condition:
+        raise TopologyError(code) from None
+
+
+def create_write_topology(**_arguments):
+    """No approval, deadline or caller-supplied socket opens the private path."""
+    raise TopologyError("host_guard_not_bound") from None
+
+
+def _runtime():
+    try:
+        listener._runtime()
+        _need(hasattr(socket, "socketpair") and hasattr(socket, "SOCK_CLOEXEC")
+              and hasattr(socket, "SOCK_NONBLOCK"), "runtime_rejected")
+    except BaseException:
+        raise TopologyError("runtime_rejected") from None
+
+
+def _make_pair():
+    kind = socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC | socket.SOCK_NONBLOCK
+    return socket.socketpair(socket.AF_UNIX, kind)
+
+
+def _endpoint_identity(endpoint):
+    try:
+        _need(type(endpoint) is socket.socket, "socket_rejected")
+        fd = endpoint.fileno()
+        _need(type(fd) is int and 3 <= fd < 2**31, "socket_rejected")
+        info = os.fstat(fd)
+        descriptor_flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+        status_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        domain = endpoint.getsockopt(socket.SOL_SOCKET, 39)
+        kind = endpoint.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE)
+        peer = endpoint.getpeername()
+        _need(all(type(value) is int for value in (
+                  info.st_dev, info.st_ino, info.st_mode, info.st_uid,
+                  info.st_gid, descriptor_flags, status_flags, domain, kind))
+              and stat.S_ISSOCK(info.st_mode) and info.st_ino > 0
+              and info.st_uid == info.st_gid == 0
+              and descriptor_flags == fcntl.FD_CLOEXEC
+              and status_flags & os.O_ACCMODE == os.O_RDWR
+              and status_flags & os.O_NONBLOCK
+              and domain == socket.AF_UNIX and kind == socket.SOCK_SEQPACKET
+              and type(peer) in (str, bytes), "socket_rejected")
+        return (
+            fd, info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode),
+            info.st_uid, info.st_gid, descriptor_flags, status_flags,
+        )
+    except TopologyError:
+        raise
+    except BaseException:
+        raise TopologyError("socket_rejected") from None
+
+
+def _close_created(endpoints):
+    failed = False
+    for endpoint in reversed(endpoints):
+        try:
+            endpoint.close()
+        except BaseException:
+            failed = True
+    _need(not failed, "cleanup_unconfirmed")
+
+
+class _Topology:
+    """One process-local copy of the pre-fork topology and its close state."""
+
+    def __init__(self, endpoints, identities, deadline_ns, token):
+        _need(token is _BUILD and type(endpoints) is dict and type(identities) is dict
+              and set(endpoints) == set(identities)
+              == {name for pair in PAIR_ENDPOINTS for name in pair},
+              "arguments_rejected")
+        self._live = dict(endpoints)
+        self._identities = dict(identities)
+        self._deadline_ns = deadline_ns
+        self._owner = os.getpid(), threading.get_ident()
+        self._stage = "initial"
+        self._failed = False
+        self._closed = 0
+        self._adoptions = 0
+        self._ambiguous = []
+        self._lock = threading.Lock()
+
+    def _enter(self):
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()),
+                  "transition_rejected")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            try:
+                _need(not self._failed, "already_failed")
+                now = time.monotonic_ns()
+                _need(type(now) is int and 0 <= now < self._deadline_ns,
+                      "transition_rejected")
+                return True
+            except BaseException:
+                self._lock.release()
+                raise
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TopologyError else "transition_rejected"
+            raise TopologyError(code) from None
+
+    def adopt_fork_child_admitted_once(self):
+        """Rebind one inherited copy to the immediate child after a clean fork."""
+        acquired = False
+        try:
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            _need(not self._failed and self._stage in {"initial", "guardian_prefork"},
+                  "transition_rejected")
+            current = os.getpid(), threading.get_ident()
+            now = time.monotonic_ns()
+            _need(all(type(value) is int and value > 0 for value in current)
+                  and current[0] != self._owner[0]
+                  and os.getppid() == self._owner[0]
+                  and threading.current_thread() is threading.main_thread()
+                  and threading.active_count() == 1
+                  and type(now) is int and 0 <= now < self._deadline_ns,
+                  "transition_rejected")
+            self._owner = current
+            self._adoptions += 1
+            return self.snapshot()
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TopologyError else "transition_rejected"
+            raise TopologyError(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def _retire_names(self, names):
+        failed = False
+        for name in tuple(names):
+            endpoint = self._live.pop(name, None)
+            if endpoint is None:
+                continue
+            try:
+                _need(_endpoint_identity(endpoint) == self._identities[name],
+                      "descriptor_changed")
+                endpoint.close()
+                self._closed += 1
+            except BaseException:
+                # Keep the object alive so its destructor cannot later close a
+                # replacement that reused the same numeric descriptor.
+                self._ambiguous.append(endpoint)
+                failed = True
+        return not failed
+
+    def transition_admitted_once(self, stage, *, extra_keep=()):
+        acquired = False
+        try:
+            acquired = self._enter()
+            _need(type(stage) is str and stage in STAGE_ENDPOINTS
+                  and stage in _ALLOWED.get(self._stage, ()),
+                  "transition_rejected")
+            _need(type(extra_keep) is tuple
+                  and all(type(fd) is int and 3 <= fd < 2**31 for fd in extra_keep)
+                  and len(set(extra_keep)) == len(extra_keep),
+                  "arguments_rejected")
+            keep_names = STAGE_ENDPOINTS[stage]
+            _need(keep_names <= self._live.keys(), "transition_rejected")
+            _need(not set(extra_keep) & {
+                identity[0] for identity in self._identities.values()
+            }, "arguments_rejected")
+            identities_ok = all(
+                _endpoint_identity(self._live[name]) == self._identities[name]
+                for name in tuple(self._live)
+            )
+            _need(identities_ok, "descriptor_changed")
+            if not self._retire_names(set(self._live) - keep_names):
+                self._failed = True
+                self._retire_names(tuple(self._live))
+                raise TopologyError("cleanup_unconfirmed") from None
+            _need(set(self._live) == keep_names, "transition_rejected")
+            self._stage = stage
+            kept = tuple(sorted(
+                (self._identities[name][0] for name in keep_names),
+            ))
+            return kept + tuple(sorted(extra_keep))
+        except BaseException as error:
+            if type(error) is TopologyError and error.code not in {
+                    "reentry", "already_failed"}:
+                self._failed = True
+            code = error.code if type(error) is TopologyError else "transition_rejected"
+            raise TopologyError(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def endpoint_admitted(self, name):
+        acquired = False
+        try:
+            acquired = self._enter()
+            _need(type(name) is str and name in self._live, "arguments_rejected")
+            endpoint = self._live[name]
+            _need(_endpoint_identity(endpoint) == self._identities[name],
+                  "descriptor_changed")
+            return endpoint
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is TopologyError else "descriptor_changed"
+            raise TopologyError(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def close_all_admitted_once(self):
+        acquired = False
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()),
+                  "transition_rejected")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            complete = self._retire_names(tuple(self._live))
+            self._failed = self._failed or not complete
+            _need(complete and not self._live, "cleanup_unconfirmed")
+            return self.snapshot()
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def snapshot(self):
+        return {
+            "schema": SCHEMA,
+            "stage": self._stage,
+            "pairs_created": len(PAIR_ENDPOINTS),
+            "endpoints_created": 2 * len(PAIR_ENDPOINTS),
+            "live_endpoints": len(self._live),
+            "closed_endpoints": self._closed,
+            "ambiguous_endpoints": len(self._ambiguous),
+            "fork_child_adoptions": self._adoptions,
+            "terminal_failed": self._failed,
+            "controller_final_endpoints": len(_CONTROLLER),
+            "guardian_prefork_endpoints": len(_GUARDIAN_PREFORK),
+            "broker_final_endpoints": len(_BROKER),
+            "worker_final_endpoints": len(_WORKER),
+            "guardian_watch_final_endpoints": len(_GUARDIAN_WATCH),
+            **dict.fromkeys(FALSE_FLAGS, False),
+        }
+
+
+def _precreate_admitted_once(*, deadline_ns):
+    global _ATTEMPTED
+    try:
+        _runtime()
+    except BaseException:
+        raise TopologyError("runtime_rejected") from None
+    now = time.monotonic_ns()
+    _need(type(deadline_ns) is int and type(now) is int
+          and 0 <= now < deadline_ns < 2**63
+          and deadline_ns - now <= 3600 * 1_000_000_000,
+          "arguments_rejected")
+    _need(not _ATTEMPTED, "already_attempted")
+    _ATTEMPTED = True
+    endpoints = []
+    named = {}
+    identities = {}
+    try:
+        for left_name, right_name in PAIR_ENDPOINTS:
+            left, right = _make_pair()
+            endpoints.extend((left, right))
+            for name, endpoint in ((left_name, left), (right_name, right)):
+                identity = _endpoint_identity(endpoint)
+                _need(identity[0] not in {row[0] for row in identities.values()}
+                      and identity[1:3] not in {row[1:3] for row in identities.values()},
+                      "socket_rejected")
+                named[name] = endpoint
+                identities[name] = identity
+        _need(len(named) == 12, "socket_rejected")
+        return _Topology(named, identities, deadline_ns, _BUILD)
+    except BaseException as error:
+        try:
+            _close_created(endpoints)
+        except BaseException:
+            raise TopologyError("cleanup_unconfirmed") from None
+        code = error.code if type(error) is TopologyError else "socket_rejected"
+        raise TopologyError(code) from None

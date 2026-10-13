@@ -1,0 +1,126 @@
+"""No cloud: unchanged CPU scope and new controls must be independently proven."""
+
+import copy
+import json
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v10 as m
+
+
+class BindingTests(unittest.TestCase):
+    def test_cpu_limits_costs_and_checkpoint_transport_unchanged(self):
+        plan = m.build()
+        old = json.loads(
+            m.read("configs/lumi-vm-attempt-016-deployment-plan-v0.1.json",
+                   "a1b548d3839d46985ff4ea58d1484c45f418c729814ca7effea4cac0bddec3b3"
+                   ).replace(m.OLD.encode(), m.ATTEMPT.encode())
+        )
+        expected = old["cpu_scope_reference"]
+        expected["output"] = "artifacts/lumi-vm-private-outer-execution-v0.20/attempt-017"
+        self.assertEqual(plan["cpu_scope_reference"], expected)
+        self.assertEqual(plan["cost_disclosure"], old["cost_disclosure"])
+        self.assertEqual(
+            plan["cleanup_store"]["deny_statements"], old["cleanup_store"]["deny_statements"]
+        )
+        self.assertEqual(plan["watchdog"]["roles"], old["watchdog"]["roles"])
+        self.assertFalse(plan["execution_permitted"])
+        self.assertFalse(plan["cleanup_store"]["policy_application_authorized"])
+
+    def test_saved_plan_exact_and_no_deployed_claim(self):
+        raw = (m.ROOT / "configs/lumi-vm-attempt-017-deployment-plan-v0.1.json").read_bytes()
+        self.assertEqual(json.loads(raw), m.build())
+        self.assertNotIn("verified_control_evidence", m.build())
+        self.assertFalse((m.ROOT / m.WATCH).exists() or (m.ROOT / m.STORE).exists())
+        with self.assertRaises(ValueError):
+            m.controls()
+
+    def test_pinned_source_and_evidence_drift_rejected(self):
+        for key in ("RELEASE_SHA", "INSPECTION_SHA", "PLAN_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def synthetic_controls(self):
+        plan = m.build()
+        pin = {
+            m.RELEASE + "/release.json": dict(
+                sha256=m.RELEASE_SHA, bytes=len(m.read(m.RELEASE + "/release.json", m.RELEASE_SHA))
+            )
+        }
+        watch = dict(
+            attempt=m.ATTEMPT,
+            source_bindings=pin,
+            status="verified_deployed_unarmed_invocation_disabled",
+            result=dict(
+                deployment=dict(
+                    unarmed_verified=True,
+                    invocation_disabled_verified=True,
+                    code_sha256=plan["watchdog"]["expected_code_sha256_base64"],
+                )
+            ),
+        )
+        store = dict(
+            attempt=m.ATTEMPT,
+            source_bindings=pin,
+            status="verified_private_cleanup_bucket_created",
+            storage=dict(bucket=m.BUCKET, prefix=plan["cleanup_store"]["prefix"]),
+            result=dict(privacy_readback_verified=True),
+        )
+        return watch, store
+
+    def check_controls(self, watch, store):
+        original = m.read
+
+        def read(name, digest=None, size=None):
+            if name in {m.WATCH, m.STORE}:
+                return m.encode(watch if name == m.WATCH else store)
+            return original(name, digest, size)
+
+        with patch.object(m, "read", side_effect=read):
+            return m.controls()
+
+    def test_exact_synthetic_controls_return_evidence_hashes(self):
+        watch, store = self.synthetic_controls()
+        self.assertEqual(
+            self.check_controls(watch, store),
+            {m.WATCH: m.sha(m.encode(watch)), m.STORE: m.sha(m.encode(store))},
+        )
+
+    def test_old_identity_and_wrong_code_or_privacy_are_rejected(self):
+        watch, store = self.synthetic_controls()
+        changes = []
+        a = copy.deepcopy(watch)
+        a["attempt"] = m.OLD
+        changes.append((a, store))
+        a = copy.deepcopy(watch)
+        a["result"]["deployment"]["invocation_disabled_verified"] = False
+        changes.append((a, store))
+        a = copy.deepcopy(watch)
+        a["result"]["deployment"]["code_sha256"] = "wrong"
+        changes.append((a, store))
+        a = copy.deepcopy(store)
+        a["storage"]["bucket"] = "lumi-cleanup-" + m.OLD
+        changes.append((watch, a))
+        a = copy.deepcopy(store)
+        a["result"]["privacy_readback_verified"] = False
+        changes.append((watch, a))
+        for watch, store in changes:
+            with self.assertRaises(ValueError):
+                self.check_controls(watch, store)
+
+    def test_no_implicit_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    import sys
+
+    def guard(event, _args):
+        if event.startswith("socket.") or event == "subprocess.Popen":
+            raise RuntimeError("offline_only")
+
+    sys.addaudithook(guard)
+    unittest.main()
+

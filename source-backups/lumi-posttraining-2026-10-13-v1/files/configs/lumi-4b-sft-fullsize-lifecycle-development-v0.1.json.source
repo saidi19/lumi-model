@@ -1,0 +1,91 @@
+{
+  "schema_version": "lumi.sft-fullsize-lifecycle-development.v0.1",
+  "date": "2026-09-23",
+  "status": "PASS_local_private_lifecycle_code_NOT_native_qualification_or_admission",
+  "repository_commit": "9ab11a99b023409b707b650372f46148ed4a9da1",
+  "scope": "Local private full-size controller/guardian/bootstrap implementation and syscall-double tests. No native execution, payload reads, network or publication.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_fullsize_bootstrap_v1.py",
+      "bytes": 7043,
+      "sha256": "ea7b78cbe5bccdab4d74ef6880da61f5338ebba484dba10ed5c81d8c37284d19"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_fullsize_composition_v1.py",
+      "bytes": 18661,
+      "sha256": "b5a5c1754350c9f20ed030506e1a00482431907ab138fd061c1f3fb0da4c3f66"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_fullsize_bootstrap_v1.py",
+      "bytes": 18062,
+      "sha256": "958252405904d7357d9acda8781a1b12063116883dd04f9b1d118917be734aac"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_fullsize_composition_v1.py",
+      "bytes": 35872,
+      "sha256": "d0819d8043d401267cd7f1a7d6a14588f53844f617cfe15213203591d5f4e96f"
+    },
+    {
+      "path": "configs/lumi-4b-sft-fullsize-entry-development-v0.1.json",
+      "bytes": 5354,
+      "sha256": "3f6e28fbc39c0ac7194974571f8ca3813a706e078a142bbf44b8ad34d4bf7d28"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-fullsize-entry-development-verification-v0.1.json",
+      "bytes": 5216,
+      "sha256": "fb553e77f95ad2901d9503c0276f02d34ae884eb826b26d1731699fea6adf967"
+    }
+  ],
+  "completed": [
+    "Private bootstrap reuses frozen attach, namespace, recursive mount readback, filesystem/IPC isolation, privilege drop and descriptor closure; executes only a fixed future staged entry.",
+    "Parent control and bootstrap start barriers require owned pidfds before start signals; worker release additionally waits for exact READY and installed parent/deadline supervision.",
+    "Private composition binds exact environment pins and worker summaries to the validated full-size entry and mount inventories.",
+    "Full-size driver passes the original absolute deadline unchanged instead of the frozen synthetic run_case 220-second cap; cleanup allowances do not renew the import deadline.",
+    "Failure cleanup uses only the owned controller/worker pidfds and leaf cgroup; ambiguous signal/kill/close operations are never retried; successful exit, receipt and EOF are required."
+  ],
+  "public_boundary": {
+    "composition": "run_fullsize_guard always raises host_guard_not_bound",
+    "bootstrap": "bootstrap always raises host_guard_not_bound",
+    "prior_entry_and_preparation": "Their public APIs remain unchanged and closed.",
+    "private_scope": "Preconditions include independently admitted host/runtime/source staging, input writer exclusion and cumulative native-write enforcement. Private functions cannot establish those premises.",
+    "fixed_future_entry": "/opt/lumi-release/guardian/fullsize_entry.py",
+    "staged_entry_installed_or_authenticated": false,
+    "new_sources_in_native_qualification_manifest": false,
+    "native_calls_in_tests": false
+  },
+  "review_corrections": [
+    "Found synthetic base.run_case hidden 220-second limit; implemented a versioned driver rather than changing frozen code.",
+    "Added controller pre-start barrier so pidfd-open/child-copy-close failure cannot start guardian work.",
+    "Added worker pre-start barrier and retained owned worker pidfd so a bootstrap stalled before cgroup attachment can be terminated."
+  ],
+  "remaining_limitations": [
+    "Fork and subsequent pidfd_open are not atomic. A child stopped before failed pidfd acquisition may require external owner containment; unconfirmed reaping remains cleanup_unconfirmed, never success.",
+    "New lifecycle and start-barrier code has not been qualified on native Linux.",
+    "The fixed executable entry/control loader, authenticated successor staging/closure and native cumulative-write enforcement are not completed by this step.",
+    "Historical dedicated host, runtime/source admission, writer exclusion/immutability, resource/readback and exact real-import authorization requirements remain open."
+  ],
+  "test_summary": {
+    "new_bootstrap": 19,
+    "new_composition": 44,
+    "prior_entry_and_guard": 48,
+    "unchanged_frozen_regressions": 296,
+    "total_unique": 407,
+    "runtimes": [
+      "CPython 3.11.15",
+      "CPython 3.13.7"
+    ]
+  },
+  "nonclaims": {
+    "host_admission_verified": false,
+    "staged_entry_authenticated": false,
+    "native_qualification_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "complete_os_containment_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "publication": false
+  }
+}

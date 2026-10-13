@@ -1,0 +1,90 @@
+# SFT execution status v0.123: corrected native AWS rehearsal passed
+
+2026-09-27 (Dhaka). **The failed-attempt launcher defect is fixed and the
+fresh generated-only Linux recovery passed all four native cases.** Gate 5
+as a whole is not complete: no real 4B checkpoint import or SFT run is claimed.
+
+The user approved a fresh bounded AWS CPU attempt after the v0.122 failure.
+Exactly one new `t3.large` VM and one fresh attempt were used. No test retry,
+resource-limit increase, model-source change or old evidence overwrite occurred.
+
+## Verified fix and results
+
+The v3 entry loads the stdlib-only control file directly, avoiding the eager
+ML registration in `lumi/__init__.py`. On the actual Linux runtime, an import
+guard rejected any attempt to load lumi/torch/transformers/numpy/safetensors.
+Control loading, source verification and host checks passed with **zero such
+imports and 20,476 KiB maximum RSS**. Thus the small resource probes no longer
+import ML before reaching their boundary checks. The fixed chain child alone
+imports ML from exact worker-owned source copies in its private tmpfs.
+
+| Native case | Unchanged limit | Accepted result |
+| --- | --- | --- |
+| Generated import/package chain | 2 GiB, 120 s | Four actual tiny DCP/import/package/checksum/reload tests passed |
+| Timeout with child | 128 MiB, 2 s | systemd timeout; independent observer saw two processes; empty cgroup afterward |
+| Memory allocation | 96 MiB, 15 s | systemd OOM kill; empty cgroup afterward |
+| Storage exhaustion | 256 MiB RAM, 64-MiB tmpfs, 15 s | Fixed worker accepted ENOSPC only after at least 63 MiB written; successful exit; empty cgroup afterward |
+
+The launcher retained `passed_generated_only`, all four case results, and no
+failure record. The read-only observer collected counts/counters, never PID
+values, source text, exception text or worker logs. Its sampled chain memory
+maximum was 286,035,968 bytes and timeout process-count maximum was two. The
+fast memory/disk probes can complete between 50-ms samples: these samples are
+not exhaustive peaks or an independent observation of ENOSPC. Their acceptance
+comes from the unchanged pinned probe code plus systemd terminal outcomes.
+
+All four cgroups were independently confirmed empty after cleanup. The entire
+root-owned source release was hash-verified again after the run. The exact
+started/result records were copied and their remote/local SHA-256 values matched.
+
+Attempt: `435d8eace28f4ade894417325d7636a1`.
+Manifest: `c9571cc65128909a641195e7754995be62341a4d5a42c046dcb08eb936e4c49c`.
+Result file: `0830fb66b849895ed1b4553a28c7e616776cbb53961c0bf81ada202c9a354b9e`.
+
+## Runtime, setup and cleanup
+
+The working final-stage bootstrap v0.3 was reused. Its active/waiting one-hour
+boot-relative expiry was verified before staging and dispatch. Ubuntu 24.04 /
+systemd 255 / signed-apt Python 3.12.3 plus 34 hash-pinned CPU wheels were used:
+torch 2.14.0+cpu, transformers 5.15.1, safetensors 0.8.0, tokenizers 0.22.2 and
+numpy 2.5.3. The 248,715,637 software-download bytes were not model data.
+This is still not the old OCI image identity; that distinction is preserved.
+
+Only an authenticated HTTPS Instance Connect tunnel could reach SSH; no public
+SSH ingress rule was added. The VM had no IAM instance profile, required IMDSv2,
+and used a 20-GiB encrypted, delete-on-termination disk. The setup command was
+initially rejected by the workspace's automatic approval review because of
+credits; it did not execute. After the user reported refill, the same setup
+ran once. This was not a native attempt retry or approval bypass.
+
+The VM is confirmed **terminated**, its EBS volume is absent, the tunnel is
+`delete-complete`, and both temporary security groups and the AWS key
+registration are absent. No pre-existing resource was modified. Ephemeral
+VM files are deleted and not recoverable, while exact run records, source
+archives and aggregate evidence remain in git-ignored local artifacts. No
+training instance is left running for this task.
+
+## Local verification and remaining work
+
+The final local run passed **45 tests, zero failures/errors/skips**: 37 control/
+source-copy tests, two stdlib-entry regressions, three bootstrap tests and three
+aggregate-observer tests. Ruff passed. The extracted source archive's 41 files
+were verified, and its control entry loaded without ML independently of the repo.
+The prior failed marker/result evidence and frozen model/import/package/SFT
+sources remain unchanged. No commit or push was performed.
+
+This closes the **four-case generated-only native rehearsal blocker**, not all
+possible production isolation properties. In particular, no controller-death
+exercise or cumulative-native-write cap is claimed. The launcher itself reports
+that billing/shutdown management is external; this run's operator separately
+verified expiry and performed cleanup.
+
+Next Gate-5 work remains the host-bound real-input/full-size coordinator adapter
+and the independently verified real checkpoint import from the preserved S3
+pretraining lineage. This run accessed no real checkpoint, tokenizer or dataset.
+Gate 6 still requires training-specific approval, GPU smoke/save/resume checks
+and the SFT run, followed by evaluation and serving gates. GPU use, inference,
+training and production eligibility remain false here.
+
+Evidence: `evidence/lumi-4b-sft-aws-rehearsal-v0.2.json`.
+Private exact records: `artifacts/lumi-sft-aws-rehearsal-attempt-v0.2/`.

@@ -1,0 +1,55 @@
+{
+  "schema": "lumi.vm-cleanup-prefix-protection-proposal.v0.1",
+  "status": "proposed_not_authorized_or_applied",
+  "account": "573978149073",
+  "bucket": "lumi-corpus-prod-27777c02b29b76efcac3",
+  "expected_current_policy_canonical_sha256": "1c667839e2b7dfc457252ed45e0a5ab5b2cdd9c1e031c30b958469f8760a85e4",
+  "expected_existing_statement_count": 1,
+  "operation": "Merge these four Deny statements while preserving the complete existing policy. This file is not a replacement bucket policy and does not authorize a write.",
+  "statements_to_add": [
+    {
+      "Sid": "LumiCleanupDenyDeletion",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion"],
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/606d788073f1f0b66a39eabeb4b32c2c/network-cleanup/*"
+    },
+    {
+      "Sid": "LumiCleanupDenyNonconditionalPut",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/606d788073f1f0b66a39eabeb4b32c2c/network-cleanup/*",
+      "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}}
+    },
+    {
+      "Sid": "LumiCleanupDenyOtherEncryption",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/606d788073f1f0b66a39eabeb4b32c2c/network-cleanup/*",
+      "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}}
+    },
+    {
+      "Sid": "LumiCleanupDenyCopy",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::lumi-corpus-prod-27777c02b29b76efcac3/lumi-corpus/v0.1/control/sft-import-research/606d788073f1f0b66a39eabeb4b32c2c/network-cleanup/*",
+      "Condition": {"Null": {"s3:x-amz-copy-source": "false"}}
+    }
+  ],
+  "no_allow_statements_added": true,
+  "existing_policy_preserved": true,
+  "lifecycle_change_allowed": false,
+  "object_access_or_mutation_allowed": false,
+  "iam_lambda_nat_ec2_creation_allowed": false,
+  "training_allowed": false,
+  "single_policy_write_only_after_approval": true,
+  "blind_retry_allowed": false,
+  "important_limits": [
+    "PutBucketPolicy replaces the policy document and has no application-level atomic compare-and-swap in this plan. A pre-write hash check detects prior drift but cannot eliminate a concurrent external administrator race; avoid concurrent policy edits.",
+    "These guards apply only to the dedicated cleanup prefix, not dataset/checkpoint/package paths.",
+    "The deletion guard has no automatic expiry. Future deletion of these small cleanup records requires an explicitly approved guard removal. This proposal does not change lifecycle settings or guarantee protection against future administrator changes."
+  ]
+}

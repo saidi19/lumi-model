@@ -1,0 +1,169 @@
+"""Pure, source-only identity bundle for attempt-008. Never a cloud launcher.
+
+Derive disjoint operational namespaces without changing checkpoint selection,
+limits, watchdog rules or native guard control flow. The returned source package
+is deliberately non-executable until the remaining consumer/archive pins close.
+"""
+
+import ast
+import copy
+import hashlib
+import json
+import re
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+OLD = "606d788073f1f0b66a39eabeb4b32c2c"
+NEW = "242bd09f5fa84b1f9a4e46cb4592ad8b"
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/"
+OUTPUT = "artifacts/lumi-vm-private-outer-execution-v0.8/attempt-008"
+PINS = {
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json": (
+        "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061"
+    ),
+    "scripts/run_sft_vm_early_stop_v2.py": (
+        "c5df93301f80b1f91a9bb8bb3cc2c833134e7a487d88332604dc657c41fce71d"
+    ),
+    "scripts/build_sft_vm_initial_boot_v2.py": (
+        "b54e195627d91e54e409459b08a544596538496a764de49c675418dba7b7b3a2"
+    ),
+    "scripts/sft_vm_external_watchdog_v1.py": (
+        "e1ff9874a5db20d9c56925991ae862740452bac86492757b1001c7349557923f"
+    ),
+    "scripts/sft_vm_network_cleanup_v1.py": (
+        "4c8e49497651b132c5df8b5baef90b6cceb96d5abca80fbbe36f7b5695434799"
+    ),
+    "evidence/lumi-vm-qualified-boot-cpu-integration-v0.1.json": (
+        "f75fbc3bff9454b0b40a041425aa0fadce7c636ed53a9bb45dec852c38a7c431"
+    ),
+    "evidence/lumi-vm-boot-smoke-closure-v0.5.json": (
+        "d18cc2c72317c42ffd5224de2b5a9e1c188cf41febf354242ea5a53cbb86b113"
+    ),
+    "evidence/lumi-vm-private-outer-execution-outcome-v0.7.json": (
+        "4481e3daff3ddd9032db426223bed4126f9bde5511951102a74d2548403b81c7"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("recovery_identity_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encoded(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def inputs():
+    result = {}
+    for name, pin in PINS.items():
+        path = ROOT / name
+        need(not path.is_symlink() and path.stat().st_size <= 131072)
+        raw = path.read_bytes()
+        need(sha(raw) == pin)
+        result[name] = raw
+    return result
+
+
+def rekey(raw):
+    before = f'ATTEMPT = "{OLD}"'.encode()
+    after = f'ATTEMPT = "{NEW}"'.encode()
+    need(raw.count(before) == raw.count(OLD.encode()) == 1)
+    result = raw.replace(before, after)
+    need(result.replace(after, before) == raw)
+    ast.parse(result)
+    return result
+
+
+def build(blobs):
+    need(type(blobs) is dict and set(blobs) == set(PINS))
+    need(all(type(raw) is bytes and sha(raw) == PINS[name] for name, raw in blobs.items()))
+    need(re.fullmatch(r"[0-9a-f]{32}", NEW) and NEW != OLD)
+    boot = json.loads(blobs["evidence/lumi-vm-boot-smoke-closure-v0.5.json"])
+    need(boot["conclusion"]["native_boot_passed"] is True)
+    need(boot["conclusion"]["cleanup_verified"] is True)
+    prior = json.loads(blobs["evidence/lumi-vm-private-outer-execution-outcome-v0.7.json"])
+    need(prior["cleanup"]["stopped_instance_verified"] is True)
+    need(prior["cleanup"]["retained_ebs"] is True)
+    base = json.loads(blobs["configs/lumi-vm-fullsize-host-proposal-v0.1.json"])
+    need(base["prepared_attempt"] == OLD)
+    need(base["retention_proposal"]["prefix"] == PREFIX + OLD + "/")
+    proposal = copy.deepcopy(base)
+    proposal["prepared_attempt"] = NEW
+    proposal["retention_proposal"]["prefix"] = PREFIX + NEW + "/"
+    # Exactly these two identity fields change: no hidden limit/policy widening.
+    restored = copy.deepcopy(proposal)
+    restored["prepared_attempt"] = OLD
+    restored["retention_proposal"]["prefix"] = PREFIX + OLD + "/"
+    need(restored == base and proposal["execution_permitted"] is False)
+    files = {"host-proposal.json": encoded(proposal)}
+    for name in (
+        "run_sft_vm_early_stop_v2.py",
+        "sft_vm_external_watchdog_v1.py",
+        "sft_vm_network_cleanup_v1.py",
+    ):
+        files[name] = rekey(blobs["scripts/" + name])
+    builder = blobs["scripts/build_sft_vm_initial_boot_v2.py"]
+    old_native = PINS["scripts/run_sft_vm_early_stop_v2.py"].encode()
+    need(builder.count(old_native) == 1)
+    files["build_sft_vm_initial_boot_v2.py"] = builder.replace(
+        old_native, sha(files["run_sft_vm_early_stop_v2.py"]).encode()
+    )
+    names = {
+        "client_token": NEW,
+        "instance_tag": NEW,
+        "key_pair": "lumi-fullsize-" + NEW,
+        "watchdog_function": "lumi-stop-" + NEW,
+        "watchdog_worker_role": "lumi-stop-worker-" + NEW,
+        "watchdog_scheduler_role": "lumi-stop-schedule-" + NEW,
+        "watchdog_schedule_group": "lumi-stop-" + NEW,
+        "watchdog_log_group": "/aws/lambda/lumi-stop-" + NEW,
+        "retention_prefix": PREFIX + NEW + "/",
+        "cleanup_claim_prefix": PREFIX + NEW + "/network-cleanup/",
+        "private_output": OUTPUT,
+    }
+    need(all(OLD not in value for value in names.values()))
+    need(
+        all(
+            len(names[k]) <= 64
+            for k in ("watchdog_function", "watchdog_worker_role", "watchdog_scheduler_role")
+        )
+    )
+    manifest = dict(
+        schema="lumi.vm-recovery-identity.v0.1",
+        attempt_label="attempt-008",
+        new_attempt=NEW,
+        predecessor_attempt=OLD,
+        namespaces=names,
+        protected_predecessor=dict(
+            instance=prior["execution"]["instance"],
+            resources=prior["cleanup"]["retained_network"],
+            attached_ebs="Preserve all predecessor-attached EBS; no lookup or mutation here.",
+            authority="Historical evidence only; no current cloud state claim.",
+        ),
+        input_bindings=PINS,
+        files={name: dict(sha256=sha(raw), bytes=len(raw)) for name, raw in files.items()},
+        checkpoint_selection_unchanged=True,
+        limits_unchanged=True,
+        native_control_flow_unchanged=True,
+        native_new_identity_executed=False,
+        installed=False,
+        deployed=False,
+        execution_permitted=False,
+        remaining_bindings=[
+            "Controller/network/setup/native-admission consumers still require new identity pins.",
+            "Rebuild source-only archives and hash closure using the same qualified guard logic.",
+            "New watchdog needs absence/permission checks; never update old watchdog.",
+            "Fresh entry/approval, live quotas and retained-resource isolation remain unbound.",
+        ],
+    )
+    need(sum(map(len, files.values())) + len(encoded(manifest)) <= 131072)
+    return files, manifest
+
+
+def run(**_arguments):
+    raise ValueError("identity_bundle_is_not_execution_authority") from None

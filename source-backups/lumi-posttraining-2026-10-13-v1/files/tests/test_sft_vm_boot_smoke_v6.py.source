@@ -1,0 +1,165 @@
+"""Offline transition regression; this module creates no execution authority."""
+
+import copy
+import importlib
+import json
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+source = (ROOT / "tests/test_sft_vm_boot_smoke_v1.py").read_text()
+old_import = 'm = importlib.import_module("execute_sft_vm_boot_smoke_v1")'
+assert source.count(old_import) == 1
+inherited = types.ModuleType("_smoke_v6_tests")
+exec(
+    compile(
+        source.replace(old_import, 'm = importlib.import_module("execute_sft_vm_boot_smoke_v6")'),
+        "<v6-inherited>",
+        "exec",
+    ),
+    inherited.__dict__,
+)
+m = inherited.m
+old = importlib.import_module("execute_sft_vm_boot_smoke_v5")
+
+
+class TransitionCloud(inherited.Cloud):
+    def __getattr__(self, op):
+        original = super().__getattr__(op)
+
+        def call(**kw):
+            result = original(**kw)
+            if op == "terminate_instances":
+                self.instance["State"]["Name"] = "shutting-down"
+                self.instance.pop("VpcId")
+                self.instance.pop("SubnetId")
+                self.instance["BlockDeviceMappings"] = []
+            elif op == "describe_instances" and self.instance is not None:
+                if self.instance["State"]["Name"] == "shutting-down":
+                    self.instance["State"]["Name"] = "terminated"
+            return result
+
+        return call
+
+
+class TransitionTests(unittest.TestCase):
+    def run_smoke(self, module, cloud):
+        records = {}
+        elapsed = [0]
+
+        def save(name, data):
+            self.assertNotIn(name, records)
+            records[name] = copy.deepcopy(data)
+
+        def sleep(seconds):
+            elapsed[0] += seconds
+
+        smoke = module.Smoke(
+            dict(ec2=cloud, sts=cloud), save, clock=lambda: elapsed[0], sleep=sleep
+        )
+        return smoke.run(), records
+
+    def test_old_guard_reproduces_transition_gap_new_guard_cleans_once(self):
+        with patch.object(old, "TOKEN", m.TOKEN):
+            previous, _ = self.run_smoke(old, TransitionCloud())
+        self.assertTrue(previous["cleanup_failed"])
+        self.assertEqual(previous["cleanup_failed_operation"], "describe_instances")
+        cloud = TransitionCloud()
+        result, records = self.run_smoke(m, cloud)
+        self.assertEqual(result["status"], "boot_passed_cleanup_verified")
+        for operation in ("run_instances", "terminate_instances", "delete_security_group"):
+            self.assertEqual([op for op, _ in cloud.calls].count(operation), 1)
+        shapes = [v for k, v in records.items() if k.startswith("instance-shape-")]
+        self.assertTrue(any(s["state"] == "shutting-down" and not s["vpc_present"] for s in shapes))
+
+    def row(self, state="shutting-down"):
+        return dict(
+            InstanceId=inherited.INSTANCE,
+            ClientToken=m.TOKEN,
+            ImageId=m.AMI,
+            InstanceType="t3.small",
+            State=dict(Name=state),
+            Tags=m.tags("instance")["Tags"],
+        )
+
+    def validate(self, row, claimed=True, bound=True):
+        cloud = types.SimpleNamespace(
+            describe_instances=lambda **_: dict(
+                Reservations=[dict(OwnerId=m.ACCOUNT, Instances=[row])]
+            )
+        )
+        smoke = m.Smoke(dict(ec2=cloud), lambda *_: None, clock=lambda: 0)
+        if bound:
+            smoke.instance = inherited.INSTANCE
+        if claimed:
+            smoke.mutations.add("terminate_instances")
+        return smoke.instance_row()
+
+    def test_detaching_requires_owned_identity_and_prior_termination_claim(self):
+        self.validate(self.row())
+        for claimed, bound in ((False, True), (True, False), (False, False)):
+            with (
+                self.subTest(claimed=claimed, bound=bound),
+                self.assertRaises((KeyError, ValueError)),
+            ):
+                self.validate(self.row(), claimed, bound)
+
+    def test_active_states_cannot_omit_network_even_after_claim(self):
+        for state in ("pending", "running", "stopping", "stopped"):
+            with self.subTest(state=state), self.assertRaises((KeyError, ValueError)):
+                self.validate(self.row(state))
+
+    def test_wrong_ownership_and_conflicting_network_still_rejected(self):
+        for key, value in {
+            "Tags": [],
+            "ClientToken": "foreign",
+            "ImageId": "foreign",
+            "VpcId": "foreign",
+            "SubnetId": "foreign",
+            "InstanceId": "i-" + "e" * 17,
+        }.items():
+            row = self.row()
+            row[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.validate(row)
+
+    def test_transport_failure_distinguished_without_retaining_exception(self):
+        class Cloud(TransitionCloud):
+            def __getattr__(self, op):
+                original = super().__getattr__(op)
+
+                def call(**kw):
+                    if op == "describe_instances" and self.instance is not None:
+                        if self.instance["State"]["Name"] == "shutting-down":
+                            raise TimeoutError("PRIVATE_EXCEPTION")
+                    return original(**kw)
+
+                return call
+
+        result, records = self.run_smoke(m, Cloud())
+        self.assertTrue(result["cleanup_failed"])
+        self.assertFalse(result["cleanup_failed_call_returned"])
+        self.assertNotIn("PRIVATE_EXCEPTION", json.dumps(records))
+
+    def test_validation_failure_distinguished_and_unknown_state_sanitized(self):
+        class Cloud(TransitionCloud):
+            def __getattr__(self, op):
+                original = super().__getattr__(op)
+
+                def call(**kw):
+                    result = original(**kw)
+                    if op == "describe_instances" and result["Reservations"]:
+                        result["Reservations"][0]["Instances"][0]["State"]["Name"] = "PRIVATE_VALUE"
+                    return result
+
+                return call
+
+        result, records = self.run_smoke(m, Cloud())
+        self.assertTrue(result["failed_call_returned"])
+        self.assertNotIn("PRIVATE_VALUE", json.dumps(records))
+
+
+if __name__ == "__main__":
+    unittest.main()

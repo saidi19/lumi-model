@@ -1,0 +1,386 @@
+"""Controller tests: synthetic cloud/SSH, real private pins and receipts."""
+
+import hashlib
+import importlib
+import io
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_retention_issuer_v1 as issuer_tests
+
+m = importlib.import_module("run_sft_vm_retention_delivery_v1")
+BINDING = dict(
+    attempt=m.ATTEMPT,
+    instance="i-" + "1" * 17,
+    endpoint="eice-" + "2" * 17,
+    root_volume="vol-" + "3" * 17,
+    work_volume="vol-" + "4" * 17,
+    vm_group="sg-" + "5" * 17,
+    endpoint_group="sg-" + "6" * 17,
+    key_name="lumi-synthetic",
+)
+
+
+def completed():
+    return dict(
+        schema="lumi.vm-retention-continuation.v0.1",
+        binding_sha256="a" * 64,
+        commit_sha256="b" * 64,
+        offhost_retention_verified=True,
+        retention_cgroup_reaped=True,
+        credential_source_cleanup_complete=True,
+        real_4b_import=False,
+        gate_5_complete=False,
+        training_authorized=False,
+        production_eligible=False,
+        instance_termination_allowed=False,
+        retry_allowed=False,
+    )
+
+
+def observed(state="retention_returned", empty=True):
+    return dict(
+        state=state,
+        parent_cgroup_empty=empty,
+        worker_cgroup_empty=empty,
+        gate_5_complete=False,
+        instance_termination_allowed=False,
+        retry_allowed=False,
+        receipt=completed() if state == "retention_returned" and empty else None,
+    )
+
+
+class Cloud:
+    def __init__(self, states=None, lost_stop=False):
+        self.states = list(states or ["running", "stopping", "stopped"])
+        self.calls = []
+        self.lost_stop = lost_stop
+        self.change = lambda row: row
+
+    def cli(self, service, operation, **fields):
+        self.calls.append((service, operation, fields))
+        if operation == "stop-instances":
+            assert fields == dict(InstanceIds=[BINDING["instance"]], Force=False, Hibernate=False)
+            if self.lost_stop:
+                raise TimeoutError("private-error")
+            return {}
+        assert operation == "describe-instances"
+        assert fields == dict(InstanceIds=[BINDING["instance"]])
+        host = json.loads(m.transport.connection.PROPOSAL.read_bytes())["host"]
+        state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        row = dict(
+            InstanceId=BINDING["instance"],
+            ClientToken=m.ATTEMPT,
+            State=dict(Name=state),
+            Tags=[dict(Key="LumiAttempt", Value=m.ATTEMPT)],
+            KeyName=BINDING["key_name"],
+            ImageId=host["ami"],
+            InstanceType=host["instance_type"],
+            VpcId=host["vpc"],
+            SubnetId=host["subnet"],
+            BlockDeviceMappings=[
+                dict(Ebs=dict(VolumeId=BINDING[k], DeleteOnTermination=False))
+                for k in ("root_volume", "work_volume")
+            ],
+        )
+        return dict(
+            Reservations=[dict(OwnerId=m.issuer.base.ACCOUNT, Instances=[self.change(row)])]
+        )
+
+
+class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.elapsed = 0
+        self.cloud = Cloud()
+        self.calls = []
+        self.responses = [observed("running", False), observed()]
+        self.deadline, self.host_deadline = 1800, 2400
+
+    def wait(self, seconds):
+        self.elapsed += seconds
+
+    def exchange(self, operation, body=b"", **kwargs):
+        self.calls.append(operation)
+        self.assertTrue(0 < kwargs["timeout"] <= 60)
+        if operation == "dispatch":
+            return dict(dispatch_requested=True, workflow_completed=False, gate_5_complete=False)
+        if operation == "submit":
+            self.assertTrue(body)
+            return dict(delivery_sent=True, workflow_completed=False, gate_5_complete=False)
+        if operation == "cancel":
+            return observed("failed")
+        return self.responses.pop(0)
+
+    def deliver(self, exchange=None, raw=b"synthetic-session-secret"):
+        return m._deliver_admitted_once(
+            raw,
+            BINDING,
+            self.root / "delivery",
+            exchange or self.exchange,
+            prior_binding_sha="a" * 64,
+            cloud=self.cloud,
+            deadline=self.deadline,
+            host_deadline=self.host_deadline,
+            clock=lambda: self.elapsed,
+            wait=self.wait,
+        )
+
+    def report(self):
+        raw = (self.root / "delivery/result.json").read_text()
+        self.assertNotIn("synthetic-session-secret", raw)
+        self.assertNotIn("private-error", raw)
+        return json.loads(raw)
+
+    def test_success_waits_for_retention_and_stopped_instance(self):
+        self.assertEqual(self.deliver(), completed())
+        self.assertTrue(self.report()["stopped_verified"])
+        self.assertEqual(self.calls, ["dispatch", "submit", "status", "status"])
+        self.assertEqual(sum(op == "stop-instances" for _, op, _ in self.cloud.calls), 1)
+        with self.assertRaises(FileExistsError):
+            self.deliver()
+
+    def test_ambiguous_submit_no_resend_and_exact_host_stopped(self):
+        def exchange(op, *args, **kwargs):
+            if op == "submit":
+                self.calls.append(op)
+                raise TimeoutError("private-error")
+            return self.exchange(op, *args, **kwargs)
+
+        with self.assertRaises(ValueError):
+            self.deliver(exchange)
+        self.assertEqual(self.calls, ["dispatch", "submit", "cancel"])
+        self.assertTrue(self.report()["stopped_verified"])
+        self.assertFalse(self.report()["retention_verified"])
+
+    def test_ambiguous_dispatch_no_submit(self):
+        def exchange(op, *args, **kwargs):
+            if op == "dispatch":
+                self.calls.append(op)
+                raise TimeoutError()
+            return self.exchange(op, *args, **kwargs)
+
+        with self.assertRaises(ValueError):
+            self.deliver(exchange)
+        self.assertEqual(self.calls, ["dispatch", "cancel"])
+
+    def test_unreachable_guest_still_stops_exact_host(self):
+        with self.assertRaises(ValueError):
+            self.deliver(lambda *a, **kw: (_ for _ in ()).throw(OSError("private-error")))
+        self.assertTrue(self.report()["stopped_verified"])
+        self.assertFalse(self.report()["guest_stop_verified"])
+
+    def test_wrong_receipt_binding_rejected(self):
+        value = observed()
+        value["receipt"]["binding_sha256"] = "c" * 64
+        self.responses = [value]
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertFalse(self.report()["retention_verified"])
+
+    def test_stopped_instance_is_not_retention_success(self):
+        self.cloud = Cloud(["stopped"])
+        self.responses = [observed("failed")]
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertTrue(self.report()["stopped_verified"])
+        self.assertFalse(any(op == "stop-instances" for _, op, _ in self.cloud.calls))
+
+    def test_deadline_reserve_and_expiry_never_renewed(self):
+        self.responses = [observed("running", False)] * 180
+        self.deadline, self.host_deadline = 150, 450
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertLess(self.elapsed, 450)
+        self.assertEqual(self.calls.count("submit"), 1)
+        self.assertEqual(self.calls.count("cancel"), 1)
+
+    def test_bad_deadlines_reject_before_effects(self):
+        for deadline, host in (
+            (120, 500),
+            (1801, 2500),
+            (1800, 2000),
+            (float("nan"), 2400),
+            (True, 2400),
+        ):
+            self.deadline, self.host_deadline = deadline, host
+            with self.assertRaises(ValueError):
+                self.deliver()
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_stop_lost_ack_observed_without_retry(self):
+        self.cloud = Cloud(lost_stop=True)
+        self.deliver()
+        self.assertTrue(self.report()["stopped_verified"])
+        self.assertEqual(sum(op == "stop-instances" for _, op, _ in self.cloud.calls), 1)
+
+    def test_stop_never_confirmed_is_not_success(self):
+        self.cloud = Cloud(["running"])
+        with self.assertRaises(ValueError):
+            self.deliver()
+        self.assertFalse(self.report()["stopped_verified"])
+        self.assertEqual(sum(op == "stop-instances" for _, op, _ in self.cloud.calls), 1)
+        self.assertLessEqual(len(self.cloud.calls), 31)
+
+    def test_mismatched_instance_or_delete_on_termination_never_stopped(self):
+        for mutate in (
+            lambda r: r | {"InstanceId": "i-" + "9" * 17},
+            lambda r: r | {"ClientToken": "0" * 32},
+            lambda r: (
+                r
+                | {
+                    "BlockDeviceMappings": [
+                        dict(Ebs=dict(VolumeId=BINDING["root_volume"], DeleteOnTermination=True))
+                    ]
+                }
+            ),
+        ):
+            cloud = Cloud()
+            cloud.change = mutate
+            result = m._stop_exact_host(BINDING, cloud, 300, clock=lambda: 0, wait=lambda _: None)
+            self.assertFalse(result["stopped_verified"] or result["stop_attempted"])
+
+    def test_issuer_joins_delivery_and_keeps_role_until_stopped(self):
+        cloud = issuer_tests.Fake()
+
+        def deliver(raw):
+            self.assertFalse(cloud.keys)
+            self.assertIn("role", cloud.entities)
+            value = self.deliver(raw=raw)
+            self.assertTrue(self.report()["stopped_verified"])
+            self.assertIn("role", cloud.entities)
+            return value
+
+        with patch.object(m.issuer, "PROPOSAL_SHA", hashlib.sha256(issuer_tests.RAW).hexdigest()):
+            result = m.issuer._run_for_admitted_delivery(
+                issuer_tests.RAW,
+                m.ATTEMPT,
+                self.root / "issuer",
+                deliver,
+                cloud=cloud,
+                now=lambda: issuer_tests.NOW,
+                wait=lambda _: None,
+            )
+        self.assertTrue(result["retention_completion_reported"] and result["cleanup_verified"])
+
+    def test_shapes_and_public_entry_reject(self):
+        for value in (observed() | {"worker_cgroup_empty": 1}, observed() | {"extra": "raw"}):
+            with self.assertRaises(ValueError):
+                m.observe(value)
+        with self.assertRaises(ValueError):
+            m.same(dict(dispatch_requested=1), dict(dispatch_requested=True))
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            m.run(approved=True)
+
+    def test_pinned_ssh_fixed_commands_and_secret_stdin(self):
+        key = self.root / "key"
+        key.write_bytes(b"synthetic-key-never-used")
+        key.chmod(0o600)
+        hosts = b"synthetic-public-key"
+        config = m.transport.connection.ssh_config(BINDING, key, self.root / "known_hosts").encode()
+        for name, raw in (("ssh_config", config), ("known_hosts", hosts)):
+            (self.root / name).write_bytes(raw)
+            (self.root / name).chmod(0o600)
+        ssh = m.SSH(
+            BINDING,
+            key,
+            self.root,
+            hashlib.sha256(config).hexdigest(),
+            hashlib.sha256(hosts).hexdigest(),
+            "c" * 64,
+            remaining_control_bytes=32768,
+        )
+        for operation in ("dispatch", "submit", "status", "cancel"):
+            compile(m.remote_program(operation, "c" * 64), "remote-synthetic", "exec")
+        with patch.object(m.transport, "pipe_exchange", return_value=b"{}") as pipe:
+            ssh("submit", b"synthetic-session-secret", timeout=10)
+            argv, body, _ = pipe.call_args.args
+            self.assertEqual(body, b"synthetic-session-secret")
+            self.assertNotIn("synthetic-session-secret", " ".join(argv))
+            self.assertIn("StrictHostKeyChecking yes", config.decode())
+            self.assertLess(ssh.remaining_control_bytes, 32768)
+            ssh.remaining_control_bytes = 1
+            with self.assertRaises(ValueError):
+                ssh("status", timeout=10)
+            self.assertEqual(pipe.call_count, 1)
+            ssh.remaining_control_bytes = 32768
+            (self.root / "known_hosts").write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                ssh("status", timeout=10)
+            self.assertEqual(pipe.call_count, 1)
+
+    def test_remote_wrapper_executes_status_cancel_and_pinned_receipt(self):
+        binding = b'{"deadline_boottime":1800}'
+        fixture_name = "_retention_remote_synthetic_fixture"
+        fixture = types.ModuleType(fixture_name)
+        fixture.ROOT = self.root
+        fixture.PACKAGE = fixture_name
+        fixture.root_file = lambda *a: binding
+        fixture.sha = lambda raw: hashlib.sha256(raw).hexdigest()
+        fixture.decode = json.loads
+        fixture.execute = lambda operation: (
+            observed() if operation == "status" else {"op": operation}
+        )
+        calls = []
+        frozen = types.SimpleNamespace(cgroup_empty=lambda _: True)
+        parent = types.SimpleNamespace(
+            old=types.SimpleNamespace(
+                handoff=types.SimpleNamespace(
+                    frozen=frozen, _stop_and_reap=lambda unit: calls.append(unit)
+                )
+            ),
+            unit=lambda: "synthetic-parent",
+            _status_admitted=lambda *a: observed(),
+            worker=types.SimpleNamespace(
+                unit_name=lambda _: "synthetic-worker",
+                retention=types.SimpleNamespace(
+                    decode=json.loads, small=lambda *a: json.dumps(completed()).encode()
+                ),
+            ),
+        )
+        source = (
+            f"from {fixture_name} import ROOT,PACKAGE,root_file,sha,decode,execute\n"
+            f"ATTEMPT={m.ATTEMPT!r}\n"
+        ).encode()
+        path = self.root / "entry.py"
+        path.write_bytes(source)
+        path.chmod(0o400)
+        old_lstat, old_fstat = Path.lstat, os.fstat
+
+        def root_owned(info):
+            fields = list(info)
+            fields[0] &= ~0o022
+            fields[4] = fields[5] = 0
+            return os.stat_result(fields)
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    fixture_name: fixture,
+                    fixture_name + ".posttraining_vm_retention_parent_v1": parent,
+                },
+            ),
+            patch.object(m, "ENTRY", str(path)),
+            patch.object(m, "ENTRY_SHA", hashlib.sha256(source).hexdigest()),
+            patch.object(Path, "lstat", lambda p: root_owned(old_lstat(p))),
+            patch.object(os, "fstat", lambda fd: root_owned(old_fstat(fd))),
+        ):
+            for operation in ("status", "cancel"):
+                output = io.BytesIO()
+                program = m.remote_program(operation, hashlib.sha256(binding).hexdigest())
+                with patch.object(sys, "stdout", types.SimpleNamespace(buffer=output)):
+                    exec(compile(program, "synthetic-remote", "exec"), {})
+                value = m.observe(json.loads(output.getvalue()))
+                self.assertEqual(m.receipt(value["receipt"]), completed())
+                self.assertTrue(value["worker_cgroup_empty"])
+            with self.assertRaises(ValueError):
+                exec(compile(m.remote_program("status", "f" * 64), "synthetic-remote", "exec"), {})
+        self.assertEqual(calls, ["synthetic-parent"])

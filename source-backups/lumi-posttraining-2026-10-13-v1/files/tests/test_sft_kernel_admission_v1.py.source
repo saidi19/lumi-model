@@ -1,0 +1,285 @@
+"""Read-only kernel-check composition using synthetic proc/cgroup metadata.
+
+No actual Linux metadata, limit installation, native target or GPU execution.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import json
+import os
+import stat
+import sys
+import time
+import unittest
+from collections import Counter
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from . import test_sft_child_status_v1 as process_status
+from . import test_sft_smoke_bridge_v1 as fixture
+
+admission = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_kernel_admission_v1")
+peers = importlib.import_module(fixture.PACKAGE + ".posttraining_sft_process_peers_v1")
+BOOT = b"11111111-2222-3333-4444-555555555555\n"
+MOUNT = b"27 20 0:42 / /sys/fs/cgroup rw,nosuid,nodev - cgroup2 cgroup rw\n"
+LIMITS = dict(memory_max_bytes=16*1024**2, pids_max=32, cpu_quota_us=100000, cpu_period_us=100000)
+NAMESPACES = {"mnt": (1, 2), "cgroup": (1, 3), "net": (1, 4)}
+
+
+class FakeReader:
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.data = {**admission.cgroup._settings(LIMITS), "boot_id": BOOT,
+                     "cgroup": b"0::/PRIVATE\n", "mountinfo": MOUNT, "cgroup.type": b"domain\n",
+                     "cgroup.events": b"populated 1\nfrozen 0\n"}
+        self.data["status"] = process_status.snapshot({
+            b"Pid": str(os.getpid()).encode(), b"Tgid": str(os.getpid()).encode(),
+            b"NSpid": str(os.getpid()).encode(), b"NStgid": str(os.getpid()).encode(),
+            b"PPid": str(os.getppid()).encode()})
+        self.files = self.capacity = self.bytes_read = self.opens = 0
+        self.counts = Counter()
+        self.closed = False
+        self.identity = (42, 100)
+        self.namespaces = dict(NAMESPACES)
+
+    def directory(self, *_):
+        self.opens += 1
+        return self.opens
+
+    def group(self, root, parts, device):
+        return self.directory(root, parts, device)
+
+    def read(self, name, parent, capacity, magic, **_):
+        self.files += 1
+        self.capacity += capacity + 1
+        self.counts[name] += 1
+        value = self.data[name]
+        raw = value(self.counts[name]) if callable(value) else value
+        self.bytes_read += len(raw)
+        return raw
+
+    def namespace(self, ns, name):
+        return self.namespaces[name]
+
+    def filesystem(self, *_):
+        return self.identity
+
+    def interface_exists(self, *_):
+        return True
+
+    def check(self):
+        pass
+
+    def finish(self):
+        self.closed = True
+        return True
+
+    def summary(self):
+        return {"metadata_bytes_read": self.bytes_read, "read_capacity_bytes": self.capacity}
+
+
+class KernelAdmissionTests(unittest.TestCase):
+    def setUp(self):
+        self.reader = FakeReader(time.monotonic() + 5)
+        self.authorize = Mock(return_value=None)
+
+    def make(self, **changes):
+        return admission.KernelAdmissionCheck(**{
+            "boot_sha256": hashlib.sha256(BOOT).hexdigest(), "group_identity": (42, 100),
+            "namespaces": NAMESPACES, "uid": 34567, "gid": 45678, "limits": LIMITS,
+            "maximum_checks": 2, "authorize": self.authorize, **changes})
+
+    def run_check(self, check):
+        with patch.object(check, "_runtime"):
+            with patch.object(admission, "_Reader", return_value=self.reader):
+                check()
+
+    def error(self, code, operation):
+        with self.assertRaises(admission.KernelAdmissionError) as caught:
+            operation()
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_constructor_inert_and_copies_pins(self):
+        namespaces = dict(NAMESPACES)
+        check = self.make(namespaces=namespaces)
+        namespaces["net"] = (10, 11)
+        self.assertEqual(check._namespaces, NAMESPACES)
+        self.authorize.assert_not_called()
+
+    def test_exact_snapshot_before_and_after_under_reader_caps(self):
+        check = self.make()
+        self.run_check(check)
+        self.assertEqual(check.summary()["checks_passed"], 1)
+        self.assertEqual(self.reader.counts["cpu.max"], 2)
+        self.assertEqual(self.reader.counts["cgroup"], 3)
+        self.assertEqual(self.reader.counts["mountinfo"], 3)
+        self.assertLessEqual(self.reader.files, admission.host.MAXIMUM_FILES)
+        self.assertLessEqual(self.reader.capacity, admission.host.MAXIMUM_READ_CAPACITY)
+        self.assertTrue(self.reader.closed)
+        self.assertNotIn("PRIVATE", json.dumps(check.summary()))
+        self.assertFalse(check.summary()["execution_authorized"])
+
+    def test_real_runtime_refuses_mac_before_authority_or_reader(self):
+        check = self.make()
+        with patch.object(admission.sys, "platform", "darwin"):
+            with patch.object(admission, "_Reader") as reader:
+                self.error("runtime_rejected", check)
+                reader.assert_not_called()
+        self.authorize.assert_not_called()
+
+    def test_denied_authority_never_opens_kernel_metadata(self):
+        check = self.make(authorize=lambda: False)
+        with patch.object(check, "_runtime"):
+            with patch.object(admission, "_Reader") as reader:
+                self.error("authority_rejected", check)
+                reader.assert_not_called()
+
+    def test_runtime_rechecked_after_authority_before_reads(self):
+        check = self.make()
+        with patch.object(check, "_runtime", side_effect=[None,
+                admission.KernelAdmissionError("runtime_rejected")]) as runtime:
+            with patch.object(admission, "_Reader") as reader:
+                self.error("runtime_rejected", check)
+                reader.assert_not_called()
+        self.assertEqual(runtime.call_count, 2)
+        self.authorize.assert_called_once()
+
+    def test_boot_pin_mismatch(self):
+        self.reader.data["boot_id"] = BOOT.replace(b"11111111", b"99999999")
+        self.error("boot_rejected", lambda: self.run_check(self.make()))
+
+    def test_boot_changes_between_snapshots(self):
+        self.reader.data["boot_id"] = lambda n: BOOT if n == 1 else BOOT.replace(b"1", b"9")
+        self.error("boot_rejected", lambda: self.run_check(self.make()))
+
+    def test_group_pin_mismatch(self):
+        self.reader.identity = (42, 101)
+        self.error("identity_rejected", lambda: self.run_check(self.make()))
+
+    def test_namespace_pin_mismatch(self):
+        self.reader.namespaces["net"] = (42, 100)
+        self.error("identity_rejected", lambda: self.run_check(self.make()))
+
+    def test_final_membership_change_rejected(self):
+        self.reader.data["cgroup"] = lambda n: b"0::/PRIVATE\n" if n < 3 else b"0::/other\n"
+        self.error("identity_rejected", lambda: self.run_check(self.make()))
+
+    def test_root_membership_rejected(self):
+        self.reader.data["cgroup"] = b"0::/\n"
+        self.error("identity_rejected", lambda: self.run_check(self.make()))
+
+    def test_each_missing_or_relaxed_limit_rejected(self):
+        for name in admission.cgroup._settings(LIMITS):
+            with self.subTest(name=name):
+                original = self.reader.data[name]
+                self.reader.data[name] = b"max\n"
+                self.error("limits_rejected", lambda: self.run_check(self.make()))
+                self.reader.data[name] = original
+
+    def test_limit_drift_rejected(self):
+        self.reader.data["cpu.max"] = lambda n: b"100000 100000\n" if n == 1 else b"max 100000\n"
+        self.error("limits_rejected", lambda: self.run_check(self.make()))
+
+    def test_capability_and_no_new_privileges_rejection(self):
+        raw = self.reader.data["status"]
+        for name, value in ((b"NoNewPrivs:\t1", b"NoNewPrivs:\t0"),
+                            (b"CapEff:\t0000000000000000", b"CapEff:\t0000000000000001")):
+            self.reader.data["status"] = raw.replace(name, value)
+            self.error("privilege_rejected", lambda: self.run_check(self.make()))
+
+    def test_frozen_or_empty_cgroup_rejected(self):
+        for raw in (b"populated 1\nfrozen 1\n", b"populated 0\nfrozen 0\n"):
+            self.reader.data["cgroup.events"] = raw
+            self.error("limits_rejected", lambda: self.run_check(self.make()))
+
+    def test_failed_read_closes_reader_and_blocks_retry(self):
+        check = self.make()
+        with patch.object(self.reader, "read", side_effect=OSError("PRIVATE")):
+            self.error("kernel_read_failed", lambda: self.run_check(check))
+        self.assertTrue(self.reader.closed)
+        self.error("terminal_failure", check)
+        self.assertNotIn("PRIVATE", json.dumps(check.summary()))
+
+    def test_cleanup_failure_does_not_pass(self):
+        check = self.make()
+        with patch.object(self.reader, "finish", return_value=False):
+            self.error("cleanup_failed", lambda: self.run_check(check))
+        self.assertEqual(check.summary()["checks_passed"], 0)
+
+    def test_close_exception_is_sanitized(self):
+        with patch.object(self.reader, "finish", side_effect=OSError("PRIVATE")):
+            self.error("cleanup_failed", lambda: self.run_check(self.make()))
+
+    def test_deadline_includes_cleanup(self):
+        self.reader.deadline = 0
+        self.error("deadline_exhausted", lambda: self.run_check(self.make()))
+
+    def test_explicit_repeat_budget(self):
+        check = self.make(maximum_checks=1)
+        self.run_check(check)
+        self.error("check_exhausted", check)
+        self.error("terminal_failure", check)
+
+    def test_owner_mismatch(self):
+        check = self.make()
+        with patch.object(admission.os, "getpid", return_value=-1):
+            self.error("owner_mismatch", check)
+
+    def test_reentry_remains_terminal_even_if_callback_swallows_it(self):
+        check = self.make()
+        def authorize():
+            try:
+                check()
+            except admission.KernelAdmissionError:
+                pass
+        check._authorize = authorize
+        self.error("reentry", lambda: self.run_check(check))
+
+    def test_invalid_pins_and_limits_rejected(self):
+        for change in ({"uid": True}, {"maximum_checks": 0}, {"group_identity": (42, 0)},
+                       {"boot_sha256": "x"*64}, {"namespaces": {}}, {"limits": {}}):
+            self.error("invalid_arguments", lambda change=change: self.make(**change))
+
+    def test_root_ownership_and_no_group_write_required(self):
+        for info in (SimpleNamespace(st_uid=1000, st_mode=stat.S_IFDIR|0o755),
+                     SimpleNamespace(st_uid=0, st_mode=stat.S_IFREG|0o664)):
+            with patch.object(admission.os, "fstat", return_value=info):
+                self.error("privilege_rejected", lambda: admission._root_owned(99))
+        with patch.object(admission.os, "fstat", return_value=SimpleNamespace(
+                st_uid=0, st_mode=stat.S_IFREG|0o644)):
+            admission._root_owned(99)
+
+    def test_protected_cgroup_file_ownership_checked_after_open(self):
+        reader = object.__new__(admission._Reader)
+        reader.protected = {77}
+        with patch.object(admission.host.Reader, "open", return_value=99):
+            with patch.object(admission, "_root_owned") as owned:
+                self.assertEqual(reader.open("memory.max", parent=77), 99)
+                owned.assert_called_once_with(99)
+                reader.open("status", parent=88)
+                owned.assert_called_once()
+
+    def test_missing_kill_interface_rejected(self):
+        with patch.object(self.reader, "interface_exists", return_value=False):
+            self.error("limits_rejected", lambda: self.run_check(self.make()))
+
+    def test_process_backend_receives_denial_before_socket_or_spawn(self):
+        check = self.make()
+        self.reader.data["memory.max"] = b"max\n"
+        source = b"pass\n"
+        owner = peers.ProcessPeers(worker_source=source,
+            source_sha256=hashlib.sha256(source).hexdigest(),
+            python_executable=str(Path(sys.executable).resolve()),
+            deadline_ns=time.monotonic_ns()+5_000_000_000, cleanup_milliseconds=1000, admit=check)
+        with patch.object(check, "_runtime"), patch.object(admission, "_Reader",
+                return_value=self.reader), patch.object(peers.subprocess, "Popen") as spawn:
+            with patch.object(peers.socket, "socketpair") as pair:
+                with self.assertRaises(peers.ProcessPeersError):
+                    owner.acquire()
+                spawn.assert_not_called()
+                pair.assert_not_called()
+        self.assertEqual(check.summary()["failure_code"], "limits_rejected")

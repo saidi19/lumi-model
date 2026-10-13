@@ -1,0 +1,218 @@
+"""Build inert diagnostic fragments; never modifies or retries attempt-013."""
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-013-source-v0.1"
+BASE_SHA = "b8c4a274eaabe214eb677a8469ef53dabf9d419da9a666e55f20d431d78c6158"
+OUTPUT = ROOT / "artifacts/lumi-vm-initial-proof-diagnostic-fragments-v0.1"
+TEMPLATE = ROOT / "scripts/sft_vm_initial_proof_diagnostics_v1.py"
+NAMES = (
+    "run_sft_vm_detached_delivery_v1.py",
+    "build_sft_vm_initial_boot_v1.py",
+    "run_sft_vm_host_setup_v3.py",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("diagnostic_fragment_build_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def replace_once(raw, old, new):
+    need(raw.count(old) == 1)
+    return raw.replace(old, new)
+
+
+def node_source(raw, name):
+    tree = ast.parse(raw)
+    node = next(n for n in tree.body if getattr(n, "name", None) == name)
+    return ast.get_source_segment(raw, node)
+
+
+def replace_node(raw, name, replacement):
+    return replace_once(raw, node_source(raw, name), replacement)
+
+
+def unchanged_nodes(before, after, excluded):
+    def kept(raw):
+        return [
+            ast.dump(n)
+            for n in ast.parse(raw).body
+            if getattr(n, "name", None) not in excluded
+            and not (
+                isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id in excluded for t in n.targets)
+            )
+        ]
+
+    need(kept(before) == kept(after))
+
+
+def build():
+    manifest_raw = (BASE / "release.json").read_bytes()
+    need(sha(manifest_raw) == BASE_SHA)
+    manifest = json.loads(manifest_raw)
+    original = {}
+    for name in NAMES:
+        path = BASE / "scripts" / name
+        need(not any(p.is_symlink() for p in (path, *path.parents)))
+        body = path.read_bytes()
+        pin = manifest["outputs"]["scripts/" + name]
+        need(len(body) == pin["bytes"] and sha(body) == pin["sha256"])
+        original[name] = body.decode()
+    template = TEMPLATE.read_text()
+    members = {
+        "EXCHANGE_STAGES",
+        "EXIT_KINDS",
+        "REMOTE_STAGES",
+        "ExchangeFailure",
+        "exchange_diagnostic",
+        "remote_failure_stage",
+        "pipe_exchange",
+    }
+    additions = []
+    for node in ast.parse(template).body:
+        names = {getattr(node, "name", None)}
+        if isinstance(node, ast.Assign):
+            names |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if names & members:
+            additions.append(ast.get_source_segment(template, node))
+    transport = replace_node(original[NAMES[0]], "pipe_exchange", "\n\n".join(additions))
+    unchanged_nodes(original[NAMES[0]], transport, members)
+    launcher = node_source(original[NAMES[1]], "proof_launcher")
+    launcher = replace_once(
+        launcher,
+        "from pathlib import Path\ntry:",
+        'from pathlib import Path\ndiagnostic_stage="alarm"\ntry:',
+    )
+    for old, new in (
+        (
+            " for parent in (p.parent,*p.parent.parents):",
+            ' diagnostic_stage="parents"\n for parent in (p.parent,*p.parent.parents):',
+        ),
+        (" fd=os.open(p,", ' diagnostic_stage="source_read"\n fd=os.open(p,'),
+        (
+            " assert hashlib.sha256(raw).hexdigest()==",
+            ' diagnostic_stage="source_hash"\n assert hashlib.sha256(raw).hexdigest()==',
+        ),
+        (
+            " m=types.ModuleType('_early_guard');",
+            " diagnostic_stage=\"module_load\"\n m=types.ModuleType('_early_guard');",
+        ),
+        (" assert m.read(p)==raw", ' diagnostic_stage="source_recheck"\n assert m.read(p)==raw'),
+        (" result=m._proof()", ' diagnostic_stage="guard_proof"\n result=m._proof()'),
+        (
+            " sys.stdout.buffer.write(m.canonical(result));",
+            ' diagnostic_stage="reply_write"\n sys.stdout.buffer.write(m.canonical(result));',
+        ),
+        (
+            "except BaseException:\n sys.exit(2)",
+            "except BaseException:\n try:\n"
+            '  failure=dict(schema="lumi.initial-proof-failure.v1",code=diagnostic_stage)\n'
+            '  sys.stdout.write(json.dumps(failure,separators=(",",":"))+"\\\\n");'
+            "sys.stdout.flush()\n except BaseException:\n  pass\n sys.exit(2)",
+        ),
+    ):
+        launcher = replace_once(launcher, old, new)
+    boot = replace_node(original[NAMES[1]], "proof_launcher", launcher)
+    unchanged_nodes(original[NAMES[1]], boot, {"proof_launcher"})
+    host = original[NAMES[2]]
+    for old, new in (
+        (
+            '        config_sha = prepared["ssh_config_sha256"]',
+            '        proof_substage = "known_hosts"\n'
+            '        config_sha = prepared["ssh_config_sha256"]',
+        ),
+        (
+            "        argv = delivery.seed.sender.command(\n",
+            '        proof_substage = "launcher"\n        launcher = initial.proof_launcher()\n'
+            '        proof_substage = "command"\n        argv = delivery.seed.sender.command(\n',
+        ),
+        ("config_sha, hosts_sha, initial.proof_launcher()", "config_sha, hosts_sha, launcher"),
+        (
+            "        proof_charge = len(argv[-1].encode())",
+            '        proof_substage = "pre_exchange_budget"\n'
+            "        proof_charge = len(argv[-1].encode())",
+        ),
+        (
+            "        proof = initial.validate_proof("
+            'delivery.seed.sender.delivery.pipe_exchange(argv, b"", 25))',
+            '        proof_substage = "exchange"\n'
+            '        raw_proof = delivery.seed.sender.delivery.pipe_exchange(argv, b"", 25)\n'
+            '        proof_substage = "proof_validation"\n'
+            "        proof = initial.validate_proof(raw_proof)\n"
+            '        proof_substage = "boottime_consistency"',
+        ),
+        (
+            "        original_host_deadline_boottime = math.floor(",
+            '        proof_substage = "deadline_conversion"\n'
+            "        original_host_deadline_boottime = math.floor(",
+        ),
+        (
+            '        delivery.seed.INPUTS.write(output / "initial-proof.json",',
+            '        proof_substage = "proof_receipt"\n'
+            '        delivery.seed.INPUTS.write(output / "initial-proof.json",',
+        ),
+        (
+            '    except BaseException:\n        report["failed_stage"] = stage',
+            '    except BaseException as error:\n        report["failed_stage"] = stage\n'
+            '        if stage == "initial_boot_proof":\n'
+            '            report["initial_proof_failure"] = dict(\n'
+            "                stage=proof_substage,\n"
+            "                **delivery.seed.sender.delivery.exchange_diagnostic(error),\n"
+            "            )",
+        ),
+    ):
+        host = replace_once(host, old, new)
+    unchanged_nodes(original[NAMES[2]], host, {"_prepare_and_setup_admitted_once"})
+    files = dict(zip(NAMES, (transport.encode(), boot.encode(), host.encode()), strict=True))
+    for name, raw in files.items():
+        compile(raw, name, "exec")
+    report = dict(
+        schema="lumi.initial-proof-diagnostic-fragments.v0.1",
+        status="local_fragments_only_not_hash_closed_or_executable",
+        base_release_sha256=BASE_SHA,
+        consumed_identity_retained=True,
+        full_runtime_integration_required=True,
+        fresh_execution_authority_required=True,
+        execution_permitted=False,
+        cpu_retry=False,
+        raw_exception_or_stderr_retained=False,
+        timeout_or_policy_relaxation=False,
+        source_bindings={
+            str(TEMPLATE.relative_to(ROOT)): dict(
+                bytes=len(template.encode()), sha256=sha(template.encode())
+            )
+        },
+        outputs={name: dict(bytes=len(raw), sha256=sha(raw)) for name, raw in files.items()},
+    )
+    return files, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    files["release.json"] = (json.dumps(report, sort_keys=True, indent=2) + "\n").encode()
+    for name, raw in files.items():
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("fragments_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

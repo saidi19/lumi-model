@@ -1,0 +1,343 @@
+"""Sealed protocol tests use synthetic descriptors, polls and raw I/O only."""
+
+import ctypes
+import importlib
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_write_protocol"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_protocol_v1")
+PRIVATE = "PRIVATE-NOT-RETAINED"
+REPORT, RELEASE = 71, 83
+NOW, DEADLINE = 10**9, 11 * 10**9
+
+
+class NativeWireTests(unittest.TestCase):
+    def test_scalar_read_uses_two_bytes_to_reject_long_seqpackets(self):
+        def syscall(number, descriptor, pointer, size):
+            self.assertEqual((number, descriptor.value, size.value), (0, RELEASE, 2))
+            ctypes.memmove(pointer, b"Gx", 2)
+            return 2
+
+        with patch.object(m.listener.frozen, "_system_call", side_effect=syscall):
+            self.assertEqual(m._read_packet(RELEASE), b"Gx")
+
+    def test_scalar_writes_are_exact_and_do_not_retry_failure(self):
+        def syscall(number, descriptor, pointer, size):
+            self.assertEqual((number, descriptor.value, size.value), (1, REPORT, 1))
+            self.assertEqual(ctypes.string_at(pointer, size.value), b"C")
+            return 1
+
+        with patch.object(m.listener.frozen, "_system_call", side_effect=syscall):
+            m._write_token(REPORT, b"C")
+        for result in (-1, 0, 2, True):
+            with self.subTest(result=result), patch.object(
+                m.listener.frozen, "_system_call", return_value=result,
+            ) as call, self.assertRaises(m.ProtocolError):
+                m._write_token(REPORT, b"R")
+            call.assert_called_once()
+
+    def test_read_rejects_invalid_syscall_returns(self):
+        for result in (-1, 3, True, None):
+            with self.subTest(result=result), patch.object(
+                m.listener.frozen, "_system_call", return_value=result,
+            ) as call, self.assertRaises(m.ProtocolError):
+                m._read_packet(RELEASE)
+            call.assert_called_once()
+
+    def test_poll_is_one_raw_syscall_with_no_implicit_retry(self):
+        def syscall(number, pointer, count, timeout):
+            value = ctypes.cast(pointer, ctypes.POINTER(m._PollFD)).contents
+            self.assertEqual((number, value.fd, value.events, count.value, timeout.value),
+                             (7, RELEASE, 0x19, 1, 250))
+            value.revents = 0x11
+            return 1
+
+        with patch.object(m.listener.frozen, "_system_call", side_effect=syscall) as call:
+            self.assertEqual(m._poll_once(RELEASE, 0x19, 250), 0x11)
+        call.assert_called_once()
+        for result in (-1, 0, 2, True):
+            with self.subTest(result=result), patch.object(
+                    m.listener.frozen, "_system_call", return_value=result) as call, \
+                    self.assertRaises(m.ProtocolError):
+                m._poll_once(RELEASE, 0x19, 250)
+            call.assert_called_once()
+
+    def test_public_entry_and_unknown_errors_are_closed(self):
+        for arguments in ({}, {"approved": True}, {"ready": b"R"}):
+            with self.assertRaises(m.ProtocolError) as caught:
+                m.run_worker_protocol(**arguments)
+            self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.assertEqual(str(m.ProtocolError(PRIVATE)), "io_failed")
+
+
+class ProtocolTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.now = NOW
+        self.packets = [b"G", b""]
+        self.flags = [0x001, 0x001 | 0x010]
+        self.identities = {fd: (1, fd, 0o140600, 0, 0, 1, 0x802)
+                           for fd in (REPORT, RELEASE)}
+        self.runtime = self.enterContext(patch.object(m.listener.frozen, "_runtime"))
+        self.guard_runtime = self.enterContext(patch.object(m.guardian, "_runtime"))
+        self.descriptor = self.enterContext(patch.object(m.guardian, "_release_descriptor"))
+        self.fcntl = self.enterContext(patch.object(
+            m.fcntl, "fcntl", return_value=m.os.O_RDWR | m.os.O_NONBLOCK,
+        ))
+        self.identity = self.enterContext(patch.object(
+            m, "_identity", side_effect=lambda fd: self.identities[fd],
+        ))
+        self.pid = self.enterContext(patch.object(m.os, "getpid", return_value=123))
+        self.thread = self.enterContext(patch.object(m.threading, "get_ident", return_value=456))
+        self.sigpipe = self.enterContext(patch.object(
+            m.signal, "getsignal", return_value=m.signal.SIG_IGN,
+        ))
+        self.clock = self.enterContext(patch.object(
+            m.time, "monotonic_ns", side_effect=lambda: self.now,
+        ))
+        self.sealed = self.enterContext(patch.object(m.listener, "_require_sealed_owner"))
+        self.read = self.enterContext(patch.object(m, "_read_packet", side_effect=self.receive))
+        self.write = self.enterContext(patch.object(m, "_write_token", side_effect=self.send))
+        self.close = self.enterContext(patch.object(
+            m.os, "close", side_effect=lambda fd: self.events.append(("close", fd)),
+        ))
+        self.poll = self.enterContext(patch.object(
+            m, "_poll_once", side_effect=lambda _fd, _mask, _ms: self.flags.pop(0),
+        ))
+        self.tripwire = self.enterContext(patch.object(
+            m.listener.frozen, "_system_call", side_effect=AssertionError("native tripwire"),
+        ))
+
+    def tearDown(self):
+        self.tripwire.assert_not_called()
+
+    def protocol(self, **changes):
+        values = {"report_fd": REPORT, "release_fd": RELEASE, "deadline_ns": DEADLINE}
+        values.update(changes)
+        return m._WorkerProtocol(**values)
+
+    def receive(self, fd):
+        self.assertEqual(fd, RELEASE)
+        self.events.append(("read", fd))
+        return self.packets.pop(0)
+
+    def send(self, fd, token):
+        self.events.append(("write", fd, token))
+
+    def test_exact_success_order_separate_channels_and_borrowed_report(self):
+        session = self.protocol()
+        result = session.run_admitted_once()
+        self.assertEqual(self.events, [
+            ("write", REPORT, b"R"), ("read", RELEASE), ("read", RELEASE),
+            ("close", RELEASE), ("write", REPORT, b"C"),
+        ])
+        self.assertTrue(all(result[name] for name in (
+            "started", "ready_write_returned", "release_token_read",
+            "release_empty_read_after_hup",
+            "release_fd_closed", "consumed_write_returned",
+        )))
+        self.assertFalse(result["report_fd_closed"])
+        self.assertFalse(result["terminal_failed"])
+        self.assertTrue(all(result[name] is False for name in m.FALSE_FLAGS))
+        self.assertFalse({"fd", "pid", "path", "identity", "raw"} & set(result))
+        self.sealed.assert_called_once()
+        self.close.assert_called_once_with(RELEASE)
+
+    def test_channel_alias_or_blocking_descriptor_rejected_before_io(self):
+        for override in ({"release_fd": REPORT}, {"release_fd": True}, {"report_fd": 2}):
+            with self.subTest(override=override), self.assertRaises(m.ProtocolError):
+                self.protocol(**override)
+        self.fcntl.return_value = m.os.O_RDWR
+        with self.assertRaises(m.ProtocolError):
+            self.protocol()
+        self.write.assert_not_called()
+        self.close.assert_not_called()
+
+    def test_two_fd_numbers_for_same_socket_are_rejected(self):
+        self.identities[RELEASE] = self.identities[REPORT]
+        with self.assertRaises(m.ProtocolError) as caught:
+            self.protocol()
+        self.assertEqual(caught.exception.code, "channel_rejected")
+        self.close.assert_not_called()
+
+    def test_invalid_or_expired_deadline_is_rejected(self):
+        for value in (True, NOW, NOW - 1, -1, NOW + 3600 * 10**9 + 1):
+            with self.subTest(value=value), self.assertRaises(m.ProtocolError):
+                self.protocol(deadline_ns=value)
+        self.close.assert_not_called()
+
+    def test_preparation_runtime_errors_have_fixed_code(self):
+        self.runtime.side_effect = m.listener.frozen.ListenerError("runtime_rejected")
+        with self.assertRaises(m.ProtocolError) as caught:
+            self.protocol()
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+        self.close.assert_not_called()
+
+    def test_unsealed_owner_never_sends_ready_or_consumes_release(self):
+        session = self.protocol()
+        self.sealed.side_effect = ValueError(PRIVATE)
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "seal_rejected")
+        self.assertFalse(session.snapshot()["started"])
+        self.write.assert_not_called()
+        self.close.assert_not_called()
+
+    def test_wrong_owner_never_sends_ready(self):
+        session = self.protocol()
+        self.pid.return_value = 999
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "owner_mismatch")
+        self.write.assert_not_called()
+        self.close.assert_not_called()
+
+    def test_ready_failure_consumes_and_closes_release_once(self):
+        session = self.protocol()
+        self.write.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "io_failed")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.close.assert_called_once_with(RELEASE)
+        self.read.assert_not_called()
+        with self.assertRaises(m.ProtocolError):
+            session.run_admitted_once()
+        self.close.assert_called_once_with(RELEASE)
+        self.write.assert_called_once()
+
+    def test_invalid_release_packet_prevents_consumed_ack(self):
+        for packet in (b"", b"X", b"Gx", bytearray(b"G")):
+            with self.subTest(packet_type=type(packet)):
+                session = self.protocol()
+                self.packets = [packet]
+                self.flags = [0x001]
+                self.events.clear()
+                with self.assertRaises(m.ProtocolError):
+                    session.run_admitted_once()
+                self.assertNotIn(("write", REPORT, b"C"), self.events)
+                self.assertIn(("close", RELEASE), self.events)
+
+    def test_duplicate_packet_and_empty_packet_without_eof_rejected(self):
+        for packet, flags in ((b"G", 0x001), (b"", 0x001)):
+            with self.subTest(packet=packet, flags=flags):
+                session = self.protocol()
+                self.packets = [b"G", packet]
+                self.flags = [0x001, flags]
+                self.events.clear()
+                with self.assertRaises(m.ProtocolError):
+                    session.run_admitted_once()
+                self.assertFalse(session.snapshot()["consumed_write_returned"])
+
+    def test_bad_poll_events_are_terminal(self):
+        for flags in (0, 0x020, True, 0x001 | 0x020):
+            with self.subTest(flags=flags):
+                session = self.protocol()
+                self.poll.side_effect = None
+                self.poll.return_value = flags
+                with self.assertRaises(m.ProtocolError):
+                    session.run_admitted_once()
+        self.read.assert_not_called()
+
+    def test_deadline_after_poll_never_reads_or_releases_work(self):
+        session = self.protocol()
+
+        def expire(_fd, _mask, _timeout):
+            self.now = DEADLINE
+            return 0x001
+
+        self.poll.side_effect = expire
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "deadline_exhausted")
+        self.read.assert_not_called()
+        self.close.assert_called_once_with(RELEASE)
+
+    def test_expired_before_ready_has_no_write(self):
+        session = self.protocol()
+        self.now = DEADLINE
+        with self.assertRaises(m.ProtocolError):
+            session.run_admitted_once()
+        self.write.assert_not_called()
+        self.close.assert_called_once_with(RELEASE)
+
+    def test_release_identity_change_does_not_close_replacement(self):
+        session = self.protocol()
+        self.identities[RELEASE] = (9, 99, 0o140600, 0, 0, 1, 0x802)
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "close_failed")
+        self.close.assert_not_called()
+        with self.assertRaises(m.ProtocolError):
+            session.run_admitted_once()
+        self.close.assert_not_called()
+
+    def test_ambiguous_close_is_not_retried_and_prevents_ack(self):
+        session = self.protocol()
+        self.close.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "close_failed")
+        self.close.assert_called_once_with(RELEASE)
+        self.assertFalse(session.snapshot()["consumed_write_returned"])
+
+    def test_consumed_ack_failure_does_not_reopen_or_reclose_release(self):
+        session = self.protocol()
+
+        def send(fd, token):
+            if token == b"C":
+                raise OSError(PRIVATE)
+
+        self.write.side_effect = send
+        with self.assertRaises(m.ProtocolError):
+            session.run_admitted_once()
+        self.close.assert_called_once_with(RELEASE)
+        self.assertFalse(session.snapshot()["consumed_write_returned"])
+
+    def test_sigpipe_disposition_change_prevents_scalar_write(self):
+        session = self.protocol()
+        self.sigpipe.return_value = m.signal.SIG_DFL
+        with self.assertRaises(m.ProtocolError) as caught:
+            session.run_admitted_once()
+        self.assertEqual(caught.exception.code, "runtime_rejected")
+        self.write.assert_not_called()
+
+    def test_swallowed_reentry_consumes_outer_operation(self):
+        session = self.protocol()
+
+        def reenter(_fd, _token):
+            try:
+                session.run_admitted_once()
+            except m.ProtocolError:
+                pass
+
+        self.write.side_effect = reenter
+        with self.assertRaises(m.ProtocolError):
+            session.run_admitted_once()
+        self.assertTrue(session.snapshot()["terminal_failed"])
+        self.assertFalse(session.snapshot()["consumed_write_returned"])
+        self.close.assert_called_once_with(RELEASE)
+        self.assertFalse(session._lock.locked())
+
+    def test_returned_snapshot_cannot_change_private_state(self):
+        session = self.protocol()
+        result = session.run_admitted_once()
+        result["started"] = False
+        result["release_fd_closed"] = False
+        self.assertTrue(session.snapshot()["started"])
+        self.assertTrue(session.snapshot()["release_fd_closed"])
+        with self.assertRaises(m.ProtocolError):
+            session.run_admitted_once()
+        self.close.assert_called_once_with(RELEASE)
+
+
+if __name__ == "__main__":
+    unittest.main()

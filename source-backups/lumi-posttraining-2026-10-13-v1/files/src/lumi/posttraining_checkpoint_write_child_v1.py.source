@@ -1,0 +1,330 @@
+"""Generation-bound ownership and reap for one freshly forked guard child.
+
+The caller supplies a numeric PID only once to pidfd_open immediately after its
+own fork.  Every later liveness check, signal, wait and close uses the owned
+pidfd.  waitid(P_PIDFD) establishes that the object is a child of this process;
+there is no waitpid, numeric-PID signal, process scan, Popen fallback or retry.
+
+This component does not fork, create channels, close inherited descriptors or
+decide protocol success.  Import is inert, the public path is closed, and local
+tests replace every pidfd, waitid, poll, signal, clock and close boundary.
+"""
+
+from __future__ import annotations
+
+import os
+import select
+import signal
+import threading
+import time
+
+from . import posttraining_checkpoint_write_guardian_v1 as guardian
+from . import posttraining_checkpoint_write_listener_v1 as listener
+
+SCHEMA = "lumi.checkpoint-write-child.v0.1"
+ROLES = frozenset({"guardian", "broker", "worker"})
+ERROR_CODES = frozenset({
+    "host_guard_not_bound", "runtime_rejected", "arguments_rejected",
+    "child_binding_rejected", "owner_mismatch", "already_attempted",
+    "already_reaped", "already_failed", "reentry", "deadline_exhausted",
+    "child_exited", "identity_rejected", "signal_failed", "reap_failed",
+    "cleanup_unconfirmed",
+})
+FALSE_FLAGS = (
+    "child_source_authenticated", "child_role_runtime_verified",
+    "child_role_semantics_verified",
+    "inherited_descriptors_verified", "child_protocol_verified",
+    "process_topology_verified",
+    "native_write_enforcement_verified", "bootstrap_integration_verified",
+    "execution_permitted", "real_4b_import", "gate_5_complete",
+    "training_authorized", "production_eligible", "retry_allowed",
+)
+
+
+class ChildOwnerError(ValueError):
+    def __init__(self, code="child_binding_rejected"):
+        self.code = (
+            code if type(code) is str and code in ERROR_CODES
+            else "child_binding_rejected"
+        )
+        super().__init__(self.code)
+
+
+def _need(condition, code="child_binding_rejected"):
+    if not condition:
+        raise ChildOwnerError(code) from None
+
+
+def own_forked_child(**_arguments):
+    """No PID, role, deadline, approval or receipt opens the private path."""
+    raise ChildOwnerError("host_guard_not_bound") from None
+
+
+def _runtime():
+    try:
+        listener._runtime()
+        required = (
+            "pidfd_open", "waitid", "P_PIDFD", "WEXITED", "WNOHANG",
+            "WNOWAIT", "CLD_EXITED", "CLD_KILLED", "CLD_DUMPED",
+        )
+        _need(all(hasattr(os, name) for name in required)
+              and hasattr(signal, "pidfd_send_signal")
+              and hasattr(select, "poll"), "runtime_rejected")
+    except BaseException:
+        raise ChildOwnerError("runtime_rejected") from None
+
+
+def _identity(fd):
+    try:
+        return guardian._pidfd_identity(fd, "identity_rejected")
+    except BaseException:
+        raise ChildOwnerError("identity_rejected") from None
+
+
+def _event_tuple(value):
+    if value is None:
+        return None
+    try:
+        row = (
+            value.si_pid, value.si_uid, value.si_signo,
+            value.si_code, value.si_status,
+        )
+    except BaseException:
+        raise ChildOwnerError("reap_failed") from None
+    _need(all(type(part) is int for part in row), "reap_failed")
+    return row
+
+
+def _wait(fd, *, consume):
+    flags = os.WEXITED | os.WNOHANG | (0 if consume else os.WNOWAIT)
+    try:
+        return os.waitid(os.P_PIDFD, fd, flags)
+    except BaseException:
+        raise ChildOwnerError("reap_failed") from None
+
+
+def _poll(fd, timeout_ms):
+    _need(type(timeout_ms) is int and 0 <= timeout_ms <= 3_600_000,
+          "deadline_exhausted")
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+        events = poller.poll(timeout_ms)
+    except BaseException:
+        raise ChildOwnerError("identity_rejected") from None
+    _need(type(events) is list and len(events) <= 1, "identity_rejected")
+    if not events:
+        return False
+    event = events[0]
+    _need(type(event) is tuple and len(event) == 2
+          and event[0] == fd and event[1] == select.POLLIN,
+          "identity_rejected")
+    return True
+
+
+class _ChildOwner:
+    """One pidfd owner; successful reap and descriptor close are separate."""
+
+    def __init__(self, pid, role, fd, identity, deadline_ns):
+        self._pid = pid
+        self._role = role
+        self._fd = fd
+        self._identity = identity
+        self._deadline_ns = deadline_ns
+        self._owner = os.getpid(), threading.get_ident()
+        self._lock = threading.Lock()
+        self._failed = False
+        self._reaped = False
+        self._close_attempted = False
+        self._closed = False
+        self._exit_observed = False
+        self._exit_success = False
+        self._live_checks = 0
+        self._signal_attempts = 0
+        self._waitid_calls = 0
+        self._terminate_attempted = False
+
+    def _enter(self, *, allow_failed=False, validate_identity=True):
+        acquired = False
+        try:
+            _need(self._owner == (os.getpid(), threading.get_ident()),
+                  "owner_mismatch")
+            acquired = self._lock.acquire(blocking=False)
+            _need(acquired, "reentry")
+            _need(allow_failed or not self._failed, "already_failed")
+            _need(not self._close_attempted, "already_attempted")
+            _need(self._fd is not None, "already_attempted")
+            if validate_identity:
+                _need(_identity(self._fd) == self._identity,
+                      "identity_rejected")
+            return True
+        except BaseException as error:
+            if acquired:
+                self._lock.release()
+            code = error.code if type(error) is ChildOwnerError else "identity_rejected"
+            raise ChildOwnerError(code) from None
+
+    def _observe(self, *, consume=False):
+        self._waitid_calls += 1
+        value = _wait(self._fd, consume=consume)
+        row = _event_tuple(value)
+        if row is not None:
+            _need(row[0] == self._pid and row[1] in (0, 10001)
+                  and row[2] == signal.SIGCHLD
+                  and row[3] in (os.CLD_EXITED, os.CLD_KILLED, os.CLD_DUMPED)
+                  and 0 <= row[4] < 2**31, "identity_rejected")
+            self._exit_observed = True
+        return row
+
+    def assert_live_admitted(self):
+        acquired = False
+        try:
+            acquired = self._enter()
+            _need(not self._reaped, "already_reaped")
+            _need(self._observe() is None and not _poll(self._fd, 0),
+                  "child_exited")
+            self._live_checks += 1
+            return self.snapshot()
+        except BaseException as error:
+            code = error.code if type(error) is ChildOwnerError else "identity_rejected"
+            raise ChildOwnerError(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def terminate_admitted_once(self):
+        acquired = False
+        try:
+            acquired = self._enter(allow_failed=True)
+            _need(not self._reaped, "already_reaped")
+            _need(not self._terminate_attempted, "already_attempted")
+            self._terminate_attempted = True
+            observed = self._observe()
+            if observed is None:
+                _need(self._signal_attempts == 0, "already_attempted")
+                self._signal_attempts += 1
+                try:
+                    signal.pidfd_send_signal(self._fd, signal.SIGKILL, None, 0)
+                except ProcessLookupError:
+                    pass
+                except BaseException:
+                    self._failed = True
+                    raise ChildOwnerError("signal_failed") from None
+            return self.snapshot()
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def reap_admitted_once(self, *, deadline_ns, require_success):
+        acquired = False
+        try:
+            acquired = self._enter(allow_failed=True)
+            _need(not self._reaped, "already_reaped")
+            now = time.monotonic_ns()
+            _need(type(deadline_ns) is int and type(require_success) is bool
+                  and type(now) is int and 0 <= now < deadline_ns < 2**63
+                  and deadline_ns <= self._deadline_ns,
+                  "deadline_exhausted")
+            timeout_ms = max(1, (deadline_ns - now + 999_999) // 1_000_000)
+            _need(_poll(self._fd, timeout_ms), "deadline_exhausted")
+            observed = self._observe()
+            _need(observed is not None, "reap_failed")
+            consumed = self._observe(consume=True)
+            _need(consumed == observed, "reap_failed")
+            self._reaped = True
+            success = observed[3] == os.CLD_EXITED and observed[4] == 0
+            self._exit_success = success
+            _need(not require_success or success, "child_exited")
+            return self.snapshot()
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is ChildOwnerError else "reap_failed"
+            raise ChildOwnerError(code) from None
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def close_admitted_once(self):
+        acquired = False
+        closing = None
+        try:
+            acquired = self._enter(
+                allow_failed=True, validate_identity=False,
+            )
+            _need(self._reaped, "reap_failed")
+            closing, self._fd = self._fd, None
+            self._close_attempted = True
+            try:
+                _need(_identity(closing) == self._identity, "identity_rejected")
+                os.close(closing)
+                self._closed = True
+            except BaseException:
+                self._failed = True
+                raise ChildOwnerError("cleanup_unconfirmed") from None
+            return self.snapshot()
+        finally:
+            if acquired:
+                self._lock.release()
+
+    def snapshot(self):
+        return {
+            "schema": SCHEMA,
+            "role": self._role,
+            "pidfd_bound": self._identity is not None,
+            "live_checks": self._live_checks,
+            "exit_observed": self._exit_observed,
+            "exit_reaped": self._reaped,
+            "exit_success_verified": self._exit_success,
+            "termination_attempted": self._terminate_attempted,
+            "signal_attempts": self._signal_attempts,
+            "waitid_calls": self._waitid_calls,
+            "pidfd_close_attempted": self._close_attempted,
+            "pidfd_closed": self._closed,
+            "terminal_failed": self._failed,
+            **dict.fromkeys(FALSE_FLAGS, False),
+        }
+
+
+def _bind_admitted_once(pid, role, *, deadline_ns):
+    try:
+        _runtime()
+    except BaseException:
+        raise ChildOwnerError("runtime_rejected") from None
+    now = time.monotonic_ns()
+    _need(type(pid) is int and 1 < pid < 2**31
+          and type(role) is str and role in ROLES
+          and type(deadline_ns) is int and type(now) is int
+          and 0 <= now < deadline_ns < 2**63
+          and deadline_ns - now <= 3600 * 1_000_000_000,
+          "arguments_rejected")
+    fd = identity = owner = None
+    try:
+        fd = os.pidfd_open(pid, 0)
+        _need(type(fd) is int and 3 <= fd < 2**31
+              and os.get_inheritable(fd) is False,
+              "child_binding_rejected")
+        identity = _identity(fd)
+        owner = _ChildOwner(pid, role, fd, identity, deadline_ns)
+        owner.assert_live_admitted()
+        return owner
+    except BaseException as error:
+        if owner is not None:
+            try:
+                owner.terminate_admitted_once()
+                owner.reap_admitted_once(
+                    deadline_ns=deadline_ns, require_success=False,
+                )
+                owner.close_admitted_once()
+                fd = None
+            except BaseException:
+                raise ChildOwnerError("cleanup_unconfirmed") from None
+        elif fd is not None:
+            closing, fd = fd, None
+            try:
+                if identity is not None:
+                    _need(_identity(closing) == identity, "identity_rejected")
+                os.close(closing)
+            except BaseException:
+                raise ChildOwnerError("cleanup_unconfirmed") from None
+        code = error.code if type(error) is ChildOwnerError else "child_binding_rejected"
+        raise ChildOwnerError(code) from None

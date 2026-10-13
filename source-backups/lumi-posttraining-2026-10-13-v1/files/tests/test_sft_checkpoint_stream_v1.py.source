@@ -1,0 +1,421 @@
+"""Small synthetic trees only; no model, dataset, network or native ML inputs."""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+import stat
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+SOURCE = Path(__file__).resolve().parents[1] / "src/lumi/posttraining_checkpoint_stream_v1.py"
+spec = importlib.util.spec_from_file_location("_synthetic_checkpoint_stream_v1", SOURCE)
+subject = importlib.util.module_from_spec(spec)
+before_import = set(sys.modules)
+spec.loader.exec_module(subject)
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+
+
+class InventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="lumi-synthetic-checkpoint-stream-")
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.root = self.base / "checkpoint"
+        self.root.mkdir(mode=0o700)
+        self.inventory = []
+        self.add_file("first.bin", b"synthetic-one")
+        self.options = {"maximum_read_bytes": 4096, "maximum_files": 8,
+                        "maximum_seconds": 10.0, "chunk_bytes": 4}
+
+    def add_file(self, name, data, mode=0o600):
+        path = self.root / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_bytes(data)
+        path.chmod(mode)
+        self.inventory.append({"path": name, "bytes": len(data),
+                               "sha256": hashlib.sha256(data).hexdigest()})
+        return path
+
+    def verify(self, **changes):
+        return subject.verify_inventory(self.root, self.inventory, **{**self.options, **changes})
+
+    def reject(self, code=None, **changes):
+        with self.assertRaises(subject.CheckpointStreamError) as caught:
+            self.verify(**changes)
+        error = caught.exception
+        self.assertIn(error.code, subject.ERROR_CODES)
+        if code is not None:
+            self.assertEqual(error.code, code)
+        self.assertEqual(error.args, (error.code,))
+        self.assertIsNone(error.__context__)
+        self.assertIsNone(error.__cause__)
+        return error
+
+    def no_filesystem_rejection(self, **changes):
+        with patch.object(
+            subject.os, "open", side_effect=AssertionError("unexpected filesystem")
+        ) as op:
+            self.reject(**changes)
+        op.assert_not_called()
+
+    def test_nested_inventory_reports_only_aggregates(self):
+        self.add_file("nested/second.bin", b"synthetic-two", mode=0o400)
+        self.add_file("nested/empty.bin", b"")
+        result = self.verify()
+        self.assertEqual(result, {
+            "schema": subject.SCHEMA, "status": "verified", "files_verified": 3,
+            "directories_verified": 2, "bytes_hashed": 26, "read_chunks": 8,
+            "inventory_closed": True, "metadata_unchanged": True, "private_modes_required": True,
+            "filesystem_mutated": False, "authorization_verified": False,
+            "source_authenticity_verified": False, "execution_permitted": False})
+        raw = json.dumps(result)
+        for lexical in ("first.bin", "nested", "synthetic-one", self.inventory[0]["sha256"]):
+            self.assertNotIn(lexical, raw)
+
+    def test_files_are_hashed_once_in_bounded_chunks_without_eof_read(self):
+        read = os.read
+        requests = []
+
+        def bounded(fd, count):
+            requests.append(count)
+            return read(fd, count)
+
+        size = self.inventory[0]["bytes"]
+        with patch.object(subject.os, "read", side_effect=bounded):
+            result = self.verify(maximum_read_bytes=size)
+        self.assertEqual(requests, [4, 4, 4, 1])
+        self.assertEqual(sum(requests), size)
+        self.assertEqual(result["bytes_hashed"], size)
+
+    def test_zero_byte_inventory_can_use_zero_read_budget(self):
+        (self.root / "first.bin").unlink()
+        self.inventory.clear()
+        self.add_file("empty", b"")
+        with patch.object(
+            subject.os, "read", side_effect=AssertionError("unexpected read")
+        ) as read:
+            result = self.verify(maximum_read_bytes=0)
+        read.assert_not_called()
+        self.assertEqual((result["bytes_hashed"], result["read_chunks"]), (0, 0))
+
+    def test_count_size_and_numeric_caps_rejected_before_filesystem(self):
+        for key, values in {
+            "maximum_files": (0, True, 65537, 1.0),
+            "maximum_read_bytes": (-1, True, 1.0, 2**63),
+            "chunk_bytes": (0, True, 1048577, 1.0),
+            "maximum_seconds": (0, -1, True, float("nan"), float("inf"), 86401),
+            "require_private": (0, 1, "true"),
+        }.items():
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    self.no_filesystem_rejection(**{key: value})
+        self.no_filesystem_rejection(maximum_read_bytes=1)
+        self.add_file("second", b"second")
+        self.no_filesystem_rejection(maximum_files=1)
+
+    def test_total_size_cap_rejects_before_filesystem(self):
+        self.add_file("second", b"second")
+        self.no_filesystem_rejection(maximum_read_bytes=self.inventory[0]["bytes"])
+
+    def test_invalid_inventory_schema_is_rejected_before_filesystem(self):
+        original = self.inventory
+        for inventory in ([], (), None, [None], [dict(original[0], extra=1)],
+                          [{"path": "x", "bytes": True, "sha256": "0" * 64}],
+                          [{"path": "x", "bytes": -1, "sha256": "0" * 64}],
+                          [{"path": "x", "bytes": 1, "sha256": "A" * 64}]):
+            with self.subTest(inventory=inventory):
+                self.inventory = inventory
+                self.no_filesystem_rejection()
+        self.inventory = original
+
+    def test_traversal_absolute_ambiguous_and_deep_paths_rejected(self):
+        for path in ("", "/file", "../file", "a/../file", "a//file", "./file", "a/./file",
+                     "a/", "a\\file", "a\x00file", "a\nfile", "x" * 256,
+                     "/".join(["a"] * 65)):
+            with self.subTest(path=path):
+                self.inventory[0]["path"] = path
+                self.no_filesystem_rejection()
+
+    def test_root_must_be_nonbroad_absolute_path(self):
+        for root in (Path("/"), Path("relative"), self.base / ".." / "checkpoint", str(self.root)):
+            with self.subTest(root=root):
+                self.root = root
+                self.no_filesystem_rejection()
+
+    def test_duplicate_and_file_directory_collisions_rejected(self):
+        first = dict(self.inventory[0])
+        for paths in (("a", "a"), ("a", "a/b"), ("a/b", "a")):
+            self.inventory = [dict(first, path=name) for name in paths]
+            self.no_filesystem_rejection()
+
+    def test_directory_count_is_bounded_before_filesystem(self):
+        self.inventory[0]["path"] = "a/b/c"
+        with patch.object(subject, "MAXIMUM_DIRECTORIES", 2):
+            self.no_filesystem_rejection()
+
+    def test_extra_file_and_empty_directory_are_rejected_without_read(self):
+        for directory in (False, True):
+            extra = self.root / "unapproved"
+            if directory:
+                extra.mkdir(mode=0o700)
+            else:
+                extra.write_bytes(b"never-read")
+            self.reject("inventory_mismatch")
+            extra.rmdir() if directory else extra.unlink()
+
+    def test_missing_and_wrong_size_files_rejected(self):
+        file = self.root / "first.bin"
+        self.inventory[0]["bytes"] += 1
+        with patch.object(
+            subject.os, "read", side_effect=AssertionError("unexpected read")
+        ) as read:
+            self.reject("inventory_mismatch")
+        read.assert_not_called()
+        file.unlink()
+        self.reject("inventory_mismatch")
+
+    def test_wrong_hash_rejected(self):
+        self.inventory[0]["sha256"] = "0" * 64
+        self.reject("hash_mismatch")
+
+    def test_file_symlink_and_hardlink_rejected(self):
+        file = self.root / "first.bin"
+        outside = self.base / "outside"
+        outside.write_bytes(b"never-read")
+        file.unlink()
+        file.symlink_to(outside)
+        with patch.object(
+            subject.os, "read", side_effect=AssertionError("unexpected read")
+        ) as read:
+            self.reject("metadata_rejected")
+        read.assert_not_called()
+        file.unlink()
+        os.link(outside, file)
+        self.reject("metadata_rejected")
+
+    def test_root_and_ancestor_symlinks_rejected(self):
+        original = self.root
+        alias = self.base / "alias"
+        alias.symlink_to(original, target_is_directory=True)
+        self.root = alias
+        self.reject("path_rejected")
+        alias.unlink()
+        alias.symlink_to(self.base, target_is_directory=True)
+        self.root = alias / original.name
+        self.reject("path_rejected")
+
+    def test_nested_symlink_rejected(self):
+        self.inventory[0]["path"] = "nested/first.bin"
+        (self.root / "first.bin").unlink()
+        (self.root / "nested").symlink_to(self.base, target_is_directory=True)
+        self.reject("metadata_rejected")
+
+    def test_fifo_rejected_before_open_or_read(self):
+        file = self.root / "first.bin"
+        file.unlink()
+        os.mkfifo(file, 0o600)
+        self.reject("metadata_rejected")
+
+    def test_private_modes_required_and_opt_out_does_not_change_source(self):
+        file = self.root / "first.bin"
+        file.chmod(0o644)
+        self.reject("metadata_rejected")
+        self.root.chmod(0o755)
+        result = self.verify(require_private=False)
+        self.assertFalse(result["private_modes_required"])
+        self.assertEqual(stat.S_IMODE(file.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(self.root.stat().st_mode), 0o755)
+        file.chmod(0o600)
+        self.reject("metadata_rejected")
+
+    def test_foreign_owner_is_rejected_even_without_private_modes(self):
+        with patch.object(subject.os, "geteuid", return_value=os.geteuid() + 1):
+            self.reject("metadata_rejected", require_private=False)
+
+    def test_read_updates_atime_without_identity_failure(self):
+        read = os.read
+        file = self.root / "first.bin"
+
+        def update_atime(fd, count):
+            value = read(fd, count)
+            # atime-only os.utime also changes ctime; use an fstat projection to
+            # model ordinary kernel read-side atime updates without a mutation.
+            return value
+
+        with patch.object(subject.os, "read", side_effect=update_atime):
+            self.verify()
+        before = file.stat()
+        values = {name: getattr(before, name) for name in (
+            "st_dev", "st_ino", "st_mode", "st_uid", "st_gid", "st_nlink", "st_size",
+            "st_mtime_ns", "st_ctime_ns")}
+        from types import SimpleNamespace
+        after = SimpleNamespace(**values, st_atime_ns=before.st_atime_ns + 1)
+        self.assertEqual(subject._snapshot(before), subject._snapshot(after))
+
+    def test_file_content_mutation_during_read_is_rejected(self):
+        read = os.read
+        file = self.root / "first.bin"
+        mutated = False
+
+        def change(fd, count):
+            nonlocal mutated
+            value = read(fd, count)
+            if not mutated:
+                mutated = True
+                file.write_bytes(b"X" * self.inventory[0]["bytes"])
+            return value
+
+        with patch.object(subject.os, "read", side_effect=change):
+            self.reject("identity_changed")
+
+    def test_root_swap_detected_while_original_descriptor_remains_pinned(self):
+        read = os.read
+        moved = self.base / "moved"
+        swapped = False
+
+        def swap(fd, count):
+            nonlocal swapped
+            value = read(fd, count)
+            if not swapped:
+                swapped = True
+                self.root.rename(moved)
+                self.root.mkdir(mode=0o700)
+            return value
+
+        with patch.object(subject.os, "read", side_effect=swap):
+            self.reject("identity_changed")
+
+    def test_post_hash_file_change_detected_by_final_metadata_walk(self):
+        original = subject._Verifier.check_ancestry
+        altered = False
+
+        def change(verifier):
+            nonlocal altered
+            original(verifier)
+            if not altered:
+                altered = True
+                (self.root / "first.bin").write_bytes(b"X" * self.inventory[0]["bytes"])
+
+        with patch.object(subject._Verifier, "check_ancestry", change):
+            self.reject("identity_changed")
+
+    def test_inventory_values_copied_before_read_cannot_retarget(self):
+        read = os.read
+
+        def change(fd, count):
+            self.inventory[0].update(path="outside-secret", bytes=1000000, sha256="0" * 64)
+            return read(fd, count)
+
+        with patch.object(subject.os, "read", side_effect=change):
+            result = self.verify()
+        self.assertEqual(result["bytes_hashed"], 13)
+
+    def test_short_read_rejected_without_retry(self):
+        with patch.object(subject.os, "read", return_value=b"") as read:
+            self.reject("short_read")
+        read.assert_called_once()
+
+    def test_partial_reads_stay_within_logical_byte_budget(self):
+        read = os.read
+        with patch.object(subject.os, "read", side_effect=lambda fd, count: read(fd, 1)):
+            result = self.verify(maximum_read_bytes=13)
+        self.assertEqual((result["bytes_hashed"], result["read_chunks"]), (13, 13))
+
+    def test_deadline_before_open_prevents_filesystem_access(self):
+        with patch.object(subject.time, "monotonic", side_effect=[10.0, 11.0]), \
+                patch.object(subject.os, "open") as opened:
+            self.reject("deadline_exhausted", maximum_seconds=0.5)
+        opened.assert_not_called()
+
+    def test_deadline_after_first_chunk_prevents_further_reads(self):
+        read = os.read
+        now = [10.0]
+
+        def expire(fd, count):
+            value = read(fd, count)
+            now[0] = 100.0
+            return value
+
+        with patch.object(subject.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(subject.os, "read", side_effect=expire) as reads:
+            self.reject("deadline_exhausted", maximum_seconds=5.0)
+        reads.assert_called_once()
+
+    def test_deadline_after_final_close_cannot_publish_success(self):
+        now = [10.0]
+        original = subject._Verifier.close
+
+        def late_close(verifier, descriptor):
+            original(verifier, descriptor)
+            if not verifier.owned:
+                now[0] = 100.0
+
+        with patch.object(subject.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(subject._Verifier, "close", late_close):
+            self.reject("deadline_exhausted", maximum_seconds=5.0)
+
+    def test_plan_deadline_checked_before_filesystem_access(self):
+        now = iter([10.0, 10.1, 11.0])
+        self.add_file("second.bin", b"second")
+        with patch.object(subject.time, "monotonic", side_effect=lambda: next(now)), \
+                patch.object(subject.os, "open") as opened:
+            self.reject("deadline_exhausted", maximum_seconds=0.5)
+        opened.assert_not_called()
+
+    def test_wrong_row_count_rejected_without_copying_keys(self):
+        self.inventory = [dict.fromkeys(range(10000))]
+        with patch.object(subject, "set", side_effect=AssertionError("copied keys"), create=True):
+            self.reject("invalid_plan")
+
+    def test_all_owned_descriptors_close_once_after_read_failure(self):
+        opened, closed = [], []
+        op, close = os.open, os.close
+
+        def tracked_open(*args, **kwargs):
+            fd = op(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def tracked_close(fd):
+            closed.append(fd)
+            close(fd)
+
+        with patch.object(subject.os, "open", side_effect=tracked_open), \
+                patch.object(subject.os, "close", side_effect=tracked_close), \
+                patch.object(subject.os, "read", side_effect=OSError("PRIVATE PATH AND TEXT")):
+            self.reject("verification_failed")
+        self.assertEqual(sorted(opened), sorted(closed))
+        self.assertEqual(len(closed), len(set(closed)))
+
+    def test_ambiguous_close_not_retried_and_other_descriptors_close(self):
+        close = os.close
+        closed, failed = [], [False]
+
+        def tracked(fd):
+            closed.append(fd)
+            close(fd)
+            if not failed[0]:
+                failed[0] = True
+                raise OSError("PRIVATE CLOSE")
+
+        with patch.object(subject.os, "close", side_effect=tracked):
+            self.reject("close_failed")
+        self.assertEqual(len(closed), len(set(closed)))
+
+    def test_import_has_no_ml_and_source_has_no_mutating_apis(self):
+        self.assertFalse(any(name.split(".")[0] in {"torch", "numpy", "transformers"}
+                             for name in IMPORT_ADDITIONS))
+        source = SOURCE.read_text()
+        for forbidden in ("read_bytes(", "write_bytes(", "os.walk(", "os.unlink(", "os.mkdir(",
+                          "os.chmod(", "subprocess", "urllib", "import torch"):
+            self.assertNotIn(forbidden, source)
+
+
+if __name__ == "__main__":
+    unittest.main()

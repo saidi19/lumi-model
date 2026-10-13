@@ -1,0 +1,136 @@
+"""Fresh attempt-021 binding of the qualified cleanup bucket deployer."""
+
+import hashlib
+from pathlib import Path
+
+from scripts import sft_vm_dedicated_cleanup_bucket_v8 as qualified
+
+_qualified_expected_approval = qualified.expected_approval
+
+ROOT = Path(__file__).resolve().parents[1]
+QUALIFIED_SHA = "84f05bf571baea58478c46c2bbb4acc3dc4dd2ca23c2a397ed2f1d6afbefdeaf"
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+ATTEMPT = "07be75c955dc43fe8818192e8a9e3fc1"
+BUCKET = "lumi-cleanup-" + ATTEMPT
+PREFIX = "lumi-corpus/v0.1/control/sft-import-research/" + ATTEMPT + "/network-cleanup/"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-021-cleanup-bucket-v0.1"
+PROPOSAL = ROOT / "configs/lumi-vm-attempt-021-cleanup-bucket-proposal-v0.1.json"
+APPROVAL = ROOT / "configs/lumi-vm-attempt-021-cleanup-bucket-approval-v0.1.json"
+HELPER = ROOT / "scripts/prepare_sft_vm_attempt021_deployment_bindings_v1.py"
+HELPER_SHA = "f6457f1d7b25d52eeaf8627236f4e3931c222e6c7d57495cae206bfdc6b5ceab"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-021-control-plan-v0.2/plan.json"
+PLAN_SHA = "0eaa303701eeb464e7a65826b455e90efc398828c29999f5613fe56dcf2ab1e1"
+MAX_CALLS, MAX_SECONDS, MAX_BYTES = 20, 300, 131072
+BLOCK = dict(qualified.BLOCK)
+ENCRYPTION = qualified.decode(qualified.encode(qualified.ENCRYPTION))
+TAGS = [
+    {"Key": "LumiAttempt", "Value": ATTEMPT},
+    {"Key": "LumiPurpose", "Value": "cleanup-claims-only"},
+]
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt021_cleanup_bucket_rejected") from None
+
+
+def bind():
+    base = ROOT / "scripts/sft_vm_dedicated_cleanup_bucket_v8.py"
+    need(hashlib.sha256(base.read_bytes()).hexdigest() == QUALIFIED_SHA)
+    values = {
+        "__file__": str(Path(__file__).resolve()),
+        "ROOT": ROOT,
+        "ACCOUNT": ACCOUNT,
+        "REGION": REGION,
+        "ATTEMPT": ATTEMPT,
+        "BUCKET": BUCKET,
+        "PREFIX": PREFIX,
+        "OUTPUT": OUTPUT,
+        "APPROVAL": APPROVAL,
+        "HELPER": HELPER,
+        "HELPER_SHA": HELPER_SHA,
+        "PLAN": PLAN,
+        "PLAN_SHA": PLAN_SHA,
+        "MAX_CALLS": MAX_CALLS,
+        "MAX_SECONDS": MAX_SECONDS,
+        "MAX_BYTES": MAX_BYTES,
+        "BLOCK": BLOCK,
+        "ENCRYPTION": ENCRYPTION,
+        "TAGS": TAGS,
+        "expected_approval": expected_approval,
+    }
+    for key, value in values.items():
+        setattr(qualified, key, value)
+    return qualified
+
+
+def encode(value):
+    return bind().encode(value)
+
+
+def decode(raw):
+    return bind().decode(raw)
+
+
+def sha(raw):
+    return bind().sha(raw)
+
+
+def policy():
+    return bind().policy()
+
+
+def requests():
+    return bind().requests()
+
+
+def sources():
+    return bind().sources()
+
+
+def expected_proposal():
+    return {
+        "schema": "lumi.attempt021-dedicated-cleanup-bucket-proposal.v0.1",
+        "status": "prepared_not_authorized",
+        "attempt": ATTEMPT,
+        "bucket": BUCKET,
+        "entry_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "helper_sha256": HELPER_SHA,
+        "plan_sha256": PLAN_SHA,
+        "policy_sha256": qualified.sha(qualified.encode(policy())),
+        "maximum_calls": MAX_CALLS,
+        "maximum_seconds": MAX_SECONDS,
+        "maximum_receipt_bytes": MAX_BYTES,
+        "shared_bucket_mutation": False,
+        "object_access": False,
+        "iam_mutation": False,
+        "instance_action": False,
+        "training": False,
+        "retry": False,
+        "rollback": False,
+        "execution_permitted": False,
+    }
+
+
+def expected_approval(message):
+    bind()
+    need(PROPOSAL.is_file() and not PROPOSAL.is_symlink())
+    proposal = PROPOSAL.read_bytes()
+    need(qualified.encode(qualified.decode(proposal)) == qualified.encode(expected_proposal()))
+    value = _qualified_expected_approval(message)
+    value["schema"] = "lumi.attempt021-dedicated-cleanup-bucket-approval.v0.1"
+    value["proposal_sha256"] = qualified.sha(proposal)
+    return value
+
+
+def authorize():
+    return bind().authorize()
+
+
+def run(*, cloud=None, clock=qualified.time.monotonic):
+    return bind().run(cloud=cloud, clock=clock)
+
+
+if __name__ == "__main__":
+    print(encode(run()).decode(), end="")

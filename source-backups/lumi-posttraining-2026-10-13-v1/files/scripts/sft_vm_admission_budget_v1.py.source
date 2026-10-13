@@ -1,0 +1,114 @@
+"""One admission budget for SDK reads, including credential identity checks."""
+
+import time
+
+MAX_CALLS = 79
+MAX_SECONDS = 1500
+SERVICES = {"sts", "ec2", "s3", "iam", "lambda", "scheduler", "service-quotas", "pricing"}
+OBJECT_OPERATIONS = {
+    "GetObject", "HeadObject", "ListObjects", "ListObjectsV2", "ListObjectVersions",
+    "GetObjectAttributes", "SelectObjectContent",
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("admission_budget_rejected") from None
+
+
+class AdmissionBudget:
+    def __init__(self, credentials, *, clock=time.monotonic):
+        self.credentials, self.clock = credentials, clock
+        self.start = clock()
+        self.calls = self.credential_calls = 0
+        self.hooks = []
+        self.original_identity = credentials.static_identity_client
+        self.installed = self.completed = False
+        self.enabled = True
+
+    def consume(self, service, *, credential=False, model, **_fields):
+        need(self.enabled and not self.completed)
+        need(service in SERVICES)
+        operation = model.name
+        need(type(operation) is str and operation.startswith(("Get", "Describe", "List", "Head")))
+        need(operation not in OBJECT_OPERATIONS)
+        need(not credential or (service == "sts" and operation == "GetCallerIdentity"))
+        need(self.calls < MAX_CALLS and 0 <= self.clock() - self.start < MAX_SECONDS - 20)
+        self.calls += 1  # Failed or ambiguous dispatches consume their budget.
+        if credential:
+            self.credential_calls += 1
+
+    def register(self, client, service, *, credential=False):
+        need(service in SERVICES and self.enabled)
+        need(client.meta.config.retries.get("total_max_attempts") == 1)
+        need(client.meta.config.proxies == {})
+        identity = f"lumi-admission-budget-{id(self)}-{len(self.hooks)}"
+
+        def handler(**fields):
+            self.consume(service, credential=credential, **fields)
+
+        client.meta.events.register("before-call", handler, unique_id=identity)
+        self.hooks.append((client.meta.events, identity))
+        return client
+
+    def __enter__(self):
+        need(not self.installed and self.enabled)
+        self.installed = True
+
+        def identity(metadata):
+            client = self.original_identity(metadata)
+            try:
+                return self.register(client, "sts", credential=True)
+            except BaseException:
+                client.close()
+                raise
+
+        self.credentials.static_identity_client = identity
+        return self
+
+    def clients(self, reader):
+        need(self.installed and self.enabled)
+        bundle = self.credentials.Clients(reader)
+        try:
+            need(set(bundle.clients) == SERVICES)
+            for service, client in bundle.clients.items():
+                self.register(client, service)
+            return bundle
+        except BaseException:
+            bundle.close()
+            raise
+
+    def inspect(self, function, bundle):
+        need(self.installed and self.enabled)
+        result = function(bundle)
+        need(type(result) is dict)
+        need(result["total_control_calls"] == self.calls - self.credential_calls)
+        need(0 < self.calls <= MAX_CALLS and self.credential_calls >= 1)
+        need(0 <= self.clock() - self.start < MAX_SECONDS)
+        result = dict(result, admission_call_budget=self.report())
+        self.completed = True
+        self.release()
+        return result
+
+    def report(self):
+        return {
+            "maximum_sdk_read_calls": MAX_CALLS,
+            "maximum_seconds": MAX_SECONDS,
+            "sdk_read_dispatches": self.calls,
+            "credential_identity_dispatches": self.credential_calls,
+            "admission_read_dispatches": self.calls - self.credential_calls,
+            "credential_identity_included": True,
+            "counts_failed_dispatches": True,
+            "credential_export_provider_requests_metered": False,
+        }
+
+    def release(self):
+        self.enabled = False
+        if self.installed:
+            self.credentials.static_identity_client = self.original_identity
+        for events, identity in self.hooks:
+            events.unregister("before-call", unique_id=identity)
+        self.hooks.clear()
+
+    def __exit__(self, *_exception):
+        self.release()

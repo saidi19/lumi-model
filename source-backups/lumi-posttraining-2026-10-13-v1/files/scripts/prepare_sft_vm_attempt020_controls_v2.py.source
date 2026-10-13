@@ -1,0 +1,146 @@
+"""Bind attempt-020 live absence and predecessor-retention evidence."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt020_controls_v1 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "0fad586431919ae9a0bb63aafbcc327101279a01a1c1dbf7620eb34a2a1b0d58"
+BASE_PLAN = "artifacts/lumi-vm-attempt-020-control-plan-v0.1/plan.json"
+BASE_PLAN_SHA = "222b929849b9d1bb286d3935aaa3c1abb4354e4246d685abfb3fabd979c6bb12"
+ABSENCE = "evidence/lumi-vm-attempt-020-control-target-absence-v0.1.json"
+ABSENCE_SHA = "2597845c46b55e0afb862c5a285f9e4e6a35c5c0f2ff365a27833b4096b86f39"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-020-control-plan-v0.2"
+ATTEMPT = previous.ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_control_plan_v2_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 64 * 1024)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    previous.build()
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    evidence = json.loads(read(ABSENCE, ABSENCE_SHA))
+    observations = evidence["observations"]
+    count_keys = {
+        "selected_cidr_subnets",
+        "attempt_instance_connect_endpoints",
+        "attempt_tagged_instances",
+        "attempt_key_pairs",
+        "attempt_security_groups",
+    }
+    flag_keys = {key for key in observations if key.endswith("_exists")}
+    retention = evidence["predecessor_retention"]
+    need(
+        evidence["attempt"] == ATTEMPT
+        and evidence["account"] == plan["account"]
+        and evidence["region"] == plan["region"]
+        and observations["selected_cidr"] == previous.CIDR
+        and all(observations[key] == 0 for key in count_keys)
+        and all(observations[key] is False for key in flag_keys)
+        and retention["attempt"] == previous.OLD
+        and retention["instance_state"] == "stopped"
+        and retention["instance_type"] == "r6i.4xlarge"
+        and retention["encrypted_volume_count"] == 2
+        and retention["delete_on_termination"] is False
+        and retention["mutated"] is False
+        and evidence["read_only_aws_calls"] <= 20
+        and evidence["bounded_transient_read_retries"] <= 8
+        and evidence["cloud_mutations"] == 0
+        and evidence["object_access"] == 0
+        and evidence["instance_actions"] == 0
+        and evidence["collision_free_for_control_preparation"] is True
+        and evidence["execution_permitted"] is False
+    )
+    plan["schema"] = "lumi.vm-attempt-020-control-plan.v0.2"
+    plan["status"] = "live_absence_verified_fresh_control_deployment_approval_required"
+    plan["network_candidate_live_availability_verified"] = True
+    plan["control_target_absence_evidence"] = {
+        "path": ABSENCE,
+        "sha256": ABSENCE_SHA,
+    }
+    plan["readiness_review"]["decision"] = (
+        "fresh_watchdog_and_cleanup_bucket_deployment_approval_required"
+    )
+    plan["readiness_review"]["risk"] = (
+        "Live absence and predecessor retention are verified, but fresh inert controls, "
+        "read-only admission and remote import remain unproved."
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Deploy and verify the fresh inert stop watchdog under exact approval.",
+        "Create and verify the fresh dedicated cleanup bucket under exact approval.",
+        "Pass fresh read-only CPU, network, store and watchdog admission.",
+        "Bind a separate one-shot CPU proposal and exact approval.",
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-020-control-plan-release.v0.2",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": previous.RELEASE_SHA,
+        "source_verification_sha256": previous.SOURCE_PROOF_SHA,
+        "control_target_absence_sha256": ABSENCE_SHA,
+        "live_target_absence_verified": True,
+        "predecessor_retention_verified": True,
+        "fresh_control_deployment_required": True,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(
+            OUTPUT / name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o400,
+        )
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

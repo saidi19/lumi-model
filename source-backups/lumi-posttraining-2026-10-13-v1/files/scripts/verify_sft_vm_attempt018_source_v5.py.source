@@ -1,0 +1,157 @@
+"""Offline verification of attempt-018 source v0.5 read-only recovery."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib
+import json
+import os
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt018_v3 as format_v3
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-attempt-018-source-v0.5"
+RELEASE_SHA = "8b66eff48b193009d4fc51761488deeb4c70488ead72e3e099838f9333cf5a5f"
+BUILDER_SHA = "e380e84fe92fabfc771c7a628c0951ff80a44102182ed4f91fe2ea4784a5992f"
+TEST_SHA = "4690a08d42d4e110b50f41c32ec104af30eef838ad75df8414d977483d012ff1"
+RECOVERY_SHA = "3b5c425666588bb7ef24c24599ad523bd411f68db1ee57526a0fdb4ea4c9c36f"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-018-source-v0.5-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_v5_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, digest, size=None, maximum=32 * 1024**2):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= maximum)
+    raw = path.read_bytes()
+    need(sha(raw) == digest and (size is None or len(raw) == size))
+    return raw
+
+
+def authenticate_outer():
+    scripts = str(RELEASE / "scripts")
+    before = set(sys.modules)
+    sys.path.insert(0, scripts)
+    try:
+        need("run_sft_vm_private_outer_v7" not in before)
+        outer = importlib.import_module("run_sft_vm_private_outer_v7")
+        need(Path(outer.__file__).resolve() == RELEASE / "scripts/run_sft_vm_private_outer_v7.py")
+        outer.authenticate()
+    finally:
+        sys.path.remove(scripts)
+        for name in set(sys.modules) - before:
+            module = sys.modules.get(name)
+            path = getattr(module, "__file__", None)
+            if path is not None and Path(path).is_relative_to(RELEASE):
+                del sys.modules[name]
+
+
+def verify():
+    read(ROOT / "scripts/prepare_sft_vm_attempt018_v5.py", BUILDER_SHA)
+    read(ROOT / "tests/test_sft_vm_attempt018_v5.py", TEST_SHA)
+    recovery = json.loads(
+        read(
+            ROOT / "evidence/lumi-vm-attempt-018-v022-execution-cleanup-verification-v0.1.json",
+            RECOVERY_SHA,
+        )
+    )
+    need(
+        recovery["execution"]["retry_allowed"] is False
+        and recovery["execution"]["run_instances_dispatch_count"] == 1
+        and recovery["execution"]["real_4b_import"] is False
+        and recovery["cleanup_recovery"]["public_cost_resources_released"] is True
+    )
+    release = json.loads(read(RELEASE / "release.json", RELEASE_SHA))
+    need(
+        release["schema"] == "lumi.vm-attempt018-source.v0.5"
+        and release["v022_execution_cleanup_verification_sha256"] == RECOVERY_SHA
+        and release["repair"] == "bounded_transient_read_only_transport_recovery"
+        and release["application_read_attempts_per_call_maximum"] == 3
+        and release["application_read_retries_total_maximum"] == 8
+        and release["sdk_attempts_per_call"] == 1
+        and release["write_attempts_per_operation"] == 1
+        and release["run_instances_attempts"] == 1
+        and release["stop_instances_attempts"] == 1
+        and release["source_versions_bound"] is True
+        and release["versioned_object_count"] == 22
+        and release["iam_source_action"] == "s3:GetObjectVersion"
+        and len(release["outputs"]) == 156
+    )
+    bodies = {}
+    for name, pin in release["outputs"].items():
+        body = read(RELEASE / name, pin["sha256"], pin["bytes"])
+        bodies[name] = body
+        if name.endswith(".py"):
+            ast.parse(body)
+    provision = bodies["scripts/provision_sft_vm_host_v5.py"]
+    need(
+        b"READ_RETRY_DELAYS = (1, 2)" in provision
+        and b"MAX_READ_RETRIES = 8" in provision
+        and b"delays = () if write else READ_RETRY_DELAYS" in provision
+        and b"write_attempts" not in provision
+    )
+    inputs = json.loads(bodies["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        body = bodies["scripts/" + role + ".py"]
+        need(pin == {"bytes": len(body), "sha256": sha(body)})
+    authenticate_outer()
+    selection = json.loads(bodies[format_v3.SELECTION])
+    members = format_v3.tar_members(bodies[format_v3.TAR])
+    manifest = json.loads(members["release-manifest.json"])
+    need(
+        selection["object_versions_bound"] is True
+        and selection["versioned_object_count"] == 22
+        and members["controls/input-selection.json"] == bodies[format_v3.SELECTION]
+        and all(sha(members[name]) == digest for name, digest in manifest.items())
+    )
+    return {
+        "schema": "lumi.vm-attempt018-source-v0.5-verification.v0.1",
+        "attempt": format_v3.ATTEMPT,
+        "status": "offline_read_only_transport_repair_verified",
+        "source_release_sha256": RELEASE_SHA,
+        "builder_sha256": BUILDER_SHA,
+        "test_sha256": TEST_SHA,
+        "v022_execution_cleanup_verification_sha256": RECOVERY_SHA,
+        "outputs_verified": 156,
+        "outer_source_authentication_verified": True,
+        "sha256_and_byte_count_closure_verified": True,
+        "bounded_transient_reads_verified": True,
+        "write_retry_prohibited_verified": True,
+        "versioned_objects_verified": 22,
+        "embedded_archive_verified": True,
+        "version_only_iam_verified": True,
+        "wire_or_billing_byte_cap_claimed": False,
+        "cloud_calls": 0,
+        "payload_reads": 0,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

@@ -1,0 +1,112 @@
+# SFT execution status v0.64
+
+Local-only result receipt, 2026-09-09. Published source is
+`11486aa570657e8c71589ced46054459972d1493`, tree
+`dd05c9121e692b257c50a95ba9beffa7fa35db71`, direct parent
+`01b89f9477dc28a6f2b771f164f347dafb53d6dc`. The seven-file v0.63 source correction
+was published non-force with matching local/GitHub object identities. This
+receipt does not trigger another workflow. All prior runs, files and evidence
+remain preserved; the started native attempt must not be rerun.
+
+## What actually passed and where execution stopped
+
+[Native run 34359447892](https://github.com/saidi19/lumi-model/actions/runs/34359447892),
+attempt 1, job `102492361796`, ran on the exact published source. The corrected
+source/synthetic preflight passed. Acquisition and hash verification of the
+already accepted software also passed: four HTTPS GET attempts, zero retries,
+1,062,113,436-byte ZIP and 1,062,113,280-byte software tar, both matching the
+unchanged v0.62/v0.63 pins. No large software artifact was downloaded on the Mac.
+
+The native step started at 13:49:33Z and stopped at 13:49:59Z. Its report says
+`status=failed`, `stage=inspect_container`, `code=fixture_failed`. This is the
+first `verify_created_oci` call, which includes both image and container checks;
+it does not establish that the actual container-inspect command was reached.
+Source ordering establishes that load/create completed and that export,
+extraction, adapter installation, workload cgroups and all three worker cases
+were **not reached**. No container was started. No worker, GPU, model/data
+access, inference or SFT was started.
+
+The separate input-retirement step passed and attests removal of exactly one
+owned temporary input file and its directory. Root fixture control flow did not
+report `cleanup_unconfirmed`, but the failure report has no explicit root
+cleanup attestation or independently retained final Docker inventory. Do not
+upgrade the input-cleanup receipt into a broader cleanup claim.
+
+## Retained evidence
+
+Artifact `10107224754`, named
+`sft-oci-guardian-evidence-11486aa570657e8c71589ced46054459972d1493`, was read once
+under a 65,536-byte cap. Its ZIP is 1,162 bytes, SHA-256
+`b34af3cf59ef917781fbd523b606ac9d9fd38015c7eda3655b132d0c0e43e418`.
+Only its three aggregate JSON members were retained locally, under
+`artifacts/lumi-sft-oci-guardian-evidence-11486aa570657e8c71589ced46054459972d1493/`.
+Exact bytes/hashes were reverified; directory mode is `0700`, files `0400`.
+No raw logs, inspect responses, source/candidate text, secrets or signed URLs
+were retained.
+
+| Member | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `acquisition.json` | 695 | `4703a3318bdc79ddc1e14cfabac768cef5b1df250f33cfe333ca6bcca1174231` |
+| `input-cleanup.json` | 201 | `f4456ba031f3d2f1f86a2f2354de7c632a648bc73ab7b313186d6c32d0ba33dd` |
+| `native.json` | 481 | `70ae37f4e0898169e5ee0fa14d7ce123d829558ad4ca942a3391202dc876e495` |
+
+## Confirmed reporting defect; native cause still unknown
+
+The guardian fixture's `main` preserves only exact `FixtureError` codes.
+`verify_created_oci` raises a different exact type, `OciAdmissionError`, so all
+its fixed codes are flattened to `fixture_failed`. Merely wrapping its code in
+`FixtureError` would still lose most codes: the fixture's allowlist excludes
+them. A safe correction needs explicit typed, fixed-code mapping or a separate
+allowlisted `admission_code` field, never arbitrary exception attributes/text.
+
+Read-only independent source review confirmed this reporting defect. It cannot
+identify the native failing predicate. The failed call covers runtime and
+deadline validation, inspect transport/JSON, image identity, container state,
+host profile and configuration equivalence. Even `profile_rejected` alone
+would not identify the individual predicate. No parser/profile relaxation or
+speculative null/empty normalization is justified by the retained evidence.
+
+## Ordinary source checks
+
+[Source run 34359447868](https://github.com/saidi19/lumi-model/actions/runs/34359447868):
+all four jobs passed, including main job `102492360767`, lint, source-only
+validators and isolated controls. The source-suite step completed at 13:57:47Z.
+Its retained partition aggregate is `SOURCE_SCOPE_ACCOUNTED`, with 5,499 source
+items selected and two history tests separately routed. Selected is not the
+same as passed; the individual pytest pass/skip summary was not retained by the
+log filter, and no count is inferred from an earlier run. The report explicitly
+keeps `private_integration_passed=false` and `full_ci_passed=false`.
+
+The completed Source log was read once under 2 MiB/45 seconds, retaining only
+the partition aggregate and hash: 61,668 bytes, SHA-256
+`a5887ca271651830712c509f43e61d53911abfd4819cc4a51159a655f63ef7aa`.
+
+[Spark run 34359447887](https://github.com/saidi19/lumi-model/actions/runs/34359447887),
+job `102492360818`, passed all **3 tests in 104.94 seconds**. Its completed log
+was read once under 2 MiB/45 seconds, retaining only the aggregate and hash:
+51,556 bytes, SHA-256
+`5c897000083e2f9e8e5baef5963294a65f76f97a9293fc27292896721dee4335`.
+Old OCI build run `34359447901` was skipped. The other two historical native
+workflows were not triggered by these source changes, not newly passed runs.
+
+## Boundary and next action
+
+Gate 5 remains partial: the cross-version tar dispatch defect is corrected and
+Linux preflight passed, but accepted OCI-to-guardian native composition has
+not passed. Local prepublication verification remains 387 synthetic/stdlib
+tests passing on each of Python 3.11.15, 3.13.7 and 3.14.6; it does not substitute
+for native acceptance. Real host/S3/data binding, H100/CUDA validation and actual
+SFT remain downstream. All production/private-integration/full-CI and real-SFT
+permission claims remain false.
+
+The next useful diagnostic needs fresh bounded authority because this native
+attempt was started and its ephemeral job has ended; only input-copy retirement
+has a separately retained cleanup attestation. Its
+scope should be one exact accepted-image acquisition/load/create, never start;
+one image and at most one container inspect, each at most 65,536 bytes/5 seconds,
+within a 15-second verification budget. Retain only fixed phase/predicate codes
+and booleans while preserving every current predicate and its evaluation
+order. No export, extraction, cgroups, adapter, workers, acceptance continuation
+or retry; retire only exact owned resources. That diagnostic has **not** been
+implemented, published or executed here. No new native workflow is authorized
+by this result receipt.

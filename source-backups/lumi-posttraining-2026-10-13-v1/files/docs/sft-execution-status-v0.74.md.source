@@ -1,0 +1,103 @@
+# SFT execution status v0.74
+
+2026-09-10. **HF checkpoint save/reload and explicit config/runtime-code content
+reads are now byte-budgeted in a new CPU-kernel successor.** Tiny BF16, FP32,
+untied and sharded roundtrips pass. This completes v0.73's HF/control-content-I/O
+software task, not coordinator integration, host admission or all of Gate 5.
+
+No real weights, trainer/tokenizer payloads or datasets were read. No GPU,
+inference, training, network action, installation, instance action, GitHub push
+or CI was initiated. Frozen predecessors and their evidence remain unchanged.
+
+## Implemented
+
+`posttraining_checkpoint_hf_io_v1.py` owns separate, caller-chosen logical read
+and write ledgers. Each at-most-1-MiB `pread`/`pwrite` reserves requested bytes
+before the syscall; failed reservations are not refunded. Control files are
+read through pinned, no-follow descriptors, without changing their existing
+0400/0600/0644 modes. Output uses a fresh exclusive 0700 directory and 0600
+files. Reads bind the exact write receipt, size, hash and recorded identity.
+Inventory checks metadata and recorded receipts; it does not hide extra content
+rereads. Failure poisons the session, and a late close/budget failure prevents
+the enclosing kernel from returning success. Partial output is not reused.
+
+`posttraining_checkpoint_hf_bytes_v1.py` uses the public safetensors bytes APIs
+one bounded shard at a time. Before tensor deserialization it validates exact
+keys, dtype, shapes, alias policy, offsets and complete nonoverlapping extents.
+Only the configured, exactly shared embedding/head alias is omitted. Shard,
+index and configuration files remain compatible with the ordinary HF loader.
+
+`posttraining_checkpoint_import_torch_v5.py` reuses the frozen v0.73 DCP reader.
+It routes the source configuration and two runtime-code control reads, generated
+files and HF verification reads through the new content session. The actual HF
+`from_pretrained` receives in-memory state, configuration and generation objects,
+with no checkpoint pathname. The implementation does not patch library globals
+or use native pathname checkpoint serialization/loading.
+
+Before output creation, it checks conservative serialized writes, all planned
+HF/control reads and visible serialization scratch against explicit caller
+caps. Scratch is four times the largest serialized-shard bound plus 2 MiB,
+included in the live projection alongside two cast states. This does not measure
+RSS or prove native allocator bounds; it does not silently raise the existing
+real-plan memory allowance. Source key/shape/chunk checks, finite-value checks,
+independent tied-alias validation, casts, FP32 buffers, config preservation and
+complete HF tensor equality/digest checks remain. The receipt is explicitly v0.5.
+
+## Verification
+
+**549 distinct tests pass in the targeted suites, with no failures or skips.**
+This is not a full-repository or real-checkpoint qualification claim.
+
+- 464 stdlib tests on Python 3.11.15, 3.13.7 and 3.14.6: 0.825s, 0.788s and
+  0.865s. This includes all of v0.73's 414 stdlib regressions.
+- 85 genuine tiny CPU tests on Python 3.13.7: 1.185s test time and 3.054s
+  supervised wall time under a 60-second parent timeout. All 71 prior native
+  regressions remain included.
+- 64 new tests: 41 content-session, nine source/header and 14 native integration.
+- Ruff E,F,I,B,UP / py311 / line length 100 passes on all six new code/test files.
+  Existing Torch DCP/platform/deprecation warnings remain visible.
+
+Tests exercise BF16/FP32/untied conversion, multiple shards and independent stock
+HF filename-loader compatibility. That last compatibility read is explicitly
+test-only and outside the kernel receipt. A separate success test disables
+native path save/safetensors opening. Intercepted HF/control `pread`/`pwrite`
+request sizes exactly match the reported counters. Limit tests deny output
+before serialization, corrupted output is rejected before loading, and close
+failure cannot report success. The initial development issue was Torch returning
+an `OrderedDict`: the helper now accepts exactly `dict` or `OrderedDict` and
+copies the mapping. No validation gate was weakened to make a test pass.
+
+Report: `evidence/lumi-4b-sft-import-metered-hf-v0.1.json`.
+Structural verification:
+`evidence/lumi-4b-sft-import-metered-hf-verification-v0.1.json`.
+
+## Remaining work
+
+1. Version coordinator/package integration for the v0.5 kernel and combine the
+   explicit ledgers. Reuse/account for the DCP reader's audit within the existing
+   two-audit plan; do not silently add a third full audit or increase saved caps.
+   The frozen coordinator/package deliberately still require old evidence and
+   are not wired to this successor.
+2. Integrate and qualify the Linux guardian/cgroup and filesystem/network/write
+   controls, then admit the exact native host/runtime and resource plan. Mac
+   tests do not qualify Linux enforcement. Real DCP inputs still must satisfy
+   the frozen reader's 0600/0700 contract; compatibility with existing 0400 DCP
+   inputs has not been established, and no input was chmodded.
+3. Only after those prerequisites and exact execution authorization, perform the
+   real checkpoint import and downstream GPU worker/profile, data relocation and
+   CUDA/smoke work already recorded in v0.70-v0.73. This is not authorization to
+   launch them now.
+
+The new ledgers cover explicit checkpoint/control content, not dependency/module
+imports, physical disk I/O, hard timeouts, all process writes or native RSS.
+Metadata pickle still requires trusted hash-bound inputs; hashing is not safe
+unpickling, origin proof or atomic protection from a hostile owner.
+
+No GPU is needed for the next software integration step. Public `run_import`
+still fails closed with `host_guard_not_bound`. **Gate 5 remains incomplete;
+real SFT, execution permission and production eligibility remain false.** The
+S3-backed pretrained base and all dataset/rights/evaluation rules are unchanged.
+
+HEAD remains `ecc545fc423650bf1089311915290523c10b3172`, with empty tracked and
+staged diffs. This stage adds three modules, three test files, a report,
+structural verification and this status successor, all local/unpublished.

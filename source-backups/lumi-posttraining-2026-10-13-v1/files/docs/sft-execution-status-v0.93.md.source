@@ -1,0 +1,41 @@
+# SFT execution status v0.93
+
+2026-09-14. The second explicitly approved one-shot read completed, but failed
+to extract a standard pytest failed-test summary. It read 99,267 bytes through
+two HTTPS GETs, below 4 MiB, using the bound corrected v2 parser. Result remains
+`summary_unavailable_or_incomplete`. Failed-test names and the exact remote
+failure cause remain unknown. The first and second STOP records and markers
+remain intact; no third read occurred and no raw log was saved.
+
+## What the local review establishes
+
+The workflow invokes pytest directly. Its only configured output option is `-q`;
+no summary-suppression option or output redirection was found. The active
+`ci_source_partition_v1.py` plugin can raise `pytest.UsageError` during startup
+before its reporting state exists, or during collection/accounting checks.
+Such a failure need not have ordinary FAILED test-node rows. The plugin's own
+`SOURCE_SCOPE_ACCOUNTED` JSON is collection accounting, not a passing test result.
+
+A synthetic startup-error example confirms that a summary-only parser rejects
+that class of input. This does not prove that startup, collection, OOM, a runtime
+error, or any particular test caused the remote failure. The plain-footer
+correction remains locally tested, but has not solved the observed extraction
+problem. The diagnostic design was too narrow; further speculative footer fixes
+or another identical read are not justified.
+
+## Next bounded diagnostic, not yet approved or executed
+
+Use at most two GETs and a 128 KiB log tail to retain only structural format flags,
+the process exit code, an allowlisted startup/collection guard error-code and
+closed scope-accounting counts if present. No raw exception values or raw log
+should be retained. These fields differ from the previous test-name/error-type
+authorization and require fresh user approval before the read.
+
+The current commit remains `6585a1e073a6a5302630ed63a3c1a3d81adda429`.
+No published source/policy change, commit, push, CI/native rerun, GPU,
+real-checkpoint import, or training occurred in this successor diagnostic.
+Gate 5 remains incomplete; the native failure is separately unresolved.
+
+Evidence:
+`evidence/lumi-4b-sft-source-failure-summary-diagnostic-v0.2.json`
+and `evidence/lumi-4b-sft-source-failure-summary-diagnostic-review-v0.2.json`.

@@ -1,0 +1,30 @@
+"""Offline checks for post-cleanup attempt-020 bindings."""
+
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v23 as m
+
+
+class Tests(unittest.TestCase):
+    def test_consumed_failure_and_verified_cleanup_bound(self):
+        manifest = m.verify()
+        plan = m.build()
+        self.assertEqual(manifest["attempt"], m.ATTEMPT)
+        self.assertEqual(m.controls(), {m.WATCH: m.WATCH_SHA, m.STORE: m.STORE_SHA})
+        self.assertIsNone(plan["successful_readonly_preflight"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_cleanup_or_failure_drift_rejected(self):
+        for key in ("CONSUMED_PREFLIGHT_SHA", "ENDPOINT_CLEANUP_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.verify()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

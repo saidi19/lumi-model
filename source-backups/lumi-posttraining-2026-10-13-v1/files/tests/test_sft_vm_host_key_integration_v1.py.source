@@ -1,0 +1,57 @@
+"""Fresh interpreter required: authenticate a generated offline source graph."""
+
+import importlib
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_host_key_integration_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.root = Path(tmp.name).resolve() / "candidate"
+        with patch.object(m, "OUTPUT", cls.root):
+            cls.report = m.prepare()
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.addClassCleanup(sys.path.remove, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+
+    def test_actual_outer_and_34_source_role_authentication(self):
+        self.outer.authenticate()
+        self.outer.loading.fresh_identity()
+        self.assertEqual(len(self.outer.loading.sources.inputs()), 34)
+        self.assertIn(str(self.root), self.outer.__file__)
+
+    def test_all_156_output_hashes_and_no_execution_authority(self):
+        self.assertEqual(len(self.report["outputs"]), 156)
+        for name, pin in self.report["outputs"].items():
+            raw = (self.root / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(m.repair.sha(raw), pin["sha256"])
+        self.assertFalse(self.report["execution_permitted"])
+        self.assertTrue(self.report["consumed_identity_retained"])
+        self.assertTrue(self.report["fresh_identity_required_before_execution"])
+
+    def test_checkpoint_selection_and_cpu_scope_not_changed(self):
+        for name in (
+            "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json",
+            "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+            "configs/lumi-vm-private-network-plan-v0.1.json",
+        ):
+            self.assertEqual((self.root / name).read_bytes(), (m.BASE / name).read_bytes())
+        raw = (self.root / m.SOURCE).read_bytes()
+        self.assertIn(b'encode("utf-8")', raw)
+        self.assertIn(b"need(raw.index(start) < raw.index(end))", raw)
+        pin = json.loads((self.root / m.INPUTS).read_bytes())["sources"][Path(m.SOURCE).stem]
+        self.assertEqual(pin["sha256"], m.repair.sha(raw))
+
+
+if __name__ == "__main__":
+    unittest.main()

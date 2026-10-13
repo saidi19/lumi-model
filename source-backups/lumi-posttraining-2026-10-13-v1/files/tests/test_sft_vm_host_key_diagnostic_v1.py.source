@@ -1,0 +1,136 @@
+"""Synthetic console only, with the unchanged pinned parser."""
+
+import base64
+import contextlib
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import diagnose_sft_vm_host_key_v1 as m
+from scripts import execute_sft_vm_private_outer_v13 as entry
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.parser = m.frozen_parser((m.ROOT / m.SOURCE).read_bytes())
+        self.blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + b"z" * 32
+        self.console = (
+            m.START + b"\nssh-ed25519 " + base64.b64encode(self.blob) + b" synthetic\n" + m.END
+        )
+
+    def analyze(self, console, encoded=True):
+        value = base64.b64encode(console).decode() if encoded else console.decode()
+        return m.analyze(dict(InstanceId="synthetic", Output=value), "synthetic", self.parser)
+
+    def test_exact_base64_and_plain_contract(self):
+        for encoded in (True, False):
+            result = self.analyze(self.console, encoded)
+            self.assertTrue(result["frozen_parser_passes"])
+            self.assertEqual(result["ed25519_valid_blobs"], 1)
+            self.assertNotIn(base64.b64encode(self.blob).decode(), json.dumps(result))
+
+    def test_duplicate_or_missing_markers_reject(self):
+        for value in (b"", self.console * 2, self.console.replace(m.END, b"")):
+            self.assertEqual(self.analyze(value)["rejection"], "marker_cardinality")
+
+    def test_wrong_or_duplicate_key_rejects(self):
+        bad = self.console.replace(base64.b64encode(self.blob), b"not_base64")
+        self.assertEqual(self.analyze(bad)["rejection"], "key_contract")
+        duplicate = self.console.replace(
+            m.END, b"ssh-ed25519 " + base64.b64encode(self.blob) + b"\n" + m.END
+        )
+        self.assertEqual(self.analyze(duplicate)["rejection"], "key_contract")
+
+    def test_type_ascii_and_size_rejections(self):
+        for output, rejection in (
+            (None, "output_type"),
+            ("\u2603", "non_ascii_input"),
+            ("!", "outer_base64"),
+            ("x" * (m.MAX_CONSOLE + 1), "encoded_size"),
+        ):
+            self.assertEqual(
+                m.analyze(dict(InstanceId="i", Output=output), "i", self.parser)["rejection"],
+                rejection,
+            )
+
+    def test_boot_markers_are_counts_only(self):
+        result = self.analyze(self.console + b"\nLUMI_BOOT_V2:wrapper_entry\nPRIVATE_SENTINEL")
+        self.assertEqual(result["fixed_boot_marker_counts"]["wrapper_entry"], 1)
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+
+    def fake_run(self, running=False, fail=False):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "OUTPUT", root / "output"))
+        proof = json.loads(m.PROOF.read_bytes())
+        instance = proof["outcome"]["instance"]
+        reader = Mock(calls=1)
+        reader.return_value = dict(
+            access_key="SYNTHETIC_SECRET", secret_key="SYNTHETIC_SECRET", token="SYNTHETIC_SECRET"
+        )
+        client = Mock()
+        client.describe_instances.return_value = dict(
+            Reservations=[
+                dict(
+                    Instances=[
+                        dict(
+                            InstanceId=instance,
+                            State=dict(Name="running" if running else "stopped"),
+                            InstanceType="r6i.4xlarge",
+                            Tags=[dict(Key="LumiAttempt", Value=proof["attempt"])],
+                            BlockDeviceMappings=[
+                                dict(Ebs=dict(VolumeId=x))
+                                for x in proof["outcome"]["two_retained_ebs_ids"]
+                            ],
+                        )
+                    ]
+                )
+            ]
+        )
+        client.get_console_output.return_value = dict(
+            InstanceId=instance, Output=base64.b64encode(self.console).decode()
+        )
+        if fail:
+            client.get_console_output.side_effect = ValueError("PRIVATE_EXCEPTION")
+        credentials = Mock()
+        credentials.Reader.return_value = reader
+        credentials.session.return_value.create_client.return_value = client
+        outer = types.SimpleNamespace(
+            credentials=credentials,
+            network=types.SimpleNamespace(
+                host=types.SimpleNamespace(timeout=lambda _: contextlib.nullcontext())
+            ),
+        )
+        self.enterContext(patch.object(entry, "outer", outer))
+        self.enterContext(patch.object(entry, "local_preconditions"))
+        result = m.run()
+        raw = b"".join(p.read_bytes() for p in m.OUTPUT.glob("*.json"))
+        self.assertNotIn(b"SYNTHETIC_SECRET", raw)
+        self.assertNotIn(b"PRIVATE_EXCEPTION", raw)
+        return result, client
+
+    def test_one_shot_and_no_raw_values(self):
+        result, client = self.fake_run()
+        self.assertEqual(result["status"], "completed_current_console_aggregate_only")
+        self.assertEqual(result["ec2_calls"], 2)
+        self.assertEqual(result["console_reads"], 1)
+        with self.assertRaises(ValueError):
+            m.run()
+        self.assertEqual(client.get_console_output.call_count, 1)
+        client.close.assert_called_once()
+
+    def test_running_host_stops_before_console(self):
+        result, client = self.fake_run(running=True)
+        self.assertEqual(result["stage"], "stopped_host_ownership")
+        client.get_console_output.assert_not_called()
+
+    def test_console_failure_preserved_no_retry(self):
+        result, client = self.fake_run(fail=True)
+        self.assertEqual(result["status"], "stopped_no_retry")
+        self.assertEqual(client.get_console_output.call_count, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

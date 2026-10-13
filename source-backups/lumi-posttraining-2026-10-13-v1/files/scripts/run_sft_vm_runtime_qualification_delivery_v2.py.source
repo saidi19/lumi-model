@@ -1,0 +1,244 @@
+"""Detached successor: every authenticated exchange fits the 120-second tunnel.
+
+Private pre-admission join only; no host launch, credentials or binding. Recover
+the ORIGINAL root-owned setup request over the pinned channel, run once on the
+native service manager, then observe and reap. Never repeat a dispatch/finish.
+"""
+
+import hashlib
+import math
+import time
+from pathlib import Path
+
+import run_sft_vm_runtime_qualification_delivery_v1 as previous
+
+sender = previous.sender
+readiness = previous.readiness
+ATTEMPT = previous.ATTEMPT
+SOURCE = Path(__file__).with_name("run_sft_vm_runtime_qualification_detached_v1.py")
+SOURCE_SHA = "e2b2f544afac042e64c19914dcb89994d99394101521c2422fc9770e904e2bff"
+MAX_POLLS = 60
+ABORT_RESERVE = 35
+CAP = 32 * 1024**2
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_qualification_delivery_rejected") from None
+
+
+def launcher(operation, expected, request, lengths):
+    need(operation in {"request", "dispatch", "status", "finish", "cancel"})
+    receiver, qualification, ready, archive = lengths
+    need(0 < receiver <= 32768)
+    if operation == "dispatch":
+        need(0 < qualification <= 32768 and 0 < ready <= 32768 and archive == 181868)
+    else:
+        need(qualification == ready == archive == 0)
+    action = {
+        "request": "m.original_request(expected)",
+        "dispatch": "m.dispatch(expected,request,sources,source)",
+        "status": "m.status(expected,request)",
+        "finish": "m.finish(expected,request)",
+        "cancel": "m.cancel(expected,request)",
+    }[operation]
+    return f"""import hashlib,json,os,signal,sys,types
+try:
+ signal.alarm(75)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ raw=sys.stdin.buffer.read({sum(lengths) + 1})
+ assert len(raw)=={sum(lengths)}
+ source=raw[:{receiver}]
+ assert hashlib.sha256(source).hexdigest()=={SOURCE_SHA!r}
+ m=types.ModuleType('_authenticated_detached_qualification')
+ m.__file__='/opt/lumi-bootstrap-input/run_sft_vm_runtime_qualification_detached_v1.py'
+ exec(compile(source,m.__file__,'exec'),m.__dict__)
+ expected={expected!r}
+ request={request!r}
+ sources={{'qualification.py':raw[{receiver}:{receiver + qualification}],
+ 'readiness.py':raw[{receiver + qualification}:{receiver + qualification + ready}],
+ 'source-release.tar.gz':raw[{receiver + qualification + ready}:]}}
+ answer={action}
+ body=json.dumps(answer,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+ assert len(body)<=4096
+ sys.stdout.buffer.write(body)
+except BaseException:
+ sys.exit(1)
+"""
+
+
+def state_reply(value, states):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "state",
+            "observation",
+            "host_admitted",
+            "binding_created",
+            "gate_5_complete",
+            "retry_allowed",
+        }
+    )
+    need(value["state"] in states)
+    need(
+        all(
+            value[k] is False
+            for k in ("host_admitted", "binding_created", "gate_5_complete", "retry_allowed")
+        )
+    )
+    if value["state"] in {"returned", "completed"}:
+        previous.validate_reply(value["observation"])
+    else:
+        need(value["observation"] is None)
+    return value
+
+
+def _qualify_prepared_channel_once(
+    output,
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    expected,
+    *,
+    deadline,
+    host_deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+    wait=time.sleep,
+):
+    need(
+        type(expected) is dict and set(expected) == {"attempt", "machine_id", "boot_id", "volumes"}
+    )
+    # Validate identity syntax before any serialization or side effect.
+    readiness.validate_request(
+        dict(
+            expected,
+            schema="lumi.vm-detached-setup-request.v0.1",
+            setup_deadline_boottime=1800,
+            host_deadline_boottime=14400,
+        ),
+        binding,
+    )
+    need(all(type(t) in {int, float} and math.isfinite(t) for t in (deadline, host_deadline)))
+    need(650 < deadline - clock() <= 700 and deadline <= host_deadline - 11315)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= CAP)
+    source = SOURCE.read_bytes()
+    need(0 < len(source) <= 32768 and hashlib.sha256(source).hexdigest() == SOURCE_SHA)
+    qualification = previous.SOURCE.read_bytes()
+    ready = readiness.SOURCE.read_bytes()
+    archive = previous.ARCHIVE.read_bytes()
+    need(
+        0 < len(qualification) <= 32768
+        and hashlib.sha256(qualification).hexdigest() == previous.SOURCE_SHA
+    )
+    need(0 < len(ready) <= 32768 and hashlib.sha256(ready).hexdigest() == readiness.SOURCE_SHA)
+    previous.qualification.unpack(archive)
+    # Reserve maximum command sizes for every planned short exchange and one
+    # failure cancellation, all within the SAME prior control-byte allowance.
+    need(
+        len(qualification) + len(ready) + len(archive) + (MAX_POLLS + 4) * (len(source) + 16384)
+        <= remaining_control_bytes
+    )
+    sender.command(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        launcher("request", expected, None, (len(source), 0, 0, 0)),
+    )
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = sender.delivery.connection.issuer.base.save
+    report = dict(
+        status="started",
+        dispatch_attempted=False,
+        finish_attempted=False,
+        cancel_attempted=False,
+        cancellation_observed=False,
+        qualification_completed=False,
+        status_reads=0,
+        control_content_bytes_charged=0,
+        host_admitted=False,
+        binding_created=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        retry_allowed=False,
+    )
+    save(output / "started.json", report)
+    request = None
+
+    def exchange(operation):
+        parts = (
+            (source, qualification, ready, archive)
+            if operation == "dispatch"
+            else (source, b"", b"", b"")
+        )
+        code = launcher(operation, expected, request, tuple(map(len, parts)))
+        argv = sender.command(binding, key, directory, config_sha, hosts_sha, code)
+        need(len(argv[-1].encode()) <= 16384)
+        body = b"".join(parts)
+        # Include the SSH-quoted remote command, not just its Python source.
+        charge = len(argv[-1].encode()) + len(body)
+        reserve = 0 if operation == "cancel" else ABORT_RESERVE
+        timeout = min(80, deadline - clock() - reserve)
+        need(timeout > 0 and (operation != "dispatch" or timeout == 80))
+        need(report["control_content_bytes_charged"] + charge <= remaining_control_bytes)
+        report["control_content_bytes_charged"] += charge
+        return sender.delivery.decode(sender.pipe_exchange(argv, body, timeout))
+
+    try:
+        response = exchange("request")
+        need(
+            type(response) is dict
+            and set(response)
+            == {"request", "observed_boottime", "host_admitted", "binding_created", "retry_allowed"}
+        )
+        need(
+            all(response[k] is False for k in ("host_admitted", "binding_created", "retry_allowed"))
+        )
+        request = response["request"]
+        readiness.validate_request(request, binding)
+        need(all(request[k] == expected[k] for k in expected))
+        observed = response["observed_boottime"]
+        need(type(observed) in {int, float} and math.isfinite(observed))
+        need(0 <= observed < request["host_deadline_boottime"] - 11315 - 650)
+        save(output / "original-request.json", request)
+        report["dispatch_attempted"] = True
+        state_reply(exchange("dispatch"), {"dispatch_requested"})
+        for _ in range(MAX_POLLS):
+            report["status_reads"] += 1
+            value = state_reply(exchange("status"), {"running", "returned"})
+            if value["state"] == "returned":
+                report["finish_attempted"] = True
+                final = state_reply(exchange("finish"), {"completed"})
+                need(final["observation"] == value["observation"])
+                report["observation"] = final["observation"]
+                report["qualification_completed"] = True
+                break
+            pause = min(10, deadline - clock() - ABORT_RESERVE - 1)
+            need(pause > 0)
+            wait(pause)
+        need(report["qualification_completed"])
+        report["status"] = "generated_runtime_qualified_and_reaped_not_admission"
+    except BaseException:
+        report["status"] = "failed_preserve_no_retry"
+        if report["dispatch_attempted"]:
+            report["cancel_attempted"] = True
+            try:
+                state_reply(exchange("cancel"), {"cancelled"})
+                report["cancellation_observed"] = True
+            except BaseException:
+                pass  # Outer lifecycle retains STOP responsibility, no false cleanup claim.
+        save(output / "result.json", report)
+        raise ValueError("detached_runtime_qualification_failed") from None
+    save(output / "result.json", report)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("native_admission_and_execution_authority_not_bound") from None

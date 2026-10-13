@@ -1,0 +1,159 @@
+"""Offline verification of the approved attempt-020 v0.2 admission."""
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+PLAN = "artifacts/lumi-vm-attempt-020-readonly-preflight-plan-v0.2/plan.json"
+PLAN_SHA = "0fd54c03c2d70e5c4005eb8c5286e417bcb44f34e2c3942bbab4a63ccb31d7c7"
+ENTRY = "scripts/preflight_sft_vm_attempt020_v2.py"
+ENTRY_SHA = "5f32faeee4e3c7bd09ae0960a911995cbe9e00c3b6c1ff7fe311fa889dbb5c02"
+BINDINGS = "scripts/prepare_sft_vm_deployment_bindings_v23.py"
+BINDINGS_SHA = "34715dc6858d36ff749d1cd73785b77c22322f39d9865da8bc9f40615e5a2f9e"
+APPROVAL = "configs/lumi-vm-attempt-020-readonly-preflight-approval-v0.2.json"
+APPROVAL_SHA = "78bc8c7290c1612f7c9e571a3c05543f816e91e4b8120dcb21e0a410e816d5a2"
+RUNNER = "scripts/preflight_sft_vm_attempt017_v1.py"
+RUNNER_SHA = "939363befa790b34537feffd7c9c0e1f992de643678402e4baa6b0faf6633745"
+RUN = "artifacts/lumi-vm-attempt-020-readonly-preflight-v0.2"
+FILES = {
+    "started.json": "6015b1968da8641230e3276896a0d68014f16ed30fc1ed56a06c89d48fd387fd",
+    "admission.json": "d036ae7858f4db369f070d61b6e11a24d3de1268ede4ca8f5b99b6deac778561",
+    "result.json": "2d0f24ddb07f9aab4eb5ab285148b56c6d5fcde5301b44635bae1670156d9b2f",
+}
+CONSUMED = "artifacts/lumi-vm-attempt-020-readonly-preflight-v0.1"
+CONSUMED_FILES = {
+    "started.json": "6015b1968da8641230e3276896a0d68014f16ed30fc1ed56a06c89d48fd387fd",
+    "result.json": "1866c0b95815f9a18147a3c91ea6bc5bbc6472a83b2b3f8aa73a3127bffe4d95",
+}
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-020-readonly-preflight-verification-v0.2.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_preflight_v2_verification_rejected") from None
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(hashlib.sha256(raw).hexdigest() == digest)
+    return raw
+
+
+def verify():
+    for name, digest in (
+        (PLAN, PLAN_SHA), (ENTRY, ENTRY_SHA), (BINDINGS, BINDINGS_SHA),
+        (APPROVAL, APPROVAL_SHA), (RUNNER, RUNNER_SHA),
+    ):
+        read(name, digest)
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    approval = json.loads(read(APPROVAL, APPROVAL_SHA))
+    need(plan["attempt"] == approval["attempt"] == ATTEMPT)
+    need(approval["plan_sha256"] == PLAN_SHA)
+    need(approval["entry_sha256"] == ENTRY_SHA)
+    need(approval["bindings_sha256"] == BINDINGS_SHA)
+    need(approval["maximum_read_calls"] == 79 and approval["maximum_seconds"] == 1500)
+    need(approval["retry"] is False and approval["cpu_launch_authorized"] is False)
+    for name, digest in plan["bindings"].items():
+        read(name, digest)
+    for name, digest in plan["control_evidence"].items():
+        read(name, digest)
+    for name, digest in CONSUMED_FILES.items():
+        read(CONSUMED + "/" + name, digest)
+    started, admission, result = (
+        json.loads(read(RUN + "/" + name, digest)) for name, digest in FILES.items()
+    )
+    # The inherited runner records its own __file__; bind the approved wrapper separately.
+    need(started["entry_sha256"] == RUNNER_SHA)
+    need(started["execution_authorized"] is False)
+    need(started["max_calls"] == 79 and started["max_seconds"] == 1500)
+    need(started["control_evidence"] == plan["control_evidence"])
+    need(result["status"] == "readonly_preflight_passed")
+    need(result["admission"] == admission)
+    need(admission["status"] == "all_readonly_admission_passed_before_execution_marker")
+    cpu, watchdog, network, store = (
+        admission[key] for key in ("cpu", "watchdog", "network", "cleanup_store")
+    )
+    need(cpu["status"] == "fresh_cpu_and_exact_attempt_preflight_passed")
+    need(watchdog["status"] == "verified_fresh_inert_watchdog")
+    need(network["fresh_network_admitted"] is True)
+    need(store["private_owner_versioning_encryption_verified"] is True)
+    need(store["claim_protection_verified_at_observation"] is True)
+    need(store["write_authority_granted"] is False)
+    need(store["object_reads"] == store["object_lists"] == store["object_writes"] == 0)
+    component_calls = (
+        cpu["calls"] + watchdog["api_calls"] + network["calls"] + store["observation_calls"]
+    )
+    need(component_calls == admission["total_control_calls"] == result["calls"] == 56)
+    need(type(result["elapsed_seconds"]) in (int, float))
+    need(0 <= admission["elapsed_seconds"] <= result["elapsed_seconds"] < 1500)
+    for key in ("cloud_mutations", "object_access"):
+        need(result[key] == admission[key] == 0)
+    need(admission["host_launch_authorized"] is False)
+    for key in (
+        "execution_marker_created", "cpu_launch_authorized", "outer_invoked",
+        "gate_5_complete", "gpu", "training",
+    ):
+        need(result[key] is False)
+    return {
+        "schema": "lumi.vm-attempt020-readonly-preflight-verification.v0.2",
+        "attempt": ATTEMPT,
+        "status": "readonly_preflight_passed",
+        "plan_sha256": PLAN_SHA,
+        "approval_sha256": APPROVAL_SHA,
+        "entry_sha256": ENTRY_SHA,
+        "bindings_sha256": BINDINGS_SHA,
+        "runner_sha256": RUNNER_SHA,
+        "run_bindings": {RUN + "/" + name: digest for name, digest in FILES.items()},
+        "consumed_bindings": {
+            CONSUMED + "/" + name: digest for name, digest in CONSUMED_FILES.items()
+        },
+        "source_bindings": plan["bindings"],
+        "control_evidence": plan["control_evidence"],
+        "calls": 56,
+        "credential_identity_calls": {
+            "included_in_admission_counter": False,
+            "initial_identity_call_required_by_pinned_code": True,
+            "refresh_count_recorded_by_runner": False,
+        },
+        "elapsed_seconds": result["elapsed_seconds"],
+        "network_admitted": True,
+        "cpu_admitted": True,
+        "inert_watchdog_verified": True,
+        "cleanup_store_verified": True,
+        "consumed_v01_preserved": True,
+        "retry": False,
+        "cloud_mutations": 0,
+        "object_access": 0,
+        "instance_actions": 0,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

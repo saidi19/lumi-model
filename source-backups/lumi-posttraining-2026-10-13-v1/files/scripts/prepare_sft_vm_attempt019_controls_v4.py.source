@@ -1,0 +1,133 @@
+"""Bind the successful attempt-019 read-only admission without CPU authority."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt019_controls_v3 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+PREVIOUS_SHA = "222eb03db0cdf0b9c539b4301f567a08d4353ca91b113c0a0d292ff775e03d6a"
+BASE_PLAN = "artifacts/lumi-vm-attempt-019-control-plan-v0.3/plan.json"
+BASE_PLAN_SHA = "1edde2da447ab57db8fc1e42e45379730d27fa8ea58a55eff1a88a269d0f12d7"
+PREFLIGHT = "evidence/lumi-vm-attempt-019-readonly-preflight-verification-v0.1.json"
+PREFLIGHT_SHA = "e0fcd19b884e33fead535c9f5f6a46e74050ebffcc039a50f345c4e53b26775e"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-019-control-plan-v0.4"
+ATTEMPT = previous.ATTEMPT
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_plan_v4_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_SHA)
+    previous.build()
+    plan = json.loads(read(BASE_PLAN, BASE_PLAN_SHA))
+    preflight = json.loads(read(PREFLIGHT, PREFLIGHT_SHA))
+    scope = plan["cpu_scope_reference"]
+    need(
+        preflight["attempt"] == ATTEMPT
+        and preflight["status"] == "readonly_preflight_passed"
+        and preflight["source_release_sha256"] == previous.previous.previous.RELEASE_SHA
+        and preflight["watchdog_verification_sha256"] == previous.WATCH_SHA
+        and preflight["cleanup_store_verification_sha256"] == previous.STORE_SHA
+        and preflight["calls"] == 56
+        and preflight["cloud_mutations"] == preflight["object_access"] == 0
+        and preflight["network_admitted"] is True
+        and preflight["cpu_admitted"] is True
+        and preflight["inert_watchdog_verified"] is True
+        and preflight["cleanup_store_verified"] is True
+        and preflight["execution_authority_created"] is False
+        and preflight["cpu_instance_launched"] is False
+        and preflight["checkpoint_access"] is False
+        and scope["output"]
+        == "artifacts/lumi-vm-private-outer-execution-v0.24/attempt-019"
+        and scope["source"]["source_versions_bound"] is True
+        and scope["source"]["hard_ip_packet_quotas_implemented"] is True
+        and scope["source"]["wire_or_billing_byte_cap_claimed"] is False
+        and scope["retention"]["status"]
+        == "implemented_requires_admitted_one_shot_credentials_and_readback"
+        and scope["watchdog_launch_interlock_bound"] is True
+        and scope["execution_entry_sha256"] is None
+    )
+    plan["schema"] = "lumi.vm-attempt-019-control-plan.v0.4"
+    plan["status"] = "readonly_preflight_passed_v024_proposal_required"
+    plan["successful_readonly_preflight"] = {
+        "path": PREFLIGHT,
+        "sha256": PREFLIGHT_SHA,
+    }
+    plan["readiness_review"]["decision"] = "explicit_v024_cpu_approval_required"
+    plan["readiness_review"]["required_before_paid_execution"] = [
+        "Fresh v0.24 proposal and explicit approval bind the admitted final scope and hashes",
+        "Immediate pre-launch read-only admission passes again before the execution marker",
+    ]
+    plan["readiness_review"]["risk"] = (
+        "Read-only admission passed, but remote boot, checkpoint download and real import "
+        "remain unproved until a separately approved one-shot CPU execution."
+    )
+    plan["unresolved_before_live_execution"] = [
+        "Bind a separate v0.24 one-shot CPU proposal and exact human approval."
+    ]
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-019-control-plan-release.v0.4",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": previous.previous.previous.RELEASE_SHA,
+        "successful_readonly_preflight_sha256": PREFLIGHT_SHA,
+        "live_controls_verified": True,
+        "network_admitted": True,
+        "cpu_admitted": True,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

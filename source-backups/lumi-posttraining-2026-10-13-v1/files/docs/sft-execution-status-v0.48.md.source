@@ -1,0 +1,121 @@
+# SFT execution status v0.48
+
+Local acceptance handoff, 2026-09-09. This receipt is intentionally not committed
+or published. The six-file implementation successor is already published and
+accepted below; do not push this result-only document to trigger another CI run.
+
+## Accepted exact commit
+
+**`3fcb22e01228052bd3abf3d69862ee8dc1f1b525`** adds the one-shot release gate,
+remote-only composition fixture, pure gate tests, AST-only source tests, Linux
+acceptance wrapper and v0.47 status. All six are additions; no accepted older
+implementation, test, fixture, workflow or evidence was edited. Local HEAD,
+origin tracking ref and live GitHub branch were verified equal after acceptance.
+The tracked tree and index are clean; unrelated untracked files are preserved.
+
+[Source CI 34319013486](https://github.com/saidi19/lumi-model/actions/runs/34319013486)
+passed all four jobs on this exact commit:
+
+- `test`: `102361318423`
+- `isolated-sft-controls`: `102361318649`
+- `frozen-lint-integrity`: `102361318672`
+- `source-only-validators`: `102361318687`
+
+The source suite reports **4796 passed, 58 skipped, 329 deselected, 36 warnings,
+9395 subtests passed in 425.81 seconds**. Final partition status is
+`SOURCE_SCOPE_ACCOUNTED`, with **4854 source-selected**, **327 private integrations
+NOT_EXECUTED**, and **2 historical tests separately routed**.
+`private_integration_passed=false` and `full_ci_passed=false` remain unchanged.
+
+[Spark CI 34319013434](https://github.com/saidi19/lumi-model/actions/runs/34319013434),
+job `102361318019`, passed **3 tests, zero skips, in 82.06 seconds** on the same SHA.
+No CI rerun, diagnostic retry or follow-up source correction was required.
+
+Local pre-publication checks passed **158 tests in 0.106 seconds**: 89 accepted
+verifier regressions, 46 new gate tests and 23 new AST/literal tests. Exact-file
+Ruff passed. Neither the Linux fixture nor its wrapper was imported or executed
+on the Mac, including platform-skip paths. Native execution occurred only in CI.
+
+## Native ordering acceptance
+
+The accounted source suite includes the one new Linux acceptance test in
+`tests/test_sft_release_gate_linux_v1.py`. On the Ubuntu runner its sole platform
+skip guard does not apply, and it requires a zero-exit structural report from
+the privileged fixture. The 70 added passing tests correspond to 46 gate tests,
+23 source tests and this one native test; skipped count remains 58. The job emits
+aggregate/quiet results, not a separately retained per-test PASS line or raw
+fixture stdout. Native claims below are the assertions required by that wrapper,
+not a fabricated standalone fixture transcript.
+
+The four preserved positive lifecycle cases now verify the declared generated
+tree before the guardian's original callback may send `b"G"`. Actual system
+CPython 3.12 preflight is enforced, with no verifier runtime-guard patch. The
+accepted IPC/filesystem/Landlock/privilege/cleanup path and CPU WorkerRun retain
+three invocations, six rank workers, four global and eight rank optimizer updates.
+
+Two additional fresh blocked-WorkerRun cases reject a wrong external manifest pin
+and a same-size generated dependency tamper. Each requires one failed verification
+attempt and **zero original release attempts/completions**. Their one blocked
+worker is SIGKILL-reaped, their exact controller is reaped with exit status 2,
+and their owned cgroup is confirmed empty and removed. Retirement is counted
+once; descriptor identities balance before and after the watcher.
+
+The experiment totals **six cgroups and six generated trees removed**. The two
+negative cases additionally require two seccomp installations and four exposed
+socket removals; the original four-case positive counters remain separate.
+No negative WorkerRun invocation follows from the verified zero release calls
+and frozen wait-for-G-before-exec sequence. This is not presented as an independent
+exec instrumentation counter, nor is the guardian's callback-consumption flag
+misrepresented as proof that G was sent.
+
+The final aggregate report is bounded to 4096 bytes. Generated manifest/content
+limits, exact cleanup targets, false nonclaims and threat-model premises are
+recorded in v0.47. The three 106-byte stand-ins are explicitly **not the runtime
+executing WorkerRun**. No coherent snapshot, execution immutability, complete
+dynamic dependency closure, publisher authentication or real-host admission is
+claimed. Real SFT execution and production eligibility remain false.
+
+## Frozen successor bindings
+
+- Gate: `95d526d88a65d8c57ee667a3e2c7f1b83f802058f8fe969f6b920a145f66fc75`
+- Native fixture: `58cdef4d15055339ea8c8b7e8026371b75a36bb4671f543bb7e2f1df3a0d0106`
+- Gate tests: `8a65ff3cec9a1ec3e01f4d8de13c43e2b46384c9f22a570527092bc2f2f330ba`
+- Source tests: `a100085090dad098be7b209b99c479c4b3ac0e71aebc34d87e1ea6ebbc58c405`
+- Linux wrapper: `3c8b6eb7e2715e77af877281aaeebe39d580dcbf7e8789d4f65adc6509fd8a65`
+- v0.47: `4c655262e7672a30735c79c4f6ff20355f787b8ef18abe79a0035e5a38d3a9d9`
+
+The prior IPC/FS/netns/cgroup/WorkerRun byte bindings remain unchanged and are
+checked by the new AST-only suite as well as the preserved composition loaders.
+
+## Roadmap: next real handoff, not another stand-in gate
+
+**This native release-ordering integration step is complete. Gate 5 overall is
+still partial.** Next is a bounded actual Linux release candidate with an
+independently reviewed software lock and same-tree CPU acceptance: runtime,
+dependencies, source and required system-library closure must describe the
+software actually executed, not generated placeholders.
+
+The bounded source/config review found the following concrete constraints:
+
+- `configs/lumi-sft-import-runtime-macos-arm64-v0.1.lock:1` explicitly targets
+  macOS arm64 / Python 3.13. It is not a Linux x86-64 / CPython 3.12 release lock.
+- `src/lumi/posttraining_sft_launch_contract_v2.py:323` and
+  `scripts/sft_guarded_bootstrap_v1.py:95` carry `runtime_lock_sha256` fields;
+  structural SHA/equality checks alone do not produce or authenticate the actual
+  release artifact. The reviewed inventory did not identify a complete matching
+  Linux SFT dependency lock.
+- `src/lumi/posttraining_sft_worker_run_v1.py:94` currently admits context sizes
+  2–4095; line 98 admits `ddp` only. The **historical draft**
+  `configs/lumi-4b-sft-gpu-smoke-launch-contract-v0.1.json:26` instead says 4096,
+  and line 60 says `fsdp_full_shard`. Do not silently treat that old draft as a
+  currently supported launch profile or change training policy just to package it.
+
+Complete the actual release handoff and integrated worker/supervisor admission
+before binding the dedicated real host, restoring the original pretrained S3
+checkpoint and relocating exact data. Explicitly approved H100/CUDA validation,
+real SFT, evaluation and later rights/quality/deployment gates remain downstream.
+
+No GPU/instance action, S3/SSH access, real model/data read, real-model inference
+or training, promotion, dataset seal, registry mutation, automation or deletion
+of prior failure evidence occurred. Mac work remained small source/lint/synthetic
+checks only. The successful source workflows do not waive private integrations.

@@ -1,0 +1,105 @@
+"""Offline fresh identity authentication; no AWS, credentials or subprocesses."""
+
+import importlib
+import json
+import socket
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+m = importlib.import_module("scripts.prepare_sft_vm_attempt016_v1")
+
+
+def guard(event, args):
+    if event.startswith("socket.") or event == "subprocess.Popen":
+        raise RuntimeError("external_execution_forbidden")
+    if event == "open" and isinstance(args[0], (str, bytes)):
+        if "/.aws/" in str(args[0]) or "connection-key" in str(args[0]):
+            raise RuntimeError("private_credentials_forbidden")
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        temp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(temp.cleanup)
+        cls.root = Path(temp.name).resolve() / "fresh"
+        with patch.object(m, "OUTPUT", cls.root):
+            cls.report = m.prepare()
+        sys.path.insert(0, str(cls.root / "scripts"))
+        cls.outer = importlib.import_module("run_sft_vm_private_outer_v7")
+
+    def test_actual_graph_and_fresh_identity(self):
+        self.outer.authenticate()
+        self.outer.loading.fresh_identity()
+        self.assertEqual(len(self.outer.loading.sources.inputs()), 34)
+        self.assertEqual(self.outer.store.worker.ATTEMPT, m.NEW)
+        self.assertEqual(self.outer.store.worker.BUCKET, m.BUCKET)
+
+    def test_all_hashes_and_no_old_operational_identity(self):
+        self.assertEqual(len(self.report["outputs"]), 156)
+        for name, pin in self.report["outputs"].items():
+            raw = (self.root / name).read_bytes()
+            self.assertEqual(len(raw), pin["bytes"])
+            self.assertEqual(m.closure.sha(raw), pin["sha256"])
+            if name.startswith("scripts/"):
+                self.assertNotIn(m.OLD.encode(), raw)
+
+    def test_cleanup_fix_and_stop_diagnostics_retained(self):
+        roles = self.outer.loading.sources.inputs()
+        transport = roles["run_sft_vm_detached_delivery_v1"]
+        self.assertIn(b'"cleanup_stdout"', transport)
+        self.assertIn(b"process.wait(timeout=2)", transport)
+        provision = (self.root / "scripts/provision_sft_vm_host_v5.py").read_bytes()
+        self.assertIn(b'self.stop_observation_check = "owner"', provision)
+
+    def test_limits_and_evidence_unchanged(self):
+        name = "configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json"
+        self.assertEqual((self.root / name).read_bytes(), (m.BASE / name).read_bytes())
+        name = "configs/lumi-vm-fullsize-host-proposal-v0.1.json"
+        self.assertEqual(
+            (self.root / name).read_bytes(),
+            (m.BASE / name).read_bytes().replace(m.OLD.encode(), m.NEW.encode()),
+        )
+        for name in self.report["outputs"]:
+            if name.startswith("evidence/"):
+                self.assertEqual((self.root / name).read_bytes(), (m.BASE / name).read_bytes())
+
+    def test_plan_is_not_live_availability_or_authorization(self):
+        plan = json.loads(
+            (self.root / "configs/lumi-vm-private-network-plan-v0.1.json").read_bytes()
+        )
+        self.assertIn(m.CIDR, json.dumps(plan))
+        for key in (
+            "execution_permitted",
+            "old_authorization_reused",
+            "old_timer_reused",
+            "selected_cidr_live_absence_verified",
+            "historical_failure_root_cause_resolved",
+        ):
+            self.assertFalse(self.report[key])
+        self.assertTrue(self.report["fresh_controls_required"])
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+        with patch.object(m, "OUTPUT", self.root), patch.object(m, "build", return_value=({}, {})):
+            with self.assertRaises(ValueError):
+                m.prepare()
+
+    def test_early_boot_contract_preserved(self):
+        name = "scripts/run_sft_vm_early_stop_v2.py"
+        actual = (self.root / name).read_bytes()
+        before = (m.BASE / name).read_bytes()
+        self.assertEqual(actual, before.replace(m.OLD.encode(), m.NEW.encode()))
+        self.assertIn(b"DefaultDependencies=no", actual)
+        self.assertIn(b"14400", actual)
+        self.assertIn(b"1800", actual)
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+    sys.addaudithook(guard)
+    unittest.main()

@@ -1,0 +1,45 @@
+"""Genuine tiny CPU fixture only; never execute Linux bootstrap or real inputs."""
+
+from __future__ import annotations
+
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_guard_fixture_v1 as fixture
+
+
+class GuardedImportFixtureNativeTests(unittest.TestCase):
+    def test_one_real_tiny_dcp_bf16_package_chain(self):
+        from lumi.modeling_lumi import LumiForCausalLM
+
+        deadline = time.monotonic() + 30
+
+        def budget():
+            self.assertLess(time.monotonic(), deadline)
+
+        with tempfile.TemporaryDirectory(prefix="lumi-guarded-import-tiny-") as directory:
+            root = Path(directory).resolve()
+            with patch.object(LumiForCausalLM, "forward", side_effect=AssertionError("no forward")):
+                result = fixture.run_tiny_fixture(root, check_budget=budget)
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(result["import_passes"], 1)
+            self.assertEqual(result["checkpoint_full_audits"], 2)
+            self.assertEqual(result["tokenizer_full_audits"], 2)
+            self.assertEqual(result["forward_calls"], 0)
+            self.assertEqual(result["optimizer_steps"], 0)
+            self.assertTrue(result["frozen_worker_checksum_verifier_passed"])
+            self.assertFalse(result["gpu_used"])
+            self.assertFalse(result["real_4b_import"])
+            self.assertLessEqual(len(fixture.canonical(result)), 4096)
+            self.assertTrue((root / "attempt/checkpoint/manifest.sha256").is_file())
+            with patch.object(fixture, "_generate") as generate, \
+                    self.assertRaises(fixture.GuardFixtureError):
+                fixture.run_tiny_fixture(root, check_budget=budget)
+            generate.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

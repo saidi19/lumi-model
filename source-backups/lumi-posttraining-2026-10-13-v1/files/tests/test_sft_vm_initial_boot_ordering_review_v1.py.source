@@ -1,0 +1,239 @@
+"""Offline characterization of the frozen boot path, not Linux qualification.
+
+The ordering fixture models Canonical cloud-init's Ubuntu Before=sysinit.target
+and systemd v255 timer defaults. No subprocess, cloud call or guest operation is
+performed. These tests preserve the consumed implementation byte-for-byte.
+"""
+
+import configparser
+import gzip
+import hashlib
+import io
+import json
+import os
+import shlex
+import tempfile
+import unittest
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
+
+from tests.test_sft_vm_initial_provisioning_v2 import IDS, initial, native
+
+
+def timer_waits_for_sysinit(body):
+    unit = configparser.ConfigParser(interpolation=None, strict=True)
+    unit.read_string(body.decode())
+    # systemd v255 timer_add_default_dependencies: system timers get After=
+    # and Requires=sysinit.target unless DefaultDependencies=no is specified.
+    defaults = unit.getboolean("Unit", "DefaultDependencies", fallback=True)
+    explicit = unit.get("Unit", "After", fallback="").split()
+    return defaults or "sysinit.target" in explicit
+
+
+class SyntheticProcess:
+    """Real in-memory OS pipe, synthetic child; never calls Popen or killpg."""
+
+    def __init__(self, raw=b"", returncode=0):
+        read_fd, self.writer = os.pipe()
+        self.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        self.returncode = returncode
+        self.pid = 123456789
+        if raw:
+            assert os.write(self.writer, raw) == len(raw)
+        if returncode is not None:
+            os.close(self.writer)
+            self.writer = None
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout):
+        assert timeout > 0 and self.returncode is not None
+        return self.returncode
+
+    def kill(self, pid, signal):
+        assert pid == self.pid and signal == 9
+        self.returncode = -9
+
+    def close(self):
+        if self.writer is not None:
+            os.close(self.writer)
+            self.writer = None
+        self.stdout.close()
+
+
+@contextmanager
+def process_result(raw=b"", returncode=0, *, timeout=False):
+    process = SyntheticProcess(raw, returncode)
+    clock = [0, 6] if timeout else None
+    try:
+        with (
+            patch.object(native.subprocess, "Popen", return_value=process) as popen,
+            patch.object(native.os, "killpg", side_effect=process.kill) as kill,
+            patch.object(native.time, "monotonic", side_effect=clock, return_value=0),
+        ):
+            yield process, popen, kill
+    finally:
+        process.close()
+
+
+class FrozenCommandTests(unittest.TestCase):
+    def test_successful_not_found_is_accepted_by_real_command_adapter(self):
+        # Upstream systemctl show differs from systemctl status: a successfully
+        # queried missing unit can return not-found with exit 0.
+        with process_result(b"not-found\n") as (process, popen, kill):
+            self.assertEqual(native.show("synthetic.timer", "LoadState"), b"not-found")
+            self.assertTrue(process.stdout.closed)
+            kill.assert_not_called()
+            self.assertEqual(popen.call_args.args[0][-2:], ["--property=LoadState", "--value"])
+            self.assertEqual(popen.call_args.kwargs["stderr"], native.subprocess.DEVNULL)
+
+    def test_nonzero_exit_cannot_be_accepted_based_on_stdout(self):
+        with process_result(b"not-found\n", 1), self.assertRaises(ValueError):
+            native.show("synthetic.timer", "LoadState")
+
+    def test_output_cap_is_enforced_before_strip(self):
+        with process_result(b" " * 4097), self.assertRaises(ValueError):
+            native.command(["synthetic-only"])
+
+    def test_exact_output_cap_is_accepted(self):
+        with process_result(b"x" * 4096):
+            self.assertEqual(native.command(["synthetic-only"]), b"x" * 4096)
+
+    def test_pending_child_hits_deadline_and_is_reaped(self):
+        with process_result(returncode=None, timeout=True) as (process, _, kill):
+            with self.assertRaises(ValueError):
+                native.command(["synthetic-only"])
+            kill.assert_called_once_with(process.pid, 9)
+            self.assertEqual(process.returncode, -9)
+            self.assertTrue(process.stdout.closed)
+
+
+class FrozenOrderingTests(unittest.TestCase):
+    def test_frozen_sources_still_match_consumed_hashes(self):
+        self.assertEqual(
+            hashlib.sha256(Path(native.__file__).read_bytes()).hexdigest(),
+            "eba343f41c33bb54ed2838a4cc8acd423f6239ec6d0d2db481e7ca6b03337f84",
+        )
+        self.assertEqual(
+            hashlib.sha256(Path(initial.__file__).read_bytes()).hexdigest(),
+            "b284326ae7e6c612763f63889a9cc12533cfa3c598be759e5180fa304fbc368c",
+        )
+
+    def test_generated_installer_runs_synchronously_in_bootcmd_with_silent_fallback(self):
+        config = json.loads(gzip.decompress(initial.user_data()).removeprefix(b"#cloud-config\n"))
+        shell = config["bootcmd"][0]
+        self.assertEqual(shell[:2], ["/bin/sh", "-c"])
+        words = shlex.split(shell[-1])
+        code = words[words.index("-c") + 1]
+        self.assertIn("sys.exit(m._main(['install']))", code)
+        self.assertIn(" >/dev/null 2>&1 || /usr/bin/systemctl --no-block poweroff", shell[-1])
+        # Inspect shell tokens, not the bitwise '&' inside quoted Python code.
+        self.assertFalse("&" in words)
+
+    def test_default_timers_create_wait_cycle_under_ubuntu_bootcmd_ordering(self):
+        for name, body in native.units().items():
+            if not name.endswith(".timer"):
+                continue
+            with self.subTest(unit=name):
+                self.assertTrue(timer_waits_for_sysinit(body))
+                # Wait-for edges, not a claim that systemd sees a unit cycle:
+                # cloud-init waits for our synchronous command, whose timer
+                # waits for sysinit, which waits for cloud-init to finish.
+                waits = {"cloud-init": name, name: "sysinit", "sysinit": "cloud-init"}
+                node = "cloud-init"
+                for _ in range(3):
+                    node = waits[node]
+                self.assertEqual(node, "cloud-init")
+
+    def test_fixture_distinguishes_explicit_early_boot_timer(self):
+        body = native.units()[native.HOST + ".timer"]
+        altered = body.replace(b"[Unit]\n", b"[Unit]\nDefaultDependencies=no\n", 1)
+        self.assertFalse(timer_waits_for_sysinit(altered))
+        # Fixture-only counterfactual, not an installed or validated repair.
+        self.assertNotEqual(body, altered)
+
+    def test_queued_but_inactive_timer_does_not_satisfy_immediate_proof(self):
+        source = initial.source_bytes()
+        units = native.units()
+        context = native.canonical(
+            dict(attempt=native.ATTEMPT, source_sha256=initial.EARLY_SHA, **IDS)
+        )
+
+        def read(path, cap=32768):
+            if path == native.SOURCE:
+                return source
+            if path == native.OUTPUT / "context.json":
+                return context
+            return units[path.name]
+
+        def show(unit, prop):
+            return {
+                "FragmentPath": str(native.SYSTEMD / unit).encode(),
+                "DropInPaths": b"",
+                "LoadState": b"loaded",
+                "ActiveState": b"inactive",
+                "SubState": b"dead",
+                "FailureAction": b"poweroff",
+            }[prop]
+
+        with (
+            patch.object(native, "identity", return_value=IDS),
+            patch.object(native, "boot_time", return_value=100),
+            patch.object(native, "read", side_effect=read),
+            patch.object(native, "show", side_effect=show),
+            self.assertRaises(ValueError),
+        ):
+            native._proof()
+
+    def test_blocked_host_timer_reaches_frozen_shutdown_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.py"
+            source.write_bytes(initial.source_bytes())
+            source.chmod(0o400)
+            systemd = root / "systemd"
+            systemd.mkdir()
+            commands = []
+            original_command = native.command
+
+            def command(argv):
+                commands.append(argv)
+                if argv == ["/usr/bin/systemctl", "start", native.HOST + ".timer"]:
+                    self.assertTrue(timer_waits_for_sysinit(native.units()[native.HOST + ".timer"]))
+                    with process_result(returncode=None, timeout=True):
+                        return original_command(argv)
+                return b""
+
+            def read(path, cap=32768, *, mode=0o400):
+                self.assertEqual(path.stat().st_mode & 0o777, mode)
+                raw = path.read_bytes()
+                self.assertLessEqual(len(raw), cap)
+                return raw
+
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (
+                patch.object(native, "SOURCE", source),
+                patch.object(native, "OUTPUT", root / "receipts" / native.ATTEMPT),
+                patch.object(native, "SYSTEMD", systemd),
+                patch.object(native, "owned"),
+                patch.object(native, "identity", return_value=IDS),
+                patch.object(native, "boot_time", return_value=100),
+                patch.object(native, "read", side_effect=read),
+                patch.object(native, "show", return_value=b"not-found"),
+                patch.object(native, "command", side_effect=command),
+                patch.object(native, "_proof") as proof,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(native._main(["install"]), 2)
+                proof.assert_not_called()
+            self.assertEqual(commands[-1], ["/usr/bin/systemctl", "--no-block", "poweroff"])
+            self.assertNotIn(["/usr/bin/systemctl", "start", native.SETUP + ".timer"], commands)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+
+
+if __name__ == "__main__":
+    unittest.main()

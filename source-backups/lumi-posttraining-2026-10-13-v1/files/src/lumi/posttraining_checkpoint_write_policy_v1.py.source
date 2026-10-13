@@ -1,0 +1,274 @@
+"""Pure, unqualified native x86-64 write-notification policy candidates.
+
+There are two fixed programs, not caller-selectable profiles. A future trusted
+bootstrap must install LISTENER_FILTER with NEW_LISTENER, transfer that listener
+to its authenticated guardian, then install FILTER (the closed final seal) and
+prove both filters before releasing any payload. The listener alone defaults to
+ALLOW and is UNSAFE. The final seal alone allows write/pwrite64 and is likewise
+NOT a write meter: only composition with the inherited listener notifies writes.
+No installer, descriptor transfer, native ABI probe or admission is implemented.
+
+Every write/pwrite64, including stdout, stderr and control descriptors, must be
+charged by a separate guardian using the complete unsigned 64-bit count before
+CONTINUE. No descriptor is exempt. Default-deny in the final seal rejects other
+data-write channels. Private mappings require exclusion of ALL inherited shared
+mappings, io_uring/AIO resources, foreign descriptors and descriptor import.
+Read-only shared mappings are denied too, so mprotect cannot upgrade one later.
+
+Open/create, mkdir, chmod and fsync are finite metadata effects, NOT physical or
+metadata-byte accounting. File authority, immutable backing, path restrictions,
+thread/process resources and setup/OS-write budgets need independent controls.
+Pointer contents (including execve paths) are deliberately not interpreted.
+Landlock/owned roots and trusted setup remain mandatory and unproven premises.
+
+Syscall numbers overlapping frozen local policies reuse their native x86-64
+values. The expanded ABI table and flag constants are local candidates only:
+Linux headers, kernel filter acceptance, CPython, loader, threads, torch and
+safetensors compatibility still require separate native qualification. This
+module must not be cited as successful native write-limit enforcement.
+The final seal refuses clone3 with fixed ENOSYS (not EPERM) to permit a caller
+to attempt legacy clone, whose scalar flags remain restricted below. This is
+a denied syscall, not evidence that any native threading fallback succeeds.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import struct
+from types import MappingProxyType
+
+SCHEMA = "lumi.checkpoint-write-policy.v0.1"
+AUDIT_ARCH_X86_64 = 0xC000003E
+LD_ABS, JMP_JEQ, JMP_JGE, ALU_AND, RET_K = 0x20, 0x15, 0x35, 0x54, 0x06
+ALLOW, DENY, KILL, USER_NOTIF = 0x7FFF0000, 0x00050001, 0x80000000, 0x7FC00000
+DENY_ENOSYS = 0x00050026
+
+SYSCALLS = MappingProxyType({
+    "read": 0, "write": 1, "open": 2, "close": 3, "stat": 4,
+    "fstat": 5, "lstat": 6, "poll": 7, "lseek": 8, "mmap": 9,
+    "mprotect": 10, "munmap": 11, "brk": 12, "rt_sigaction": 13,
+    "rt_sigprocmask": 14, "rt_sigreturn": 15, "ioctl": 16,
+    "pread64": 17, "pwrite64": 18, "readv": 19, "writev": 20,
+    "access": 21, "select": 23, "sched_yield": 24, "mremap": 25,
+    "madvise": 28, "dup": 32, "dup2": 33, "nanosleep": 35,
+    "getpid": 39, "sendfile": 40, "socket": 41, "connect": 42,
+    "accept": 43, "sendto": 44, "recvfrom": 45, "sendmsg": 46,
+    "recvmsg": 47, "socketpair": 53, "clone": 56, "fork": 57,
+    "vfork": 58, "execve": 59, "exit": 60, "uname": 63,
+    "fcntl": 72, "fsync": 74, "fdatasync": 75, "truncate": 76,
+    "ftruncate": 77, "getdents": 78, "getcwd": 79, "chdir": 80,
+    "fchdir": 81, "rename": 82, "mkdir": 83, "rmdir": 84,
+    "unlink": 87, "readlink": 89, "chmod": 90, "fchmod": 91,
+    "getrlimit": 97, "getrusage": 98, "sysinfo": 99, "ptrace": 101,
+    "getuid": 102, "getgid": 104, "geteuid": 107, "getegid": 108,
+    "getppid": 110, "getgroups": 115, "sigaltstack": 131,
+    "statfs": 137, "fstatfs": 138, "prctl": 157, "arch_prctl": 158,
+    "setrlimit": 160, "mount": 165, "gettid": 186, "setxattr": 188,
+    "lsetxattr": 189, "fsetxattr": 190, "futex": 202,
+    "sched_getaffinity": 204, "io_setup": 206, "io_submit": 209,
+    "getdents64": 217, "set_tid_address": 218, "restart_syscall": 219,
+    "clock_gettime": 228, "clock_getres": 229, "clock_nanosleep": 230,
+    "exit_group": 231, "openat": 257, "mkdirat": 258,
+    "newfstatat": 262, "unlinkat": 263, "renameat": 264,
+    "readlinkat": 267, "fchmodat": 268, "faccessat": 269,
+    "pselect6": 270, "ppoll": 271, "unshare": 272,
+    "set_robust_list": 273, "splice": 275, "tee": 276, "vmsplice": 278,
+    "utimensat": 280, "fallocate": 285, "dup3": 292, "preadv": 295,
+    "pwritev": 296, "prlimit64": 302, "setns": 308, "getcpu": 309,
+    "process_vm_writev": 311, "renameat2": 316, "seccomp": 317,
+    "getrandom": 318, "memfd_create": 319, "bpf": 321, "execveat": 322,
+    "copy_file_range": 326, "preadv2": 327, "pwritev2": 328,
+    "rseq": 334, "io_uring_setup": 425, "io_uring_enter": 426,
+    "io_uring_register": 427, "clone3": 435, "close_range": 436,
+    "openat2": 437, "pidfd_getfd": 438, "faccessat2": 439,
+})
+
+# No socket, IPC creation/receive, metadata ownership change, signal-other-PID,
+# namespace, privilege, arbitrary ioctl or arbitrary prctl operations.
+UNCONDITIONAL_SYSCALLS = (
+    "read", "write", "close", "stat", "fstat", "lstat", "poll", "lseek",
+    "munmap", "brk", "rt_sigaction", "rt_sigprocmask", "rt_sigreturn",
+    "pread64", "pwrite64", "readv", "access", "select", "sched_yield",
+    "madvise", "dup", "dup2", "nanosleep", "getpid", "execve", "exit",
+    "uname", "fsync", "getdents", "getcwd", "chdir", "fchdir", "readlink",
+    "getrlimit", "getrusage", "sysinfo", "getuid", "getgid", "geteuid",
+    "getegid", "getppid", "getgroups", "sigaltstack", "statfs", "fstatfs",
+    "gettid", "futex", "sched_getaffinity", "getdents64", "set_tid_address",
+    "restart_syscall", "clock_gettime", "clock_getres", "clock_nanosleep",
+    "exit_group", "newfstatat", "readlinkat", "faccessat", "pselect6",
+    "ppoll", "set_robust_list", "preadv", "getcpu", "getrandom", "rseq",
+)
+OPEN_FLAGS = 0x3 | 0x40 | 0x80 | 0x400 | 0x800 | 0x10000 | 0x20000 | 0x80000
+MMAP_FLAGS = 0x2 | 0x10 | 0x20 | 0x800 | 0x4000 | 0x20000 | 0x100000
+CLONE_REQUIRED = 0x100 | 0x200 | 0x400 | 0x800 | 0x10000
+CLONE_FLAGS = CLONE_REQUIRED | 0x40000 | 0x80000 | 0x100000 | 0x200000 | 0x1000000
+ERROR_CODES = frozenset({"program_rejected", "host_guard_not_bound"})
+
+
+class WritePolicyError(RuntimeError):
+    def __init__(self, code="program_rejected"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "program_rejected"
+        super().__init__(self.code)
+
+
+def _need(condition):
+    if not condition:
+        raise WritePolicyError() from None
+
+
+def _load(offset):
+    return (LD_ABS, 0, 0, offset)
+
+
+def _equal(offset, value):
+    return [_load(offset), (JMP_JEQ, 1, 0, value), (RET_K, 0, 0, DENY)]
+
+
+def _one_of(offset, values):
+    rows = [_load(offset)]
+    rows += [(JMP_JEQ, len(values) - position, 0, value)
+             for position, value in enumerate(values)]
+    return [*rows, (RET_K, 0, 0, DENY)]
+
+
+def _argument(index, values):
+    return _equal(20 + 8 * index, 0) + _one_of(16 + 8 * index, values)
+
+
+def _zero(index):
+    return _argument(index, (0,))
+
+
+def _flags(index, accepted, required=0):
+    rows = _equal(20 + 8 * index, 0)
+    rows += [_load(16 + 8 * index), (ALU_AND, 0, 0, ~accepted & 0xFFFFFFFF),
+             (JMP_JEQ, 1, 0, 0), (RET_K, 0, 0, DENY)]
+    if required:
+        rows += [_load(16 + 8 * index), (ALU_AND, 0, 0, required),
+                 (JMP_JEQ, 1, 0, required), (RET_K, 0, 0, DENY)]
+    return rows
+
+
+def _open(flags_index, mode_index):
+    rows = _flags(flags_index, OPEN_FLAGS)
+    rows += [_load(16 + 8 * flags_index), (ALU_AND, 0, 0, 3),
+             (JMP_JEQ, 0, 1, 3), (RET_K, 0, 0, DENY)]
+    # Mode is ignored by Linux without O_CREAT; inspect it only on creation.
+    mode = _argument(mode_index, (0o400, 0o600, 0o700))
+    rows += [_load(16 + 8 * flags_index), (ALU_AND, 0, 0, 0x40),
+             (JMP_JEQ, len(mode), 0, 0), *mode]
+    return rows
+
+
+def _fcntl():
+    rows = _equal(28, 0)  # Complete command argument, not just its low word.
+    rows += [_load(24)]
+    # GETFD/GETFL ignore arg; SETFD allows only zero or FD_CLOEXEC.
+    rows += [(JMP_JEQ, 0, 1, 1), (RET_K, 0, 0, ALLOW),
+             (JMP_JEQ, 0, 1, 3), (RET_K, 0, 0, ALLOW)]
+    setfd = [*_argument(2, (0, 1)), (RET_K, 0, 0, ALLOW)]
+    rows += [(JMP_JEQ, 0, len(setfd), 2), *setfd]
+    rows += [(JMP_JEQ, 2, 0, 0), (JMP_JEQ, 1, 0, 1030),
+             (RET_K, 0, 0, DENY)]
+    rows += _equal(36, 0)
+    rows += [_load(32), (JMP_JGE, 0, 1, 0x80000000), (RET_K, 0, 0, DENY)]
+    return rows
+
+
+def _architecture():
+    # Reject foreign architecture, tagged x32, negative numbers and historical
+    # untagged x32 syscalls 512..547 before ANY allow/notify/deny dispatch.
+    return [
+        _load(4), (JMP_JEQ, 1, 0, AUDIT_ARCH_X86_64), (RET_K, 0, 0, KILL),
+        _load(0), (JMP_JGE, 0, 1, 0x40000000), (RET_K, 0, 0, KILL),
+        (JMP_JGE, 0, 2, 512), (JMP_JGE, 1, 0, 548), (RET_K, 0, 0, KILL),
+    ]
+
+
+def _finish(rows):
+    _need(0 < len(rows) <= 4096)
+    for index, row in enumerate(rows):
+        _need(type(row) is tuple and len(row) == 4
+              and all(type(value) is int for value in row))
+        code, yes, no, value = row
+        _need(code in (LD_ABS, JMP_JEQ, JMP_JGE, ALU_AND, RET_K)
+              and 0 <= yes <= 255 and 0 <= no <= 255
+              and 0 <= value <= 0xFFFFFFFF)
+        if code in (JMP_JEQ, JMP_JGE):
+            _need(index + max(yes, no) + 1 < len(rows))
+        else:
+            _need(yes == no == 0)
+        if code == LD_ABS:
+            _need(value % 4 == 0 and 0 <= value <= 60)
+    _need(rows[-1][0] == RET_K)
+    return tuple(rows)
+
+
+def build_listener_filter():
+    """Trusted bootstrap ONLY; unsafe default-allow until final seal composes."""
+    rows = _architecture()
+    for name in ("write", "pwrite64"):
+        rows += [(JMP_JEQ, 0, 1, SYSCALLS[name]), (RET_K, 0, 0, USER_NOTIF)]
+    return _finish([*rows, (RET_K, 0, 0, ALLOW)])
+
+
+def build_filter():
+    """Compile final closed seal; requires the earlier listener filter.
+
+    No syscall effects or caller-supplied profile. ALLOW cannot override the
+    inherited listener's higher-precedence USER_NOTIF for write/pwrite64.
+    """
+    rows = _architecture()
+    rows += [(JMP_JEQ, 0, 1, SYSCALLS["clone3"]), (RET_K, 0, 0, DENY_ENOSYS)]
+    bodies = {
+        "open": _open(1, 2), "openat": _open(2, 3),
+        "mmap": _argument(2, tuple(range(8))) + _flags(3, MMAP_FLAGS, 2),
+        "mprotect": _argument(2, tuple(range(8))),
+        "mremap": _argument(3, (0, 1)),
+        "clone": _flags(0, CLONE_FLAGS, CLONE_REQUIRED),
+        "fcntl": _fcntl(), "dup3": _argument(2, (0, 0x80000)),
+        "mkdir": _argument(1, (0o700,)), "mkdirat": _argument(2, (0o700,)),
+        "chmod": _argument(1, (0o400, 0o600, 0o700)),
+        "fchmod": _argument(1, (0o400, 0o600, 0o700)),
+        "fchmodat": _argument(2, (0o400, 0o600, 0o700)),
+        "prlimit64": _zero(0) + _zero(2),
+        "arch_prctl": _argument(0, (0x1002, 0x1003, 0x1004)),
+        "prctl": _argument(0, (21, 39)) + sum((_zero(i) for i in range(1, 5)), []),
+    }
+    for name, restrictions in bodies.items():
+        body = [*restrictions, (RET_K, 0, 0, ALLOW)]
+        _need(len(body) <= 255)
+        rows += [(JMP_JEQ, 0, len(body), SYSCALLS[name]), *body]
+    for name in UNCONDITIONAL_SYSCALLS:
+        rows += [(JMP_JEQ, 0, 1, SYSCALLS[name]), (RET_K, 0, 0, ALLOW)]
+    return _finish([*rows, (RET_K, 0, 0, DENY)])
+
+
+LISTENER_FILTER = build_listener_filter()
+FILTER = build_filter()
+LISTENER_FILTER_SHA256 = hashlib.sha256(
+    b"".join(struct.pack("<HBBI", *row) for row in LISTENER_FILTER)
+).hexdigest()
+FILTER_SHA256 = hashlib.sha256(
+    b"".join(struct.pack("<HBBI", *row) for row in FILTER)
+).hexdigest()
+POLICY_SUMMARY = MappingProxyType({
+    "schema": SCHEMA, "filter_sha256": FILTER_SHA256,
+    "listener_filter_sha256": LISTENER_FILTER_SHA256,
+    "instruction_count": len(FILTER), "listener_instruction_count": len(LISTENER_FILTER),
+    "two_filter_composition_required": True,
+    "all_descriptor_scalar_writes_require_notification": True,
+    "shared_mapping_exclusion_required": True,
+    "metadata_and_physical_write_accounting": False,
+    "native_abi_qualified": False, "native_filters_installed": False,
+    "listener_transport_verified": False, "inherited_authority_closed": False,
+    "native_importer_compatibility_verified": False,
+    "cumulative_write_limit_enforced": False, "host_guard_bound": False,
+    "real_import_permitted": False, "real_sft_execution_permitted": False,
+    "production_eligible": False,
+})
+
+
+def install_write_policy(**_arguments):
+    """Closed admission; compiling candidates never installs or admits anything."""
+    raise WritePolicyError("host_guard_not_bound") from None

@@ -1,0 +1,117 @@
+"""Local-only lifecycle successor; preserve primary diagnostics across cleanup errors."""
+
+import ast
+import hashlib
+from pathlib import Path
+
+from scripts import prepare_sft_vm_setup_exchange_diagnostic_v1 as previous
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "scripts/send_sft_vm_setup_inputs_v6.py"
+BASE_SHA = "877ed7f14d1b9e1fa888f7da96230e4225b79861dafb4ed81e5af11227c33569"
+OUTPUT = ROOT / "scripts/send_sft_vm_setup_inputs_v7.py"
+
+SUPPORT = """
+class ExchangeCleanupFailure(ValueError):
+    def __init__(self, codes):
+        super().__init__("exchange_cleanup_failed")
+        self.codes = tuple(codes)
+
+
+def _finish_exchange_process(process):
+    failures = []
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except BaseException:
+        failures.append("kill_failed")
+    try:
+        process.wait(timeout=5)
+    except BaseException:
+        failures.append("wait_failed")
+    for stream, code in ((process.stdin, "stdin_close_failed"),
+                         (process.stdout, "stdout_close_failed")):
+        try:
+            stream.close()
+        except BaseException:
+            failures.append(code)
+    if failures:
+        raise ExchangeCleanupFailure(failures) from None
+
+
+def pipe_exchange(argv, body, timeout):
+    try:
+        return _pipe_exchange_v6(argv, body, timeout)
+    except BaseException as error:
+        cleanup = list(error.codes) if type(error) is ExchangeCleanupFailure else []
+        current = error
+        diagnostic = None
+        for _ in range(8):
+            if type(current) is SetupExchangeFailure:
+                diagnostic = dict(current.diagnostic)
+                break
+            current = current.__context__
+            if current is None:
+                break
+        if diagnostic is None:
+            kind = "other"
+            if isinstance(error, (TimeoutError, subprocess.TimeoutExpired)):
+                kind = "timeout"
+            elif isinstance(error, OSError):
+                kind = "io"
+            elif isinstance(error, ValueError):
+                kind = "validation"
+            diagnostic = dict(schema="lumi.setup-exchange-diagnostic.v0.2",
+                phase="cleanup" if cleanup else "boundary", kind=kind,
+                stdin_bytes_written=None, stdout_bytes_seen=None,
+                exit_code=None, remote_failure_code=None)
+            origin = "boundary_unknown_counts"
+        else:
+            origin = "primary_preserved"
+        diagnostic["diagnostic_origin"] = origin
+        diagnostic["cleanup_failure_codes"] = cleanup
+        raise SetupExchangeFailure(diagnostic) from None
+
+"""
+
+
+def build():
+    raw = BASE.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA or raw != previous.build():
+        raise ValueError("exchange_lifecycle_base_rejected") from None
+    text = raw.decode()
+    text = text.replace(
+        "def pipe_exchange(argv, body, timeout):", "def _pipe_exchange_v6(argv, body, timeout):", 1
+    )
+    old = """    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        finally:
+            process.stdin.close()
+            process.stdout.close()"""
+    if text.count(old) != 1:
+        raise ValueError("exchange_lifecycle_anchor_rejected") from None
+    text = text.replace(old, "    finally:\n        _finish_exchange_process(process)", 1)
+    text = text.replace("def command(", SUPPORT + "\ndef command(", 1)
+    compile(text, str(OUTPUT), "exec")
+    return text.encode()
+
+
+def test_namespace():
+    values = previous.test_namespace()
+    tree = ast.parse(build())
+    names = {
+        "_pipe_exchange_v6",
+        "_finish_exchange_process",
+        "pipe_exchange",
+        "ExchangeCleanupFailure",
+        "SetupExchangeFailure",
+    }
+    nodes = [n for n in tree.body if getattr(n, "name", None) in names]
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), "<lifecycle-fixture>", "exec"), values)
+    return values

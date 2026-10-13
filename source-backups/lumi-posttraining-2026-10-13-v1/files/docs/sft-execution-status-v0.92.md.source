@@ -1,0 +1,44 @@
+# SFT execution status v0.92
+
+2026-09-14. The newly approved one-shot Source failure-summary diagnostic read
+99,267 bytes using two HTTPS GETs, below the 4 MiB cap. It stopped with
+`summary_unavailable_or_incomplete`. No raw log, parameter value or exception
+message was retained. No failed-test names were recovered; this does not mean
+there were no failures. The attempt marker and STOP evidence are preserved.
+
+## Local parser correction
+
+A synthetic example reproduced a real limitation in the initial parser: its
+completion check required an equals-sign-decorated footer and rejected a plain
+`1 failed in 1.00s` footer. The repository sets pytest `addopts = "-q"`.
+This establishes a local coverage gap, not the actual format or cause of the
+remote diagnostic failure: the raw log was not retained and was not fetched again.
+
+A new pure parser, `scripts/parse_sft_source_failure_summary_v2.py`, accepts both
+plain and decorated whole-line footers. It checks FAILED and ERROR counts
+separately before deduplication, rejects duplicate counts and incomplete rows,
+strips all parameter values, and only returns bound test identifiers and
+unambiguous allowlisted error types (or null). It contains no download or retry
+path. The original diagnostic script was not changed after its one-shot read.
+
+The corrected parser passes 22 synthetic tests on Python 3.11.15 and 3.13.7.
+Targeted Ruff checks pass. No real log has been tested with the new parser.
+
+## What remains unresolved
+
+The Source suite's failing test names and exact exceptions remain unknown.
+The separate native `source_admission / fixture_failed` cause is also unknown.
+Previously verified GitHub lint, isolated controls, validators and Spark results
+remain pass; full Source and native qualification remain fail. Gate 5 is not done.
+
+No new commit, push, CI retry, native retry, GPU, real-checkpoint import or training
+occurred. The current commit remains `6585a1e073a6a5302630ed63a3c1a3d81adda429`.
+The new parser and these records are local and unpublished.
+
+One fresh bounded log read using a corrected successor would require new user
+approval. Do not reuse or delete the consumed marker or silently refetch the log.
+
+Records:
+
+- `evidence/lumi-4b-sft-source-failure-summary-diagnostic-v0.1.json`
+- `evidence/lumi-4b-sft-source-failure-summary-parser-correction-v0.1.json`

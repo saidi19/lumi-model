@@ -1,0 +1,55 @@
+"""Offline read-only admission receipt validation; mutations only in memory."""
+
+import copy
+import socket
+import subprocess
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt022_readonly_preflight_v2 as verifier
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        for module, name in ((socket, "socket"), (socket, "create_connection"),
+                             (subprocess, "run"), (subprocess, "Popen")):
+            guard = patch.object(module, name, side_effect=AssertionError("offline_only"))
+            guard.start()
+            self.addCleanup(guard.stop)
+
+    def reject_result_change(self, change):
+        original = verifier.load
+
+        def altered(path):
+            value = copy.deepcopy(original(path))
+            if path == verifier.entry.OUTPUT / "result.json":
+                change(value)
+            return value
+
+        with patch.object(verifier, "load", side_effect=altered):
+            with self.assertRaises(ValueError):
+                verifier.verify()
+
+    def test_success_is_admission_only_not_real_import(self):
+        report = verifier.verify()
+        self.assertEqual(report["inclusive_sdk_read_calls"], 57)
+        self.assertTrue(report["network_admitted"])
+        self.assertFalse(report["cpu_instance_launched"])
+        self.assertFalse(report["real_4b_import"])
+        self.assertFalse(report["gate_5_complete"])
+
+    def test_launch_flag_rejected(self):
+        self.reject_result_change(lambda value: value.update(cpu_launch_authorized=True))
+
+    def test_object_access_rejected(self):
+        self.reject_result_change(lambda value: value.update(object_access=1))
+
+    def test_changed_dispatch_count_rejected(self):
+        def changed(value):
+            value["admission_call_budget"]["sdk_read_dispatches"] = 80
+
+        self.reject_result_change(changed)
+
+
+if __name__ == "__main__":
+    unittest.main()

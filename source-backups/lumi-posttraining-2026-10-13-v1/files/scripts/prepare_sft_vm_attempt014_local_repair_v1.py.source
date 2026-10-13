@@ -1,0 +1,156 @@
+"""In-memory local repair candidates only; never mutate a consumed source graph."""
+
+import ast
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-014-source-v0.1"
+BASE_SHA = "ea70b6104481d305d6cbe262ac28737e58e814eff223edb5dbda47fd77bfc375"
+
+OLD_CLEANUP = """        try:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            process.stdin.close()
+            process.stdout.close()
+        except BaseException:
+            raise ExchangeFailure("cleanup", exit_kind, remote_stage) from None"""
+
+NEW_CLEANUP = """        cleanup_stage = None
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except BaseException:
+            cleanup_stage = "cleanup_kill"
+        try:
+            process.wait(timeout=2)
+        except BaseException:
+            cleanup_stage = cleanup_stage or "cleanup_wait"
+        try:
+            process.stdin.close()
+        except BaseException:
+            cleanup_stage = cleanup_stage or "cleanup_stdin"
+        try:
+            process.stdout.close()
+        except BaseException:
+            cleanup_stage = cleanup_stage or "cleanup_stdout"
+        if cleanup_stage is not None:
+            raise ExchangeFailure(cleanup_stage, exit_kind, remote_stage) from None"""
+
+CHECKS = (
+    "describe",
+    "pagination",
+    "reservation",
+    "owner",
+    "single_instance",
+    "instance_syntax",
+    "instance_binding",
+    "token_image",
+    "type_vpc",
+    "subnet_key",
+    "tags",
+    "state",
+)
+
+
+def once(raw, before, after):
+    if raw.count(before) != 1:
+        raise ValueError("repair_source_mismatch")
+    return raw.replace(before, after)
+
+
+def transport(raw):
+    raw = once(raw, OLD_CLEANUP, NEW_CLEANUP)
+    return once(
+        raw,
+        '        "cleanup",',
+        '        "cleanup",\n        "cleanup_kill",\n        "cleanup_wait",'
+        '\n        "cleanup_stdin",\n        "cleanup_stdout",',
+    )
+
+
+def provision(raw):
+    tree = ast.parse(raw)
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "Transaction")
+    node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "instance")
+    original = ast.get_source_segment(raw, node)
+    updated = original
+    targets = (
+        ('value = self.cli("ec2", "describe-instances", **fields)', "describe"),
+        ('need(not value.get("NextToken"))', "pagination"),
+        ("reservation = connection.one(rows)", "reservation"),
+        ('need(reservation["OwnerId"] == self.host["account"])', "owner"),
+        ('row = connection.one(reservation["Instances"])', "single_instance"),
+        (
+            'need(type(instance) is str and re.fullmatch(r"i-[0-9a-f]{17}", instance))',
+            "instance_syntax",
+        ),
+        ('need(instance == self.binding["instance"])', "instance_binding"),
+        (
+            'need(row["ClientToken"] == ATTEMPT and row["ImageId"] == self.host["ami"])',
+            "token_image",
+        ),
+        (
+            'need(row["InstanceType"] == self.host["instance_type"] '
+            'and row["VpcId"] == self.host["vpc"])',
+            "type_vpc",
+        ),
+        (
+            'need(row["SubnetId"] == self.host["subnet"] '
+            'and row["KeyName"] == self.binding["key_name"])',
+            "subnet_key",
+        ),
+        ("connection.owned(row, ATTEMPT)", "tags"),
+    )
+    for text, code in targets:
+        indent = "            " if code == "instance_binding" else "        "
+        updated = once(
+            updated,
+            indent + text,
+            indent + f'self.stop_observation_check = "{code}"\n' + indent + text,
+        )
+    raw = once(raw, original, updated)
+    raw = once(
+        raw,
+        '                state = row["State"]["Name"]',
+        '                self.stop_observation_check = "state"\n'
+        '                state = row["State"]["Name"]',
+    )
+    old = (
+        '            self.report["stop_observation_diagnostic"] = '
+        'failure.describe(error, "stop_observation")'
+    )
+    new = old + '\n            check = getattr(self, "stop_observation_check", "unknown")\n'
+    new += f"            allowed = {CHECKS!r}\n"
+    new += (
+        '            self.report["stop_observation_check"] = '
+        'check if type(check) is str and check in allowed else "unknown"'
+    )
+    return once(raw, old, new)
+
+
+def build():
+    raw = (BASE / "release.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != BASE_SHA:
+        raise ValueError("repair_release_mismatch")
+    manifest = json.loads(raw)
+    result = {}
+    for name, transform in (
+        ("scripts/run_sft_vm_detached_delivery_v1.py", transport),
+        ("scripts/provision_sft_vm_host_v5.py", provision),
+    ):
+        original = (BASE / name).read_bytes()
+        if hashlib.sha256(original).hexdigest() != manifest["outputs"][name]["sha256"]:
+            raise ValueError("repair_source_mismatch")
+        result[name] = transform(original.decode())
+        ast.parse(result[name])
+    return result
+
+
+def run(**_arguments):
+    raise ValueError("local_repair_not_execution_authority")

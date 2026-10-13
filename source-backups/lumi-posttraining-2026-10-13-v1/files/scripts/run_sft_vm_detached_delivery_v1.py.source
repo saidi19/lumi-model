@@ -1,0 +1,271 @@
+"""Short pinned SSH connections for an independently admitted root workflow.
+
+No CLI or host-admission override. The future native bootstrap must supply the
+authenticated parent.py entry. This connects the issuer callback to dispatch,
+one submission and status/stop, but does not provision/admit that entry or host.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import time
+
+import prepare_sft_vm_host_connection_v1 as connection
+
+MAX_REPLY = 4096
+HOST_MAX_SECONDS = 14400
+CLEANUP_RESERVE = 120
+
+
+def need(value):
+    if not value:
+        raise ValueError("detached_delivery_rejected") from None
+
+
+def read_pinned(path, digest, maximum):
+    connection.safe_path(path)
+    need(type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(stream.fileno())
+        need(stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid())
+        need(stat.S_IMODE(info.st_mode) in {0o400, 0o600} and info.st_nlink == 1)
+        raw = stream.read(maximum + 1)
+    need(len(raw) <= maximum and hashlib.sha256(raw).hexdigest() == digest)
+    return raw
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def decode(raw):
+    need(type(raw) is bytes and len(raw) <= MAX_REPLY)
+    value = json.loads(raw, object_pairs_hook=unique)
+    need(type(value) is dict)
+    return value
+
+
+def status(value):
+    need(
+        type(value) is dict
+        and set(value)
+        == {"state", "parent_cgroup_empty", "children_reaped", "gate_5_complete", "retry_allowed"}
+    )
+    need(
+        value["state"]
+        in {
+            "not_started",
+            "dispatch_requested",
+            "running",
+            "workflow_returned",
+            "failed",
+            "failed_or_interrupted",
+            "interrupted",
+        }
+    )
+    need(all(type(value[k]) is bool for k in value if k != "state"))
+    need(value["gate_5_complete"] is False and value["retry_allowed"] is False)
+    return value
+
+
+def pipe_exchange(argv, body, timeout):
+    """Bounded memory, null stderr, one process group and no automatic retry."""
+    need(0 < timeout <= 100 and type(body) in {bytes, bytearray} and len(body) <= 65536)
+    env = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    env.update(
+        PATH="/usr/bin:/bin:/opt/homebrew/bin", LC_ALL="C", AWS_MAX_ATTEMPTS="1", AWS_PAGER=""
+    )
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + timeout
+        reply, offset = bytearray(), 0
+        with selectors.DefaultSelector() as selector:
+            os.set_blocking(process.stdout.fileno(), False)
+            selector.register(process.stdout, selectors.EVENT_READ, "read")
+            if body:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, "write")
+            else:
+                process.stdin.close()
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                need(remaining > 0)
+                events = selector.select(remaining)
+                need(events)
+                for key, _ in events:
+                    if key.data == "write":
+                        try:
+                            count = os.write(key.fd, memoryview(body)[offset:])
+                        except BlockingIOError:
+                            continue
+                        need(count > 0)
+                        offset += count
+                        if offset == len(body):
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                    else:
+                        try:
+                            chunk = os.read(key.fd, MAX_REPLY + 1 - len(reply))
+                        except BlockingIOError:
+                            continue
+                        reply.extend(chunk)
+                        need(len(reply) <= MAX_REPLY)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+            need(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0)
+        return bytes(reply)
+    except BaseException:
+        raise ValueError("ssh_exchange_failed") from None
+    finally:
+        # Include the ProxyCommand tunnel, even when the SSH leader exited.
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        process.stdin.close()
+        process.stdout.close()
+
+
+class SSH:
+    """Construct only after native admission; these pins are not admission."""
+
+    def __init__(self, binding, key, directory, config_sha, hosts_sha, entry_sha):
+        connection.targets(binding, {"prepared_attempt": binding["attempt"]})
+        need(type(entry_sha) is str and re.fullmatch(r"[0-9a-f]{64}", entry_sha))
+        self.binding, self.key, self.directory = dict(binding), key, directory
+        self.config_sha, self.hosts_sha, self.entry_sha = config_sha, hosts_sha, entry_sha
+
+    def __call__(self, operation, body=b"", *, timeout=100):
+        need(operation in {"dispatch", "submit", "status", "cancel"})
+        need(type(body) in {bytes, bytearray} and len(body) <= 65536)
+        need(bool(body) == (operation == "submit"))
+        config = self.directory / "ssh_config"
+        hosts = self.directory / "known_hosts"
+        expected = connection.ssh_config(self.binding, self.key, hosts).encode()
+        need(read_pinned(config, self.config_sha, 16384) == expected)
+        read_pinned(hosts, self.hosts_sha, 4096)
+        attempt = self.binding["attempt"]
+        entry = f"/var/lib/lumi-vm-fullsize/{attempt}/controller/parent.py"
+        if operation == "cancel":
+            remote = [
+                "sudo",
+                "-n",
+                "/usr/bin/systemctl",
+                "stop",
+                f"lumi-vm-fullsize-v1-{attempt}-parent.service",
+            ]
+        else:
+            remote = ["sudo", "-n", "/usr/bin/python3", "-I", "-B", entry, operation, attempt]
+            if operation == "dispatch":
+                remote.append(self.entry_sha)
+        argv = [
+            "/usr/bin/ssh",
+            "-F",
+            str(config),
+            "-T",
+            "-o",
+            "LogLevel=QUIET",
+            "lumi-fullsize-" + attempt,
+            " ".join(remote),
+        ]
+        raw = pipe_exchange(argv, body, timeout)
+        if operation == "cancel":
+            need(raw == b"")
+            return None
+        return decode(raw)
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _deliver_admitted_once(
+    raw, attempt, output, exchange, *, deadline, clock=time.monotonic, wait=time.sleep
+):
+    """Issuer callback: return only on finished/reaped success, otherwise raise.
+
+    On ambiguous dispatch/submission, never resend. Request stop once and check
+    aggregate status. If stop cannot be proven, retain an explicit unresolved
+    failure; issuer cleanup still revokes its allow without claiming instant
+    revocation. Deadline is the ALREADY RUNNING admitted host budget, not a fresh
+    four-hour allowance. Native admission must bind it to host expiry. The remote
+    parent's independent 8435-second limit is unchanged.
+    """
+    need(type(attempt) is str and re.fullmatch(r"[0-9a-f]{32}", attempt))
+    need(type(raw) in {bytes, bytearray} and 0 < len(raw) <= 65536)
+    need(
+        type(deadline) in {int, float} and CLEANUP_RESERVE < deadline - clock() <= HOST_MAX_SECONDS
+    )
+    connection.safe_path(output)
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    save = connection.issuer.base.save
+    save(output / "started.json", {"attempt": attempt, "retry_allowed": False})
+    report = {
+        "workflow_returned": False,
+        "stop_verified": False,
+        "cancel_attempted": False,
+        "gate_5_complete": False,
+        "credential_contents_retained": False,
+        "retry_allowed": False,
+    }
+    phase = "dispatch"
+    try:
+        reply = exchange("dispatch", timeout=min(100, deadline - clock() - CLEANUP_RESERVE))
+        need(reply == {"dispatch_requested": True, "workflow_completed": False})
+        phase = "submit"
+        reply = exchange("submit", raw, timeout=min(100, deadline - clock() - CLEANUP_RESERVE))
+        need(reply == {"delivery_sent": True, "workflow_completed": False})
+        phase = "status"
+        for _ in range(480):
+            remaining = deadline - clock() - CLEANUP_RESERVE
+            need(remaining > 0)
+            observed = status(exchange("status", timeout=min(100, remaining)))
+            stopped = observed["parent_cgroup_empty"] and observed["children_reaped"]
+            if observed["state"] == "workflow_returned" and stopped:
+                report.update(workflow_returned=True, stop_verified=True)
+                break
+            need(observed["state"] not in {"failed", "failed_or_interrupted", "interrupted"})
+            wait(min(30, max(0, deadline - clock() - CLEANUP_RESERVE)))
+        else:
+            raise ValueError("status_limit")
+    except BaseException:
+        report["failed_phase"] = phase
+        report["cancel_attempted"] = True
+        try:
+            remaining = deadline - clock()
+            need(remaining > 0)
+            exchange("cancel", timeout=min(60, remaining))
+        except BaseException:
+            report["cancel_outcome_unconfirmed"] = True
+        try:
+            remaining = deadline - clock()
+            need(remaining > 0)
+            observed = status(exchange("status", timeout=min(60, remaining)))
+            report["stop_verified"] = (
+                observed["parent_cgroup_empty"] and observed["children_reaped"]
+            )
+        except BaseException:
+            report["stop_verified"] = False
+    save(output / "result.json", report)
+    need(report["workflow_returned"] and report["stop_verified"])
+    return report

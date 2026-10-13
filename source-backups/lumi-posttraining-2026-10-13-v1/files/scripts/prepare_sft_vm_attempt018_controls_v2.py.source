@@ -1,0 +1,141 @@
+"""Rebind attempt-018 controls to the selector-corrected source release."""
+
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "0532df93f0f2418bb6d467d3e5215759"
+OLD_RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.1"
+RELEASE = "artifacts/lumi-vm-attempt-018-source-v0.2"
+RELEASE_SHA = "7ec91d363c3ab1422bb35c35757e8ae04fa166d5943c3bdc18aa2952d8b64602"
+BASE_PLAN = "artifacts/lumi-vm-attempt-018-control-plan-v0.1/plan.json"
+BASE_PLAN_SHA = "f361d8c0e285ee4c1593d837c780719b5115d6877fb069122010712da13e0f77"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-018-source-v0.2-verification-v0.1.json"
+SOURCE_PROOF_SHA = "edc115d2ffce111b350bd84af5c9b211495f43e902f7d3393cfa8f4c2ccb4ce8"
+FAILURE = "evidence/lumi-vm-attempt-018-readonly-preflight-failure-v0.2.json"
+FAILURE_SHA = "6f2554a53f56be98f0d49a272a0d2c8f822d50caac908824031e22ca446c0c4d"
+WATCH = "evidence/lumi-vm-attempt-018-inert-watchdog-reverification-v0.2.json"
+WATCH_SHA = "a3bd63f95783a162c7c23e1cd90c81a77de01293fc45d39183d9280d4c2e408a"
+STORE = "evidence/lumi-vm-attempt-018-cleanup-bucket-reverification-v0.2.json"
+STORE_SHA = "55b419bc6e7c7c22477c36b83ca649f817a435d6d80fd6c91cae805f56cf758d"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-018-control-plan-v0.2"
+OLD_CIDR, NEW_CIDR = "172.31.97.0/27", "172.31.96.224/27"
+BINDINGS = (
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+    "configs/lumi-vm-private-network-plan-v0.1.json",
+    "scripts/arm_sft_vm_external_watchdog_v2.py",
+    "scripts/check_sft_vm_cleanup_store_v1.py",
+    "scripts/prepare_sft_vm_external_watchdog_v1.py",
+    "scripts/sft_vm_external_watchdog_v1.py",
+    "scripts/sft_vm_network_cleanup_v1.py",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt018_control_plan_v2_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(name, digest=None, size=None):
+    path = Path(name)
+    need(not path.is_absolute() and ".." not in path.parts)
+    path = ROOT / path
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def build():
+    manifest = json.loads(read(RELEASE + "/release.json", RELEASE_SHA))
+    need(manifest["attempt"] == ATTEMPT and manifest["selected_cidr"] == NEW_CIDR)
+    need(manifest["execution_permitted"] is False and len(manifest["outputs"]) == 156)
+    for name, pin in manifest["outputs"].items():
+        raw = read(RELEASE + "/" + name, pin["sha256"], pin["bytes"])
+        if name.endswith(".py"):
+            ast.parse(raw)
+    source = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    failure = json.loads(read(FAILURE, FAILURE_SHA))
+    watch = json.loads(read(WATCH, WATCH_SHA))
+    store = json.loads(read(STORE, STORE_SHA))
+    need(source["selected_cidr"] == failure["localized_cause"]["selector_target"] == NEW_CIDR)
+    need(failure["result"]["cloud_mutations"] == 0)
+    need(watch["status"] == "verified_deployed_unarmed_invocation_disabled")
+    need(store["status"] == "verified_private_cleanup_bucket_created")
+    raw = read(BASE_PLAN, BASE_PLAN_SHA)
+    raw = raw.replace(OLD_RELEASE.encode(), RELEASE.encode())
+    raw = raw.replace(OLD_CIDR.encode(), NEW_CIDR.encode())
+    plan = json.loads(raw)
+    plan["schema"] = "lumi.vm-attempt-018-control-plan.v0.2"
+    plan["release_manifest_sha256"] = RELEASE_SHA
+    plan["source_preparation_evidence"] = {
+        "path": SOURCE_PROOF,
+        "sha256": SOURCE_PROOF_SHA,
+    }
+    plan["network_selector_correction_evidence"] = {
+        "path": FAILURE,
+        "sha256": FAILURE_SHA,
+    }
+    plan["control_target_absence_evidence"] = {
+        "path": FAILURE,
+        "sha256": FAILURE_SHA,
+    }
+    plan["required_control_proofs"] = [WATCH, STORE]
+    plan["source_bindings"] = {
+        RELEASE + "/" + name: manifest["outputs"][name] for name in BINDINGS
+    }
+    plan["readiness_review"]["confirmed_defect"] = (
+        "The fresh-identity builder advanced the target despite verified removal; "
+        "v0.2 restores the deterministic first-free /27 selected from current state."
+    )
+    plan["readiness_review"]["decision"] = (
+        "controls_reverified_then_fresh_readonly_preflight_no_cpu_execution"
+    )
+    plan["status"] = "controls_reverified_preflight_required"
+    plan["approval_record"] = None
+    plan["execution_permitted"] = False
+    plan["gate_5_complete"] = False
+    return plan
+
+
+def prepare():
+    plan = build()
+    body = encode(plan)
+    report = {
+        "schema": "lumi.vm-attempt-018-control-plan-release.v0.2",
+        "attempt": ATTEMPT,
+        "plan_sha256": sha(body),
+        "plan_bytes": len(body),
+        "source_release_sha256": RELEASE_SHA,
+        "watchdog_reverification_sha256": WATCH_SHA,
+        "cleanup_store_reverification_sha256": STORE_SHA,
+        "execution_permitted": False,
+        "cloud_mutations": 0,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+    need(not OUTPUT.exists() and not any(item.is_symlink() for item in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (("plan.json", body), ("release.json", encode(report))):
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("control_plan_is_not_cloud_or_cpu_authority") from None

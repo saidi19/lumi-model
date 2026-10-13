@@ -1,0 +1,203 @@
+"""Join one native setup seed to the frozen control sender; no host admission.
+
+Private API for the independently authorized fresh-host controller. Consumes
+the caller's already-running local setup deadline and the first 1800 seconds
+of native CLOCK_BOOTTIME; neither allowance is restarted. No cloud provisioning,
+wheel download, mount, install, import, credential issuance or expiry grant.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import math
+import time
+
+import send_sft_vm_setup_inputs_v5 as sender
+
+INPUTS = sender.inputs
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+SENDER_SHA = "4f2fcdd29ee840077b2535f0e010f649c37c2f18729f4ac7fea6f3b81957ca1b"
+SEED_TIMEOUT = 25
+SETUP_BOOT_DEADLINE = 1800
+
+# Sent as a fixed, shell-quoted command over the existing pinned SSH connection.
+# It creates only exact fresh root-private control parents and an exclusive seed
+# receipt. Partial failures remain; the next invocation cannot recreate them.
+SEED = """import json,os,re,signal,stat,sys,time
+from pathlib import Path
+try:
+ signal.alarm(20)
+ assert sys.platform == "linux" and os.geteuid() == os.getegid() == 0
+ assert sys.version_info[:2] == (3,12) and sys.flags.isolated and sys.dont_write_bytecode
+ assert os.stat("/proc/self/ns/mnt").st_ino == os.stat("/proc/1/ns/mnt").st_ino
+ now = time.clock_gettime(time.CLOCK_BOOTTIME)
+ assert 0 <= now < 1670
+ with open("/etc/machine-id","rb") as f:
+  machine = f.read(65).strip().decode("ascii")
+ with open("/proc/sys/kernel/random/boot_id","rb") as f:
+  boot = f.read(65).strip().decode("ascii")
+ assert re.fullmatch(r"[0-9a-f]{32}",machine)
+ assert re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",boot)
+ base = Path("/var/lib")
+ for p in (base,*base.parents):
+  s = p.lstat()
+  assert stat.S_ISDIR(s.st_mode) and s.st_uid == 0 and not s.st_mode & 0o022
+ names = ("lumi-vm-bootstrap","lumi-vm-input-deployment","lumi-vm-setup")
+ assert all(not os.path.lexists(base/n) for n in names)
+ def sync(p):
+  fd = os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+  try: os.fsync(fd)
+  finally: os.close(fd)
+ for name in names:
+  (base/name).mkdir(mode=0o700,exist_ok=False)
+  sync(base)
+ attempt = base/names[0]/"606d788073f1f0b66a39eabeb4b32c2c"
+ attempt.mkdir(mode=0o700,exist_ok=False)
+ sync(attempt.parent)
+ result = {"schema":"lumi.vm-setup-seed.v0.1",
+  "attempt":"606d788073f1f0b66a39eabeb4b32c2c","machine_id":machine,"boot_id":boot,
+  "observed_boottime":now,"setup_deadline_boottime":1800,
+  "receipt_parents_created":True,"host_admitted":False,
+  "expiry_enforced":False,"execution_permitted":False,"retry_allowed":False}
+ raw = json.dumps(result,sort_keys=True,separators=(",",":"),allow_nan=False).encode()+b"\\n"
+ assert len(raw) <= 4096
+ fd = os.open(attempt/"seed.json",os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o400)
+ with os.fdopen(fd,"wb") as f:
+  assert f.write(raw) == len(raw)
+  f.flush()
+  os.fsync(f.fileno())
+ sync(attempt)
+ for name in names:
+  s = (base/name).lstat()
+  assert s.st_uid == s.st_gid == 0 and stat.S_IMODE(s.st_mode) == 0o700
+ with (attempt/"seed.json").open("rb") as f:
+  assert f.read(4097) == raw
+ assert time.clock_gettime(time.CLOCK_BOOTTIME) < 1800
+ sys.stdout.buffer.write(raw)
+ sys.stdout.buffer.flush()
+except BaseException:
+ sys.stdout.write('{"status":"setup_seed_failed","execution_permitted":false}\\n')
+ sys.exit(2)
+"""
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_bootstrap_rejected") from None
+
+
+def validate_seed(raw):
+    value = sender.delivery.decode(raw)
+    fixed = {
+        "schema": "lumi.vm-setup-seed.v0.1",
+        "attempt": ATTEMPT,
+        "setup_deadline_boottime": SETUP_BOOT_DEADLINE,
+        "receipt_parents_created": True,
+        "host_admitted": False,
+        "expiry_enforced": False,
+        "execution_permitted": False,
+        "retry_allowed": False,
+    }
+    need(set(value) == set(fixed) | {"machine_id", "boot_id", "observed_boottime"})
+    need(INPUTS.canonical({k: value[k] for k in fixed}) == INPUTS.canonical(fixed))
+    observed = value["observed_boottime"]
+    need(type(observed) in {int, float} and math.isfinite(observed) and 0 <= observed < 1670)
+    sender.native_launcher(value["machine_id"], value["boot_id"], value["setup_deadline_boottime"])
+    return value
+
+
+def run(**_arguments):
+    raise ValueError("host_guard_not_bound") from None
+
+
+def _seed_and_send_admitted_once(
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    receiver,
+    archive,
+    output,
+    *,
+    deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+):
+    need(type(deadline) in {int, float} and 145 < deadline - clock() <= 1800)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= INPUTS.CAP)
+    need(
+        hashlib.sha256(
+            INPUTS.read(INPUTS.REPO / "scripts/send_sft_vm_setup_inputs_v5.py", 131072)
+        ).hexdigest()
+        == SENDER_SHA
+    )
+    # Preflight both frozen payloads before any remote seed or local attempt write.
+    source = INPUTS.read(receiver, sender.RECEIVER_BYTES)
+    content = INPUTS.read(archive, sender.ARCHIVE_BYTES)
+    need(len(source) == sender.RECEIVER_BYTES and INPUTS.sha(source) == sender.RECEIVER_SHA)
+    need(len(content) == sender.ARCHIVE_BYTES and INPUTS.sha(content) == sender.ARCHIVE_SHA)
+    INPUTS.unpack(content, sender.ARCHIVE_SHA)
+    argv = sender.command(binding, key, directory, config_sha, hosts_sha, SEED)
+    seed_charge = len(argv[-1].encode())
+    # Reserve a conservative launcher allowance before the first network action.
+    need(seed_charge + sender.MAX_BODY + 4096 <= remaining_control_bytes)
+    need(145 < deadline - clock() <= 1800)
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    INPUTS.sync(output.parent)
+    report = {
+        "seed_dispatch_attempted": False,
+        "seed_confirmed": False,
+        "control_staging_confirmed": False,
+        "remote_completion_unknown": False,
+        "seed_content_bytes_charged": seed_charge,
+        "retry_allowed": False,
+        "host_admitted": False,
+        "gate_5_complete": False,
+        "execution_permitted": False,
+        "expiry_enforced": False,
+    }
+    INPUTS.write(output / "started.json", INPUTS.canonical(report))
+    INPUTS.sync(output)
+    phase = "seed"
+    try:
+        need(145 < deadline - clock() <= 1800)
+        report["seed_dispatch_attempted"] = True
+        raw = sender.delivery.pipe_exchange(argv, b"", SEED_TIMEOUT)
+        seed = validate_seed(raw)
+        INPUTS.write(output / "seed.json", INPUTS.canonical(seed))
+        INPUTS.sync(output)
+        report["seed_confirmed"] = True
+        phase = "control_transfer"
+        delivered = sender._send_admitted_once(
+            binding,
+            key,
+            directory,
+            config_sha,
+            hosts_sha,
+            receiver,
+            archive,
+            seed["machine_id"],
+            seed["boot_id"],
+            seed["setup_deadline_boottime"],
+            output / "control-transfer",
+            deadline=deadline,
+            remaining_control_bytes=remaining_control_bytes - seed_charge,
+            clock=clock,
+        )
+        need(delivered["remote_staging_confirmed"] is True)
+        report["control_staging_confirmed"] = True
+        report["total_control_content_bytes_charged"] = (
+            seed_charge + delivered["control_content_bytes_charged"]
+        )
+        need(report["total_control_content_bytes_charged"] <= remaining_control_bytes)
+    except BaseException:
+        report["failed_phase"] = phase
+        report["remote_completion_unknown"] = report["seed_dispatch_attempted"]
+        INPUTS.write(output / "result.json", INPUTS.canonical(report))
+        INPUTS.sync(output)
+        raise ValueError("setup_bootstrap_failed") from None
+    INPUTS.write(output / "result.json", INPUTS.canonical(report))
+    INPUTS.sync(output)
+    return report

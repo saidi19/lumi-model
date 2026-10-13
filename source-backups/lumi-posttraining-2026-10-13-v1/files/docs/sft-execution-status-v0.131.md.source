@@ -1,0 +1,91 @@
+# SFT execution status v0.131: full-size VM controls and exact input selection prepared
+
+2026-09-28. **The existing full-size control adapter is now connected locally
+to VM coordinator v4, and the exact preserved S3 input selection is verified
+against saved metadata.** 177 tests passed, zero failures/errors/skips; Ruff
+passed. This is not an executable/admitted full-size VM parent, an acquisition,
+or a real import. The successful tiny native result in v0.130 remains intact.
+
+## Concrete changes
+
+`posttraining_checkpoint_vm_fullsize_entry_v1.py` reuses the existing full-size
+metadata, resource, runtime-source and one-shot/result validation, targeting
+the VM coordinator v4 instead of old guardian coordinator v3. A distinct
+VM-control schema and scope reject replay of the old route's control header.
+The public `run_import` still unconditionally rejects `host_guard_not_bound`;
+the private adapter is reserved for a separately authenticated future parent.
+No approval flag, hashes or generated-test result grants that admission.
+
+The original full-size output remains `/outputs/import/attempt-001`; its
+parent already meets the frozen minimum-depth rule. Unlike the tiny entry's
+old `/work/import-attempt`, it did not need a layout correction. The future
+parent must create/verify that private output parent exclusively on new
+disk-backed storage. Old full-size entry/guardian, tiny entries and all frozen
+coordinator/kernel/loader/package sources are unchanged.
+
+`prepare_sft_vm_fullsize_metadata_v1.py` performs an offline, fixed-file,
+hash-bound check of the nine existing metadata/control documents plus the two
+runtime source files. It uses an inert package namespace; no ML imports,
+checkpoint/trainer/tokenizer content, network, mounts or processes are needed.
+The eight import-control bodies pass the existing v4 resource-input validator;
+the selected keys are taken from the pinned backup plan, never guessed.
+
+Saved selection: `configs/lumi-4b-sft-vm-fullsize-input-selection-v0.1.json`.
+It explicitly keeps acquisition/execution permission, host admission, current
+remote availability, object-version binding, training and production false.
+
+## Original pretrained model and exact inventory
+
+The base remains Lumi 4B, step 76,294, 80-billion pretraining tokens, eight-rank
+DCP, 4,002,376,704 parameters. No replacement model or data selection was made.
+
+- Checkpoint: 19 files / 48,839,117,190 bytes.
+- Tokenizer: three files / 4,648,253 bytes.
+- Total exact selected S3 objects: 22 / 48,843,765,443 bytes.
+- Included opaque trainer files: eight / 32,019,583,243 bytes. Both full
+  checkpoint audits must hash these; they must not be deserialized or omitted.
+- Saved lineage metadata inspected: 115,776 bytes per preparation pass;
+  runtime source inspected: 28,536 bytes. No payload was acquired or read.
+
+The actual tokenizer inventory already includes the `tokenizer/` prefix and
+trainer files live at the checkpoint root. An initial local draft incorrectly
+prepended another tokenizer prefix and assumed a trainer subdirectory; exact
+lookup rejected it. Corrected before saving the selection, with regressions
+for prefix handling, omitted trainer rows, missing/duplicate objects and key,
+size, hash, bucket or lineage mismatch. This was not a failed remote attempt.
+
+## Reused proposed limits, not execution approval
+
+The previous resource envelope is unchanged: 64-GiB worker RAM, 3,600-second
+import deadline, 200,055,533,069 logical coordinator-read bytes and
+8,415,205,181 cooperative private-content-write bytes. The earlier host target
+is 128-GiB RAM (80-GiB MemAvailable preflight) and 128-GiB disk capacity/free
+headroom proposal. It still needs concrete host/storage design and readback.
+Do not confuse disk capacity with cumulative native writes or infer real I/O
+sufficiency from the tiny pass. Full-size timing and serializer overhead are
+not measured. The frozen DCP payload allowance remains 64 GiB.
+
+## Verification and exact remaining work
+
+42 successor/selection cases plus 135 unchanged regressions passed in 0.443
+seconds in the existing CPython 3.13.7 environment. Tests use synthetic
+integer-only full-size metadata and runtime/coordinator doubles, not 4B tensor
+allocation. An inert namespace avoided eager ML registration. Parent audit
+hook recorded zero network/payload attempts; no ML modules were loaded. Ruff
+passed for all four additions. Nine old full-size bindings and four native
+success bindings were rechecked unchanged. No commit/push occurred.
+
+Remaining local implementation is the full-size parent lifecycle, not another
+generic validator project: bind exact approved host/runtime/source identity;
+perform separately bounded exact-key acquisition and verify all hashes; close
+acquisition credentials/writers before read-only input/source exposure; enforce
+disk-backed output/RAM/swap/tasks/deadline with independent readback; call this
+adapter once and independently verify/retain the SFT package and cleanup result.
+Setup, transfer, extra checksum readback, logs and package retention need their
+combined budgets in the final run proposal. A qualified tiny parent cannot just
+be switched to real data or given its old approval.
+
+Only after that wiring and explicit host/acquisition/import authorization can
+the real checkpoint be imported. No VM, S3 request, GPU, inference, training,
+promotion or seal occurred here. Gate 5 remains incomplete; Gate 6 GPU smoke
+and SFT follow successful full-size import, then evaluation and serving.

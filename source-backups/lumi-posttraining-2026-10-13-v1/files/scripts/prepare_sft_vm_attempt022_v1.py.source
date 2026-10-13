@@ -1,0 +1,216 @@
+"""Bind the qualified watchdog diagnostic fix into a fresh local source successor."""
+
+import ast
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt021_v1 as previous
+from scripts import prepare_sft_vm_watchdog_failure_fix_v1 as fix
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-021-source-v0.1"
+BASE_SHA = "5cc27a9dc616baff2138aa81bd0d85a3089a33863fdc20270c71f7b7b0319409"
+BUILDER_SHA = "d7749baba6ded653d67de4ac6675e84085fb46412f47a041d3b28e0bc646e580"
+FIX_BUILDER_SHA = "6c57d686d1d18b394196812ba80971c303fcca59a939d2213ab00a7454fab85d"
+FIX_SHA = "5c7bca89187836c90e0fd23b2c6e2853d5a6a050c6aee4ba5231809c0f9e07f3"
+PROOF = ROOT / "evidence/lumi-vm-watchdog-failure-fix-verification-v0.2.json"
+PROOF_SHA = "6ecccdb93258a0ac04b08039013f81a930409f09982beca1bc4cda2df10f7fb7"
+FAILURE = ROOT / "evidence/lumi-vm-attempt-021-v026-execution-verification-v0.1.json"
+FAILURE_SHA = "180bb0194ddf01d698a99a4523b16e739fe67bed087fa2245b6dd6116da9db5f"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-022-source-v0.1"
+OLD = "07be75c955dc43fe8818192e8a9e3fc1"
+NEW = "afae7b4618174ce084fd3b6a902d74e1"
+OLD_CIDR, NEW_CIDR = "172.31.97.64/27", "172.31.97.96/27"
+LOADER = "scripts/load_sft_vm_private_host_v6.py"
+TAR, SETUP_TAR, SELECTION = previous.TAR, previous.SETUP_TAR, previous.SELECTION
+need, sha, read = previous.need, previous.sha, previous.read
+encode = previous.source.source.previous.encode
+
+
+def rewrite(raw):
+    for before, after in (
+        (OLD, NEW),
+        ("attempt-021", "attempt-022"),
+        ("Attempt-021", "Attempt-022"),
+        ("attempt021", "attempt022"),
+        (OLD_CIDR, NEW_CIDR),
+    ):
+        raw = raw.replace(before.encode(), after.encode())
+    return raw
+
+
+def prerequisites():
+    read(Path(previous.__file__), BUILDER_SHA)
+    read(Path(fix.__file__), FIX_BUILDER_SHA)
+    proof = json.loads(read(PROOF, PROOF_SHA))
+    need(proof["full_current_inert_checks_passed"] and proof["completed_revision_stable"])
+    need(proof["live_sdk_reads"] == 16 and proof["credential_identity_reads_included"] == 1)
+    need(proof["original_failure_cause_proven"] is False)
+    need(proof["new_cpu_execution_authorized"] is False)
+    for name, digest in proof["bindings"].items():
+        read(ROOT / name, digest)
+    failed = json.loads(read(FAILURE, FAILURE_SHA))
+    need(failed["status"] == "failed_attempt_cleanup_verified_no_cpu_launch_no_retry")
+    need(failed["cpu_instance_launched"] is False and failed["retry"] is False)
+    need(all(failed["observations"].values()))
+    for name, digest in failed["pins"].items():
+        read(ROOT / name, digest)
+    raw = read(ROOT / fix.OUTPUT, FIX_SHA)
+    need(raw == fix.build())
+    manifest = json.loads(read(BASE / "release.json", BASE_SHA))
+    base = {
+        name: read(BASE / name, pin["sha256"], pin["bytes"])
+        for name, pin in manifest["outputs"].items()
+    }
+    need(len(base) == 156 and sha(base[LOADER]) == fix.SOURCE_SHA)
+    return base, raw
+
+
+def build():
+    base, fixed = prerequisites()
+    preserved = {
+        name
+        for name in base
+        if name not in (TAR, SETUP_TAR)
+        and (
+            "/" not in name
+            or name.startswith("evidence/")
+            or name.endswith((".gz", ".tar", ".pem"))
+        )
+    }
+    seed = {
+        name: raw if name in preserved or not name.endswith((".py", ".json")) else rewrite(raw)
+        for name, raw in base.items()
+    }
+    # Preserve the internal import filename; the isolated release carries v7 code.
+    seed[LOADER] = rewrite(fixed)
+    worker = "scripts/sft_vm_external_watchdog_v1.py"
+    old_code = base64.b64encode(hashlib.sha256(previous.package(base[worker])).digest())
+    new_code = base64.b64encode(hashlib.sha256(previous.package(seed[worker])).digest())
+    need(old_code != new_code)
+    for name in (
+        "scripts/arm_sft_vm_external_watchdog_v2.py",
+        "scripts/prepare_sft_vm_private_host_sources_v4.py",
+    ):
+        need(seed[name].count(old_code) == 1)
+        seed[name] = seed[name].replace(old_code, new_code)
+    final = previous.close(base, seed, preserved)
+    for name, body in final.items():
+        if name in preserved:
+            need(body == base[name])
+        if name.endswith(".py"):
+            ast.parse(body)
+        if name.startswith("scripts/"):
+            need(OLD.encode() not in body and b"attempt-021" not in body)
+    need(b"failure_diagnostic=(" in final[LOADER])
+    need(b"class WatchdogCloudFailure" in final[LOADER])
+    archive = previous.setup_members(final[SETUP_TAR])
+    contract = previous.stage_contract(final[previous.SETUP_STAGE])
+    fallback = previous.setup_members(base[SETUP_TAR])
+    need(
+        len(archive) == 19
+        and all(
+            body == final.get(previous.SETUP_MEMBERS[name], fallback[name])
+            and sha(body) == contract[name][1]
+            and len(body) <= contract[name][2]
+            for name, body in archive.items()
+        )
+    )
+    receipt = previous.repair.check(
+        final[previous.SETUP_SEND],
+        final[previous.SETUP_STAGE],
+        final[SETUP_TAR],
+        OUTPUT / previous.SETUP_STAGE,
+    )
+    need(receipt["files"] == 19 and receipt["host_admitted"] is False)
+    sender = previous.constants(final[previous.SETUP_SEND])
+    need(sender["ARCHIVE_SHA"] == sha(final[SETUP_TAR]))
+    need(sender["ARCHIVE_BYTES"] == len(final[SETUP_TAR]))
+    need(sender["RECEIVER_SHA"] == sha(final[previous.SETUP_STAGE]))
+    need(sender["RECEIVER_BYTES"] == len(final[previous.SETUP_STAGE]))
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        body = final["scripts/" + role + ".py"]
+        need(sha(body) == pin["sha256"] and len(body) == pin["bytes"])
+    plan = json.loads(final["configs/lumi-vm-private-network-plan-v0.1.json"])
+    need(plan["attempt"] == NEW and plan["targets"]["new_private_subnet_cidr"] == NEW_CIDR)
+    selected = json.loads(final[SELECTION])
+    need(selected["object_versions_bound"] and selected["versioned_object_count"] == 22)
+    members = previous.source.source.previous.previous.tar_members(final[TAR])
+    need(members["controls/input-selection.json"] == final[SELECTION])
+    pins = json.loads(members["release-manifest.json"])
+    need(all(sha(members[name]) == digest for name, digest in pins.items()))
+    report = dict(
+        schema="lumi.vm-attempt022-source.v0.1",
+        status="local_source_bound_not_authorized",
+        attempt=NEW,
+        attempt_label="attempt-022",
+        operational_predecessor=OLD,
+        base_release_sha256=BASE_SHA,
+        predecessor_failure_sha256=FAILURE_SHA,
+        watchdog_failure_fix_verification_sha256=PROOF_SHA,
+        qualified_loader_implementation_sha256=FIX_SHA,
+        internal_loader_import_filename_preserved=True,
+        cleanup_bucket="lumi-cleanup-" + NEW,
+        selected_cidr=NEW_CIDR,
+        selected_cidr_live_absence_verified=False,
+        watchdog_code_sha256_base64=new_code.decode(),
+        receipt_file_count=19,
+        sender_receiver_receipts_equal=True,
+        receipt_contract_guard_before_paid_allocation=True,
+        source_versions_bound=True,
+        versioned_object_count=22,
+        historical_failure_cause_proven=False,
+        prior_evidence_preserved=True,
+        current_readback_proves_fresh_identity=False,
+        fresh_controls_required=True,
+        fresh_live_admission_required=True,
+        execution_permitted=False,
+        old_authorization_reused=False,
+        old_timer_reused=False,
+        retry=False,
+        aws_calls=0,
+        cloud_mutations=0,
+        checkpoint_access=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        outputs={
+            name: dict(bytes=len(raw), sha256=sha(raw)) for name, raw in sorted(final.items())
+        },
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in sorted((files | {"release.json": encode(report)}).items()):
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(body) == len(body))
+    return dict(
+        status=report["status"],
+        source_files=len(files),
+        attempt=NEW,
+        release_sha256=sha(encode(report)),
+        aws_calls=0,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("fresh_source_is_not_cpu_execution_authority") from None
+
+
+if __name__ == "__main__":
+    import sys
+
+    need(sys.argv[1:] == ["--prepare-once"])
+    print(json.dumps(prepare(), sort_keys=True))

@@ -1,0 +1,366 @@
+"""Synthetic pidfd child-owner tests; no process or signal is created."""
+
+from __future__ import annotations
+
+import importlib
+import signal
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_checkpoint_write_child_v1"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+before_import = set(sys.modules)
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_child_v1")
+IMPORT_ADDITIONS = set(sys.modules) - before_import
+RAW_WAIT = m._wait
+
+PRIVATE = "SYNTHETIC-PRIVATE-PAYLOAD"
+IDENTITY = (1, 77, 0o20000, 1)
+CHANGED = (9, 99, 0o20000, 1)
+
+
+class ExitInfo:
+    def __init__(self, *, pid=1234, uid=0, signo=signal.SIGCHLD,
+                 code=None, status=0):
+        self.si_pid = pid
+        self.si_uid = uid
+        self.si_signo = int(signo)
+        self.si_code = int(m.os.CLD_EXITED if code is None else code)
+        self.si_status = int(status)
+
+
+class ChildOwnerTests(unittest.TestCase):
+    def setUp(self):
+        self.pid = 1234
+        self.fd = 77
+        self.now = 100
+        self.deadline = 1_000_000_100
+        self.controller_pid = 55
+        self.exit_info = None
+        self.poll_override = None
+        self.identity_value = IDENTITY
+        self.wait_calls = []
+        self.close_calls = []
+        self.signal_calls = []
+
+        self.runtime = self.enterContext(patch.object(m, "_runtime", return_value=None))
+        self.clock = self.enterContext(patch.object(
+            m.time, "monotonic_ns", side_effect=lambda: self.now,
+        ))
+        self.open = self.enterContext(patch.object(
+            m.os, "pidfd_open", return_value=self.fd, create=True,
+        ))
+        self.inheritable = self.enterContext(patch.object(
+            m.os, "get_inheritable", return_value=False,
+        ))
+        self.identity = self.enterContext(patch.object(
+            m, "_identity", side_effect=lambda _fd: self.identity_result(),
+        ))
+        self.wait = self.enterContext(patch.object(
+            m, "_wait", side_effect=self.wait_result,
+        ))
+        self.poll = self.enterContext(patch.object(
+            m, "_poll", side_effect=self.poll_result,
+        ))
+        self.signal = self.enterContext(patch.object(
+            m.signal, "pidfd_send_signal", side_effect=self.signal_result, create=True,
+        ))
+        self.close = self.enterContext(patch.object(
+            m.os, "close", side_effect=self.close_result,
+        ))
+        self.getpid = self.enterContext(patch.object(
+            m.os, "getpid", return_value=self.controller_pid,
+        ))
+
+    def identity_result(self):
+        if isinstance(self.identity_value, BaseException):
+            raise self.identity_value
+        return self.identity_value
+
+    def wait_result(self, fd, *, consume):
+        self.assertEqual(fd, self.fd)
+        self.wait_calls.append(consume)
+        return self.exit_info
+
+    def poll_result(self, fd, timeout_ms):
+        self.assertEqual(fd, self.fd)
+        self.assertIs(type(timeout_ms), int)
+        if self.poll_override is not None:
+            return self.poll_override
+        return self.exit_info is not None
+
+    def signal_result(self, fd, number, info, flags):
+        self.signal_calls.append((fd, number, info, flags))
+        self.exit_info = ExitInfo(code=m.os.CLD_KILLED, status=signal.SIGKILL)
+
+    def close_result(self, fd):
+        self.close_calls.append(fd)
+
+    def bind(self, **changes):
+        values = {
+            "pid": self.pid,
+            "role": "worker",
+            "deadline_ns": self.deadline,
+        }
+        values.update(changes)
+        return m._bind_admitted_once(
+            values.pop("pid"), values.pop("role"), **values,
+        )
+
+    def error(self, code, **changes):
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            self.bind(**changes)
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(caught.exception.args, (code,))
+        self.assertNotIn(PRIVATE, repr(caught.exception))
+
+    def test_import_is_inert_and_public_entry_is_closed(self):
+        roots = m.listener.ML_ROOTS
+        self.assertFalse(any(name.split(".", 1)[0] in roots
+                             for name in IMPORT_ADDITIONS))
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            m.own_forked_child(pid=self.pid, role="worker", approval=True)
+        self.assertEqual(caught.exception.code, "host_guard_not_bound")
+        self.runtime.assert_not_called()
+        self.open.assert_not_called()
+
+    def test_error_vocabulary_cannot_retain_private_text(self):
+        for value in (PRIVATE, None, True, {}, "unknown"):
+            error = m.ChildOwnerError(value)
+            self.assertEqual(error.args, ("child_binding_rejected",))
+            self.assertNotIn(PRIVATE, repr(error))
+
+    def test_runtime_rejection_precedes_arguments_and_pidfd_open(self):
+        self.runtime.side_effect = RuntimeError(PRIVATE)
+        self.error("runtime_rejected", pid=True, role=PRIVATE, deadline_ns=0)
+        self.open.assert_not_called()
+
+    def test_argument_types_roles_and_deadlines_are_exact(self):
+        variants = (
+            {"pid": True}, {"pid": 1}, {"pid": 2**31}, {"pid": 1.0},
+            {"role": PRIVATE}, {"role": True},
+            {"deadline_ns": True}, {"deadline_ns": 100},
+            {"deadline_ns": 2**63},
+            {"deadline_ns": 100 + 3600 * 1_000_000_000 + 1},
+        )
+        for changes in variants:
+            with self.subTest(changes=changes):
+                self.error("arguments_rejected", **changes)
+        self.open.assert_not_called()
+
+    def test_bind_opens_one_noninheritable_pidfd_and_proves_initial_live_state(self):
+        owner = self.bind()
+        report = owner.snapshot()
+        self.open.assert_called_once_with(self.pid, 0)
+        self.inheritable.assert_called_once_with(self.fd)
+        self.assertEqual(report["role"], "worker")
+        self.assertTrue(report["pidfd_bound"])
+        self.assertEqual(report["live_checks"], 1)
+        self.assertEqual(report["waitid_calls"], 1)
+        self.assertFalse(report["exit_observed"])
+        self.assertFalse(report["terminal_failed"])
+        self.assertTrue(all(report[name] is False for name in m.FALSE_FLAGS))
+        self.assertEqual(self.close_calls, [])
+
+    def test_pidfd_open_failure_is_fixed_and_has_no_close(self):
+        self.open.side_effect = OSError(PRIVATE)
+        self.error("child_binding_rejected")
+        self.assertEqual(self.close_calls, [])
+
+    def test_inheritable_pidfd_is_closed_once_before_return(self):
+        self.inheritable.return_value = True
+        self.error("child_binding_rejected")
+        self.assertEqual(self.close_calls, [self.fd])
+
+    def test_initial_identity_failure_closes_fresh_pidfd_once(self):
+        self.identity_value = m.ChildOwnerError("identity_rejected")
+        self.error("identity_rejected")
+        self.assertEqual(self.close_calls, [self.fd])
+
+    def test_already_exited_child_is_reaped_and_closed_during_failed_bind(self):
+        self.exit_info = ExitInfo(uid=10001)
+        self.error("child_exited")
+        self.assertEqual(self.wait_calls, [False, False, False, True])
+        self.assertEqual(self.signal_calls, [])
+        self.assertEqual(self.close_calls, [self.fd])
+
+    def test_live_owner_can_be_rechecked_without_mutation(self):
+        owner = self.bind()
+        report = owner.assert_live_admitted()
+        self.assertEqual(report["live_checks"], 2)
+        self.assertEqual(report["waitid_calls"], 2)
+        self.assertEqual(self.signal_calls, [])
+
+    def test_natural_success_is_observed_consumed_and_closed_once(self):
+        owner = self.bind()
+        self.exit_info = ExitInfo(uid=10001)
+        report = owner.reap_admitted_once(
+            deadline_ns=self.deadline, require_success=True,
+        )
+        self.assertTrue(report["exit_observed"])
+        self.assertTrue(report["exit_reaped"])
+        self.assertTrue(report["exit_success_verified"])
+        self.assertEqual(self.signal_calls, [])
+        closed = owner.close_admitted_once()
+        self.assertTrue(closed["pidfd_closed"])
+        self.assertEqual(self.close_calls, [self.fd])
+
+    def test_nonzero_exit_reaps_but_cannot_claim_success(self):
+        owner = self.bind()
+        self.exit_info = ExitInfo(uid=10001, status=2)
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.reap_admitted_once(
+                deadline_ns=self.deadline, require_success=True,
+            )
+        self.assertEqual(caught.exception.code, "child_exited")
+        self.assertTrue(owner.snapshot()["exit_reaped"])
+        self.assertFalse(owner.snapshot()["exit_success_verified"])
+        owner.close_admitted_once()
+
+    def test_terminate_uses_pidfd_once_then_reaps_killed_child(self):
+        owner = self.bind()
+        report = owner.terminate_admitted_once()
+        self.assertTrue(report["termination_attempted"])
+        self.assertEqual(report["signal_attempts"], 1)
+        self.assertEqual(self.signal_calls, [
+            (self.fd, signal.SIGKILL, None, 0),
+        ])
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.terminate_admitted_once()
+        self.assertEqual(caught.exception.code, "already_attempted")
+        reaped = owner.reap_admitted_once(
+            deadline_ns=self.deadline, require_success=False,
+        )
+        self.assertTrue(reaped["exit_reaped"])
+        self.assertFalse(reaped["exit_success_verified"])
+        owner.close_admitted_once()
+
+    def test_process_lookup_during_signal_still_requires_real_reap(self):
+        owner = self.bind()
+
+        def raced_exit(*_arguments):
+            self.exit_info = ExitInfo(code=m.os.CLD_KILLED, status=signal.SIGKILL)
+            raise ProcessLookupError(PRIVATE)
+
+        self.signal.side_effect = raced_exit
+        owner.terminate_admitted_once()
+        owner.reap_admitted_once(
+            deadline_ns=self.deadline, require_success=False,
+        )
+        owner.close_admitted_once()
+        self.assertEqual(self.close_calls, [self.fd])
+
+    def test_signal_error_is_terminal_and_never_retried(self):
+        owner = self.bind()
+        self.signal.side_effect = OSError(PRIVATE)
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.terminate_admitted_once()
+        self.assertEqual(caught.exception.code, "signal_failed")
+        self.assertEqual(self.signal.call_count, 1)
+        with self.assertRaises(m.ChildOwnerError):
+            owner.terminate_admitted_once()
+        self.assertEqual(self.signal.call_count, 1)
+
+    def test_reap_requires_readiness_and_unchanged_absolute_deadline(self):
+        owner = self.bind()
+        self.poll_override = False
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.reap_admitted_once(
+                deadline_ns=self.deadline, require_success=False,
+            )
+        self.assertEqual(caught.exception.code, "deadline_exhausted")
+        self.assertTrue(owner.snapshot()["terminal_failed"])
+
+    def test_malformed_exit_identity_is_never_consumed_as_success(self):
+        for value in (
+            ExitInfo(pid=999), ExitInfo(uid=7), ExitInfo(signo=signal.SIGTERM),
+            ExitInfo(code=999), ExitInfo(status=-1),
+        ):
+            with self.subTest(value=value.__dict__):
+                self.exit_info = None
+                self.poll_override = None
+                self.identity_value = IDENTITY
+                self.wait_calls.clear()
+                owner = self.bind()
+                self.exit_info = value
+                with self.assertRaises(m.ChildOwnerError) as caught:
+                    owner.reap_admitted_once(
+                        deadline_ns=self.deadline, require_success=False,
+                    )
+                self.assertEqual(caught.exception.code, "identity_rejected")
+
+    def test_descriptor_change_prevents_signal_reap_and_close(self):
+        owner = self.bind()
+        self.identity_value = CHANGED
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.terminate_admitted_once()
+        self.assertEqual(caught.exception.code, "identity_rejected")
+        self.assertEqual(self.signal_calls, [])
+        self.assertEqual(self.close_calls, [])
+
+    def test_close_requires_reap_and_changed_fd_is_not_closed(self):
+        owner = self.bind()
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.close_admitted_once()
+        self.assertEqual(caught.exception.code, "reap_failed")
+        self.exit_info = ExitInfo(uid=10001)
+        owner.reap_admitted_once(
+            deadline_ns=self.deadline, require_success=True,
+        )
+        self.identity_value = CHANGED
+        with self.assertRaises(m.ChildOwnerError) as cleanup:
+            owner.close_admitted_once()
+        self.assertEqual(cleanup.exception.code, "cleanup_unconfirmed")
+        self.assertEqual(self.close_calls, [])
+        with self.assertRaises(m.ChildOwnerError) as second:
+            owner.close_admitted_once()
+        self.assertEqual(second.exception.code, "already_attempted")
+
+    def test_wrong_process_owner_cannot_use_bound_pidfd(self):
+        owner = self.bind()
+        self.getpid.return_value = self.controller_pid + 1
+        with self.assertRaises(m.ChildOwnerError) as caught:
+            owner.assert_live_admitted()
+        self.assertEqual(caught.exception.code, "owner_mismatch")
+        self.assertEqual(self.signal_calls, [])
+
+    def test_raw_wait_uses_pidfd_nonconsuming_then_consuming_flags(self):
+        result = object()
+        p_pidfd, exited, nohang, nowait = 3, 4, 8, 16
+        constants = (
+            patch.object(m.os, "P_PIDFD", p_pidfd, create=True),
+            patch.object(m.os, "WEXITED", exited, create=True),
+            patch.object(m.os, "WNOHANG", nohang, create=True),
+            patch.object(m.os, "WNOWAIT", nowait, create=True),
+        )
+        with constants[0], constants[1], constants[2], constants[3], \
+                patch.object(m.os, "waitid", return_value=result,
+                             create=True) as waitid:
+            self.assertIs(RAW_WAIT(self.fd, consume=False), result)
+            waitid.assert_called_once_with(
+                p_pidfd, self.fd, exited | nohang | nowait,
+            )
+        constants = (
+            patch.object(m.os, "P_PIDFD", p_pidfd, create=True),
+            patch.object(m.os, "WEXITED", exited, create=True),
+            patch.object(m.os, "WNOHANG", nohang, create=True),
+            patch.object(m.os, "WNOWAIT", nowait, create=True),
+        )
+        with constants[0], constants[1], constants[2], constants[3], \
+                patch.object(m.os, "waitid", return_value=result,
+                             create=True) as waitid:
+            self.assertIs(RAW_WAIT(self.fd, consume=True), result)
+            waitid.assert_called_once_with(
+                p_pidfd, self.fd, exited | nohang,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

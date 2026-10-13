@@ -1,0 +1,153 @@
+"""Two-call read-only response-shape diagnostic; no cleanup authority."""
+
+import hashlib
+import json
+import os
+import signal
+import time
+from datetime import UTC, datetime
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PRIOR = "evidence/lumi-vm-v05-host-resource-cleanup-outcome-v0.1.json"
+PRIOR_SHA = "cff51fb7a6c3617a8d492bf4fdd98773507ffeb1be3b897e7b028dac6aa8f891"
+APPROVAL = "configs/lumi-vm-v05-association-diagnostic-approval-v0.1.json"
+OUTPUT = "artifacts/lumi-vm-v05-association-diagnostic-v0.1"
+ACCOUNT = "573978149073"
+VPC = "vpc-0905fbf9490a2dead"
+GROUPS = ["sg-0f44659cfec8fa6b7", "sg-0befee7e888d24436"]
+STATES = {"associating", "associated", "association-failed", "disassociating",
+          "disassociated", "disassociation-failed"}
+
+
+def need(value):
+    if not value:
+        raise ValueError("diagnostic_rejected")
+
+
+def kind(value):
+    return {dict: "object", list: "array", str: "string", int: "integer",
+            float: "number", bool: "boolean", type(None): "null"}.get(type(value), "other")
+
+
+def summarize(value):
+    out = {"response_type": kind(value)}
+    if type(value) is not dict:
+        return out
+    out.update(response_key_count=len(value),
+               association_field_present="SecurityGroupVpcAssociations" in value,
+               pagination_field_present="NextToken" in value,
+               pagination_present=bool(value.get("NextToken")))
+    rows = value.get("SecurityGroupVpcAssociations")
+    out["association_field_type"] = kind(rows)
+    if type(rows) is not list:
+        return out
+    out.update(row_count=len(rows), nonobject_row_count=0, unknown_group_count=0,
+               vm_rows=0, endpoint_rows=0, original_vpc_matches=0,
+               vpc_owner_matches=0, group_owner_matches=0,
+               missing_field_counts={name: 0 for name in (
+                   "GroupId", "VpcId", "VpcOwnerId", "GroupOwnerId", "State")},
+               state_counts=dict.fromkeys(sorted(STATES | {"unknown_or_missing"}), 0))
+    for row in rows:
+        if type(row) is not dict:
+            out["nonobject_row_count"] += 1
+            continue
+        out["vm_rows"] += row.get("GroupId") == GROUPS[0]
+        out["endpoint_rows"] += row.get("GroupId") == GROUPS[1]
+        out["unknown_group_count"] += row.get("GroupId") not in GROUPS
+        out["original_vpc_matches"] += row.get("VpcId") == VPC
+        out["vpc_owner_matches"] += row.get("VpcOwnerId") == ACCOUNT
+        out["group_owner_matches"] += row.get("GroupOwnerId") == ACCOUNT
+        for field in out["missing_field_counts"]:
+            out["missing_field_counts"][field] += field not in row
+        state = row.get("State")
+        name = state if type(state) is str and state in STATES else "unknown_or_missing"
+        out["state_counts"][name] += 1
+    return out
+
+
+def main():
+    def digest(path):
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    need(digest(ROOT / PRIOR) == PRIOR_SHA)
+    approval = json.loads((ROOT / APPROVAL).read_text())
+    need(approval["human_approval"] == "ok shuru kor" and approval["read_only"] is True)
+    need(approval["prior_outcome_sha256"] == PRIOR_SHA)
+    prior = json.loads((ROOT / PRIOR).read_text())
+    for name, expected in (prior["bindings"] | approval["bindings"]).items():
+        need(digest(ROOT / name) == expected)
+    output = ROOT / OUTPUT
+    output.mkdir(mode=0o700, exist_ok=False)
+    written = 0
+    def save(name, value):
+        nonlocal written
+        raw = json.dumps(value, sort_keys=True).encode()
+        need(written + len(raw) <= 32768)
+        written += len(raw)
+        fd = os.open(output / (name + ".json"), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+    save("started", {"approval_sha256": digest(ROOT / APPROVAL),
+                     "prior_outcome_sha256": PRIOR_SHA, "retry_allowed": False})
+    result = dict(status="stopped", stage="credentials", resource_calls=0, mutation_calls=0,
+                  credential_provider_invocations=0, response_bytes=0, private_key_read=False)
+    clients = []
+    start = time.monotonic()
+    def expired(*_):
+        raise TimeoutError()
+    def bounded(value):
+        size = len(json.dumps(value, default=str).encode())
+        result["response_bytes"] += size
+        need(size <= 262144 and result["response_bytes"] <= 524288)
+        return value
+    signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, 60)
+    try:
+        import sft_vm_controller_credentials_v2 as credentials
+        from botocore.config import Config
+
+        result["credential_provider_invocations"] = 1
+        value = json.loads(credentials.export_credentials())
+        need(value["Version"] == 1)
+        expiry = datetime.fromisoformat(value["Expiration"].replace("Z", "+00:00"))
+        need((expiry - datetime.now(UTC)).total_seconds() > 90)
+        secret = dict(aws_access_key_id=value["AccessKeyId"],
+                      aws_secret_access_key=value["SecretAccessKey"],
+                      aws_session_token=value["SessionToken"])
+        session = credentials.session()
+        for service in ("sts", "ec2"):
+            clients.append(session.create_client(service, region_name="us-east-1",
+                endpoint_url=credentials.endpoint(service), verify=credentials.ca_path(),
+                config=Config(proxies={}, connect_timeout=3, read_timeout=5,
+                              retries={"total_max_attempts": 1},
+                              ignore_configured_endpoint_urls=True), **secret))
+        secret.clear()
+        value.clear()
+        result["stage"] = "identity"
+        result["resource_calls"] += 1
+        need(bounded(clients[0].get_caller_identity())["Account"] == ACCOUNT)
+        result["stage"] = "association_response"
+        result["resource_calls"] += 1
+        response = bounded(clients[1].describe_security_group_vpc_associations(
+            Filters=[dict(Name="group-id", Values=GROUPS)], MaxResults=100))
+        result["aggregate"] = summarize(response)
+        result.update(status="completed", stage="aggregate_retained")
+    except Exception as error:
+        code = getattr(error, "response", {}).get("Error", {}).get("Code")
+        result["failure_code"] = code if code in {
+            "ExpiredToken", "ExpiredTokenException", "AccessDenied", "UnauthorizedOperation",
+        } else "credential_call_or_validation_failed"
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        for client in clients:
+            client.close()
+        result["elapsed_seconds"] = round(time.monotonic() - start, 3)
+        save("result", result)
+    print(json.dumps(result, sort_keys=True))
+    return 0 if result["status"] == "completed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

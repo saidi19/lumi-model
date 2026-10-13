@@ -1,0 +1,132 @@
+"""Build a local diagnostic-only loader successor; no cloud execution authority."""
+
+from scripts import verify_sft_vm_attempt021_v026_execution_v1 as evidence
+
+ROOT = evidence.ROOT
+SOURCE = "artifacts/lumi-vm-attempt-021-source-v0.1/scripts/load_sft_vm_private_host_v6.py"
+SOURCE_SHA = "4cd749c00338fb7222f34440098ce183a2f1d8581715254c677d5e2dd3796a56"
+DIAGNOSTIC = "evidence/lumi-vm-attempt-021-watchdog-diagnostic-v0.1.json"
+DIAGNOSTIC_SHA = "70b985e63d1760599af59254c52c73e71fef78d93766de5278e251d0933691fc"
+OUTPUT = "scripts/load_sft_vm_private_host_v7.py"
+need, read = evidence.need, evidence.read
+
+SUPPORT = '''
+SAFE_ERROR_CODES = frozenset({
+    "ResourceNotFoundException", "AccessDenied", "AccessDeniedException",
+    "ExpiredToken", "ExpiredTokenException", "ThrottlingException",
+    "TooManyRequestsException", "ServiceUnavailableException", "InternalServerException",
+})
+
+
+def safe_cloud_error(error):
+    response = getattr(error, "response", None)
+    details = response.get("Error") if type(response) is dict else None
+    code = details.get("Code") if type(details) is dict else None
+    if code is not None:
+        safe = code if type(code) is str and code in SAFE_ERROR_CODES else "other"
+        return dict(kind="aws_service", code=safe)
+    name = type(error).__name__
+    kind = {
+        "ConnectTimeoutError": "connect_timeout", "ReadTimeoutError": "read_timeout",
+        "EndpointConnectionError": "connection", "ConnectionClosedError": "connection",
+        "SSLError": "tls",
+    }.get(name, "unknown")
+    if isinstance(error, TimeoutError):
+        kind = "timeout"
+    elif isinstance(error, (ValueError, AssertionError, TypeError, KeyError)):
+        kind = "validation"
+    elif isinstance(error, (KeyboardInterrupt, SystemExit)):
+        kind = "interrupted"
+    return dict(kind=kind, code="none")
+
+
+class WatchdogCloudFailure(ValueError):
+    def __init__(self, diagnostic):
+        super().__init__("watchdog_cloud_failure_preserve_no_retry")
+        self.diagnostic = dict(diagnostic)
+
+
+class ObservedCloudClient:
+    """Record finite failure codes before the frozen SDK wrapper redacts errors."""
+
+    def __init__(self, client, service, failure_record):
+        self.client, self.meta = client, client.meta
+        self.service, self.failure_record = service, failure_record
+
+    def __getattr__(self, name):
+        allowed = {item.replace("-", "_") for item in original_guard.OPS[self.service]}
+        if self.service == "lambda":
+            allowed.add("update_function_code")
+        need(name in allowed)
+
+        def call(**fields):
+            try:
+                return getattr(self.client, name)(**fields)
+            except Exception as error:
+                self.failure_record.update(safe_cloud_error(error))
+                raise
+
+        return call
+
+'''
+
+CONSTRUCTOR = '''    def __init__(self, clients):
+        self.failure_record = {}
+        super().__init__({
+            service: ObservedCloudClient(client, service, self.failure_record)
+            for service, client in clients.items()
+        })
+
+    def cli(self, service, operation, **fields):
+        self.failure_record.clear()
+        try:
+            return self._once(service, operation, **fields)
+        except LookupError:
+            # Expected resource absence is not a failed cloud call.
+            self.failure_record.clear()
+            raise
+        except Exception as error:
+            diagnostic = self.failure_record or safe_cloud_error(error)
+            raise WatchdogCloudFailure(diagnostic) from None
+
+'''
+
+
+def build():
+    raw = read(SOURCE, SOURCE_SHA)
+    read(DIAGNOSTIC, DIAGNOSTIC_SHA)
+    for name, digest in evidence.PINS.items():
+        read(name, digest)
+    text = raw.decode()
+    anchor = "class WatchdogCloud(original_guard.SDKCloud):"
+    need(text.count(anchor) == 1)
+    text = text.replace(anchor, SUPPORT.lstrip() + "\n" + anchor)
+    start = text.index(anchor)
+    method = text.index("    def cli(self, service, operation, **fields):", start)
+    text = text[:method] + CONSTRUCTOR + text[method:].replace(
+        "    def cli(self, service, operation, **fields):",
+        "    def _once(self, service, operation, **fields):", 1,
+    )
+    start = text.index("def _update_inert_watchdog_once(")
+    prefix, update = text[:start], text[start:]
+    need(update.count("    except BaseException:\n") == 2)
+    update = update.replace(
+        "    except BaseException:\n", "    except BaseException as error:\n", 1
+    )
+    needle = "                    failed_check=failed_check,\n"
+    need(update.count(needle) == 1)
+    update = update.replace(needle, needle + '''                    failure_diagnostic=(
+                        dict(error.diagnostic) if type(error) is WatchdogCloudFailure
+                        else safe_cloud_error(error)
+                    ),
+''')
+    text = prefix + update
+    text = text.replace('"""Attempt-021-only private loader;',
+                        '"""Local diagnostic candidate; no fresh execution authority.\n'
+                        'Attempt-021-only private loader;', 1)
+    compile(text, OUTPUT, "exec")
+    return (text.rstrip("\n") + "\n").encode()
+
+
+def run(**_arguments):
+    raise ValueError("diagnostic_fix_is_not_execution_authority") from None

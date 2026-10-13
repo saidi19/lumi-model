@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""Fixed full-size source/control loader; executable admission remains closed.
+
+main never dispatches. The private adapter is for a future independently
+admitted Linux worker, not a command-line bypass. It authenticates bounded
+root-owned controls and source bytes, makes fresh private code copies, installs
+an inert lumi namespace and calls the existing one-shot entry adapter. Local
+tests double all filesystem/native/worker operations; never invoke it on Mac.
+
+The parent must independently bind runtime/source origin, read-only mounts,
+writer exclusion, supervisor deadline and native cumulative-write enforcement.
+Root-owned or uid-owned read-only files alone do not prove immutability. Setup
+content reads/copies have separate fixed bounds; coordinator accounting does
+not cover them, implicit module-loader reads, metadata or OS writes. Nothing
+here acquires inputs, provisions a host, admits training or removes evidence.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib
+import importlib.machinery
+import json
+import os
+import re
+import stat
+import sys
+import threading
+import types
+from pathlib import Path
+
+ENTRY = Path("/opt/lumi-release/guardian/fullsize_entry.py")
+HELPER = Path("/opt/lumi-release/guardian/guarded_import_helpers.py")
+HELPER_BYTES = 14356
+HELPER_SHA256 = "687a2989ccefdf2466dc77cda62d99d5c6428bc60c74e0e32e15991cec120690"
+SOURCE_ROOT = Path("/opt/lumi-release/importer/src")
+SOURCE_MANIFEST = Path("/opt/lumi-release/importer/manifest.json")
+CONTROL_ROOT = Path("/opt/lumi-release/fullsize-control")
+CONTROL = CONTROL_ROOT / "control.json"
+OUTPUT = Path("/outputs")
+IMPORT_PARENT = OUTPUT / "import"
+CONTROL_SCHEMA = "lumi.checkpoint-fullsize-entry-control.v0.1"
+REPORT_SCHEMA = "lumi.checkpoint-fullsize-entry.v0.1"
+CONTROL_NAMES = ("base.json", "manifest.sha256", "state.json", "config.json", "handoff.json",
+                 "plan.json", "envelope.json", "kernel-io.json")
+RUNTIME_NAMES = ("configuration_lumi.py", "modeling_lumi.py")
+MAXIMUM_CONTROL_BYTES = 131072
+MAXIMUM_BUNDLE_BYTES = 524288
+MAXIMUM_SOURCE_FILES = 128
+MAXIMUM_SOURCE_FILE_BYTES = 262144
+MAXIMUM_SOURCE_BYTES = 4194304
+MAXIMUM_MANIFEST_BYTES = 65536
+MAXIMUM_SETUP_READ_BYTES = (MAXIMUM_SOURCE_FILE_BYTES + HELPER_BYTES + MAXIMUM_CONTROL_BYTES
+    + MAXIMUM_BUNDLE_BYTES + MAXIMUM_MANIFEST_BYTES + 2 * MAXIMUM_SOURCE_BYTES)
+MAXIMUM_PRIVATE_SOURCE_WRITE_BYTES = MAXIMUM_SOURCE_BYTES
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+DIR_FLAGS = READ_FLAGS | os.O_DIRECTORY
+SOURCE_NAME = re.compile(r"lumi/[A-Za-z_][A-Za-z0-9_]*\.py\Z", re.ASCII)
+ML_ROOTS = frozenset({"torch", "numpy", "transformers", "safetensors", "tokenizers",
+                      "tensorflow", "jax", "cupy", "cuda"})
+FIXED_ENV = {
+    "PATH": "/usr/bin:/bin", "LC_ALL": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONNOUSERSITE": "1", "CUDA_VISIBLE_DEVICES": "", "HF_HUB_OFFLINE": "1",
+    "HF_DATASETS_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1", "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    "AWS_EC2_METADATA_DISABLED": "true", "TOKENIZERS_PARALLELISM": "false",
+    "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+}
+PIN_KEYS = frozenset({"LUMI_IMPORT_SOURCE_MANIFEST_SHA256", "LUMI_FULLSIZE_ENTRY_SHA256",
+    "LUMI_FULLSIZE_CONTROL_SHA256", "LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256"})
+REQUIRED_SOURCES = frozenset({
+    "lumi/__init__.py", "lumi/posttraining_checkpoint_guard_fixture_v1.py",
+    "lumi/posttraining_checkpoint_fullsize_entry_v1.py",
+    "lumi/posttraining_checkpoint_import_runner_v3.py",
+    "lumi/posttraining_checkpoint_import_runner_v2.py",
+    "lumi/posttraining_checkpoint_resource_envelope_v1.py",
+    "lumi/posttraining_checkpoint_host_contract_v1.py",
+    "lumi/posttraining_checkpoint_import_plan_v1.py",
+    "lumi/posttraining_final_base_metadata_v1.py",
+    "lumi/posttraining_checkpoint_io_contract_v1.py",
+    "lumi/posttraining_checkpoint_import_torch_v5.py",
+    "lumi/posttraining_checkpoint_package_v2.py",
+    "lumi/configuration_lumi.py", "lumi/modeling_lumi.py",
+})
+FALSE_FLAGS = ("execution_permitted", "host_admission_verified", "source_immutability_verified",
+    "native_write_enforcement_verified", "whole_worker_writes_metered", "real_4b_import",
+    "training_authorized", "production_eligible", "gate_5_complete", "retry_allowed")
+ERROR_CODES = frozenset({"runtime_rejected", "already_attempted", "entry_binding_rejected",
+    "helper_binding_rejected", "source_binding_rejected", "control_binding_rejected",
+    "output_rejected", "source_staging_failed", "resource_contract_rejected",
+    "import_failed", "result_rejected"})
+_ATTEMPTED = False
+
+
+class FullsizeScriptError(ValueError):
+    def __init__(self, code="control_binding_rejected"):
+        self.code = (code if type(code) is str and code in ERROR_CODES
+                     else "control_binding_rejected")
+        super().__init__(self.code)
+
+
+def need(value, code="control_binding_rejected"):
+    if not value:
+        raise FullsizeScriptError(code) from None
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def pin(value):
+    return type(value) is str and re.fullmatch(r"[a-f0-9]{64}", value) is not None \
+        and value != "0" * 64
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+                      allow_nan=False).encode("ascii")
+
+
+def decode(raw):
+    def pairs(rows):
+        value = {}
+        for key, child in rows:
+            need(key not in value)
+            value[key] = child
+        return value
+
+    def reject(_value):
+        raise FullsizeScriptError()
+
+    try:
+        need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_CONTROL_BYTES)
+        value = json.loads(raw, object_pairs_hook=pairs, parse_constant=reject)
+        need(type(value) is dict and canonical(value) == raw)
+        return value
+    except FullsizeScriptError:
+        raise
+    except Exception:
+        raise FullsizeScriptError() from None
+
+
+def _snapshot(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_uid,
+            info.st_gid, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _root_owned(info, *, directory=False):
+    need((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+         and info.st_uid == info.st_gid == 0 and not stat.S_IMODE(info.st_mode) & 0o022
+         and (directory or info.st_nlink == 1))
+
+
+def root_read(path, *, maximum):
+    """Bounded controls only; traverse every root-owned ancestor without symlinks."""
+    need(type(path) is type(Path()) and path.is_absolute() and ".." not in path.parts
+         and type(maximum) is int and 0 < maximum <= MAXIMUM_SOURCE_FILE_BYTES)
+    parent, fd = os.open("/", DIR_FLAGS), None
+    try:
+        _root_owned(os.fstat(parent), directory=True)
+        for component in path.parts[1:-1]:
+            child = os.open(component, DIR_FLAGS, dir_fd=parent)
+            previous, parent = parent, child
+            os.close(previous)
+            _root_owned(os.fstat(parent), directory=True)
+        fd = os.open(path.name, READ_FLAGS, dir_fd=parent)
+        before = os.fstat(fd)
+        _root_owned(before)
+        need(0 < before.st_size <= maximum)
+        chunks, remaining = [], before.st_size
+        while remaining:
+            raw = os.read(fd, min(65536, remaining))
+            need(type(raw) is bytes and 0 < len(raw) <= remaining)
+            chunks.append(raw)
+            remaining -= len(raw)
+        need(_snapshot(os.fstat(fd)) == _snapshot(before)
+             and _snapshot(os.stat(path.name, dir_fd=parent, follow_symlinks=False))
+             == _snapshot(before))
+        return b"".join(chunks)
+    finally:
+        try:
+            if fd is not None:
+                os.close(fd)
+        finally:
+            os.close(parent)
+
+
+def runtime_check(argv, environment):
+    need(type(argv) is list and argv == [str(ENTRY), "--bound-checkpoint-import"],
+         "runtime_rejected")
+    need(sys.platform == "linux" and os.uname().machine == "x86_64"
+         and sys.implementation.name == "cpython" and sys.version_info[:2] == (3, 12)
+         and sys.flags.isolated == sys.flags.ignore_environment == sys.flags.no_user_site == 1
+         and sys.dont_write_bytecode and not sys.flags.optimize and sys.byteorder == "little"
+         and os.getresuid() == os.getresgid() == (10001, 10001, 10001)
+         and os.getgroups() == [] and threading.current_thread() is threading.main_thread()
+         and threading.active_count() == 1
+         and not any(name.split(".", 1)[0] in ML_ROOTS | {"lumi"} for name in sys.modules),
+         "runtime_rejected")
+    need(type(environment) is dict and set(environment) == set(FIXED_ENV) | PIN_KEYS
+         and all(type(value) is str for value in environment.values())
+         and all(environment[key] == value for key, value in FIXED_ENV.items())
+         and all(pin(environment[key]) for key in PIN_KEYS), "runtime_rejected")
+
+
+def load_helpers():
+    raw = root_read(HELPER, maximum=HELPER_BYTES)
+    need(len(raw) == HELPER_BYTES and digest(raw) == HELPER_SHA256, "helper_binding_rejected")
+    module = types.ModuleType("_lumi_fullsize_verified_helpers_v1")
+    module.__file__ = str(HELPER)
+    exec(compile(raw, str(HELPER), "exec"), module.__dict__)
+    return module
+
+
+def validate_control(raw, *, expected_control_sha256, expected_entry_sha256,
+                     expected_source_manifest_sha256, expected_attempt_nonce_sha256):
+    need(all(pin(value) for value in (expected_control_sha256, expected_entry_sha256,
+         expected_source_manifest_sha256, expected_attempt_nonce_sha256)))
+    need(type(raw) is bytes and 0 < len(raw) <= MAXIMUM_CONTROL_BYTES
+         and digest(raw) == expected_control_sha256)
+    value = decode(raw)
+    fixed = {"schema": CONTROL_SCHEMA, "scope": "bound_checkpoint_import_only",
+        "entry_sha256": expected_entry_sha256,
+        "source_manifest_sha256": expected_source_manifest_sha256,
+        "attempt_nonce_sha256": expected_attempt_nonce_sha256}
+    need(set(value) == set(fixed) | {"files"}
+         and all(type(value[key]) is type(wanted) and value[key] == wanted
+                 for key, wanted in fixed.items()))
+    need(type(value["files"]) is list and len(value["files"]) == len(CONTROL_NAMES))
+    for row, name in zip(value["files"], CONTROL_NAMES, strict=True):
+        need(type(row) is dict and set(row) == {"path", "bytes", "sha256"}
+             and row["path"] == name and type(row["bytes"]) is int
+             and 0 < row["bytes"] <= MAXIMUM_CONTROL_BYTES and pin(row["sha256"]))
+    need(sum(row["bytes"] for row in value["files"]) <= MAXIMUM_BUNDLE_BYTES)
+    return value
+
+
+def validate_bodies(control, bodies):
+    need(type(bodies) is dict and set(bodies) == set(CONTROL_NAMES))
+    for row in control["files"]:
+        raw = bodies[row["path"]]
+        need(type(raw) is bytes and len(raw) == row["bytes"] and digest(raw) == row["sha256"])
+    return dict(bodies)
+
+
+def validate_source_reports(files, source_report, copy_report=None, *, expected_manifest_sha256):
+    """Only explicit helper content I/O is bounded; no whole-worker I/O claim."""
+    code = "source_binding_rejected" if copy_report is None else "source_staging_failed"
+    need(type(files) is dict and REQUIRED_SOURCES <= set(files)
+         and 2 <= len(files) <= MAXIMUM_SOURCE_FILES
+         and all(type(name) is str and SOURCE_NAME.fullmatch(name) and type(raw) is bytes
+                 and len(raw) <= MAXIMUM_SOURCE_FILE_BYTES for name, raw in files.items()), code)
+    total = sum(map(len, files.values()))
+    need(total <= MAXIMUM_SOURCE_BYTES and pin(expected_manifest_sha256), code)
+    fixed = {"source_manifest_sha256": expected_manifest_sha256,
+             "source_files_verified": len(files), "source_bytes_verified": total}
+    need(type(source_report) is dict and set(source_report) == set(fixed)
+         | {"source_verification_read_bytes"}
+         and all(type(source_report[key]) is type(value) and source_report[key] == value
+                 for key, value in fixed.items()), code)
+    read_bytes = source_report["source_verification_read_bytes"]
+    need(type(read_bytes) is int and total < read_bytes <= total + MAXIMUM_MANIFEST_BYTES, code)
+    if copy_report is not None:
+        wanted = {"private_source_copy_files": len(files),
+            "private_source_copy_bytes_reserved": total,
+            "private_source_copy_readback_bytes": total,
+            "private_source_copies_rootfs_immutable": False,
+            "hostile_owner_code_immutability_verified": False}
+        need(type(copy_report) is dict and set(copy_report) == set(wanted)
+             and all(type(copy_report[key]) is type(value) and copy_report[key] == value
+                     for key, value in wanted.items()), code)
+    return {**fixed, "source_verification_read_bytes": read_bytes}
+
+
+def _output_check(helper):
+    fd = helper.open_directory(OUTPUT)
+    try:
+        info = os.fstat(fd)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 10001
+             and stat.S_IMODE(info.st_mode) == 0o700, "output_rejected")
+        with os.scandir(fd) as entries:
+            need(next(entries, None) is None, "output_rejected")
+    finally:
+        os.close(fd)
+
+
+def prepare_import_parent(helper):
+    """Create a fresh fixed parent exclusively; no reuse, deletion or chmod of old data."""
+    parent = created = None
+    try:
+        parent = helper.open_directory(OUTPUT)
+        info = os.fstat(parent)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 10001
+             and stat.S_IMODE(info.st_mode) == 0o700, "output_rejected")
+        os.mkdir("import", 0o700, dir_fd=parent)
+        created = os.open("import", DIR_FLAGS, dir_fd=parent)
+        info = os.fstat(created)
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == info.st_gid == 10001
+             and stat.S_IMODE(info.st_mode) == 0o700, "output_rejected")
+        need(_snapshot(os.stat("import", dir_fd=parent, follow_symlinks=False))
+             == _snapshot(info), "output_rejected")
+        os.fsync(created)
+        os.fsync(parent)
+    except BaseException:
+        raise FullsizeScriptError("output_rejected") from None
+    finally:
+        try:
+            if created is not None:
+                os.close(created)
+        finally:
+            if parent is not None:
+                os.close(parent)
+
+
+def install_package(source):
+    """Authenticate source first; never execute the original ML-registering initializer."""
+    need(type(source) is type(Path()) and source.parent.parent == OUTPUT and source.name == "src"
+         and re.fullmatch(r"lumi-import-code-[A-Za-z0-9_-]+", source.parent.name) is not None,
+         "source_staging_failed")
+    need(not any(name.split(".", 1)[0] in ML_ROOTS | {"lumi"} for name in sys.modules),
+         "runtime_rejected")
+    package = types.ModuleType("lumi")
+    package.__package__ = "lumi"
+    package.__path__ = [str(source / "lumi")]
+    package.__spec__ = importlib.machinery.ModuleSpec("lumi", loader=None, is_package=True)
+    package.__spec__.submodule_search_locations = package.__path__
+    sys.modules["lumi"] = package
+    return importlib.import_module("lumi.posttraining_checkpoint_fullsize_entry_v1")
+
+
+def validate_worker(result, prepared):
+    fixed = {"schema": REPORT_SCHEMA,
+        "status": "coordinator_returned_parent_verification_required",
+        "coordinator_passes": 1, "checkpoint_full_audits": 2, "tokenizer_full_audits": 2,
+        "input_files": sum(map(len, prepared["inventories"].values())),
+        "input_bytes": sum(sum(rows.values()) for rows in prepared["inventories"].values()),
+        **prepared["bindings"], **dict.fromkeys(FALSE_FLAGS, False)}
+    counters = {"coordinator_read_bytes_reserved": prepared["limits"][
+        "maximum_coordinator_read_bytes"],
+        "private_write_bytes_reserved": prepared["limits"]["maximum_private_write_bytes"]}
+    need(type(result) is dict and set(result) == set(fixed) | set(counters)
+         | {"coordinator_result_sha256"}, "result_rejected")
+    need(all(type(result[key]) is type(value) and result[key] == value
+             for key, value in fixed.items()) and pin(result["coordinator_result_sha256"])
+         and all(type(result[key]) is int and 0 < result[key] <= cap
+                 for key, cap in counters.items()), "result_rejected")
+    return dict(result)
+
+
+def _execute_staged(source, arguments):
+    """Keep dependency/worker stdout off the report socket, including failed imports.
+
+    The independently bound bootstrap supplies /dev/null on stderr. This helper
+    writes no report; it only returns the exact validated dictionary after
+    restoring the original stdout. Python buffers are drained to the null sink
+    before restoration. A failed flush leaves stdout on the null sink and
+    closes the saved report handle; unknown buffered data cannot be restored
+    to that channel. This is not arbitrary native C-stdio containment.
+    """
+    saved = os.dup(1)
+    output, redirected, first_flush_ok, restore = sys.stdout, False, False, True
+    try:
+        os.dup2(2, 1)
+        redirected = True
+        restore = False
+        output.flush()
+        first_flush_ok = restore = True
+        module = install_package(source)
+        try:
+            prepared = module.prepare_entry(**arguments)
+        except BaseException:
+            raise FullsizeScriptError("resource_contract_rejected") from None
+        try:
+            result = module._run_admitted_once(**arguments)
+        except BaseException:
+            raise FullsizeScriptError("import_failed") from None
+        return validate_worker(result, prepared)
+    finally:
+        try:
+            if redirected and first_flush_ok:
+                restore = False
+                output.flush()
+                restore = True
+        finally:
+            try:
+                if restore:
+                    os.dup2(saved, 1)
+            finally:
+                os.close(saved)
+
+
+def _run_admitted_once(*, argv, environment):
+    """Private fixed worker setup, consumed before the first bounded source read.
+
+    No payload read or ML occurs before the authenticated staged entry repeats
+    its pure plan/resource/source validation. Setup can leave private partial
+    code/parent directories on failure; they are never retried or cleaned here.
+    The returned exact worker frame remains compatible with the composition;
+    staging counters are validated internally, never added to that protocol.
+    """
+    global _ATTEMPTED
+    runtime_check(argv, environment)
+    need(not _ATTEMPTED, "already_attempted")
+    environment = dict(environment)
+    _ATTEMPTED = True
+    try:
+        raw_entry = root_read(ENTRY, maximum=MAXIMUM_SOURCE_FILE_BYTES)
+        need(digest(raw_entry) == environment["LUMI_FULLSIZE_ENTRY_SHA256"],
+             "entry_binding_rejected")
+        helper = load_helpers()
+        raw = root_read(CONTROL, maximum=MAXIMUM_CONTROL_BYTES)
+        pins = {"expected_control_sha256": environment["LUMI_FULLSIZE_CONTROL_SHA256"],
+            "expected_entry_sha256": environment["LUMI_FULLSIZE_ENTRY_SHA256"],
+            "expected_source_manifest_sha256": environment["LUMI_IMPORT_SOURCE_MANIFEST_SHA256"],
+            "expected_attempt_nonce_sha256": environment["LUMI_FULLSIZE_ATTEMPT_NONCE_SHA256"]}
+        control = validate_control(raw, **pins)
+        bodies = validate_bodies(control, {row["path"]: root_read(
+            CONTROL_ROOT / row["path"], maximum=row["bytes"]) for row in control["files"]})
+        try:
+            files, source_report = helper.verify_source_tree(SOURCE_ROOT, SOURCE_MANIFEST,
+                environment["LUMI_IMPORT_SOURCE_MANIFEST_SHA256"])
+            validate_source_reports(files, source_report,
+                expected_manifest_sha256=environment["LUMI_IMPORT_SOURCE_MANIFEST_SHA256"])
+        except BaseException:
+            raise FullsizeScriptError("source_binding_rejected") from None
+        _output_check(helper)
+        prepare_import_parent(helper)
+        try:
+            source, copy_report = helper.stage_private_sources(OUTPUT, files)
+            validate_source_reports(files, source_report, copy_report,
+                expected_manifest_sha256=environment["LUMI_IMPORT_SOURCE_MANIFEST_SHA256"])
+        except BaseException:
+            raise FullsizeScriptError("source_staging_failed") from None
+        setup_reads = (len(raw_entry) + HELPER_BYTES + len(raw) + sum(map(len, bodies.values()))
+                       + source_report["source_verification_read_bytes"]
+                       + copy_report["private_source_copy_readback_bytes"])
+        need(setup_reads <= MAXIMUM_SETUP_READ_BYTES
+             and copy_report["private_source_copy_bytes_reserved"]
+             <= MAXIMUM_PRIVATE_SOURCE_WRITE_BYTES, "source_staging_failed")
+        arguments = {"control_raw": raw, "bodies": bodies, **pins,
+            "runtime_sources": {name: files["lumi/" + name] for name in RUNTIME_NAMES}}
+        del files
+        return _execute_staged(source, arguments)
+    except FullsizeScriptError:
+        raise
+    except BaseException:
+        raise FullsizeScriptError("import_failed") from None
+
+
+def main():
+    """No real executable entry until native admission and write enforcement exist."""
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

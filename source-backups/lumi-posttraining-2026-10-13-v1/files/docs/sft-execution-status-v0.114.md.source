@@ -1,0 +1,67 @@
+# SFT execution status v0.114
+
+2026-09-26. The guardian's early-failure ownership ambiguity is corrected by a
+versioned, locally verified authority-transfer contract. **Gate 5 remains
+incomplete because the actual process composition does not yet exist.** No
+process, cgroup, socket, pidfd, listener, checkpoint/tokenizer/dataset payload,
+remote mutation, GPU operation, inference or training was executed. Guardian v1
+and all prior evidence remain byte-for-byte unchanged.
+
+## Completed
+
+- One private bundle holds the exact `CgroupLease` and release descriptor. Its
+  one-shot take clears both references through a callback-free in-memory state
+  transition, so ownership is explicit rather than inferred from an exception.
+- Runtime, scalar-argument and guardian-lock rejection happen before bundle
+  consumption; on those paths the caller still owns both authorities.
+- After consumption, the guardian records responsibility before lease or
+  descriptor validation. Every later failure attempts one lease retirement and
+  one release-FD close. The caller must not clean either authority again.
+- A descriptor transferred before identity capture is still closed once. After
+  identity capture, replacement is rejected, and a failed or ambiguous close is
+  reported as `cleanup_unconfirmed` without retry.
+- Existing terminal priority, release send, workload retirement,
+  generation-stable broker stop, owned pidfd cleanup and borrowed pidfd
+  non-ownership remain unchanged. Public execution remains closed.
+
+## Verification
+
+**836 unique tests pass on CPython 3.11.15 and 3.13.7**, with no failures,
+errors or skips: 15 guardian-v2 tests plus the previous 821 regressions. The new
+tests replace every runtime, cgroup, descriptor, pidfd, poll, clock, signal and
+cleanup boundary; no native authority was exercised.
+
+Syntax/AST checks pass for the two new files on both runtimes; maximum line
+length is 92 and trailing whitespace is zero. Tests used `-B`, and no bytecode
+file for the new component is present. Ruff was unavailable and no replacement
+was downloaded.
+
+Development record:
+`configs/lumi-4b-sft-write-guardian-authority-development-v0.1.json`.
+
+SHA-256: `acb462ab9b7cb42d2dc7fc0e70e85a4def7cd086136dd6f1fd2ffce8f6048d19`.
+
+Verification:
+`evidence/lumi-4b-sft-write-guardian-authority-development-verification-v0.1.json`.
+
+SHA-256: `03b0e9bf56e07aa6d48bd7346dd275153a4e8d87a4dc7d2309949f3b69d91db2`.
+
+## Exact next work and unchanged boundary
+
+The next successor is the controller-owned process composition. It must create
+the dedicated broker, worker and guardian children; construct an exact
+inherited-FD close matrix; hand off and adopt the listener; drop and seal the
+worker; verify READY before arming guardian v2; transport aggregate ledger
+reservations before each CONTINUE; receive CONSUMED; terminate on every
+ambiguous path; and reap broker and worker through generation-bound pidfds.
+
+That composition must structurally guarantee one writer and no extra packet on
+the release channel—it cannot infer exclusivity from socket metadata. After it
+passes local synthetic tests, the remaining Gate-5 sequence is frozen full-size
+bootstrap/lifecycle integration, successor source-closure authentication, a
+separately authorized bounded Linux native qualification, and unchanged
+host/input/resource/real-import admission.
+
+GPU is still unnecessary. The S3-backed pretrained checkpoint remains the
+intended base, but no remote availability check was made in this successor.
+Real import, training and production remain disabled.

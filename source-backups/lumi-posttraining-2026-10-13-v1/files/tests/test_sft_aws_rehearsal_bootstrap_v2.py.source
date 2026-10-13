@@ -1,0 +1,35 @@
+"""Regression checks for boot-safe expiry; native readback is still required."""
+import unittest
+from pathlib import Path
+
+import yaml
+
+
+class BootstrapTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(__file__).resolve().parents[1]
+        self.config = yaml.safe_load(
+            (root / 'configs/lumi-sft-aws-rehearsal-bootstrap-v0.2.yaml').read_text()
+        )
+
+    def test_early_timer_is_nonblocking(self):
+        command, = self.config['bootcmd']
+        self.assertEqual(command[0], 'systemd-run')
+        self.assertIn('--no-block', command)
+        self.assertNotIn('--wait', command)
+
+    def test_expiry_bound_to_boot_not_controller(self):
+        command, = self.config['bootcmd']
+        self.assertIn('--on-boot=3600s', command)
+        self.assertIn('--timer-property=AccuracySec=1s', command)
+        self.assertEqual(command[-1], '/usr/sbin/poweroff')
+
+    def test_no_workload_in_bootstrap(self):
+        self.assertEqual(self.config['packages'], ['python3-venv'])
+        self.assertIs(self.config['package_upgrade'], False)
+        self.assertEqual([row[0] for row in self.config['runcmd']],
+                         ['groupadd', 'useradd', 'install'])
+
+
+if __name__ == '__main__':
+    unittest.main()

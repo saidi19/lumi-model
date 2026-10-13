@@ -1,0 +1,388 @@
+"""Source-only packaging and post-completion join; no native or cloud execution."""
+
+import datetime as dt
+import importlib
+import importlib.util
+import io
+import json
+import tarfile
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests import test_sft_vm_retention_unit_v1 as previous
+
+prior = previous.prior
+c = importlib.import_module(prior.PACKAGE + ".posttraining_vm_retention_continuation_v1")
+NATIVE_COMPLETED = c._completed_parent
+
+
+def builder():
+    path = prior.ROOT / "scripts/prepare_sft_vm_retention_release_v1.py"
+    spec = importlib.util.spec_from_file_location("_retention_release_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def credential(now=None, seconds=2400):
+    now = time.time() if now is None else now
+    return dict(
+        AccessKeyId=prior.CREDS["access_key"],
+        SecretAccessKey=prior.CREDS["secret_key"],
+        SessionToken=prior.CREDS["session_token"],
+        Expiration=dt.datetime.fromtimestamp(now + seconds, dt.UTC).isoformat(),
+    )
+
+
+class BundleTests(unittest.TestCase):
+    def setUp(self):
+        self.b = builder()
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.raw, self.members = self.b.assemble()
+
+    def test_deterministic_exact_source_only_closure(self):
+        self.assertEqual(len(self.members), 18)
+        self.assertEqual(self.b.assemble()[0], self.raw)
+        self.assertEqual(self.b.unpack(self.raw, self.b.sha(self.raw)), self.members)
+        self.assertTrue(
+            all(
+                n.endswith(".py") or n == "configs/lumi-vm-fullsize-host-proposal-v0.1.json"
+                for n in self.members
+            )
+        )
+
+    def test_prepare_and_readback_no_authority_or_overwrite(self):
+        out = self.root / "release"
+        result = self.b.prepare(out)
+        self.assertEqual((out / "retention-source.tar").read_bytes(), self.raw)
+        self.assertEqual(json.loads((out / "build.json").read_bytes()), result)
+        self.assertFalse(result["execution_permitted"] or result["host_admitted"])
+        with self.assertRaises(FileExistsError):
+            self.b.prepare(out)
+
+    def test_changed_source_rejected_before_output_directory(self):
+        original = self.b.read
+
+        def wrong(path, *args):
+            raw = original(path, *args)
+            return raw + b"#changed" if path.name == "retain_sft_vm_package_v1.py" else raw
+
+        with patch.object(self.b, "read", side_effect=wrong):
+            with self.assertRaises(ValueError):
+                self.b.prepare(self.root / "release")
+        self.assertFalse((self.root / "release").exists())
+
+    def test_archive_mutation_trailing_bytes_and_wrong_digest_rejected(self):
+        for raw, pin in (
+            (self.raw, "0" * 64),
+            (self.raw + b"secret", self.b.sha(self.raw + b"secret")),
+            (self.raw[:-512], self.b.sha(self.raw[:-512])),
+        ):
+            with self.assertRaises(ValueError):
+                self.b.unpack(raw, pin)
+
+    def malformed(self, name, kind=tarfile.REGTYPE):
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w", format=tarfile.USTAR_FORMAT) as tar:
+            row = tarfile.TarInfo(name)
+            row.type, row.mode = kind, 0o400
+            row.size = 1 if kind == tarfile.REGTYPE else 0
+            if kind != tarfile.REGTYPE:
+                row.linkname = "/outside"
+            tar.addfile(row, io.BytesIO(b"x") if row.size else None)
+        return out.getvalue()
+
+    def test_traversal_symlink_hardlink_and_unlisted_member_rejected(self):
+        for name, kind in (
+            ("../outside", tarfile.REGTYPE),
+            ("extra", tarfile.REGTYPE),
+            ("link", tarfile.SYMTYPE),
+            ("hard", tarfile.LNKTYPE),
+        ):
+            raw = self.malformed(name, kind)
+            with self.assertRaises((ValueError, KeyError)):
+                self.b.unpack(raw, self.b.sha(raw))
+
+    def test_private_staging_exact_bytes_and_replay_blocked(self):
+        root = self.root / self.b.ATTEMPT
+        root.mkdir()
+        bundle = self.root / "bundle.tar"
+        bundle.write_bytes(self.raw)
+        with patch.object(self.b, "ROOT", self.root), patch.object(self.b, "boundary"):
+            result = self.b._install_admitted_once(bundle, self.b.sha(self.raw), "b" * 32)
+            self.assertFalse(result["binding_created"] or result["execution_permitted"])
+            for name, raw in self.members.items():
+                path = root / "retention-release" / name
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+            with self.assertRaises(FileExistsError):
+                self.b._install_admitted_once(bundle, self.b.sha(self.raw), "b" * 32)
+        self.assertFalse((root / "controller/binding.json").exists())
+
+    def test_public_install_and_mac_boundary_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            self.b.install(approved=True)
+        with patch.object(self.b.sys, "platform", "darwin"), patch("builtins.open") as opened:
+            with self.assertRaises(ValueError):
+                self.b.boundary("b" * 32)
+        opened.assert_not_called()
+
+
+class CredentialTests(unittest.TestCase):
+    def test_separate_retention_lifetime_and_exact_normalization(self):
+        raw = json.dumps(credential(1000)).encode()
+        self.assertEqual(
+            json.loads(c.normalize_retention_credentials(raw, 1000, 1800)), prior.CREDS
+        )
+
+    def test_wrong_keys_lifetime_longterm_and_whitespace_rejected(self):
+        value = credential(1000)
+        bad = [
+            value | {"Extra": True},
+            value | {"AccessKeyId": "AKIADUMMY"},
+            value | {"SecretAccessKey": "two words"},
+            credential(1000, 1859),
+            credential(1000, 3601),
+            value | {"Expiration": "2030-01-01T00:00:00"},
+        ]
+        for row in bad:
+            with self.assertRaises(ValueError):
+                c.normalize_retention_credentials(json.dumps(row).encode(), 1000, 1800)
+
+    def test_duplicate_key_or_invalid_budget_rejected(self):
+        with self.assertRaises(ValueError):
+            c.normalize_retention_credentials(b'{"AccessKeyId":"x","AccessKeyId":"y"}', 1000, 1800)
+        for budget in (True, 0, float("nan"), 1801):
+            with self.assertRaises(ValueError):
+                c.normalize_retention_credentials(
+                    json.dumps(credential(1000)).encode(), 1000, budget
+                )
+
+
+class ContinuationTests(unittest.TestCase):
+    commands = previous.ParentJoinedTests.commands
+
+    def setUp(self):
+        previous.ParentJoinedTests.setUp(self)
+        self.enterContext(patch.object(c, "ROOT", self.root))
+        self.admit = self.enterContext(
+            patch.object(
+                c, "_completed_parent", return_value=(self.completed, time.monotonic() + 120)
+            )
+        )
+        self.raw = bytearray(json.dumps(credential()).encode())
+        self.pipe = self.enterContext(patch.object(c.setup, "_read_pipe", return_value=self.raw))
+        self.mount = self.enterContext(
+            patch.object(c.setup, "_mount_empty", return_value="synthetic-mount")
+        )
+        self.abandon = self.enterContext(patch.object(c.setup, "_abandon_undispatched"))
+        self.no_import = self.enterContext(
+            patch.object(
+                c.setup, "_run_admitted_once", side_effect=AssertionError("must not restart import")
+            )
+        )
+
+    def execute(self):
+        return c._continue_admitted_once(
+            prior.m.ATTEMPT,
+            machine_id="b" * 32,
+            expected_binding_sha256="c" * 64,
+            credential_fd=123,
+        )
+
+    def test_joined_parent_worker_transport_returns_only_retention_success(self):
+        value = self.execute()
+        self.assertTrue(value["offhost_retention_verified"])
+        self.assertFalse(value["gate_5_complete"] or value["instance_termination_allowed"])
+        self.assertEqual(self.dispatches, 1)
+        self.assertEqual(len(self.store.calls), 20)
+        self.assertEqual(set(self.raw), {0})
+        self.no_import.assert_not_called()
+        self.abandon.assert_not_called()
+        self.cleanup.assert_called_once()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.assertEqual(self.dispatches, 1)
+
+    def test_parent_not_complete_prevents_pipe_read_or_mount(self):
+        self.admit.side_effect = ValueError("not ready")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.pipe.assert_not_called()
+        self.mount.assert_not_called()
+
+    def test_bad_credential_consumes_attempt_without_mount(self):
+        self.raw[:] = b'{"invalid":true}'
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.mount.assert_not_called()
+        self.assertTrue((self.destination / "retention-continuation.started.json").exists())
+
+    def test_failed_write_cleans_only_own_undispatched_source(self):
+        with patch.object(c.setup, "_write_source", side_effect=OSError("SECRET")):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.abandon.assert_called_once()
+        self.assertEqual(self.dispatches, 0)
+        self.assertNotIn(
+            b"SECRET", (self.destination / "retention-continuation.failed.json").read_bytes()
+        )
+
+    def test_ambiguous_mount_is_not_guessed_or_retried(self):
+        self.mount.side_effect = OSError("ambiguous")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.mount.assert_called_once()
+        self.abandon.assert_not_called()
+
+    def test_worker_cleanup_failure_not_retried_by_adapter(self):
+        self.cleanup.side_effect = OSError("failed")
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.cleanup.assert_called_once()
+        self.abandon.assert_not_called()
+        self.assertFalse((self.destination / "retention-continuation.result.json").exists())
+
+    def test_existing_source_is_not_adopted(self):
+        (self.destination / "retention-credentials").mkdir()
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.pipe.assert_not_called()
+        self.mount.assert_not_called()
+
+    def test_result_write_failure_preserves_worker_receipt_without_second_cleanup(self):
+        original = c.original.marker
+
+        def marker(root, name, value):
+            if name == "retention-continuation.result.json":
+                raise OSError("result")
+            return original(root, name, value)
+
+        with patch.object(c.original, "marker", side_effect=marker):
+            with self.assertRaises(ValueError):
+                self.execute()
+        self.cleanup.assert_called_once()
+        self.abandon.assert_not_called()
+        self.assertTrue((self.destination / "retention-worker/result.json").exists())
+
+
+class PriorBindingTests(unittest.TestCase):
+    commands = previous.ParentJoinedTests.commands
+
+    def setUp(self):
+        ContinuationTests.setUp(self)
+        self.b = builder()
+        raw = (prior.ROOT / "scripts/run_sft_vm_parent_entry_v2.py").read_bytes()
+        self.validator = self.b.metadata(raw, c.ENTRY_SHA)
+        self.boot = "12345678-1234-1234-1234-123456789abc"
+        self.binding = dict(
+            schema="lumi.vm-root-host-binding.v0.1",
+            attempt=prior.m.ATTEMPT,
+            machine_id="b" * 32,
+            boot_id=self.boot,
+            host_started_boottime=0,
+            host_deadline_boottime=4000,
+            prepared_sha256="e" * 64,
+        )
+        self.entry_raw = raw
+        self.enterContext(patch.object(c, "_validator", return_value=self.validator))
+        self.enterContext(patch.object(self.validator, "root_file", side_effect=self.root_file))
+        self.enterContext(
+            patch.object(c.original.handoff.frozen, "small", return_value=self.boot.encode())
+        )
+        self.status = self.enterContext(
+            patch.object(
+                c.original,
+                "_status_admitted",
+                return_value=dict(
+                    state="workflow_returned",
+                    parent_cgroup_empty=True,
+                    children_reaped=True,
+                    gate_5_complete=False,
+                    retry_allowed=False,
+                ),
+            )
+        )
+        prior.write(
+            self.destination / "detached-parent.result.json",
+            prior.m.canonical(
+                dict(
+                    state="workflow_returned",
+                    gate_5_complete=False,
+                    offhost_retention_verified=False,
+                )
+            ),
+        )
+
+    def root_file(self, path, *_args):
+        if path.name == "parent.py":
+            return self.entry_raw
+        if path.name == "binding.json":
+            return prior.m.canonical(self.binding)
+        if path.name == "binding.sha256":
+            return c.sha(prior.m.canonical(self.binding)).encode()
+        return (prior.ROOT / "src/lumi" / path.name).read_bytes()
+
+    def execute(self, pin=None, machine="b" * 32):
+        return NATIVE_COMPLETED(
+            prior.m.ATTEMPT, machine, pin or c.sha(prior.m.canonical(self.binding))
+        )
+
+    def test_frozen_prior_closure_binding_and_completed_state_admit_only_retention(self):
+        result, deadline = self.execute()
+        self.assertEqual(result, self.completed)
+        self.assertTrue(1790 < deadline - time.monotonic() <= 1800)
+        self.pipe.assert_not_called()
+        self.no_import.assert_not_called()
+
+    def test_wrong_binding_hash_machine_and_prior_source_rejected(self):
+        with self.assertRaises(ValueError):
+            self.execute(pin="0" * 64)
+        with self.assertRaises(ValueError):
+            self.execute(machine="a" * 32)
+        self.entry_raw += b"#changed"
+        with self.assertRaises(ValueError):
+            self.execute()
+
+    def test_incomplete_or_running_prior_parent_rejected(self):
+        for key, value in (
+            ("state", "running"),
+            ("parent_cgroup_empty", False),
+            ("children_reaped", False),
+            ("gate_5_complete", True),
+        ):
+            old = self.status.return_value[key]
+            self.status.return_value[key] = value
+            with self.assertRaises(ValueError):
+                self.execute()
+            self.status.return_value[key] = old
+
+    def test_insufficient_host_time_and_elapsed_preflight_do_not_renew_budget(self):
+        self.binding["host_deadline_boottime"] = 3000
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.binding["host_deadline_boottime"] = 4000
+        with patch.object(c.time, "clock_gettime", side_effect=[1000, 2300]):
+            with self.assertRaises(ValueError):
+                self.execute()
+
+    def test_public_continuation_remains_closed(self):
+        with self.assertRaisesRegex(ValueError, "host_guard_not_bound"):
+            c.continue_retention(approved=True)
+
+    def test_boolean_lookalikes_in_prior_status_or_receipt_rejected(self):
+        self.status.return_value["children_reaped"] = 1
+        with self.assertRaises(ValueError):
+            self.execute()
+        self.status.return_value["children_reaped"] = True
+        prior.write(
+            self.destination / "detached-parent.result.json",
+            prior.m.canonical(
+                dict(state="workflow_returned", gate_5_complete=0, offhost_retention_verified=False)
+            ),
+        )
+        with self.assertRaises(ValueError):
+            self.execute()

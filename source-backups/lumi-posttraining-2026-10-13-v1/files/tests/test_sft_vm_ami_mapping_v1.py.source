@@ -1,0 +1,141 @@
+"""Observed AMI shape, synthetic metadata only; never cloud or model access."""
+
+import copy
+import hashlib
+import importlib
+import sys
+import unittest
+from pathlib import Path
+
+from tests import test_sft_vm_fresh_host_v1 as fixtures
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("prepare_sft_vm_host_connection_v3")
+joined = importlib.import_module("run_sft_vm_joined_admission_v2")
+
+
+def image():
+    return {
+        "RootDeviceName": "/dev/sda1",
+        "BlockDeviceMappings": [
+            {
+                "DeviceName": "/dev/sda1",
+                "Ebs": {
+                    "SnapshotId": "snap-" + "a" * 17,
+                    "Encrypted": False,
+                    "DeleteOnTermination": True,
+                    "VolumeSize": 8,
+                    "VolumeType": "gp3",
+                },
+            },
+            {"DeviceName": "/dev/sdb", "VirtualName": "ephemeral0"},
+            {"DeviceName": "/dev/sdc", "VirtualName": "ephemeral1"},
+        ],
+    }
+
+
+class MappingTests(unittest.TestCase):
+    def test_exact_observed_shape_accepts_without_mutating_input(self):
+        value = image()
+        before = copy.deepcopy(value)
+        self.assertIs(m.image_root_mapping(value), value["BlockDeviceMappings"][0])
+        self.assertEqual(value, before)
+
+    def test_root_selection_is_not_positional(self):
+        value = image()
+        value["BlockDeviceMappings"].reverse()
+        self.assertEqual(m.image_root_mapping(value)["DeviceName"], "/dev/sda1")
+
+    def test_missing_extra_duplicate_unknown_or_additional_ebs_rejected(self):
+        changes = [
+            lambda r: r.pop(),
+            lambda r: r.append(copy.deepcopy(r[0])),
+            lambda r: r.__setitem__(1, copy.deepcopy(r[0])),
+            lambda r: r[1].update(DeviceName="/dev/sdd"),
+            lambda r: r[1].update(VirtualName="ephemeral2"),
+            lambda r: r[1].update(Ebs={"SnapshotId": "snap-" + "b" * 17}),
+            lambda r: r[0].update(NoDevice=""),
+            lambda r: r[1].update(NoDevice=""),
+        ]
+        for change in changes:
+            value = image()
+            change(value["BlockDeviceMappings"])
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                m.image_root_mapping(value)
+
+    def test_wrong_types_root_snapshot_or_device_rejected(self):
+        for key, bad in (
+            ("RootDeviceName", "/dev/xvda"),
+            ("BlockDeviceMappings", {}),
+            ("BlockDeviceMappings", [None, None, None]),
+        ):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                m.image_root_mapping(image() | {key: bad})
+        for bad in (None, "", True, "snap-bad", "snap-" + "G" * 17):
+            value = image()
+            value["BlockDeviceMappings"][0]["Ebs"]["SnapshotId"] = bad
+            with self.subTest(snapshot=bad), self.assertRaises(ValueError):
+                m.image_root_mapping(value)
+
+    def test_frozen_failure_reproduces_and_successor_fresh_lineage_passes(self):
+        observed, launch, now = fixtures.fixture()
+        observed["image"]["Images"][0].update(image())
+        with self.assertRaises(ValueError):
+            fixtures.m.inspect(
+                observed, fixtures.prior.B, fixtures.prior.P, launch, observed_at=now
+            )
+        value = m.inspect(observed, fixtures.prior.B, fixtures.prior.P, launch, observed_at=now)
+        self.assertTrue(value["fresh_launch_and_work_volume_match"])
+        self.assertFalse(value["native_host_admitted"])
+
+    def test_launched_disk_safety_is_not_relaxed_by_ami_defaults(self):
+        for volume, changes in (
+            (0, {"Encrypted": False}),
+            (0, {"Size": 8}),
+            (0, {"SnapshotId": "snap-" + "b" * 17}),
+            (1, {"SnapshotId": "snap-" + "a" * 17}),
+            (1, {"MultiAttachEnabled": True}),
+        ):
+            observed, launch, now = fixtures.fixture()
+            observed["image"]["Images"][0].update(image())
+            observed["volumes"]["Volumes"][volume].update(changes)
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                m.inspect(observed, fixtures.prior.B, fixtures.prior.P, launch, observed_at=now)
+
+    def test_all_successor_consumers_use_same_corrected_module_and_valid_pins(self):
+        provision = joined.lifecycle.guard.provision
+        self.assertIs(provision.connection, m)
+        self.assertIs(provision.setup.connection, m)
+        self.assertIs(joined.prepare.connection, m)
+        self.assertIs(joined.prepare.setup, provision.setup)
+        self.assertIs(joined.retained_host.frozen, m)
+        for module in (
+            joined,
+            joined.lifecycle,
+            joined.lifecycle.guard,
+            provision,
+            provision.setup,
+            joined.prepare,
+        ):
+            for name, pin in module.PINS.items():
+                self.assertEqual(
+                    hashlib.sha256(Path(module.__file__).with_name(name).read_bytes()).hexdigest(),
+                    pin,
+                )
+        joined.authenticate()
+
+    def test_public_entries_still_reject_boolean_approval(self):
+        for module in (
+            m,
+            joined,
+            joined.lifecycle,
+            joined.lifecycle.guard,
+            joined.lifecycle.guard.provision,
+            joined.prepare,
+            joined.retained_host,
+        ):
+            with (
+                self.subTest(module=module.__name__),
+                self.assertRaises((ValueError, RuntimeError)),
+            ):
+                module.run(approved=True, execute=True)

@@ -1,0 +1,310 @@
+"""One-shot, deny-all STS issuer qualification; always tear down owned IAM resources.
+
+Not an import launcher. No S3/EC2 API, login profile, persisted key or AWS profile
+edit. CLI captures root-authorized IAM responses privately; SDK receives only
+the fresh limited user's key in memory. Reports contain no credentials/errors.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import resource
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+DENY = {"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Action": "*", "Resource": "*"}]}
+CA = Path(
+    "artifacts/lumi-sft-import-runtime-v0.1/venv/lib/python3.13/site-packages/certifi/cacert.pem"
+)
+CA_SHA = "9cc2a774b5198dcff14d9be1e66091f538975d867ce029a96bce15a55dfd730f"
+
+
+class CloudError(Exception):
+    pass
+
+
+def compact(value):
+    return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def save(path, value):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+class Cloud:
+    def cli(self, service, operation, **fields):
+        # Bodies/keys remain inside captured pipes, never terminal output.
+        env = dict(os.environ, AWS_MAX_ATTEMPTS="1", AWS_PAGER="")
+        for name in list(env):
+            if name.startswith("AWS_") and name not in {"AWS_MAX_ATTEMPTS", "AWS_PAGER"}:
+                del env[name]
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                service,
+                operation,
+                "--cli-input-json",
+                "file:///dev/stdin",
+                "--region",
+                REGION,
+                "--output",
+                "json",
+                "--no-cli-pager",
+                "--cli-connect-timeout",
+                "10",
+                "--cli-read-timeout",
+                "15",
+            ],
+            input=compact(fields),
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=35,
+            check=False,
+        )
+        if result.returncode:
+            raise CloudError("absent" if "(NoSuchEntity)" in result.stderr else "aws_call_failed")
+        return json.loads(result.stdout) if result.stdout.strip() else {}
+
+    def absent(self, kind, name):
+        try:
+            self.cli("iam", "get-" + kind, **{kind.title() + "Name": name})
+        except CloudError as error:
+            if str(error) == "absent":
+                return True
+            raise
+        return False
+
+    def issue(self, key, role_arn):
+        import botocore.config
+        import botocore.session
+
+        if hashlib.sha256(CA.read_bytes()).hexdigest() != CA_SHA:
+            raise CloudError("ca_binding_failed")
+        client = botocore.session.Session().create_client(
+            "sts",
+            region_name=REGION,
+            endpoint_url="https://sts.us-east-1.amazonaws.com",
+            aws_access_key_id=key["AccessKeyId"],
+            aws_secret_access_key=key["SecretAccessKey"],
+            aws_session_token=None,
+            verify=str(CA),
+            config=botocore.config.Config(
+                connect_timeout=10, read_timeout=15, retries={"total_max_attempts": 1}, proxies={}
+            ),
+        )
+        try:
+            return client.assume_role(
+                RoleArn=role_arn,
+                RoleSessionName="lumi-deny-all-check",
+                DurationSeconds=7200,
+                Policy=compact(DENY),
+            )["Credentials"]
+        finally:
+            client.close()
+
+
+def qualify(cloud, name, wait=time.sleep):
+    user_arn = f"arn:aws:iam::{ACCOUNT}:user/lumi/temporary/{name}"
+    role_arn = f"arn:aws:iam::{ACCOUNT}:role/lumi/temporary/{name}"
+    report = {
+        "schema": "lumi-temporary-issuer-check-v0.1",
+        "name": name,
+        "session_issued": False,
+        "contract_expiry_pass": False,
+        "cleanup_verified": False,
+        "stage": "identity",
+        "s3_requests": 0,
+        "instances_launched": 0,
+        "gate_5_complete": False,
+        "production_eligible": False,
+        "secret_persisted": False,
+    }
+    user = role = user_policy = role_policy = False
+    key = credentials = None
+    cleanup_errors = []
+    try:
+        identity = cloud.cli("sts", "get-caller-identity")
+        if (
+            identity.get("Account") != ACCOUNT
+            or identity.get("Arn") != f"arn:aws:iam::{ACCOUNT}:root"
+        ):
+            raise CloudError("wrong_controller")
+        if not cloud.absent("user", name) or not cloud.absent("role", name):
+            raise CloudError("collision")
+        # Mark before each potentially ambiguous mutating request. Random fresh
+        # names, absence preflight and attempt receipt identify this run's scope.
+        tags = [{"Key": "Purpose", "Value": "lumi-deny-all-issuer-check"}]
+        report["stage"] = "create_user"
+        user = True
+        cloud.cli("iam", "create-user", UserName=name, Path="/lumi/temporary/", Tags=tags)
+        expires = (dt.datetime.now(dt.UTC) + dt.timedelta(minutes=15)).isoformat()
+        trust = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{ACCOUNT}:root"},
+                    "Action": "sts:AssumeRole",
+                    "Condition": {
+                        "ArnEquals": {"aws:PrincipalArn": user_arn},
+                        "DateLessThan": {"aws:CurrentTime": expires},
+                    },
+                }
+            ],
+        }
+        report["stage"] = "create_role"
+        role = True
+        cloud.cli(
+            "iam",
+            "create-role",
+            RoleName=name,
+            Path="/lumi/temporary/",
+            Tags=tags,
+            AssumeRolePolicyDocument=compact(trust),
+            MaxSessionDuration=7200,
+        )
+        role_policy = True
+        cloud.cli(
+            "iam",
+            "put-role-policy",
+            RoleName=name,
+            PolicyName="DenyAll",
+            PolicyDocument=compact(DENY),
+        )
+        permission = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "sts:AssumeRole",
+                    "Resource": role_arn,
+                    "Condition": {"DateLessThan": {"aws:CurrentTime": expires}},
+                },
+                {"Effect": "Deny", "NotAction": "sts:AssumeRole", "Resource": "*"},
+                {"Effect": "Deny", "Action": "sts:AssumeRole", "NotResource": role_arn},
+            ],
+        }
+        user_policy = True
+        cloud.cli(
+            "iam",
+            "put-user-policy",
+            UserName=name,
+            PolicyName="OnlyProbeRole",
+            PolicyDocument=compact(permission),
+        )
+        actual = cloud.cli("iam", "get-role-policy", RoleName=name, PolicyName="DenyAll")
+        if actual.get("PolicyDocument") != DENY:
+            raise CloudError("policy_readback_failed")
+        report["stage"] = "issue_key"
+        key = cloud.cli("iam", "create-access-key", UserName=name)["AccessKey"]
+        report["stage"] = "assume_role"
+        wait(15)  # One propagation allowance, not an STS retry loop.
+        credentials = cloud.issue(key, role_arn)
+        report["session_issued"] = True
+        remaining = (credentials["Expiration"] - dt.datetime.now(dt.UTC)).total_seconds()
+        if not 3675 <= remaining <= 7200 or not credentials["AccessKeyId"].startswith("ASIA"):
+            raise CloudError("expiry_contract_failed")
+        report.update(
+            contract_expiry_pass=True, remaining_seconds=int(remaining), stage="qualified"
+        )
+    except Exception:
+        report["failed_stage"] = report["stage"]
+        report["stage"] = "failed"
+    finally:
+        # Inventory the newly created user's keys even if create-access-key's
+        # response was lost. None of these names existed at preflight.
+        steps = []
+        if user:
+
+            def delete_keys():
+                if cloud.absent("user", name):
+                    return
+                keys = cloud.cli("iam", "list-access-keys", UserName=name)["AccessKeyMetadata"]
+                for item in keys:
+                    cloud.cli(
+                        "iam", "delete-access-key", UserName=name, AccessKeyId=item["AccessKeyId"]
+                    )
+
+            steps.append(("keys", delete_keys))
+        if user_policy:
+            steps.append(
+                (
+                    "user_policy",
+                    lambda: cloud.cli(
+                        "iam", "delete-user-policy", UserName=name, PolicyName="OnlyProbeRole"
+                    ),
+                )
+            )
+        if user:
+            steps.append(("user", lambda: cloud.cli("iam", "delete-user", UserName=name)))
+        if role_policy:
+            steps.append(
+                (
+                    "role_policy",
+                    lambda: cloud.cli(
+                        "iam", "delete-role-policy", RoleName=name, PolicyName="DenyAll"
+                    ),
+                )
+            )
+        if role:
+            steps.append(("role", lambda: cloud.cli("iam", "delete-role", RoleName=name)))
+        for label, operation in steps:
+            try:
+                operation()
+            except CloudError as error:
+                if str(error) != "absent":
+                    cleanup_errors.append(label)
+            except Exception:
+                cleanup_errors.append(label)
+        try:
+            report["cleanup_verified"] = (
+                user
+                and role
+                and cloud.absent("user", name)
+                and cloud.absent("role", name)
+                and not cleanup_errors
+            )
+        except Exception:
+            cleanup_errors.append("readback")
+        key = credentials = None  # Not a cryptographic erasure claim.
+        report["cleanup_errors"] = cleanup_errors
+    return report
+
+
+def main():
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    output = Path(sys.argv[1])
+    output.mkdir(mode=0o700, parents=False, exist_ok=False)
+    name = "lumi-issuer-check-" + uuid.uuid4().hex[:12]
+    save(
+        output / "started.json",
+        {
+            "name": name,
+            "account": ACCOUNT,
+            "scope": "temporary IAM user/key/deny-all role; one STS call; teardown",
+            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        },
+    )
+    result = qualify(Cloud(), name)
+    save(output / "result.json", result)
+    print(compact(result))
+    return 0 if result["contract_expiry_pass"] and result["cleanup_verified"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,154 @@
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+SPEC = importlib.util.spec_from_file_location(
+    "permissions", ROOT / "scripts/prepare_sft_vm_acquisition_permissions_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+NOW = dt.datetime(2026, 9, 28, tzinfo=dt.UTC)
+KEYS = [f"synthetic/object-{n}" for n in range(22)]
+
+
+class PolicyTests(unittest.TestCase):
+    def test_current_per_resource_response_and_legacy_response(self):
+        policy, arns = m.policy_for_keys(KEYS, NOW + dt.timedelta(hours=2))
+        for current in (True, False):
+
+            class Cloud:
+                def __init__(self, current_response, test):
+                    self.current = current_response
+                    self.test = test
+
+                def cli(self, service, operation, **args):
+                    self.test.assertEqual((service, operation), ("iam", "simulate-custom-policy"))
+                    context = {
+                        v["ContextKeyName"]: v["ContextKeyValues"][0]
+                        for v in args["ContextEntries"]
+                    }
+                    when = dt.datetime.fromisoformat(context["aws:CurrentTime"])
+                    secure = context["aws:SecureTransport"] == "true"
+                    rows = []
+                    for action in args["ActionNames"]:
+                        entries = []
+                        for arn in args["ResourceArns"]:
+                            allowed = (
+                                action == "s3:GetObject"
+                                and arn in arns
+                                and secure
+                                and when < NOW + dt.timedelta(hours=2)
+                            )
+                            decision = "allowed" if allowed else "explicitDeny"
+                            if self.current:
+                                entries.append(
+                                    {"EvalResourceName": arn, "EvalResourceDecision": decision}
+                                )
+                            else:
+                                rows.append(
+                                    {
+                                        "EvalActionName": action,
+                                        "EvalResourceName": arn,
+                                        "EvalDecision": decision,
+                                    }
+                                )
+                        if self.current:
+                            rows.append(
+                                {
+                                    "EvalActionName": action,
+                                    "EvalResourceName": "arn:${Partition}:s3:::${Bucket}/${Key}",
+                                    "EvalDecision": "explicitDeny",
+                                    "ResourceSpecificResults": entries,
+                                }
+                            )
+                    return {"EvaluationResults": rows}
+
+            result = m.check_matrix(
+                Cloud(current, self), policy, arns, NOW, NOW + dt.timedelta(hours=2)
+            )
+            self.assertEqual(result["decisions"], 38)
+            self.assertEqual(result["allowed"], 23)
+            self.assertEqual(result["explicitDeny"], 15)
+
+    def test_exact_once_and_explicit_denies(self):
+        policy, arns = m.policy_for_keys(KEYS, NOW)
+        statements = {s["Sid"]: s for s in policy["Statement"]}
+        self.assertEqual(statements["DenyOtherResources"]["NotResource"], arns)
+        self.assertEqual(statements["DenyOtherActions"]["NotAction"], "s3:GetObject")
+        self.assertEqual(statements["ReadOnly"]["Action"], "s3:GetObject")
+        for arn in arns:
+            self.assertEqual(json.dumps(policy).count(arn + '"'), 1)
+        self.assertIn("DateGreaterThanEquals", statements["DenyExpired"]["Condition"])
+
+    def test_reject_duplicate_and_wrong_count(self):
+        for keys in [KEYS[:-1], KEYS + ["extra"], KEYS[:-1] + [KEYS[0]]]:
+            with self.assertRaises(ValueError):
+                m.policy_for_keys(keys, NOW)
+
+    def test_reject_policy_wildcards_and_variables(self):
+        for key in ["object*", "object?", "${aws:username}", "object\n", "é"]:
+            with self.assertRaises(ValueError):
+                m.policy_for_keys([key] + KEYS[1:], NOW)
+
+    def test_reject_naive_expiry(self):
+        with self.assertRaises(ValueError):
+            m.policy_for_keys(KEYS, NOW.replace(tzinfo=None))
+
+    def test_role_quota_enforced(self):
+        with self.assertRaises(ValueError):
+            m.policy_for_keys([k + "x" * 1000 for k in KEYS], NOW)
+
+    def test_selection_change_rejected_before_json_decode(self):
+        with self.assertRaises(ValueError):
+            m.build(b"invalid", NOW)
+
+    def test_builder_bound_synthetic_selection(self):
+        value = {
+            "account": m.issuer.base.ACCOUNT,
+            "region": m.issuer.base.REGION,
+            "bucket": m.BUCKET,
+            "object_count": 22,
+            "objects": [
+                {"key": k, "bytes": 48843765443 if i == 0 else 0} for i, k in enumerate(KEYS)
+            ],
+        }
+        raw = json.dumps(value).encode()
+        with patch.object(m, "SELECTION_SHA", hashlib.sha256(raw).hexdigest()):
+            policy, arns, expiry = m.build(raw, NOW)
+        self.assertEqual(len(arns), 22)
+        self.assertEqual((expiry - NOW).total_seconds(), 7200)
+        self.assertLess(len(m.issuer.base.compact(policy)), 10240)
+
+    def test_incomplete_simulation_rejected(self):
+        class Cloud:
+            def cli(self, *args, **kwargs):
+                return {"EvaluationResults": [], "IsTruncated": False}
+
+        policy, arns = m.policy_for_keys(KEYS, NOW + dt.timedelta(hours=2))
+        with self.assertRaises(ValueError):
+            m.check_matrix(Cloud(), policy, arns, NOW, NOW + dt.timedelta(hours=2))
+
+    def test_truncated_simulation_rejected_without_retry(self):
+        class Cloud:
+            calls = 0
+
+            def cli(self, *args, **kwargs):
+                self.calls += 1
+                return {"EvaluationResults": [], "IsTruncated": True}
+
+        cloud = Cloud()
+        policy, arns = m.policy_for_keys(KEYS, NOW + dt.timedelta(hours=2))
+        with self.assertRaises(ValueError):
+            m.check_matrix(cloud, policy, arns, NOW, NOW + dt.timedelta(hours=2))
+        self.assertEqual(cloud.calls, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

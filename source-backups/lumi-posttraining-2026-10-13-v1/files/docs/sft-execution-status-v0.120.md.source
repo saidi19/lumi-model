@@ -1,0 +1,126 @@
+# SFT execution status v0.120: reuse the working import path
+
+2026-09-27. **Gate 5 remains incomplete, but a complete tiny CPU import and
+packaging chain now passes.** The four new integration cases plus 84 focused
+regressions passed on the existing Mac CPython 3.13.7 runtime: 88 tests,
+zero failures/errors/skips. No dependency installation was needed.
+
+## What was actually exercised
+
+`generated DCP -> import_torch_v5 -> package_v2 -> actual SFT checksum consumer
+-> native HF filename reload`
+
+The test calls the real components without substituting their implementations.
+It covers single-shard and multi-shard BF16 exports, exact tensor equality,
+preservation of FP32 rotary buffers, tokenizer-file copying, before/after input
+hashes, private file permissions, and a second read-only package verification.
+The actual SFT checksum verifier is exercised both through the package's path
+adapter and independently on an ordinary Path. Corrupt weights are rejected
+by both consumers; mismatched tokenizer content cannot produce a completed
+receipt or manifest.
+
+The tokenizer files are synthetic opaque bytes, not a usable tokenizer. This
+is not a tokenization, training, real-4B, Linux-containment, or performance test.
+Forward passes, optimizer steps and network connects were forbidden. The
+final regression run also denied access to real payload directories and
+subprocess launches; it observed no prohibited attempts.
+
+The first new test setup incorrectly reused a Mock budget callback returning
+a Mock rather than None. It was corrected to a real monotonic deadline check.
+That was a test setup error, not an actual checkpoint import attempt. No
+production conversion or packaging defect was found in this integration.
+
+## Selected preparation route; not a live execution authorization
+
+The user asked to resume with the best approach after discussing the cost of
+continuing the per-write broker. Retain the existing Lumi architecture,
+pretrained checkpoint binding, tokenizer, curated data, masking, checksums,
+save/resume logic and tested import/package code. Do not restart those jobs.
+
+Prepare a **separate isolated-Linux execution route**. Do not extend the
+unfinished arbitrary-native-write broker/controller/guardian protocol as a
+prerequisite for first SFT. Its code and evidence remain intact; its previous
+failures have not been relabelled as passes.
+
+This revises the intended execution protection, not the model or data:
+
+| Concern | Simplified route requirement |
+| --- | --- |
+| Host | Dedicated Linux VM, never the user's already-busy Lambda instance |
+| Inputs | Exact authenticated checkpoint/tokenizer/source bindings; no writable aliases available to the worker; read-only mounts and before/after hashes |
+| Worker | Unprivileged, no acquisition credentials, no network, no GPU for import |
+| Resources | Independently enforced RAM, swap, process, disk-capacity and wall-time limits; bounded logs/temp files; whole-workload termination |
+| Content accounting | Retain existing cooperative DCP/HF/package read/write counters and caps |
+| Native writes | Do not claim that filesystem capacity bounds cumulative native bytes written |
+| Attempts | Fresh exclusive attempt; preserve failures; no retry after start |
+| Billing | Named host, agreed duration/rate/cost limit and lifecycle action; stopping a worker alone does not stop instance billing |
+
+The old host contract requires cumulative native-write enforcement. **It is
+not satisfied by this alternative.** Its v0.1 file and every old execution
+authorization remain unchanged. The revised route must have its own explicit
+host-bound admission; no old approval flag or private entry is repurposed to
+bypass the old contract. No live authorization or host admission is created
+by this document. Production eligibility remains false.
+
+The earlier 64-GiB worker-memory / 128-GiB host-storage / 3,600-second import
+proposal is a planning reference, not a measured requirement or approved
+host. Final host settings must include supervisor, runtime, logs and staging
+headroom. A disk-capacity budget is separate from the retained cooperative
+write budgets. H100 capacity or GPU count is not inferred from this tiny test.
+
+## Remaining work, in execution order
+
+1. **Local integration:** connect one standard Linux supervisor and entry to
+   the existing CPU coordinator and package verifier, under the revised
+   host contract. Test the same entry on generated input, including timeout,
+   memory/storage exhaustion and cleanup. Do not build a new conversion
+   kernel, package format or generic syscall broker. Public/private old
+   execution entries stay closed; the new route is not implemented yet.
+2. **Target check and Gate-5 completion:** select/bind the dedicated host,
+   runtime and finite resource/cost limits; run the generated-input native
+   check there. Only after that succeeds and real-input acquisition/import
+   is admitted, use the bound S3 base checkpoint, perform the real CPU import,
+   and independently verify the complete SFT package. No training GPU is
+   needed for the import itself. This turn did not access S3.
+3. **Gate 6:** fix/bind SFT-specific launch approval before data/CUDA setup,
+   then run the bounded H100 smoke with save/resume and measure memory before
+   choosing full-run geometry. Train and seal only after that acceptance.
+   The existing `train_distributed_sft_v2.py` initializes distributed/CUDA
+   before the worker's generic authorization check; it is not a ready-to-run
+   approved launcher. Do not bypass that check or start it unchanged.
+4. **Gates 7 and 8:** frozen quality/safety evaluation, then serving/deployment
+   acceptance. Private research artifacts do not grant production rights.
+
+These are remaining outcomes, not four small tests or a promised day count.
+The next action is still local supervisor/entry integration, **not GPU rental**.
+The original eight-gate roadmap remains; only the Gate-5 execution approach
+is being simplified. Older roadmap/status snapshots are historical.
+
+## Reproduction and records
+
+Run only in the already installed isolated ML runtime; no install or download:
+
+```sh
+PYTHONPATH=src PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 \
+TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+HF_HUB_DISABLE_PROGRESS_BARS=1 TOKENIZERS_PARALLELISM=false \
+CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+artifacts/lumi-sft-import-runtime-v0.1/venv/bin/python -B -m unittest \
+  tests.test_sft_checkpoint_import_integration_v2 \
+  tests.test_sft_checkpoint_import_torch_v5 \
+  tests.test_sft_checkpoint_import_torch_v5_source \
+  tests.test_sft_checkpoint_package_v2
+```
+
+The additional outer audit-hook/120-second alarm used in the recorded run is
+described in the verification record; the command above runs the same suite,
+not an OS-isolation qualification. Ruff also passed for the new test file.
+
+- Tests: `tests/test_sft_checkpoint_import_integration_v2.py`.
+- Aggregate result and source pins:
+  `evidence/lumi-4b-sft-import-chain-integration-v0.1.json`.
+- Preserved predecessor: `docs/sft-execution-status-v0.119.md`.
+
+No real model/tokenizer/dataset reads, inference, training, remote/instance
+actions, publication, staging, commit or push occurred. No prior source or
+evidence file was edited. Existing untracked work remains in place.

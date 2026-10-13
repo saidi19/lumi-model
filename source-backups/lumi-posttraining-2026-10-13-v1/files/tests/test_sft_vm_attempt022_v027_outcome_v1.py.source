@@ -1,0 +1,45 @@
+"""Synthetic read-only outcome budget guards; no credentials or cloud."""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+from scripts import verify_sft_vm_attempt022_v027_outcome_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def meter(self, clock=None):
+        return m.Meter(Mock(static_identity_client=Mock()),
+                       clock=clock or Mock(return_value=0))
+
+    def test_identity_and_failed_dispatches_count(self):
+        meter = self.meter()
+        meter.consume("sts", credential=True, model=SimpleNamespace(name="GetCallerIdentity"))
+        self.assertEqual((meter.calls, meter.credential_calls), (1, 1))
+
+    def test_no_mutation_or_object_operation(self):
+        for service, operation in (("ec2", "RunInstances"), ("ec2", "StopInstances"),
+                                   ("s3", "GetObject"), ("ec2", "DeleteSubnet")):
+            meter = self.meter()
+            with self.assertRaises(ValueError):
+                meter.consume(service, model=SimpleNamespace(name=operation))
+            self.assertEqual(meter.calls, 0)
+
+    def test_twelve_call_cap(self):
+        meter = self.meter()
+        meter.calls = 12
+        with self.assertRaises(ValueError):
+            meter.consume("ec2", model=SimpleNamespace(name="DescribeInstances"))
+        self.assertEqual(meter.calls, 12)
+
+    def test_expired_window_rejects_dispatch(self):
+        clock = Mock(return_value=0)
+        meter = self.meter(clock)
+        clock.return_value = 161
+        with self.assertRaises(ValueError):
+            meter.consume("ec2", model=SimpleNamespace(name="DescribeInstances"))
+        self.assertEqual(meter.calls, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

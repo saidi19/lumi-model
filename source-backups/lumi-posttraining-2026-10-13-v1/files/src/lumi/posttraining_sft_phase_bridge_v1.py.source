@@ -1,0 +1,94 @@
+"""Parent-confirmed barriers for every frozen WorkerRun v2 phase.
+
+Extends the frozen bridge without changing epoch frames, resource accounting,
+step fences, worker reports or earlier evidence. In particular reserved is not
+released merely because rank zero SENT its ACK confirmation: the parent must
+consume that confirmation and all eight phase arrivals. No dummy resource
+reservation, local thread event or NCCL-only barrier substitutes for that proof.
+
+updated arrivals must be sent by trusted workers only after local CUDA work has
+completed. This parent can verify protocol order, not a worker's CUDA honesty.
+Outer admission, independent deadlines, native worker checks and cleanup remain
+mandatory. This module neither enables a launcher nor authenticates authority.
+"""
+
+from .posttraining_sft_epoch_protocol_v2 import EpochLedgerSession
+from .posttraining_sft_smoke_bridge_v1 import ParentInvocation as OriginalParent
+from .posttraining_sft_supervisor_v2 import SEQUENCE
+
+
+def phases(invocation_index):
+    """The exact existing worker callback order, not another training profile."""
+    if type(invocation_index) is not int or not 0 <= invocation_index < 3:
+        raise ValueError("invalid_invocation") from None
+    _, start, stop, _ = SEQUENCE[invocation_index]
+    return [("inputs", start), ("restored", start)] + [
+        (name, step) for step in range(start + 1, stop + 1)
+        for name in ("reserved", "updated", "completed", "checkpoint")]
+
+
+class _PhaseSession(EpochLedgerSession):
+    def _message(self, channel_rank, request):
+        # Auth/schema checks remain in the frozen superclass. This additional
+        # ordering check rejects work requests before mutating the supervisor.
+        operation = request.get("operation")
+        if operation in ("reserve_step", "step_complete"):
+            self._need(self.phase_guard(operation), "step_boundary_rejected")
+        return super()._message(channel_rank, request)
+
+
+class ParentInvocation(OriginalParent):
+    def __init__(self, **options):
+        super().__init__(**options)
+        index = options["invocation_index"]
+        self._expected_phases = phases(index)
+        self._base_steps = sum(row[2] - row[1] for row in SEQUENCE[:index])
+        self._session = _PhaseSession(
+            options["supervisor"], world_size=8, epoch=options["epoch"],
+            rank_tokens=options["rank_tokens"])
+        self._session.phase_guard = self._request_phase
+
+    def _request_phase(self, operation):
+        if self._phase_index >= len(self._expected_phases):
+            return False
+        name, _ = self._expected_phases[self._phase_index]
+        return name == {"reserve_step": "reserved", "step_complete": "completed"}[operation]
+
+    def _boundary(self, name, step):
+        active = int(name in ("reserved", "updated"))
+        completed = step - self._invocation[1] - active
+        return completed, self._base_steps + completed + active, self._base_steps + completed
+
+    def phase(self, rank, phase, step):
+        self._check()
+        if (type(rank) is not int or not 0 <= rank < 8 or rank in self._phases
+                or type(phase) is not str or type(step) is not int
+                or self._phase_index >= len(self._expected_phases)
+                or (phase, step) != self._expected_phases[self._phase_index]
+                or self._fenced != self._boundary(phase, step)[0]):
+            self._fail("phase_rejected")
+        self._phases.add(rank)
+        self._release_ready_phase()
+
+    def _release_ready_phase(self):
+        if len(self._phases) != 8:
+            return
+        phase, step = self._expected_phases[self._phase_index]
+        fenced, reserved, completed = self._boundary(phase, step)
+        snapshot, ledger = self._session.summary(), self._ledger.summary()
+        if (self._fenced != fenced
+                or ledger["global_optimizer_steps_reserved"] > reserved
+                or ledger["global_optimizer_steps_completed"] > completed):
+            self._fail("phase_rejected")
+        if (snapshot["pending_acknowledgements"] or snapshot["rank_step_confirmations_pending"]
+                or ledger["global_optimizer_steps_reserved"] != reserved
+                or ledger["global_optimizer_steps_completed"] != completed):
+            return
+        for rank in range(8):
+            self._callback(self._release, "transport_failed", rank, phase, step)
+        self._phase_index += 1
+        self._phases.clear()
+
+    def summary(self):
+        return {**super().summary(),
+                "schema_version": "lumi.sft-parent-phase-invocation-summary.v0.1"}

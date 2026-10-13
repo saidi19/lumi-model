@@ -1,0 +1,51 @@
+# SFT execution status v0.97
+
+2026-09-17. Local diagnosis of the consumed native qualification failure is
+complete. Its exact historical cause remains unproven; no native attempt was
+rerun. Source/Spark CI success recorded in v0.96 is unchanged.
+
+## What the local check established
+
+The old harness labels its whole setup block `source_admission`. Nine distinct
+synthetic failures in that block produce the same `fixture_failed` report.
+Those include source/helper loading, subreaper setup, temporary-directory setup,
+disk-query failure and insufficient disk space.
+
+In particular, free disk one byte below the unchanged 16 GiB floor reproduces
+the exact retained harness-output SHA-256. This is a demonstrated possible
+cause, **not proof that the old host lacked disk space**: no disk count or finer
+setup stage was retained. The old workflow acquired its software archive before
+checking this disk floor.
+
+The actual 78-file source closure and both helper loaders passed inert local
+checks with native-library/process/socket/fork operations denied. No deterministic
+loader defect was found. No Linux `prctl` or native harness execution occurred.
+
+## Verification and preservation
+
+- 14 new local synthetic tests plus the 21 unchanged harness tests passed in
+  both orders on Python 3.11.15 and 3.13.7: four runs, 140 test executions,
+  zero skips. This is source/synthetic evidence, not Linux qualification.
+- Ruff 0.15.1 passed. Review caught two test-module namespace isolation issues;
+  both were fixed and covered by restoration regressions before final runs.
+- The old harness, supervisor, acquisition helper, verifier, tests, execution
+  plan and four retained aggregates still match their previous hashes.
+- No tracked source, workflow, threshold or execution permission changed.
+  No network, GitHub push, Docker operation, GPU or real model/data access.
+
+New local files: the localization regression test, its aggregate evidence and
+this status note. They have not been published.
+
+## Next needed step
+
+Prepare and separately authorize a small fresh CPU-only Linux preflight with
+fixed setup-substage codes and a disk-capacity aggregate, **before** any software
+image acquisition. It needs no GPU, model or dataset. It must preserve the
+16 GiB floor, report acquisition headroom, and must not invoke the full prepared
+pipeline or reuse the consumed native attempt. Current-host observations would
+not retroactively prove what happened on the old disposable host.
+
+Gate 5 remains incomplete. Full native qualification and real SFT training are
+not authorized or claimed by this diagnostic.
+
+Evidence: `evidence/lumi-4b-sft-prepared-source-localization-v0.1.json`.

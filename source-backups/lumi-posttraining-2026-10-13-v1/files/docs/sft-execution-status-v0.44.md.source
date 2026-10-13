@@ -1,0 +1,72 @@
+# SFT execution status v0.44
+
+Local result handoff, 2026-09-09. This document is intentionally not committed
+or published; the source and tests it records are already published and verified
+on the exact commit below. Do not publish it merely to trigger another CI run.
+
+## Accepted narrow IPC successor
+
+Local HEAD, origin tracking ref and live GitHub branch were verified equal to
+**`d974c446218325ed3e43ee20a0cdc80bbb1307c9`** after acceptance. The tracked tree
+and index are clean. Unrelated untracked files and prior evidence remain intact.
+
+[Source CI 34315983656](https://github.com/saidi19/lumi-model/actions/runs/34315983656)
+completed successfully on this SHA. All four jobs passed:
+
+- `frozen-lint-integrity`: `102352188003`
+- `isolated-sft-controls`: `102352188221`
+- `source-only-validators`: `102352188270`
+- `test`: `102352188200`
+
+The source suite result is **4637 passed, 58 skipped, 329 deselected,
+36 warnings, 8828 subtests passed in 401.85 seconds**. The final partition
+reported **4695 source-selected tests**, **327 private integrations NOT_EXECUTED**,
+with the two historical tests separately routed. `private_integration_passed`
+and `full_ci_passed` remain **false**. Source-CI success is not full/private-CI
+or real-training admission.
+
+[Spark CI 34315983631](https://github.com/saidi19/lumi-model/actions/runs/34315983631)
+and job `102352187842` passed **3 tests, zero skips, in 82.34 seconds** on the
+same exact SHA.
+
+## What this acceptance establishes
+
+The source suite includes the remote Linux IPC wrapper, which is not skippable
+on the Ubuntu runner except through its explicit non-Linux platform guard.
+Its passing assertions require four lifecycle cases (normal, deadline,
+parent-loss, pinned WorkerRun), four seccomp installations, eight same-UID
+matching STREAM/SEQPACKET exposed-socket positive controls, and eight owned
+socket removals. Accepted filesystem, Landlock, IP-isolation, privilege-drop
+and guardian cleanup checks remain required. WorkerRun retains three
+invocations, six ranks, four global and eight rank optimizer updates using
+generated tiny CPU tensors, not real model/data.
+
+The former errno-only listener assertion has been replaced by exact
+SO_ACCEPTCONN=0 readbacks and rejected nonblocking accept, covering both
+explicit listen rejection and a no-op successful return. Original-peer
+communication and retarget restrictions are still tested. This correction
+passes the native integrated test; no successful listener transition is allowed.
+The exact CI kernel release was not captured, so no particular kernel-version
+attribution is claimed. The source rationale and tests are in v0.43.
+
+Both failed attempts remain preserved: commit `71eda784` / Source run
+`34312382330`, and diagnostic commit `bdc0a4e` / Source run `34314108918`.
+Their cleanup was confirmed. They were not deleted or rerun; the accepted run
+uses the evidence-backed four-file correction. Filter bytecode, accepted older
+fixtures, workflows, private data rules and all earlier evidence were unchanged.
+
+## Roadmap position and next work
+
+This narrow named-UNIX creation/connected-pair acceptance step is complete.
+**Gate 5 overall remains partial.** It is not a full IPC or OS sandbox:
+SysV IPC, process signaling, host metadata and trusted retained-peer authority
+are not proved closed. Runtime origin, real-host binding and integrated
+admission are also not yet proved. The next pre-GPU work is to resolve the
+remaining host/runtime and isolation obligations against an explicit threat
+model, then verify integrated admission without claiming evidence that does
+not exist. Real-size relocation and H100 validation remain later steps.
+
+No GPU instance, S3 access, real-model/data read, inference, training, promotion,
+dataset seal or registry mutation occurred. Mac work was source/AST/lint plus
+992 pure regression tests in 0.646 seconds with no ML imports. Native fixtures
+ran only in GitHub CI. No automation or background monitor was created.

@@ -1,0 +1,244 @@
+"""Tiny owned fixtures for metadata observations; no ML or checkpoint content reads."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import stat
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_identity_v1 as module
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.parent = Path(self.temporary.name).resolve()
+        self.root = self.parent / "checkpoint"
+        self.root.mkdir(mode=0o700)
+        (self.root / "model").mkdir(mode=0o700)
+        self.inventory = []
+        for name, raw in (("model/.metadata", b"opaque metadata"),
+                          ("model/__0_0.distcp", b"opaque tensor"),
+                          ("trainer-rank-00000.pt", b"opaque trainer")):
+            path = self.root / name
+            path.write_bytes(raw)
+            path.chmod(0o600)
+            self.inventory.append({"path": name, "bytes": len(raw),
+                                   "sha256": hashlib.sha256(raw).hexdigest()})
+
+    def snapshot(self, **kwargs):
+        return module.snapshot_inventory(self.root, self.inventory,
+                                         check_budget=kwargs.get("check_budget", lambda: None))
+
+    def test_equal_private_immutable_snapshots(self):
+        before = self.snapshot()
+        self.assertEqual(before, self.snapshot())
+        self.assertEqual(len(before), len(self.inventory) + 2)
+        self.assertIn((), before)
+        self.assertIn(("model", "__0_0.distcp"), before)
+        self.assertEqual(repr(before), "<CheckpointIdentitySnapshot private>")
+        with self.assertRaises(TypeError):
+            before[()] = ()
+
+    def test_never_reads_content_or_calls_inherited_hash_helper(self):
+        with patch.object(module.os, "read", side_effect=AssertionError("read forbidden")), \
+             patch.object(module.os, "pread", side_effect=AssertionError("pread forbidden")), \
+             patch.object(module.stream._Verifier, "file",
+                          side_effect=AssertionError("hash helper forbidden")), \
+             patch.object(Path, "read_bytes", side_effect=AssertionError("read forbidden")), \
+             patch.object(Path, "open", side_effect=AssertionError("read forbidden")):
+            self.assertEqual(len(self.snapshot()), 5)
+
+    def test_unknown_digest_does_not_become_checksum_verification(self):
+        self.inventory[0]["sha256"] = "0" * 64
+        self.assertEqual(len(self.snapshot()), 5)
+
+    def test_replaced_equal_sized_file_changes_private_snapshot(self):
+        before = self.snapshot()
+        source = self.root / "model/__0_0.distcp"
+        replacement = self.parent / "replacement"
+        replacement.write_bytes(b"different dat")
+        replacement.chmod(0o600)
+        self.assertEqual(replacement.stat().st_size, source.stat().st_size)
+        replacement.replace(source)
+        self.assertNotEqual(before, self.snapshot())
+
+    def test_changed_size_is_rejected(self):
+        (self.root / "model/__0_0.distcp").write_bytes(b"x")
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "inventory_mismatch"):
+            self.snapshot()
+
+    def test_extra_empty_directory_is_rejected(self):
+        (self.root / "extra").mkdir(mode=0o700)
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "inventory_mismatch"):
+            self.snapshot()
+
+    def test_extra_file_is_rejected(self):
+        (self.root / "extra").touch(mode=0o600)
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "inventory_mismatch"):
+            self.snapshot()
+
+    def test_missing_file_is_rejected(self):
+        (self.root / "trainer-rank-00000.pt").unlink()
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "inventory_mismatch"):
+            self.snapshot()
+
+    def test_readonly_file_is_refused_without_chmod(self):
+        path = self.root / "model/__0_0.distcp"
+        path.chmod(0o400)
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "metadata_rejected"):
+            self.snapshot()
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o400)
+
+    def test_nonprivate_directory_is_rejected(self):
+        (self.root / "model").chmod(0o755)
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "metadata_rejected"):
+            self.snapshot()
+
+    def test_hardlink_is_rejected(self):
+        os.link(self.root / "model/__0_0.distcp", self.parent / "hardlink")
+        with self.assertRaisesRegex(module.CheckpointIdentityError, "metadata_rejected"):
+            self.snapshot()
+
+    def test_symlink_file_is_rejected(self):
+        path = self.root / "model/__0_0.distcp"
+        path.unlink()
+        path.symlink_to(self.root / "trainer-rank-00000.pt")
+        with self.assertRaises(module.CheckpointIdentityError):
+            self.snapshot()
+
+    def test_symlink_ancestor_is_rejected(self):
+        alias = self.parent / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        with self.assertRaises(module.CheckpointIdentityError):
+            module.snapshot_inventory(alias, self.inventory, check_budget=lambda: None)
+
+    def test_foreign_group_is_rejected(self):
+        original = module.os.stat
+        def observed(*args, **kwargs):
+            info = original(*args, **kwargs)
+            if args[0] == "__0_0.distcp":
+                return types.SimpleNamespace(
+                    st_mode=info.st_mode, st_uid=info.st_uid, st_gid=info.st_gid + 1,
+                    st_ino=info.st_ino, st_nlink=info.st_nlink)
+            return info
+        with patch.object(module.os, "stat", observed):
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "metadata_rejected"):
+                self.snapshot()
+
+    def test_invalid_plan_fails_before_open(self):
+        for inventory in ([], [dict(self.inventory[0], bytes=True)], self.inventory * 44):
+            with self.subTest(inventory_length=len(inventory)), \
+                 patch.object(module.os, "open") as opened:
+                with self.assertRaises(module.CheckpointIdentityError):
+                    module.snapshot_inventory(self.root, inventory, check_budget=lambda: None)
+                opened.assert_not_called()
+
+    def test_noncallback_fails_before_open(self):
+        with patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "invalid_arguments"):
+                self.snapshot(check_budget=None)
+            opened.assert_not_called()
+
+    def test_callback_non_none_denies_before_open(self):
+        with patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "budget_check_failed"):
+                self.snapshot(check_budget=lambda: True)
+            opened.assert_not_called()
+
+    def test_owner_mismatch_denies_before_open(self):
+        initialize = module._Observer.__init__
+        def initialized(observer, **kwargs):
+            initialize(observer, **kwargs)
+            observer._process_owner = (-1, -1, -1, -1)
+        with patch.object(module._Observer, "__init__", initialized), \
+             patch.object(module.os, "open") as opened:
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "owner_mismatch"):
+                self.snapshot()
+            opened.assert_not_called()
+
+    def test_callback_reentry_remains_terminal_when_swallowed(self):
+        holders = []
+        initialize = module._Observer.__init__
+        def initialized(observer, **kwargs):
+            initialize(observer, **kwargs)
+            holders.append(observer)
+        def budget():
+            if holders:
+                try:
+                    holders[0].check_time()
+                except module.CheckpointIdentityError:
+                    pass
+        with patch.object(module._Observer, "__init__", initialized):
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "budget_check_failed"):
+                self.snapshot(check_budget=budget)
+
+    def test_callback_failure_closes_every_descriptor_once(self):
+        calls, opened, closed = [0], [], []
+        real_open, real_close = module.os.open, module.os.close
+        def opening(*args, **kwargs):
+            result = real_open(*args, **kwargs)
+            opened.append(result)
+            return result
+        def closing(fd):
+            closed.append(fd)
+            return real_close(fd)
+        def budget():
+            calls[0] += 1
+            if calls[0] == 9:
+                raise RuntimeError("PRIVATE TOKEN")
+        with patch.object(module.os, "open", opening), patch.object(module.os, "close", closing):
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "budget_check_failed"):
+                self.snapshot(check_budget=budget)
+        self.assertEqual(sorted(opened), sorted(closed))
+
+    def test_close_failure_denies_success_and_continues_cleanup(self):
+        opened, closed = [], []
+        real_open, real_close = module.os.open, module.os.close
+        def opening(*args, **kwargs):
+            result = real_open(*args, **kwargs)
+            opened.append(result)
+            return result
+        def closing(fd):
+            closed.append(fd)
+            real_close(fd)
+            if len(closed) == 1:
+                raise OSError("PRIVATE TOKEN")
+        with patch.object(module.os, "open", opening), patch.object(module.os, "close", closing):
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "close_failed"):
+                self.snapshot()
+        self.assertEqual(sorted(opened), sorted(closed))
+
+    def test_late_post_close_callback_denies_success(self):
+        holders = []
+        initialize = module._Observer.__init__
+        def initialized(observer, **kwargs):
+            initialize(observer, **kwargs)
+            holders.append(observer)
+        def budget():
+            if holders and holders[0].files and not holders[0].owned:
+                raise RuntimeError("PRIVATE TOKEN")
+        with patch.object(module._Observer, "__init__", initialized):
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "budget_check_failed"):
+                self.snapshot(check_budget=budget)
+
+    def test_mutation_between_initial_and_final_walk_is_rejected(self):
+        original = module._Observer.check_ancestry
+        def ancestry(observer):
+            if observer.files:
+                path = self.root / "model/__0_0.distcp"
+                path.write_bytes(b"different dat")
+            return original(observer)
+        with patch.object(module._Observer, "check_ancestry", ancestry):
+            with self.assertRaisesRegex(module.CheckpointIdentityError, "identity_changed"):
+                self.snapshot()
+
+
+if __name__ == "__main__":
+    unittest.main()

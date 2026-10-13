@@ -1,0 +1,318 @@
+import base64
+import copy
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+SPEC = importlib.util.spec_from_file_location(
+    "host_connection", ROOT / "scripts/prepare_sft_vm_host_connection_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+P = json.loads((ROOT / "configs/lumi-vm-fullsize-host-proposal-v0.1.json").read_text())
+B = {
+    "attempt": P["prepared_attempt"],
+    "instance": "i-" + "1" * 17,
+    "endpoint": "eice-" + "2" * 17,
+    "root_volume": "vol-" + "3" * 17,
+    "work_volume": "vol-" + "4" * 17,
+    "vm_group": "sg-" + "5" * 17,
+    "endpoint_group": "sg-" + "6" * 17,
+    "key_name": "lumi-synthetic",
+}
+KEY = base64.b64encode(b"\0\0\0\x0bssh-ed25519\0\0\0\x20" + b"x" * 32).decode()
+CONSOLE = (
+    "-----BEGIN SSH HOST KEY KEYS-----\nssh-ed25519 "
+    + KEY
+    + " root@synthetic\n-----END SSH HOST KEY KEYS-----\n"
+)
+
+
+def fixture():
+    h = P["host"]
+    tags = [{"Key": "LumiAttempt", "Value": B["attempt"]}]
+    devices = [
+        {"DeviceName": name, "Ebs": {"VolumeId": B[kind + "_volume"], "DeleteOnTermination": False}}
+        for kind, name in (("root", "/dev/sda1"), ("work", "/dev/sdf"))
+    ]
+    vm = {
+        "InstanceId": B["instance"],
+        "State": {"Name": "running"},
+        "Tags": tags,
+        "ImageId": h["ami"],
+        "InstanceType": h["instance_type"],
+        "Architecture": h["architecture"],
+        "VpcId": h["vpc"],
+        "SubnetId": h["subnet"],
+        "KeyName": B["key_name"],
+        "Placement": {"AvailabilityZone": h["availability_zone"]},
+        "MetadataOptions": {"HttpTokens": "required", "State": "applied"},
+        "SecurityGroups": [{"GroupId": B["vm_group"]}],
+        "NetworkInterfaces": [{}],
+        "RootDeviceName": "/dev/sda1",
+        "BlockDeviceMappings": devices,
+    }
+
+    def rule(group):
+        return {
+            "IpProtocol": "tcp",
+            "FromPort": 22,
+            "ToPort": 22,
+            "UserIdGroupPairs": [{"GroupId": group, "UserId": h["account"]}],
+        }
+
+    volumes = [
+        {
+            "VolumeId": B[kind + "_volume"],
+            "Encrypted": True,
+            "Size": size,
+            "VolumeType": "gp3",
+            "State": "in-use",
+            "Tags": tags,
+            "AvailabilityZone": h["availability_zone"],
+            "Iops": 3000,
+            "Throughput": 125,
+            "Attachments": [
+                {
+                    "InstanceId": B["instance"],
+                    "State": "attached",
+                    "Device": devices[i]["DeviceName"],
+                }
+            ],
+        }
+        for i, (kind, size) in enumerate((("root", 32), ("work", 128)))
+    ]
+    return copy.deepcopy(
+        {
+            "identity": {"Account": h["account"]},
+            "instances": {"Reservations": [{"OwnerId": h["account"], "Instances": [vm]}]},
+            "health": {
+                "InstanceStatuses": [
+                    {
+                        "InstanceId": B["instance"],
+                        "InstanceStatus": {"Status": "ok"},
+                        "SystemStatus": {"Status": "ok"},
+                    }
+                ]
+            },
+            "shutdown": {
+                "InstanceId": B["instance"],
+                "InstanceInitiatedShutdownBehavior": {"Value": "stop"},
+            },
+            "image": {
+                "Images": [
+                    {
+                        "ImageId": h["ami"],
+                        "OwnerId": h["ami_owner"],
+                        "Architecture": h["architecture"],
+                        "State": "available",
+                    }
+                ]
+            },
+            "endpoint": {
+                "InstanceConnectEndpoints": [
+                    {
+                        "InstanceConnectEndpointId": B["endpoint"],
+                        "State": "create-complete",
+                        "VpcId": h["vpc"],
+                        "SubnetId": h["subnet"],
+                        "SecurityGroupIds": [B["endpoint_group"]],
+                        "Tags": tags,
+                    }
+                ]
+            },
+            "group": {
+                "SecurityGroups": [
+                    {
+                        "GroupId": B["vm_group"],
+                        "VpcId": h["vpc"],
+                        "Tags": tags,
+                        "IpPermissions": [rule(B["endpoint_group"])],
+                    },
+                    {
+                        "GroupId": B["endpoint_group"],
+                        "VpcId": h["vpc"],
+                        "Tags": tags,
+                        "IpPermissions": [],
+                        "IpPermissionsEgress": [rule(B["vm_group"])],
+                    },
+                ]
+            },
+            "volumes": {"Volumes": volumes},
+        }
+    )
+
+
+class HostTests(unittest.TestCase):
+    def test_valid_metadata_is_not_native_admission(self):
+        result = m.inspect(fixture(), B, P)
+        self.assertTrue(result["control_plane_matches"])
+        self.assertFalse(result["native_host_admitted"])
+        self.assertFalse(result["gate_5_complete"])
+
+    def test_wrong_instance_lifecycle_identity_image_and_network_rejected(self):
+        for key, value in (
+            ("InstanceId", "i-" + "a" * 17),
+            ("ImageId", "ami-wrong"),
+            ("InstanceType", "p5.48xlarge"),
+            ("PublicIpAddress", "203.0.113.1"),
+            ("IamInstanceProfile", {"Arn": "not-allowed"}),
+            ("InstanceLifecycle", "spot"),
+            ("Tags", []),
+            ("State", {"Name": "terminated"}),
+        ):
+            with self.subTest(key=key):
+                data = fixture()
+                data["instances"]["Reservations"][0]["Instances"][0][key] = value
+                with self.assertRaises(ValueError):
+                    m.inspect(data, B, P)
+
+    def test_wrong_account_and_duplicate_instance_rejected(self):
+        data = fixture()
+        data["identity"]["Account"] = "000000000000"
+        with self.assertRaises(ValueError):
+            m.inspect(data, B, P)
+
+    def test_unhealthy_shutdown_and_endpoint_mismatch_rejected(self):
+        data = fixture()
+        data["shutdown"]["InstanceInitiatedShutdownBehavior"]["Value"] = "terminate"
+        with self.assertRaises(ValueError):
+            m.inspect(data, B, P)
+        data = fixture()
+        data["health"]["InstanceStatuses"][0]["SystemStatus"]["Status"] = "impaired"
+        with self.assertRaises(ValueError):
+            m.inspect(data, B, P)
+        data = fixture()
+        data["endpoint"]["InstanceConnectEndpoints"][0]["SubnetId"] = "wrong"
+        with self.assertRaises(ValueError):
+            m.inspect(data, B, P)
+        data = fixture()
+        data["instances"]["Reservations"] *= 2
+        with self.assertRaises(ValueError):
+            m.inspect(data, B, P)
+
+    def test_public_or_wrong_group_ssh_rejected(self):
+        for change in (
+            {"IpRanges": [{"CidrIp": "0.0.0.0/0"}]},
+            {"FromPort": 1},
+            {"Ipv6Ranges": [{"CidrIpv6": "::/0"}]},
+        ):
+            data = fixture()
+            data["group"]["SecurityGroups"][0]["IpPermissions"][0].update(change)
+            with self.assertRaises(ValueError):
+                m.inspect(data, B, P)
+
+    def test_volume_preservation_and_size_checks(self):
+        for change in ({"Encrypted": False}, {"Size": 20}, {"Tags": []}, {"Throughput": 250}):
+            data = fixture()
+            data["volumes"]["Volumes"][1].update(change)
+            with self.assertRaises(ValueError):
+                m.inspect(data, B, P)
+        data = fixture()
+        data["instances"]["Reservations"][0]["Instances"][0]["BlockDeviceMappings"][1]["Ebs"][
+            "DeleteOnTermination"
+        ] = True
+        with self.assertRaises(ValueError):
+            m.inspect(data, B, P)
+
+    def test_console_plain_and_base64_same_public_pin(self):
+        plain = {"InstanceId": B["instance"], "Output": CONSOLE}
+        encoded = plain | {"Output": base64.b64encode(CONSOLE.encode()).decode()}
+        self.assertEqual(m.host_key(plain, B["instance"]), m.host_key(encoded, B["instance"]))
+        self.assertEqual(m.host_key(plain, B["instance"])[0], KEY)
+
+    def test_console_mismatch_duplicate_malformed_and_oversize_rejected(self):
+        for console in (
+            CONSOLE * 2,
+            CONSOLE.replace(KEY, "YWJj"),
+            "unrecognized",
+            "x" * (m.MAX_CONSOLE + 1),
+        ):
+            with self.assertRaises((ValueError, KeyError)):
+                m.host_key({"InstanceId": B["instance"], "Output": console}, B["instance"])
+        with self.assertRaises(ValueError):
+            m.host_key({"InstanceId": "wrong", "Output": CONSOLE}, B["instance"])
+
+    def test_binding_injection_rejected(self):
+        for field in B:
+            with self.assertRaises(ValueError):
+                m.targets(B | {field: B[field] + ";bad"}, P)
+
+    def test_pinned_ssh_and_readonly_call_pipeline(self):
+        self._pipeline()
+
+    def _pipeline(self, bad=False):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            key = root / "synthetic_key"
+            key.write_text("not a real key")
+            key.chmod(0o600)
+            calls = []
+            data = fixture()
+            if bad:
+                data["volumes"]["Volumes"][0]["Encrypted"] = False
+            mapping = dict(
+                zip(
+                    (
+                        "get-caller-identity",
+                        "describe-instances",
+                        "describe-instance-status",
+                        "describe-instance-attribute",
+                        "describe-images",
+                        "describe-instance-connect-endpoints",
+                        "describe-security-groups",
+                        "describe-volumes",
+                    ),
+                    data.values(),
+                    strict=True,
+                )
+            )
+
+            class Cloud:
+                def cli(self, service, operation, **args):
+                    calls.append(operation)
+                    if operation == "get-console-output":
+                        return {
+                            "InstanceId": B["instance"],
+                            "Output": "synthetic-private-console-not-for-retention\n" + CONSOLE,
+                        }
+                    return mapping[operation]
+
+            output = root / "output"
+            result = m._prepare_bound_connection(B, key, output, cloud=Cloud())
+            self.assertFalse(result["ssh_connection_started"])
+            for path in output.iterdir():
+                self.assertNotIn("synthetic-private-console-not-for-retention", path.read_text())
+            if bad:
+                self.assertEqual(result["status"], "failed_closed")
+                self.assertNotIn("get-console-output", calls)
+                self.assertFalse((output / "ssh_config").exists())
+            else:
+                self.assertEqual(len(calls), 9)
+                config = (output / "ssh_config").read_text()
+                self.assertIn("StrictHostKeyChecking yes", config)
+                self.assertIn("--max-tunnel-duration 120", config)
+                self.assertIn("IdentityAgent none", config)
+                self.assertNotIn("accept-new", config)
+                self.assertNotIn("not a real key", config)
+                self.assertEqual(os.stat(output / "known_hosts").st_mode & 0o777, 0o600)
+                with self.assertRaises(FileExistsError):
+                    m._prepare_bound_connection(B, key, output, cloud=Cloud())
+
+    def test_invalid_volume_never_creates_ssh_config(self):
+        self._pipeline(bad=True)
+
+    def test_unsafe_key_permissions_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp).resolve()
+            key = root / "key"
+            key.write_text("synthetic")
+            key.chmod(0o644)
+            with self.assertRaises(ValueError):
+                m.ssh_config(B, key, root / "hosts")

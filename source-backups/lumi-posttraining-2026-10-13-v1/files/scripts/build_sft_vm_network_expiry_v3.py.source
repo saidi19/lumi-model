@@ -1,0 +1,232 @@
+"""Successor rule-command correction; never apply it on this host.
+
+Native nft/systemd qualification and authenticated bootstrap installation remain
+required. Packet quota readback is not a wire-byte or billing meter. The original
+launch-bound deadline must be supplied by the outer controller, never restarted.
+"""
+
+from __future__ import annotations
+
+import json
+
+ATTEMPT = "606d788073f1f0b66a39eabeb4b32c2c"
+TABLE = "lumi_fullsize_" + ATTEMPT
+QUOTAS = {"all_in": 64424509440, "setup_in": 1073741824, "all_out": 10737418240}
+SERVICE = "lumi-fullsize-expiry-v1.service"
+TIMER = "lumi-fullsize-expiry-v1.timer"
+
+
+def need(value):
+    if not value:
+        raise ValueError("network_expiry_rejected") from None
+
+
+def integer(value, low, high):
+    need(type(value) is int and low <= value <= high)
+    return value
+
+
+def match(left, right):
+    return {"match": {"op": "==", "left": left, "right": right}}
+
+
+def port(protocol, field, number):
+    return match({"payload": {"protocol": protocol, "field": field}}, number)
+
+
+def rule(chain, expressions):
+    return {"rule": {"family": "inet", "table": TABLE, "chain": chain, "expr": expressions}}
+
+
+def objects(*, setup=True):
+    """Single table, no global flush, no new quota objects on phase transition."""
+    need(type(setup) is bool)
+    result = [{"table": {"family": "inet", "name": TABLE}}]
+    for name, size in QUOTAS.items():
+        result.append(
+            {"quota": dict(family="inet", table=TABLE, name=name, bytes=size, used=0, inv=True)}
+        )
+    for chain in ("input", "output", "forward", "setup_gate"):
+        value = dict(family="inet", table=TABLE, name=chain)
+        if chain != "setup_gate":
+            value.update(
+                type="filter",
+                hook=chain,
+                prio=-10,
+                policy="drop" if chain == "forward" else "accept",
+            )
+        result.append({"chain": value})
+    for chain, field in (("input", "sport"), ("output", "dport")):
+        # These are packet guards, not a destination allowlist. The existing
+        # pinned HTTPS clients, no-redirect rules and host isolation still apply.
+        result.append(rule(chain, [port("tcp", field, 80), {"drop": None}]))
+        result.append(rule(chain, [port("udp", field, 443), {"drop": None}]))
+        result.append(
+            rule(
+                chain,
+                [
+                    match({"meta": {"key": "nfproto"}}, "ipv6"),
+                    port("tcp", field, 443),
+                    {"drop": None},
+                ],
+            )
+        )
+        quota = "all_in" if chain == "input" else "all_out"
+        result.append(rule(chain, [port("tcp", field, 443), {"quota": quota}, {"drop": None}]))
+        if chain == "input":
+            result.append(
+                rule(chain, [port("tcp", field, 443), {"jump": {"target": "setup_gate"}}])
+            )
+    if setup:
+        result.append(rule("setup_gate", [{"quota": "setup_in"}, {"drop": None}]))
+    return result
+
+
+def install_policy():
+    # nftables 1.0.9 rejects CREATE for rules (parser_json.c:3765-3767).
+    # Keep exclusive table creation first in the SAME atomic batch. A prior
+    # table therefore rejects the batch; ADD rules cannot silently reuse it.
+    # Object definitions, limits, ordering and all readback gates are unchanged.
+    return {"nftables": [{"add" if "rule" in obj else "create": obj} for obj in objects()]}
+
+
+def unique(pairs):
+    value = {}
+    for key, item in pairs:
+        need(key not in value)
+        value[key] = item
+    return value
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+
+
+def inspect(raw, *, setup=True, previous=None):
+    """Strict own-table readback, retaining quota cardinalities/handles only.
+
+    Expected input: nft --json --numeric list table inet TABLE. No normalization
+    of rule expressions is guessed. Native output differences fail closed until
+    qualified. Quota used may saturate at its limit; it is not complete traffic.
+    """
+    need(type(raw) is bytes and len(raw) <= 32768)
+    try:
+        value = json.loads(raw, object_pairs_hook=unique)
+    except (ValueError, UnicodeError):
+        raise ValueError("network_expiry_rejected") from None
+    need(type(value) is dict and set(value) == {"nftables"})
+    rows = value["nftables"]
+    need(type(rows) is list and len(rows) <= 32)
+    cleaned, quotas, handles, setup_handle = [], {}, {}, None
+    metadata_seen = False
+    for row in rows:
+        need(type(row) is dict and len(row) == 1)
+        kind, item = next(iter(row.items()))
+        if kind == "metainfo":
+            need(not metadata_seen and type(item) is dict)
+            need(item.get("json_schema_version") == 1)
+            metadata_seen = True
+            continue
+        need(kind in {"table", "quota", "chain", "rule"} and type(item) is dict)
+        body = dict(item)
+        handle = integer(body.pop("handle", None), 1, 2**64 - 1)
+        key = (kind, body.get("name") if kind != "rule" else (body.get("chain"), handle))
+        need(key not in handles)
+        handles[key] = handle
+        if kind == "quota":
+            name = body.get("name")
+            need(name in QUOTAS and name not in quotas)
+            quotas[name] = integer(body.get("used"), 0, QUOTAS[name])
+            need(quotas[name] < QUOTAS[name])  # Saturation/depletion requires stop.
+            body["used"] = 0
+        if kind == "rule":
+            # Linux NFPROTO_IPV6 is 10. Native nft --numeric readback emits
+            # that integer instead of the builder's symbolic "ipv6".
+            # Normalize only this exact comparison; retain every other field.
+            expressions = body.get("expr")
+            need(type(expressions) is list)
+            for expression in expressions:
+                if type(expression) is not dict or set(expression) != {"match"}:
+                    continue
+                comparison = expression["match"]
+                if (
+                    type(comparison) is dict
+                    and comparison.get("left") == {"meta": {"key": "nfproto"}}
+                    and comparison.get("op") == "=="
+                    and type(comparison.get("right")) is int
+                    and comparison["right"] == 10
+                ):
+                    comparison["right"] = "ipv6"
+        if kind == "rule" and body.get("chain") == "setup_gate":
+            need(setup_handle is None)
+            setup_handle = handle
+        cleaned.append({kind: body})
+    # Objects may be listed in a different order; rule order within each chain
+    # must be identical, including the combined quota before the setup quota.
+    expected = objects(setup=setup)
+    for kind in ("table", "quota", "chain"):
+        actual_items = [x[kind] for x in cleaned if kind in x]
+        wanted = [x[kind] for x in expected if kind in x]
+        need(sorted(map(canonical, actual_items)) == sorted(map(canonical, wanted)))
+    for chain in ("input", "output", "forward", "setup_gate"):
+        actual_rules = [x for x in cleaned if "rule" in x and x["rule"].get("chain") == chain]
+        wanted_rules = [x for x in expected if "rule" in x and x["rule"]["chain"] == chain]
+        need(canonical(actual_rules) == canonical(wanted_rules))
+    need(len(cleaned) == len(expected))
+    if previous is not None:
+        need(set(previous) == {"used", "handles", "setup_handle"})
+        for name, used in quotas.items():
+            need(used >= previous["used"][name])
+        # Identity must persist; deleting/recreating the table or quotas is not
+        # a permitted counter reset. Transition only deletes one gate rule.
+        for key, handle in handles.items():
+            need(previous["handles"].get(key) == handle)
+    return {"used": quotas, "handles": handles, "setup_handle": setup_handle}
+
+
+def setup_transition(raw):
+    """Build ONLY; caller must authenticate successful frozen offline setup first.
+
+    After applying once, require inspect(setup=False, previous=before). This does
+    not authenticate setup, execute nft, or grant acquisition permission.
+    """
+    before = inspect(raw, setup=True)
+    return {
+        "nftables": [
+            {
+                "delete": {
+                    "rule": {
+                        "family": "inet",
+                        "table": TABLE,
+                        "chain": "setup_gate",
+                        "handle": before["setup_handle"],
+                    }
+                }
+            }
+        ]
+    }, before
+
+
+def expiry_units(*, original_deadline_boot_seconds, observed_boot_seconds):
+    """Deadline must already include launch-to-boot elapsed time and stop margin.
+
+    This is not a new now+4h allowance. The outer controller must bind the boot
+    ID, account for launch time, and independently verify EC2 stopped. The unit
+    requests shutdown; it does not prove stopped or delete retained EBS.
+    """
+    deadline = integer(original_deadline_boot_seconds, 1, 14400)
+    now = integer(observed_boot_seconds, 0, 14399)
+    need(now < deadline)
+    return {
+        TIMER: "[Unit]\nDescription=Lumi original host expiry\n"
+        "[Timer]\n" + f"OnBootSec={deadline}s\nUnit={SERVICE}\n"
+        "WakeSystem=yes\nAccuracySec=1us\nRandomizedDelaySec=0\n",
+        SERVICE: "[Unit]\nDescription=Lumi preserve-storage shutdown request\n"
+        "[Service]\nType=oneshot\nRestart=no\nTimeoutStartSec=10s\n"
+        "ExecStart=/usr/bin/systemctl --no-block poweroff\n"
+        "StandardInput=null\nStandardOutput=null\nStandardError=null\n",
+    }
+
+
+def run(**_arguments):
+    raise ValueError("native_network_expiry_admission_not_bound") from None

@@ -1,0 +1,90 @@
+"""Pure pytest summary parser; no network, filesystem reads, or raw-log output."""
+
+from __future__ import annotations
+
+import builtins
+import re
+
+MAXIMUM_LOG_BYTES = 4 * 1024 * 1024
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+STAMP = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z ")
+HEADER = re.compile(r"=+ short test summary info =+")
+NODE = re.compile(
+    r"^(FAILED|ERROR) (tests/test_[A-Za-z0-9_]+\.py"
+    r"(?:::[A-Za-z_][A-Za-z0-9_]*){0,3})(?=\[|\s|$)"
+)
+COUNT = (
+    r"[0-9]{1,10} (?:failed|passed|skipped|errors?|xfailed|xpassed|deselected|warnings?|reruns?)"
+)
+FOOTER = re.compile(rf"({COUNT}(?:, {COUNT})*) in [0-9]+(?:\.[0-9]+)?s(?: \([0-9:]+\))?")
+ERROR_TYPES = {
+    name
+    for name, value in vars(builtins).items()
+    if isinstance(value, type) and issubclass(value, BaseException)
+} | {"Failed"}
+
+
+class SummaryRejected(ValueError):
+    """Only a fixed error code, never a source line or exception message."""
+
+
+def need(value: bool, code: str) -> None:
+    if not value:
+        raise SummaryRejected(code) from None
+
+
+def parse_summary(data: bytes, allowed_paths: set[str]) -> list[dict]:
+    """Retain parameter-free test identifiers and unambiguous builtin types.
+
+    Both default decorated and quiet undecorated pytest footers are accepted.
+    Unknown/custom types and parameterized-row types remain null. This parser
+    never infers a type from an assertion expression or message fragment.
+    """
+    need(type(data) is bytes and len(data) <= MAXIMUM_LOG_BYTES, "log_bound")
+    rows, active, complete, source_rows = set(), False, False, 0
+    row_counts = {"failed": 0, "error": 0}
+    for line in data.decode("utf-8", errors="replace").splitlines():
+        line = STAMP.sub("", ANSI.sub("", line)).strip()
+        if HEADER.fullmatch(line):
+            rows, active, complete, source_rows = set(), True, False, 0
+            row_counts = {"failed": 0, "error": 0}
+            continue
+        if not active:
+            continue
+        footer = FOOTER.fullmatch(line.strip("= "))
+        if footer:
+            counts = {}
+            for number, kind in re.findall(r"([0-9]+) ([a-z]+)", footer.group(1)):
+                kind = {"errors": "error", "warnings": "warning", "reruns": "rerun"}.get(kind, kind)
+                need(kind not in counts, "duplicate_summary_count")
+                counts[kind] = int(number)
+            need(
+                source_rows > 0
+                and all(counts.get(kind, 0) == count for kind, count in row_counts.items()),
+                "summary_count_mismatch",
+            )
+            complete, active = True, False
+            continue
+        need(not line.startswith("="), "summary_footer_unrecognized")
+        if not line.startswith(("FAILED ", "ERROR ")):
+            continue
+        need(len(line) <= 65536, "summary_line_bound")
+        match = NODE.match(line)
+        need(match is not None, "summary_node_unrecognized")
+        node = match.group(2)
+        need(node.split("::")[0] in allowed_paths and len(node) <= 512, "summary_node_not_bound")
+        remainder, error_type = line[match.end() :], None
+        need(not remainder.startswith("[") or "]" in remainder, "summary_node_truncated")
+        if not remainder.startswith("["):
+            message = re.match(r"^ - ([A-Za-z_][A-Za-z0-9_]*)(?=:|$)", remainder)
+            if message and message.group(1) in ERROR_TYPES:
+                error_type = message.group(1)
+        rows.add((node, error_type))
+        source_rows += 1
+        row_counts[match.group(1).lower()] += 1
+        need(source_rows <= 512, "summary_row_bound")
+    need(complete and source_rows > 0 and bool(rows), "summary_unavailable_or_incomplete")
+    return [
+        {"test": name, "error_type": kind}
+        for name, kind in sorted(rows, key=lambda row: (row[0], row[1] or ""))
+    ]

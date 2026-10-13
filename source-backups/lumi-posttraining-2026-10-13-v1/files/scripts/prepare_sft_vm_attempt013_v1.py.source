@@ -1,0 +1,150 @@
+"""Fresh attempt-013 source with real-console-qualified host-key correction.
+
+Source preparation only: no cloud access or authority to run the consumed host.
+"""
+
+import ast
+import json
+import os
+import re
+import types
+from pathlib import Path
+
+from scripts import prepare_sft_vm_host_key_unicode_v2 as repair
+
+ROOT = Path(__file__).resolve().parents[1]
+NEW = "d8664931c4984fe4a3121d2632af88a8"
+OLD = "58907eb20ec649a7bc340a144541ee32"
+BUCKET = "lumi-cleanup-" + NEW
+CIDR = "172.31.96.96/27"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-013-source-v0.1"
+PROOFS = {
+    "evidence/lumi-vm-host-key-repair-integration-verification-v0.2.json": (
+        "94616138eb11b6e6ea89040a54d2a7cd5b15831889baef34b8ba25db17d0c28a"
+    ),
+    "evidence/lumi-vm-attempt-012-endpoint-cleanup-verification-v0.1.json": (
+        "43f7eb150fe7308ec5afd331cd616f50af96d2891412ced6cb12f0db7d74c1dd"
+    ),
+}
+BUILDER = "scripts/prepare_sft_vm_attempt012_v1.py"
+BUILDER_SHA = "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc"
+
+
+def build():
+    for name, digest in PROOFS.items():
+        proof = json.loads(repair.read(name, digest))
+        for path, pin in proof["source_bindings"].items():
+            repair.read(path, pin["sha256"], pin["bytes"])
+    cleanup = json.loads(repair.read(list(PROOFS)[1], list(PROOFS.values())[1]))
+    repair.need(cleanup["result"]["cleanup_verified"] is True)
+    repair.need(cleanup["result"]["delete_dispatches"] == 1)
+    raw = repair.read(BUILDER, BUILDER_SHA)
+    for before, after in (
+        (OLD, NEW),
+        ('("attempt-011", "attempt-012")', '("attempt-011", "attempt-013")'),
+        ('("Attempt-011", "Attempt-012")', '("Attempt-011", "Attempt-013")'),
+        ('("attempt011", "attempt012")', '("attempt011", "attempt013")'),
+        ('("v0.11", "v0.13")', '("v0.11", "v0.14")'),
+    ):
+        repair.need(before.encode() in raw)
+        raw = raw.replace(before.encode(), after.encode())
+    builder = types.ModuleType("_fresh_attempt013_builder")
+    builder.__file__ = str(ROOT / BUILDER)
+    exec(compile(raw, builder.__file__, "exec"), builder.__dict__)
+    original, ancestor = builder.build()
+    seeds = dict(original)
+    name = "scripts/prepare_sft_vm_host_connection_v3.py"
+    # Use the verified exact function, keeping the newly rebound module globals.
+    qualified = repair.build()
+
+    def function(body):
+        node = next(
+            n
+            for n in ast.parse(body).body
+            if isinstance(n, ast.FunctionDef) and n.name == "host_key"
+        )
+        return "\n".join(body.decode().splitlines()[node.lineno - 1 : node.end_lineno]).encode()
+
+    current_function = function(seeds[name])
+    repair.need(seeds[name].count(current_function) == 1)
+    seeds[name] = seeds[name].replace(current_function, function(qualified))
+    inputs_name = "configs/lumi-vm-private-host-source-inputs-v0.1.json"
+    inputs = json.loads(seeds[inputs_name])
+    inputs["sources"][Path(name).stem]["bytes"] = len(seeds[name])
+    seeds[inputs_name] = builder.encode(inputs)
+    for target, count in (
+        ("configs/lumi-vm-private-network-plan-v0.1.json", 1),
+        ("scripts/run_sft_vm_private_network_v1.py", 2),
+    ):
+        repair.need(seeds[target].count(b"172.31.96.64/27") == count)
+        seeds[target] = seeds[target].replace(b"172.31.96.64/27", CIDR.encode())
+    ancillary = {p for p in original if p.endswith(".json") and "/" not in p}
+    final = builder.closure(original, seeds, ancillary)
+    logical = {
+        name,
+        inputs_name,
+        "configs/lumi-vm-private-network-plan-v0.1.json",
+        "scripts/run_sft_vm_private_network_v1.py",
+    }
+    for path, body in final.items():
+        if path.endswith(".py"):
+            ast.parse(body)
+        if path not in logical:
+            repair.need(
+                re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", body)
+                == re.sub(rb"\b[0-9a-f]{64}\b", b"HASH", original[path])
+            )
+        if (
+            path in ancillary
+            or path.startswith("evidence/")
+            or path.endswith((".tar", ".gz", ".pem"))
+        ):
+            repair.need(body == original[path])
+        if path.startswith("scripts/"):
+            repair.need(OLD.encode() not in body)
+    report = dict(
+        schema="lumi.vm-attempt013-source.v0.1",
+        attempt=NEW,
+        operational_predecessor=OLD,
+        outputs={p: dict(bytes=len(b), sha256=repair.sha(b)) for p, b in sorted(final.items())},
+        identity_composition=ancestor,
+        ancestor_manifest_scope="Fresh identity before host-key and CIDR integration",
+        proof_bindings=PROOFS,
+        builder_sha256=BUILDER_SHA,
+        cleanup_bucket=BUCKET,
+        selected_cidr=CIDR,
+        selected_cidr_live_absence_verified=False,
+        execution_permitted=False,
+        old_authorization_reused=False,
+        old_timer_reused=False,
+        fresh_controls_required=True,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        logical_changes=sorted(logical),
+        consequent_hash_changes=sorted(p for p in final if final[p] != original[p]),
+    )
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    repair.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, raw in (
+        files | {"release.json": (json.dumps(report, sort_keys=True, indent=2) + "\n").encode()}
+    ).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            repair.need(stream.write(raw) == len(raw))
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("source_preparation_is_not_execution_authority") from None
+
+
+if __name__ == "__main__":
+    print(json.dumps(prepare(), sort_keys=True))

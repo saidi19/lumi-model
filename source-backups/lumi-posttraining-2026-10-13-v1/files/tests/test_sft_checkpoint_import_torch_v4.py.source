@@ -1,0 +1,179 @@
+"""Actual tiny CPU metered-DCP/HF tests, no real weights or forward passes."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import unittest
+from unittest.mock import patch
+
+from lumi import posttraining_checkpoint_import_torch_v4 as m
+from tests import test_sft_checkpoint_import_torch_v3 as fixtures
+from tests.test_sft_checkpoint_import_runner_v1 import seal_fixture
+
+
+class MeteredKernelTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixtures.CheckpointImportTorchTests.setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.CheckpointImportTorchTests.tearDownClass()
+
+    def setUp(self):
+        self.fixture = fixtures.CheckpointImportTorchTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.fixture.budget.return_value = None
+
+    def checkpoint(self, mutate=None):
+        f = self.fixture
+        f._checkpoint(mutate)
+        f.checkpoint_path.chmod(0o700)
+        tokens = f.root / "synthetic-token-input"
+        tokens.mkdir(mode=0o700)
+        self.metadata = seal_fixture(f.checkpoint_path, tokens)
+        manifest = self.metadata[1]
+        self.audit_bytes = sum(item["bytes"] for item in json.loads(self.metadata[4])["files"])
+        self.contract = {
+            "expected_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+            "maximum_file_bytes": 4 * 1024**2, "maximum_read_bytes": 16 * 1024**2,
+            "maximum_read_call_bytes": 4 * 1024**2,
+        }
+
+    def execute(self, dtype="bfloat16", **changes):
+        f = self.fixture
+        with patch.object(f.model_class, "forward", side_effect=AssertionError("forward")):
+            return m.convert_and_verify(f.config_path, f.checkpoint_path, f.output_path, dtype,
+                **f.limits, checkpoint_read_contract=self.contract | changes)
+
+    def test_actual_bfloat16_roundtrip_reports_metered_source(self):
+        self.checkpoint()
+        result = self.execute()
+        self.assertEqual(set(result), set(m.EVIDENCE_KEYS))
+        self.assertEqual(result["schema_version"], "lumi.sft-checkpoint-import-kernel.v0.4")
+        self.assertEqual(result["cast_tensor_sha256"], result["reload_tensor_sha256"])
+        read = result["dcp_read_verification"]
+        self.assertIs(read["dcp_reads_metered"], True)
+        self.assertEqual(read["dcp_input_audit_bytes"], self.audit_bytes)
+        self.assertGreater(read["model_payload_read_bytes_reserved"], 0)
+        self.assertEqual(read["dcp_read_bytes_reserved"], self.audit_bytes
+                         + read["model_payload_read_bytes_reserved"])
+        for key in ("real_4b_import", "training_authorized", "production_eligible",
+                    "os_resource_limits_enforced", "complete_source_read_budget_verified"):
+            self.assertIs(result[key], False)
+        self.fixture._assert_exported_buffer_policy()
+
+    def test_actual_float32_roundtrip(self):
+        self.checkpoint()
+        result = self.execute("float32")
+        self.assertEqual(result["source_tensor_sha256"], result["reload_tensor_sha256"])
+
+    def test_tied_alias_disagreement_still_rejected(self):
+        self.checkpoint(lambda state: state.update({"lm_head.weight": state["lm_head.weight"] + 1}))
+        with self.assertRaisesRegex(m.ImportKernelError, "tied_alias_mismatch"):
+            self.execute()
+        self.assertFalse(self.fixture.output_path.exists())
+
+    def test_nonfinite_tensor_still_rejected(self):
+        self.checkpoint(lambda state: state["lm_head.weight"].fill_(float("nan")))
+        with self.assertRaisesRegex(m.ImportKernelError, "dcp_nonfinite"):
+            self.execute()
+
+    def test_hash_mismatch_rejects_before_pickle(self):
+        self.checkpoint()
+        with patch("pickle.load", side_effect=AssertionError("must not deserialize")) as load:
+            with self.assertRaisesRegex(m.ImportKernelError, "dcp_read_failed"):
+                self.execute(expected_manifest_sha256="0" * 64)
+            load.assert_not_called()
+        self.assertFalse(self.fixture.output_path.exists())
+
+    def test_native_reads_exhaust_budget_after_complete_audit(self):
+        self.checkpoint()
+        with self.assertRaisesRegex(m.ImportKernelError, "dcp_read_failed"):
+            self.execute(maximum_read_bytes=self.audit_bytes)
+        self.assertFalse(self.fixture.output_path.exists())
+
+    def test_stock_path_stream_is_not_used_by_dcp(self):
+        self.checkpoint()
+        from torch.distributed.checkpoint.filesystem import FileSystem
+
+        with patch.object(FileSystem, "create_stream",
+                          side_effect=AssertionError("path-native DCP stream")) as opened:
+            self.execute()
+            opened.assert_not_called()
+
+    def test_read_only_source_mode_refused_without_chmod(self):
+        self.checkpoint()
+        path = self.fixture.checkpoint_path / "model/.metadata"
+        path.chmod(0o400)
+        before = path.read_bytes()
+        with self.assertRaisesRegex(m.ImportKernelError, "dcp_read_failed"):
+            self.execute()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_old_package_does_not_accept_new_kernel_receipt(self):
+        self.checkpoint()
+        result = self.execute()
+        from lumi import posttraining_checkpoint_import_plan_v1 as planner
+        from lumi import posttraining_checkpoint_package_v1 as package
+
+        plan = planner.build_import_plan(*self.metadata,
+            expected_base_sha256=hashlib.sha256(self.metadata[0]).hexdigest(), dtype="bfloat16")
+        ledger = package._Ledger(1, 1, 131072, lambda: None)
+        with self.assertRaisesRegex(package.CheckpointPackageError, "kernel_evidence"):
+            package._inputs(plan, plan["plan_sha256"], result, ledger)
+
+    def test_report_matches_every_actual_checkpoint_read_request(self):
+        self.checkpoint()
+        identities = set()
+        for path in self.fixture.checkpoint_path.rglob("*"):
+            if path.is_file():
+                info = path.stat()
+                identities.add((info.st_dev, info.st_ino))
+        original_read, original_pread = os.read, os.pread
+        requests = []
+
+        def record(fd, count):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) in identities:
+                requests.append(count)
+                self.assertLessEqual(count, 1024**2)
+
+        def counted_read(fd, count):
+            record(fd, count)
+            return original_read(fd, count)
+
+        def counted_pread(fd, count, offset):
+            record(fd, count)
+            return original_pread(fd, count, offset)
+
+        with (patch.object(os, "read", side_effect=counted_read),
+              patch.object(os, "pread", side_effect=counted_pread)):
+            result = self.execute()
+        self.assertGreater(len(requests), 20)
+        self.assertEqual(sum(requests), result["dcp_read_verification"]["dcp_read_bytes_reserved"])
+
+    def test_tensor_deserializer_receives_only_descriptor_free_views(self):
+        self.checkpoint()
+        original = self.fixture.torch.load
+        calls = []
+
+        def inspected(stream, *args, **kwargs):
+            self.assertFalse(hasattr(stream, "fileno"))
+            self.assertFalse(hasattr(stream, "__fspath__"))
+            self.assertIs(kwargs.get("weights_only"), True)
+            self.assertEqual(kwargs.get("map_location"), "cpu")
+            calls.append(1)
+            return original(stream, *args, **kwargs)
+
+        with patch.object(self.fixture.torch, "load", side_effect=inspected):
+            self.execute()
+        self.assertGreater(len(calls), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

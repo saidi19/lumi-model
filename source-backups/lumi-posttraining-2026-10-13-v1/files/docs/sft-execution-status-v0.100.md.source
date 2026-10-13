@@ -1,0 +1,74 @@
+# SFT execution status v0.100
+
+2026-09-21. The approved one-shot SDK capacity preflight was published and
+executed once. It **failed before deletion** at the bounded metadata census.
+Gate 5 and the capacity blocker remain open. No GPU, image acquisition, model
+or dataset access, native qualification, or training occurred.
+
+## Published scope and validation
+
+Commit `7d6007defa8868c4276372411b7ae6ca1189ec75` adds exactly four files: the
+new cleanup script, synthetic tests, one-shot workflow, and versioned plan.
+Parent `716774386cc3eba22f860c7699d6a33654882a02` and the private repository
+identity were checked before the non-force push. No prior tracked file changed.
+
+The 54 new tests plus 93 frozen regressions pass on both CPython 3.11.15 and
+3.13.7. Ruff 0.15.1 finds no new E/F/I/B/UP findings. Independent review found no
+blocking scope issue under the explicitly stated trusted disposable VM and
+no-concurrent-writers premise. The original 16 GiB floor remains unchanged.
+
+## Actual result, not a successful cleanup
+
+[Fresh run 35616015735](https://github.com/saidi19/lumi-model/actions/runs/35616015735)
+used attempt 1 and job `106386798089`, lasting 49 seconds including setup and
+artifact upload. Hash authentication and the synthetic test step succeeded.
+The exact-target cleanup step failed with `stage=census`, `code=budget_exhausted`.
+
+The authenticated 928-byte aggregate confirms `removal_started=false`, zero
+removed leaves/directories, no SDK root removal, and no setup-probe execution.
+The Mac SDK and other real local resources were not touched; local deletion
+tests operated only on their own synthetic temporary fixtures.
+
+Available disk before the census was 14,347,677,696 bytes; the unchanged
+theoretical pre-acquisition requirement was 18,241,982,464 bytes. There is no
+after-cleanup measurement because no cleanup started.
+
+The `census_nodes=0` and `census_allocated_bytes=0` fields are **unpopulated
+defaults**, not evidence of an empty SDK. The script only publishes those fields
+after the census returns. Its coarse code does not distinguish listing/global
+node count, directory depth, cumulative relative-name bytes, or allocated block
+bytes. This is a definite diagnostic limitation; neither the crossed limit nor
+a traversal bug is established by the result. Do not guess actual SDK size.
+
+Artifact `10645608530` is a 623-byte ZIP with server digest
+`e793b925aa1f90f1d0fb9c7d681452242a0bd1b4dd58c840d500bd2dc101e757`.
+Only its single canonical aggregate was retained; no raw logs or ZIP were saved.
+The aggregate SHA-256 is
+`4b26a0457ca9e81a043fc8d77ebb4b301e5101898c0e9917d25173b59cf7939e`.
+Two zero-network structural verification passes succeeded. Prior bound evidence
+and frozen native sources remain byte-for-byte unchanged.
+
+## CI and remaining boundary
+
+Spark source checks succeeded. Source CI's lint, isolated controls, and
+source-only validators succeeded; the remaining source-suite job is still
+running at this note's initial recording. Its final result will be recorded
+separately once observed. The preflight failure must remain visible, not be
+deleted or mislabeled as a pass.
+
+The approved attempt is consumed and was not retried. No limits were raised and
+no broader deletion was attempted. The next justified scope is one separately
+approved, fresh, read-only same-target metadata census with budget-specific
+codes and bounded partial counters, retaining the existing caps. It must not
+delete SDK entries, acquire software/model objects, or run qualification.
+Only its result can justify a specific later correction; it does not authorize
+another cleanup. `production_eligible=false` remains unchanged.
+
+Local records:
+
+- `evidence/lumi-4b-sft-sdk-capacity-preflight-result-v0.1.json`
+- `evidence/lumi-4b-sft-sdk-capacity-preflight-verification-v0.1.json`
+- `artifacts/lumi-sft-sdk-capacity-preflight-v0.1/aggregate-capacity.json`
+
+These post-run receipts are local-only; the implementation's four files are
+published. No post-run push, workflow rerun, or subsequent execution occurred.

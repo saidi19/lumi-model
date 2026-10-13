@@ -1,0 +1,51 @@
+{
+  "authorization": {
+    "additional_candidate_row_reads_authorized": false,
+    "candidate_materialization_authorized": false,
+    "gpu_authorized": false,
+    "network_authorized": false,
+    "production_dataset_seal_authorized": false,
+    "sft_training_authorized": false
+  },
+  "bindings": {
+    "failure_report": {
+      "path": "evidence/lumi-4b-sft-learning-candidate-seal-failure-v0.1.json",
+      "sha256": "b59d06d81c5d8d91b4779beb31d219fa9a7de17799fdccfb707621567d326a6f"
+    },
+    "failure_verification": {
+      "path": "evidence/lumi-4b-sft-learning-candidate-seal-failure-verification-v0.1.json",
+      "sha256": "fd576f03612dfbd311019d1ab18700a8e6ebd3f0eff815a4df5eda8bcc1fdeba"
+    },
+    "predecessor_execution_plan": {
+      "path": "configs/lumi-4b-sft-learning-candidate-seal-v0.1.json",
+      "sha256": "744c0ba4c1417defd6010438bccab730056748b763aa6e840de0bc17daf21060"
+    },
+    "repaired_implementation": {
+      "path": "src/lumi/posttraining_learning_candidate_seal_v2.py",
+      "sha256": "a3c669651618425942e6b1ff97a615efd5e3ed15981d11eb2d4ebfd0ab72c54f"
+    },
+    "repaired_runner": {
+      "path": "scripts/seal_sft_learning_candidate_recovery_v2.py",
+      "sha256": "3ccaca69e7abf98fad9700d09f02a129a4def504e9c7e976da3035e339264e65"
+    },
+    "repaired_test": {
+      "path": "tests/test_learning_candidate_seal_v2.py",
+      "sha256": "3d225c04c31c6669d1526b2a87b003341604fc485b6f4136d3b18246d321365d"
+    },
+    "repaired_verifier": {
+      "path": "scripts/verify_sft_learning_candidate_seal_recovery_v2.py",
+      "sha256": "e8254f1add06faffc52a759be421eee3142a7d7d465d79fdbb21af504cfacd7d"
+    }
+  },
+  "exact_successor_authorization_text": "I approve one bounded local-only Lumi registry-v0.17 learning-candidate seal token-ledger runtime-recovery successor. Bind predecessor execution plan SHA-256 744c0ba4c1417defd6010438bccab730056748b763aa6e840de0bc17daf21060, fail-closed report SHA-256 b59d06d81c5d8d91b4779beb31d219fa9a7de17799fdccfb707621567d326a6f, failure verification SHA-256 fd576f03612dfbd311019d1ab18700a8e6ebd3f0eff815a4df5eda8bcc1fdeba, repaired implementation SHA-256 a3c669651618425942e6b1ff97a615efd5e3ed15981d11eb2d4ebfd0ab72c54f, runner SHA-256 3ccaca69e7abf98fad9700d09f02a129a4def504e9c7e976da3035e339264e65, verifier SHA-256 e8254f1add06faffc52a759be421eee3142a7d7d465d79fdbb21af504cfacd7d, and test SHA-256 3d225c04c31c6669d1526b2a87b003341604fc485b6f4136d3b18246d321365d. The predecessor completed the full frozen v0.12 gate replay and then failed closed after consuming exactly 529,962 candidate-row reads because redundant row retokenization disagreed with the independently verified frozen per-source token ledger; it wrote no final train JSONL, validation JSONL, manifest, or verification and left no temporary files. Authorize exactly one additional materialization pass over the same 264,981 bound candidate rows / 359,324,855 input bytes, without repeating the full MinHash audit and without retokenizing rows. Require every candidate file hash, source ID, split, record count, lexical source ordering, and the frozen v0.12 per-source split ledger to match; then materialize exactly 251,176 train rows / 7,341,582 train supervised tokens and 13,805 validation rows / 427,005 validation supervised tokens, excluding the 1,463-row closure candidate SHA-256 e8c0a360c898e6c8f78701c27f534b49f8bbe43c557bec9d15f0ec2c4eb74b1e. Maximum 60 additional local runtime-minutes / 264,981 additional candidate-row reads / 1,073,741,824 additional private write bytes / 0 network bytes / 0 GPU use. It may create only the v0.2 execution plan, private train and validation JSONL, raw-text-free smoke-only manifest, and independent byte-hash/count verification. Preserve the frozen 10M production floor and every source blocker. No registry or data-contract change, production dataset seal, encoded shard creation, SFT training, external API, download, S3 action, remote access, instance action, production promotion, or unrelated access.",
+  "repair": {
+    "additional_candidate_row_reads": 264981,
+    "additional_full_passes": 1,
+    "additional_runtime_minutes": 60,
+    "frozen_source_token_ledger": true,
+    "repeat_full_minhash_audit": false,
+    "retokenize_rows": false
+  },
+  "schema_version": "lumi.sft-learning-candidate-seal-runtime-recovery-preflight.v0.2",
+  "status": "PASS_repair_ready_additional_pass_not_authorized"
+}

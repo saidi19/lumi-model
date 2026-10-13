@@ -1,0 +1,84 @@
+"""Offline request-shape and fail-closed checks for metadata-only inspection."""
+
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from scripts import inspect_sft_vm_attempt011_prerequisites_v1 as m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.plan, _ = m.binding.build()
+
+    def reader(self):
+        receipts = []
+        return m.Reader(self.plan, lambda n, v: receipts.append((n, v))), receipts
+
+    def test_all_21_requests_are_metadata_only_and_offline_sdk_valid(self):
+        import botocore.session
+        import botocore.validate
+
+        session = botocore.session.Session()
+        rows = m.requests(self.plan)
+        self.assertEqual(len(rows), 21)
+        for _, service, op, fields in rows:
+            self.assertTrue(op.startswith(("get-", "describe-")))
+            self.assertNotIn(op, {"get-object", "list-objects", "head-object"})
+            service = "s3" if service == "s3api" else service
+            operation = "".join(word.capitalize() for word in op.split("-"))
+            shape = session.get_service_model(service).operation_model(operation).input_shape
+            botocore.validate.validate_parameters(fields, shape)
+
+    def test_mutations_out_of_order_and_read_budget_rejected_before_dispatch(self):
+        reader, _ = self.reader()
+        with patch.object(m.subprocess, "run") as invoke:
+            for row in [("mutation", "ec2", "run-instances", {}), reader.allowed[1]]:
+                with self.assertRaises(ValueError):
+                    reader.read(row)
+            reader.calls = 21
+            with self.assertRaises(ValueError):
+                reader.read(reader.allowed[0])
+            invoke.assert_not_called()
+
+    def test_exact_iam_absence_one_call_no_retry(self):
+        reader, receipts = self.reader()
+        reader.calls = 1
+        reply = SimpleNamespace(
+            returncode=1, stdout=b"", stderr=b"An error occurred (NoSuchEntity)"
+        )
+        with patch.object(m.subprocess, "run", return_value=reply) as invoke:
+            self.assertIsNone(reader.read(reader.allowed[1]))
+        self.assertEqual(invoke.call_count, 1)
+        self.assertIn("https://iam.amazonaws.com", invoke.call_args.args[0])
+        self.assertEqual(invoke.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+        self.assertEqual(receipts[-1][1]["status"], "expected_absence")
+
+    def test_unknown_or_access_denied_is_not_absence_and_not_raw_text(self):
+        for code in (b"AccessDenied", b"PRIVATE_SECRET"):
+            reader, receipts = self.reader()
+            reader.calls = 1
+            reply = SimpleNamespace(
+                returncode=1, stdout=b"", stderr=b"An error occurred (" + code + b") secret"
+            )
+            with patch.object(m.subprocess, "run", return_value=reply):
+                with self.assertRaises(ValueError):
+                    reader.read(reader.allowed[1])
+            self.assertNotIn("PRIVATE_SECRET", str(receipts))
+            self.assertNotIn("secret", str(receipts))
+
+    def test_pagination_and_deadline_fail_closed(self):
+        reader, _ = self.reader()
+        reply = SimpleNamespace(returncode=0, stdout=b'{"NextToken":"more"}', stderr=b"")
+        with patch.object(m.subprocess, "run", return_value=reply):
+            with self.assertRaises(ValueError):
+                reader.read(reader.allowed[0])
+        reader, _ = self.reader()
+        with (
+            patch.object(m.time, "monotonic", return_value=reader.start + 855),
+            patch.object(m.subprocess, "run") as invoke,
+        ):
+            with self.assertRaises(ValueError):
+                reader.read(reader.allowed[0])
+            invoke.assert_not_called()

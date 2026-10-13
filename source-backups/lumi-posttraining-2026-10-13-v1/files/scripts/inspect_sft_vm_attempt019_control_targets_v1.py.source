@@ -1,0 +1,338 @@
+"""One bounded read-only absence check for attempt-019 control targets."""
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import json
+import os
+import subprocess
+import time
+from pathlib import Path
+
+import botocore.session
+from botocore.config import Config
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    HTTPClientError,
+    ReadTimeoutError,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "c7124d8fb1a244798d7e41b7b5dfad61"
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+VPC = "vpc-0905fbf9490a2dead"
+CIDR = "172.31.97.0/27"
+PLAN = ROOT / "artifacts/lumi-vm-attempt-019-control-plan-v0.1/plan.json"
+PLAN_SHA = "c40e57adaf1d690443eb8c40acb4835ee94dc24f579d0b1a17db94ee1f2a4608"
+SOURCE_PROOF = ROOT / "evidence/lumi-vm-attempt-019-source-v0.1-verification-v0.1.json"
+SOURCE_PROOF_SHA = "fc55f988dc5ddc7b833a361209e74fbde44e0bc35494ed95b21e083bbaf6fac9"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-019-control-target-absence-v0.1.json"
+FUNCTION = "lumi-stop-" + ATTEMPT
+WORKER_ROLE = "lumi-stop-worker-" + ATTEMPT
+SCHEDULE_ROLE = "lumi-stop-schedule-" + ATTEMPT
+GROUP = "lumi-stop-" + ATTEMPT
+LOG_GROUP = "/aws/lambda/" + FUNCTION
+BUCKET = "lumi-cleanup-" + ATTEMPT
+KEY = "lumi-fullsize-" + ATTEMPT
+SECURITY_GROUPS = [KEY + "-vm", KEY + "-endpoint"]
+IAM_USERS = ["lumi-acquire-" + ATTEMPT, "lumi-retain-" + ATTEMPT]
+IAM_ROLES = [WORKER_ROLE, SCHEDULE_ROLE, *IAM_USERS]
+MAX_CALLS = 20
+MAX_SECONDS = 300
+MAX_READ_RETRIES = 8
+READ_DELAYS = (1, 2)
+ABSENCE_CODES = {
+    "lambda": {"ResourceNotFoundException"},
+    "iam": {"NoSuchEntity"},
+    "scheduler": {"ResourceNotFoundException"},
+    "s3": {"404", "NoSuchBucket", "NotFound"},
+}
+TRANSIENT_CODES = {
+    "InternalError",
+    "InternalFailure",
+    "RequestTimeout",
+    "RequestTimeoutException",
+    "ServiceUnavailable",
+    "SlowDown",
+    "Throttling",
+    "ThrottlingException",
+}
+TRANSIENT_EXCEPTIONS = (
+    ConnectionClosedError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    HTTPClientError,
+    ReadTimeoutError,
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_control_target_absence_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def read(path, digest):
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 64 * 1024)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def error_code(error):
+    response = getattr(error, "response", {})
+    return str(response.get("Error", {}).get("Code", "unknown"))
+
+
+def transient(error):
+    if isinstance(error, TRANSIENT_EXCEPTIONS):
+        return True
+    response = getattr(error, "response", {})
+    status = response.get("ResponseMetadata", {}).get("HTTPStatusCode")
+    return status in {500, 502, 503, 504} or error_code(error) in TRANSIENT_CODES
+
+
+class Reads:
+    def __init__(self, clients, *, clock=time.monotonic, sleep=time.sleep):
+        self.clients = clients
+        self.clock = clock
+        self.sleep = sleep
+        self.start = clock()
+        self.calls = 0
+        self.retries = 0
+
+    def call(self, service, operation, **fields):
+        need(operation.startswith(("get_", "describe_", "list_", "head_")))
+        need(operation not in {"get_object", "list_objects", "list_objects_v2"})
+        for index, delay in enumerate((0, *READ_DELAYS)):
+            need(self.calls < MAX_CALLS and self.clock() - self.start < MAX_SECONDS)
+            if delay:
+                need(self.retries < MAX_READ_RETRIES)
+                self.retries += 1
+                self.sleep(delay)
+            self.calls += 1
+            try:
+                return getattr(self.clients[service], operation)(**fields)
+            except Exception as error:
+                if index == len(READ_DELAYS) or not transient(error):
+                    raise
+        need(False)
+
+    def absent(self, service, operation, **fields):
+        try:
+            self.call(service, operation, **fields)
+        except Exception as error:
+            if error_code(error) in ABSENCE_CODES.get(service, set()):
+                return True
+            raise
+        return False
+
+
+def clients():
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith("AWS_")
+        and key.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+    }
+    env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+    completed = subprocess.run(
+        [
+            "/opt/homebrew/bin/aws",
+            "--profile",
+            "default",
+            "configure",
+            "export-credentials",
+            "--format",
+            "process",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        timeout=20,
+        env=env,
+    )
+    need(completed.returncode == 0 and 0 < len(completed.stdout) <= 32768)
+    need(len(completed.stderr) <= 4096)
+    exported = json.loads(completed.stdout)
+    need(
+        exported.get("Version") == 1
+        and all(
+            isinstance(exported.get(name), str) and 0 < len(exported[name]) <= 16384
+            for name in ("AccessKeyId", "SecretAccessKey", "SessionToken", "Expiration")
+        )
+    )
+    session = botocore.session.get_session()
+    session.set_config_variable("config_file", "/dev/null")
+    session.set_config_variable("credentials_file", "/dev/null")
+    config = Config(
+        region_name=REGION,
+        connect_timeout=5,
+        read_timeout=10,
+        retries={"mode": "standard", "total_max_attempts": 1},
+    )
+    names = {
+        "sts": "sts",
+        "ec2": "ec2",
+        "lambda": "lambda",
+        "iam": "iam",
+        "scheduler": "scheduler",
+        "logs": "logs",
+        "s3": "s3",
+    }
+    credentials = {
+        "aws_access_key_id": exported["AccessKeyId"],
+        "aws_secret_access_key": exported["SecretAccessKey"],
+        "aws_session_token": exported["SessionToken"],
+    }
+    return {
+        name: session.create_client(service, config=config, **credentials)
+        for name, service in names.items()
+    }
+
+
+def inspect(cloud):
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    source = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    need(
+        plan["attempt"] == ATTEMPT
+        and plan["network_candidate_cidr"] == CIDR
+        and plan["network_candidate_live_availability_verified"] is False
+        and plan["control_target_absence_evidence"] is None
+        and plan["execution_permitted"] is False
+        and source["attempt"] == ATTEMPT
+        and source["fresh_identity_verified"] is True
+        and source["execution_authority_created"] is False
+    )
+    reads = Reads(cloud)
+    identity = reads.call("sts", "get_caller_identity")
+    need(identity["Account"] == ACCOUNT)
+    subnets = reads.call(
+        "ec2",
+        "describe_subnets",
+        Filters=[
+            {"Name": "vpc-id", "Values": [VPC]},
+            {"Name": "cidr-block", "Values": [CIDR]},
+        ],
+    )["Subnets"]
+    endpoints = reads.call(
+        "ec2",
+        "describe_instance_connect_endpoints",
+        Filters=[{"Name": "tag:LumiAttempt", "Values": [ATTEMPT]}],
+    )["InstanceConnectEndpoints"]
+    instances = reads.call(
+        "ec2",
+        "describe_instances",
+        Filters=[{"Name": "tag:LumiAttempt", "Values": [ATTEMPT]}],
+        MaxResults=100,
+    )["Reservations"]
+    keys = reads.call(
+        "ec2", "describe_key_pairs", Filters=[{"Name": "key-name", "Values": [KEY]}]
+    )["KeyPairs"]
+    groups = reads.call(
+        "ec2",
+        "describe_security_groups",
+        Filters=[{"Name": "group-name", "Values": SECURITY_GROUPS}],
+    )["SecurityGroups"]
+    observations = {
+        "selected_cidr": CIDR,
+        "selected_cidr_subnets": len(subnets),
+        "attempt_instance_connect_endpoints": len(endpoints),
+        "attempt_tagged_instances": sum(len(item["Instances"]) for item in instances),
+        "attempt_key_pairs": len(keys),
+        "attempt_security_groups": len(groups),
+        "watchdog_function_exists": not reads.absent(
+            "lambda", "get_function_configuration", FunctionName=FUNCTION
+        ),
+        "watchdog_worker_role_exists": not reads.absent(
+            "iam", "get_role", RoleName=WORKER_ROLE
+        ),
+        "watchdog_schedule_role_exists": not reads.absent(
+            "iam", "get_role", RoleName=SCHEDULE_ROLE
+        ),
+        "acquisition_user_exists": not reads.absent(
+            "iam", "get_user", UserName=IAM_USERS[0]
+        ),
+        "retention_user_exists": not reads.absent(
+            "iam", "get_user", UserName=IAM_USERS[1]
+        ),
+        "acquisition_role_exists": not reads.absent(
+            "iam", "get_role", RoleName=IAM_ROLES[2]
+        ),
+        "retention_role_exists": not reads.absent(
+            "iam", "get_role", RoleName=IAM_ROLES[3]
+        ),
+        "watchdog_schedule_group_exists": not reads.absent(
+            "scheduler", "get_schedule_group", Name=GROUP
+        ),
+    }
+    log_groups = reads.call(
+        "logs", "describe_log_groups", logGroupNamePrefix=LOG_GROUP, limit=10
+    )["logGroups"]
+    observations["watchdog_log_group_exists"] = any(
+        item["logGroupName"] == LOG_GROUP for item in log_groups
+    )
+    observations["dedicated_cleanup_bucket_exists"] = not reads.absent(
+        "s3", "head_bucket", Bucket=BUCKET, ExpectedBucketOwner=ACCOUNT
+    )
+    counts = [
+        value
+        for key, value in observations.items()
+        if key.endswith(("_subnets", "_endpoints", "_instances", "_pairs", "_groups"))
+    ]
+    flags = [value for key, value in observations.items() if key.endswith("_exists")]
+    need(all(value == 0 for value in counts) and all(value is False for value in flags))
+    return {
+        "schema": "lumi.vm-attempt019-control-target-absence.v0.1",
+        "date": dt.datetime.now(dt.UTC).date().isoformat(),
+        "observed_at_utc": dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace(
+            "+00:00", "Z"
+        ),
+        "attempt": ATTEMPT,
+        "account": ACCOUNT,
+        "region": REGION,
+        "vpc": VPC,
+        "source_bindings": {
+            str(PLAN.relative_to(ROOT)): PLAN_SHA,
+            str(SOURCE_PROOF.relative_to(ROOT)): SOURCE_PROOF_SHA,
+        },
+        "observations": observations,
+        "read_only_aws_calls": reads.calls,
+        "bounded_transient_read_retries": reads.retries,
+        "cloud_mutations": 0,
+        "object_access": 0,
+        "instance_actions": 0,
+        "checkpoint_access": False,
+        "collision_free_for_control_preparation": True,
+        "execution_permitted": False,
+        "cpu_launch_authorized": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def run():
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    result = inspect(clients())
+    raw = encode(result)
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    print(json.dumps(result, sort_keys=True))
+    return result
+
+
+if __name__ == "__main__":
+    run()

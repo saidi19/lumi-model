@@ -1,0 +1,194 @@
+"""Regression tests for corrected child roles; no native process is started."""
+
+from __future__ import annotations
+
+import importlib
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "_synthetic_write_process_v2"
+package = types.ModuleType(PACKAGE)
+package.__path__ = [str(ROOT / "src/lumi")]
+sys.modules[PACKAGE] = package
+m = importlib.import_module(PACKAGE + ".posttraining_checkpoint_write_process_v2")
+PRIVATE = "SYNTHETIC-PRIVATE-MUST-NOT-ESCAPE"
+
+
+class Topology:
+    def __init__(self, events):
+        self.events, self.stage = events, "guardian_prefork"
+
+    def adopt_fork_child_admitted_once(self):
+        self.events.append("adopt")
+
+    def transition_admitted_once(self, stage, *, extra_keep=()):
+        self.events.append(("transition", stage))
+        self.stage = stage
+        return (10, 11, 12) + tuple(extra_keep)
+
+    def snapshot(self):
+        return {"stage": self.stage}
+
+    def close_all_admitted_once(self):
+        self.events.append("topology_close")
+
+
+class ProcessRoleTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.value = Topology(self.events)
+        self.enterContext(patch.object(m.topology, "_Topology", Topology))
+        self.prune = self.enterContext(patch.object(
+            m, "_prune_child_descriptors",
+            side_effect=lambda kept: self.events.append(("prune", kept))))
+        self.enter_group = self.enterContext(patch.object(
+            m.cgroup, "enter_current_process",
+            side_effect=lambda fd: self.events.append(("enter_group", fd))))
+        self.parent_close = self.enterContext(patch.object(
+            m, "_close_parent_descriptor",
+            side_effect=lambda fd, ident: self.events.append(("parent_close", fd))))
+        self.group_close = self.enterContext(patch.object(
+            m, "_close_group_descriptor",
+            side_effect=lambda fd, ident: self.events.append(("group_close", fd))))
+        self.inherited_close = self.enterContext(patch.object(
+            m, "_close_inherited_pidfd_copy",
+            side_effect=lambda owner: self.events.append("inherited_close")))
+
+    def role(self, stage, owner=None):
+        return m._role_branch_admitted_once(
+            self.value, stage, 50, ("parent",), 60, ("leaf",), owner,
+        )
+
+    def test_broker_cannot_keep_workload_leaf_populated(self):
+        report = self.role("broker").snapshot()
+        self.enter_group.assert_not_called()
+        self.assertEqual(self.events, [
+            "adopt", ("transition", "broker"), ("prune", (10, 11, 12, 50, 60)),
+            ("parent_close", 50), ("group_close", 60),
+        ])
+        self.assertEqual(report["role"], "broker")
+        self.assertFalse(report["execution_permitted"])
+
+    def test_worker_enters_leaf_only_after_pruning(self):
+        self.role("worker", object())
+        self.assertEqual(self.events, [
+            "adopt", "inherited_close", ("transition", "worker"),
+            ("prune", (10, 11, 12, 50, 60)), ("parent_close", 50),
+            ("enter_group", 60), ("group_close", 60),
+        ])
+
+    def test_ambiguous_inherited_close_is_not_retried(self):
+        self.inherited_close.side_effect = m.ProcessCompositionError(
+            "cleanup_unconfirmed")
+        with self.assertRaisesRegex(m.ProcessCompositionError, "cleanup_unconfirmed"):
+            self.role("worker", object())
+        self.assertEqual(self.inherited_close.call_count, 1)
+        self.enter_group.assert_not_called()
+        self.parent_close.assert_called_once()
+        self.group_close.assert_called_once()
+
+    def test_prune_failure_cannot_reach_cgroup_or_runtime(self):
+        self.prune.side_effect = m.ProcessCompositionError("cleanup_unconfirmed")
+        with self.assertRaisesRegex(m.ProcessCompositionError, "cleanup_unconfirmed"):
+            self.role("worker")
+        self.enter_group.assert_not_called()
+        self.assertIn("topology_close", self.events)
+
+    def test_worker_join_failure_closes_owned_descriptors_once(self):
+        self.enter_group.side_effect = RuntimeError(PRIVATE)
+        with self.assertRaisesRegex(m.ProcessCompositionError, "topology_failed"):
+            self.role("worker")
+        self.parent_close.assert_called_once()
+        self.group_close.assert_called_once()
+
+    def test_parent_close_failure_not_retried(self):
+        self.parent_close.side_effect = RuntimeError(PRIVATE)
+        with self.assertRaises(m.ProcessCompositionError) as caught:
+            self.role("worker")
+        self.assertNotIn(PRIVATE, str(caught.exception))
+        self.parent_close.assert_called_once()
+        self.group_close.assert_called_once()
+        self.enter_group.assert_not_called()
+
+    def test_leaf_close_failure_not_retried(self):
+        self.group_close.side_effect = RuntimeError(PRIVATE)
+        with self.assertRaises(m.ProcessCompositionError):
+            self.role("worker")
+        self.group_close.assert_called_once()
+
+    def test_invalid_role_rejected_before_transition(self):
+        with self.assertRaisesRegex(m.ProcessCompositionError, "arguments_rejected"):
+            self.role("controller")
+        self.prune.assert_not_called()
+        self.enter_group.assert_not_called()
+
+    def test_role_uses_corrected_authority_not_frozen_v1(self):
+        self.assertEqual(m.authority.SCHEMA,
+                         "lumi.checkpoint-write-endpoint-authority.v0.2")
+
+    def test_public_and_private_composition_reject_before_any_native_call(self):
+        with patch.object(m.os, "fork", create=True) as fork, \
+             patch.object(m, "_runtime") as runtime, \
+             patch.object(m.topology, "_precreate_admitted_once") as sockets:
+            with self.assertRaisesRegex(m.ProcessCompositionError,
+                                        "host_guard_not_bound"):
+                m.compose_write_processes(approved=True)
+            with self.assertRaisesRegex(m.ProcessCompositionError,
+                                        "role_runtime_unbound"):
+                m._compose_admitted_once(approved=True)
+        fork.assert_not_called()
+        runtime.assert_not_called()
+        sockets.assert_not_called()
+
+
+class DescriptorPruneTests(unittest.TestCase):
+    def setUp(self):
+        self.alive = {0, 1, 2, 10, 11, 12, 50, 60, 90, 91}
+        self.closed = []
+        self.enterContext(patch.object(
+            m.os, "listdir", side_effect=lambda path: list(map(str, self.alive))))
+        self.enterContext(patch.object(m.os, "fstat", return_value=object()))
+        self.close = self.enterContext(patch.object(
+            m.os, "close", side_effect=self.drop))
+
+    def drop(self, fd):
+        self.closed.append(fd)
+        self.alive.remove(fd)
+
+    def test_actual_enumeration_and_close_helpers_remove_ambient_fds(self):
+        m._prune_child_descriptors((10, 11, 12, 50, 60))
+        self.assertEqual(set(self.closed), {90, 91})
+        self.assertEqual(self.alive, {0, 1, 2, 10, 11, 12, 50, 60})
+
+    def test_readback_rejects_a_silently_unclosed_descriptor(self):
+        self.close.side_effect = lambda fd: self.closed.append(fd)
+        with self.assertRaisesRegex(m.ProcessCompositionError, "cleanup_unconfirmed"):
+            m._prune_child_descriptors((10, 11, 12, 50, 60))
+        self.assertEqual(set(self.closed), {90, 91})
+
+    def test_missing_kept_descriptor_is_not_silently_accepted(self):
+        self.alive.remove(10)
+        with self.assertRaisesRegex(m.ProcessCompositionError, "cleanup_unconfirmed"):
+            m._prune_child_descriptors((10, 11, 12, 50, 60))
+
+    def test_ambiguous_native_close_is_never_retried(self):
+        self.close.side_effect = OSError(PRIVATE)
+        with self.assertRaisesRegex(m.ProcessCompositionError, "cleanup_unconfirmed"):
+            m._prune_child_descriptors((10, 11, 12, 50, 60))
+        self.assertEqual(self.close.call_count, 1)
+
+    def test_duplicate_boolean_and_out_of_range_keep_sets_rejected(self):
+        for kept in ((10, 10), (True,), (2,), (2**20,), [10]):
+            with self.subTest(kept=kept):
+                with self.assertRaisesRegex(m.ProcessCompositionError,
+                                            "descriptor_changed"):
+                    m._prune_child_descriptors(kept)
+        self.close.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

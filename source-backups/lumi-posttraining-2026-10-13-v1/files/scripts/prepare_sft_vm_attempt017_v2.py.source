@@ -1,0 +1,73 @@
+"""Offline correction of derived watchdog ZIP binding; preserves v0.1 evidence."""
+
+import ast
+import base64
+import hashlib
+import io
+import json
+import os
+import types
+import zipfile
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt012_v1 as closure
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-attempt-017-source-v0.1"
+BASE_SHA = "5722c4d28294b224c6e405fd729d9151d926f9fe70aa4c7b267cc9dd6814da07"
+OUTPUT = ROOT / "artifacts/lumi-vm-attempt-017-source-v0.2"
+ARM = "scripts/arm_sft_vm_external_watchdog_v2.py"
+
+
+def build():
+    closure.read(ROOT / "scripts/prepare_sft_vm_attempt012_v1.py",
+                 "df5f47d151e88bf13e4765105eb76182c71decf19e94b3948e7f696b627901dc")
+    manifest = json.loads(closure.read(BASE / "release.json", BASE_SHA))
+    original = {n: closure.read(BASE / n, p["sha256"], p["bytes"])
+                for n, p in manifest["outputs"].items()}
+    # Evaluate the actual pinned pure package function, not a second ZIP recipe.
+    deploy = ast.parse(original["scripts/prepare_sft_vm_external_watchdog_v1.py"])
+    package = next(n for n in deploy.body if getattr(n, "name", None) == "package")
+    ns = dict(Path=Path, io=io, zipfile=zipfile, need=closure.need,
+              worker=types.SimpleNamespace(__file__=str(
+                  BASE / "scripts/sft_vm_external_watchdog_v1.py")))
+    exec(compile(ast.Module(body=[package], type_ignores=[]), "<pinned-package>", "exec"), ns)
+    digest = base64.b64encode(hashlib.sha256(ns["package"]()).digest()).decode()
+    node = next(n for n in ast.parse(original[ARM]).body if isinstance(n, ast.Assign)
+                and isinstance(n.targets[0], ast.Name) and n.targets[0].id == "CODE")
+    before = node.value.value
+    closure.need(before != digest and original[ARM].count(before.encode()) == 1)
+    seeds = original | {ARM: original[ARM].replace(before.encode(), digest.encode())}
+    preserved = {n for n in original if "/" not in n or n.startswith("evidence/")
+                 or n.endswith((".gz", ".tar", ".pem"))}
+    final = closure.closure(original, seeds, preserved)
+    for name in preserved:
+        closure.need(final[name] == original[name])
+    inputs = json.loads(final["configs/lumi-vm-private-host-source-inputs-v0.1.json"])
+    for role, pin in inputs["sources"].items():
+        raw = final["scripts/" + role + ".py"]
+        closure.need(len(raw) == pin["bytes"] and closure.sha(raw) == pin["sha256"])
+    report = dict(manifest, schema="lumi.vm-attempt017-source.v0.2",
+                  corrected_base_release_sha256=BASE_SHA, watchdog_code_sha256_base64=digest,
+                  previous_watchdog_code_sha256_base64=before,
+                  watchdog_zip_binding_corrected=True, execution_permitted=False,
+                  outputs={n: dict(bytes=len(b), sha256=closure.sha(b))
+                           for n, b in sorted(final.items())})
+    return final, report
+
+
+def prepare():
+    files, report = build()
+    closure.need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    OUTPUT.mkdir(mode=0o700)
+    for name, body in (files | {"release.json": closure.encode(report)}).items():
+        path = OUTPUT / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            closure.need(stream.write(body) == len(body))
+    return report
+
+
+def run(**_kwargs):
+    raise ValueError("offline_only_not_execution_authority")

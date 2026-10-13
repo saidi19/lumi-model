@@ -1,0 +1,485 @@
+"""Real binding/schema/hash and temp-file behavior; native host observations doubled."""
+
+import copy
+import importlib
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("bind_sft_vm_native_admission_v1")
+d = importlib.import_module("run_sft_vm_runtime_qualification_detached_v1")
+entry = importlib.import_module("run_sft_vm_parent_entry_v2")
+ready = importlib.import_module("inspect_sft_vm_native_readiness_v1")
+reply = importlib.import_module("tests.test_sft_vm_runtime_qualification_v1").reply
+
+REPO = Path(__file__).resolve().parents[1]
+CLEAN = b"Name:\tignored\nUid:\t0 0 0 0\nGid:\t0 0 0 0\nGroups:\t0\n"
+
+
+class ParsingTests(unittest.TestCase):
+    def test_source_pins_and_authentic_helpers(self):
+        names = {
+            "receiver.py": "run_sft_vm_runtime_qualification_detached_v1.py",
+            "readiness.py": "inspect_sft_vm_native_readiness_v1.py",
+            "qualification.py": "qualify_sft_vm_existing_runtime_v1.py",
+        }
+        bodies = {name: (REPO / "scripts" / source).read_bytes() for name, source in names.items()}
+        self.assertEqual({name: m.sha(raw) for name, raw in bodies.items()}, m.PINS)
+        with patch.object(m, "root_read", side_effect=lambda path: bodies[path.name]):
+            detached, readiness = m.helpers()
+        self.assertEqual(detached.QUALIFICATION, d.QUALIFICATION)
+        self.assertEqual(readiness.DESCRIPTOR_SHA, ready.DESCRIPTOR_SHA)
+
+    def test_tampered_helper_rejected_before_exec(self):
+        with patch.object(m, "root_read", return_value=b"raise RuntimeError('must not execute')"):
+            with self.assertRaises(ValueError):
+                m.helpers()
+
+    def test_duplicate_json_keys_rejected(self):
+        with self.assertRaises(ValueError):
+            m.decode(b'{"state":1,"state":2}')
+
+    def test_public_entry_cannot_be_opened_by_approval(self):
+        with patch.object(m, "helpers") as helpers:
+            with self.assertRaises(ValueError):
+                m.run(approved=True, trusted_root=True)
+            helpers.assert_not_called()
+
+    def test_mac_rejected_before_reads(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "helpers") as helpers:
+            with self.assertRaises(ValueError):
+                m._bind_same_host({})
+            helpers.assert_not_called()
+
+    def test_qualification_exact_schema(self):
+        m.qualification_report(reply(), d.QUALIFICATION)
+        for key in m.QUAL_TRUE + m.QUAL_FALSE:
+            changed = reply()
+            changed[key] = not changed[key]
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                m.qualification_report(changed, d.QUALIFICATION)
+
+    def test_qualification_wrong_identity_count_type_and_unknown_field(self):
+        for key, value in (
+            ("attempt", "f" * 32),
+            ("qualification_attempt", "f" * 32),
+            ("source_files_verified", True),
+            ("source_files_verified", 48),
+            ("full_input_audits", 1),
+            ("generated_files_unchanged", 49),
+            ("generated_files_unchanged", 257),
+            ("generated_files_unchanged", 61.0),
+            ("status", "passed"),
+            ("unknown", False),
+        ):
+            changed = reply()
+            changed[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                m.qualification_report(changed, d.QUALIFICATION)
+
+    def test_clean_identity_accepts_empty_groups_and_ignores_name(self):
+        m.clean_identity(CLEAN)
+        m.clean_identity(CLEAN.replace(b"Groups:\t0", b"Groups:"))
+
+    def test_all_uid_gid_slots_and_supplementary_group_reject_worker(self):
+        for key in (b"Uid", b"Gid"):
+            for index in range(4):
+                ids = [b"0"] * 4
+                ids[index] = b"10001"
+                raw = CLEAN.replace(key + b":\t0 0 0 0", key + b":\t" + b" ".join(ids))
+                with self.subTest(key=key, index=index), self.assertRaises(ValueError):
+                    m.clean_identity(raw)
+        with self.assertRaises(ValueError):
+            m.clean_identity(CLEAN.replace(b"Groups:\t0", b"Groups:\t0 10001"))
+
+    def test_missing_duplicate_bad_numeric_identity_rejected(self):
+        for raw in (
+            CLEAN + b"Uid:\t0 0 0 0\n",
+            CLEAN.replace(b"Gid:", b"Other:"),
+            CLEAN.replace(b"Uid:\t0 0 0 0", b"Uid:\t0 0 0"),
+            CLEAN.replace(b"Groups:\t0", b"Groups:\t-1"),
+            CLEAN.replace(b"Groups:\t0", b"Groups:\t+0"),
+        ):
+            with self.assertRaises(ValueError):
+                m.clean_identity(raw)
+
+
+class CensusTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "PROC", self.root))
+        self.status = self.root / "2/task/2/status"
+        self.status.parent.mkdir(parents=True)
+        self.status.write_bytes(CLEAN)
+        self.budget = dict(bytes=0, seconds=0)
+
+    def test_two_sweeps_aggregate_only_shared_byte_budget(self):
+        first = m.census(self.budget)
+        self.assertEqual(first, dict(processes=1, threads=1, vanished=0, bytes_read=len(CLEAN)))
+        self.assertEqual(m.census(self.budget), first)
+        self.assertEqual(self.budget["bytes"], len(CLEAN) * 2)
+
+    def test_nonleader_worker_thread_rejected(self):
+        path = self.root / "2/task/3/status"
+        path.parent.mkdir()
+        path.write_bytes(CLEAN.replace(b"Uid:\t0", b"Uid:\t10001"))
+        with self.assertRaises(ValueError):
+            m.census(self.budget)
+
+    def test_process_and_thread_counts_bounded(self):
+        def many(path):
+            if Path(path) == self.root:
+                return [
+                    types.SimpleNamespace(name=str(n), path=str(self.root / "2"))
+                    for n in range(4097)
+                ]
+            return [types.SimpleNamespace(name="2", path=str(self.status.parent))]
+
+        class Scan:
+            def __init__(self, path):
+                self.items = make_items(path)
+
+            def __enter__(self):
+                return iter(self.items)
+
+            def __exit__(self, *_):
+                pass
+
+        make_items = many
+        with patch.object(m.os, "scandir", Scan), self.assertRaises(ValueError):
+            m.census(self.budget)
+
+        def threads(path):
+            return (
+                [types.SimpleNamespace(name="2", path=str(self.root / "2"))]
+                if Path(path) == self.root
+                else [
+                    types.SimpleNamespace(name=str(n), path=str(self.status.parent))
+                    for n in range(8193)
+                ]
+            )
+
+        make_items = threads
+        with patch.object(m.os, "scandir", Scan), self.assertRaises(ValueError):
+            m.census(dict(bytes=0, seconds=0))
+
+    def test_overlong_status_rejected(self):
+        self.status.write_bytes(CLEAN + b"x" * 16385)
+        with self.assertRaises(ValueError):
+            m.census(self.budget)
+
+    def test_byte_and_time_caps_rejected_before_status_read(self):
+        for budget in (dict(bytes=16 * 1024**2, seconds=0), dict(bytes=0, seconds=41)):
+            with self.assertRaises(ValueError):
+                m.census(budget)
+
+    def test_disappeared_thread_counted_without_text(self):
+        path = self.root / "2/task/3"
+        path.mkdir()
+        result = m.census(self.budget)
+        self.assertEqual(result["vanished"], 1)
+        self.assertEqual(result["threads"], 2)
+
+    def test_symlink_and_permission_error_fail_closed(self):
+        self.status.unlink()
+        self.status.symlink_to(self.root / "missing")
+        with self.assertRaises(OSError):
+            m.census(self.budget)
+        with (
+            patch.object(m.os, "open", side_effect=PermissionError),
+            self.assertRaises(PermissionError),
+        ):
+            m.census(self.budget)
+
+
+class RootReadTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.path = self.root / "source.py"
+        self.path.write_bytes(b"synthetic_source")
+        self.path.chmod(0o400)
+        self.enterContext(patch.object(m, "private_directory"))
+        actual = os.fstat
+
+        def root_stat(fd):
+            info = actual(fd)
+            values = {key: getattr(info, key) for key in dir(info) if key.startswith("st_")}
+            values.update(st_uid=0, st_gid=0)
+            return types.SimpleNamespace(**values)
+
+        self.stat = self.enterContext(patch.object(m.os, "fstat", side_effect=root_stat))
+        self.root_stat = root_stat
+
+    def test_bounded_regular_read(self):
+        self.assertEqual(m.root_read(self.path), b"synthetic_source")
+
+    def test_nonprivate_mode_rejected(self):
+        self.path.chmod(0o644)
+        with self.assertRaises(ValueError):
+            m.root_read(self.path)
+
+    def test_nonroot_owner_rejected(self):
+        def nonroot(fd):
+            info = self.root_stat(fd)
+            info.st_uid = 10001
+            return info
+
+        self.stat.side_effect = nonroot
+        with self.assertRaises(ValueError):
+            m.root_read(self.path)
+
+    def test_symlink_and_hardlink_rejected(self):
+        link = self.root / "alias"
+        link.symlink_to(self.path)
+        with self.assertRaises(OSError):
+            m.root_read(link)
+        os.link(self.path, self.root / "hardlink")
+        with self.assertRaises(ValueError):
+            m.root_read(self.path)
+
+    def test_empty_and_oversized_rejected(self):
+        with self.assertRaises(ValueError):
+            m.root_read(self.path, 1)
+        empty = self.root / "empty"
+        empty.touch(mode=0o400)
+        with self.assertRaises(ValueError):
+            m.root_read(empty)
+
+    def test_metadata_mutation_rejected_but_atime_change_allowed(self):
+        count = 0
+        field = "st_mtime_ns"
+
+        def changed(fd):
+            nonlocal count
+            info = self.root_stat(fd)
+            count += 1
+            if count % 2 == 0:
+                setattr(info, field, getattr(info, field) + 1)
+            return info
+
+        self.stat.side_effect = changed
+        with self.assertRaises(ValueError):
+            m.root_read(self.path)
+        field = "st_atime_ns"
+        self.assertEqual(m.root_read(self.path), b"synthetic_source")
+
+
+class BindingTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.root, self.qual = self.temp / "fullsize", self.temp / "qualification"
+        self.root.mkdir(mode=0o700)
+        self.qual.mkdir(mode=0o700)
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.enterContext(patch.object(m, "QUAL_ROOT", self.qual))
+        self.enterContext(patch.object(m, "boundary"))
+        # Native root ownership is doubled on Mac; writer is real exclusive temp IO.
+        self.enterContext(patch.object(m, "private_directory"))
+        self.enterContext(
+            patch.object(m, "root_read", side_effect=lambda path, *a: path.read_bytes())
+        )
+        for name in ("stage", "credentials", "controller"):
+            (self.root / name).mkdir(mode=0o700)
+        for name in ("source-staging.json", "controller-staged.json"):
+            (self.root / name).write_bytes(b"unchanged")
+        self.request = dict(
+            attempt=m.ATTEMPT,
+            machine_id="a" * 32,
+            boot_id="aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            host_deadline_boottime=14300,
+            volumes=dict(root_volume="root", work_volume="work"),
+        )
+        self.expected = {
+            k: self.request[k] for k in ("attempt", "machine_id", "boot_id", "volumes")
+        }
+        self.written = []
+        self.b = types.SimpleNamespace(
+            sync=Mock(),
+            encode=lambda v: json.dumps(v).encode(),
+            write=self.write,
+            boot_time=lambda: 1000,
+            show=Mock(return_value=b"inactive"),
+        )
+        self.h = types.SimpleNamespace(cgroup_empty=Mock(return_value=True))
+        self.detached = types.SimpleNamespace(
+            context=Mock(return_value=(self.b, self.h, self.request)),
+            result=d.result,
+            units=d.units,
+            QUALIFICATION=d.QUALIFICATION,
+        )
+        self.ready = types.SimpleNamespace(
+            _inspect_same_host=Mock(),
+            modules=lambda: {"parent.py": entry},
+            DESCRIPTOR_SHA=ready.DESCRIPTOR_SHA,
+        )
+        self.enterContext(patch.object(m, "helpers", return_value=(self.detached, self.ready)))
+        self.scan = self.enterContext(
+            patch.object(
+                m,
+                "census",
+                return_value=dict(processes=20, threads=30, vanished=0, bytes_read=1000),
+            )
+        )
+        for name, value in (
+            ("request.json", self.request),
+            ("reaped.json", d.result("completed")),
+            ("dispatch.json", d.result("dispatch_requested")),
+            ("started.json", d.result("running")),
+            ("result.json", reply()),
+        ):
+            (self.qual / name).write_text(json.dumps(value))
+        (self.qual / "finish.started").write_bytes(b"consumed\n")
+
+    def write(self, path, raw):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+        self.written.append(path.name)
+
+    def call(self):
+        return m._bind_same_host(self.expected)
+
+    def test_success_actual_parent_contract_original_deadline_and_hash_last(self):
+        report = self.call()
+        raw = (self.root / "controller/binding.json").read_bytes()
+        binding = json.loads(raw)
+        self.assertEqual(binding["host_deadline_boottime"], 14300)
+        self.assertEqual(binding["host_started_boottime"], 0)
+        self.assertEqual(
+            (self.root / "controller/binding.sha256").read_bytes(), (m.sha(raw) + "\n").encode()
+        )
+        self.assertEqual(
+            self.written, ["started.json", "binding.json", "binding.sha256", "result.json"]
+        )
+        self.assertEqual(self.scan.call_count, 2)
+        self.ready._inspect_same_host.assert_called_once_with(self.request)
+        self.detached.context.assert_called_once_with(self.expected)
+        self.assertEqual(report["trust_scope"], m.TRUST)
+        self.assertTrue(report["binding_created"])
+        for key in (
+            "host_admitted",
+            "real_4b_import",
+            "training_authorized",
+            "gate_5_complete",
+            "production_eligible",
+            "adversarial_privileged_writer_exclusion_claimed",
+            "cloud_admission_established",
+            "retention_admission_established",
+            "retry_allowed",
+        ):
+            self.assertIs(report[key], False)
+        self.assertEqual((self.root / "source-staging.json").read_bytes(), b"unchanged")
+
+    def test_repeated_attempt_rejected_without_overwrite(self):
+        self.call()
+        raw = (self.root / "controller/binding.json").read_bytes()
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual((self.root / "controller/binding.json").read_bytes(), raw)
+        self.assertEqual(self.scan.call_count, 2)
+
+    def test_failed_and_cancelled_qualification_rejected(self):
+        (self.qual / "failed.json").write_bytes(b"failed")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "controller/binding.json").exists())
+        self.assertTrue((self.root / "native-admission/started.json").exists())
+
+    def test_cancel_marker_rejected(self):
+        (self.qual / "cancel.started").write_bytes(b"consumed\n")
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_wrong_boot_request_rejected(self):
+        changed = copy.deepcopy(self.request)
+        changed["boot_id"] = "0" * 36
+        (self.qual / "request.json").write_text(json.dumps(changed))
+        with self.assertRaises(ValueError):
+            self.call()
+        self.scan.assert_not_called()
+
+    def test_missing_finish_rejected(self):
+        (self.qual / "finish.started").unlink()
+        with self.assertRaises(FileNotFoundError):
+            self.call()
+
+    def test_unreaped_result_rejected(self):
+        (self.qual / "reaped.json").write_text(json.dumps(d.result("returned")))
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_nonempty_cgroup_rejected(self):
+        self.h.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_still_active_parent_rejected(self):
+        self.b.show.return_value = b"active"
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_readiness_failure_preserved_and_cannot_retry(self):
+        self.ready._inspect_same_host.side_effect = ValueError("synthetic")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "controller/binding.json").exists())
+        self.ready._inspect_same_host.side_effect = None
+        with self.assertRaises(ValueError):
+            self.call()
+        self.ready._inspect_same_host.assert_called_once()
+
+    def test_second_census_failure_prevents_binding(self):
+        self.scan.side_effect = [dict(processes=1), ValueError("synthetic_worker")]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "controller/binding.json").exists())
+
+    def test_original_deadline_not_renewed_when_insufficient(self):
+        self.b.boot_time = lambda: 3100
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse((self.root / "controller/binding.json").exists())
+
+    def test_existing_binding_cannot_overwrite(self):
+        path = self.root / "controller/binding.json"
+        path.write_bytes(b"prior")
+        with self.assertRaises(FileExistsError):
+            self.call()
+        self.assertEqual(path.read_bytes(), b"prior")
+
+    def test_partial_binding_failure_keeps_evidence_and_no_hash(self):
+        def fail(path, raw):
+            self.write(path, raw)
+            if path.name == "binding.json":
+                raise OSError("synthetic_lost_write_ack")
+
+        self.b.write = fail
+        with self.assertRaises(OSError):
+            self.call()
+        self.assertTrue((self.root / "controller/binding.json").exists())
+        self.assertFalse((self.root / "controller/binding.sha256").exists())
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_post_commit_report_failure_keeps_consumed_binding(self):
+        def fail(path, raw):
+            if path.name == "result.json":
+                raise OSError("synthetic_lost_ack")
+            self.write(path, raw)
+
+        self.b.write = fail
+        with self.assertRaises(OSError):
+            self.call()
+        self.assertTrue((self.root / "controller/binding.sha256").exists())
+        with self.assertRaises(ValueError):
+            self.call()
+
+
+if __name__ == "__main__":
+    unittest.main()

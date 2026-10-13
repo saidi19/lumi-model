@@ -1,0 +1,193 @@
+import ast
+import copy
+import hashlib
+import importlib.util
+import json
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "network_expiry_v2_test", ROOT / "scripts/build_sft_vm_network_expiry_v2.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+def snapshot():
+    rows = copy.deepcopy(m.objects())
+    for handle, row in enumerate(rows, 1):
+        next(iter(row.values()))["handle"] = handle
+    return rows
+
+
+def encode(rows):
+    return json.dumps({"nftables": rows}).encode()
+
+
+class NetworkExpiryV2Tests(unittest.TestCase):
+    def test_only_install_command_and_module_docstring_change(self):
+        old = (ROOT / "scripts/build_sft_vm_network_expiry_v1.py").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(old).hexdigest(),
+            "1e4ae4078af9fd024d2ae2988b3f265010acd6c4d65d126f60e574960c4d99f7",
+        )
+        new = (ROOT / "scripts/build_sft_vm_network_expiry_v2.py").read_bytes()
+
+        def unchanged_tree(raw):
+            tree = ast.parse(raw)
+            tree.body = [
+                item
+                for index, item in enumerate(tree.body)
+                if index != 0
+                and not (isinstance(item, ast.FunctionDef) and item.name == "install_policy")
+            ]
+            return ast.dump(tree, include_attributes=False)
+
+        self.assertEqual(unchanged_tree(old), unchanged_tree(new))
+
+    def test_frozen_numeric_limits(self):
+        raw = (ROOT / "configs/lumi-vm-fullsize-host-proposal-v0.1.json").read_bytes()
+        self.assertEqual(
+            hashlib.sha256(raw).hexdigest(),
+            "9e1ea3041ce5ca3ead8f58d0931dc8c7e41c5a66a9bc43e55ff75890b662c061",
+        )
+        limits = json.loads(raw)["transport"]
+        self.assertEqual(
+            m.QUOTAS,
+            {
+                "setup_in": limits["setup_https_inbound_cap_bytes"],
+                "all_in": limits["proposed_combined_vm_https_inbound_cap_bytes"],
+                "all_out": limits["proposed_backup_https_outbound_cap_bytes"],
+            },
+        )
+        self.assertEqual(limits["source_control_upload_cap_bytes"], 33554432)
+
+    def test_fresh_create_no_flush_or_reset(self):
+        commands = m.install_policy()["nftables"]
+        self.assertEqual(len(commands), len(m.objects()))
+        for command, obj in zip(commands, m.objects(), strict=True):
+            self.assertEqual(command, {"add" if "rule" in obj else "create": obj})
+        self.assertFalse(any("rule" in c.get("create", {}) for c in commands))
+        self.assertEqual(commands[0], {"create": {"table": {"family": "inet", "name": m.TABLE}}})
+
+    def test_combined_before_setup_gate(self):
+        rules = [
+            x["rule"]["expr"] for x in m.objects() if "rule" in x and x["rule"]["chain"] == "input"
+        ]
+        self.assertEqual(rules[-2][-2:], [{"quota": "all_in"}, {"drop": None}])
+        self.assertEqual(rules[-1][-1], {"jump": {"target": "setup_gate"}})
+
+    def test_ipv6_quic_http_and_forwarding_blocked(self):
+        for chain, field in (("input", "sport"), ("output", "dport")):
+            expressions = [
+                x["rule"]["expr"]
+                for x in m.objects()
+                if "rule" in x and x["rule"]["chain"] == chain
+            ]
+            self.assertEqual(expressions[0], [m.port("tcp", field, 80), {"drop": None}])
+            self.assertEqual(expressions[1], [m.port("udp", field, 443), {"drop": None}])
+            self.assertIn("ipv6", json.dumps(expressions[2]))
+        forward = [
+            x["chain"] for x in m.objects() if "chain" in x and x["chain"]["name"] == "forward"
+        ][0]
+        self.assertEqual(forward["policy"], "drop")
+
+    def test_readback_and_monotonic_usage(self):
+        rows = snapshot()
+        before = m.inspect(encode(rows))
+        rows[1]["quota"]["used"] = 100
+        self.assertEqual(m.inspect(encode(rows), previous=before)["used"]["all_in"], 100)
+        with self.assertRaises(ValueError):
+            m.inspect(encode(snapshot()), previous=m.inspect(encode(rows)))
+
+    def test_threshold_equality_requires_stop(self):
+        for name, cap in m.QUOTAS.items():
+            for used in (cap, cap + 1, -1, True, 1.5):
+                rows = snapshot()
+                next(x["quota"] for x in rows if "quota" in x and x["quota"]["name"] == name)[
+                    "used"
+                ] = used
+                with self.subTest(name=name, used=used), self.assertRaises(ValueError):
+                    m.inspect(encode(rows))
+
+    def test_transition_deletes_only_gate_and_preserves_all_quotas(self):
+        rows = snapshot()
+        rows[1]["quota"]["used"] = 120
+        rows[2]["quota"]["used"] = 120
+        command, before = m.setup_transition(encode(rows))
+        self.assertEqual(
+            command["nftables"],
+            [
+                {
+                    "delete": {
+                        "rule": {
+                            "family": "inet",
+                            "table": m.TABLE,
+                            "chain": "setup_gate",
+                            "handle": before["setup_handle"],
+                        }
+                    }
+                }
+            ],
+        )
+        rows.pop()
+        after = m.inspect(encode(rows), setup=False, previous=before)
+        self.assertEqual(after["used"], before["used"])
+        with self.assertRaises(ValueError):
+            m.setup_transition(encode(rows))
+
+    def test_changed_quota_identity_rejected(self):
+        rows = snapshot()
+        before = m.inspect(encode(rows))
+        rows[1]["quota"]["handle"] += 1000
+        with self.assertRaises(ValueError):
+            m.inspect(encode(rows), previous=before)
+
+    def test_weakened_extra_or_reordered_policy_rejected(self):
+        mutations = [
+            lambda r: r.pop(),
+            lambda r: r.append(copy.deepcopy(r[-1])),
+            lambda r: r[1]["quota"].update(inv=False),
+            lambda r: r[1]["quota"].update(bytes=2**63),
+            lambda r: r[0]["table"].update(name="other"),
+            lambda r: r.reverse(),
+        ]
+        for mutate in mutations:
+            rows = snapshot()
+            mutate(rows)
+            with self.assertRaises(ValueError):
+                m.inspect(encode(rows))
+
+    def test_bounded_duplicate_key_free_json(self):
+        for raw in (b"{}", b'{"nftables":[],"nftables":[]}', b"x" * 32769, b"\xff", b"null"):
+            with self.assertRaises(ValueError):
+                m.inspect(raw)
+
+    def test_metadata_does_not_change_policy(self):
+        rows = snapshot()
+        rows.insert(0, {"metainfo": {"json_schema_version": 1, "version": "synthetic"}})
+        self.assertEqual(m.inspect(encode(rows))["used"], dict.fromkeys(m.QUOTAS, 0))
+        rows.insert(0, copy.deepcopy(rows[0]))
+        with self.assertRaises(ValueError):
+            m.inspect(encode(rows))
+
+    def test_original_deadline_not_now_plus_allowance(self):
+        first = m.expiry_units(original_deadline_boot_seconds=14000, observed_boot_seconds=100)
+        later = m.expiry_units(original_deadline_boot_seconds=14000, observed_boot_seconds=2000)
+        self.assertEqual(first, later)
+        timer = first[m.TIMER]
+        self.assertIn("OnBootSec=14000s", timer)
+        self.assertIn("WakeSystem=yes", timer)
+        self.assertNotIn("OnActiveSec", timer)
+        self.assertIn("RandomizedDelaySec=0", timer)
+        self.assertIn("--no-block poweroff", first[m.SERVICE])
+
+    def test_bad_expired_or_extended_deadline_rejected(self):
+        for end, now in ((14401, 1), (0, 0), (True, 0), (10, 10), (10, 11), (10, -1), (10.5, 1)):
+            with self.subTest(end=end, now=now), self.assertRaises(ValueError):
+                m.expiry_units(original_deadline_boot_seconds=end, observed_boot_seconds=now)
+
+    def test_no_public_execution_even_with_approval_flag(self):
+        with self.assertRaisesRegex(ValueError, "native_network_expiry_admission_not_bound"):
+            m.run(approved=True)

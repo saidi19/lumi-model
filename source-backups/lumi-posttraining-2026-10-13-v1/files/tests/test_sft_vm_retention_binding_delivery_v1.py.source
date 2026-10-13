@@ -1,0 +1,523 @@
+"""Frozen native admission composition; only native/wire boundaries are doubled."""
+
+import ast
+import copy
+import importlib
+import json
+import shlex
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+m = importlib.import_module("run_sft_vm_retention_binding_detached_v1")
+d = importlib.import_module("run_sft_vm_retention_binding_delivery_v1")
+fixtures = importlib.import_module("tests.test_sft_vm_retention_admission_v1")
+channel = importlib.import_module("tests.test_sft_vm_runtime_qualification_v1")
+
+
+def bodies():
+    return {name: d.SOURCE.with_name(path).read_bytes() for name, path in d.HELPERS.items()}
+
+
+def observation(prior_pin, end):
+    return dict(
+        schema="lumi.vm-native-retention-admission.v0.1",
+        attempt=m.ATTEMPT,
+        trust_scope="dedicated-vm-trusted-admin-root-os-v1",
+        retention_binding_created=True,
+        retention_binding_sha256="e" * 64,
+        prior_binding_sha256=prior_pin,
+        deadline_boottime=end,
+        release_files_verified=21,
+        sdk_package_versions_matched=5,
+        metadata_and_package_files_observed=9,
+        post_import_work_free_floor_bytes=50111017472,
+        aggregates=dict(
+            package_bytes=300,
+            metadata_bytes=400,
+            initial_manifest_read_bytes=100,
+            package_manifest_sha256="a" * 64,
+            source_manifest_sha256="b" * 64,
+        ),
+        census_before=dict(processes=1, threads=1, vanished=0, bytes_read=50),
+        census_after=dict(processes=1, threads=1, vanished=0, bytes_read=50),
+        outer_stop_required_on_failure=True,
+        **{k: False for k in m.FALSE},
+    )
+
+
+class ContractTests(unittest.TestCase):
+    def test_all_actual_pins_and_public_boundaries(self):
+        self.assertEqual(m.sha(d.SOURCE.read_bytes()), d.SOURCE_SHA)
+        loaded = m.sources(bodies())
+        self.assertEqual(set(loaded), {"core.py", "admission.py"})
+        self.assertEqual(loaded["admission.py"].ENTRY_SHA, m.PINS["entry.py"])
+        self.assertEqual(len(d.payload()), 5)
+        for module in (m, d):
+            with self.assertRaises(ValueError):
+                module.run(approved=True)
+
+    def test_changed_missing_extra_sources_never_execute(self):
+        original = bodies()
+        for value in (
+            dict(original, **{"binder.py": b"bad"}),
+            {k: v for k, v in original.items() if k != "entry.py"},
+            dict(original, extra=b"bad"),
+        ):
+            with patch("builtins.exec") as execute, self.assertRaises(ValueError):
+                m.sources(value)
+            execute.assert_not_called()
+
+    def test_mac_service_rejects_before_reads(self):
+        with patch.object(m.sys, "platform", "darwin"), patch.object(m, "read_root") as read:
+            with self.assertRaises(ValueError):
+                m._serve_once()
+            read.assert_not_called()
+
+    def test_service_and_wire_programs_compile_and_are_bounded(self):
+        command = m.command("a" * 64)
+        compile(command[-1], "service", "exec")
+        for option in (
+            "RuntimeMaxSec=240",
+            "Restart=no",
+            "FailureAction=poweroff",
+            "MemorySwapMax=0",
+            "KillMode=control-group",
+            "StandardError=null",
+        ):
+            self.assertIn("--property=" + option, command)
+        for operation in ("dispatch", "status", "finish", "cancel"):
+            code = d.launcher(operation, {}, "a" * 64, 12800, list(map(len, d.payload())))
+            compile(code, "wire", "exec")
+            self.assertIn("signal.alarm(75)", code)
+            self.assertIn("strict=True", code)
+        with self.assertRaises(ValueError):
+            d.launcher("dispatch", {}, "a" * 64, 12800, [True] * 5)
+
+    def test_raw_text_boolean_counts_and_wrong_authority_rejected(self):
+        value = observation("d" * 64, 12800)
+        for changes in (
+            {"host_admitted": True},
+            {"credentials_issued": True},
+            {"release_files_verified": True},
+            {"exception_text": "secret"},
+            {"prior_binding_sha256": "f" * 64},
+            {"deadline_boottime": 12801},
+        ):
+            with self.assertRaises(ValueError):
+                m.validate_report(value | changes, "d" * 64, 12800)
+        for key, change in (
+            ("census_before", {"bytes_read": 16 * 1024**2}),
+            ("aggregates", {"package_bytes": 8415205182}),
+            ("aggregates", {"metadata_bytes": 3670017}),
+            ("aggregates", {"initial_manifest_read_bytes": True}),
+        ):
+            broken = copy.deepcopy(value)
+            broken[key].update(change)
+            with self.assertRaises(ValueError):
+                m.validate_report(broken, "d" * 64, 12800)
+
+
+class NativeTests(unittest.TestCase):
+    def setUp(self):
+        self.f = fixtures.AdmissionTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.root = self.f.root.parent / "detached-retention-binding"
+        self.enterContext(patch.object(m, "ROOT", self.root))
+        self.enterContext(patch.object(m, "FULLSIZE", self.f.root))
+        self.b = self.f.bootstrap
+        self.b.owned = Mock()
+        self.b.show = Mock(return_value=b"not-found")
+        self.b.command = Mock()
+        self.h = types.SimpleNamespace(
+            cgroup_empty=Mock(return_value=True), observe=Mock(), validate_terminal=Mock()
+        )
+        self.loaded = {
+            "core.py": types.SimpleNamespace(binder=lambda raw: self.f.binder),
+            "admission.py": fixtures.m,
+        }
+        self.context = self.enterContext(
+            patch.object(m, "context", return_value=(self.loaded, self.f.binder, self.b, self.h))
+        )
+        self.raw = bodies()
+        self.receiver = d.SOURCE.read_bytes()
+
+    def dispatch(self):
+        return m.dispatch(self.f.request, self.f.prior_pin, 12800, self.raw, self.receiver)
+
+    def serve(self):
+        self.b.show.return_value = b"active"
+        with (
+            patch.object(m, "__file__", str(self.root / "receiver.py")),
+            patch.object(m, "sources", return_value=self.loaded),
+            patch.object(m, "read_root", side_effect=lambda p, *a: p.read_bytes()),
+            patch.object(
+                m,
+                "sys",
+                types.SimpleNamespace(
+                    platform="linux",
+                    version_info=(3, 12),
+                    flags=types.SimpleNamespace(isolated=1),
+                    dont_write_bytecode=True,
+                ),
+            ),
+            patch.object(m, "os", types.SimpleNamespace(geteuid=lambda: 0, getegid=lambda: 0)),
+            patch.object(m.signal, "signal"),
+            patch.object(m.signal, "alarm") as alarm,
+        ):
+            m._serve_once()
+            self.assertEqual([c.args[0] for c in alarm.call_args_list], [220, 0])
+        self.b.show.return_value = b"inactive"
+        self.h.observe.return_value = dict(ActiveState="active", SubState="exited")
+
+    def finish(self):
+        return m.finish(self.f.request, self.f.prior_pin, 12800, self.raw)
+
+    def test_actual_admission_inventory_binding_report_and_reaping(self):
+        self.dispatch()
+        self.serve()
+        value = self.finish()
+        self.assertEqual(value["state"], "completed")
+        self.assertEqual(value["observation"]["deadline_boottime"], 12800)
+        self.assertTrue((self.root / "reaped.json").exists())
+        binding = self.f.root / "retention-controller/binding.json"
+        self.assertEqual(
+            value["observation"]["retention_binding_sha256"], m.sha(binding.read_bytes())
+        )
+        self.assertFalse(value["host_admitted"])
+        with self.assertRaises(FileExistsError):
+            self.finish()
+
+    def test_full_pinned_delivery_to_real_admission_and_reaped_reply(self):
+        wire = channel.ChannelTests()
+        wire.setUp()
+        self.addCleanup(wire.doCleanups)
+        self.f.request.update(
+            schema="lumi.vm-detached-setup-request.v0.1",
+            setup_deadline_boottime=1800,
+            volumes=wire.request["volumes"],
+        )
+        operations = []
+
+        def exchange(argv, body, timeout):
+            self.assertLessEqual(timeout, 80)
+            code = shlex.split(argv[-1])[-1]
+            tree = ast.parse(code)
+            values = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    target = node.targets[0]
+                    if isinstance(target, ast.Name) and target.id in {
+                        "request",
+                        "prior_pin",
+                        "end",
+                    }:
+                        values[target.id] = ast.literal_eval(node.value)
+                    if isinstance(target, ast.Name) and target.id == "answer":
+                        operation = node.value.func.attr
+            pieces, offset = [], 0
+            for raw in d.payload():
+                pieces.append(body[offset : offset + len(raw)])
+                offset += len(raw)
+            self.assertEqual(offset, len(body))
+            self.assertEqual(m.sha(pieces[0]), d.SOURCE_SHA)
+            received = dict(zip(d.HELPERS, pieces[1:], strict=True))
+            m.sources(received)
+            operations.append(operation)
+            args = (values["request"], values["prior_pin"], values["end"], received)
+            if operation == "dispatch":
+                result = m.dispatch(*args, pieces[0])
+                self.serve()
+            else:
+                result = getattr(m, operation)(*args)
+            return json.dumps(result).encode()
+
+        with patch.object(d.sender, "pipe_exchange", side_effect=exchange):
+            report = d._bind_retention_channel_once(
+                wire.root / "binding-integration",
+                wire.binding,
+                wire.key,
+                wire.root,
+                wire.config_pin,
+                wire.hosts_pin,
+                self.f.request,
+                self.f.prior_pin,
+                deadline=11350,
+                retention_deadline=12800,
+                host_deadline=14300,
+                remaining_control_bytes=4000000,
+                clock=lambda: 11000,
+                wait=lambda seconds: self.fail("synchronous fixture should already be returned"),
+            )
+        self.assertEqual(operations, ["dispatch", "status", "finish"])
+        self.assertTrue(report["binding_delivery_completed"])
+        self.assertEqual(report["observation"]["prior_binding_sha256"], self.f.prior_pin)
+        self.assertTrue((self.root / "reaped.json").exists())
+
+    def test_exclusive_source_mode_and_no_retry_after_lost_service_dispatch(self):
+        self.b.command.side_effect = TimeoutError("private-dispatch-error")
+        with self.assertRaises(TimeoutError):
+            self.dispatch()
+        for path in self.root.iterdir():
+            self.assertEqual(path.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(self.root.stat().st_mode & 0o777, 0o700)
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_called_once()
+
+    def test_dispatch_replay_existing_admission_or_active_service_rejected(self):
+        self.b.show.return_value = b"loaded"
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.show.return_value = b"not-found"
+        self.dispatch()
+        with self.assertRaises(ValueError):
+            self.dispatch()
+        self.b.command.assert_called_once()
+
+    def test_insufficient_native_reserve_before_dispatch(self):
+        for now in (12800 - 440, 10999):
+            self.b.boot_time = lambda now=now: now
+            with self.assertRaises(ValueError):
+                self.dispatch()
+        self.assertFalse(self.root.exists())
+
+    def test_partial_admission_failure_is_consumed_and_scrubbed(self):
+        self.dispatch()
+        with patch.object(fixtures.m, "_admit_same_host", side_effect=OSError("private-error")):
+            with self.assertRaisesRegex(ValueError, "retention_binding_service_failed"):
+                self.serve()
+        self.assertNotIn("private-error", (self.root / "failed.json").read_text())
+        with self.assertRaises(ValueError):
+            m.status(self.f.request, self.f.prior_pin, 12800, self.raw)
+        with self.assertRaises(ValueError):
+            self.dispatch()
+
+    def test_cancel_does_not_revoke_committed_binding(self):
+        self.dispatch()
+        self.serve()
+        path = self.f.root / "retention-controller/binding.json"
+        before = path.read_bytes()
+        result = m.cancel(self.f.request, self.f.prior_pin, 12800, self.raw)
+        self.assertTrue(result["binding_may_exist"])
+        self.assertEqual(path.read_bytes(), before)
+        with self.assertRaises(ValueError):
+            self.finish()
+        with self.assertRaises(FileExistsError):
+            m.cancel(self.f.request, self.f.prior_pin, 12800, self.raw)
+
+    def test_changed_binding_or_deadline_and_nonempty_cgroup_rejected(self):
+        self.dispatch()
+        self.serve()
+        self.h.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            self.finish()
+        self.h.cgroup_empty.return_value = True
+        with self.assertRaises(ValueError):
+            m.status(self.f.request, self.f.prior_pin, 12801, self.raw)
+        path = self.f.root / "retention-controller/binding.sha256"
+        path.chmod(0o600)
+        path.write_bytes(b"f" * 64 + b"\n")
+        with self.assertRaises(ValueError):
+            self.finish()
+
+    def test_completion_too_late_rejected(self):
+        self.dispatch()
+        self.serve()
+        self.b.boot_time = lambda: 12620
+        with self.assertRaises(ValueError):
+            self.finish()
+
+
+class DeliveryTests(unittest.TestCase):
+    def setUp(self):
+        self.f = channel.ChannelTests()
+        self.f.setUp()
+        self.addCleanup(self.f.doCleanups)
+        self.t = 11000
+        self.prior_pin = "d" * 64
+        self.end = 12700  # Native host end14300 vs controller end14400: preserve the offset.
+        self.responses = [
+            self.reply(s) for s in ("dispatch_requested", "running", "returned", "completed")
+        ]
+
+        def exchange(*_):
+            value = self.responses.pop(0)
+            if isinstance(value, BaseException):
+                raise value
+            return json.dumps(value).encode()
+
+        self.exchange = self.enterContext(
+            patch.object(d.sender, "pipe_exchange", side_effect=exchange)
+        )
+
+    def reply(self, state):
+        return m.result(
+            state,
+            observation(self.prior_pin, self.end) if state in {"returned", "completed"} else None,
+        )
+
+    def wait(self, seconds):
+        self.t += seconds
+
+    def call(self, **changes):
+        kw = dict(
+            deadline=11350,
+            retention_deadline=12800,
+            host_deadline=14400,
+            remaining_control_bytes=4000000,
+            clock=lambda: self.t,
+            wait=self.wait,
+        )
+        return d._bind_retention_channel_once(
+            self.f.root / "retention-binding",
+            self.f.binding,
+            self.f.key,
+            self.f.root,
+            self.f.config_pin,
+            self.f.hosts_pin,
+            self.f.request,
+            self.prior_pin,
+            **(kw | changes),
+        )
+
+    def saved(self):
+        return json.loads((self.f.root / "retention-binding/result.json").read_bytes())
+
+    def test_pinned_transfer_and_fixed_native_deadline_accounting(self):
+        result = self.call()
+        self.assertTrue(result["binding_delivery_completed"])
+        self.assertEqual(result["retention_deadline_boottime"], self.end)
+        charge = 0
+        for call in self.exchange.call_args_list:
+            argv, body, timeout = call.args
+            self.assertEqual(body, b"".join(d.payload()))
+            self.assertIn("signal.alarm(75)", argv[-1])
+            self.assertIn("end=12700", argv[-1])
+            self.assertLessEqual(timeout, 80)
+            charge += len(argv[-1].encode()) + len(body)
+        self.assertEqual(result["control_content_bytes_charged"], charge)
+
+    def test_native_check_outlives_tunnel_and_dispatches_once(self):
+        self.responses = (
+            [self.reply("dispatch_requested")]
+            + [self.reply("running")] * 14
+            + [self.reply("returned"), self.reply("completed")]
+        )
+        self.assertTrue(self.call()["binding_delivery_completed"])
+        self.assertGreater(self.t, 11120)
+        self.assertEqual(
+            sum("answer=m.dispatch" in c.args[0][-1] for c in self.exchange.call_args_list), 1
+        )
+
+    def test_lost_dispatch_ack_cancels_once_no_retry_or_raw_error(self):
+        self.responses = [TimeoutError("private-error"), self.reply("cancelled")]
+        with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+            self.call()
+        with self.assertRaises(FileExistsError):
+            self.call()
+        value = self.saved()
+        self.assertTrue(value["cancellation_observed"] and value["outer_stop_required_on_failure"])
+        self.assertFalse(value["cancellation_revokes_binding"])
+        self.assertNotIn("private-error", json.dumps(value))
+        self.assertEqual(self.exchange.call_count, 2)
+
+    def test_lost_finish_ack_and_changed_terminal_observation_fail_closed(self):
+        self.responses = [
+            self.reply("dispatch_requested"),
+            self.reply("returned"),
+            TimeoutError(),
+            self.reply("cancelled"),
+        ]
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.saved()["binding_state"], "unknown_after_dispatch")
+        self.assertEqual(
+            sum("answer=m.finish" in c.args[0][-1] for c in self.exchange.call_args_list), 1
+        )
+
+    def test_changed_terminal_observation_rejected(self):
+        value = self.reply("completed")
+        value["observation"]["retention_binding_sha256"] = "f" * 64
+        self.responses = [
+            self.reply("dispatch_requested"),
+            self.reply("returned"),
+            value,
+            self.reply("cancelled"),
+        ]
+        with self.assertRaises(ValueError):
+            self.call()
+
+    def test_invalid_deadline_or_budget_before_exchange(self):
+        for change in (
+            {"deadline": 11300},
+            {"deadline": 11351},
+            {"retention_deadline": 11530},
+            {"retention_deadline": 12801},
+            {"host_deadline": 13400},
+            {"deadline": float("nan")},
+            {"remaining_control_bytes": True},
+            {"remaining_control_bytes": 1000},
+        ):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.call(**change)
+        self.exchange.assert_not_called()
+
+    def test_known_host_drift_before_exchange(self):
+        (self.f.root / "known_hosts").write_bytes(b"changed")
+        with self.assertRaises(ValueError):
+            self.call()
+        self.exchange.assert_not_called()
+
+    def test_bounded_poll_exhaustion_and_cancel_failure(self):
+        self.responses = (
+            [self.reply("dispatch_requested")] + [self.reply("running")] * 24 + [TimeoutError()]
+        )
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertEqual(self.saved()["status_reads"], 24)
+        self.assertFalse(self.saved()["cancellation_observed"])
+        self.assertEqual(self.exchange.call_count, 26)
+
+    def test_late_exchange_and_unknown_observation_fail_closed(self):
+        def late(*_):
+            self.t = 11350
+            return json.dumps(self.reply("dispatch_requested")).encode()
+
+        self.exchange.side_effect = late
+        with self.assertRaises(ValueError):
+            self.call()
+        self.assertFalse(self.saved()["binding_delivery_completed"])
+        self.assertEqual(self.exchange.call_count, 1)
+
+    def test_strict_reply_and_no_raw_observation(self):
+        for changes in ({"exception": "raw"}, {"binding_may_exist": 1}, {"host_admitted": True}):
+            with self.assertRaises(ValueError):
+                d.state_reply(
+                    self.reply("returned") | changes, {"returned"}, self.prior_pin, self.end
+                )
+        wrong = self.reply("returned")
+        wrong["observation"]["deadline_boottime"] += 1
+        with self.assertRaises(ValueError):
+            d.state_reply(wrong, {"returned"}, self.prior_pin, self.end)
+
+    def test_lost_local_save_keeps_success_evidence_and_requires_stop(self):
+        save = d.sender.delivery.connection.issuer.base.save
+
+        def fail(path, value):
+            save(path, value)
+            if path.name == "result.json":
+                raise OSError("lost-local-ack")
+
+        self.responses.append(self.reply("cancelled"))
+        with patch.object(d.sender.delivery.connection.issuer.base, "save", side_effect=fail):
+            with self.assertRaisesRegex(ValueError, "outer_stop_required"):
+                self.call()
+        failure = json.loads((self.f.root / "retention-binding/failure.json").read_bytes())
+        self.assertTrue(failure["outer_stop_required_on_failure"])
+        self.assertFalse(failure["binding_delivery_completed"])
+        self.assertTrue(self.saved()["binding_delivery_completed"])

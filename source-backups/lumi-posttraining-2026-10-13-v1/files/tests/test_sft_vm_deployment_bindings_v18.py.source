@@ -1,0 +1,33 @@
+"""Offline tests for pre-deployment attempt-019 bindings."""
+import unittest
+from unittest.mock import patch
+
+from scripts import prepare_sft_vm_deployment_bindings_v18 as m
+
+
+class Tests(unittest.TestCase):
+    def test_source_absence_and_plan_verify(self):
+        manifest = m.verify()
+        plan = m.build()
+        self.assertEqual(len(manifest["outputs"]), 156)
+        self.assertTrue(plan["network_candidate_live_availability_verified"])
+        self.assertEqual(plan["required_control_proofs"], [])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_control_evidence_cannot_be_claimed_early(self):
+        with self.assertRaisesRegex(ValueError, "not_created"):
+            m.controls()
+
+    def test_drift_rejected(self):
+        for key in ("RELEASE_SHA", "SOURCE_PROOF_SHA", "ABSENCE_SHA", "PLAN_SHA"):
+            with self.subTest(key=key), patch.object(m, key, "0" * 64):
+                with self.assertRaises(ValueError):
+                    m.build()
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            m.run(approved=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

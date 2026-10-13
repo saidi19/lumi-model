@@ -1,0 +1,186 @@
+"""Real local SSH version probe plus synthetic STOP cases; no AWS/network."""
+
+import ast
+import copy
+import importlib
+import json
+import socket
+import sys
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_attempt015_local_repair_v1 as repair
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        repair.build()
+        manifest = json.loads(
+            (
+                repair.ROOT / "artifacts/lumi-vm-private-outer-execution-v0.17/attempt-015/"
+                "host-preparation/staged/manifest.json"
+            ).read_bytes()
+        )
+        sys.path.insert(0, str(repair.BASE / "scripts"))
+        cls.entry = importlib.import_module(manifest["entry"])
+        cls.entry.authenticate()
+        cls.original = cls.entry.lifecycle.guard.provision
+        cls.delivery = cls.original.setup.delivery.seed.sender.delivery
+
+    def candidate(self, module, transform):
+        result = types.ModuleType("offline_candidate")
+        result.__file__ = module.__file__
+        exec(
+            compile(transform(Path(module.__file__).read_text()), module.__file__, "exec"),
+            result.__dict__,
+        )
+        return result
+
+    def test_real_local_ssh_original_and_candidate(self):
+        for module in (self.delivery, self.candidate(self.delivery, repair.transport)):
+            self.assertEqual(module.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3), b"")
+
+    def test_cleanup_errors_remain_closed_and_all_resources_reaped(self):
+        module = self.candidate(self.delivery, repair.transport)
+        for error, stage in (
+            (PermissionError, "permission"),
+            (OSError, "os"),
+            (RuntimeError, "other"),
+        ):
+            processes = []
+            original = module.subprocess.Popen
+
+            def capture(*args, original=original, processes=processes, **kwargs):
+                p = original(*args, **kwargs)
+                processes.append(p)
+                return p
+
+            with (
+                patch.object(module.os, "killpg", side_effect=error("SECRET")),
+                patch.object(module.subprocess, "Popen", side_effect=capture),
+            ):
+                with self.assertRaises(module.ExchangeFailure) as caught:
+                    module.pipe_exchange(["/usr/bin/ssh", "-V"], b"", 3)
+            diagnostic = module.exchange_diagnostic(caught.exception)
+            self.assertEqual(diagnostic["exchange_stage"], "cleanup_kill_" + stage)
+            self.assertNotIn("SECRET", json.dumps(diagnostic))
+            self.assertEqual(processes[0].returncode, 0)
+            self.assertTrue(processes[0].stdin.closed and processes[0].stdout.closed)
+
+    def fixture(self, *, known=True):
+        module = self.candidate(self.original, repair.provision)
+        tx = object.__new__(module.Transaction)
+        tx.binding = {"key_name": "synthetic"}
+        instance = "i-00000000000000001"
+        if known:
+            tx.binding["instance"] = instance
+        tx.host = dict(
+            account="573978149073",
+            ami="ami-synthetic",
+            instance_type="r6i.4xlarge",
+            vpc="vpc-synthetic",
+            subnet="subnet-synthetic",
+        )
+        row = dict(
+            InstanceId=instance,
+            ClientToken=module.ATTEMPT,
+            ImageId=tx.host["ami"],
+            InstanceType=tx.host["instance_type"],
+            VpcId=tx.host["vpc"],
+            SubnetId=tx.host["subnet"],
+            KeyName="synthetic",
+            Tags=[dict(Key="LumiAttempt", Value=module.ATTEMPT)],
+        )
+        response = dict(Reservations=[dict(OwnerId=tx.host["account"], Instances=[row])])
+        tx.cli = Mock(return_value=response)
+        return tx, response
+
+    def test_known_reconciliation_uses_exact_id(self):
+        tx, response = self.fixture()
+        self.assertEqual(tx.instance(reconcile=True), response["Reservations"][0]["Instances"][0])
+        tx.cli.assert_called_once_with(
+            "ec2", "describe-instances", InstanceIds=["i-00000000000000001"]
+        )
+
+    def test_unknown_reconciliation_stays_bounded(self):
+        tx, _ = self.fixture(known=False)
+        tx.instance(reconcile=True)
+        self.assertEqual(tx.cli.call_args.kwargs["MaxResults"], 5)
+        self.assertIn("Filters", tx.cli.call_args.kwargs)
+
+    def test_pagination_still_rejected(self):
+        for known in (True, False):
+            tx, response = self.fixture(known=known)
+            response["NextToken"] = "synthetic"
+            with self.assertRaises(ValueError):
+                tx.instance(reconcile=True)
+
+    def test_identity_and_owner_mismatches_still_rejected(self):
+        for field in (
+            "InstanceId",
+            "ClientToken",
+            "ImageId",
+            "VpcId",
+            "InstanceType",
+            "SubnetId",
+            "KeyName",
+            "Tags",
+            "OwnerId",
+        ):
+            tx, response = self.fixture()
+            reservation = response["Reservations"][0]
+            if field == "OwnerId":
+                reservation[field] = "000000000000"
+            else:
+                reservation["Instances"][0][field] = [] if field == "Tags" else "wrong"
+            with self.assertRaises(ValueError):
+                tx.instance(reconcile=True)
+
+    def test_only_lookup_selection_changes_in_provision(self):
+        before = Path(self.original.__file__).read_text()
+        after = repair.provision(before)
+        self.assertEqual(
+            after.replace(
+                'if "instance" not in self.binding',
+                'if reconcile or "instance" not in self.binding',
+            ),
+            before,
+        )
+
+    def test_transport_body_except_cleanup_unchanged(self):
+        before = ast.parse(Path(self.delivery.__file__).read_text())
+        after = ast.parse(repair.transport(Path(self.delivery.__file__).read_text()))
+
+        def body(tree):
+            node = copy.deepcopy(
+                next(n for n in tree.body if getattr(n, "name", None) == "pipe_exchange")
+            )
+            for item in node.body:
+                if isinstance(item, ast.Try) and item.finalbody:
+                    item.finalbody = []
+            return ast.dump(node)
+
+        self.assertEqual(body(before), body(after))
+
+    def test_no_execution_authority(self):
+        with self.assertRaises(ValueError):
+            repair.run(approved=True)
+
+
+if __name__ == "__main__":
+    socket.has_ipv6 = False
+
+    def guard(event, args):
+        if event.startswith("socket."):
+            raise RuntimeError("network_forbidden")
+        if event == "subprocess.Popen" and args[1] != ["/usr/bin/ssh", "-V"]:
+            raise RuntimeError("only_local_ssh_version_probe_allowed")
+        if event == "open" and isinstance(args[0], (str, bytes)):
+            if "/.aws/" in str(args[0]) or "connection-key" in str(args[0]):
+                raise RuntimeError("private_credentials_forbidden")
+
+    sys.addaudithook(guard)
+    unittest.main()

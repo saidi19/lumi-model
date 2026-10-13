@@ -1,0 +1,70 @@
+# SFT execution status v0.40
+
+Observed filesystem acceptance, 2026-09-09. This local handoff records results
+for the already-published commit, without creating another CI run merely to
+record its own result. This document is not yet committed or published.
+
+## Exact accepted commit and remote results
+
+Both completed runs report head SHA
+`cd9498da1d48c8d7a94436a6a9b7d0292e62e6e4`.
+
+[Source CI 34308560259](https://github.com/saidi19/lumi-model/actions/runs/34308560259)
+passed all four jobs:
+
+- test: job 102330244962; 4583 passed, 58 skipped, 329 deselected, 36 warnings,
+  8526 subtests in 382.13 seconds.
+- source-only-validators: job 102330244877, passed.
+- frozen-lint-integrity: job 102330245010, passed.
+- isolated-sft-controls: job 102330245058, passed.
+
+Source accounting reports 4641 selected tests, 327 private integrations
+NOT_EXECUTED and two historical cases routed separately. Its explicit
+`full_ci_passed` and `private_integration_passed` remain false. This is accepted
+source/generated-fixture scope, not a claim that all repository/private tests ran.
+
+[Spark CI 34308560299](https://github.com/saidi19/lumi-model/actions/runs/34308560299)
+passed job 102330244980: 3 tests, zero skips, 64.39 seconds.
+
+The Linux filesystem wrapper's only skip condition is non-Linux. Its source
+acceptance requires all four generated cases, private mount/root and Landlock
+checks, same-UID host/proc-root access denial, read-only canary checks, bounded
+tmpfs exhaustion, permanent privilege drop, inherited-authority closure,
+three WorkerRun invocations/six ranks, four global/eight rank optimizer steps,
+and exact cleanup of four cgroups/mountpoints/sentinel processes. The passing
+Linux source run establishes this generated acceptance under that test contract.
+
+## Corrections retained in history
+
+The original filesystem commit `741639cc3eac16a4fa844c886350159f55e1e56a` failed
+before normal-case mount setup completed. Its successor
+`5ab44f96b677cc23f70c6f34eff79f7a55716eac` corrected namespace-affinity of pinned
+bind sources and advanced to a WorkerRun failure. Both failed runs remain
+preserved, with confirmed owned cleanup; neither was rerun unchanged or deleted.
+
+The accepted successor adds a verified-private-root READ_DIR-only opt-in for
+the unchanged loader's ancestor walk, plus allowlisted WorkerRun failure
+projection. It does not grant root file-content read/write/execute permission.
+The failure report from the prior run did not prove its exact inner failure;
+the source-AST regression independently established the directory-walk contract
+conflict, and the new remote result establishes end-to-end generated acceptance.
+
+Local verification was 939 stdlib-only tests, no failures/errors/skips,
+`ML_MODULES_LOADED=False`, exact Ruff and Linux-file AST checks. No Linux
+fixture/wrapper or ML runtime was imported or executed on the Mac. The older
+netns, cgroup and WorkerRun fixtures remain byte-for-byte bound and unchanged.
+Tracked code is clean after publication; unrelated untracked files are excluded.
+
+## Roadmap handoff
+
+The generated filesystem isolation/compatibility substep is now accepted.
+Gate 5 as a whole remains partial. Next source/design work is the trusted
+runtime/filesystem handoff and real-host admission binding, including residual
+pathname-UNIX IPC authority within exposed trusted trees. Complete hostile
+process containment, runtime origin and real-host admission are not proved here.
+
+Real-size import/relocation and actual H100 validation remain separate later
+work. No GPU instance, S3 object, pretrained model, real dataset, inference,
+training, registry, promotion or dataset seal was touched. Real-SFT admission
+and production eligibility remain false. No additional CI run was started
+after the accepted result.

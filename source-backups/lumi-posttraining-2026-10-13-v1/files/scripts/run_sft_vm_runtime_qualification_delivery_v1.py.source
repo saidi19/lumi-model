@@ -1,0 +1,261 @@
+"""One pinned generated-only qualification exchange; no public launch authority.
+
+Uses the existing authenticated SSH transport and installed CPU runtime. The
+source-only release is the previously successful v3 coordinator bundle, v0.4.
+Charge the transfer against the caller's existing control-byte/time budget.
+"""
+
+import hashlib
+import math
+import os
+import selectors
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+import qualify_sft_vm_existing_runtime_v1 as qualification
+import run_sft_vm_native_readiness_delivery_v1 as readiness
+
+sender = readiness.sender
+ATTEMPT = qualification.ATTEMPT
+SOURCE = Path(__file__).with_name("qualify_sft_vm_existing_runtime_v1.py")
+SOURCE_SHA = "1922beb8a6c49f7d8bf4d89e22a73259b3d37f38b4e910f0680499d49e4a064b"
+ARCHIVE = SOURCE.parents[1] / "artifacts/lumi-vm-coordinator-source-v0.4/source-release.tar.gz"
+TRUE = (
+    "native_ml_runtime_qualified",
+    "same_boot_readiness_rechecked",
+    "both_cgroups_empty",
+    "generated_tmpfs_unmounted",
+    "independent_checksum_consumer",
+)
+FALSE = (
+    "runtime_reinstalled",
+    "binding_created",
+    "host_admitted",
+    "real_4b_import",
+    "gate_5_complete",
+    "training_authorized",
+    "production_eligible",
+    "retry_allowed",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("runtime_qualification_delivery_rejected") from None
+
+
+def pipe_exchange(argv, body, timeout):
+    """Existing nonblocking control-pipe pattern, with this transfer's own caps.
+
+    Do not widen the frozen credential channel's 64 KiB / 100 second limits.
+    This source-only qualification needs <=247404 bytes and <=610 seconds.
+    """
+    need(type(body) is bytes and 0 < len(body) <= 181868 + 65536)
+    need(type(timeout) in {int, float} and 0 < timeout <= 610)
+    env = {k: os.environ[k] for k in ("HOME", "TMPDIR") if k in os.environ}
+    env.update(
+        PATH="/usr/bin:/bin:/opt/homebrew/bin", LC_ALL="C", AWS_MAX_ATTEMPTS="1", AWS_PAGER=""
+    )
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=env,
+    )
+    try:
+        deadline = time.monotonic() + timeout
+        reply, offset = bytearray(), 0
+        with selectors.DefaultSelector() as selector:
+            for stream, events, tag in (
+                (process.stdout, selectors.EVENT_READ, "read"),
+                (process.stdin, selectors.EVENT_WRITE, "write"),
+            ):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, events, tag)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                need(remaining > 0)
+                events = selector.select(remaining)
+                need(events)
+                for key, _ in events:
+                    if key.data == "write":
+                        try:
+                            size = os.write(key.fd, memoryview(body)[offset : offset + 65536])
+                        except BlockingIOError:
+                            continue
+                        need(size > 0)
+                        offset += size
+                        if offset == len(body):
+                            selector.unregister(key.fileobj)
+                            process.stdin.close()
+                    else:
+                        try:
+                            chunk = os.read(key.fd, 4097 - len(reply))
+                        except BlockingIOError:
+                            continue
+                        reply.extend(chunk)
+                        need(len(reply) <= 4096)
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+            need(offset == len(body))
+            need(process.wait(timeout=max(0.001, deadline - time.monotonic())) == 0)
+        return bytes(reply)
+    except BaseException:
+        raise ValueError("qualification_ssh_exchange_failed") from None
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        finally:
+            process.stdin.close()
+            process.stdout.close()
+
+
+def validate_reply(value):
+    need(
+        type(value) is dict
+        and set(value)
+        == {
+            "schema",
+            "attempt",
+            "qualification_attempt",
+            "status",
+            "source_files_verified",
+            "generated_files_unchanged",
+            "full_input_audits",
+            *TRUE,
+            *FALSE,
+        }
+    )
+    need(value["schema"] == "lumi.vm-existing-runtime-qualification.v0.1")
+    need(
+        value["attempt"] == ATTEMPT
+        and value["qualification_attempt"] == qualification.QUALIFICATION
+    )
+    need(value["status"] == "passed_generated_only")
+    need(all(value[k] is True for k in TRUE) and all(value[k] is False for k in FALSE))
+    need(type(value["source_files_verified"]) is int and value["source_files_verified"] == 49)
+    need(type(value["full_input_audits"]) is int and value["full_input_audits"] == 2)
+    need(
+        type(value["generated_files_unchanged"]) is int
+        and 49 < value["generated_files_unchanged"] <= 256
+    )
+    return value
+
+
+def launcher(request, lengths):
+    source_len, readiness_len, archive_len = lengths
+    return f"""import hashlib,json,os,signal,sys,types
+def expired(*_):
+ raise TimeoutError('generated_qualification_deadline')
+try:
+ signal.signal(signal.SIGALRM,expired)
+ signal.alarm(600)
+ assert sys.platform=='linux' and sys.version_info[:2]==(3,12)
+ assert os.geteuid()==os.getegid()==0 and sys.flags.isolated and sys.dont_write_bytecode
+ raw=sys.stdin.buffer.read({sum(lengths) + 1})
+ assert len(raw)=={sum(lengths)}
+ source=raw[:{source_len}]
+ ready=raw[{source_len}:{source_len + readiness_len}]
+ archive=raw[{source_len + readiness_len}:]
+ assert hashlib.sha256(source).hexdigest()=={SOURCE_SHA!r}
+ assert hashlib.sha256(ready).hexdigest()=={qualification.READINESS_SHA!r}
+ assert len(archive)=={archive_len}
+ assert hashlib.sha256(archive).hexdigest()=={qualification.ARCHIVE_SHA!r}
+ m=types.ModuleType('_authenticated_runtime_qualification')
+ m.__file__='/opt/lumi-bootstrap-input/qualify_sft_vm_existing_runtime_v1.py'
+ exec(compile(source,m.__file__,'exec'),m.__dict__)
+ result=m._qualify_same_host({request!r},archive,ready)
+ body=json.dumps(result,sort_keys=True,separators=(',',':'),allow_nan=False).encode()
+ assert len(body)<=4096
+ sys.stdout.buffer.write(body)
+except BaseException:
+ sys.exit(1)
+"""
+
+
+def _qualify_channel_once(
+    output,
+    binding,
+    key,
+    directory,
+    config_sha,
+    hosts_sha,
+    request,
+    *,
+    deadline,
+    remaining_control_bytes,
+    clock=time.monotonic,
+):
+    readiness.validate_request(request, binding)
+    need(type(deadline) in {int, float} and math.isfinite(deadline))
+    need(610 < deadline - clock() <= 14400)
+    need(type(remaining_control_bytes) is int and 0 < remaining_control_bytes <= 32 * 1024**2)
+    source = SOURCE.read_bytes()
+    ready = readiness.SOURCE.read_bytes()
+    need(0 < len(source) <= 32768 and hashlib.sha256(source).hexdigest() == SOURCE_SHA)
+    need(
+        0 < len(ready) <= 32768 and hashlib.sha256(ready).hexdigest() == qualification.READINESS_SHA
+    )
+    archive = ARCHIVE.read_bytes()
+    qualification.unpack(archive)
+    raw = source + ready + archive
+    argv = sender.command(
+        binding,
+        key,
+        directory,
+        config_sha,
+        hosts_sha,
+        launcher(request, (len(source), len(ready), len(archive))),
+    )
+    charge = len(argv[-1].encode()) + len(raw)
+    need(charge <= remaining_control_bytes)
+    sender.delivery.connection.safe_path(output)
+    output.mkdir(mode=0o700, exist_ok=False)
+    save = sender.delivery.connection.issuer.base.save
+    save(
+        output / "started.json",
+        dict(
+            attempt=ATTEMPT,
+            qualification_attempt=qualification.QUALIFICATION,
+            source_sha256=SOURCE_SHA,
+            archive_sha256=qualification.ARCHIVE_SHA,
+            control_content_bytes_charged=charge,
+            retry_allowed=False,
+        ),
+    )
+    try:
+        need(deadline - clock() > 610)
+        result = validate_reply(sender.delivery.decode(pipe_exchange(argv, raw, 610)))
+        report = dict(
+            status="generated_runtime_qualified_not_admission",
+            observation=result,
+            control_content_bytes_charged=charge,
+            host_admitted=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            retry_allowed=False,
+        )
+    except BaseException:
+        report = dict(
+            status="qualification_failed_preserve_no_retry",
+            host_admitted=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            retry_allowed=False,
+        )
+        save(output / "result.json", report)
+        raise ValueError("generated_qualification_exchange_failed") from None
+    save(output / "result.json", report)
+    return report
+
+
+def run(**_arguments):
+    raise ValueError("authenticated_same_host_channel_not_bound") from None

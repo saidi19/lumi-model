@@ -1,0 +1,194 @@
+"""Trusted-parent scalar write reservation core, not a native listener service.
+
+The fixed 80-byte notification / 24-byte response layouts are Linux x86-64 ABI
+candidates, not a target-kernel probe. No seccomp, ioctl, descriptor transfer,
+payload read, process launch or native enforcement is performed by this module.
+A future authenticated adapter must bind the listener to both fixed filters,
+validate notification IDs in the kernel, and own response transmission while an
+independent deadline/parent-loss guardian remains armed. The public server stays
+closed. Private callbacks are trusted-parent test/integration boundaries, never
+worker-controlled callbacks or evidence that a kernel operation succeeded.
+
+Every scalar write/pwrite64 request is charged across ALL destinations before
+either callback. No buffer/path is inspected, FD is exempted, or failed/short/
+cancelled write refunded. This protects a requested data-byte upper bound only;
+CONTINUE does not generally solve pointer/FD TOCTOU, metadata or physical disk
+accounting. All alternative write channels and inherited authority must be
+excluded by independently qualified controls. Budget creation is not approval.
+
+Only aggregate snapshots/fixed error codes may be retained. Notification and
+response bytes and private IDs must not be logged. A failed callback, stale ID,
+deadline, malformed request, reentry or ambiguity terminally consumes this core;
+no retry, refund, reset, budget enlargement or replacement listener is offered.
+Suppressed exception display is not safe exception-object retention: tracebacks
+can retain private frames. Retain the fixed code only, never an exception object.
+"""
+
+from __future__ import annotations
+
+import os
+import struct
+import threading
+import time
+
+SCHEMA = "lumi.checkpoint-write-broker.v0.1"
+BUDGET_SCHEMA = "lumi.checkpoint-write-budget.v0.1"
+AUDIT_ARCH_X86_64 = 0xC000003E
+NOTIFICATION = struct.Struct("<QIIiIQ6Q")
+RESPONSE = struct.Struct("<QqiI")
+MAXIMUM_BYTES = 128 * 1024**3
+MAXIMUM_NOTIFICATIONS = 262144
+MAXIMUM_CALL_BYTES = 1048576
+MAXIMUM_SECONDS = 3600
+CONTINUE = 1
+FALSE_FLAGS = (
+    "native_listener_bound", "kernel_id_validation_verified", "native_response_verified",
+    "native_abi_qualified", "alternative_write_channels_closed",
+    "independent_deadline_enforced", "native_cumulative_write_enforcement_verified",
+    "metadata_or_physical_write_accounting", "host_admission_verified",
+    "execution_permitted", "real_import_permitted", "gate_5_complete",
+    "training_authorized", "production_eligible", "retry_allowed",
+)
+ERROR_CODES = frozenset({
+    "budget_rejected", "notification_rejected", "deadline_exhausted", "owner_mismatch",
+    "reentry", "already_failed", "budget_exhausted", "request_limit_exhausted",
+    "call_limit_exhausted", "duplicate_notification", "notification_invalid",
+    "response_rejected", "callback_rejected", "broker_failed", "host_guard_not_bound",
+})
+
+
+class WriteBrokerError(ValueError):
+    def __init__(self, code="broker_failed"):
+        self.code = code if type(code) is str and code in ERROR_CODES else "broker_failed"
+        super().__init__(self.code)
+
+
+def _need(condition, code):
+    if not condition:
+        raise WriteBrokerError(code) from None
+
+
+def make_budget(*, maximum_bytes, maximum_notifications, maximum_call_bytes, precharged_bytes=0):
+    """Build detached bounded planning controls, never an authorization capability."""
+    _need(type(maximum_bytes) is int and 0 < maximum_bytes <= MAXIMUM_BYTES
+          and type(maximum_notifications) is int
+          and 0 < maximum_notifications <= MAXIMUM_NOTIFICATIONS
+          and type(maximum_call_bytes) is int
+          and 0 < maximum_call_bytes <= min(maximum_bytes, MAXIMUM_CALL_BYTES)
+          and type(precharged_bytes) is int and 0 <= precharged_bytes <= maximum_bytes,
+          "budget_rejected")
+    return {"schema": BUDGET_SCHEMA, "maximum_bytes": maximum_bytes,
+            "maximum_notifications": maximum_notifications,
+            "maximum_call_bytes": maximum_call_bytes, "precharged_bytes": precharged_bytes}
+
+
+def _budget(value):
+    _need(type(value) is dict and set(value) == {
+        "schema", "maximum_bytes", "maximum_notifications", "maximum_call_bytes",
+        "precharged_bytes"} and type(value["schema"]) is str
+        and value["schema"] == BUDGET_SCHEMA, "budget_rejected")
+    return make_budget(**{key: item for key, item in value.items() if key != "schema"})
+
+
+def parse_notification(raw):
+    """Decode private candidate ABI bytes; discard PID, IP, FD, pointers and offsets.
+
+    This validates wire shape only, NOT kernel origin or ID validity. The scalar
+    count is never truncated, signed, obtained from a pointer, or FD-classified.
+    """
+    _need(type(raw) is bytes and len(raw) == NOTIFICATION.size == 80, "notification_rejected")
+    identifier, pid, flags, number, arch, _ip, *_arguments = NOTIFICATION.unpack(raw)
+    _need(0 < pid < 2**31 and flags == 0 and arch == AUDIT_ARCH_X86_64
+          and number in (1, 18), "notification_rejected")
+    return {"id": identifier, "syscall": number, "requested_bytes": _arguments[2]}
+
+
+def serve_write_notifications(**_arguments):
+    """Neither supplied pins nor approval flags open an unbound native server."""
+    raise WriteBrokerError("host_guard_not_bound") from None
+
+
+class _Broker:
+    """One trusted-owner request stream; no listener authority is created here."""
+
+    def __init__(self, budget, *, deadline_ns):
+        copied = _budget(budget)
+        now = time.monotonic_ns()
+        _need(type(now) is int and now >= 0 and type(deadline_ns) is int
+              and now < deadline_ns < 2**63
+              and deadline_ns - now <= MAXIMUM_SECONDS * 1_000_000_000, "deadline_exhausted")
+        self._budget = copied
+        self._deadline_ns = deadline_ns
+        self._owner = os.getpid(), threading.get_ident()
+        self._lock = threading.Lock()
+        self._reserved = copied["precharged_bytes"]
+        self._notifications = self._continued = 0
+        self._seen = set()
+        self._failed = False
+
+    def _owner_check(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+
+    def _live(self):
+        self._owner_check()
+        _need(not self._failed, "already_failed")
+        now = time.monotonic_ns()
+        _need(type(now) is int and 0 <= now < self._deadline_ns, "deadline_exhausted")
+
+    def _enter(self):
+        try:
+            self._owner_check()
+            _need(self._lock.acquire(blocking=False), "reentry")
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is WriteBrokerError else "broker_failed"
+            raise WriteBrokerError(code) from None
+
+    def _service_admitted_once(self, raw, *, id_valid, send_response):
+        """Consume one candidate notification under future native adapter ownership.
+
+        Debit precedes ID validation and send. Callbacks must respectively return
+        exact True and None; any other result is ambiguous terminal failure. The
+        caller must independently kill the owned workload after any error, not
+        reuse this object or instantiate a replacement for the same attempt.
+        """
+        self._enter()
+        try:
+            self._live()
+            _need(callable(id_valid) and callable(send_response), "callback_rejected")
+            request = parse_notification(raw)
+            identifier, count = request["id"], request["requested_bytes"]
+            _need(identifier not in self._seen, "duplicate_notification")
+            _need(self._notifications < self._budget["maximum_notifications"],
+                  "request_limit_exhausted")
+            _need(count <= self._budget["maximum_call_bytes"], "call_limit_exhausted")
+            _need(count <= self._budget["maximum_bytes"] - self._reserved, "budget_exhausted")
+            # Reserve before either external callback. There is no rollback.
+            self._seen.add(identifier)
+            self._notifications += 1  # Zero-length requests consume this bound too.
+            self._reserved += count
+            self._live()
+            _need(id_valid(identifier) is True, "notification_invalid")
+            self._live()
+            response = RESPONSE.pack(identifier, 0, 0, CONTINUE)
+            _need(len(response) == 24, "response_rejected")
+            _need(send_response(response) is None, "response_rejected")
+            self._live()  # A swallowed nested failure or late send remains terminal.
+            self._continued += 1
+        except BaseException as error:
+            self._failed = True
+            code = error.code if type(error) is WriteBrokerError else "broker_failed"
+            raise WriteBrokerError(code) from None
+        finally:
+            self._lock.release()
+
+    def snapshot(self):
+        """Aggregate diagnostics only, including after a terminal failure/deadline."""
+        self._enter()
+        try:
+            return {"schema": SCHEMA, "reserved_bytes": self._reserved,
+                    "notifications_reserved": self._notifications,
+                    "continued_notifications": self._continued, "terminal_failed": self._failed,
+                    **dict.fromkeys(FALSE_FLAGS, False)}
+        finally:
+            self._lock.release()

@@ -1,0 +1,309 @@
+"""Source-pinned attempt-008 deployment scope and approval bindings, not execution.
+
+Only pure policy/metadata builders are evaluated. No AWS SDK, CLI, credentials,
+live policy reads/writes, deployment, instance action or import is performed.
+The approval template is deliberately unapproved; a saved template is no grant.
+"""
+
+import ast
+import builtins
+import hashlib
+import json
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = "artifacts/lumi-vm-recovery-outer-v0.8"
+RELEASE_SHA = "dd9170eb58a6ccd50269e5b0d4c4aee8abea91fc13ff76e5ea763f4a0387596e"
+REPORT = "evidence/lumi-vm-recovery-outer-v0.1.json"
+REPORT_SHA = "86e62ff0b8cedd5173d146e2dea034faceb945148f611afbe32caa5d9c47423d"
+ATTEMPT = "242bd09f5fa84b1f9a4e46cb4592ad8b"
+OLD = "606d788073f1f0b66a39eabeb4b32c2c"
+SOURCES = (
+    "scripts/sft_vm_external_watchdog_v1.py",
+    "scripts/prepare_sft_vm_external_watchdog_v1.py",
+    "scripts/arm_sft_vm_external_watchdog_v2.py",
+    "scripts/sft_vm_network_cleanup_v1.py",
+    "scripts/check_sft_vm_cleanup_store_v1.py",
+    "configs/lumi-vm-fullsize-host-proposal-v0.1.json",
+    "configs/lumi-vm-private-network-plan-v0.1.json",
+)
+
+
+def need(value):
+    if not value:
+        raise ValueError("deployment_binding_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def unique(pairs):
+    result = {}
+    for key, value in pairs:
+        need(key not in result)
+        result[key] = value
+    return result
+
+
+def decode(raw):
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def read(path, pin, maximum=131072):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= maximum)
+    raw = path.read_bytes()
+    need(len(raw) <= maximum and sha(raw) == pin)
+    return raw
+
+
+def inputs():
+    manifest = decode(read(ROOT / RELEASE / "release.json", RELEASE_SHA))
+    report = decode(read(ROOT / REPORT, REPORT_SHA))
+    need(manifest["attempt"] == report["attempt"] == ATTEMPT)
+    need(report["results"]["outer_loader_integrated"] is True)
+    need(report["boundaries"]["live_execution_authorized"] is False)
+    blobs = {n: read(ROOT / RELEASE / n, manifest["outputs"][n]["sha256"]) for n in SOURCES}
+    return blobs, {n: manifest["outputs"][n] for n in SOURCES}
+
+
+def module(raw, name, dependencies=None):
+    dependencies = dependencies or {}
+    value = types.ModuleType("_scope_" + name)
+    value.__file__ = str(ROOT / RELEASE / "scripts" / (name + ".py"))
+
+    def local_import(key, globals=None, locals=None, fromlist=(), level=0):
+        if key in dependencies:
+            need(level == 0)
+            return dependencies[key]
+        need(
+            key
+            in {
+                "base64",
+                "datetime",
+                "hashlib",
+                "io",
+                "json",
+                "math",
+                "os",
+                "re",
+                "time",
+                "subprocess",
+                "sys",
+                "zipfile",
+                "pathlib",
+            }
+        )
+        return builtins.__import__(key, globals, locals, fromlist, level)
+
+    value.__dict__["__builtins__"] = {**vars(builtins), "__import__": local_import}
+    exec(compile(raw, value.__file__, "exec"), value.__dict__)
+    return value
+
+
+def build(blobs, pins):
+    need(set(blobs) == set(pins) == set(SOURCES))
+    need(
+        all(
+            len(raw) == pins[n]["bytes"] and sha(raw) == pins[n]["sha256"]
+            for n, raw in blobs.items()
+        )
+    )
+    worker = module(blobs[SOURCES[0]], "sft_vm_external_watchdog_v1")
+    inert = module(
+        blobs[SOURCES[1]],
+        "prepare_sft_vm_external_watchdog_v1",
+        {"sft_vm_external_watchdog_v1": worker},
+    )
+    cleanup = module(blobs[SOURCES[3]], "sft_vm_network_cleanup_v1")
+    need(worker.ATTEMPT == cleanup.ATTEMPT == ATTEMPT)
+    tree = ast.parse(blobs[SOURCES[4]])
+    selected = [
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "required_denials"
+    ]
+    need(len(selected) == 1)
+    namespace = {"worker": cleanup}
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]), "<pinned-denial-builder>", "exec"),
+        namespace,
+    )
+    denials = namespace["required_denials"]()
+    need(len(denials) == 4 and all(row["Effect"] == "Deny" for row in denials))
+    for index, row in enumerate(denials, 1):
+        row["Sid"] = "LumiCleanup" + ATTEMPT + str(index)
+    policies = [
+        dict(role=name, trust=trust, inline_policy=policy)
+        for name, trust, policy in inert.policies()
+    ]
+    host = decode(blobs[SOURCES[5]])
+    network = decode(blobs[SOURCES[6]])
+    need(host["prepared_attempt"] == network["attempt"] == ATTEMPT)
+    guard = ast.parse(blobs[SOURCES[2]])
+    code = next(
+        n.value.value
+        for n in guard.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == "CODE"
+    )
+    plan = dict(
+        schema="lumi.vm-attempt-008-deployment-plan.v0.1",
+        status="prepared_not_authorized",
+        attempt=ATTEMPT,
+        account=worker.ACCOUNT,
+        region=worker.REGION,
+        release_manifest_sha256=RELEASE_SHA,
+        integration_report_sha256=REPORT_SHA,
+        source_bindings={RELEASE + "/" + n: pin for n, pin in pins.items()},
+        watchdog=dict(
+            function=inert.FUNCTION,
+            roles=policies,
+            role_path=inert.PATH,
+            inline_policy_name=inert.POLICY,
+            log_group=inert.LOG_GROUP,
+            log_retention_days=7,
+            schedule_group_reserved=inert.GROUP,
+            maximum_new_roles=2,
+            maximum_new_functions=1,
+            maximum_new_log_groups=1,
+            schedule_creation_allowed=False,
+            invocation_allowed=False,
+            reserved_concurrency=0,
+            environment=inert.UNARMED,
+            expected_code_sha256_base64=code,
+            api_calls_maximum=45,
+            mutation_retry_allowed=False,
+            deployment_output="artifacts/lumi-vm-attempt-008-watchdog-deployment-v0.1",
+            collision_rule="Any exact-name collision stops before mutation; no adoption or update.",
+            partial_failure="Preserve IDs/evidence; no automatic rollback, retry or deletion.",
+        ),
+        cleanup_store=dict(
+            bucket=cleanup.BUCKET,
+            prefix=cleanup.PREFIX,
+            deny_statements=denials,
+            new_allows=0,
+            existing_statements_preserved=True,
+            policy_before_sha256=None,
+            policy_after_sha256=None,
+            live_policy_read=False,
+            live_policy_write=False,
+            standalone_policy_document=False,
+            application_rule=(
+                "Never PUT these fragments as a whole bucket policy. Obtain current policy, "
+                "bind before/after hashes and writer coordination, or stop. "
+                "No policy application runner is bound here."
+            ),
+        ),
+        cpu_scope_reference=dict(
+            status="not_authorized_by_watchdog_scope",
+            instance_count=1,
+            instance_type=host["host"]["instance_type"],
+            vcpu=host["host"]["vcpu"],
+            memory_mib=host["host"]["memory_mib"],
+            maximum_instance_seconds=14400,
+            shared_controller_seconds=18000,
+            cleanup_reserve_seconds=1800,
+            storage=host["storage"],
+            source=host["transport"],
+            import_limits=host["frozen_import_content_limits"],
+            retention=host["retention_proposal"],
+            output="artifacts/lumi-vm-private-outer-execution-v0.8/attempt-008",
+            separate_full_scope_approval_required=True,
+            execution_entry_sha256=None,
+        ),
+        exclusions=[
+            "Existing or retained predecessor resources",
+            "EC2/NAT/EIP creation in watchdog phase",
+            "Checkpoint download or CPU import in watchdog phase",
+            "GPU, inference or training",
+            "Dataset or evaluation access",
+            "Promotion, registry mutation or seal",
+            "Automatic retry or overwrite",
+            "Retained EBS/S3 deletion",
+        ],
+        approval_record=None,
+        execution_permitted=False,
+        gate_5_complete=False,
+        unresolved_before_live_execution=[
+            "Explicit watchdog deployment approval; local preparation is not cloud authority.",
+            "Bounded deployment entry/deadline and live exact-name absence must be verified.",
+            "Read-only bucket-policy inspection, writer coordination and exact merge approval.",
+            "Separate bound CPU entry, full-scope approval and live admission before any instance.",
+        ],
+        cost_disclosure=dict(
+            host_planning_ceiling_usd=10,
+            network_planning_ceiling_usd=5,
+            separate_ceilings=True,
+            hard_billing_cap=False,
+            retained_storage_and_control_services_additional=True,
+            current_prices_checked=False,
+            credits_assumed=False,
+        ),
+    )
+    need(OLD not in json.dumps(plan))
+    need(host["host"]["instance_type"] == "r6i.4xlarge")
+    return plan
+
+
+def validate_plan(plan):
+    need(encode(plan) == encode(build(*inputs())))
+
+
+def approval_template(plan):
+    validate_plan(plan)
+    return dict(
+        schema="lumi.vm-attempt-008-watchdog-approval.v0.1",
+        status="pending_human_approval",
+        attempt=ATTEMPT,
+        plan_sha256=sha(encode(plan)),
+        scope="inert_watchdog_only",
+        human_message=None,
+        approved_execution_count=0,
+        deployment_entry_sha256=None,
+        cleanup_policy_write_approved=False,
+        cpu_execution_approved=False,
+    )
+
+
+def merge_policy(existing_raw, expected_before_sha256, plan):
+    """Pure candidate merge, never a live read, mutation or atomic-CAS claim."""
+    validate_plan(plan)
+    need(type(existing_raw) is bytes and 0 < len(existing_raw) <= 16384)
+    need(sha(existing_raw) == expected_before_sha256)
+    document = decode(existing_raw)
+    need(type(document) is dict and type(document.get("Statement")) is list)
+    rows = document["Statement"]
+    need(len(rows) <= 60 and all(type(row) is dict for row in rows))
+    wanted = plan["cleanup_store"]["deny_statements"]
+    need(len(wanted) == 4 and all(row["Effect"] == "Deny" for row in wanted))
+    keys = {row["Sid"] for row in wanted}
+    present = [row for row in rows if row.get("Sid") in keys]
+    if present:
+        need(encode(present) == encode(wanted))
+        return dict(
+            status="already_present_no_write",
+            before_sha256=expected_before_sha256,
+            after_sha256=expected_before_sha256,
+            candidate=None,
+            write_authorized=False,
+        )
+    successor = {**document, "Statement": rows + wanted}
+    raw = encode(successor)
+    need(len(raw) <= 16384 and successor["Statement"][: len(rows)] == rows)
+    return dict(
+        status="candidate_only_requires_separate_approval",
+        before_sha256=expected_before_sha256,
+        after_sha256=sha(raw),
+        candidate=successor,
+        write_authorized=False,
+    )
+
+
+def run(**_arguments):
+    raise ValueError("deployment_scope_is_not_execution_authority") from None

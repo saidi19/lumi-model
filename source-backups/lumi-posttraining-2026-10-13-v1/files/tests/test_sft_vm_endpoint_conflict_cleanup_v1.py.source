@@ -1,0 +1,200 @@
+"""No AWS calls: exact cleanup, preservation and transport failure fixtures."""
+
+import copy
+import json
+import types
+import unittest
+from unittest.mock import Mock, patch
+
+from scripts import cleanup_sft_vm_endpoint_conflict_v1 as m
+
+
+def tags(attempt):
+    return [dict(Key="LumiAttempt", Value=attempt)]
+
+
+class Fake:
+    def __init__(self):
+        self.save = Mock()
+        self.actions = []
+        self.groups = {
+            g: dict(
+                GroupId=g,
+                GroupName=m.KEY_NAME + suffix,
+                OwnerId=m.ACCOUNT,
+                VpcId=m.VPC,
+                Tags=tags(m.ATTEMPT),
+                IpPermissions=ingress,
+                IpPermissionsEgress=egress,
+            )
+            for g, suffix, ingress, egress in (
+                (m.VM, "-vm", [m.ssh(m.EP)], [m.HTTPS]),
+                (m.EP, "-endpoint", [], [m.ssh(m.VM)]),
+            )
+        }
+        self.key = dict(
+            KeyPairId=m.KEY, KeyName=m.KEY_NAME, KeyType="ed25519", Tags=tags(m.ATTEMPT)
+        )
+        self.endpoint = dict(
+            InstanceConnectEndpointId=m.ENDPOINT,
+            State="create-complete",
+            VpcId=m.VPC,
+            OwnerId=m.ACCOUNT,
+            SubnetId=m.OLD_SUBNET,
+            SecurityGroupIds=[m.OLD_GROUP],
+            NetworkInterfaceIds=[m.OLD_ENI],
+            Tags=tags(m.OLD),
+        )
+        self.instance = dict(
+            InstanceId=m.OLD_INSTANCE,
+            State={"Name": "stopped"},
+            VpcId=m.VPC,
+            SubnetId=m.OLD_SUBNET,
+            Tags=tags(m.OLD),
+            BlockDeviceMappings=[{"Ebs": {"VolumeId": v}} for v in m.VOLUMES],
+        )
+        self.dependent = False
+
+    def call(self, op, **fields):
+        if op not in m.READS:
+            self.actions.append((op, fields))
+            if op == "revoke-security-group-ingress":
+                self.groups[m.VM]["IpPermissions"] = []
+            elif op == "revoke-security-group-egress":
+                self.groups[m.EP]["IpPermissionsEgress"] = []
+            elif op == "delete-security-group":
+                del self.groups[fields["GroupId"]]
+            elif op == "delete-key-pair":
+                self.key = None
+            else:
+                self.endpoint = None
+                return {"InstanceConnectEndpoint": {"InstanceConnectEndpointId": m.ENDPOINT}}
+            return {"Return": True}
+        if op == "get-caller-identity":
+            return {"Account": m.ACCOUNT}
+        if op == "describe-instance-connect-endpoints":
+            return {"InstanceConnectEndpoints": [self.endpoint] if self.endpoint else []}
+        if op == "describe-instances":
+            return {
+                "Reservations": [dict(OwnerId=m.ACCOUNT, Instances=[self.instance])]
+                if "InstanceIds" in fields
+                else []
+            }
+        if op == "describe-volumes":
+            return {
+                "Volumes": [
+                    dict(
+                        VolumeId=v,
+                        State="in-use",
+                        Encrypted=True,
+                        Attachments=[{"InstanceId": m.OLD_INSTANCE}],
+                    )
+                    for v in m.VOLUMES
+                ]
+            }
+        if op == "describe-security-groups":
+            return {
+                "SecurityGroups": [
+                    copy.deepcopy(self.groups[g])
+                    for g in fields.get("GroupIds", self.groups)
+                    if g in self.groups
+                ]
+            }
+        if op == "describe-key-pairs":
+            return {"KeyPairs": [self.key] if self.key else []}
+        if op == "describe-network-interfaces":
+            return {
+                "NetworkInterfaces": [{"NetworkInterfaceId": "foreign"}] if self.dependent else []
+            }
+        if op == "describe-security-group-references":
+            return {"SecurityGroupReferenceSet": []}
+        if op == "describe-security-group-vpc-associations":
+            return {"SecurityGroupVpcAssociations": []}
+        raise AssertionError(op)
+
+
+class Tests(unittest.TestCase):
+    def test_exact_six_mutations_preserve_instance_and_volumes(self):
+        f = Fake()
+        before = copy.deepcopy(f.instance)
+        m.Cleanup(f, wait=lambda _: None).run()
+        self.assertEqual(f.actions, list(m.ACTIONS))
+        self.assertEqual(f.instance, before)
+        self.assertFalse(f.groups or f.key or f.endpoint)
+
+    def test_foreign_tag_running_vm_wrong_volume_or_dependent_eni_stops_before_write(self):
+        for change in (
+            lambda f: f.endpoint.update(Tags=tags("foreign")),
+            lambda f: f.instance.update(State={"Name": "running"}),
+            lambda f: f.instance.update(BlockDeviceMappings=[]),
+            lambda f: setattr(f, "dependent", True),
+            lambda f: f.groups[m.VM].update(IpPermissions=[]),
+        ):
+            f = Fake()
+            change(f)
+            with self.assertRaises(ValueError):
+                m.Cleanup(f).run()
+            self.assertFalse(f.actions)
+
+    def test_mutation_failure_does_not_retry_or_delete_endpoint(self):
+        f = Fake()
+        original = f.call
+
+        def call(op, **fields):
+            if op == "delete-security-group":
+                raise ValueError("synthetic")
+            return original(op, **fields)
+
+        f.call = call
+        with self.assertRaises(ValueError):
+            m.Cleanup(f).run()
+        self.assertEqual(len(f.actions), 2)
+        self.assertIsNotNone(f.endpoint)
+
+    def test_wrong_target_rejected_before_transport(self):
+        c = m.Cloud(Mock(), clock=lambda: 1)
+        with patch.object(m.subprocess, "run") as run, self.assertRaises(ValueError):
+            c.call("delete-security-group", GroupId=m.OLD_GROUP)
+        run.assert_not_called()
+
+    def test_transport_error_consumes_write_and_forbids_retry(self):
+        c = m.Cloud(Mock(), clock=lambda: 1)
+        failed = types.SimpleNamespace(
+            returncode=1, stdout=b"", stderr=b"An error occurred (DependencyViolation)"
+        )
+        with patch.object(m.subprocess, "run", return_value=failed) as run:
+            for _ in range(2):
+                with self.assertRaises(ValueError):
+                    c.call(*m.ACTIONS[0][:1], **m.ACTIONS[0][1])
+            self.assertEqual(run.call_count, 1)
+        self.assertEqual(c.writes, 1)
+
+    def test_read_budget_pagination_and_deadline(self):
+        for mode in ("budget", "pagination", "deadline"):
+            c = m.Cloud(Mock(), clock=lambda: 1)
+            if mode == "budget":
+                c.reads = 60
+            if mode == "deadline":
+                c.start = -899
+            value = types.SimpleNamespace(
+                returncode=0, stdout=json.dumps({"NextToken": "more"}).encode(), stderr=b""
+            )
+            with (
+                patch.object(m.subprocess, "run", return_value=value),
+                self.assertRaises(ValueError),
+            ):
+                c.call("get-caller-identity")
+
+    def test_association_token_cycle_stops(self):
+        f = Fake()
+        original = f.call
+
+        def call(op, **fields):
+            if op == "describe-security-group-vpc-associations":
+                return {"SecurityGroupVpcAssociations": [], "NextToken": "repeat"}
+            return original(op, **fields)
+
+        f.call = call
+        with self.assertRaises(ValueError):
+            m.Cleanup(f).run()
+        self.assertFalse(f.actions)

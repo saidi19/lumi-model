@@ -1,0 +1,564 @@
+"""Prepared, approval-bound source-only Linux setup transfer qualification.
+
+Never resume a consumed import. A separately approved disposable t3.micro uses
+the retained private endpoint/key without modifying them. Actual frozen seed,
+large-frame transport, native receiver and full receipt are used, not substitutes.
+"""
+
+import importlib
+import json
+import os
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+RELEASE = ROOT / "artifacts/lumi-vm-attempt-021-source-v0.1"
+RELEASE_SHA = "5cc27a9dc616baff2138aa81bd0d85a3089a33863fdc20270c71f7b7b0319409"
+PROOF = ROOT / "evidence/lumi-vm-attempt-021-source-verification-v0.1.json"
+PROOF_SHA = "e229517116e979636fa818ac20c921f52151bb644a9c24ebc28262e25a4fef87"
+PLAN = ROOT / "configs/lumi-setup-transfer-qualification-v0.1.json"
+APPROVAL = ROOT / "configs/lumi-setup-transfer-qualification-approval-v0.1.json"
+OUT = ROOT / "artifacts/lumi-setup-transfer-qualification-v0.1"
+READ_OUT = ROOT / "evidence/lumi-setup-transfer-readonly-readiness-v0.1.json"
+KEY = ROOT / (
+    "artifacts/lumi-vm-private-outer-execution-v0.25/attempt-020/host/execution/host/connection-key"
+)
+TOKEN = "lumi-setup-transfer-20261013-54c370e9"
+ACCOUNT = "573978149073"
+REGION = "us-east-1"
+AMI = "ami-0045d7fc2ad003464"
+VPC = "vpc-0905fbf9490a2dead"
+SUBNET = "subnet-0d25c06f30f8f812a"
+TABLE = "rtb-0022f8a855e85e2e7"
+ENDPOINT = "eice-039630ac19d9a7694"
+GROUP = "sg-039e86738f495e678"
+ENDPOINT_GROUP = "sg-09db4b81b405b3ccb"
+KEY_NAME = "lumi-fullsize-3179537f150b45548946f8114e8b73ca"
+RETAINED = "i-015114693b56c75e3"
+VOLUMES = {"vol-0e654866571fa99fd", "vol-0e6c46311964511ac"}
+OWNER_ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+FIXED_PINS = {
+    "scripts/sft_vm_diagnostic_bootstrap_v3.py": (
+        "a6189ddfcffdd0d9740ba95f77a8967c0eb315bd233d244d770e2f0901e323fe"
+    ),
+    "scripts/diagnose_sft_vm_transport_live_v1.py": (
+        "ca17033d8a43c5548d2c42fcd431361bcc3e25be731d95da688da928121c66ac"
+    ),
+}
+
+
+def need(value):
+    if not value:
+        raise ValueError("setup_qualification_rejected") from None
+
+
+def sha(raw):
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, cap=32 * 1024**2):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        need(stat.S_ISREG(before.st_mode) and before.st_nlink == 1)
+        need(0 < before.st_size <= cap)
+        raw = stream.read(before.st_size + 1)
+        after = os.fstat(stream.fileno())
+    need(len(raw) == before.st_size)
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns", "st_mode")
+    need(all(getattr(before, k) == getattr(after, k) for k in fields))
+    return raw
+
+
+def save(path, value):
+    raw = (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(len(raw) <= 65536 and not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def authenticate():
+    need(sha(read(RELEASE / "release.json")) == RELEASE_SHA)
+    need(sha(read(PROOF)) == PROOF_SHA)
+    manifest = json.loads(read(RELEASE / "release.json"))
+    need(len(manifest["outputs"]) == 156 and manifest["receipt_file_count"] == 19)
+    for name, pin in manifest["outputs"].items():
+        relative = Path(name)
+        need(not relative.is_absolute() and ".." not in relative.parts)
+        raw = read(RELEASE / relative)
+        need(len(raw) == pin["bytes"] and sha(raw) == pin["sha256"])
+    for name, digest in FIXED_PINS.items():
+        need(sha(read(ROOT / name)) == digest)
+    names = {
+        Path(name).stem
+        for name in manifest["outputs"]
+        if name.startswith("scripts/") and name.endswith(".py")
+    }
+    previous = {n: sys.modules.pop(n) for n in names if n in sys.modules}
+    location = str(RELEASE / "scripts")
+    sys.path.insert(0, location)
+    try:
+        seed = importlib.import_module("start_sft_vm_setup_bootstrap_v5")
+        need(
+            Path(seed.__file__).resolve() == RELEASE / "scripts/start_sft_vm_setup_bootstrap_v5.py"
+        )
+        sender = seed.sender
+        receiver = read(RELEASE / "scripts/stage_sft_vm_setup_inputs_v5.py")
+        archive = read(RELEASE / "artifacts/lumi-vm-setup-inputs-release-v0.5/setup-inputs.tar")
+        need(sha(receiver) == sender.RECEIVER_SHA and len(receiver) == sender.RECEIVER_BYTES)
+        need(sha(archive) == sender.ARCHIVE_SHA and len(archive) == sender.ARCHIVE_BYTES)
+        sender.inputs.unpack(archive, sender.ARCHIVE_SHA)
+        sender.validate_receipt_contract(archive)
+        need(sender.MAX_BODY == len(receiver) + len(archive))
+        need(sender.LOCAL_SECONDS == 100 and sender.REMOTE_SECONDS == 85)
+        need(sender.expected_receipt()["files"] == 19)
+        return seed, receiver, archive
+    finally:
+        sys.path.remove(location)
+        for name in names:
+            sys.modules.pop(name, None)
+        sys.modules.update(previous)
+
+
+def user_data():
+    from scripts import sft_vm_diagnostic_bootstrap_v3 as bootstrap
+
+    return bootstrap.user_data()
+
+
+def approve(plan_raw):
+    plan = json.loads(plan_raw)
+    need(plan["entry_sha256"] == sha(read(Path(__file__))))
+    need(plan["token"] == TOKEN and plan["source_release_sha256"] == RELEASE_SHA)
+    approval = json.loads(read(APPROVAL, 16384))
+    need(set(approval) == {"plan_sha256", "entry_sha256", "human_authorization", "approved"})
+    need(approval["approved"] is True and type(approval["human_authorization"]) is str)
+    need(len(approval["human_authorization"]) > 100)
+    need(
+        approval["plan_sha256"] == sha(plan_raw)
+        and approval["entry_sha256"] == plan["entry_sha256"]
+    )
+
+
+class Cloud:
+    """SDK calls counted before dispatch; no SDK retries, fixed mutation allowlist."""
+
+    def __init__(self, *, execute, clock=time.monotonic):
+        import botocore.session
+        from botocore.config import Config
+
+        self.execute, self.clock, self.started, self.calls = execute, clock, clock(), 0
+        result = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "configure",
+                "export-credentials",
+                "--profile",
+                "default",
+                "--format",
+                "process",
+            ],
+            capture_output=True,
+            timeout=20,
+            check=True,
+        )
+        need(len(result.stdout) < 32768)
+        creds = json.loads(result.stdout)
+        session = botocore.session.get_session()
+        session.set_credentials(
+            creds["AccessKeyId"], creds["SecretAccessKey"], creds["SessionToken"]
+        )
+        config = Config(
+            retries={"total_max_attempts": 1}, connect_timeout=3, read_timeout=5, proxies={}
+        )
+        self.clients = {
+            n: session.create_client(n, region_name=REGION, config=config) for n in ("ec2", "sts")
+        }
+        self.launch_sent = self.terminate_sent = False
+        self.instance = None
+
+    def call(self, operation, *, cleanup=False, **fields):
+        reads = {
+            "get_caller_identity",
+            "describe_instances",
+            "describe_volumes",
+            "describe_instance_connect_endpoints",
+            "describe_security_groups",
+            "describe_subnets",
+            "describe_route_tables",
+            "describe_key_pairs",
+            "describe_images",
+            "get_console_output",
+        }
+        need(operation in reads | {"run_instances", "terminate_instances"})
+        need(self.calls < (100 if cleanup else 70 if self.execute else 12))
+        need(self.clock() - self.started < (850 if cleanup else 580 if self.execute else 240))
+        if operation == "run_instances":
+            need(self.execute and not self.launch_sent and fields == launch_fields())
+            self.launch_sent = True
+        if operation == "terminate_instances":
+            need(self.execute and cleanup and not self.terminate_sent)
+            need(self.instance is not None and fields == {"InstanceIds": [self.instance]})
+            self.terminate_sent = True
+        self.calls += 1
+        client = self.clients["sts" if operation == "get_caller_identity" else "ec2"]
+        value = getattr(client, operation)(**fields)
+        need(type(value) is dict and not value.get("NextToken"))
+        return value
+
+
+def one(rows):
+    need(type(rows) is list and len(rows) == 1)
+    return rows[0]
+
+
+def tag(row, key, value):
+    tags = row.get("Tags", [])
+    need(sum(t.get("Key") == key for t in tags) == 1)
+    need(next(t["Value"] for t in tags if t["Key"] == key) == value)
+
+
+def preflight(cloud):
+    need(cloud.call("get_caller_identity")["Account"] == ACCOUNT)
+    reservation = one(cloud.call("describe_instances", InstanceIds=[RETAINED])["Reservations"])
+    need(reservation["OwnerId"] == ACCOUNT)
+    host = one(reservation["Instances"])
+    need(host["InstanceId"] == RETAINED and host["State"]["Name"] == "stopped")
+    tag(host, "LumiAttempt", OWNER_ATTEMPT)
+    need(all(m["Ebs"]["DeleteOnTermination"] is False for m in host["BlockDeviceMappings"]))
+    volumes = cloud.call("describe_volumes", VolumeIds=sorted(VOLUMES))["Volumes"]
+    need({v["VolumeId"] for v in volumes} == VOLUMES)
+    for volume in volumes:
+        need(volume["Encrypted"] is True and volume["State"] == "in-use")
+        need(one(volume["Attachments"])["InstanceId"] == RETAINED)
+        tag(volume, "LumiAttempt", OWNER_ATTEMPT)
+    endpoint = one(
+        cloud.call("describe_instance_connect_endpoints", InstanceConnectEndpointIds=[ENDPOINT])[
+            "InstanceConnectEndpoints"
+        ]
+    )
+    need(endpoint["InstanceConnectEndpointId"] == ENDPOINT)
+    need(endpoint["State"] == "create-complete" and endpoint["SubnetId"] == SUBNET)
+    need(endpoint["VpcId"] == VPC and endpoint["SecurityGroupIds"] == [ENDPOINT_GROUP])
+    tag(endpoint, "LumiAttempt", OWNER_ATTEMPT)
+    groups = cloud.call("describe_security_groups", GroupIds=[GROUP, ENDPOINT_GROUP])[
+        "SecurityGroups"
+    ]
+    need({g["GroupId"] for g in groups} == {GROUP, ENDPOINT_GROUP})
+    for group in groups:
+        need(group["OwnerId"] == ACCOUNT and group["VpcId"] == VPC)
+        tag(group, "LumiAttempt", OWNER_ATTEMPT)
+    vm_group = next(g for g in groups if g["GroupId"] == GROUP)
+    ingress = one(vm_group["IpPermissions"])
+    need(ingress["IpProtocol"] == "tcp" and ingress["FromPort"] == ingress["ToPort"] == 22)
+    need(not any(ingress.get(k) for k in ("IpRanges", "Ipv6Ranges", "PrefixListIds")))
+    need(one(ingress["UserIdGroupPairs"])["GroupId"] == ENDPOINT_GROUP)
+    subnet = one(cloud.call("describe_subnets", SubnetIds=[SUBNET])["Subnets"])
+    need(subnet["SubnetId"] == SUBNET and subnet["VpcId"] == VPC and subnet["State"] == "available")
+    tag(subnet, "LumiAttempt", OWNER_ATTEMPT)
+    table = one(cloud.call("describe_route_tables", RouteTableIds=[TABLE])["RouteTables"])
+    need(table["RouteTableId"] == TABLE and table["VpcId"] == VPC)
+    tag(table, "LumiAttempt", OWNER_ATTEMPT)
+    need(any(a.get("SubnetId") == SUBNET for a in table["Associations"]))
+    route = one(table["Routes"])
+    need(route.get("DestinationCidrBlock") == "172.31.0.0/16")
+    need(route.get("GatewayId") == "local" and route.get("State") == "active")
+    key = one(cloud.call("describe_key_pairs", KeyNames=[KEY_NAME])["KeyPairs"])
+    need(key["KeyName"] == KEY_NAME)
+    tag(key, "LumiAttempt", OWNER_ATTEMPT)
+    image = one(cloud.call("describe_images", ImageIds=[AMI])["Images"])
+    need(image["ImageId"] == AMI and image["State"] == "available")
+    need(image["OwnerId"] == "099720109477" and image["Architecture"] == "x86_64")
+    collision = cloud.call(
+        "describe_instances", Filters=[{"Name": "client-token", "Values": [TOKEN]}]
+    )
+    need(not collision["Reservations"])
+    need(KEY.is_file() and not KEY.is_symlink() and stat.S_IMODE(KEY.stat().st_mode) == 0o600)
+    read(KEY, 16384)  # Stable root-private key read; never retain or print its contents.
+    return {
+        "status": "read_only_ready",
+        "retained_host_stopped": True,
+        "retained_encrypted_volumes_preserved": True,
+        "existing_private_endpoint_ready": True,
+        "no_default_egress_route": True,
+        "launch_dispatched": False,
+        "aws_sdk_calls": cloud.calls,
+        "mutations": 0,
+        "gate_5_complete": False,
+    }
+
+
+def launch_fields():
+    return dict(
+        ImageId=AMI,
+        InstanceType="t3.micro",
+        MinCount=1,
+        MaxCount=1,
+        ClientToken=TOKEN,
+        KeyName=KEY_NAME,
+        UserData=user_data(),
+        InstanceInitiatedShutdownBehavior="terminate",
+        MetadataOptions=dict(HttpTokens="required", HttpEndpoint="enabled"),
+        CreditSpecification=dict(CpuCredits="standard"),
+        NetworkInterfaces=[
+            dict(
+                DeviceIndex=0,
+                SubnetId=SUBNET,
+                Groups=[GROUP],
+                AssociatePublicIpAddress=False,
+                DeleteOnTermination=True,
+            )
+        ],
+        BlockDeviceMappings=[
+            dict(
+                DeviceName="/dev/sda1",
+                Ebs=dict(VolumeSize=8, VolumeType="gp3", Encrypted=True, DeleteOnTermination=True),
+            )
+        ],
+        TagSpecifications=[
+            dict(ResourceType=kind, Tags=[dict(Key="LumiDiagnostic", Value=TOKEN)])
+            for kind in ("instance", "volume")
+        ],
+    )
+
+
+def owned(response, instance, *, terminal=False):
+    need(type(instance) is str and re.fullmatch(r"i-[0-9a-f]{17}", instance))
+    need(not response.get("NextToken"))
+    reservation = one(response["Reservations"])
+    need(reservation["OwnerId"] == ACCOUNT)
+    vm = one(reservation["Instances"])
+    need(vm["InstanceId"] == instance and vm["ClientToken"] == TOKEN)
+    need(vm["ImageId"] == AMI and vm["InstanceType"] == "t3.micro")
+    tag(vm, "LumiDiagnostic", TOKEN)
+    if terminal:
+        need(vm["State"]["Name"] == "terminated")
+    else:
+        need(vm["VpcId"] == VPC and vm["SubnetId"] == SUBNET and vm["KeyName"] == KEY_NAME)
+        need({g["GroupId"] for g in vm["SecurityGroups"]} == {GROUP})
+        need(not vm.get("PublicIpAddress") and not vm.get("IamInstanceProfile"))
+        need(vm["MetadataOptions"]["HttpTokens"] == "required")
+        need(not any(i.get("Ipv6Addresses") for i in vm.get("NetworkInterfaces", [])))
+    return vm
+
+
+def ssh_argv(instance, private_ip, hosts):
+    import ipaddress
+
+    need(re.fullmatch(r"i-[0-9a-f]{17}", instance))
+    need(ipaddress.ip_address(private_ip) in ipaddress.ip_network("172.31.97.32/27"))
+    # Explicit endpoint/IP avoids the CLI's instance-ID resolution. Tunnel
+    # authentication/provider requests are not counted as controller SDK calls.
+    proxy = (
+        f"/opt/homebrew/bin/aws --profile default --region {REGION} ec2-instance-connect "
+        f"open-tunnel --private-ip-address {private_ip} --instance-connect-endpoint-id "
+        f"{ENDPOINT} --remote-port 22 --max-tunnel-duration 120"
+    )
+    argv = ["/usr/bin/ssh", "-F", "/dev/null", "-T", "-i", str(KEY)]
+    for option in (
+        f"ProxyCommand={proxy}",
+        f"HostKeyAlias={instance}",
+        f"UserKnownHostsFile={hosts}",
+        "GlobalKnownHostsFile=/dev/null",
+        "StrictHostKeyChecking=yes",
+        "BatchMode=yes",
+        "IdentityAgent=none",
+        "IdentitiesOnly=yes",
+        "ConnectTimeout=20",
+        "ConnectionAttempts=1",
+        "LogLevel=QUIET",
+    ):
+        argv += ["-o", option]
+    return argv + [f"ubuntu@{private_ip}"]
+
+
+def transfer(seed, receiver, archive, argv, report):
+    sender = seed.sender
+    report["seed_dispatch_attempted"] = True
+    reply = sender.delivery.pipe_exchange(
+        argv + ["sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(seed.SEED)], b"", 25
+    )
+    identity = seed.validate_seed(reply)
+    need(identity["observed_boottime"] < 440)
+    report["seed_confirmed"] = True
+    # Earlier deadline is diagnostic-only; production's frozen 1800 s cap is
+    # untouched. Exact real sender launcher and pipe implementation are used.
+    launcher = sender.native_launcher(identity["machine_id"], identity["boot_id"], 575)
+    report["transfer_dispatch_attempted"] = True
+    report["attempted_payload_bytes"] = len(receiver) + len(archive)
+    reply = sender.pipe_exchange(
+        argv + ["sudo -n /usr/bin/python3 -I -B -c " + shlex.quote(launcher)],
+        receiver + archive,
+        sender.LOCAL_SECONDS,
+    )
+    report["failure_stage"] = "receipt_decode"
+    observed = sender.delivery.decode(reply)
+    report["failure_stage"] = "receipt_contract"
+    need(sender.inputs.canonical(observed) == sender.inputs.canonical(sender.expected_receipt()))
+    report.update(full_receipt_matches=True, native_19_files_readback_verified=True)
+    report.pop("failure_stage", None)
+
+
+def execute(cloud, seed, receiver, archive, *, clock=time.monotonic, sleep=time.sleep):
+    from scripts.diagnose_sft_vm_transport_live_v1 import console_key
+
+    need(not OUT.exists() and not OUT.is_symlink())
+    OUT.mkdir(mode=0o700)
+    report = dict(
+        status="started",
+        launch_dispatched=False,
+        terminate_dispatched=False,
+        terminated_verified=False,
+        seed_dispatch_attempted=False,
+        seed_confirmed=False,
+        transfer_dispatch_attempted=False,
+        full_receipt_matches=False,
+        native_19_files_readback_verified=False,
+        retry_allowed=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        raw_exception_or_console_retained=False,
+    )
+    save(OUT / "started.json", report)
+    instance = None
+    stage = "preflight"
+    try:
+        preflight(cloud)
+        stage = "launch"
+        save(OUT / "launch-dispatch.json", {"token": TOKEN, "maximum_instances": 1})
+        report["launch_dispatched"] = True
+        launched = cloud.call("run_instances", **launch_fields())
+        instance = one(launched["Instances"])["InstanceId"]
+        need(re.fullmatch(r"i-[0-9a-f]{17}", instance))
+        cloud.instance = instance
+        save(OUT / "launch.json", {"instance": instance, "token": TOKEN})
+        stage = "console_host_key"
+        key = None
+        for _ in range(21):
+            need(clock() - cloud.started < 425)
+            vm = owned(cloud.call("describe_instances", InstanceIds=[instance]), instance)
+            need(vm["State"]["Name"] in {"pending", "running"})
+            console = cloud.call("get_console_output", InstanceId=instance, Latest=True)
+            raw = console.get("Output", "")
+            need(type(raw) is str and len(raw) <= 262144)
+            if raw:
+                try:
+                    key = console_key(raw)
+                except (ValueError, UnicodeError):
+                    pass
+            if key:
+                break
+            sleep(min(20, max(0, 425 - (clock() - cloud.started))))
+        need(key is not None and vm["State"]["Name"] == "running")
+        hosts = OUT / "known_hosts"
+        fd = os.open(hosts, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as stream:
+            stream.write(f"{instance} ssh-ed25519 {key}\n")
+        stage = "seed"
+        need(clock() - cloud.started < 440)
+        argv = ssh_argv(instance, vm["PrivateIpAddress"], hosts)
+        transfer(seed, receiver, archive, argv, report)
+        report["status"] = "source_only_native_transfer_passed"
+    except BaseException:
+        report["status"] = "failed_no_retry"
+        report.setdefault(
+            "failure_stage", "exchange" if report["transfer_dispatch_attempted"] else stage
+        )
+        report["remote_completion_unknown"] = report["transfer_dispatch_attempted"]
+    finally:
+        # Reserve independent cleanup time/calls. Never delete a retained host.
+        if report["launch_dispatched"]:
+            try:
+                fields = (
+                    dict(InstanceIds=[instance])
+                    if instance
+                    else dict(Filters=[dict(Name="client-token", Values=[TOKEN])])
+                )
+                response = cloud.call("describe_instances", cleanup=True, **fields)
+                if instance is None:
+                    instance = one(one(response["Reservations"])["Instances"])["InstanceId"]
+                terminal = (
+                    one(one(response["Reservations"])["Instances"])["State"]["Name"] == "terminated"
+                )
+                vm = owned(response, instance, terminal=terminal)
+                cloud.instance = instance
+                if not terminal and vm["State"]["Name"] != "shutting-down":
+                    save(OUT / "terminate-dispatch.json", {"instance": instance, "token": TOKEN})
+                    report["terminate_dispatched"] = True
+                    cloud.call("terminate_instances", cleanup=True, InstanceIds=[instance])
+                for _ in range(24):
+                    if terminal:
+                        break
+                    need(clock() - cloud.started < 820)
+                    response = cloud.call(
+                        "describe_instances", cleanup=True, InstanceIds=[instance]
+                    )
+                    terminal = (
+                        one(one(response["Reservations"])["Instances"])["State"]["Name"]
+                        == "terminated"
+                    )
+                    owned(response, instance, terminal=terminal)
+                    if not terminal:
+                        sleep(min(12, max(0, 820 - (clock() - cloud.started))))
+                report["terminated_verified"] = terminal
+                report["instance"] = instance
+            except BaseException:
+                report["cleanup_unresolved"] = True
+        report.update(aws_sdk_calls=cloud.calls, elapsed_seconds=round(clock() - cloud.started, 3))
+        if report["launch_dispatched"] and not report["terminated_verified"]:
+            report["cleanup_unresolved"] = True
+        save(OUT / "result.json", report)
+    return report
+
+
+def main():
+    need(sys.argv[1:] in (["--inspect-only"], ["--execute-once"]))
+    seed, receiver, archive = authenticate()  # Before credentials or paid allocation.
+    live = sys.argv[1:] == ["--execute-once"]
+    plan_raw = read(PLAN, 65536)
+    plan = json.loads(plan_raw)
+    need(plan["entry_sha256"] == sha(read(Path(__file__))))
+    if live:
+        approve(plan_raw)
+        need(not OUT.exists())
+    else:
+        need(not READ_OUT.exists())
+    cloud = Cloud(execute=live)
+    if live:
+        result = execute(cloud, seed, receiver, archive)
+    else:
+        try:
+            result = preflight(cloud)
+        except BaseException:
+            result = dict(
+                status="read_only_rejected_no_mutation",
+                aws_sdk_calls=cloud.calls,
+                mutations=0,
+                launch_dispatched=False,
+                gate_5_complete=False,
+            )
+        result.update(
+            plan_sha256=sha(plan_raw),
+            entry_sha256=plan["entry_sha256"],
+            source_release_sha256=RELEASE_SHA,
+            observed_at_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        )
+        save(READ_OUT, result)
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

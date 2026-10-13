@@ -1,0 +1,425 @@
+"""Approval-gated, one-shot read-only inspection; never arm or retry a CPU run.
+
+Uses the verified diagnostic patch to inspect only attempt-011's retained timer.
+Current RoleIds are observed twice, not misrepresented as creation-time pins.
+"""
+
+import base64
+import hashlib
+import importlib
+import json
+import os
+import select
+import signal
+import subprocess
+import sys
+import time
+import types
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = ROOT / "artifacts/lumi-vm-dedicated-cleanup-source-v0.1"
+PATCH = ROOT / "artifacts/lumi-vm-network-diagnostics-source-v0.1"
+PRIOR = "evidence/lumi-vm-attempt-011-cpu-execution-verification-v0.1.json"
+PRIOR_SHA = "6d2608e64b10c428cfc4fd7f3467de358d1a48f019a67b653196468fa576ed26"
+PROOF = "evidence/lumi-vm-network-diagnostic-repair-verification-v0.1.json"
+PROOF_SHA = "7326ff5b53c753e054f9df220ac0f1a4951535824d72797bd064f852027b5f6e"
+BASE_SHA = "f80873927a33724d37932560238352d524e744744ab4c98a9a5bd8cec65768d1"
+CLASSIFIER = "scripts/diagnose_sft_vm_cleanup_identity_v1.py"
+CLASSIFIER_SHA = "d34636e17f292672ca6408f267ee26eeab6d935a89d08db5af91ae8ac37a0cf7"
+CA = (
+    BASE
+    / "artifacts/lumi-sft-import-runtime-v0.1/venv/lib/python3.13/site-packages/certifi/cacert.pem"
+)
+CA_SHA = "9cc2a774b5198dcff14d9be1e66091f538975d867ce029a96bce15a55dfd730f"
+START = "artifacts/lumi-vm-private-outer-execution-v0.12/attempt-011/network-expiry/started.json"
+OUTPUT = ROOT / "artifacts/lumi-vm-retained-expiry-inspection-v0.2"
+APPROVAL = ROOT / "configs/lumi-vm-retained-expiry-inspection-approval-v0.2.json"
+PLAN = ROOT / "configs/lumi-vm-retained-expiry-inspection-plan-v0.2.json"
+MAX_CALLS, MAX_SECONDS, MAX_RESPONSE_BYTES, MAX_WRITE_BYTES = 18, 400, 1048576, 16384
+READ_TIMEOUT_SECONDS, COMMAND_SECONDS, CLEANUP_RESERVE_SECONDS = 15, 30, 2
+PREVIOUS = "evidence/lumi-vm-retained-expiry-inspection-verification-v0.1.json"
+PREVIOUS_SHA = "0fbdf689f358801cc563378c63a2527512efe39a8bec4c0c8a8cf9c0b81b2ed5"
+
+
+def need(value):
+    if not value:
+        raise ValueError("retained_expiry_inspection_rejected") from None
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(path, digest=None, size=None):
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 20 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+
+def decode(raw):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            need(key not in value)
+            value[key] = item
+        return value
+
+    return json.loads(raw, object_pairs_hook=unique)
+
+
+def verify_pins(proof):
+    for name, pin in proof["source_bindings"].items():
+        relative = Path(name)
+        need(not relative.is_absolute() and ".." not in relative.parts)
+        read(ROOT / relative, pin["sha256"], pin["bytes"])
+
+
+def inputs():
+    previous = decode(read(ROOT / PREVIOUS, PREVIOUS_SHA))
+    verify_pins(previous)
+    need(previous["result"]["status"] == "stopped_no_retry")
+    need(
+        previous["result"]["diagnostic"]
+        == dict(check="list-role-policies", kind="read_timeout", stage="expiry_control")
+    )
+    need(previous["result"]["mutations"] == 0)
+    prior = decode(read(ROOT / PRIOR, PRIOR_SHA))
+    proof = decode(read(ROOT / PROOF, PROOF_SHA))
+    verify_pins(prior)
+    verify_pins(proof)
+    manifest = decode(read(BASE / "release.json", BASE_SHA))
+    for name, pin in manifest["outputs"].items():
+        need(not Path(name).is_absolute() and ".." not in Path(name).parts)
+        read(BASE / name, pin["sha256"], pin["bytes"])
+    read(ROOT / CLASSIFIER, CLASSIFIER_SHA)
+    read(CA, CA_SHA)
+    need(prior["entry_result"]["execution_marker_created"] is True)
+    need(prior["outcome"]["attempt_retry"] is False)
+    bound = decode(read(ROOT / START))["binding"]
+    need(bound["attempt"] == prior["attempt"])
+    return manifest, bound
+
+
+def load():
+    manifest, bound = inputs()
+    # Avoid stale modules from a different release. No credential creation/import.
+    names = {Path(n).stem for n in manifest["outputs"] if n.startswith("scripts/")}
+    need(not names.intersection(sys.modules) and sys.dont_write_bytecode)
+    sys.path.insert(0, str(BASE / "scripts"))
+
+    def patched(name):
+        path = PATCH / (name + ".py")
+        module = types.ModuleType(name)
+        module.__file__ = str(path)
+        sys.modules[name] = module
+        exec(compile(read(path), str(path), "exec"), module.__dict__)
+        return module
+
+    failure = patched("sft_vm_safe_failure_v1")
+    armer = patched("arm_sft_vm_network_cleanup_v1")
+    classifier = importlib.import_module("scripts.diagnose_sft_vm_cleanup_identity_v1")
+    need(Path(classifier.__file__).resolve() == ROOT / CLASSIFIER)
+    need(armer.worker.binding(json.dumps(bound)) == bound)
+    return armer, failure, classifier.classify, bound
+
+
+def requests(armer, bound):
+    n = armer.names(bound["nonce"])
+    rows = [("sts", "get-caller-identity", {})]
+    for role in (n["worker"], n["scheduler"]):
+        for op in (
+            "get-role",
+            "get-role-policy",
+            "list-role-policies",
+            "list-attached-role-policies",
+        ):
+            fields = dict(RoleName=role)
+            if op == "get-role-policy":
+                fields["PolicyName"] = armer.POLICY
+            rows.append(("iam", op, fields))
+    for op in (
+        "get-function-configuration",
+        "get-function-concurrency",
+        "get-function-event-invoke-config",
+        "get-policy",
+        "get-function-url-config",
+        "list-event-source-mappings",
+    ):
+        fields = dict(FunctionName=n["function"])
+        if op == "list-event-source-mappings":
+            fields["MaxItems"] = 1
+        rows.append(("lambda", op, fields))
+    rows.append(("scheduler", "get-schedule", dict(Name="cleanup", GroupName=n["group"])))
+    return rows
+
+
+def plan():
+    _, bound = inputs()
+    return dict(
+        schema="lumi.vm-retained-expiry-inspection-plan.v0.2",
+        status="prepared_not_authorized",
+        entry_sha256=sha(read(Path(__file__))),
+        prior_report_sha256=PRIOR_SHA,
+        diagnostic_proof_sha256=PROOF_SHA,
+        attempt=bound["attempt"],
+        nonce=bound["nonce"],
+        maximum_control_calls=MAX_CALLS,
+        predecessor_inspection_sha256=PREVIOUS_SHA,
+        cli_socket_read_timeout_seconds=READ_TIMEOUT_SECONDS,
+        command_deadline_seconds=COMMAND_SECONDS,
+        command_cleanup_reserve_seconds=CLEANUP_RESERVE_SECONDS,
+        maximum_runtime_seconds=MAX_SECONDS,
+        maximum_response_bytes=MAX_RESPONSE_BYTES,
+        maximum_private_write_bytes=MAX_WRITE_BYTES,
+        scope="one_readonly_retained_timer_configuration_inspection",
+        original_timer_binding_unchanged=True,
+        current_role_ids_not_creation_time_pins=True,
+        current_observation_not_historical_cause_proof=True,
+        output=str(OUTPUT.relative_to(ROOT)),
+        retry=False,
+        mutations=False,
+        ec2_access=False,
+        s3_access=False,
+        object_access=False,
+        timer_arm=False,
+        instance_action=False,
+        gpu=False,
+        training=False,
+        execution_permitted=False,
+    )
+
+
+def expected_approval(message):
+    return dict(
+        schema="lumi.vm-retained-expiry-inspection-approval.v0.2",
+        status="explicit_human_approval_recorded",
+        human_message=message,
+        approved_execution_count=1,
+        plan_sha256=sha(encode(plan())),
+        entry_sha256=sha(read(Path(__file__))),
+        scope=plan()["scope"],
+        cpu_retry=False,
+        mutation=False,
+    )
+
+
+def authorize():
+    need(read(PLAN) == encode(plan()))
+    value = decode(read(APPROVAL))
+    message = value.get("human_message")
+    need(type(message) is str and 0 < len(message.strip()) <= 4096)
+    need(value == expected_approval(message))
+    need(not OUTPUT.exists() and not any(p.is_symlink() for p in (OUTPUT, *OUTPUT.parents)))
+    return value
+
+
+def command(argv, env):
+    """Bound both pipe buffers while reading; never persist command output."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        start_new_session=True,
+    )
+    buffers = {proc.stdout: bytearray(), proc.stderr: bytearray()}
+    active, end = set(buffers), time.monotonic() + COMMAND_SECONDS
+    try:
+        while active:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("control_deadline")
+            ready, _, _ = select.select(list(active), [], [], min(0.2, remaining))
+            for stream in ready:
+                body = os.read(stream.fileno(), 4096)
+                if not body:
+                    active.remove(stream)
+                    continue
+                buffers[stream].extend(body)
+                need(len(buffers[stream]) <= (262144 if stream is proc.stdout else 8192))
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("control_deadline")
+        try:
+            code = proc.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError("control_deadline") from None
+        return code, bytes(buffers[proc.stdout]), bytes(buffers[proc.stderr])
+    finally:
+        if proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=CLEANUP_RESERVE_SECONDS)
+        proc.stdout.close()
+        proc.stderr.close()
+
+
+class Cloud:
+    def __init__(self, armer, failure, classify, bound, *, clock=time.monotonic):
+        self.allowed = requests(armer, bound)
+        self.failure, self.classify, self.clock = failure, classify, clock
+        self.start, self.calls, self.bytes = clock(), 0, 0
+        self.category = "none"
+        self.seen = {}
+
+    def cli(self, service, operation, **fields):
+        try:
+            return self._cli(service, operation, **fields)
+        except LookupError:
+            raise
+        except BaseException as error:
+            raise self.failure.Failure(
+                "readonly_control_failed",
+                self.failure.describe(error, "expiry_control", operation),
+            ) from None
+
+    def _cli(self, service, operation, **fields):
+        need((service, operation, fields) in self.allowed)
+        key = (service, operation, encode(fields))
+        limit = 2 if operation == "get-role" else 1
+        need(self.seen.get(key, 0) < limit)
+        need(
+            self.calls < MAX_CALLS
+            and 0
+            <= self.clock() - self.start
+            < MAX_SECONDS - COMMAND_SECONDS - CLEANUP_RESERVE_SECONDS
+        )
+        self.seen[key] = self.seen.get(key, 0) + 1
+        self.calls += 1
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("AWS_")
+            and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        env.update(
+            AWS_MAX_ATTEMPTS="1",
+            AWS_RETRY_MODE="standard",
+            AWS_PAGER="",
+            AWS_EC2_METADATA_DISABLED="true",
+            AWS_CLI_AUTO_PROMPT="off",
+        )
+        argv = [
+            "/opt/homebrew/bin/aws",
+            "--profile",
+            "default",
+            "--region",
+            "us-east-1",
+            service,
+            operation,
+            "--cli-input-json",
+            encode(fields).decode(),
+            "--no-paginate",
+            "--output",
+            "json",
+            "--cli-connect-timeout",
+            "3",
+            "--cli-read-timeout",
+            str(READ_TIMEOUT_SECONDS),
+            "--endpoint-url",
+            "https://iam.amazonaws.com"
+            if service == "iam"
+            else f"https://{service}.us-east-1.amazonaws.com",
+            "--ca-bundle",
+            str(CA),
+        ]
+        code, stdout, stderr = command(argv, env)
+        self.bytes += len(stdout) + len(stderr)
+        need(self.bytes <= MAX_RESPONSE_BYTES and self.clock() - self.start < MAX_SECONDS)
+        if code:
+            if service == "lambda" and operation in {"get-policy", "get-function-url-config"}:
+                if b"(ResourceNotFoundException)" in stderr:
+                    raise LookupError("absent") from None
+            self.category = self.classify(stderr)
+            kind = {
+                "connect_timeout": "connect_timeout",
+                "read_timeout": "read_timeout",
+                "tls_verification": "tls",
+                "endpoint_connection": "connection",
+            }.get(self.category, "aws_service")
+            raise self.failure.Failure(
+                "readonly_control_failed", dict(stage="expiry_control", kind=kind, check=operation)
+            ) from None
+        value = decode(stdout)
+        need(type(value) is dict)
+        need(not any(value.get(k) for k in ("NextToken", "NextMarker", "Marker", "IsTruncated")))
+        return value
+
+
+def inspect(armer, failure, cloud, bound, *, clock=time.monotonic, wall=time.time):
+    """No arm call. A fresh inspection clock does not extend the old timer."""
+    need(cloud.cli("sts", "get-caller-identity")["Account"] == armer.worker.ACCOUNT)
+    expiry = armer.Expiry(
+        OUTPUT / "unused", cloud, admit_claim_store=lambda _: need(False), clock=clock, wall=wall
+    )
+    expiry.used = True
+    expiry.started, expiry.wall_start = clock(), wall()
+    expiry.bound = bound
+    expiry.original = dict(attempt=bound["attempt"], nonce=bound["nonce"], deadline=None)
+    expiry.code_sha = base64.b64encode(hashlib.sha256(armer.package()).digest()).decode()
+    n = armer.names(bound["nonce"])
+    for role in (n["worker"], n["scheduler"]):
+        row = cloud.cli("iam", "get-role", RoleName=role)["Role"]
+        need(row["Arn"] == n["role_base"] + role)
+        need(type(row["RoleId"]) is str and 0 < len(row["RoleId"]) <= 128)
+        expiry.role_ids[role] = row["RoleId"]
+    expiry.verify(**expiry.original)
+    return dict(
+        status="current_retained_timer_configuration_verified",
+        original_remote_cause_proven=False,
+        creation_time_role_ids_verified=False,
+    )
+
+
+def run():
+    approval = authorize()  # Reject missing approval before importing runtime or consuming output.
+    armer, failure, classify, bound = load()
+    OUTPUT.mkdir(mode=0o700, exist_ok=False)
+    written = 0
+
+    def save(name, value):
+        nonlocal written
+        raw = encode(value)
+        need(written + len(raw) <= MAX_WRITE_BYTES)
+        fd = os.open(OUTPUT / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            need(stream.write(raw) == len(raw))
+        written += len(raw)
+
+    save("started.json", dict(approval_sha256=sha(encode(approval)), retry=False))
+    cloud = Cloud(armer, failure, classify, bound)
+    result = dict(
+        status="stopped_no_retry",
+        mutations=0,
+        object_access=0,
+        cpu_retry=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+        raw_response_retained=False,
+    )
+    try:
+        result.update(inspect(armer, failure, cloud, bound))
+    except BaseException as error:
+        result["diagnostic"] = failure.describe(error, "expiry_verify")
+    result.update(
+        control_calls=cloud.calls,
+        response_bytes=cloud.bytes,
+        elapsed_seconds=round(cloud.clock() - cloud.start, 3),
+        transport_category=cloud.category,
+    )
+    save("result.json", result)
+    print(json.dumps(result, sort_keys=True), flush=True)
+    return result
+
+
+if __name__ == "__main__":
+    run()

@@ -1,0 +1,172 @@
+"""Offline structural verification of the attempt-019 endpoint cleanup."""
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "c7124d8fb1a244798d7e41b7b5dfad61"
+ENDPOINT = "eice-00c5b6339d93e0085"
+VM = "i-068358c462d98a32a"
+VOLUMES = ["vol-0d22435afc196a589", "vol-0e1c912b1eb8ef89c"]
+SOURCE = "scripts/cleanup_sft_vm_attempt019_endpoint_v1.py"
+SOURCE_SHA = "a04db2d39ad19ccdf55b7ba1be6755e4854dd0dc24047172524964c424ca5fbe"
+TEST = "tests/test_sft_vm_attempt019_endpoint_cleanup_v1.py"
+TEST_SHA = "9ae4651fe3edb6b479581c2fdec2514466d5bfcb5d4d1fe949dc733429684bbb"
+APPROVAL = "configs/lumi-vm-attempt-019-endpoint-cleanup-approval-v0.1.json"
+APPROVAL_SHA = "18ba8dcd811fb2f7080bc809fd90e96b1ba122e39988d218315b1984b6b19f86"
+AUDIT = "evidence/lumi-vm-attempt-019-v024-execution-failure-verification-v0.1.json"
+AUDIT_SHA = "50b72551632cefd5c1f2af9382def5bef025002bf58ef66cb6f805ab252e50fc"
+BLOCKER = "evidence/lumi-vm-attempt-020-readonly-preflight-failure-v0.1.json"
+BLOCKER_SHA = "f371c5516c9a22d927e3acf1dd13da66fbe8c57f61654882f866a8310c742170"
+RUN = "artifacts/lumi-vm-attempt-019-endpoint-cleanup-v0.1"
+STARTED_SHA = "79b530c3e6c84f01a4b39b2a03c10667ab435f0c330dd046062cd026e465e69f"
+PREFLIGHT_SHA = "df5a2a35f878d8ebeb73254c52b0b904439ec035779d93b8a734318bfbf485ed"
+DISPATCH_SHA = "720100cea702cbdddd6f9e8b5d600ff7d5cc6e865fe5ea9ebf05ed6cc9ac0180"
+RESULT_SHA = "d0afa47c31cef7254df1aa4e6db2c209987aa0b2f3022689cc88e1351400b8e9"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-019-endpoint-cleanup-verification-v0.1.json"
+OPERATIONS = [
+    "get-caller-identity",
+    "describe-instances",
+    "describe-volumes",
+    "describe-subnets",
+    "describe-route-tables",
+    "describe-security-groups",
+    "describe-key-pairs",
+    "describe-instance-connect-endpoints",
+    "describe-network-interfaces",
+    "delete-instance-connect-endpoint",
+    "describe-instance-connect-endpoints",
+    "describe-instance-connect-endpoints",
+    "describe-network-interfaces",
+    "describe-instances",
+    "describe-volumes",
+    "describe-subnets",
+    "describe-route-tables",
+    "describe-security-groups",
+    "describe-key-pairs",
+]
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_endpoint_cleanup_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest=None):
+    relative = Path(name)
+    need(not relative.is_absolute() and ".." not in relative.parts)
+    path = ROOT / relative
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(digest is None or sha(raw) == digest)
+    return raw
+
+
+def verify():
+    for name, digest in (
+        (SOURCE, SOURCE_SHA),
+        (TEST, TEST_SHA),
+        (APPROVAL, APPROVAL_SHA),
+        (AUDIT, AUDIT_SHA),
+        (BLOCKER, BLOCKER_SHA),
+    ):
+        read(name, digest)
+    started = json.loads(read(RUN + "/started.json", STARTED_SHA))
+    preflight = json.loads(read(RUN + "/preflight.json", PREFLIGHT_SHA))
+    dispatch = json.loads(read(RUN + "/delete-dispatch.json", DISPATCH_SHA))
+    result = json.loads(read(RUN + "/result.json", RESULT_SHA))
+    need(
+        started["approval_sha256"] == APPROVAL_SHA
+        and started["audit_sha256"] == AUDIT_SHA
+        and started["blocker_sha256"] == BLOCKER_SHA
+        and started["source_sha256"] == SOURCE_SHA
+        and started["endpoint"] == ENDPOINT
+        and started["maximum_reads"] == 30
+        and started["maximum_delete_dispatches"] == 1
+        and started["maximum_seconds"] == 600
+        and started["retry"] is False
+        and started["cpu_launch_authorized"] is False
+        and started["gpu"] is False
+        and started["training"] is False
+        and started["s3_object_access"] is False
+        and preflight == {"ownership_verified": True, "preserved_resources_verified": True}
+        and dispatch == {"endpoint": ENDPOINT, "retry": False}
+        and result["status"] == "endpoint_removed_preserved_resources_verified"
+        and result["cleanup_verified"] is True
+        and result["endpoint"] == ENDPOINT
+        and result["reads"] == 18
+        and result["delete_dispatches"] == 1
+        and result["instance_actions"] == result["s3_actions"] == 0
+        and result["gpu"] is result["training"] is result["gate_5_complete"] is False
+    )
+    run_bindings = {
+        RUN + "/started.json": STARTED_SHA,
+        RUN + "/preflight.json": PREFLIGHT_SHA,
+        RUN + "/delete-dispatch.json": DISPATCH_SHA,
+        RUN + "/result.json": RESULT_SHA,
+    }
+    for index, operation in enumerate(OPERATIONS, 1):
+        name = RUN + f"/call-{index:02d}.json"
+        raw = read(name)
+        receipt = json.loads(raw)
+        need(receipt == {"acknowledged": True, "operation": operation})
+        run_bindings[name] = sha(raw)
+    need(len(list((ROOT / RUN).glob("call-*.json"))) == len(OPERATIONS))
+    return {
+        "schema": "lumi.vm-attempt019-endpoint-cleanup-verification.v0.1",
+        "attempt": ATTEMPT,
+        "status": "endpoint_removed_preserved_resources_verified",
+        "endpoint": ENDPOINT,
+        "source_sha256": SOURCE_SHA,
+        "test_sha256": TEST_SHA,
+        "approval_sha256": APPROVAL_SHA,
+        "predecessor_failure_verification_sha256": AUDIT_SHA,
+        "attempt020_blocker_evidence_sha256": BLOCKER_SHA,
+        "run_bindings": run_bindings,
+        "reads": 18,
+        "delete_dispatches": 1,
+        "retry": False,
+        "endpoint_interface_absent": True,
+        "preserved": {
+            "stopped_instance": VM,
+            "encrypted_ebs_volumes": VOLUMES,
+            "subnet": "subnet-0af788acdfd4d17a1",
+            "route_table": "rtb-0d520ddf61f7615f0",
+            "security_groups": ["sg-087cb90968b2a9def", "sg-0b55bcd63758a16a4"],
+            "key_pair": "lumi-fullsize-" + ATTEMPT,
+            "pre_and_post_checks_passed": True,
+        },
+        "instance_actions": 0,
+        "s3_actions": 0,
+        "cpu_launch_authorized": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+        "next_required": (
+            "Prepare a fresh attempt-020 read-only admission successor; "
+            "do not reuse the consumed output path."
+        ),
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

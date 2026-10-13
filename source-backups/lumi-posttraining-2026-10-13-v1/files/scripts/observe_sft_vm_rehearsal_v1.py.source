@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""Read-only, aggregate-only observer of one named rehearsal's cgroups.
+
+No dispatch, ML import, model paths, PID values, source text or exception text.
+Timing snapshots supplement, never override, the launcher's acceptance rules.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import time
+from pathlib import Path
+
+
+def observe(attempt):
+    if not re.fullmatch(r'[a-f0-9]{32}', attempt):
+        raise ValueError('attempt_invalid')
+    names = ('chain', 'timeout', 'memory', 'disk')
+    snapshots = {name: {'observations': 0, 'max_process_count': 0,
+                        'max_memory_bytes': 0, 'max_shmem_bytes': 0,
+                        'max_oom_kill_count': 0} for name in names}
+    record_root = Path('/var/lib/lumi-sft-rehearsal') / attempt
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        for mode in names:
+            group = Path('/sys/fs/cgroup/system.slice') / (
+                f'lumi-sft-rehearsal-{attempt}-{mode}.service')
+            try:
+                procs = (group/'cgroup.procs').read_bytes()
+                memory = (group/'memory.current').read_bytes()
+                stat = (group/'memory.stat').read_bytes()
+                events = (group/'memory.events').read_bytes()
+                if max(map(len, (procs, memory, stat, events))) > 16384:
+                    raise ValueError('aggregate_read_too_large')
+                metrics = dict(line.split() for line in stat.splitlines())
+                counts = dict(line.split() for line in events.splitlines())
+                row = snapshots[mode]
+                row['observations'] += 1
+                for key, value in {
+                    'max_process_count': len(procs.splitlines()),
+                    'max_memory_bytes': int(memory),
+                    'max_shmem_bytes': int(metrics.get(b'shmem', b'0')),
+                    'max_oom_kill_count': int(counts.get(b'oom_kill', b'0')),
+                }.items():
+                    row[key] = max(row[key], value)
+            except FileNotFoundError:
+                pass
+        if (record_root/'result.json').exists() or (record_root/'failure.json').exists():
+            return {'schema': 'lumi.rehearsal-cgroup-observer.v0.1',
+                    'terminal_record_seen': True, 'cases': snapshots}
+        time.sleep(0.05)
+    return {'schema': 'lumi.rehearsal-cgroup-observer.v0.1',
+            'terminal_record_seen': False, 'cases': snapshots}
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--attempt', required=True)
+    args = parser.parse_args()
+    print(json.dumps(observe(args.attempt), sort_keys=True))

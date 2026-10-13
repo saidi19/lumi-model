@@ -1,0 +1,291 @@
+import base64
+import contextlib
+import copy
+import datetime as dt
+import hashlib
+import importlib
+import io
+import json
+import os
+import sys
+import tempfile
+import types
+import unittest
+import zipfile
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+w = importlib.import_module("sft_vm_external_watchdog_v1")
+d = importlib.import_module("prepare_sft_vm_external_watchdog_v1")
+BOUND = dict(
+    armed=True,
+    attempt=w.ATTEMPT,
+    launch_not_before=1000,
+    launch_not_after=1100,
+    stop_at=15000,
+    expires_at=15300,
+)
+
+
+def row(state="running"):
+    return dict(
+        InstanceId="i-" + "1" * 17,
+        ClientToken=w.ATTEMPT,
+        Tags=[dict(Key="LumiAttempt", Value=w.ATTEMPT)],
+        ImageId=w.AMI,
+        InstanceType="r6i.4xlarge",
+        VpcId=w.VPC,
+        SubnetId=w.SUBNET,
+        KeyName="lumi-fullsize-" + w.ATTEMPT,
+        LaunchTime=dt.datetime.fromtimestamp(1050, dt.UTC),
+        State=dict(Name=state),
+        BlockDeviceMappings=[
+            dict(Ebs=dict(VolumeId="vol-" + c * 17, DeleteOnTermination=False)) for c in "34"
+        ],
+    )
+
+
+class EC2:
+    def __init__(self, states=None, lost=False):
+        self.states = list(states or ["running", "stopping", "stopped"])
+        self.stop_calls = []
+        self.reads = []
+        self.lost = lost
+        self.change = lambda r: r
+
+    def describe_instances(self, **fields):
+        self.reads.append(fields)
+        state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+        return dict(Reservations=[dict(OwnerId=w.ACCOUNT, Instances=[self.change(row(state))])])
+
+    def stop_instances(self, **fields):
+        self.stop_calls.append(fields)
+        if self.lost:
+            raise TimeoutError("private-error")
+        return {}
+
+
+class WorkerTests(unittest.TestCase):
+    def observe(self, cloud, context=None, clock=lambda: 15000):
+        return w.observe_stop(
+            BOUND,
+            cloud,
+            context or types.SimpleNamespace(get_remaining_time_in_millis=lambda: 180000),
+            clock=clock,
+            wait=lambda _: None,
+        )
+
+    def test_unarmed_handler_never_imports_sdk_or_touches_cloud(self):
+        with (
+            patch.dict(os.environ, {"LUMI_WATCHDOG_BINDING": '{"armed":false}'}),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            result = w.handler({"private": "secret"}, None)
+        self.assertEqual(result["stage"], "unarmed")
+        self.assertNotIn("secret", output.getvalue())
+
+    def test_bad_binding_rejected(self):
+        for value in (
+            BOUND | {"attempt": "0" * 32},
+            BOUND | {"stop_at": 15400},
+            BOUND | {"armed": 1},
+            BOUND | {"expires_at": 15401},
+            BOUND | {"extra": 1},
+        ):
+            with self.assertRaises(ValueError):
+                w.binding(json.dumps(value))
+        self.assertEqual(w.binding(json.dumps(BOUND)), BOUND)
+
+    def test_one_stop_and_readback(self):
+        cloud = EC2()
+        result = self.observe(cloud)
+        self.assertTrue(result["stopped_verified"])
+        self.assertEqual(
+            cloud.stop_calls, [dict(InstanceIds=["i-" + "1" * 17], Force=False, Hibernate=False)]
+        )
+        self.assertEqual(len(cloud.reads), 3)
+        self.assertEqual(cloud.reads[0]["Filters"][0]["Values"], [w.ATTEMPT])
+
+    def test_duplicate_invocation_already_stopped_no_stop(self):
+        cloud = EC2(["stopped"])
+        self.assertTrue(self.observe(cloud)["stopped_verified"])
+        self.assertEqual(cloud.stop_calls, [])
+
+    def test_lost_stop_ack_not_resent(self):
+        cloud = EC2(lost=True)
+        self.assertTrue(self.observe(cloud)["stopped_verified"])
+        self.assertEqual(len(cloud.stop_calls), 1)
+
+    def test_wrong_target_or_volume_flags_reject(self):
+        for changes in (
+            {"ClientToken": "0" * 32},
+            {"InstanceType": "p5.48xlarge"},
+            {"Tags": []},
+            {"LaunchTime": dt.datetime.fromtimestamp(999, dt.UTC)},
+            {"BlockDeviceMappings": [dict(Ebs=dict(VolumeId="wrong", DeleteOnTermination=True))]},
+        ):
+            cloud = EC2()
+            cloud.change = lambda r, changes=changes: r | changes
+            result = self.observe(cloud)
+            self.assertEqual(result["stage"], "observation_rejected")
+            self.assertFalse(cloud.stop_calls)
+
+    def test_instance_identity_cannot_switch(self):
+        cloud = EC2()
+        cloud.change = lambda r: r if len(cloud.reads) == 1 else r | {"InstanceId": "i-" + "2" * 17}
+        self.assertFalse(self.observe(cloud)["stopped_verified"])
+        self.assertEqual(len(cloud.stop_calls), 1)
+
+    def test_deadlines_and_lambda_budget_before_reads(self):
+        for clock in (lambda: 14999, lambda: 15300):
+            cloud = EC2()
+            self.observe(cloud, clock=clock)
+            self.assertFalse(cloud.reads)
+        cloud = EC2()
+        self.observe(cloud, types.SimpleNamespace(get_remaining_time_in_millis=lambda: 1000))
+        self.assertFalse(cloud.reads)
+
+    def test_bounded_no_stop_confirmation(self):
+        cloud = EC2(["running"])
+        self.assertEqual(self.observe(cloud)["stage"], "stop_unconfirmed")
+        self.assertEqual(len(cloud.reads), 24)
+        self.assertEqual(len(cloud.stop_calls), 1)
+
+    def test_no_matching_instance(self):
+        cloud = EC2()
+        cloud.describe_instances = lambda **kw: dict(Reservations=[])
+        self.assertEqual(self.observe(cloud)["stage"], "no_matching_instance")
+        self.assertFalse(cloud.stop_calls)
+
+
+class DeploymentCloud:
+    def __init__(self, fail=None):
+        self.fail = fail
+        self.calls = []
+        self.roles = {}
+        self.policies = {}
+        self.groups = []
+        self.function = None
+
+    def cli(self, service, operation, **kw):
+        self.calls.append((service, operation, kw))
+        if operation == self.fail:
+            raise RuntimeError("private-error")
+        if operation == "get-caller-identity":
+            return dict(Account=d.ACCOUNT)
+        if operation == "get-role":
+            if kw["RoleName"] not in self.roles:
+                raise LookupError()
+            return dict(Role=self.roles[kw["RoleName"]])
+        if operation == "create-role":
+            value = dict(
+                Arn=d.BASE + kw["RoleName"],
+                RoleId="synthetic-" + kw["RoleName"],
+                AssumeRolePolicyDocument=json.loads(kw["AssumeRolePolicyDocument"]),
+            )
+            self.roles[kw["RoleName"]] = value
+            return dict(Role=value)
+        if operation == "put-role-policy":
+            self.policies[kw["RoleName"]] = json.loads(kw["PolicyDocument"])
+        if operation == "get-role-policy":
+            return dict(PolicyDocument=self.policies[kw["RoleName"]])
+        if operation == "describe-log-groups":
+            return dict(logGroups=self.groups)
+        if operation == "create-log-group":
+            self.groups = [dict(logGroupName=d.LOG_GROUP)]
+        if operation == "put-retention-policy":
+            self.groups[0]["retentionInDays"] = kw["retentionInDays"]
+        if operation == "create-function":
+            self.function = {
+                k: copy.deepcopy(v)
+                for k, v in kw.items()
+                if k not in {"Code", "Tags", "Publish", "Description"}
+            }
+            self.function.update(
+                CodeSha256=base64.b64encode(
+                    hashlib.sha256(base64.b64decode(kw["Code"]["ZipFile"])).digest()
+                ).decode(),
+                State="Active",
+                FunctionArn=f"arn:aws:lambda:{d.REGION}:{d.ACCOUNT}:function:{d.FUNCTION}",
+            )
+        if operation == "get-function-configuration":
+            if self.function is None:
+                raise LookupError()
+            return self.function
+        if operation == "put-function-concurrency":
+            self.concurrency = kw["ReservedConcurrentExecutions"]
+        if operation == "get-function-concurrency":
+            return dict(ReservedConcurrentExecutions=self.concurrency)
+        if operation == "put-function-event-invoke-config":
+            self.event = {k: v for k, v in kw.items() if k != "FunctionName"}
+        if operation == "get-function-event-invoke-config":
+            return self.event
+        return {}
+
+
+class DeploymentTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def test_success_inert_and_no_schedule_or_invoke(self):
+        cloud = DeploymentCloud()
+        result = d.deploy(self.root / "deployment", cloud, wait=lambda _: None)
+        self.assertEqual(result["status"], "deployed_unarmed_invocation_disabled")
+        self.assertTrue(result["unarmed_verified"] and result["invocation_disabled_verified"])
+        self.assertEqual(cloud.concurrency, 0)
+        self.assertLessEqual(result["api_calls"], 45)
+        self.assertFalse(
+            any(
+                op in {"invoke", "create-schedule", "run-instances", "stop-instances"}
+                for _, op, _ in cloud.calls
+            )
+        )
+
+    def test_collision_prevents_mutations(self):
+        cloud = DeploymentCloud()
+        cloud.roles[d.WORKER_ROLE] = {}
+        result = d.deploy(self.root / "deployment", cloud, wait=lambda _: None)
+        self.assertEqual(result["failed_stage"], "absence_preflight")
+        self.assertFalse(any(op.startswith(("create", "put")) for _, op, _ in cloud.calls))
+
+    def test_partial_failure_preserved_no_retry(self):
+        cloud = DeploymentCloud("create-function")
+        result = d.deploy(self.root / "deployment", cloud, wait=lambda _: None)
+        self.assertEqual(result["failed_stage"], "create_function")
+        self.assertEqual(len(cloud.roles), 2)
+        self.assertEqual(sum(op == "create-function" for _, op, _ in cloud.calls), 1)
+        with self.assertRaises(FileExistsError):
+            d.deploy(self.root / "deployment", cloud)
+        self.assertNotIn("private-error", (self.root / "deployment/result.json").read_text())
+
+    def test_deterministic_source_only_zip(self):
+        body = d.package()
+        self.assertEqual(body, d.package())
+        with zipfile.ZipFile(io.BytesIO(body)) as archive:
+            self.assertEqual(archive.namelist(), ["watchdog.py"])
+            self.assertEqual(archive.read("watchdog.py"), Path(w.__file__).read_bytes())
+
+    def test_policies_stop_only_tag_and_exact_invoke(self):
+        roles = d.policies()
+        self.assertEqual(len(roles), 2)
+        policy = roles[0][2]
+        allows = [s for s in policy["Statement"] if s["Effect"] == "Allow"]
+        stop = next(s for s in allows if s["Action"] == "ec2:StopInstances")
+        self.assertEqual(
+            stop["Condition"]["StringEquals"]["ec2:ResourceTag/LumiAttempt"], w.ATTEMPT
+        )
+        self.assertNotIn("s3:", json.dumps(policy))
+        self.assertNotIn("Terminate", json.dumps(policy))
+        self.assertEqual(
+            roles[1][1]["Statement"][0]["Condition"]["StringEquals"]["aws:SourceAccount"], w.ACCOUNT
+        )
+
+    def test_cli_rejects_mutations_outside_deployment(self):
+        for service, op in (
+            ("ec2", "run-instances"),
+            ("lambda", "invoke"),
+            ("scheduler", "create-schedule"),
+        ):
+            with self.assertRaises(ValueError):
+                d.Cloud().cli(service, op)

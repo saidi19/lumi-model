@@ -1,0 +1,121 @@
+"""Pinned public wheel preparation with tiny synthetic response bodies only."""
+
+import hashlib
+import importlib.util
+import io
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "sdk_prepare", ROOT / "scripts/prepare_sft_vm_acquisition_sdk_v1.py"
+)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+
+class LockTests(unittest.TestCase):
+    def test_five_public_wheels_exactly_reuse_existing_project_pins(self):
+        lock = m.validate(m.LOCK.read_bytes(), m.PRIOR.read_bytes())
+        self.assertEqual(len(lock["requirements"]), 5)
+        self.assertEqual(sum(r["bytes"] for r in lock["requirements"]), 15791700)
+        self.assertFalse(lock["linux_sdk_qualified"])
+        self.assertEqual(lock["requirements"][0]["version"], "1.43.51")
+
+    def test_changed_prior_hash_version_or_wheel_host_rejected(self):
+        raw, prior = m.LOCK.read_bytes(), m.PRIOR.read_bytes()
+        with self.assertRaises(ValueError):
+            m.validate(raw, prior + b"changed")
+        for field, value in (
+            ("version", "999"),
+            ("sha256", "a" * 64),
+            ("url", "https://other.example/fake.whl"),
+            ("yanked_at_metadata_check", True),
+        ):
+            changed = json.loads(raw)
+            changed["requirements"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                m.validate(json.dumps(changed).encode(), prior)
+
+    def test_optional_native_crt_and_duplicate_dependency_not_allowed(self):
+        raw, prior = m.LOCK.read_bytes(), m.PRIOR.read_bytes()
+        for change in ("extra", "duplicate"):
+            value = json.loads(raw)
+            if change == "extra":
+                value["extras"] = ["crt"]
+            else:
+                value["requirements"][-1] = value["requirements"][0]
+            with self.assertRaises(ValueError):
+                m.validate(json.dumps(value).encode(), prior)
+
+    def test_redirect_rejected_without_following(self):
+        with self.assertRaisesRegex(ValueError, "sdk_redirect_rejected"):
+            m.NoRedirect().redirect_request(None, None, 302, None, None, None)
+
+
+class StreamTests(unittest.TestCase):
+    def setUp(self):
+        self.body = b"synthetic wheel bytes"
+        self.row = {"bytes": len(self.body), "sha256": hashlib.sha256(self.body).hexdigest()}
+        self.response = Mock(status=200, headers={"Content-Length": str(len(self.body))})
+        self.response.read.side_effect = io.BytesIO(self.body).read
+
+    def copy(self):
+        with tempfile.TemporaryFile() as output:
+            m.copy_wheel(self.response, output, self.row, time.monotonic() + 30)
+            output.seek(0)
+            return output.read()
+
+    def test_exact_bounded_body_hash_and_mode(self):
+        self.assertEqual(self.copy(), self.body)
+        self.assertEqual(self.response.read.call_args_list[-1].args, (1,))
+
+    def test_wrong_status_or_size_before_body_read(self):
+        for status, headers in (
+            (403, {}),
+            (200, {"Content-Length": "999"}),
+            (200, {"Content-Length": str(len(self.body)), "Content-Encoding": "gzip"}),
+        ):
+            self.response.status, self.response.headers = status, headers
+            with self.assertRaises(ValueError):
+                self.copy()
+        self.response.read.assert_not_called()
+
+    def test_bad_hash_truncated_or_overlong_rejected(self):
+        for body in (b"x" * len(self.body), self.body[:-1], self.body + b"extra"):
+            self.response.read.side_effect = io.BytesIO(body).read
+            with self.assertRaises(ValueError):
+                self.copy()
+
+    def test_deadline_before_body_read(self):
+        with tempfile.TemporaryFile() as output, self.assertRaises(ValueError):
+            m.copy_wheel(self.response, output, self.row, time.monotonic() - 1)
+        self.response.read.assert_not_called()
+
+
+class FetchTests(unittest.TestCase):
+    def test_connection_failure_preserved_without_retry_or_install(self):
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder).resolve() / "fresh"
+            opener = Mock()
+            opener.open.side_effect = OSError("private error text")
+            with patch.object(m.urllib.request, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(ValueError, "sdk_acquisition_failed"):
+                    m.fetch(destination, m.LOCK.read_bytes(), m.PRIOR.read_bytes())
+                opener.open.assert_called_once()
+                failure = json.loads((destination / "failed.json").read_bytes())
+                self.assertEqual(failure["wheels_verified"], 0)
+                self.assertEqual(failure["requests_started"], 1)
+                self.assertNotIn("private error text", (destination / "failed.json").read_text())
+                with self.assertRaises(FileExistsError):
+                    m.fetch(destination, m.LOCK.read_bytes(), m.PRIOR.read_bytes())
+                self.assertFalse((destination / "result.json").exists())
+                opener.open.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,588 @@
+"""Genuine tiny-only CPU tests for bounded v3; no real checkpoint, training or GPU."""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib
+import json
+import os
+import stat
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from lumi import posttraining_checkpoint_import_torch_v3 as m
+from lumi.posttraining_checkpoint_import_torch_v3 import convert_and_verify, require_dependencies
+
+
+class CheckpointImportTorchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        try:
+            require_dependencies()
+            cls.torch = importlib.import_module("torch")
+            cls.previous_threads = cls.torch.get_num_threads()
+            cls.torch.set_num_threads(1)
+            cls.dcp = importlib.import_module("torch.distributed.checkpoint")
+            cls.safetensors = importlib.import_module("safetensors.torch")
+            importlib.import_module("transformers")
+            cls.config_class = importlib.import_module("lumi.configuration_lumi").LumiConfig
+            cls.model_class = importlib.import_module("lumi.modeling_lumi").LumiForCausalLM
+        except (ImportError, RuntimeError) as error:
+            raise RuntimeError(
+                "PENDING: real tiny DCP/HF tests require torch, transformers and "
+                "safetensors; no round-trip success is established"
+            ) from error
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.torch.set_num_threads(cls.previous_threads)
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory(prefix="lumi-import-synthetic-v3-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.config_path = self.root / "config.json"
+        self.checkpoint_path = self.root / "checkpoint"
+        self.output_path = self.root / "hf"
+        self.budget = mock.Mock()
+        self.limits = {"maximum_parameters": 1_000_000,
+                       "maximum_tensor_bytes": 32 * 1024**2,
+                       "maximum_output_bytes": 4 * 1024**2,
+                       "check_budget": self.budget}
+        self.payload = {
+            "vocab_size": 17,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "max_position_embeddings": 16,
+            "tie_word_embeddings": True,
+        }
+        self.config_path.write_text(json.dumps(self.payload), encoding="utf-8")
+
+    def _checkpoint(self, mutate=None) -> None:
+        torch = self.torch
+        self.checkpoint_path.mkdir()
+        config = self.config_class(**self.payload)
+        config._attn_implementation = "eager"
+        with torch.device("cpu"):
+            model = self.model_class(config).float()
+        with torch.no_grad():
+            for index, parameter in enumerate(model.parameters()):
+                values = torch.arange(parameter.numel(), dtype=torch.float32, device="cpu")
+                parameter.copy_(((values.remainder(23) - 11) / 31 + index / 100).reshape(
+                    parameter.shape
+                ))
+        self.buffer_names = set(dict(model.named_buffers()))
+        state = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
+        if mutate is not None:
+            mutate(state)
+        self.fixture_state = {name: tensor.clone() for name, tensor in state.items()}
+        self.dcp.save(
+            {"model": state},
+            storage_writer=self.dcp.FileSystemWriter(self.checkpoint_path / "model"),
+        )
+
+    def _run(self, dtype="float32", **changes):
+        with mock.patch.object(self.model_class, "forward", side_effect=AssertionError("forward")):
+            return convert_and_verify(
+                self.config_path, self.checkpoint_path, self.output_path, dtype,
+                **{**self.limits, **changes}
+            )
+
+    def _assert_dtype_evidence(self, result, dtype) -> None:
+        self.assertEqual(result["dtype"], dtype)
+        self.assertEqual(result["parameter_dtype"], dtype)
+        self.assertEqual(
+            result["buffer_dtype_policy"], "configured_buffer_dtype_preserve_values"
+        )
+        self.assertEqual(result["cast_tensor_sha256"], result["reload_tensor_sha256"])
+
+    def _assert_exported_buffer_policy(self) -> None:
+        weights = list(self.output_path.glob("model*.safetensors"))
+        self.assertEqual(len(weights), 1)
+        exported = self.safetensors.load_file(weights[0], device="cpu")
+        self.assertTrue(self.buffer_names)
+        for name in self.buffer_names:
+            self.assertEqual(exported[name].device.type, "cpu")
+            self.assertEqual(exported[name].dtype, self.torch.float32)
+            self.assertTrue(self.torch.equal(exported[name], self.fixture_state[name].float()))
+
+    def _assert_roundtrip(self, dtype) -> None:
+        self._checkpoint()
+        result = self._run(dtype)
+        self.assertFalse(result["real_4b_import"])
+        self.assertFalse(result["training_authorized"])
+        self.assertFalse(result["production_eligible"])
+        self.assertEqual(set(result), set(m.EVIDENCE_KEYS))
+        self.assertGreater(self.budget.call_count, 20)
+        self.assertTrue(result["no_forward_pass"])
+        self.assertTrue(result["complete_keys_shapes_verified"])
+        self.assertTrue(result["hf_reload_tensor_equal"])
+        self._assert_dtype_evidence(result, dtype)
+        self.assertGreater(result["model_parameters"], 0)
+        self.assertLessEqual(result["model_parameters"], 1_000_000)
+        if dtype == "float32":
+            self.assertEqual(result["source_tensor_sha256"], result["reload_tensor_sha256"])
+        else:
+            self.assertNotEqual(result["source_tensor_sha256"], result["reload_tensor_sha256"])
+
+    def test_real_float32_roundtrip(self) -> None:
+        self._assert_roundtrip("float32")
+
+    def test_real_bfloat16_roundtrip(self) -> None:
+        self._assert_roundtrip("bfloat16")
+
+    def test_real_bfloat16_source_roundtrip(self) -> None:
+        self._checkpoint(lambda state: state.update({
+            name: tensor.bfloat16() for name, tensor in state.items()
+        }))
+        self.assertTrue(all(tensor.dtype == self.torch.bfloat16
+                            for tensor in self.fixture_state.values()))
+        result = self._run("bfloat16")
+        self._assert_dtype_evidence(result, "bfloat16")
+        self._assert_exported_buffer_policy()
+
+    def test_real_mixed_parameter_buffer_source_roundtrip(self) -> None:
+        self._checkpoint(lambda state: state.update({
+            name: tensor.bfloat16() for name, tensor in state.items()
+            if name not in self.buffer_names
+        }))
+        for name, tensor in self.fixture_state.items():
+            expected = self.torch.float32 if name in self.buffer_names else self.torch.bfloat16
+            self.assertEqual(tensor.dtype, expected)
+        result = self._run("bfloat16")
+        self._assert_dtype_evidence(result, "bfloat16")
+        self._assert_exported_buffer_policy()
+
+    def test_bfloat16_export_preserves_original_float32_buffer_values(self) -> None:
+        self._checkpoint()
+        self.assertTrue(any(
+            not self.torch.equal(self.fixture_state[name],
+                                 self.fixture_state[name].bfloat16().float())
+            for name in self.buffer_names
+        ), "fixture must expose lossy whole-model BF16 buffer casting")
+        result = self._run("bfloat16")
+        self._assert_dtype_evidence(result, "bfloat16")
+        self._assert_exported_buffer_policy()
+
+    def test_missing_key_fails(self) -> None:
+        self._checkpoint(lambda state: state.pop("lm_head.weight"))
+        with self.assertRaisesRegex(ValueError, "dcp_key_inventory"):
+            self._run()
+        self.assertFalse(self.output_path.exists())
+
+    def test_extra_key_fails(self) -> None:
+        self._checkpoint(lambda state: state.update(extra=self.torch.ones(1)))
+        with self.assertRaisesRegex(ValueError, "dcp_key_inventory"):
+            self._run()
+        self.assertFalse(self.output_path.exists())
+
+    def test_shape_mismatch_fails(self) -> None:
+        self._checkpoint(lambda state: state.update({"lm_head.weight": self.torch.ones(1)}))
+        with self.assertRaisesRegex(ValueError, "dcp_shape_inventory"):
+            self._run()
+
+    def test_unsupported_checkpoint_dtype_fails(self) -> None:
+        self._checkpoint(
+            lambda state: state.update({"lm_head.weight": state["lm_head.weight"].double()})
+        )
+        with self.assertRaisesRegex(ValueError, "dcp_dtype_rejected"):
+            self._run()
+
+    def test_tied_alias_disagreement_fails(self) -> None:
+        self._checkpoint(
+            lambda state: state.update({"lm_head.weight": state["lm_head.weight"] + 1})
+        )
+        with self.assertRaisesRegex(ValueError, "tied_alias_mismatch"):
+            self._run()
+
+    def test_nonfinite_checkpoint_fails(self) -> None:
+        self._checkpoint(lambda state: state["lm_head.weight"].fill_(float("nan")))
+        with self.assertRaisesRegex(ValueError, "dcp_nonfinite"):
+            self._run()
+
+    def test_invalid_requested_dtype_fails_before_restore(self) -> None:
+        with self.assertRaisesRegex(ValueError, "dtype_rejected"):
+            self._run("float16")
+        self.assertFalse(self.output_path.exists())
+
+    def test_parameter_cap_before_model_allocation(self) -> None:
+        self.checkpoint_path.mkdir()
+        self.payload["vocab_size"] = 1_000_000
+        self.config_path.write_text(json.dumps(self.payload), encoding="utf-8")
+        with mock.patch.object(
+            self.model_class, "__init__", side_effect=AssertionError("allocated")
+        ):
+            with self.assertRaisesRegex(ValueError, "parameter_limit_exceeded"):
+                self._run()
+        self.assertFalse(self.output_path.exists())
+
+    def test_existing_output_is_never_overwritten(self) -> None:
+        self.output_path.mkdir()
+        sentinel = self.output_path / "sentinel"
+        sentinel.write_bytes(b"unchanged")
+        with self.assertRaisesRegex(m.ImportKernelError, "output_exists"):
+            self._run()
+        self.assertEqual(sentinel.read_bytes(), b"unchanged")
+
+    def test_distributed_process_group_is_refused(self) -> None:
+        self.checkpoint_path.mkdir()
+        with mock.patch.object(self.torch.distributed, "is_initialized", return_value=True):
+            with self.assertRaisesRegex(ValueError, "distributed_group_rejected"):
+                self._run()
+
+
+    def test_explicit_limits_and_callback_required_before_dependencies(self):
+        with mock.patch.object(m, "require_dependencies") as dependencies:
+            for key in ("maximum_parameters", "maximum_tensor_bytes", "maximum_output_bytes"):
+                for bad in (None, True, 0, -1, 1.0, 2**63):
+                    with self.assertRaisesRegex(m.ImportKernelError, "limits_required"):
+                        self._run(**{key: bad})
+            with self.assertRaisesRegex(m.ImportKernelError, "budget_callback_required"):
+                self._run(check_budget=None)
+            dependencies.assert_not_called()
+        with self.assertRaises(TypeError):
+            convert_and_verify(self.config_path, self.checkpoint_path, self.output_path, "float32")
+
+    def test_budget_failure_precedes_any_input_or_dependency_access(self):
+        failure = mock.Mock(side_effect=RuntimeError("DO_NOT_RETAIN_EXCEPTION_TEXT"))
+        with mock.patch.object(m, "_private_path") as paths, \
+                mock.patch.object(m, "require_dependencies") as dependencies:
+            with self.assertRaisesRegex(m.ImportKernelError, "^budget_check_failed$"):
+                self._run(check_budget=failure)
+            paths.assert_not_called()
+            dependencies.assert_not_called()
+        self.assertEqual(failure.call_count, 1)
+
+    def test_tensor_limit_precedes_cpu_destination_allocation(self):
+        self._checkpoint()
+        original = self.torch.empty
+
+        def empty(*args, **kwargs):
+            if kwargs.get("device") == "cpu":
+                raise AssertionError("CPU allocation occurred before projected limit")
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.torch, "empty", side_effect=empty):
+            with self.assertRaisesRegex(m.ImportKernelError, "tensor_limit_exceeded"):
+                self._run(maximum_tensor_bytes=1)
+        self.assertFalse(self.output_path.exists())
+
+    def test_output_projection_precedes_restore_and_directory_creation(self):
+        self._checkpoint()
+        with mock.patch.object(self.dcp, "load_state_dict") as load:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_limit_exceeded"):
+                self._run(maximum_output_bytes=m.OUTPUT_OVERHEAD_BYTES)
+            load.assert_not_called()
+        self.assertFalse(self.output_path.exists())
+
+    def test_projected_peak_formula_and_output_projection_reported_exactly(self):
+        self._checkpoint()
+        result = self._run("bfloat16")
+        expected = max(result["source_state_bytes"] + result["cast_state_bytes"],
+                       2 * result["cast_state_bytes"])
+        expected += result["largest_tensor_bytes"] + 2 * m.CHUNK_BYTES
+        self.assertEqual(result["projected_live_tensor_bytes"], expected)
+        self.assertEqual(result["projected_output_bytes"],
+                         result["cast_state_bytes"] + m.OUTPUT_OVERHEAD_BYTES)
+        self.assertLessEqual(result["output_bytes"], result["projected_output_bytes"])
+        self.assertFalse(result["os_resource_limits_enforced"])
+        self.assertFalse(result["complete_source_read_budget_verified"])
+
+    def test_private_modes_exist_during_save_and_umask_is_restored(self):
+        self._checkpoint()
+        original = self.model_class.save_pretrained
+        witnessed = []
+
+        def saving(model, output, **kwargs):
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
+            current = os.umask(0o077)
+            try:
+                self.assertEqual(current, 0o077)
+                witnessed.append(True)
+                return original(model, output, **kwargs)
+            finally:
+                os.umask(current)
+
+        prior = os.umask(0o022)
+        try:
+            with mock.patch.object(self.model_class, "save_pretrained", saving):
+                self._run()
+            current = os.umask(0o022)
+            self.assertEqual(current, 0o022)
+            self.assertEqual(witnessed, [True])
+            self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600
+                                for path in self.output_path.iterdir()))
+        finally:
+            os.umask(prior)
+
+    def test_partial_save_failure_preserved_not_overwritten_and_umask_restored(self):
+        self._checkpoint()
+
+        def failure(_model, output, **_kwargs):
+            (output / "config.json").write_bytes(b"PARTIAL_SYNTHETIC")
+            raise RuntimeError("PRIVATE_ERROR_NOT_EXPOSED")
+
+        prior = os.umask(0o027)
+        try:
+            with mock.patch.object(self.model_class, "save_pretrained", failure):
+                with self.assertRaisesRegex(m.ImportKernelError, "^conversion_failed$"):
+                    self._run()
+            current = os.umask(0o027)
+            self.assertEqual(current, 0o027)
+            self.assertEqual((self.output_path / "config.json").read_bytes(), b"PARTIAL_SYNTHETIC")
+            with self.assertRaisesRegex(m.ImportKernelError, "^output_exists$"):
+                self._run()
+        finally:
+            os.umask(prior)
+
+    def test_unknown_code_file_output_rejected_before_hf_reload(self):
+        self._checkpoint()
+        original = self.model_class.save_pretrained
+
+        def saving(model, output, **kwargs):
+            original(model, output, **kwargs)
+            (output / "modeling_untrusted.py").write_bytes(b"synthetic")
+
+        with mock.patch.object(self.model_class, "save_pretrained", saving), \
+                mock.patch.object(self.model_class, "from_pretrained") as reload:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_inventory_rejected"):
+                self._run()
+            reload.assert_not_called()
+
+    def test_saved_config_geometry_change_rejected_before_reload(self):
+        self._checkpoint()
+        original = self.model_class.save_pretrained
+
+        def saving(model, output, **kwargs):
+            original(model, output, **kwargs)
+            config = json.loads((output / "config.json").read_bytes())
+            config["hidden_size"] += 1
+            (output / "config.json").write_text(json.dumps(config))
+
+        with mock.patch.object(self.model_class, "save_pretrained", saving), \
+                mock.patch.object(self.model_class, "from_pretrained") as reload:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_config_changed"):
+                self._run()
+            reload.assert_not_called()
+
+    def test_postwrite_output_cap_and_bounded_safe_sharding(self):
+        self._checkpoint()
+        with mock.patch.object(m, "SHARD_BYTES", 256):
+            result = self._run()
+        self.assertGreater(result["safetensor_file_count"], 1)
+        self.assertTrue((self.output_path / "model.safetensors.index.json").is_file())
+
+    def test_planner_inventory_matches_genuine_tiny_architecture_variants(self):
+        from lumi.posttraining_checkpoint_import_plan_v1 import tensor_inventory
+
+        for tied, bias, heads in ((True, False, 2), (False, False, 2), (True, True, 4),
+                                   (False, True, 4)):
+            payload = {**self.payload, "tie_word_embeddings": tied,
+                       "attention_bias": bias, "num_attention_heads": heads}
+            config = self.config_class(**payload)
+            with self.torch.device("meta"):
+                model = self.model_class(config)
+            actual = model.state_dict()
+            parameters = {name for name, _ in model.named_parameters(remove_duplicate=False)}
+            rows = tensor_inventory(config.to_dict())
+            self.assertEqual({row["name"] for row in rows}, set(actual))
+            for row in rows:
+                self.assertEqual(row["shape"], list(actual[row["name"]].shape))
+                self.assertEqual(row["role"],
+                                 "parameter" if row["name"] in parameters else "buffer")
+                self.assertEqual(row["elements"], actual[row["name"]].numel())
+                if row["role"] == "buffer":
+                    self.assertEqual(actual[row["name"]].dtype, self.torch.float32)
+            unique = sum(row["elements"] for row in rows if row["role"] == "parameter"
+                         and "alias_of" not in row)
+            self.assertEqual(unique, sum(value.numel() for value in model.parameters()))
+
+    def test_untied_biased_independent_query_width_roundtrip(self):
+        self.payload.update(tie_word_embeddings=False, attention_bias=True, num_attention_heads=4)
+        self.config_path.write_text(json.dumps(self.payload))
+        self._checkpoint()
+        result = self._run("bfloat16")
+        self.assertFalse(result["tied_aliases_verified"])
+        self._assert_exported_buffer_policy()
+
+    def test_streamed_digest_matches_old_framing_without_full_tensor_tobytes(self):
+        state = {"scalar-vector": self.torch.arange(37, dtype=self.torch.float32),
+                 "bf16": self.torch.arange(16, dtype=self.torch.bfloat16).reshape(4, 4)}
+        expected = hashlib.sha256()
+        for name, tensor in sorted(state.items()):
+            header = json.dumps([name, str(tensor.dtype), list(tensor.shape)],
+                                separators=(",", ":"), ensure_ascii=True).encode("ascii")
+            payload = tensor.reshape(-1).view(self.torch.uint8).numpy().tobytes()
+            expected.update(len(header).to_bytes(8, "big"))
+            expected.update(header)
+            expected.update(len(payload).to_bytes(8, "big"))
+            expected.update(payload)
+        tick = mock.Mock()
+        with mock.patch.object(m, "CHUNK_BYTES", 16):
+            self.assertEqual(m._tensor_digest(state, tick), expected.hexdigest())
+            self.assertTrue(all(chunk.numel() * chunk.element_size() <= 16
+                                for chunk in m._chunks(state["scalar-vector"], tick)))
+        self.assertGreater(tick.call_count, 20)
+
+    def test_chunked_equality_finite_and_noncontiguous_rejection(self):
+        left = self.torch.arange(33, dtype=self.torch.float32)
+        right = left.clone()
+        with mock.patch.object(m, "CHUNK_BYTES", 16):
+            self.assertTrue(m._equal(left, right, self.budget))
+            right[-1] += 1
+            self.assertFalse(m._equal(left, right, self.budget))
+            right[-1] = float("nan")
+            with self.assertRaisesRegex(m.ImportKernelError, "cast_nonfinite"):
+                m._finite(right, self.budget, "cast_nonfinite")
+            with self.assertRaisesRegex(m.ImportKernelError, "tensor_layout_rejected"):
+                list(m._chunks(self.torch.ones((2, 4)).t(), self.budget))
+
+    def test_chunk_coverage_complete_nonoverlap_dimensions_and_types(self):
+        def meta(chunks):
+            return types.SimpleNamespace(size=(4, 4), chunks=[
+                types.SimpleNamespace(offsets=offset, sizes=size) for offset, size in chunks])
+        good = meta([((0, 0), (2, 4)), ((2, 0), (2, 4))])
+        m._require_complete_chunks(good, self.budget)
+        cases = (
+            ([((0, 0), (2, 4))], "dcp_chunk_coverage"),
+            ([((0, 0), (3, 4)), ((2, 0), (2, 4))], "dcp_chunk_overlap"),
+            ([((0,), (4,))], "dcp_chunk_dimensions"),
+            ([((0, 0), (5, 4))], "dcp_chunk_bounds"),
+            ([((False, 0), (4, 4))], "dcp_chunk_bounds"),
+            ([], "dcp_chunk_limit"),
+        )
+        for chunks, code in cases:
+            with self.assertRaisesRegex(m.ImportKernelError, code):
+                m._require_complete_chunks(meta(chunks), self.budget)
+
+    def test_budget_failure_mid_digest_stops_further_chunks(self):
+        tick = mock.Mock(side_effect=[None, None, RuntimeError("bounded-stop")])
+        with mock.patch.object(m, "CHUNK_BYTES", 16):
+            with self.assertRaises(RuntimeError):
+                m._tensor_digest({"tensor": self.torch.ones(64)}, tick)
+        self.assertEqual(tick.call_count, 3)
+
+    def test_no_old_cap_or_dispatch_mutation_and_meta_assign_source_order(self):
+        root = Path(__file__).resolve().parents[1]
+        old = root / "src/lumi/posttraining_checkpoint_import_torch_v2.py"
+        self.assertEqual(hashlib.sha256(old.read_bytes()).hexdigest(),
+                         "01e301ed152a6e81ae9ef6acdb25b71a3e3778148114228591051c2e25e0ab6f")
+        source = (root / "src/lumi/posttraining_checkpoint_import_torch_v3.py").read_text()
+        self.assertNotIn("MAXIMUM_SYNTHETIC_PARAMETERS", source)
+        self.assertIn('with torch.device("meta")', source)
+        self.assertIn("strict=True, assign=True", source)
+        self.assertIn("model.tie_weights()", source)
+        self.assertLess(source.index("del destinations, metadata, reader, model_state"),
+                        source.index("LumiForCausalLM.from_pretrained"))
+        tree = ast.parse(source)
+        self.assertFalse(any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                             and node.func.attr in {"tobytes", "init_process_group", "forward",
+                                                    "generate", "cuda", "system"}
+                             for node in ast.walk(tree)))
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                        and node.name == "convert_and_verify")
+        self.assertEqual([arg.arg for arg in function.args.kwonlyargs],
+                         ["maximum_parameters", "maximum_tensor_bytes",
+                          "maximum_output_bytes", "check_budget"])
+        self.assertEqual(function.args.kw_defaults, [None] * 4)
+
+
+    def test_source_loading_switches_rejected_before_dependencies(self):
+        self.checkpoint_path.mkdir()
+        nested = "synthetic"
+        for _ in range(150):
+            nested = {"padding": nested}
+        for key, value in (("quantization_config", {"load_in_4bit": True}),
+                           ("quantization_config", None), ("auto_map", {}),
+                           ("device_map", "cuda"), ("_attn_implementation", "remote/kernel"),
+                           ("tp_plan", "auto"), ("extra", nested),
+                           ("use_cache", 1), ("num_hidden_layers", 129)):
+            with self.subTest(key=key):
+                self.config_path.write_text(json.dumps(self.payload | {key: value}))
+                with mock.patch.object(m, "require_dependencies") as dependencies:
+                    with self.assertRaisesRegex(m.ImportKernelError, "configuration_rejected"):
+                        self._run()
+                    dependencies.assert_not_called()
+                self.assertFalse(self.output_path.exists())
+
+    def test_generated_config_size_checked_before_output_write(self):
+        self._checkpoint()
+        with mock.patch.object(self.config_class, "to_json_string",
+                               return_value="x" * (m.MAXIMUM_CONFIG_BYTES + 1)), \
+                mock.patch.object(self.model_class, "save_pretrained") as save:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_limit_exceeded"):
+                self._run()
+            save.assert_not_called()
+        self.assertFalse(self.output_path.exists())
+
+    def test_dotdot_paths_rejected(self):
+        with mock.patch.object(m, "require_dependencies") as dependencies:
+            with self.assertRaisesRegex(m.ImportKernelError, "path_rejected"):
+                convert_and_verify(self.root / "absent" / ".." / "config.json",
+                                   self.checkpoint_path, self.output_path, "float32", **self.limits)
+            dependencies.assert_not_called()
+
+    def test_full_source_fields_and_explicit_cpu_reload(self):
+        self.payload.update(architectures=["LumiForCausalLM"], model_type="lumi",
+                            initialization_strategy="residual_scaled_v0.1", initializer_range=.02,
+                            use_cache=False, torch_dtype="bfloat16")
+        self.config_path.write_text(json.dumps(self.payload))
+        self._checkpoint()
+        original = self.model_class.from_pretrained
+
+        def reload(*args, **kwargs):
+            self.assertIsNone(kwargs["device_map"])
+            self.assertEqual(self.torch.empty(0).device.type, "cpu")
+            self.assertIs(kwargs["use_safetensors"], True)
+            self.assertIs(kwargs["local_files_only"], True)
+            self.assertIs(kwargs["trust_remote_code"], False)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.model_class, "from_pretrained", side_effect=reload):
+            result = self._run("bfloat16")
+        self.assertTrue(result["configuration_fields_preserved"])
+        saved = json.loads((self.output_path / "config.json").read_bytes())
+        self.assertTrue(m._source_fields_preserved(saved, self.payload))
+
+    def test_runtime_code_replacement_rejected(self):
+        self._checkpoint()
+        original = self.model_class.save_pretrained
+
+        def saving(model, output, **kwargs):
+            original(model, output, **kwargs)
+            (output / "modeling_lumi.py").write_bytes(b"different synthetic code")
+
+        with mock.patch.object(self.model_class, "save_pretrained", saving), \
+                mock.patch.object(self.model_class, "from_pretrained") as reload:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_inventory_rejected"):
+                self._run()
+            reload.assert_not_called()
+
+    def test_saved_quantizer_injection_rejected_before_reload(self):
+        self._checkpoint()
+        original = self.model_class.save_pretrained
+
+        def saving(model, output, **kwargs):
+            original(model, output, **kwargs)
+            path = output / "config.json"
+            payload = json.loads(path.read_bytes())
+            payload["quantization_config"] = {"load_in_4bit": True}
+            path.write_text(json.dumps(payload))
+
+        with mock.patch.object(self.model_class, "save_pretrained", saving), \
+                mock.patch.object(self.model_class, "from_pretrained") as reload:
+            with self.assertRaisesRegex(m.ImportKernelError, "output_config_changed"):
+                self._run()
+            reload.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

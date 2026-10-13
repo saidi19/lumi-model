@@ -1,0 +1,385 @@
+"""Fault injection into actual candidate functions; no sockets or subprocesses."""
+
+import ast
+import collections
+import hashlib
+import io
+import json
+import math
+import signal
+import stat
+import subprocess
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from scripts import prepare_sft_vm_initial_proof_diagnostics_v1 as b
+from scripts import sft_vm_initial_proof_diagnostics_v1 as d
+
+
+def function(raw, name, namespace):
+    node = next(n for n in ast.parse(raw).body if getattr(n, "name", None) == name)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "<candidate>", "exec"), namespace)
+    return namespace[name]
+
+
+class Selector:
+    def __init__(self):
+        self.rows = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def register(self, stream, event, data):
+        self.rows[stream] = types.SimpleNamespace(fileobj=stream, fd=stream.fileno(), data=data)
+
+    def unregister(self, stream):
+        del self.rows[stream]
+
+    def get_map(self):
+        return self.rows
+
+    def select(self, remaining):
+        return [(row, 1) for row in self.rows.values()]
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.files, cls.manifest = b.build()
+
+    def exchange(self, *, code=0, reply=b"{}", fault=None, body=b""):
+        process = Mock(pid=123)
+        process.wait.return_value = code
+        process.stdin.fileno.return_value = 10
+        process.stdout.fileno.return_value = 11
+        os_fake = types.SimpleNamespace(
+            environ={},
+            set_blocking=Mock(),
+            read=Mock(side_effect=[reply, b""]),
+            write=Mock(side_effect=lambda _, v: len(v)),
+            killpg=Mock(),
+        )
+        selector = Selector()
+        popen = Mock(return_value=process)
+        clock = Mock(return_value=100)
+        if fault == "spawn":
+            popen.side_effect = OSError("PRIVATE_SENTINEL")
+        elif fault == "select":
+            selector.select = lambda _: []
+        elif fault == "deadline":
+            clock.side_effect = [100, 126]
+        elif fault == "wait":
+            process.wait.side_effect = [subprocess.TimeoutExpired("PRIVATE_SENTINEL", 25), 0]
+        elif fault in {"read", "write", "cleanup"}:
+            getattr(os_fake, "killpg" if fault == "cleanup" else fault).side_effect = OSError(
+                "PRIVATE_SENTINEL"
+            )
+        with (
+            patch.object(d, "os", os_fake),
+            patch.object(d.subprocess, "Popen", popen),
+            patch.object(d.selectors, "DefaultSelector", return_value=selector),
+            patch.object(d.time, "monotonic", clock),
+        ):
+            try:
+                value = d.pipe_exchange(["NEVER_EXECUTED"], body, 25)
+                return value, process, popen, os_fake
+            except d.ExchangeFailure as error:
+                self.assertNotIn("PRIVATE_SENTINEL", str(error))
+                return d.exchange_diagnostic(error), process, popen, os_fake
+
+    def test_success_preserves_bytes_and_process_group_cleanup(self):
+        raw, process, popen, fake = self.exchange(body=b"public-control", reply=b"proof")
+        self.assertEqual(raw, b"proof")
+        popen.assert_called_once()
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
+        self.assertEqual(popen.call_args.kwargs["env"]["AWS_MAX_ATTEMPTS"], "1")
+        fake.killpg.assert_called_once_with(123, signal.SIGKILL)
+        process.stdout.close.assert_called_once()
+
+    def test_transport_failures_have_fixed_codes_and_no_retry(self):
+        for stage in ("spawn", "deadline", "select", "read", "write", "wait", "cleanup"):
+            with self.subTest(stage=stage):
+                report, _, popen, fake = self.exchange(fault=stage, body=b"x")
+                self.assertEqual(report["exchange_stage"], stage)
+                self.assertEqual(popen.call_count, 1)
+                if stage != "spawn":
+                    fake.killpg.assert_called_once()
+
+    def test_exit_kinds_and_remote_stage_are_not_success(self):
+        reply = json.dumps(
+            dict(schema="lumi.initial-proof-failure.v1", code="guard_proof")
+        ).encode()
+        for code, kind in ((2, "exit_2"), (255, "exit_255"), (7, "other_nonzero"), (-9, "signal")):
+            report, *_ = self.exchange(code=code, reply=reply)
+            self.assertEqual(report["exit_kind"], kind)
+            self.assertEqual(report["remote_stage"], "guard_proof" if code == 2 else "none")
+
+    def test_reply_limit_and_argument_limits_preserved(self):
+        report, *_ = self.exchange(reply=b"x" * 4097)
+        self.assertEqual(report["exchange_stage"], "reply_limit")
+        for body, seconds in ((b"", 0), (b"", 101), (b"x" * 65537, 25)):
+            with patch.object(d.subprocess, "Popen") as popen, self.assertRaises(d.ExchangeFailure):
+                d.pipe_exchange([], body, seconds)
+            popen.assert_not_called()
+
+    def test_remote_envelope_is_strict_and_never_keeps_raw_data(self):
+        for raw in (
+            b"[]",
+            b"PRIVATE_SENTINEL",
+            b"x" * 257,
+            b'{"schema":"lumi.initial-proof-failure.v1","code":"PRIVATE_SENTINEL"}',
+            b'{"schema":"lumi.initial-proof-failure.v1","code":"guard_proof","extra":1}',
+            b'{"schema":"lumi.initial-proof-failure.v1","code":"parents","code":"guard_proof"}',
+        ):
+            self.assertEqual(d.remote_failure_stage(raw), "none")
+        error = d.ExchangeFailure("PRIVATE_SENTINEL")
+        error.remote_stage = "PRIVATE_SENTINEL"
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(d.exchange_diagnostic(error)))
+
+    def test_remote_launcher_fixed_failure_and_alarm(self):
+        make = function(
+            self.files[b.NAMES[1]],
+            "proof_launcher",
+            dict(
+                source_bytes=lambda: None,
+                EARLY_PATH="/synthetic/guard.py",
+                EARLY_SHA=hashlib.sha256(b"pass").hexdigest(),
+            ),
+        )
+        launcher = make()
+        for fault in (
+            "alarm",
+            "parents",
+            "source_read",
+            "source_hash",
+            "module_load",
+            "source_recheck",
+            "guard_proof",
+            "reply_write",
+            None,
+        ):
+            with self.subTest(fault=fault):
+                self.remote_launcher(launcher, fault)
+
+    def remote_launcher(self, launcher, fault):
+        raw = b"fail" if fault == "source_hash" else b"pass"
+        stream = io.BytesIO(raw)
+        stream.fileno = lambda: 42
+        output = io.StringIO()
+        output.buffer = io.BytesIO()
+        if fault == "reply_write":
+            output.buffer = Mock(write=Mock(side_effect=OSError("PRIVATE_SENTINEL")))
+        alarm = Mock()
+        os_fake = types.SimpleNamespace(
+            O_RDONLY=0,
+            O_NOFOLLOW=0,
+            O_NONBLOCK=0,
+            open=Mock(return_value=42),
+            fdopen=lambda *a: stream,
+            fstat=lambda _: types.SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o400, st_uid=0, st_gid=0, st_nlink=1, st_size=len(raw)
+            ),
+        )
+        path = Mock()
+        path.parent = Mock()
+        path.parents = (path.parent,)
+        path.parent.parents = ()
+        path.parent.lstat.return_value = types.SimpleNamespace(
+            st_mode=stat.S_IFDIR | 0o700, st_uid=0
+        )
+        module = types.SimpleNamespace(
+            read=Mock(return_value=b"pass"),
+            _proof=Mock(return_value={"synthetic": True}),
+            canonical=lambda v: json.dumps(v).encode(),
+        )
+        types_fake = types.SimpleNamespace(ModuleType=Mock(return_value=module))
+        targets = dict(
+            alarm=alarm,
+            parents=path.parent.lstat,
+            source_read=os_fake.open,
+            module_load=types_fake.ModuleType,
+            source_recheck=module.read,
+            guard_proof=module._proof,
+        )
+        if fault in targets:
+            targets[fault].side_effect = ValueError("PRIVATE_SENTINEL")
+
+        def exit_(code):
+            raise SystemExit(code)
+
+        modules = dict(
+            hashlib=hashlib,
+            os=os_fake,
+            signal=types.SimpleNamespace(alarm=alarm),
+            stat=stat,
+            sys=types.SimpleNamespace(stdout=output, exit=exit_),
+            types=types_fake,
+            json=json,
+            pathlib=types.SimpleNamespace(Path=lambda _: path),
+        )
+        namespace = {
+            "__builtins__": dict(
+                vars(__import__("builtins")), __import__=lambda name, *a, **k: modules[name]
+            )
+        }
+        if fault:
+            with self.assertRaises(SystemExit) as caught:
+                exec(launcher, namespace)
+            self.assertEqual(caught.exception.code, 2)
+            self.assertEqual(d.remote_failure_stage(output.getvalue().encode()), fault)
+            self.assertNotIn("PRIVATE_SENTINEL", output.getvalue())
+        else:
+            exec(launcher, namespace)
+            self.assertEqual(json.loads(output.buffer.getvalue()), {"synthetic": True})
+        alarm.assert_called_once_with(20)
+
+    def test_host_substage_fault_matrix_and_success_handoff(self):
+        for stage in (
+            "known_hosts",
+            "launcher",
+            "command",
+            "pre_exchange_budget",
+            "exchange",
+            "proof_validation",
+            "boottime_consistency",
+            "deadline_conversion",
+            "proof_receipt",
+            None,
+        ):
+            with self.subTest(stage=stage):
+                self.host_case(stage)
+
+    def host_case(self, fault):
+        reports = {}
+
+        def need(value):
+            if not value:
+                raise ValueError("PRIVATE_SENTINEL")
+
+        def write(path, raw):
+            if fault == "proof_receipt" and path.name == "initial-proof.json":
+                raise OSError("PRIVATE_SENTINEL")
+            reports[path.name] = json.loads(raw)
+
+        read = Mock(return_value=b"public")
+        initial = types.SimpleNamespace(
+            source_bytes=Mock(),
+            proof_launcher=Mock(return_value="pass"),
+            validate_proof=Mock(
+                return_value={"observed_boottime": 500 if fault == "boottime_consistency" else 50}
+            ),
+        )
+        exchange = Mock(return_value=b"{}")
+        sender = types.SimpleNamespace(
+            command=Mock(return_value=["ssh", "command"]),
+            delivery=types.SimpleNamespace(
+                pipe_exchange=exchange, exchange_diagnostic=d.exchange_diagnostic
+            ),
+        )
+        prepared = dict(
+            status="prepared_pinned_connection_not_native_admission",
+            ssh_config_sha256="a" * 64,
+            control_plane_matches=True,
+            fresh_launch_and_work_volume_match=True,
+            work_snapshot_absent=True,
+            private_egress_route_configured=True,
+            native_host_admitted=False,
+            egress_reachability_proven=False,
+        )
+        connection = types.SimpleNamespace(
+            validate_launch=Mock(),
+            safe_path=Mock(),
+            _prepare_bound_connection=Mock(return_value=prepared),
+            canonical=lambda v: json.dumps(v).encode(),
+        )
+        validate = Mock()
+        targets = dict(
+            known_hosts=read,
+            launcher=initial.proof_launcher,
+            command=sender.command,
+            exchange=exchange,
+            proof_validation=initial.validate_proof,
+            deadline_conversion=validate,
+        )
+        if fault in targets:
+            targets[fault].side_effect = (
+                d.ExchangeFailure("exit", "exit_2", "guard_proof")
+                if fault == "exchange"
+                else ValueError("PRIVATE_SENTINEL")
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = types.SimpleNamespace(
+                CAP=33554432, REPO=Path(tmp), read=read, sync=Mock(), write=write
+            )
+            delivery = types.SimpleNamespace(
+                seed=types.SimpleNamespace(INPUTS=inputs, sender=sender),
+                source_bytes=Mock(),
+                validate_parameters=validate,
+            )
+            handoff = Mock(side_effect=ValueError("HANDOFF_STOP"))
+            invoke = function(
+                self.files[b.NAMES[2]],
+                "_prepare_and_setup_admitted_once",
+                dict(
+                    need=need,
+                    math=math,
+                    hashlib=hashlib,
+                    time=types.SimpleNamespace(monotonic=lambda: 100, sleep=Mock()),
+                    PINS={},
+                    initial=initial,
+                    connection=connection,
+                    delivery=delivery,
+                    _seed_send_and_setup_same_boot=handoff,
+                ),
+            )
+            with self.assertRaises(ValueError):
+                invoke(
+                    dict(root_volume="root", work_volume="work"),
+                    Path(tmp) / "key",
+                    Path(tmp) / "output",
+                    {},
+                    cloud=Mock(),
+                    deadline=900,
+                    launch_monotonic=0,
+                    host_deadline_monotonic=14400,
+                    remaining_control_bytes=1 if fault == "pre_exchange_budget" else 10000,
+                    clock=lambda: 100,
+                )
+        result = reports["result.json"]
+        self.assertNotIn("PRIVATE_SENTINEL", json.dumps(result))
+        if fault:
+            self.assertEqual(result["initial_proof_failure"]["stage"], fault)
+            handoff.assert_not_called()
+        else:
+            self.assertNotIn("initial_proof_failure", result)
+            self.assertIn("initial-proof.json", reports)
+            handoff.assert_called_once()
+
+    def test_auth_checks_and_boot_install_unchanged(self):
+        for index in (1, 2):
+            old = (b.BASE / "scripts" / b.NAMES[index]).read_bytes()
+
+            def checks(raw):
+                return collections.Counter(
+                    ast.dump(n)
+                    for n in ast.walk(ast.parse(raw))
+                    if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == "need"
+                )
+
+            self.assertEqual(checks(old), checks(self.files[b.NAMES[index]]))
+        self.assertFalse(self.manifest["execution_permitted"])
+        self.assertTrue(self.manifest["full_runtime_integration_required"])
+
+    def test_public_entry_rejected(self):
+        for module in (b, d):
+            with self.assertRaises(ValueError):
+                module.run(approved=True)

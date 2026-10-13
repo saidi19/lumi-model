@@ -1,0 +1,27 @@
+"""Offline checks for attempt-019 control verification inputs."""
+import unittest
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_attempt019_controls_v1 as m
+
+
+class Tests(unittest.TestCase):
+    def test_consumed_receipts_and_nonclaims_are_bound(self):
+        plan, watch, store = m.local()
+        self.assertEqual(plan["attempt"], m.ATTEMPT)
+        self.assertEqual(watch["status"], "deployed_unarmed_invocation_disabled")
+        self.assertFalse(watch["invocation"])
+        self.assertEqual(store["status"], "created_private_cleanup_store_verified")
+        self.assertFalse(store["object_access"])
+        self.assertFalse(plan["execution_permitted"])
+
+    def test_receipt_drift_is_rejected(self):
+        name = "artifacts/lumi-vm-attempt-019-cleanup-bucket-v0.1/result.json"
+        pins = dict(m.SOURCE_BINDINGS)
+        pins[name] = (pins[name][0], "0" * 64)
+        with patch.object(m, "SOURCE_BINDINGS", pins), self.assertRaises(ValueError):
+            m.local()
+
+
+if __name__ == "__main__":
+    unittest.main()

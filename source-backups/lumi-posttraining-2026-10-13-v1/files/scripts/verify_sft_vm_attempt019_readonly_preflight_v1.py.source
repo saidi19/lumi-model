@@ -1,0 +1,143 @@
+"""Offline structural verification of attempt-019 read-only admission."""
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "c7124d8fb1a244798d7e41b7b5dfad61"
+SOURCE_RELEASE_SHA = "eae01e7ff3b23b801c69a6c29f1cf852830a8c33fe6d2605c7afa4c73f131dd0"
+SOURCE_PROOF = "evidence/lumi-vm-attempt-019-source-v0.1-verification-v0.1.json"
+SOURCE_PROOF_SHA = "fc55f988dc5ddc7b833a361209e74fbde44e0bc35494ed95b21e083bbaf6fac9"
+PREDECESSOR_FAILURE = "evidence/lumi-vm-attempt-018-readonly-preflight-failure-v0.6.json"
+PREDECESSOR_FAILURE_SHA = "be410a1da527775221dcbc41b41ac5254cf1f68ab9a32fbbbd9fce609aeb0316"
+ENTRY = "scripts/preflight_sft_vm_attempt019_v1.py"
+ENTRY_SHA = "d904d92208f68be4eb3d97fae46c74df8111d8f6d44d01982219be84161c9374"
+TEST = "tests/test_sft_vm_attempt019_readonly_preflight_v1.py"
+TEST_SHA = "b0d012286363d496162a4b7abc3d51ee7e3723929b45e2aff3fadc30b0a66777"
+BINDINGS = "scripts/prepare_sft_vm_deployment_bindings_v19.py"
+BINDINGS_SHA = "0aff5899fcf0fcc72e9c3fef8cf50c4be7b65f68ca9d06259312fafcc7439d06"
+WATCH = "evidence/lumi-vm-attempt-019-inert-watchdog-deployment-verification-v0.1.json"
+WATCH_SHA = "6df0a83a3488e23f3f909e17c102ef15ab09b35f66789328245e4127e1e92049"
+STORE = "evidence/lumi-vm-attempt-019-cleanup-bucket-verification-v0.1.json"
+STORE_SHA = "604ec15088b122421af33c882c3983376c3a891b6497ab03eea31a35cc7f15f0"
+RUN = "artifacts/lumi-vm-attempt-019-readonly-preflight-v0.1"
+FILES = {
+    "started.json": "fd2920f512b1cc21991149efb581093c206bb8466f937dd93fd1ff8178282afa",
+    "admission.json": "32a0d3c1881ca29b1a5f32a9d3eeb1e21e90ed2a7738173b6c764ca04459b233",
+    "result.json": "89d0067027dd9b057a109e3131265dfe00cd4ea3dc5dc440f5ec4971e4ec5b47",
+}
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-019-readonly-preflight-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt019_preflight_v1_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest):
+    path = ROOT / name
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 32 * 1024**2)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def verify():
+    for name, digest in (
+        (ENTRY, ENTRY_SHA),
+        (TEST, TEST_SHA),
+        (BINDINGS, BINDINGS_SHA),
+        (SOURCE_PROOF, SOURCE_PROOF_SHA),
+        (PREDECESSOR_FAILURE, PREDECESSOR_FAILURE_SHA),
+        (WATCH, WATCH_SHA),
+        (STORE, STORE_SHA),
+    ):
+        read(name, digest)
+    source = json.loads(read(SOURCE_PROOF, SOURCE_PROOF_SHA))
+    predecessor = json.loads(read(PREDECESSOR_FAILURE, PREDECESSOR_FAILURE_SHA))
+    need(
+        source["attempt"] == ATTEMPT
+        and source["source_release_sha256"] == SOURCE_RELEASE_SHA
+        and source["fresh_identity_verified"] is True
+        and source["outer_source_authentication_verified"] is True
+        and source["sha256_and_byte_count_closure_verified"] is True
+        and predecessor["localization"]["same_identity_reuse_rejected"] is True
+        and predecessor["localization"]["fresh_attempt_identity_required"] is True
+    )
+    started, admission, result = (
+        json.loads(read(RUN + "/" + name, digest)) for name, digest in FILES.items()
+    )
+    need(
+        started["execution_authorized"] is False
+        and started["max_calls"] == 79
+        and started["control_evidence"] == {WATCH: WATCH_SHA, STORE: STORE_SHA}
+        and admission["status"] == "all_readonly_admission_passed_before_execution_marker"
+        and admission["total_control_calls"] == result["calls"] == 56
+        and admission["network"]["fresh_network_admitted"] is True
+        and admission["cpu"]["status"] == "fresh_cpu_and_exact_attempt_preflight_passed"
+        and admission["watchdog"]["status"] == "verified_fresh_inert_watchdog"
+        and admission["cleanup_store"]["object_reads"] == 0
+        and admission["host_launch_authorized"] is False
+        and result["status"] == "readonly_preflight_passed"
+    )
+    for key in ("cloud_mutations", "object_access"):
+        need(result[key] == 0 and admission[key] == 0)
+    for key in (
+        "execution_marker_created",
+        "cpu_launch_authorized",
+        "outer_invoked",
+        "gate_5_complete",
+        "gpu",
+        "training",
+    ):
+        need(result[key] is False)
+    return {
+        "schema": "lumi.vm-attempt019-readonly-preflight-verification.v0.1",
+        "attempt": ATTEMPT,
+        "status": "readonly_preflight_passed",
+        "source_release_sha256": SOURCE_RELEASE_SHA,
+        "source_verification_sha256": SOURCE_PROOF_SHA,
+        "predecessor_identity_reuse_failure_sha256": PREDECESSOR_FAILURE_SHA,
+        "entry_sha256": ENTRY_SHA,
+        "test_sha256": TEST_SHA,
+        "bindings_sha256": BINDINGS_SHA,
+        "watchdog_verification_sha256": WATCH_SHA,
+        "cleanup_store_verification_sha256": STORE_SHA,
+        "run_bindings": {RUN + "/" + name: digest for name, digest in FILES.items()},
+        "calls": 56,
+        "cloud_mutations": 0,
+        "object_access": 0,
+        "network_admitted": True,
+        "cpu_admitted": True,
+        "inert_watchdog_verified": True,
+        "cleanup_store_verified": True,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

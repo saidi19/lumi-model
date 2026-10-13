@@ -1,0 +1,192 @@
+import hashlib
+import importlib.util
+import json
+import tempfile
+import time
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from tests import test_sft_vm_setup_sequence_v1 as prior
+
+ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location(
+    "wheel_unit_test", ROOT / "scripts/run_sft_vm_cpu_wheel_unit_v1.py"
+)
+m = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(m)
+
+
+def receipt():
+    return dict(
+        requests_started=34,
+        wheels_verified=34,
+        verified_content_bytes=102,
+        all_wheel_readback_matches=True,
+        retry_allowed=False,
+        host_admitted=False,
+        gate_5_complete=False,
+        runtime_installed=False,
+        global_network_cap_proven=False,
+    )
+
+
+class WheelUnitTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())).resolve()
+        self.enterContext(patch.object(m, "OUTPUT", self.root / "unit"))
+        self.events = []
+        self.fail_start = False
+        self.fail_stop = False
+        self.helper = types.SimpleNamespace(
+            write_new=prior.frozen.write_new,
+            observe=Mock(
+                return_value={
+                    "ActiveState": "active",
+                    "SubState": "exited",
+                    "Result": "success",
+                    "ExecMainCode": "1",
+                    "ExecMainStatus": "0",
+                }
+            ),
+            validate_terminal=prior.frozen.validate_terminal,
+            cgroup_empty=Mock(return_value=True),
+        )
+
+        def run(argv, timeout, **kw):
+            if argv[0] == "/usr/bin/systemd-run":
+                self.events.append("dispatch")
+                if self.fail_start:
+                    raise TimeoutError("private exception")
+            else:
+                self.assertEqual(argv, ["/usr/bin/systemctl", "stop", m.UNIT])
+                self.events.append("stop")
+                if self.fail_stop:
+                    return types.SimpleNamespace(returncode=1)
+            return types.SimpleNamespace(returncode=0)
+
+        self.helper.run_command = run
+        self.setup = types.SimpleNamespace(sync=prior.m.sync)
+
+        def read(*args):
+            self.assertEqual(self.events[-1], "stop")
+            self.events.append("receipt")
+            return json.dumps(self.value).encode()
+
+        self.value = receipt()
+        self.setup.read = read
+        self.volumes = {"root_volume": "vol-" + "1" * 17, "work_volume": "vol-" + "2" * 17}
+        self.storage = types.SimpleNamespace(
+            _run_storage_checked_setup=Mock(
+                side_effect=lambda *args: (
+                    self.events.append("setup")
+                    or {"host_admitted": False, "gate_5_complete": False}
+                )
+            )
+        )
+        self.enterContext(
+            patch.object(m, "preflight", return_value=(self.storage, self.setup, self.helper, 102))
+        )
+
+    def run_case(self):
+        self.deadline = time.monotonic() + 1700
+        return m._run_network_admitted_once("b" * 32, self.volumes, self.deadline)
+
+    def test_stop_and_receipt_before_original_setup_with_same_deadline(self):
+        result = self.run_case()
+        self.assertFalse(result["host_admitted"])
+        self.assertEqual(self.events, ["dispatch", "stop", "receipt", "setup"])
+        self.storage._run_storage_checked_setup.assert_called_once_with(
+            self.volumes, "b" * 32, self.deadline
+        )
+        with self.assertRaises(FileExistsError):
+            self.run_case()
+        self.assertEqual(len(self.events), 4)
+
+    def test_ambiguous_start_stops_and_blocks_install(self):
+        self.fail_start = True
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events, ["dispatch", "stop"])
+        self.storage._run_storage_checked_setup.assert_not_called()
+        raw = (m.OUTPUT / "failed.json").read_bytes()
+        self.assertNotIn(b"private exception", raw)
+        self.assertFalse(json.loads(raw)["retry_allowed"])
+
+    def test_failed_stop_or_populated_cgroup_blocks_receipt(self):
+        self.fail_stop = True
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events, ["dispatch", "stop"])
+
+    def test_populated_cgroup_blocks_install(self):
+        self.helper.cgroup_empty.return_value = False
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events, ["dispatch", "stop"])
+
+    def test_invalid_receipt_blocks_install(self):
+        self.value["wheels_verified"] = 33
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events, ["dispatch", "stop", "receipt"])
+        self.storage._run_storage_checked_setup.assert_not_called()
+
+    def test_failed_child_is_stopped_without_install(self):
+        self.helper.observe.return_value = {"SubState": "failed", "Result": "exit-code"}
+        with self.assertRaises(ValueError):
+            self.run_case()
+        self.assertEqual(self.events, ["dispatch", "stop"])
+
+    def test_public_entry_closed_and_short_deadline_no_dispatch(self):
+        with self.assertRaisesRegex(ValueError, "network_and_expiry_admission_not_bound"):
+            m.run(approved=True)
+        for seconds in (0, 329, 1801):
+            with self.assertRaises(ValueError):
+                m._run_network_admitted_once("b" * 32, self.volumes, time.monotonic() + seconds)
+        self.assertFalse(self.events)
+
+
+class UnitContractTests(unittest.TestCase):
+    def test_resource_readonly_and_no_credential_properties(self):
+        argv = m.command(12345.5)
+        props = dict(
+            a.removeprefix("--property=").split("=", 1) for a in argv if a.startswith("--property=")
+        )
+        for key, value in {
+            "RuntimeMaxSec": "300",
+            "MemoryMax": "1G",
+            "MemorySwapMax": "0",
+            "TasksMax": "64",
+            "Restart": "no",
+            "RemainAfterExit": "yes",
+            "CapabilityBoundingSet": "",
+            "StandardOutput": "null",
+            "RestrictAddressFamilies": "AF_INET AF_UNIX",
+        }.items():
+            self.assertEqual(props[key], value)
+        self.assertIn("/opt/lumi-cpu-input/runtime-lock.json", props["ReadOnlyPaths"])
+        self.assertIn("end=min(12345.5,time.monotonic()+300)", argv[-1])
+        self.assertIn("deadline=end", argv[-1])
+        compile(argv[-1], "<wheel-unit-entry>", "exec")
+
+    def test_frozen_bindings_match(self):
+        for file, pin in [
+            ("scripts/acquire_sft_vm_cpu_wheels_v1.py", m.SOURCE_SHA),
+            ("scripts/check_sft_vm_storage_v1.py", m.STORAGE_SHA),
+        ]:
+            self.assertEqual(hashlib.sha256((ROOT / file).read_bytes()).hexdigest(), pin)
+
+    def test_duplicate_extra_and_numeric_boolean_receipts_rejected(self):
+        for raw in [
+            json.dumps(receipt() | {"all_wheel_readback_matches": 1}).encode(),
+            json.dumps(receipt() | {"extra": "text"}).encode(),
+            b'{"requests_started":34,"requests_started":34}',
+        ]:
+            with self.assertRaises(ValueError):
+                m.check_receipt(types.SimpleNamespace(read=lambda *a, raw=raw: raw), 102)
+
+
+if __name__ == "__main__":
+    unittest.main()

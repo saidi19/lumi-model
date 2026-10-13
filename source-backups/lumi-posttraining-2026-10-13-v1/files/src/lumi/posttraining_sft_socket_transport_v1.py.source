@@ -1,0 +1,368 @@
+"""Bounded local socket pump for the eight-rank smoke bridge, not a launcher.
+
+The trusted host supplies admission, acquisition of exclusively owned connected
+socket pairs, worker/watchdog health, memory observation and bounded process
+retirement. Acquisition runs only after admission and bridge begin. It must
+clean up partial acquisition itself. A successful return transfers the sixteen
+parent endpoints here; no pickle, pipe object deserialization or network socket
+is used. Children use the existing ledger client plus the small control framing
+below. All three invocations must share the caller's Supervisor.
+
+This implements real partial-I/O/deadline/ACK/phase/report/EOF handling. It does
+NOT authenticate a target, spawn a process, create an independent watchdog or
+enforce RAM/GPU quotas. Callbacks are trusted capabilities, not metadata proof.
+The host must enforce a deadline even if a callback or this process hangs.
+retire(success) must stop/reap every owned child within its independent cleanup
+budget, also on partial acquisition or admission failure, and return None only
+after verifying cleanup. No subsequent invocation is safe after ANY failure,
+including retirement failure after the bridge has finished its ledger epoch.
+Do not log suppressed traceback contexts, messages, sockets or capabilities.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import selectors
+import socket
+import threading
+import time
+
+from .posttraining_sft_peer_credentials_v1 import _close_received_rights
+from .posttraining_sft_smoke_bridge_v1 import ParentInvocation
+from .posttraining_sft_worker_client_v2 import ANCILLARY_BYTES, _socket_identity
+
+CONTROL_BYTES = 4096
+ERRORS = frozenset({
+    "invalid_arguments", "already_consumed", "owner_mismatch", "admission_rejected",
+    "acquisition_failed", "socket_rejected", "deadline_exhausted", "clock_rejected",
+    "health_failed", "wire_exhausted", "io_failed", "control_rejected",
+    "bridge_failed", "memory_failed", "retirement_failed", "close_failed",
+})
+
+
+class TransportError(RuntimeError):
+    def __init__(self, code):
+        self.code = code if type(code) is str and code in ERRORS else "io_failed"
+        super().__init__(self.code)
+
+
+def _need(value, code="invalid_arguments"):
+    if not value:
+        raise TransportError(code) from None
+
+
+def _integer(value):
+    return type(value) is int and 0 < value <= 2**63 - 1
+
+
+def control_frame(message):
+    """Length-prefixed ASCII JSON; callers must use only documented fixed fields."""
+    raw = json.dumps(message, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=True, allow_nan=False).encode("ascii")
+    _need(0 < len(raw) <= CONTROL_BYTES, "control_rejected")
+    return len(raw).to_bytes(4, "big") + raw
+
+
+def _object(pairs):
+    result = {}
+    for key, value in pairs:
+        _need(key not in result, "control_rejected")
+        result[key] = value
+    return result
+
+
+class SocketTransport:
+    """One owner, one consumed invocation; no sockets acquired by construction.
+
+    acquire() -> tuple of eight (ledger_socket, control_socket) tuples.
+    check_health(retiring: bool) -> None; verify owned worker/watchdog state.
+    observe_memory() -> (host_ram_bytes, eight GPU byte counts).
+    retire(success: bool) -> None; verify owned children reaped, including failure.
+    These callbacks MUST be bounded and must never reuse this consumed attempt.
+    Control messages: phase {status,phase,step}, report {status,summary,requests},
+    closed {status}. Responses: phase_committed {status,phase,step}, release {status}.
+    After a report workers stay alive until release, send closed, close BOTH
+    sockets and exit. Control data never contains tensors, IDs or source text.
+    """
+
+    def __init__(self, *, bridge_options, admit, acquire, check_health, observe_memory,
+                 retire, deadline_ns, maximum_exchange_ns, maximum_wire_bytes,
+                 maximum_reads, clock_ns=time.monotonic_ns):
+        _need(not hasattr(self, "_owner"), "already_consumed")
+        _need(type(bridge_options) is dict and not set(bridge_options) & {
+            "admit", "send_frame", "release_phase", "interrupt"})
+        _need(all(callable(fn) for fn in (admit, acquire, check_health, observe_memory,
+                                         retire, clock_ns)))
+        _need(all(_integer(n) for n in (deadline_ns, maximum_exchange_ns,
+                                       maximum_wire_bytes, maximum_reads)))
+        self._admit, self._acquire, self._health = admit, acquire, check_health
+        self._memory, self._retire, self._clock = observe_memory, retire, clock_ns
+        self._deadline, self._exchange = deadline_ns, maximum_exchange_ns
+        self._wire_cap, self._read_cap = maximum_wire_bytes, maximum_reads
+        self._owner = os.getpid(), threading.get_ident()
+        self._state, self._failure, self._stage = "idle", None, "idle"
+        self._wire = self._reads = self._messages = self._sent = self._received = 0
+        self._last_clock = 0
+        self._pairs, self._identities = (), {}
+        self._reports, self._closed, self._eof = {}, set(), set()
+        self._buffers = [bytearray() for _ in range(8)]
+        self._fragment_deadlines = [None] * 8
+        self._ack_deadlines = {}
+        self._retiring = self._retirement_verified = self._cleanup_failed = False
+        try:
+            self._bridge = ParentInvocation(
+                **bridge_options, admit=self._admit,
+                send_frame=lambda rank, raw: self._send(rank, 0, raw),
+                release_phase=self._release_phase, interrupt=self._interrupt)
+        except BaseException:
+            raise TransportError("invalid_arguments") from None
+
+    def _interrupt(self):
+        # Also poison a finished epoch on post-finish cleanup failure, preventing
+        # a later shared-ledger invocation from starting after leaked children.
+        try:
+            self._bridge._ledger.interrupt()
+        except BaseException:
+            pass
+
+    def _now(self):
+        try:
+            now = self._clock()
+        except BaseException:
+            raise TransportError("clock_rejected") from None
+        _need(type(now) is int and self._last_clock <= now <= 2**63 - 1, "clock_rejected")
+        self._last_clock = now
+        _need(now < self._deadline, "deadline_exhausted")
+        return now
+
+    def _charge(self, count):
+        _need(self._wire + count <= self._wire_cap, "wire_exhausted")
+        self._wire += count
+
+    def _socket(self, rank, kind):
+        sock = self._pairs[rank][kind]
+        _need(_socket_identity(sock) == self._identities[id(sock)], "socket_rejected")
+        return sock
+
+    def _send(self, rank, kind, raw):
+        self._charge(len(raw))
+        stop = min(self._deadline, self._now() + self._exchange)
+        sock = self._socket(rank, kind)
+        offset = 0
+        while offset < len(raw):
+            remaining = stop - self._now()
+            _need(remaining > 0, "deadline_exhausted")
+            sock.settimeout(remaining / 1_000_000_000)
+            count = sock.send(memoryview(raw)[offset:])
+            _need(type(count) is int and 0 < count <= len(raw) - offset, "io_failed")
+            offset += count
+            self._sent += count
+
+    def _release_phase(self, rank, phase, step):
+        self._send(rank, 1, control_frame({"status": "phase_committed",
+                                         "phase": phase, "step": step}))
+
+    def _bind(self, pairs):
+        _need(type(pairs) is tuple and len(pairs) == 8 and all(
+            type(pair) is tuple and len(pair) == 2
+            and all(type(sock) is socket.socket for sock in pair) for pair in pairs),
+            "socket_rejected")
+        self._pairs = pairs  # Ownership of returned sockets, even on later failure.
+        seen = set()
+        for pair in pairs:
+            for sock in pair:
+                identity = _socket_identity(sock, require_connected=True)
+                _need(identity[1:3] not in seen, "socket_rejected")
+                seen.add(identity[1:3])
+                self._identities[id(sock)] = identity
+
+    def _control(self, rank, raw):
+        try:
+            message = json.loads(raw.decode("ascii"), object_pairs_hook=_object,
+                                 parse_constant=lambda _: _need(False, "control_rejected"))
+            _need(type(message) is dict, "control_rejected")
+            status = message.get("status")
+            _need(type(status) is str, "control_rejected")
+            self._messages += 1
+            _need(self._messages <= 48, "control_rejected")  # <= 6 per rank on reference.
+            if self._retiring:
+                _need(message == {"status": "closed"} and rank not in self._closed,
+                      "control_rejected")
+                self._closed.add(rank)
+            elif status == "phase":
+                _need(set(message) == {"status", "phase", "step"}
+                      and rank not in self._reports, "control_rejected")
+                self._bridge.phase(rank, message["phase"], message["step"])
+            else:
+                _need(status == "report" and set(message) == {"status", "summary", "requests"}
+                      and rank not in self._reports and type(message["summary"]) is dict
+                      and _integer(message["requests"]), "control_rejected")
+                _, start, stop, resume = self._bridge._invocation
+                expected = {
+                    "schema_version": "lumi.sft-worker-run-summary.v0.2", "state": "complete",
+                    "stage": "complete", "failure_code": None, "failure_stage": None,
+                    "completed_steps": stop - start, "saved_checkpoints": stop - start,
+                    "restored_checkpoints": int(resume), "os_admission_verified": False,
+                    "os_resource_enforcement": False, "real_sft_execution_permitted": False,
+                    "production_eligible": False,
+                }
+                summary = message["summary"]
+                _need(set(summary) == set(expected) and all(
+                    type(summary[k]) is type(v) and summary[k] == v for k, v in expected.items()),
+                    "control_rejected")
+                self._reports[rank] = (message["summary"], message["requests"])
+        except BaseException:
+            raise TransportError("control_rejected") from None
+
+    def _receive(self, selector, rank, kind):
+        _need(self._reads < self._read_cap, "wire_exhausted")
+        self._charge(CONTROL_BYTES + 4 + ANCILLARY_BYTES)
+        self._reads += 1
+        sock = self._socket(rank, kind)
+        sock.settimeout(min(self._exchange, self._deadline - self._now()) / 1e9)
+        cloexec = getattr(socket, "MSG_CMSG_CLOEXEC", 0)
+        raw, ancillary, flags, _ = sock.recvmsg(CONTROL_BYTES + 4, ANCILLARY_BYTES, cloexec)
+        _, close_failed = _close_received_rights(ancillary)
+        _need(not close_failed, "close_failed")
+        _need(not ancillary and not flags & ~cloexec, "socket_rejected")
+        self._received += len(raw)
+        if not raw:
+            _need(self._retiring and (kind == 0 or rank in self._closed), "io_failed")
+            _need(not self._buffers[rank] if kind else True, "control_rejected")
+            self._eof.add((rank, kind))
+            selector.unregister(sock)
+            return
+        if kind == 0:
+            _need(not self._retiring, "control_rejected")
+            self._bridge.feed(rank, raw)
+            return
+        _need(rank not in self._closed, "control_rejected")
+        buffer = self._buffers[rank]
+        if not buffer:
+            self._fragment_deadlines[rank] = self._now() + self._exchange
+        buffer.extend(raw)
+        _need(len(buffer) <= CONTROL_BYTES + 4, "control_rejected")
+        if len(buffer) >= 4:
+            size = int.from_bytes(buffer[:4], "big")
+            _need(0 < size <= CONTROL_BYTES, "control_rejected")
+            if len(buffer) >= size + 4:
+                # At most one outstanding control message per rank. This also
+                # rejects pipelined reports/closed before their release.
+                _need(len(buffer) == size + 4, "control_rejected")
+                self._control(rank, bytes(buffer[4:]))
+                buffer.clear()
+                self._fragment_deadlines[rank] = None
+
+    def _pump(self):
+        with selectors.DefaultSelector() as selector:
+            for rank, pair in enumerate(self._pairs):
+                for kind, sock in enumerate(pair):
+                    selector.register(sock, selectors.EVENT_READ, (rank, kind))
+            while len(self._eof) != 16:
+                now = self._now()
+                self._stage = "health_failed"
+                _need(self._health(self._retiring) is None, "health_failed")
+                self._stage = "bridge_failed"
+                if not self._retiring:
+                    self._bridge.poll()
+                    pending = {(rank, tx.ack.sequence)
+                               for rank, tx in self._bridge._session._pending.items()}
+                    self._ack_deadlines = {
+                        key: self._ack_deadlines.get(key, now + self._exchange)
+                        for key in pending}
+                    if self._ack_deadlines and now >= min(self._ack_deadlines.values()):
+                        self._bridge.expire_ack_deadline()
+                deadlines = [d for d in self._fragment_deadlines if d is not None]
+                _need(not deadlines or now < min(deadlines), "deadline_exhausted")
+                stop = min([self._deadline, now + 50_000_000, *deadlines,
+                            *self._ack_deadlines.values()])
+                self._stage = "io_failed"
+                for key, _ in selector.select(max(0, stop - now) / 1e9):
+                    self._receive(selector, *key.data)
+                if len(self._reports) == 8 and not self._retiring:
+                    # Independent channels may deliver a report before its final
+                    # ledger confirmation. Drain confirmations before finishing.
+                    snapshot = self._bridge._session.summary()
+                    expected_requests = sum(report[1] for report in self._reports.values())
+                    if (snapshot["pending_acknowledgements"]
+                            or snapshot["requests_predebited"] < expected_requests):
+                        continue
+                    _need(not any(self._buffers), "control_rejected")
+                    self._stage = "memory_failed"
+                    memory = self._memory()
+                    _need(type(memory) is tuple and len(memory) == 2, "memory_failed")
+                    self._stage = "bridge_failed"
+                    self._bridge.finish(
+                        worker_summaries=[self._reports[r][0] for r in range(8)],
+                        rank_requests=[self._reports[r][1] for r in range(8)],
+                        host_ram_bytes=memory[0], per_gpu_memory_bytes=memory[1])
+                    self._retiring = True
+                    self._ack_deadlines.clear()
+                    for rank in range(8):
+                        self._send(rank, 1, control_frame({"status": "release"}))
+            _need(len(self._closed) == 8, "control_rejected")
+
+    def run(self):
+        _need(self._owner == (os.getpid(), threading.get_ident()), "owner_mismatch")
+        _need(self._state == "idle", "already_consumed")
+        self._state = "running"
+        try:
+            self._now()
+            self._stage = "admission_rejected"
+            self._bridge.begin()
+            self._stage = "acquisition_failed"
+            pairs = self._acquire()
+            self._stage = "socket_rejected"
+            self._bind(pairs)
+            self._pump()
+        except BaseException as error:
+            self._failure = error.code if type(error) is TransportError else self._stage
+            self._interrupt()
+        finally:
+            try:
+                _need(self._retire(self._failure is None) is None, "retirement_failed")
+                self._retirement_verified = True
+            except BaseException:
+                self._cleanup_failed = True
+                self._failure = self._failure or "retirement_failed"
+                self._interrupt()
+            seen = set()
+            for pair in self._pairs:
+                for sock in pair:
+                    if id(sock) in seen:
+                        continue
+                    seen.add(id(sock))
+                    try:
+                        if id(sock) in self._identities:
+                            _need(_socket_identity(sock) == self._identities[id(sock)],
+                                  "socket_rejected")
+                        sock.close()
+                    except BaseException:
+                        self._cleanup_failed = True
+                        self._failure = self._failure or "close_failed"
+                        self._interrupt()
+            for buffer in self._buffers:
+                buffer.clear()
+            if self._failure is None:
+                try:
+                    self._now()
+                except BaseException as error:
+                    self._failure = (error.code if type(error) is TransportError
+                                     else "clock_rejected")
+                    self._interrupt()
+        self._state = "failed" if self._failure else "complete"
+        if self._failure:
+            raise TransportError(self._failure) from None
+        return self.summary()
+
+    def summary(self):
+        return {"schema_version": "lumi.sft-socket-transport-summary.v0.1",
+                "state": self._state, "failure_code": self._failure,
+                "wire_capacity_reserved": self._wire, "bytes_sent": self._sent,
+                "bytes_received": self._received, "read_calls": self._reads,
+                "control_messages": self._messages, "closed_reports": len(self._closed),
+                "eof_channels": len(self._eof), "cleanup_failed": self._cleanup_failed,
+                "trusted_retirement_callback_completed": self._retirement_verified,
+                "target_admission_verified": False, "independent_watchdog_verified": False,
+                "real_execution_authorized": False, "production_eligible": False}

@@ -1,0 +1,208 @@
+"""Offline verification of the fresh inclusive read-only admission evidence."""
+
+import json
+import sys
+from pathlib import Path
+
+from scripts import preflight_sft_vm_attempt022_v1 as entry
+from scripts import qualify_sft_vm_setup_transfer_v1 as files
+
+ROOT = Path(__file__).resolve().parents[1]
+ENTRY_SHA = "eacd5f09b14262f281110d17a5e368c1627d7d7f1ecd2a75b559dc82bbbea33d"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-022-readonly-preflight-verification-v0.1.json"
+
+
+def load(path):
+    return json.loads(files.read(path))
+
+
+def verify():
+    entry.need(entry.sha(files.read(Path(entry.__file__))) == ENTRY_SHA)
+    entry.runtime()
+    entry.bindings.verify()
+    controls = entry.bindings.controls()
+    result = load(entry.OUTPUT / "result.json")
+    if result["status"] == "stopped_no_retry":
+        started = load(entry.OUTPUT / "started.json")
+        entry.need(started["entry_sha256"] == ENTRY_SHA)
+        entry.need(started["control_evidence"] == controls)
+        entry.need(started["execution_authorized"] is False)
+        entry.need(started["max_calls"] == 79 and started["max_seconds"] == 1500)
+        entry.need(started["credential_identity_calls_included"] is True)
+        entry.need(result["failed_stage"] in {"cpu", "watchdog", "network", "cleanup_store"})
+        entry.need(not (entry.OUTPUT / "admission.json").exists())
+        entry.need(result["cloud_mutations"] == result["object_access"] == 0)
+        for key in (
+            "execution_marker_created", "cpu_launch_authorized", "outer_invoked",
+            "gate_5_complete", "gpu", "training", "retry_performed",
+        ):
+            entry.need(result[key] is False)
+        ledger = result["admission_call_budget"]
+        entry.need(ledger["maximum_sdk_read_calls"] == 79)
+        entry.need(ledger["maximum_seconds"] == 1500)
+        entry.need(0 < ledger["sdk_read_dispatches"] <= 79)
+        entry.need(ledger["credential_identity_dispatches"] >= 1)
+        entry.need(ledger["credential_identity_included"] is True)
+        entry.need(
+            ledger["sdk_read_dispatches"] == ledger["admission_read_dispatches"]
+            + ledger["credential_identity_dispatches"]
+        )
+        entry.need(0 <= result["elapsed_seconds"] < 1500)
+        plan_path = ROOT / "configs/lumi-vm-attempt-022-readonly-preflight-plan-v0.1.json"
+        plan = load(plan_path)
+        for name, digest in plan["source_bindings"].items():
+            entry.need(entry.sha(files.read(ROOT / name)) == digest)
+        paths = [
+            Path(__file__), Path(entry.__file__), plan_path,
+            entry.OUTPUT / "started.json", entry.OUTPUT / "result.json",
+            ROOT / "configs/lumi-vm-attempt-022-control-readback-plan-v0.1.json",
+            ROOT / "artifacts/lumi-vm-attempt-022-readonly-control-verification-v0.1/started.json",
+            ROOT / "artifacts/lumi-vm-attempt-022-readonly-control-verification-v0.1/result.json",
+            *[ROOT / name for name in controls],
+        ]
+        bindings = dict(plan["source_bindings"])
+        bindings.update({str(p.relative_to(ROOT)): entry.sha(files.read(p)) for p in paths})
+        return dict(
+            schema="lumi.vm-attempt022-readonly-preflight-verification.v0.1",
+            attempt=entry.ATTEMPT,
+            status="stopped_no_retry_failure_evidence_verified",
+            failed_stage=result["failed_stage"],
+            failure_cause_proven=False,
+            inclusive_sdk_read_calls=ledger["sdk_read_dispatches"],
+            credential_identity_calls=ledger["credential_identity_dispatches"],
+            elapsed_seconds=result["elapsed_seconds"],
+            network_admitted=False,
+            cpu_admitted=False,
+            full_readonly_admission_passed=False,
+            independent_control_readback_passed=True,
+            source_bindings=bindings,
+            control_evidence=controls,
+            admission_call_budget=ledger,
+            cloud_mutations=0,
+            object_access=0,
+            instance_actions=0,
+            execution_authority_created=False,
+            cpu_instance_launched=False,
+            checkpoint_access=False,
+            prior_evidence_preserved=True,
+            retry=False,
+            real_4b_import=False,
+            gate_5_complete=False,
+            gpu=False,
+            training=False,
+            next_required="Fresh bounded network-localization diagnostic; "
+            "do not rerun consumed preflight or change frozen source without a verified successor.",
+        )
+    started, admission, result = [
+        load(entry.OUTPUT / name) for name in ("started.json", "admission.json", "result.json")
+    ]
+    entry.need(started["entry_sha256"] == ENTRY_SHA)
+    entry.need(started["control_evidence"] == controls and started["execution_authorized"] is False)
+    entry.need(started["max_calls"] == 79 and started["max_seconds"] == 1500)
+    entry.need(started["credential_identity_calls_included"] is True)
+    entry.need(result["status"] == "readonly_preflight_passed" and result["admission"] == admission)
+    entry.need(admission["status"] == "all_readonly_admission_passed_before_execution_marker")
+    cpu, watch, network, store = [
+        admission[k] for k in ("cpu", "watchdog", "network", "cleanup_store")
+    ]
+    entry.need(cpu["status"] == "fresh_cpu_and_exact_attempt_preflight_passed")
+    entry.need(watch["status"] == "verified_fresh_inert_watchdog")
+    entry.need(network["fresh_network_admitted"] is True)
+    entry.need(store["private_owner_versioning_encryption_verified"] is True)
+    entry.need(store["claim_protection_verified_at_observation"] is True)
+    entry.need(store["write_authority_granted"] is False)
+    entry.need(store["object_reads"] == store["object_lists"] == store["object_writes"] == 0)
+    component_calls = (
+        cpu["calls"] + watch["api_calls"] + network["calls"] + store["observation_calls"]
+    )
+    ledger = admission["admission_call_budget"]
+    entry.need(ledger == result["admission_call_budget"])
+    entry.need(
+        component_calls == admission["total_control_calls"] == ledger["admission_read_dispatches"]
+    )
+    entry.need(
+        ledger["sdk_read_dispatches"] == component_calls + ledger["credential_identity_dispatches"]
+    )
+    entry.need(
+        0 < ledger["sdk_read_dispatches"] <= 79 and ledger["credential_identity_dispatches"] >= 1
+    )
+    entry.need(ledger["credential_identity_included"] is True)
+    entry.need(0 <= admission["elapsed_seconds"] <= result["elapsed_seconds"] < 1500)
+    entry.need(result["cloud_mutations"] == admission["cloud_mutations"] == 0)
+    entry.need(result["object_access"] == admission["object_access"] == 0)
+    entry.need(admission["host_launch_authorized"] is False)
+    for key in (
+        "execution_marker_created",
+        "cpu_launch_authorized",
+        "outer_invoked",
+        "gate_5_complete",
+        "gpu",
+        "training",
+        "retry_performed",
+    ):
+        entry.need(result[key] is False)
+    run_bindings = {
+        str((entry.OUTPUT / name).relative_to(ROOT)): entry.sha(files.read(entry.OUTPUT / name))
+        for name in ("started.json", "admission.json", "result.json")
+    }
+    source_bindings = {
+        str(Path(entry.__file__).relative_to(ROOT)): ENTRY_SHA,
+        str(Path(entry.bindings.__file__).relative_to(ROOT)): entry.BINDINGS_SHA,
+        str(Path(entry.budget.__file__).relative_to(ROOT)): entry.BUDGET_SHA,
+        str(entry.SOURCE.relative_to(ROOT)): entry.SOURCE_SHA,
+        entry.bindings.PLAN: entry.bindings.PLAN_SHA,
+        entry.bindings.PLAN_RELEASE: entry.bindings.PLAN_RELEASE_SHA,
+        entry.bindings.RELEASE + "/release.json": entry.bindings.RELEASE_SHA,
+    }
+    return dict(
+        schema="lumi.vm-attempt022-readonly-preflight-verification.v0.1",
+        attempt=entry.ATTEMPT,
+        status="readonly_preflight_passed",
+        entry_sha256=ENTRY_SHA,
+        bindings_sha256=entry.BINDINGS_SHA,
+        run_bindings=run_bindings,
+        source_bindings=source_bindings,
+        control_evidence=controls,
+        admission_calls=component_calls,
+        inclusive_sdk_read_calls=ledger["sdk_read_dispatches"],
+        credential_identity_calls=ledger["credential_identity_dispatches"],
+        admission_call_budget=ledger,
+        elapsed_seconds=result["elapsed_seconds"],
+        network_admitted=True,
+        cpu_admitted=True,
+        inert_watchdog_verified=True,
+        cleanup_store_verified=True,
+        cloud_mutations=0,
+        object_access=0,
+        instance_actions=0,
+        execution_authority_created=False,
+        cpu_instance_launched=False,
+        checkpoint_access=False,
+        prior_evidence_preserved=True,
+        retry=False,
+        real_4b_import=False,
+        gate_5_complete=False,
+        gpu=False,
+        training=False,
+    )
+
+
+if __name__ == "__main__":
+    entry.need(sys.argv[1:] == ["--write-once"] and not OUTPUT.exists())
+    result = verify()
+    files.save(OUTPUT, result)
+    print(
+        json.dumps(
+            {
+                k: result[k]
+                for k in (
+                    "status",
+                    "inclusive_sdk_read_calls",
+                    "credential_identity_calls",
+                    "network_admitted",
+                    "cpu_admitted",
+                )
+            },
+            sort_keys=True,
+        )
+    )

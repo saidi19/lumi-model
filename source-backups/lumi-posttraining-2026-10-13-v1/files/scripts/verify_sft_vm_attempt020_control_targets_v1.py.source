@@ -1,0 +1,127 @@
+"""Offline verification of attempt-020 live target absence and retention."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+ATTEMPT = "3179537f150b45548946f8114e8b73ca"
+OLD = "c7124d8fb1a244798d7e41b7b5dfad61"
+INSPECTOR = "scripts/inspect_sft_vm_attempt020_control_targets_v1.py"
+INSPECTOR_SHA = "f119deab431bfad41cd265d2be4d05c53f3e917213b886882b737aeee354ecb2"
+TEST = "tests/test_sft_vm_attempt020_control_targets_v1.py"
+TEST_SHA = "8d8c68dbe38559595d01d13333504023af94988221c9a3686c0b72fb6a32bf9a"
+EVIDENCE = "evidence/lumi-vm-attempt-020-control-target-absence-v0.1.json"
+EVIDENCE_SHA = "2597845c46b55e0afb862c5a285f9e4e6a35c5c0f2ff365a27833b4096b86f39"
+PLAN = "artifacts/lumi-vm-attempt-020-control-plan-v0.2/plan.json"
+PLAN_SHA = "6e3a355033b684f11900bf189d17b06e6cb5fe3c43dccfa021015d47f4439ee4"
+PLAN_RELEASE = "artifacts/lumi-vm-attempt-020-control-plan-v0.2/release.json"
+PLAN_RELEASE_SHA = "16d2c6996b028269df1ed01c4251d4d192499cea9d083a3d528881126bd496db"
+OUTPUT = ROOT / "evidence/lumi-vm-attempt-020-control-target-absence-verification-v0.1.json"
+
+
+def need(value):
+    if not value:
+        raise ValueError("attempt020_control_target_verification_rejected") from None
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def read(name, digest):
+    path = ROOT / name
+    need(not any(item.is_symlink() for item in (path, *path.parents)))
+    need(path.is_file() and 0 < path.stat().st_size <= 64 * 1024)
+    raw = path.read_bytes()
+    need(sha(raw) == digest)
+    return raw
+
+
+def verify():
+    for name, digest in (
+        (INSPECTOR, INSPECTOR_SHA),
+        (TEST, TEST_SHA),
+        (EVIDENCE, EVIDENCE_SHA),
+        (PLAN, PLAN_SHA),
+        (PLAN_RELEASE, PLAN_RELEASE_SHA),
+    ):
+        read(name, digest)
+    evidence = json.loads(read(EVIDENCE, EVIDENCE_SHA))
+    plan = json.loads(read(PLAN, PLAN_SHA))
+    release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    observations = evidence["observations"]
+    counts = [
+        value
+        for key, value in observations.items()
+        if key.endswith(("_subnets", "_endpoints", "_instances", "_pairs", "_groups"))
+    ]
+    flags = [value for key, value in observations.items() if key.endswith("_exists")]
+    retention = evidence["predecessor_retention"]
+    need(
+        evidence["attempt"] == ATTEMPT
+        and all(value == 0 for value in counts)
+        and all(value is False for value in flags)
+        and evidence["read_only_aws_calls"] == 18
+        and evidence["bounded_transient_read_retries"] == 0
+        and evidence["cloud_mutations"] == 0
+        and evidence["object_access"] == 0
+        and evidence["instance_actions"] == 0
+        and evidence["collision_free_for_control_preparation"] is True
+        and retention["attempt"] == OLD
+        and retention["instance_state"] == "stopped"
+        and retention["encrypted_volume_count"] == 2
+        and retention["delete_on_termination"] is False
+        and retention["mutated"] is False
+        and plan["attempt"] == ATTEMPT
+        and plan["network_candidate_live_availability_verified"] is True
+        and plan["control_target_absence_evidence"] == {"path": EVIDENCE, "sha256": EVIDENCE_SHA}
+        and plan["execution_permitted"] is False
+        and release["plan_sha256"] == PLAN_SHA
+        and release["live_target_absence_verified"] is True
+        and release["predecessor_retention_verified"] is True
+    )
+    return {
+        "schema": "lumi.vm-attempt020-control-target-absence-verification.v0.1",
+        "attempt": ATTEMPT,
+        "status": "fresh_targets_absent_and_predecessor_retention_verified",
+        "inspector_sha256": INSPECTOR_SHA,
+        "test_sha256": TEST_SHA,
+        "absence_evidence_sha256": EVIDENCE_SHA,
+        "control_plan_sha256": PLAN_SHA,
+        "control_plan_release_sha256": PLAN_RELEASE_SHA,
+        "read_only_aws_calls": 18,
+        "bounded_transient_read_retries": 0,
+        "fresh_target_collisions": 0,
+        "predecessor_instance_stopped": True,
+        "predecessor_encrypted_volumes_retained": 2,
+        "cloud_mutations": 0,
+        "object_access": 0,
+        "instance_actions": 0,
+        "execution_authority_created": False,
+        "cpu_instance_launched": False,
+        "checkpoint_access": False,
+        "real_4b_import": False,
+        "gate_5_complete": False,
+        "gpu": False,
+        "training": False,
+    }
+
+
+def write():
+    result = verify()
+    raw = (json.dumps(result, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    fd = os.open(OUTPUT, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+    return result
+
+
+if __name__ == "__main__":
+    need(sys.argv in ([sys.argv[0]], [sys.argv[0], "--write"]))
+    print(json.dumps(write() if len(sys.argv) == 2 else verify(), sort_keys=True))

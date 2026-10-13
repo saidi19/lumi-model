@@ -1,0 +1,52 @@
+# SFT execution status v0.80
+
+2026-09-13. The approved local-only test-fixture portability correction is
+complete. No new commit, push, CI retry, network, GPU or real model/data access
+occurred. Gate 5 remains incomplete; native qualification has not passed.
+
+## Correction and regression evidence
+
+Only `tests/test_sft_import_qualification_acquisition_v1.py` changed among tracked
+files. The shared acquisition fixture now lets `tempfile.TemporaryDirectory`
+choose the platform's default parent and still resolves the resulting path.
+Production acquisition, exact retirement `/tmp` namespace, ownership/mode
+checks, workflow and native guards are unchanged.
+
+Two new regression tests were added before correcting the setup. Both failed
+against the old hardcoded parent, then passed after the one-line correction:
+
+- All seven existing acquisition cases run with the macOS-specific parent
+  simulated as unavailable, and all generated fixture directories are removed.
+- A generated alternate default parent is honored and cleaned up, preventing
+  replacement with another fixed path.
+
+The exact six qualification-preflight modules pass on Python 3.11.15, 3.13.7
+and 3.14.6: 135 distinct top-level tests per interpreter, zero failures, errors
+or skips. The two regressions additionally run eight existing cases internally;
+those are not new distinct tests. Audit hooks rejected socket/process-start
+operations; no such calls were attempted and no ML modules were loaded.
+Ruff and git diff checks pass. The full repository suite was not rerun.
+
+## Historical bindings and remaining boundary
+
+HEAD remains `9a4a191fa96753f7d8ae78cedbee54f16d536a04`; its committed test
+preserves the original 14,428 bytes and SHA-256
+`2e0face51eff424944013fc97379f23f683eb44876d075886b14a17a7f0ea533`.
+
+The corrected working-tree test is 16,219 bytes, SHA-256
+`5049bec1618b0cb234e852cd50783f3a10c7056eaade44d198c11d338b24dd77`.
+The other 69 required execution files and all bound prior evidence are intact.
+No file is staged. The historical execution plan is unchanged and deliberately
+does not describe this corrected working tree. It must not be reused or silently
+rebound for another push/run.
+
+This proves the local portability fix, not the exact exception in the failed
+remote preflight and not native Linux qualification. Existing CI status was not
+refreshed in this zero-network step; do not treat the v0.79 snapshot as current.
+
+Evidence:
+`evidence/lumi-4b-sft-import-qualification-portable-fixture-fix-v0.1.json`
+and its matching `-verification-v0.1.json`.
+
+The next remote action needs a separately bound successor publication/run plan.
+No successor publication or remote execution is authorized by this local result.

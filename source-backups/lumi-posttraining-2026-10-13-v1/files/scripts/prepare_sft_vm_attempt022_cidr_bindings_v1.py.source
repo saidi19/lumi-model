@@ -1,0 +1,133 @@
+"""Bind CIDR-only source successor to existing controls, without redeployment."""
+
+import json
+import os
+import sys
+from pathlib import Path
+
+from scripts import prepare_sft_vm_attempt022_deployment_bindings_v2 as previous
+from scripts import prepare_sft_vm_attempt022_v2 as source
+
+ROOT = source.ROOT
+PLAN_DIR = "artifacts/lumi-vm-attempt-022-control-plan-v0.3"
+HELPER = "scripts/prepare_sft_vm_attempt022_deployment_bindings_v3.py"
+SOURCE_RELEASE_SHA = "90596ec5852b0853b0240b0e2fa3fae8a779cb31ad0b5b8fb40612631cbaa2d9"
+PREVIOUS_HELPER_SHA = "f2a6c1ddc2ac8c89d018049ea152196d6e89a4048ac9f88be177a5e8dd504e03"
+need, sha, encode = source.need, source.sha, source.encode
+
+
+def build():
+    need(sha(Path(previous.__file__).read_bytes()) == PREVIOUS_HELPER_SHA)
+    original = previous.build()
+    manifest = source.verify()
+    need(sha((source.OUTPUT / "release.json").read_bytes()) == SOURCE_RELEASE_SHA)
+    need(manifest["watchdog_code_unchanged"] and manifest["selector_byte_identical"])
+    need(manifest["watchdog_code_sha256_base64"] == original["watchdog"][
+        "expected_code_sha256_base64"])
+    plan = json.loads(encode(original))
+    old_prefix = previous.RELEASE + "/"
+    release = str(source.OUTPUT.relative_to(ROOT))
+    plan["source_bindings"] = {
+        release + "/" + name.removeprefix(old_prefix): manifest["outputs"][
+            name.removeprefix(old_prefix)] for name in original["source_bindings"]
+    }
+    plan.update(
+        schema="lumi.vm-attempt-022-control-plan.v0.3",
+        status="cidr_corrected_existing_controls_bound_fresh_readonly_admission_required",
+        release_manifest_sha256=SOURCE_RELEASE_SHA,
+        network_candidate_cidr=source.NEW_CIDR,
+        network_candidate_live_availability_verified=False,
+        source_preparation_evidence={"path": release + "/release.json",
+                                     "sha256": SOURCE_RELEASE_SHA},
+        cidr_correction_evidence={"path": str(source.DIAGNOSTIC.relative_to(ROOT)),
+                                  "sha256": source.DIAGNOSTIC_SHA},
+        source_versions_and_safety_rules_unchanged=True,
+        watchdog_and_cleanup_bucket_redeployment_required=False,
+        successful_readonly_preflight=None, approval_record=None,
+        execution_permitted=False, gate_5_complete=False,
+    )
+    return manifest, plan
+
+
+def helper_source(plan_raw, release_raw):
+    root_release = str(source.OUTPUT.relative_to(ROOT))
+    values = dict(
+        ATTEMPT=source.ATTEMPT, OLD=previous.OLD, BUCKET=previous.BUCKET,
+        RELEASE=root_release, RELEASE_SHA=SOURCE_RELEASE_SHA,
+        PLAN=PLAN_DIR + "/plan.json", PLAN_SHA=sha(plan_raw),
+        PLAN_RELEASE=PLAN_DIR + "/release.json", PLAN_RELEASE_SHA=sha(release_raw),
+        WATCH=previous.WATCH, WATCH_SHA=previous.WATCH_SHA,
+        STORE=previous.STORE, STORE_SHA=previous.STORE_SHA,
+        BUILDER_SHA=sha(Path(__file__).read_bytes()),
+    )
+    text = (
+        '"""CIDR-corrected bindings; real controls preserved, no CPU authority."""\n'
+        "\nimport json\nfrom pathlib import Path\n\n"
+        "from scripts import prepare_sft_vm_attempt022_cidr_bindings_v1 as builder\n\n"
+        "ROOT = builder.ROOT\nneed, sha, encode = builder.need, builder.sha, builder.encode\n"
+    )
+    text += "".join(f"{key} = {value!r}\n" for key, value in values.items())
+    text += '''
+def read(name, digest=None, size=None):
+    path = ROOT / name
+    need(not Path(name).is_absolute() and ".." not in Path(name).parts)
+    need(not any(p.is_symlink() for p in (path, *path.parents)))
+    raw = path.read_bytes()
+    need(0 < len(raw) <= 32 * 1024**2)
+    need(digest is None or sha(raw) == digest)
+    need(size is None or len(raw) == size)
+    return raw
+
+def verify():
+    need(sha(Path(builder.__file__).read_bytes()) == BUILDER_SHA)
+    manifest, expected = builder.build()
+    need(read(PLAN, PLAN_SHA) == encode(expected))
+    release = json.loads(read(PLAN_RELEASE, PLAN_RELEASE_SHA))
+    need(release["source_release_sha256"] == RELEASE_SHA)
+    need(release["plan_sha256"] == PLAN_SHA and release["execution_permitted"] is False)
+    return manifest
+
+def build():
+    verify()
+    return json.loads(read(PLAN, PLAN_SHA))
+
+def controls():
+    build()
+    return {WATCH: WATCH_SHA, STORE: STORE_SHA}
+
+def run(**_fields):
+    raise ValueError("cidr_bindings_not_cpu_authority") from None
+'''
+    compile(text, HELPER, "exec")
+    return text.encode()
+
+
+def save(path, raw):
+    need(not path.exists() and not any(p.is_symlink() for p in (path, *path.parents)))
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "wb") as stream:
+        need(stream.write(raw) == len(raw))
+
+
+def prepare():
+    _, plan = build()
+    raw = encode(plan)
+    release = encode(dict(
+        schema="lumi.vm-attempt022-cidr-plan-release.v0.3", attempt=source.ATTEMPT,
+        plan_sha256=sha(raw), source_release_sha256=SOURCE_RELEASE_SHA,
+        diagnostic_sha256=source.DIAGNOSTIC_SHA, existing_controls_reused=True,
+        execution_permitted=False,
+    ))
+    helper = helper_source(raw, release)
+    directory = ROOT / PLAN_DIR
+    need(not directory.exists() and not (ROOT / HELPER).exists())
+    directory.mkdir(mode=0o700)
+    save(directory / "plan.json", raw)
+    save(directory / "release.json", release)
+    save(ROOT / HELPER, helper)
+    return dict(plan_sha256=sha(raw), helper_sha256=sha(helper), aws_calls=0)
+
+
+if __name__ == "__main__":
+    need(sys.argv[1:] == ["--prepare-once"])
+    print(json.dumps(prepare(), sort_keys=True))

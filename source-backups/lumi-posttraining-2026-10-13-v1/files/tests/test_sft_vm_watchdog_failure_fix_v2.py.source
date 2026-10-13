@@ -1,0 +1,53 @@
+"""Offline guards for the fresh restored-login read-only successor."""
+
+import ast
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from scripts import verify_sft_vm_watchdog_failure_fix_v2 as m
+
+
+class Tests(unittest.TestCase):
+    def test_source_and_failed_predecessor_closure(self):
+        outer, fixed, target = m.local()
+        self.assertTrue(target)
+        self.assertEqual(fixed.BASE_CODE, outer.loading.BASE_CODE)
+        self.assertEqual(m.OUTPUT.name, "lumi-vm-attempt-021-watchdog-full-readback-v0.2")
+        self.assertFalse(m.OUTPUT.exists())
+        self.assertFalse(m.REPORT.exists())
+
+    def test_sixteen_reads_and_zero_mutations(self):
+        meter = m.Meter(types.SimpleNamespace(static_identity_client=None), clock=lambda: 1)
+        for _ in range(16):
+            meter.consume("lambda", model=types.SimpleNamespace(name="GetFunctionConfiguration"))
+        with self.assertRaises(ValueError):
+            meter.consume("lambda", model=types.SimpleNamespace(name="GetFunctionConfiguration"))
+        fresh = m.Meter(types.SimpleNamespace(static_identity_client=None), clock=lambda: 1)
+        for op in ("UpdateFunctionCode", "RunInstances", "GetObject", "HeadObject"):
+            with self.subTest(op=op), self.assertRaises(ValueError):
+                fresh.consume("lambda", model=types.SimpleNamespace(name=op))
+        self.assertEqual(fresh.calls, 0)
+
+    def test_inert_check_fence_and_reader_clock_unchanged(self):
+        old = ast.parse((m.ROOT / "scripts/verify_sft_vm_watchdog_failure_fix_v1.py").read_bytes())
+        new = ast.parse(Path(m.__file__).read_bytes())
+        for cls in ("Meter",):
+
+            def get(tree, cls=cls):
+                return next(node for node in tree.body if getattr(node, "name", None) == cls)
+
+            self.assertEqual(ast.dump(get(old)), ast.dump(get(new)))
+        code = Path(m.__file__).read_text()
+        self.assertIn("fixed._inert_checks(guard, BoundConfiguration, call)", code)
+        self.assertIn('fenced["RevisionId"] == verified["RevisionId"]', code)
+        self.assertIn("credential_failure_diagnostic=", code)
+
+    def test_closed_if_evidence_pin_changes(self):
+        with patch.object(m.builder, "read", side_effect=ValueError), self.assertRaises(ValueError):
+            m.local()
+
+
+if __name__ == "__main__":
+    unittest.main()

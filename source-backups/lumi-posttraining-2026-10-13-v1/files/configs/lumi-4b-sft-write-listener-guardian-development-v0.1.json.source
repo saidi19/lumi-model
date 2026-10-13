@@ -1,0 +1,146 @@
+{
+  "schema_version": "lumi.sft-write-listener-guardian-development.v0.1",
+  "date": "2026-09-24",
+  "status": "PASS_local_listener_and_guardian_candidates_NOT_integrated_native_enforcement",
+  "scope": "Local, import-inert Linux listener-adapter and independent guardian candidates with synthetic native-boundary tests only. No filter, listener, ioctl, pidfd, cgroup, socket, worker, payload, remote, GPU, inference or training execution.",
+  "bindings": [
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_listener_v1.py",
+      "bytes": 20848,
+      "sha256": "46df3670f8921e06679b2978c7aecd70700dd71c67a44dcf84c7cd4bb034e64a"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_guardian_v1.py",
+      "bytes": 18831,
+      "sha256": "b8831ac5c43d4e1f58e5a56467b42d3ac2ef8b225210fbb9f472bf048e35896b"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_listener_v1.py",
+      "bytes": 33333,
+      "sha256": "765f91d93c5c84464f798b7ca575d1f53932241502a943b311e0a02dd5ad0bdc"
+    },
+    {
+      "path": "tests/test_sft_checkpoint_write_guardian_v1.py",
+      "bytes": 38980,
+      "sha256": "8f70733eebea549d37d9f3849a0a41fb4d8558c3f7f6884808c33fb20bbb7551"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_policy_v1.py",
+      "bytes": 12666,
+      "sha256": "0b415b6951d9b0a7886158851a90464536fd42bd8716ae740a6361fc3cbf7690"
+    },
+    {
+      "path": "src/lumi/posttraining_checkpoint_write_broker_v1.py",
+      "bytes": 9293,
+      "sha256": "cfad51b8870bab8cd58ae35252aa932d49248dc44d64d779a359fa91d58e1716"
+    },
+    {
+      "path": "src/lumi/posttraining_sft_cgroup_guardian_v1.py",
+      "bytes": 12395,
+      "sha256": "407e29f2b81f1a17bb11fe1b3aa917759b0ae182e0ba18f5d449e8bfa31afc66"
+    },
+    {
+      "path": "src/lumi/posttraining_sft_cgroup_v1.py",
+      "bytes": 14117,
+      "sha256": "6ab54ebb721e9607457afb943fe1e120a35d114b38be11eed77969cb75603757"
+    },
+    {
+      "path": "configs/lumi-4b-sft-write-guard-core-development-v0.1.json",
+      "bytes": 6210,
+      "sha256": "5abd3ce88efc86a8128bae13c66349301e13e8f583cf01d0173eeb04b327916f"
+    },
+    {
+      "path": "evidence/lumi-4b-sft-write-guard-core-development-verification-v0.1.json",
+      "bytes": 6405,
+      "sha256": "10f0a84383fa5d3ad259b5f65a661d01cb9c9b24ccb89f3a6e2ec6330085ffe8"
+    }
+  ],
+  "completed": [
+    "The listener adapter is import-inert and publicly closed. Its private candidate path fixes one Linux 6.8 x86_64 CPython 3.12 ABI, reads back USER_NOTIF sizes/action support, sets and reads back no-new-privileges, installs one fixed listener program, requires one exact transfer callback acknowledgement, verifies descriptor stability and closes the local copy.",
+    "The fixed final seal is a separate one-shot operation available only after the same bootstrap owner completed the transfer and local close. It rechecks the fixed ABI and seccomp mode before and after installing only the frozen final policy.",
+    "The private supervisor adoption path consumes one CLOEXEC listener descriptor. Each notification has one receive, one ID-validity check and one exact CONTINUE response; identity changes, malformed frames, duplicate operations, callback ambiguity and close failures terminally consume the adapter without retry.",
+    "Notification receive can block and therefore must execute in a separately killable dedicated broker process, not in the guardian or a shared thread. This development successor does not create, transfer, authenticate or reap that process.",
+    "The guardian is import-inert and publicly closed. It requires the frozen cgroup runtime contract, one main thread, only default or ignored catchable signal dispositions, and ignored SIGPIPE.",
+    "The guardian validates one root-owned CLOEXEC O_RDWR AF_UNIX SOCK_SEQPACKET release descriptor and transmits one fixed byte with per-call MSG_DONTWAIT and MSG_NOSIGNAL. It does not trust mutable descriptor blocking flags.",
+    "The guardian atomically duplicates the borrowed broker pidfd with F_DUPFD_CLOEXEC, opens and owns the parent pidfd, treats pidfd readiness as authoritative exit including zombies, and chooses terminal reasons in fixed parent-loss, deadline, broker-loss, workload-empty priority.",
+    "Every admitted terminal path retires the owned cgroup and makes one generation-stable broker-stop attempt before closing only owned descriptors. Aggregate results distinguish borrowed from owned pidfd closure and retain explicit false claims for unproved transport, origin, reap, receipt, containment and native enforcement properties."
+  ],
+  "listener_abi_candidate": {
+    "reference_kernel": "Linux v6.8 x86_64 candidate only",
+    "listener_flags": 40,
+    "notification_bytes": 80,
+    "response_bytes": 24,
+    "seccomp_data_bytes": 64,
+    "recv_ioctl_hex": "0xc0502100",
+    "send_ioctl_hex": "0xc0182101",
+    "id_valid_ioctl_hex": "0x40082102",
+    "exact_callback_ack_bytes": 30,
+    "actual_target_abi_qualified": false,
+    "actual_scm_rights_adoption_verified": false
+  },
+  "guardian_candidate": {
+    "release_token_hex": "47",
+    "release_transport": "AF_UNIX SOCK_SEQPACKET candidate descriptor",
+    "release_send_flags_hex": "0x4040",
+    "reason_priority": ["parent_lost", "deadline_exhausted", "broker_lost", "workload_empty"],
+    "borrowed_broker_pidfd_closed": false,
+    "release_atomic_with_liveness_verified": false,
+    "broker_origin_or_receipt_or_reap_verified": false,
+    "guardian_death_containment_verified": false
+  },
+  "public_reference_basis": [
+    "https://www.kernel.org/doc/html/v6.8/userspace-api/seccomp_filter.html",
+    "https://raw.githubusercontent.com/torvalds/linux/v6.8/include/uapi/linux/seccomp.h",
+    "https://raw.githubusercontent.com/torvalds/linux/v6.8/kernel/seccomp.c",
+    "https://raw.githubusercontent.com/torvalds/linux/v6.8/arch/x86/entry/syscalls/syscall_64.tbl",
+    "https://raw.githubusercontent.com/torvalds/linux/v6.8/include/uapi/asm-generic/ioctl.h"
+  ],
+  "verification": {
+    "new_listener_tests": 37,
+    "new_guardian_tests": 52,
+    "new_tests": 89,
+    "prior_regressions": 608,
+    "unique_tests_per_runtime": 697,
+    "runtimes": ["CPython 3.11.15", "CPython 3.13.7"],
+    "all_native_boundaries_synthetic": true,
+    "native_operations_performed": false,
+    "independent_review": "PASS_no_concrete_local_candidate_blocker"
+  },
+  "remaining_integration_work": [
+    "Implement and test the exact SCM_RIGHTS bootstrap transport, separately killable broker-child spawn, listener adoption acknowledgement, aggregate receipt and parent-side reap without opening a post-seal transport path.",
+    "Connect the adopted listener to the frozen scalar broker loop inside that dedicated process, and make every blocking receive, ID-validation, response and terminal failure subordinate to the independent guardian-owned retirement boundary.",
+    "Implement the sealed READY/release protocol over an owned local SOCK_SEQPACKET pair and prove descriptor origin, writer/reader exclusivity, one-byte consumption and lifecycle ordering rather than inferring them from descriptor type.",
+    "Integrate the adapter, broker child and guardian into the frozen bootstrap, dispatcher and lifecycle closure while preserving host, input, source, cgroup, authority, core-dump, mapping and resource-envelope gates.",
+    "Authenticate the successor source closure and run a separately authorized bounded Linux native qualification before any real checkpoint payload read or import.",
+    "Re-run unchanged host/input/resource/real-import admission after native qualification."
+  ],
+  "nonclaims": {
+    "public_execution_open": false,
+    "target_kernel_abi_qualified": false,
+    "native_filters_installed": false,
+    "native_listener_bound": false,
+    "listener_transfer_or_origin_authenticated": false,
+    "supervisor_liveness_verified_by_listener": false,
+    "alternative_write_channels_proved_closed": false,
+    "user_notif_pointer_toctou_eliminated": false,
+    "broker_process_spawned_or_reaped": false,
+    "release_channel_origin_or_exclusivity_verified": false,
+    "release_consumed_verified": false,
+    "release_atomic_with_liveness_verified": false,
+    "kernel_id_validation_verified": false,
+    "native_response_verified": false,
+    "native_cumulative_write_enforcement_verified": false,
+    "physical_disk_write_accounting": false,
+    "guardian_death_containment_verified": false,
+    "worker_exit_success_verified": false,
+    "host_admission_verified": false,
+    "native_qualification_verified": false,
+    "execution_permitted": false,
+    "real_4b_import": false,
+    "gate_5_complete": false,
+    "training_authorized": false,
+    "production_eligible": false,
+    "retry_allowed": false,
+    "publication": false
+  }
+}

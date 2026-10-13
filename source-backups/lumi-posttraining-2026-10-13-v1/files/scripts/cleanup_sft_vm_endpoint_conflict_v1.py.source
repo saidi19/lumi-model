@@ -1,0 +1,364 @@
+"""Six exact authorized cleanup mutations; no compute, model or S3 access."""
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+from scripts.cleanup_sft_vm_v05_host_resources_v3 import HTTPS, Journal, canonical, ssh
+
+ROOT = Path(__file__).resolve().parents[1]
+AUDIT = ROOT / "evidence/lumi-vm-endpoint-dependency-audit-completion-v0.1.json"
+AUDIT_SHA = "2d524805b53798f62c3278907a9b1f213535d22cf8741cf79d8309c837a5ff18"
+APPROVAL = ROOT / "configs/lumi-vm-endpoint-conflict-cleanup-approval-v0.1.json"
+OUTPUT = ROOT / "artifacts/lumi-vm-endpoint-conflict-cleanup-v0.1"
+ACCOUNT = "573978149073"
+ATTEMPT = "242bd09f5fa84b1f9a4e46cb4592ad8b"
+OLD = "606d788073f1f0b66a39eabeb4b32c2c"
+VPC = "vpc-0905fbf9490a2dead"
+VM, EP = "sg-082958a6c2bee3618", "sg-0350ae95c7068b2c5"
+ENDPOINT = "eice-08b3cb5ef65152517"
+OLD_GROUP = "sg-07ef790d8844ff9a0"
+OLD_SUBNET = "subnet-09acdd244d70aa502"
+OLD_INSTANCE = "i-045114b98ce9b3a48"
+OLD_ENI = "eni-036c60cfe16f9d611"
+VOLUMES = {"vol-0d7265d5cfae1a20e", "vol-0b7a2271037f8f3bd"}
+KEY = "key-0634300de4307a07d"
+KEY_NAME = "lumi-fullsize-" + ATTEMPT
+READS = {
+    "get-caller-identity",
+    "describe-security-groups",
+    "describe-key-pairs",
+    "describe-instances",
+    "describe-network-interfaces",
+    "describe-volumes",
+    "describe-security-group-references",
+    "describe-security-group-vpc-associations",
+    "describe-instance-connect-endpoints",
+}
+ACTIONS = (
+    ("revoke-security-group-ingress", dict(GroupId=VM, IpPermissions=[ssh(EP)])),
+    ("revoke-security-group-egress", dict(GroupId=EP, IpPermissions=[ssh(VM)])),
+    ("delete-security-group", dict(GroupId=EP)),
+    ("delete-security-group", dict(GroupId=VM)),
+    ("delete-key-pair", dict(KeyPairId=KEY)),
+    ("delete-instance-connect-endpoint", dict(InstanceConnectEndpointId=ENDPOINT)),
+)
+
+
+def need(condition):
+    if not condition:
+        raise ValueError("cleanup_validation_failed")
+
+
+def owned(row, attempt=ATTEMPT):
+    need(
+        [t.get("Value") for t in row.get("Tags", []) if t.get("Key") == "LumiAttempt"] == [attempt]
+    )
+
+
+class Cloud:
+    def __init__(self, save, *, clock=time.monotonic):
+        self.save, self.clock, self.start = save, clock, clock()
+        self.reads = self.writes = self.bytes = 0
+        self.stage = "initial"
+
+    def call(self, op, **fields):
+        self.stage = op
+        remaining = 900 - (self.clock() - self.start)
+        need(remaining > 25)
+        if op in READS:
+            need(self.reads < 60)
+            self.reads += 1
+        else:
+            need(self.writes < 6 and (op, fields) == ACTIONS[self.writes])
+            self.writes += 1  # Consumed before invocation; never retry mutations.
+            self.save(
+                f"mutation-{self.writes:02d}", dict(operation=op, parameters=fields, started=True)
+            )
+        service = "sts" if op == "get-caller-identity" else "ec2"
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if not k.startswith("AWS_")
+            and k.lower() not in {"http_proxy", "https_proxy", "all_proxy"}
+        }
+        env.update(AWS_MAX_ATTEMPTS="1", AWS_PAGER="", AWS_EC2_METADATA_DISABLED="true")
+        p = subprocess.run(
+            [
+                "/opt/homebrew/bin/aws",
+                "--profile",
+                "default",
+                "--region",
+                "us-east-1",
+                "--endpoint-url",
+                f"https://{service}.us-east-1.amazonaws.com",
+                "--cli-connect-timeout",
+                "5",
+                "--cli-read-timeout",
+                "15",
+                "--no-cli-pager",
+                service,
+                op,
+                "--cli-input-json",
+                json.dumps(fields),
+                "--output",
+                "json",
+                "--no-paginate",
+            ],
+            capture_output=True,
+            timeout=25,
+            env=env,
+        )
+        need(len(p.stdout) <= 262144 and len(p.stderr) <= 8192)
+        self.bytes += len(p.stdout) + len(p.stderr)
+        need(self.bytes <= 4194304)
+        if p.returncode:
+            match = re.search(rb"An error occurred \(([A-Za-z0-9_.-]+)\)", p.stderr)
+            code = match.group(1).decode() if match else "cli_failed"
+            absent = {
+                ("describe-security-groups", "InvalidGroup.NotFound"): "SecurityGroups",
+                ("describe-key-pairs", "InvalidKeyPair.NotFound"): "KeyPairs",
+            }.get((op, code))
+            if absent:
+                return {absent: []}
+            self.save("failure-code", dict(operation=op, code=code))
+            raise ValueError("cloud_call_failed")
+        value = json.loads(p.stdout or b"{}")
+        if op != "describe-security-group-vpc-associations":
+            need(not value.get("NextToken"))
+        need(not value.get("nextToken") and not value.get("IsTruncated"))
+        return value
+
+
+class Cleanup:
+    def __init__(self, cloud, *, wait=time.sleep):
+        self.c, self.wait = cloud, wait
+        self.rules = {VM: ([ssh(EP)], [HTTPS]), EP: ([], [ssh(VM)])}
+
+    def group(self, row):
+        group = row["GroupId"]
+        need(group in self.rules and row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC)
+        need(row["GroupName"] == KEY_NAME + ("-vm" if group == VM else "-endpoint"))
+        owned(row)
+        for field, expected in zip(
+            ("IpPermissions", "IpPermissionsEgress"), self.rules[group], strict=True
+        ):
+            actual = [{k: v for k, v in rule.items() if v != []} for rule in row[field]]
+            need(canonical(actual) == canonical(expected))
+
+    def groups(self):
+        for group in (VM, EP):
+            rows = self.c.call("describe-security-groups", GroupIds=[group])["SecurityGroups"]
+            if group in self.rules:
+                need(len(rows) == 1 and rows[0]["GroupId"] == group)
+                self.group(rows[0])
+            else:
+                need(not rows)
+
+    def endpoint(self):
+        rows = self.c.call(
+            "describe-instance-connect-endpoints",
+            Filters=[dict(Name="vpc-id", Values=[VPC])],
+            MaxResults=20,
+        )["InstanceConnectEndpoints"]
+        active = [r for r in rows if r["State"] != "delete-complete"]
+        need(len(active) == 1)
+        row = active[0]
+        need(row["InstanceConnectEndpointId"] == ENDPOINT and row["State"] == "create-complete")
+        need(row["OwnerId"] == ACCOUNT and row["VpcId"] == VPC and row["SubnetId"] == OLD_SUBNET)
+        need(row["SecurityGroupIds"] == [OLD_GROUP])
+        need(row["NetworkInterfaceIds"] == [OLD_ENI])
+        owned(row, OLD)
+
+    def preserved(self):
+        rows = self.c.call("describe-instances", InstanceIds=[OLD_INSTANCE])["Reservations"]
+        need(len(rows) == 1 and rows[0]["OwnerId"] == ACCOUNT and len(rows[0]["Instances"]) == 1)
+        i = rows[0]["Instances"][0]
+        need(i["InstanceId"] == OLD_INSTANCE and i["State"]["Name"] == "stopped")
+        need(i["VpcId"] == VPC and i["SubnetId"] == OLD_SUBNET)
+        owned(i, OLD)
+        need({b["Ebs"]["VolumeId"] for b in i["BlockDeviceMappings"]} == VOLUMES)
+        vols = self.c.call("describe-volumes", VolumeIds=sorted(VOLUMES))["Volumes"]
+        need(len(vols) == 2 and {v["VolumeId"] for v in vols} == VOLUMES)
+        for v in vols:
+            need(v["State"] == "in-use" and v["Encrypted"] is True)
+            need(len(v["Attachments"]) == 1 and v["Attachments"][0]["InstanceId"] == OLD_INSTANCE)
+
+    def dependencies(self):
+        for name, values in (
+            ("key-name", [KEY_NAME]),
+            ("instance.group-id", [VM, EP]),
+            ("tag:LumiAttempt", [ATTEMPT]),
+        ):
+            rows = self.c.call(
+                "describe-instances", Filters=[dict(Name=name, Values=values)], MaxResults=100
+            )["Reservations"]
+            need(all(i["State"]["Name"] == "terminated" for r in rows for i in r["Instances"]))
+        need(
+            not self.c.call(
+                "describe-network-interfaces",
+                Filters=[dict(Name="group-id", Values=[VM, EP])],
+                MaxResults=100,
+            )["NetworkInterfaces"]
+        )
+        for name in ("ip-permission.group-id", "egress.ip-permission.group-id"):
+            rows = self.c.call(
+                "describe-security-groups",
+                Filters=[dict(Name=name, Values=[VM, EP])],
+                MaxResults=100,
+            )["SecurityGroups"]
+            for row in rows:
+                self.group(row)
+        need(
+            not self.c.call("describe-security-group-references", GroupId=[VM, EP])[
+                "SecurityGroupReferenceSet"
+            ]
+        )
+        seen, token = set(), None
+        for _ in range(8):
+            fields = dict(Filters=[dict(Name="group-id", Values=[VM, EP])], MaxResults=100)
+            if token:
+                fields["NextToken"] = token
+            r = self.c.call("describe-security-group-vpc-associations", **fields)
+            need(r.get("SecurityGroupVpcAssociations") == [])
+            token = r.get("NextToken")
+            if not token:
+                return
+            need(type(token) is str and len(token) <= 8192 and token not in seen)
+            seen.add(token)
+        need(False)
+
+    def run(self):
+        need(self.c.call("get-caller-identity")["Account"] == ACCOUNT)
+        self.endpoint()
+        self.preserved()
+        self.groups()
+        keys = self.c.call("describe-key-pairs", KeyPairIds=[KEY])["KeyPairs"]
+        need(
+            len(keys) == 1
+            and keys[0]["KeyName"] == KEY_NAME
+            and keys[0]["KeyPairId"] == KEY
+            and keys[0]["KeyType"] == "ed25519"
+        )
+        owned(keys[0])
+        self.dependencies()
+        self.c.save(
+            "admission",
+            dict(
+                exact_targets_verified=True,
+                dependencies_clear=True,
+                stopped_vm_and_two_volumes_verified=True,
+            ),
+        )
+        for index, (operation, fields) in enumerate(ACTIONS):
+            if index == 5:
+                self.endpoint()
+                self.preserved()
+            response = self.c.call(operation, **fields)
+            if index < 5:
+                need(response.get("Return") is True)
+            if index == 0:
+                self.rules[VM] = ([], [HTTPS])
+            elif index == 1:
+                self.rules[EP] = ([], [])
+            elif index in (2, 3):
+                del self.rules[EP if index == 2 else VM]
+            if index < 4:
+                self.groups()
+            elif index == 4:
+                need(self.c.call("describe-key-pairs", KeyPairIds=[KEY])["KeyPairs"] == [])
+            else:
+                need(response["InstanceConnectEndpoint"]["InstanceConnectEndpointId"] == ENDPOINT)
+            self.c.save(
+                f"verified-{index + 1:02d}",
+                dict(request_returned=True, asynchronous_endpoint_deletion=index == 5),
+            )
+        for _ in range(14):
+            rows = self.c.call(
+                "describe-instance-connect-endpoints",
+                Filters=[dict(Name="vpc-id", Values=[VPC])],
+                MaxResults=20,
+            )["InstanceConnectEndpoints"]
+            active = [r for r in rows if r["State"] != "delete-complete"]
+            need(
+                all(
+                    r["InstanceConnectEndpointId"] == ENDPOINT
+                    and r["State"] == "delete-in-progress"
+                    for r in active
+                )
+            )
+            if not active:
+                enis = self.c.call(
+                    "describe-network-interfaces",
+                    Filters=[dict(Name="network-interface-id", Values=[OLD_ENI])],
+                    MaxResults=100,
+                )["NetworkInterfaces"]
+                if not enis:
+                    self.preserved()
+                    return
+            self.wait(20)
+        need(False)
+
+
+def main():
+    need(not OUTPUT.exists() and not OUTPUT.is_symlink())
+    need(not any(p.is_symlink() for p in (ROOT, *ROOT.parents)))
+    need(hashlib.sha256(AUDIT.read_bytes()).hexdigest() == AUDIT_SHA)
+    approval = json.loads(APPROVAL.read_bytes())
+    need(
+        approval
+        == dict(
+            human_message="ok shuru kor",
+            audit_sha256=AUDIT_SHA,
+            script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            execution_count=1,
+            maximum_mutations=6,
+            maximum_readonly_calls=60,
+            maximum_seconds=900,
+            retained_endpoint_removal_approved=True,
+            preserve_vm_ebs_s3=True,
+            retry=False,
+            gpu=False,
+            training=False,
+        )
+    )
+    journal = Journal(OUTPUT)
+    journal.save("started", approval)
+    cloud = Cloud(journal.save)
+    result = dict(
+        status="stopped_no_retry",
+        cleanup_verified=False,
+        retry_allowed=False,
+        instance_actions=0,
+        gpu_used=False,
+        training=False,
+        gate_5_complete=False,
+    )
+    try:
+        Cleanup(cloud).run()
+        result.update(
+            status="cleanup_verified",
+            cleanup_verified=True,
+            endpoint_eni_deleted=True,
+            stopped_vm_and_two_volumes_verified=True,
+        )
+    except Exception:
+        result["failed_stage"] = cloud.stage
+    finally:
+        result.update(
+            reads=cloud.reads,
+            mutations=cloud.writes,
+            response_bytes=cloud.bytes,
+            elapsed_seconds=round(time.monotonic() - cloud.start, 3),
+        )
+        journal.save("result", result)
+        print(json.dumps(result, sort_keys=True))
+    return 0 if result["cleanup_verified"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
