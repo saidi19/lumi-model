@@ -2,13 +2,72 @@
 
 Lumi is a from-scratch language-model research project by Afnan Technologies Inc.
 
+## Public repository status
+
+This is research source, not a released instruction-tuned model. Public visibility
+does not itself grant an open-source license: source licensing review is pending.
+The maintainer has confirmed **Md. Delower Hossain Saidi** as the copyright
+holder of the maintainer-owned original source. See
+[licensing review](docs/licensing-review.md).
+
+The configured 4B architecture has **4,002,376,704 parameters**. The default-branch
+history records an 83,886,080-token 4B pilot and an 80B production plan. A separate
+post-training branch reports completion of 80B pretraining; that is a
+repository-reported claim, not independently reverified checkpoint evidence in
+this OSS review. Prepared corpus tokens are not evidence of consumed training
+tokens. See [MODEL_CARD.md](MODEL_CARD.md) for the claim boundaries.
+
+Start with the [CPU quickstart](docs/cpu-quickstart.md). The chronological phase
+notes below are historical records, not a current release-readiness checklist.
+Gate 5 work is on hold during repository hardening; this work does not authorize
+cloud execution, checkpoint downloads, GPU training, or model release.
+
 The first target is a dense, decoder-only ~4B-parameter base model that can be
 post-trained into `Lumi-4B-Instruct`, served with an OpenAI-compatible API, and
 quantized for Apple Silicon. This repository contains model code, configuration,
 tests, and small smoke-training utilities. It intentionally does **not** contain
 training data, secrets, or model checkpoints.
 
-## Current phase
+## Start here
+
+- [CPU quickstart](docs/cpu-quickstart.md): Python 3.12/3.13, synthetic tests,
+  tiny smoke training and analytical parameter counting; no private assets needed.
+- [Model card](MODEL_CARD.md): architecture, pilot metrics and evidence limits.
+- [Reproducibility guide](docs/reproducibility.md): real entry points and the
+  boundary between local tests and artifact-dependent research.
+- [Contributing](CONTRIBUTING.md), [security](SECURITY.md),
+  [community conduct](CODE_OF_CONDUCT.md) and [audit report](OSS_READINESS_REPORT.md).
+
+### Repository map
+
+| Location | Purpose |
+| --- | --- |
+| `src/lumi/` | Model/configuration, data processing, checkpointing and serving code |
+| `configs/` | Versioned architecture, corpus and experiment contracts |
+| `scripts/` | Training, evaluation, verification and explicitly gated cloud tools |
+| `tests/` | Synthetic correctness and control-contract tests |
+| `docs/`, `reports/` | Historical plans, experiment reports and reproducibility evidence |
+| `data/` | Data policy and benchmark signatures; not a public training corpus |
+
+Core dependencies include PyTorch, Transformers, Tokenizers and Safetensors.
+Data processing and Apple Silicon support have separate optional dependencies.
+Development used Codex extensively; AI assistance is not represented as manual
+authorship. The maintainer owns project direction, review and release decisions.
+
+### License and roadmap
+
+This review branch proposes Apache-2.0 for maintainer-owned original source and
+documentation: see [LICENSE](LICENSE), [NOTICE](NOTICE) and the
+[license review](docs/licensing-review.md). It is a PR proposal, not a claim that
+the default branch has already adopted it. Data, weights, tokenizer assets and
+third-party material are separate. No model-weight download is offered here.
+
+Immediate work is to review and merge the source-readiness PR, resolve any asset
+redistribution questions, and make CPU development reproducible. Post-training
+Gate 5 remains paused; usable instruction tuning and model release are later,
+separately authorized work, not results of this repository-hardening change.
+
+## Historical phase record
 
 Phase 1 architecture correctness is complete. Phase 2 validates checkpoint,
 tokenizer, data, and deployment portability before any expensive GPU run:
