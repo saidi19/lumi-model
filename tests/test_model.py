@@ -18,6 +18,39 @@ from lumi import (
 from lumi.modeling_lumi import _lumi_eager_attention_forward
 
 
+@pytest.mark.parametrize("requires_cache_position", [True, False])
+def test_causal_mask_api_compatibility(
+    tiny_config: LumiConfig, monkeypatch: pytest.MonkeyPatch, requires_cache_position: bool
+) -> None:
+    import lumi.modeling_lumi as modeling
+
+    original = modeling.create_causal_mask
+    installed_requires_position = modeling._MASK_REQUIRES_CACHE_POSITION
+    calls = []
+
+    def checked_mask(**kwargs):
+        calls.append(True)
+        assert ("cache_position" in kwargs) is requires_cache_position
+        sequence = kwargs["inputs_embeds"].shape[1]
+        positions = torch.arange(sequence, device=kwargs["inputs_embeds"].device)
+        if requires_cache_position:
+            torch.testing.assert_close(kwargs["cache_position"], positions)
+        if installed_requires_position:
+            kwargs["cache_position"] = positions
+        else:
+            kwargs.pop("cache_position", None)
+        return original(**kwargs)
+
+    monkeypatch.setattr(modeling, "_MASK_REQUIRES_CACHE_POSITION", requires_cache_position)
+    monkeypatch.setattr(modeling, "create_causal_mask", checked_mask)
+    model = LumiForCausalLM(tiny_config).eval()
+    tokens = torch.tensor([[0, 0, 1, 8, 9], [1, 8, 9, 10, 11]])
+    with torch.no_grad():
+        output = model(input_ids=tokens, attention_mask=tokens.ne(0))
+    assert calls == [True]
+    assert torch.isfinite(output.logits).all()
+
+
 def test_forward_shape_and_finite_loss(tiny_config: LumiConfig) -> None:
     torch.manual_seed(1)
     model = LumiForCausalLM(tiny_config)

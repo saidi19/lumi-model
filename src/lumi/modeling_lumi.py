@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import Any, NamedTuple
 
@@ -16,6 +17,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from .configuration_lumi import LumiConfig
 
 FLASH_VARLEN_IMPLEMENTATIONS = {"flash_attention_2"}
+_MASK_REQUIRES_CACHE_POSITION = "cache_position" in inspect.signature(create_causal_mask).parameters
 
 
 class PackedDocumentMetadata(NamedTuple):
@@ -451,6 +453,11 @@ class LumiModel(LumiPreTrainedModel):
                 attention_mask=attention_mask,
                 past_key_values=None,
                 position_ids=position_ids,
+                **(
+                    {"cache_position": torch.arange(sequence, device=hidden_states.device)}
+                    if _MASK_REQUIRES_CACHE_POSITION
+                    else {}
+                ),
             )
 
         for layer in self.layers:
