@@ -47,6 +47,13 @@ Whole-repository Ruff passed. These earlier environment failures are retained
 here rather than reported as successful runs. Remote CI and a completely clean
 installation remain separate checks, not established by the local result.
 
+Subsequent remote verification: both GitHub Actions runs for PR #60 at commit
+`40cd303cdcd98917ee1f5780a081ac14f1d05cd6` completed successfully on 2026-10-15:
+[PR run](https://github.com/saidi19/lumi-model/actions/runs/38698863043) and
+[push run](https://github.com/saidi19/lumi-model/actions/runs/38698812056).
+This verifies that commit's configured Ubuntu/Python 3.12 workflow, not every
+platform or dependency combination. PR #60 remains open with no submitted reviews.
+
 Application responses measure 371, 356 and 364 characters, each under 500.
 Local links in the changed documentation resolve. CI now has read-only contents
 permissions, non-persisted checkout credentials, concurrency cancellation and a
@@ -100,8 +107,8 @@ production artifacts. See [application draft](docs/codex-oss-application.md).
    Weight/data/tokenizer and benchmark-signature rights stay separate.
 2. Establish a private reporting channel and review any historical infrastructure
    metadata before broader distribution. No history rewrite is authorized.
-3. Inspect remote CI and validate clean-install/platform combinations before a
-   release. Local tests are not a promise covering every supported dependency.
+3. Remote CI passed at the commit above. Validate additional clean-install/platform
+   combinations before a release; those passes do not cover every supported dependency.
 4. Confirm application account/contact information and applicant acceptance of
    the program terms; disclose the PR's actual merge/license status. Submission
    does not guarantee acceptance or benefits.

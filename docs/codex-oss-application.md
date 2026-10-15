@@ -1,6 +1,8 @@
 # Codex for OSS application draft
 
-Not submitted. Refresh repository metrics and PR/merge status before submission.
+Not submitted. The maintainer will fill and submit the form personally; this
+document supplies suggested answers, not authorization for agent submission.
+Refresh repository metrics and PR/merge status before submission.
 Do not include credentials, private artifact locations or confidential records.
 
 ## Maintainer role
@@ -23,11 +25,21 @@ Development has been extensively Codex-assisted. The public history documents a 
 
 ## Evidence and submission checklist
 
+- Select **Primary maintainer** for the role.
+- GitHub username: `saidi19` (the form requires a public profile).
+- Use the email associated with the applicant's ChatGPT account. Keep that
+  personal contact information out of this public repository.
+- The live form inspected on 2026-10-15 marks **OpenAI Organization ID** required
+  and links to https://platform.openai.com/settings/organization/general.
+  Use the intended API organization's ID, not a GitHub organization, project ID
+  or API key. Do not store the identifier in this public repository.
+- Select optional Codex Security/API-credit interests only if genuinely desired.
 - Repository: https://github.com/saidi19/lumi-model
 - Pilot: https://github.com/saidi19/lumi-model/pull/58
 - Production plan (not completion): https://github.com/saidi19/lumi-model/pull/59
-- Review branch: `chore/oss-maintainer-readiness`; attach its PR, and disclose
-  whether the proposed license has been merged.
+- Review PR: https://github.com/saidi19/lumi-model/pull/60 — currently open.
+  Both configured CI runs passed at commit `40cd303`. Review and merge approval
+  remain outstanding. Do not describe the license as adopted on main until merged.
 - Confirm the applicant's ChatGPT-account email and any requested affiliation
   directly with the applicant; do not infer these from Git commit addresses.
 - Read and accept the program terms as the applicant before submission.
